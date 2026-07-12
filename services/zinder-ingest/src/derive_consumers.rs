@@ -13,27 +13,35 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroU32,
     path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use parking_lot::{Mutex, MutexGuard};
 use prost::Message as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpochId,
-    TransactionFactsArtifact, TransactionId, TransparentOutPoint, TransparentSpendFact,
+    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    ChainEpochId, TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
+    TransparentOutPoint, TransparentSpendFact,
 };
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer,
-    ChainEventDispatchInputs, DeriveStore, DeriveStoreOptions, IronwoodMigrationConsumer,
+    COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+    ChainEventDispatchInputs, CommitmentRootSearchConsumer, ConventionalFeeDistributionConsumer,
+    DeriveConsumerName, DeriveStore, DeriveStoreOptions, IronwoodMigrationConsumer,
     MempoolConsumerEvent, MempoolConsumerEventVariant, MempoolEventCountsConsumer,
-    RecentTransactionsConsumer, ReorgIncidentsConsumer,
-    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionFeesConsumer,
-    TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
+    PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PaidFeeDistributionConsumer, RecentTransactionsConsumer,
+    ReorgIncidentsConsumer, TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+    TransactionComponentSummaryConsumer, TransactionFeesConsumer, TransactionHistoryConsumer,
+    TransactionIntrinsicValueBalanceFacts, TransparentAddressActivityConsumer,
+    TransparentAddressDeltasConsumer, TransparentAddressRankingConsumer,
     TransparentAddressTransactionHistoryConsumer, TransparentOutpointSpendConsumer,
-    TransparentSpendFacts,
+    TransparentSpendFacts, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, ValuePoolFlowHistoryConsumer,
 };
 use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
 use zinder_runtime::{IngestPhase, Readiness};
@@ -45,7 +53,9 @@ use zinder_store::{
 use crate::{
     DeriveReplayPolicy, IngestDeriveConfig, IngestError,
     chain_ingest::{ingest_error_class, outcome_status},
+    conventional_fee_distribution_backfill::seed_conventional_fee_distribution_visible_tail,
     memory_pressure::RuntimeMemorySnapshot,
+    transaction_component_backfill::seed_transaction_component_visible_tail,
 };
 
 const DERIVE_REPLAY_STAGE_READ_EVENTS: &str = "read_events";
@@ -53,6 +63,11 @@ const DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
 const DERIVE_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS: &str = "build_block_contexts";
 const DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS: &str = "read_transparent_spend_facts";
 const DERIVE_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
+static DERIVE_PROJECTION_WRITE_LOCK: Mutex<()> = parking_lot::const_mutex(());
+
+pub(crate) fn derive_projection_write_guard() -> MutexGuard<'static, ()> {
+    DERIVE_PROJECTION_WRITE_LOCK.lock()
+}
 
 /// Default poll cadence for the derive tailer when the canonical store is
 /// ingesting faster than chain-event notifications arrive.
@@ -79,7 +94,7 @@ const RETENTION_RELEASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Internal cap on variable fan-out rows one derive replay chunk should stage.
 ///
-/// `replay_batch_blocks` bounds block count, but `recent_transactions` and
+/// `replay_batch_blocks` bounds block count, but transaction projections and
 /// `transparent_address_transaction_history` scale with transaction/address
 /// fan-out. This cap keeps one derive write batch from growing with a dense
 /// multi-block event. A single dense block is still admitted because replay
@@ -134,25 +149,23 @@ const fn phase_engages_replay_gate(phase: Option<IngestPhase>) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DeriveReplayProjectionRows {
-    recent_transactions: usize,
+    transaction_rows: usize,
     transparent_address_transaction_history: usize,
 }
 
 impl DeriveReplayProjectionRows {
     const fn is_empty(self) -> bool {
-        self.recent_transactions == 0 && self.transparent_address_transaction_history == 0
+        self.transaction_rows == 0 && self.transparent_address_transaction_history == 0
     }
 
     const fn total(self) -> usize {
-        self.recent_transactions
+        self.transaction_rows
             .saturating_add(self.transparent_address_transaction_history)
     }
 
     const fn saturating_add(self, other: Self) -> Self {
         Self {
-            recent_transactions: self
-                .recent_transactions
-                .saturating_add(other.recent_transactions),
+            transaction_rows: self.transaction_rows.saturating_add(other.transaction_rows),
             transparent_address_transaction_history: self
                 .transparent_address_transaction_history
                 .saturating_add(other.transparent_address_transaction_history),
@@ -164,9 +177,12 @@ fn projection_rows_for_transactions(
     transactions: &[TransactionFactsArtifact],
 ) -> DeriveReplayProjectionRows {
     DeriveReplayProjectionRows {
-        recent_transactions: RecentTransactionsConsumer::projected_row_count_for_transactions(
+        transaction_rows: RecentTransactionsConsumer::projected_row_count_for_transactions(
             transactions,
-        ),
+        )
+        .saturating_add(TransactionHistoryConsumer::projected_row_count_for_transactions(
+            transactions,
+        )),
         transparent_address_transaction_history:
             TransparentAddressTransactionHistoryConsumer::projected_row_count_upper_bound_for_transactions(
                 transactions,
@@ -365,6 +381,263 @@ pub fn open_primary_derive_store_for_canonical(
             rocksdb_resource_budget,
         },
     )
+}
+
+const BACKFILL_OWNED_BLOCK_CONSUMERS: [DeriveConsumerName; 5] = [
+    COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
+    CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+    PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
+    TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
+    VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
+];
+fn backfill_tail_seed_batch_blocks() -> NonZeroU32 {
+    NonZeroU32::new(256).unwrap_or(NonZeroU32::MIN)
+}
+
+/// Seeds missing event cursors for consumers with dedicated historical backfills.
+///
+/// A newly declared block consumer normally starts without a cursor, causing
+/// every bundled block consumer to replay from retained history. Backfill-owned
+/// consumers instead reconstruct settled history from canonical facts. When
+/// every other bundled block consumer agrees on one cursor, each missing
+/// backfill-owned consumer can join at that exact boundary. A fresh or partially
+/// rebuilt derive store is left untouched so the normal replay contract applies.
+pub fn seed_backfill_owned_consumer_cursors(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+) -> Result<(), IngestError> {
+    let Some(cursor) = unanimous_existing_block_consumer_cursor(derive_store)? else {
+        return Ok(());
+    };
+    let missing_consumers = missing_backfill_consumer_cursors(derive_store, &cursor)?;
+    let Some(authoritative_height) =
+        derive_store.last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)?
+    else {
+        return Ok(());
+    };
+    seed_conventional_fee_distribution_cursor(
+        chain_store,
+        derive_store,
+        &cursor,
+        &missing_consumers,
+        authoritative_height,
+    )?;
+    seed_transaction_component_cursor(
+        chain_store,
+        derive_store,
+        &cursor,
+        &missing_consumers,
+        authoritative_height,
+    )?;
+    for consumer_name in missing_consumers.into_iter().filter(|name| {
+        ![
+            CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+            PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
+            TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
+            VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
+        ]
+        .contains(name)
+    }) {
+        derive_store.put_chain_event_cursor(consumer_name, &cursor)?;
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "backfill_owned_consumer_cursor_seeded",
+            consumer = consumer_name.as_str(),
+            "derive consumer joined the existing event boundary; historical coverage remains backfill-owned"
+        );
+    }
+    Ok(())
+}
+
+fn seed_conventional_fee_distribution_cursor(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    cursor: &[u8],
+    missing_consumers: &[DeriveConsumerName],
+    authoritative_height: BlockHeight,
+) -> Result<(), IngestError> {
+    let cursor_is_missing =
+        missing_consumers.contains(&CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME);
+    let chain_epoch = chain_store.current_chain_epoch()?.ok_or_else(|| {
+        IngestError::DeriveDispatch(
+            "canonical chain epoch is missing while seeding conventional-fee distribution tail"
+                .to_owned(),
+        )
+    })?;
+    let desired_tail_boundary = backfill_consumer_tail_boundary(
+        chain_epoch.settled_tip_height,
+        authoritative_height,
+        "conventional-fee distribution",
+    )?;
+    let tail_boundary_changed =
+        ConventionalFeeDistributionConsumer::widen_tail_boundary_for_startup(
+            derive_store,
+            desired_tail_boundary,
+        )
+        .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+    let tail_needs_seed = ConventionalFeeDistributionConsumer::tail_coverage(derive_store)?
+        .is_some_and(|tail| {
+            tail.complete_through_height
+                .is_none_or(|through| through < authoritative_height)
+        });
+    if cursor_is_missing || tail_boundary_changed || tail_needs_seed {
+        seed_conventional_fee_distribution_visible_tail(
+            chain_store,
+            derive_store,
+            authoritative_height,
+            backfill_tail_seed_batch_blocks(),
+        )?;
+    }
+    if cursor_is_missing {
+        derive_store.put_chain_event_cursor(CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME, cursor)?;
+    }
+    if cursor_is_missing || tail_boundary_changed || tail_needs_seed {
+        let tail_boundary = ConventionalFeeDistributionConsumer::tail_coverage(derive_store)?
+            .ok_or_else(|| {
+                IngestError::DeriveDispatch(
+                    "conventional-fee distribution tail coverage disappeared during startup"
+                        .to_owned(),
+                )
+            })?
+            .boundary_height;
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "conventional_fee_distribution_tail_boundary_initialized",
+            cursor_seeded = cursor_is_missing,
+            tail_boundary = tail_boundary.value(),
+            "conventional-fee distribution consumer joined the existing derive event boundary"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn unanimous_existing_block_consumer_cursor(
+    derive_store: &DeriveStore,
+) -> Result<Option<Vec<u8>>, IngestError> {
+    let mut agreed_cursor: Option<Vec<u8>> = None;
+    for consumer_name in DeriveStore::bundled_chain_event_consumer_names()
+        .iter()
+        .copied()
+        .filter(|name| {
+            !BACKFILL_OWNED_BLOCK_CONSUMERS.contains(name)
+                && *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME
+        })
+    {
+        let Some(candidate) = derive_store.get_chain_event_cursor(consumer_name)? else {
+            return Ok(None);
+        };
+        if agreed_cursor
+            .as_ref()
+            .is_some_and(|existing| existing != &candidate)
+        {
+            return Err(IngestError::DeriveDispatch(
+                "existing block derive consumer cursors disagree while seeding backfill-owned consumers"
+                    .to_owned(),
+            ));
+        }
+        agreed_cursor = Some(candidate);
+    }
+    Ok(agreed_cursor)
+}
+
+fn missing_backfill_consumer_cursors(
+    derive_store: &DeriveStore,
+    cursor: &[u8],
+) -> Result<Vec<DeriveConsumerName>, IngestError> {
+    let mut missing_consumers = Vec::new();
+    for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS {
+        match derive_store.get_chain_event_cursor(consumer_name)? {
+            Some(existing) if existing != cursor => {
+                return Err(IngestError::DeriveDispatch(
+                    "backfill-owned derive consumer cursor disagrees with the existing block consumer boundary"
+                        .to_owned(),
+                ));
+            }
+            Some(_) => {}
+            None => missing_consumers.push(consumer_name),
+        }
+    }
+    Ok(missing_consumers)
+}
+
+fn seed_transaction_component_cursor(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    cursor: &[u8],
+    missing_consumers: &[DeriveConsumerName],
+    authoritative_height: BlockHeight,
+) -> Result<(), IngestError> {
+    let component_cursor_is_missing =
+        missing_consumers.contains(&TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME);
+    let chain_epoch = chain_store.current_chain_epoch()?.ok_or_else(|| {
+        IngestError::DeriveDispatch(
+            "canonical chain epoch is missing while seeding transaction-component tail".to_owned(),
+        )
+    })?;
+    let desired_tail_boundary = backfill_consumer_tail_boundary(
+        chain_epoch.settled_tip_height,
+        authoritative_height,
+        "transaction-component",
+    )?;
+    let tail_boundary_changed =
+        TransactionComponentSummaryConsumer::widen_tail_boundary_for_startup(
+            derive_store,
+            desired_tail_boundary,
+        )
+        .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+    let tail_needs_seed = TransactionComponentSummaryConsumer::tail_coverage(derive_store)?
+        .is_some_and(|tail| {
+            tail.complete_through_height
+                .is_none_or(|through| through < authoritative_height)
+        });
+    if component_cursor_is_missing || tail_boundary_changed || tail_needs_seed {
+        seed_transaction_component_visible_tail(
+            chain_store,
+            derive_store,
+            authoritative_height,
+            backfill_tail_seed_batch_blocks(),
+        )?;
+    }
+    if component_cursor_is_missing {
+        derive_store.put_chain_event_cursor(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, cursor)?;
+    }
+    if component_cursor_is_missing || tail_boundary_changed || tail_needs_seed {
+        let tail_boundary = TransactionComponentSummaryConsumer::tail_coverage(derive_store)?
+            .ok_or_else(|| {
+                IngestError::DeriveDispatch(
+                    "transaction-component tail coverage disappeared during startup".to_owned(),
+                )
+            })?
+            .boundary_height;
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "transaction_component_tail_boundary_initialized",
+            cursor_seeded = component_cursor_is_missing,
+            tail_boundary = tail_boundary.value(),
+            "transaction-component consumer joined the existing derive event boundary"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn backfill_consumer_tail_boundary(
+    settled_tip_height: BlockHeight,
+    authoritative_height: BlockHeight,
+    projection: &str,
+) -> Result<BlockHeight, IngestError> {
+    BlockHeight::new(settled_tip_height.value().min(authoritative_height.value()))
+        .next()
+        .ok_or_else(|| {
+            IngestError::DeriveDispatch(format!("{projection} live-tail boundary height overflow"))
+        })
+}
+
+/// Compatibility wrapper for callers using the original root-specific API.
+pub fn seed_commitment_root_search_cursor_for_backfill(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+) -> Result<(), IngestError> {
+    seed_backfill_owned_consumer_cursors(chain_store, derive_store)
 }
 
 /// Refuses to run when the durable transparent-outpoint-spend projection is
@@ -1252,7 +1525,12 @@ fn persisted_chain_event_cursor(
     derive_store: &DeriveStore,
 ) -> Result<Option<StreamCursorTokenV1>, IngestError> {
     let mut cursor: Option<Vec<u8>> = None;
-    for consumer_name in DeriveStore::bundled_chain_event_consumer_names() {
+    let ranking_is_active =
+        TransparentAddressRankingConsumer::active_metadata(derive_store)?.is_some();
+    for consumer_name in DeriveStore::bundled_chain_event_consumer_names()
+        .iter()
+        .filter(|name| ranking_is_active || **name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
+    {
         let Some(candidate) = derive_store.get_chain_event_cursor(*consumer_name)? else {
             // A consumer without a cursor is fresh or was reset by a scoped
             // schema rebuild; it must replay from the earliest retained event
@@ -1293,6 +1571,7 @@ fn committed_block_range_for_chain_event(
 struct StagedReplayBlock {
     height: BlockHeight,
     header: BlockHeaderArtifact,
+    final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
     transaction_ids: Vec<TransactionId>,
 }
 
@@ -1326,10 +1605,12 @@ fn stage_committed_replay_blocks(
             )));
         };
         let transaction_ids = reader.transaction_ids_at_height(height)?;
+        let final_note_commitment_roots = reader.final_note_commitment_roots_at(height)?;
         batch_transaction_ids.extend_from_slice(&transaction_ids);
         staged.push(StagedReplayBlock {
             height,
             header,
+            final_note_commitment_roots,
             transaction_ids,
         });
         next_height = height.next().ok_or_else(|| {
@@ -1400,6 +1681,7 @@ fn hydrate_committed_block_replay_batch(
             block_time_unix_seconds: staged_block.header.block_time,
             block_size_bytes: staged_block.header.block_size_bytes,
             transactions,
+            final_note_commitment_roots: staged_block.final_note_commitment_roots,
             transparent_spends,
         });
     }
@@ -1461,6 +1743,7 @@ fn hydrate_committed_block(
         transactions.push(transaction);
     }
     let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
+    let final_note_commitment_roots = reader.final_note_commitment_roots_at(height)?;
     Ok(CanonicalReplayBlock {
         height,
         block_hash: header.block_hash,
@@ -1468,6 +1751,7 @@ fn hydrate_committed_block(
         block_time_unix_seconds: header.block_time,
         block_size_bytes: header.block_size_bytes,
         transactions,
+        final_note_commitment_roots,
         transparent_spends,
     })
 }
@@ -1492,26 +1776,43 @@ pub(crate) fn dispatch_chain_event(
     blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>>,
     advance_cursor: bool,
 ) -> Result<(), IngestError> {
+    let _write_guard = derive_projection_write_guard();
     let mut block_summary = BlockSummaryConsumer::new();
     let mut ironwood_migration = IronwoodMigrationConsumer::new();
+    let mut commitment_root_search = CommitmentRootSearchConsumer::new();
+    let mut conventional_fee_distribution = ConventionalFeeDistributionConsumer::new();
+    let mut paid_fee_distribution = PaidFeeDistributionConsumer::new();
     let mut transaction_fees = TransactionFeesConsumer::new();
     let mut recent_transactions = RecentTransactionsConsumer::new();
+    let mut transaction_history = TransactionHistoryConsumer::new();
+    let mut transaction_component_summary = TransactionComponentSummaryConsumer::new();
     let mut transparent_activity = TransparentAddressActivityConsumer::new();
     let mut transparent_deltas = TransparentAddressDeltasConsumer::new();
+    let mut transparent_ranking = TransparentAddressRankingConsumer::new();
     let mut transparent_transaction_history = TransparentAddressTransactionHistoryConsumer::new();
     let mut transparent_outpoint_spend = TransparentOutpointSpendConsumer::new();
-    let mut consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 8] = [
+    let mut value_pool_flow_history = ValuePoolFlowHistoryConsumer::new();
+    let mut consumers: Vec<&mut dyn zinder_derive::BlockKeyedConsumer> = vec![
         &mut block_summary,
         &mut ironwood_migration,
+        &mut commitment_root_search,
+        &mut conventional_fee_distribution,
+        &mut paid_fee_distribution,
         &mut transaction_fees,
         &mut recent_transactions,
+        &mut transaction_history,
+        &mut transaction_component_summary,
         &mut transparent_activity,
         &mut transparent_deltas,
         &mut transparent_transaction_history,
         &mut transparent_outpoint_spend,
+        &mut value_pool_flow_history,
     ];
+    if TransparentAddressRankingConsumer::active_metadata(derive_store)?.is_some() {
+        consumers.push(&mut transparent_ranking);
+    }
     derive_store
-        .write_chain_event_chunk(&mut consumers, inputs, blocks, advance_cursor)
+        .write_chain_event_chunk(consumers.as_mut_slice(), inputs, blocks, advance_cursor)
         .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
     Ok(())
 }
@@ -1593,6 +1894,81 @@ fn apply_mempool_event(
     Ok(())
 }
 
+/// Hydrates one current canonical range for cursor-neutral startup projections.
+pub(crate) async fn read_current_block_context_batch(
+    chain_store: &PrimaryChainStore,
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+) -> Result<Vec<Arc<BlockCommitContext>>, IngestError> {
+    let store = chain_store.clone();
+    let (chain_epoch_id, replay_blocks) = tokio::task::spawn_blocking(move || {
+        let reader = store.current_chain_epoch_reader()?;
+        let chain_epoch_id = reader.chain_epoch().id;
+        let mut replay_blocks = Vec::with_capacity(
+            BlockHeightRange::inclusive(start_height, end_height)
+                .into_iter()
+                .len(),
+        );
+        for height in BlockHeightRange::inclusive(start_height, end_height) {
+            let header = reader.block_header_at(height)?.ok_or_else(|| {
+                IngestError::DeriveDispatch(format!(
+                    "ranking startup references unavailable block-header facts {}",
+                    height.value()
+                ))
+            })?;
+            let transaction_ids = reader.transaction_ids_at_height(height)?;
+            let mut facts_by_id = reader.transaction_facts_by_ids(&transaction_ids)?;
+            let mut transactions = Vec::with_capacity(transaction_ids.len());
+            for transaction_id in transaction_ids {
+                let transaction =
+                    facts_by_id
+                        .remove(&transaction_id)
+                        .flatten()
+                        .ok_or_else(|| {
+                            IngestError::DeriveDispatch(format!(
+                                "ranking startup references unavailable transaction facts {}",
+                                hex::encode(transaction_id.as_bytes())
+                            ))
+                        })?;
+                transactions.push(transaction);
+            }
+            let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
+            replay_blocks.push(CanonicalReplayBlock {
+                height,
+                block_hash: header.block_hash,
+                previous_block_hash: header.parent_hash,
+                block_time_unix_seconds: header.block_time,
+                block_size_bytes: header.block_size_bytes,
+                transactions,
+                final_note_commitment_roots: reader.final_note_commitment_roots_at(height)?,
+                transparent_spends,
+            });
+        }
+        Ok::<_, IngestError>((chain_epoch_id, replay_blocks))
+    })
+    .await
+    .map_err(|error| IngestError::BlockingTaskFailed {
+        reason: error.to_string(),
+    })??;
+    let mut contexts = build_block_contexts_from_committed_event(
+        chain_store,
+        chain_epoch_id,
+        replay_blocks,
+        false,
+    )
+    .await?;
+    let mut ordered = Vec::with_capacity(contexts.len());
+    for height in BlockHeightRange::inclusive(start_height, end_height) {
+        ordered.push(contexts.remove(&height).ok_or_else(|| {
+            IngestError::DeriveDispatch(format!(
+                "ranking startup context is missing at height {}",
+                height.value()
+            ))
+        })?);
+    }
+    Ok(ordered)
+}
+
 async fn build_block_contexts_from_committed_event(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
@@ -1606,6 +1982,13 @@ async fn build_block_contexts_from_committed_event(
         finalized,
     )
     .await?;
+    let transaction_intrinsic_value_balances =
+        read_transaction_intrinsic_value_balances_for_committed_blocks(
+            chain_store,
+            chain_epoch_id,
+            &replay_blocks,
+        )
+        .await?;
     let mut out = HashMap::with_capacity(replay_blocks.len());
     for block in replay_blocks {
         let context = BlockCommitContext::new(
@@ -1616,12 +1999,51 @@ async fn build_block_contexts_from_committed_event(
                 block_time_unix_seconds: block.block_time_unix_seconds,
                 block_size_bytes: block.block_size_bytes,
                 transactions: block.transactions,
+                final_note_commitment_roots: block.final_note_commitment_roots,
             },
             TransparentSpendFacts::from_map(Arc::clone(&transparent_spends)),
+        )
+        .with_transaction_intrinsic_value_balances(
+            TransactionIntrinsicValueBalanceFacts::from_map(Arc::clone(
+                &transaction_intrinsic_value_balances,
+            )),
         );
         out.insert(block.height, Arc::new(context));
     }
     Ok(out)
+}
+
+async fn read_transaction_intrinsic_value_balances_for_committed_blocks(
+    chain_store: &PrimaryChainStore,
+    chain_epoch_id: ChainEpochId,
+    replay_blocks: &[CanonicalReplayBlock],
+) -> Result<Arc<HashMap<TransactionId, TransactionIntrinsicValueBalances>>, IngestError> {
+    let transaction_ids: Vec<TransactionId> = replay_blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .transactions
+                .iter()
+                .map(|transaction| transaction.location.transaction_id)
+        })
+        .collect();
+    let chain_store = chain_store.clone();
+    tokio::task::spawn_blocking(move || {
+        let reader = chain_store.chain_epoch_reader_at(chain_epoch_id)?;
+        let mut balances = HashMap::with_capacity(transaction_ids.len());
+        for transaction_id in transaction_ids {
+            if let Some(artifact) =
+                reader.transaction_intrinsic_value_balances_by_id(transaction_id)?
+            {
+                balances.insert(transaction_id, artifact.value_balances);
+            }
+        }
+        Ok::<_, IngestError>(Arc::new(balances))
+    })
+    .await
+    .map_err(|error| IngestError::BlockingTaskFailed {
+        reason: error.to_string(),
+    })?
 }
 
 struct CanonicalReplayBlock {
@@ -1631,6 +2053,7 @@ struct CanonicalReplayBlock {
     block_time_unix_seconds: i64,
     block_size_bytes: u64,
     transactions: Vec<TransactionFactsArtifact>,
+    final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
     transparent_spends: Vec<TransparentOutPoint>,
 }
 
@@ -2005,6 +2428,257 @@ mod tests {
 
     use super::*;
 
+    fn derive_store() -> Result<(tempfile::TempDir, DeriveStore), IngestError> {
+        let tempdir = tempfile::tempdir().map_err(|error| {
+            IngestError::DeriveDispatch(format!("create derive test directory: {error}"))
+        })?;
+        let store = DeriveStore::open(
+            tempdir.path(),
+            DeriveStoreOptions {
+                sync_writes: false,
+                consumers: DeriveStore::bundled_consumers(),
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            },
+        )?;
+        Ok((tempdir, store))
+    }
+
+    fn seed_existing_block_consumer_cursors(
+        store: &DeriveStore,
+        cursor: &[u8],
+    ) -> Result<(), IngestError> {
+        for consumer_name in DeriveStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied()
+            .filter(|name| !BACKFILL_OWNED_BLOCK_CONSUMERS.contains(name))
+        {
+            store.put_chain_event_cursor(consumer_name, cursor)?;
+        }
+        Ok(())
+    }
+
+    fn seed_backfill_owned_consumer_cursors(store: &DeriveStore) -> Result<(), IngestError> {
+        let Some(cursor) = unanimous_existing_block_consumer_cursor(store)? else {
+            return Ok(());
+        };
+        let missing_consumers = missing_backfill_consumer_cursors(store, &cursor)?;
+        let Some(authoritative_height) =
+            store.last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)?
+        else {
+            return Ok(());
+        };
+        let component_cursor_is_missing =
+            missing_consumers.contains(&TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME);
+        let conventional_fee_cursor_is_missing =
+            missing_consumers.contains(&CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME);
+        if conventional_fee_cursor_is_missing
+            || ConventionalFeeDistributionConsumer::tail_coverage(store)?.is_none()
+        {
+            let boundary = authoritative_height.next().ok_or_else(|| {
+                IngestError::DeriveDispatch(
+                    "conventional-fee distribution live-tail boundary height overflow".to_owned(),
+                )
+            })?;
+            ConventionalFeeDistributionConsumer::initialize_tail_boundary(store, boundary)
+                .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+        }
+        if component_cursor_is_missing
+            || TransactionComponentSummaryConsumer::tail_coverage(store)?.is_none()
+        {
+            let boundary = authoritative_height.next().ok_or_else(|| {
+                IngestError::DeriveDispatch(
+                    "transaction-component live-tail boundary height overflow".to_owned(),
+                )
+            })?;
+            TransactionComponentSummaryConsumer::initialize_tail_boundary(store, boundary)
+                .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+        }
+        for consumer_name in missing_consumers {
+            store.put_chain_event_cursor(consumer_name, &cursor)?;
+        }
+        Ok(())
+    }
+
+    fn seed_authoritative_projection_height(
+        store: &DeriveStore,
+        height: BlockHeight,
+    ) -> Result<(), IngestError> {
+        store.put_consumer(
+            BLOCK_SUMMARY_COLUMN_FAMILY,
+            &zinder_core::wire::encode_height_key_ascending(height),
+            b"test-block-summary",
+        )?;
+        Ok(())
+    }
+
+    fn assert_tail_boundary(
+        store: &DeriveStore,
+        expected_boundary: BlockHeight,
+    ) -> Result<(), IngestError> {
+        let coverage = TransactionComponentSummaryConsumer::tail_coverage(store)?
+            .ok_or_else(|| IngestError::DeriveDispatch("tail coverage missing".to_owned()))?;
+        assert_eq!(coverage.boundary_height, expected_boundary);
+        assert_eq!(coverage.complete_through_height, None);
+        assert_eq!(coverage.complete_through_time_unix_seconds, None);
+        Ok(())
+    }
+
+    fn assert_conventional_fee_tail_boundary(
+        store: &DeriveStore,
+        expected_boundary: BlockHeight,
+    ) -> Result<(), IngestError> {
+        let coverage =
+            ConventionalFeeDistributionConsumer::tail_coverage(store)?.ok_or_else(|| {
+                IngestError::DeriveDispatch(
+                    "conventional-fee distribution tail coverage missing".to_owned(),
+                )
+            })?;
+        assert_eq!(coverage.boundary_height, expected_boundary);
+        assert_eq!(coverage.complete_through_height, None);
+        assert_eq!(coverage.complete_through_time_unix_seconds, None);
+        Ok(())
+    }
+
+    #[test]
+    fn three_fresh_backfill_consumers_join_unanimous_existing_boundary() -> Result<(), IngestError>
+    {
+        let (_tempdir, store) = derive_store()?;
+        let cursor = [0xA5; 64];
+        seed_existing_block_consumer_cursors(&store, &cursor)?;
+        seed_authoritative_projection_height(&store, BlockHeight::new(100))?;
+
+        seed_backfill_owned_consumer_cursors(&store)?;
+
+        for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS {
+            assert_eq!(
+                store.get_chain_event_cursor(consumer_name)?,
+                Some(cursor.to_vec())
+            );
+        }
+        assert_conventional_fee_tail_boundary(&store, BlockHeight::new(101))?;
+        assert_tail_boundary(&store, BlockHeight::new(101))?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_tail_begins_after_the_shared_settled_and_authoritative_prefix()
+    -> Result<(), IngestError> {
+        assert_eq!(
+            backfill_consumer_tail_boundary(BlockHeight::new(90), BlockHeight::new(100), "test",)?,
+            BlockHeight::new(91)
+        );
+        assert_eq!(
+            backfill_consumer_tail_boundary(BlockHeight::new(110), BlockHeight::new(100), "test",)?,
+            BlockHeight::new(101)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn already_seeded_component_repairs_tail_while_fresh_peer_joins() -> Result<(), IngestError> {
+        let (_tempdir, store) = derive_store()?;
+        let cursor = [0xA5; 64];
+        seed_existing_block_consumer_cursors(&store, &cursor)?;
+        seed_authoritative_projection_height(&store, BlockHeight::new(100))?;
+        store.put_chain_event_cursor(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, &cursor)?;
+
+        seed_backfill_owned_consumer_cursors(&store)?;
+
+        assert_eq!(
+            store.get_chain_event_cursor(COMMITMENT_ROOT_SEARCH_CONSUMER_NAME)?,
+            Some(cursor.to_vec())
+        );
+        assert_eq!(
+            store.get_chain_event_cursor(CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME)?,
+            Some(cursor.to_vec())
+        );
+        assert_eq!(
+            store.get_chain_event_cursor(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME)?,
+            Some(cursor.to_vec())
+        );
+        assert_conventional_fee_tail_boundary(&store, BlockHeight::new(101))?;
+        assert_tail_boundary(&store, BlockHeight::new(101))?;
+        seed_backfill_owned_consumer_cursors(&store)?;
+        assert_conventional_fee_tail_boundary(&store, BlockHeight::new(101))?;
+        assert_tail_boundary(&store, BlockHeight::new(101))?;
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_consumers_stay_fresh_when_any_existing_cursor_is_missing() -> Result<(), IngestError>
+    {
+        let (_tempdir, store) = derive_store()?;
+        seed_authoritative_projection_height(&store, BlockHeight::new(100))?;
+        let first_existing = DeriveStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied()
+            .find(|name| !BACKFILL_OWNED_BLOCK_CONSUMERS.contains(name))
+            .ok_or_else(|| IngestError::DeriveDispatch("test consumer missing".to_owned()))?;
+        store.put_chain_event_cursor(first_existing, &[0xA5; 64])?;
+
+        seed_backfill_owned_consumer_cursors(&store)?;
+
+        for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS {
+            assert!(store.get_chain_event_cursor(consumer_name)?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_consumers_stay_fresh_without_authoritative_projection_height()
+    -> Result<(), IngestError> {
+        let (_tempdir, store) = derive_store()?;
+        seed_existing_block_consumer_cursors(&store, &[0xA5; 64])?;
+
+        seed_backfill_owned_consumer_cursors(&store)?;
+
+        for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS {
+            assert!(store.get_chain_event_cursor(consumer_name)?.is_none());
+        }
+        assert!(TransactionComponentSummaryConsumer::tail_coverage(&store)?.is_none());
+        assert!(ConventionalFeeDistributionConsumer::tail_coverage(&store)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_consumer_seeding_rejects_authoritative_height_overflow() -> Result<(), IngestError>
+    {
+        let (_tempdir, store) = derive_store()?;
+        seed_existing_block_consumer_cursors(&store, &[0xA5; 64])?;
+        seed_authoritative_projection_height(&store, BlockHeight::new(u32::MAX))?;
+
+        let result = seed_backfill_owned_consumer_cursors(&store);
+
+        assert!(matches!(result, Err(IngestError::DeriveDispatch(_))));
+        for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS {
+            assert!(store.get_chain_event_cursor(consumer_name)?.is_none());
+        }
+        assert!(TransactionComponentSummaryConsumer::tail_coverage(&store)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_consumer_seeding_rejects_disagreeing_existing_boundaries() -> Result<(), IngestError>
+    {
+        let (_tempdir, store) = derive_store()?;
+        seed_authoritative_projection_height(&store, BlockHeight::new(100))?;
+        seed_existing_block_consumer_cursors(&store, &[0xA5; 64])?;
+        let first_existing = DeriveStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied()
+            .find(|name| !BACKFILL_OWNED_BLOCK_CONSUMERS.contains(name))
+            .ok_or_else(|| IngestError::DeriveDispatch("test consumer missing".to_owned()))?;
+        store.put_chain_event_cursor(first_existing, &[0x5A; 64])?;
+
+        let result = seed_backfill_owned_consumer_cursors(&store);
+
+        assert!(matches!(result, Err(IngestError::DeriveDispatch(_))));
+        for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS {
+            assert!(store.get_chain_event_cursor(consumer_name)?.is_none());
+        }
+        Ok(())
+    }
+
     fn replay_config() -> IngestDeriveConfig {
         IngestDeriveConfig {
             replay_batch_blocks: NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN),
@@ -2208,7 +2882,7 @@ mod tests {
     #[test]
     fn projection_row_cap_keeps_at_least_one_block_per_chunk() {
         let oversized_block_rows = DeriveReplayProjectionRows {
-            recent_transactions: DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
+            transaction_rows: DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
                 .saturating_add(1),
             transparent_address_transaction_history: 0,
         };
@@ -2222,12 +2896,12 @@ mod tests {
     #[test]
     fn projection_row_cap_closes_chunk_before_next_block_exceeds_limit() {
         let current_rows = DeriveReplayProjectionRows {
-            recent_transactions: DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
+            transaction_rows: DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
                 .saturating_sub(1),
             transparent_address_transaction_history: 0,
         };
         let next_block_rows = DeriveReplayProjectionRows {
-            recent_transactions: 2,
+            transaction_rows: 2,
             transparent_address_transaction_history: 0,
         };
 
@@ -2251,12 +2925,11 @@ mod tests {
             ..normal_limits
         };
         let small_rows = DeriveReplayProjectionRows {
-            recent_transactions: DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS,
+            transaction_rows: DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS,
             transparent_address_transaction_history: 0,
         };
         let dense_rows = DeriveReplayProjectionRows {
-            recent_transactions: DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS
-                .saturating_add(1),
+            transaction_rows: DERIVE_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS.saturating_add(1),
             transparent_address_transaction_history: 0,
         };
 

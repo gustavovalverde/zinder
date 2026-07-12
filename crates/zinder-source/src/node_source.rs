@@ -4,8 +4,8 @@ use std::num::NonZeroU32;
 
 use async_trait::async_trait;
 use zinder_core::{
-    BlockHeight, BlockId, ChainValuePools, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    TransactionBroadcastResult,
+    BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, RawTransactionBytes,
+    ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastResult,
 };
 
 use crate::{
@@ -130,6 +130,20 @@ pub trait NodeSource: Send + Sync + 'static {
     async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
         Err(SourceError::NodeCapabilityMissing {
             capability: crate::NodeCapability::ChainValuePools,
+        })
+    }
+
+    /// Fetches authoritative cumulative value-pool balances for an exact block.
+    ///
+    /// Returns [`SourceError::NodeCapabilityMissing`] when this source does not
+    /// expose block-bound cumulative value-pool balances.
+    async fn fetch_block_value_pool_balances(
+        &self,
+        block_id: BlockId,
+    ) -> Result<BlockValuePoolBalances, SourceError> {
+        let _ = block_id;
+        Err(SourceError::NodeCapabilityMissing {
+            capability: crate::NodeCapability::BlockValuePoolBalances,
         })
     }
 

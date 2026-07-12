@@ -49,6 +49,47 @@ memory_pause_ratio = 0.99
 memory_resume_ratio = 0.80
 min_replay_batch_blocks = 50
 
+[ingest.commitment_root_backfill]
+# Historical root enrichment is resumable and does not gate wallet readiness.
+enabled = true
+batch_blocks = 256
+fetch_concurrency = 8
+
+[ingest.conventional_fee_distribution_backfill]
+# Historical ZIP-317 conventional-fee distribution is resumable and does not gate readiness.
+enabled = true
+batch_blocks = 256
+
+[ingest.paid_fee_distribution_backfill]
+# Seed exact paid fees at the live boundary, then prepend settled history.
+enabled = true
+batch_blocks = 256
+fetch_concurrency = 8
+history_days = 365
+timestamp_safety_seconds = 7200
+
+[ingest.transaction_component_backfill]
+# Historical transaction-component projection is resumable and does not gate readiness.
+enabled = true
+batch_blocks = 256
+
+[ingest.transaction_history_verifier]
+# Canonical transaction-history verification is resumable and does not gate readiness.
+enabled = true
+batch_blocks = 256
+
+[ingest.value_pool_flow_backfill]
+# Seed the live flow tail and reconstruct source-backed historical events.
+enabled = true
+batch_blocks = 256
+fetch_concurrency = 8
+
+[ingest.value_pool_balance_backfill]
+# Scan canonical heights while fetching only UTC-day candidates and live-tail blocks.
+enabled = true
+batch_blocks = 10000
+fetch_concurrency = 8
+
 # Bulk-catchup runs on cold stores and after long downtime; the unified
 # loop bounces back when the gap closes through the threshold.
 [ingest.bulk_catchup]

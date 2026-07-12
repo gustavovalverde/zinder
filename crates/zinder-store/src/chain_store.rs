@@ -7,20 +7,30 @@ use std::{
     collections::{HashMap, HashSet},
     num::NonZeroU32,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
 use parking_lot::RwLock;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId,
-    CompactBlockArtifact, Network, SubtreeRootArtifact, TransactionBlobArtifact,
-    TransactionFactsArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
-    TreeStateArtifact, UnixTimestampMillis,
+    ArtifactSchemaVersion, BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash,
+    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockTransactionIndexArtifact,
+    BlockValuePoolBalances, ChainEpoch, ChainEpochId, CompactBlockArtifact, DisplacedBlock,
+    DisplacedBlockArchiveCoverage, Network, SubtreeRootArtifact, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact,
+    UnixTimestampMillis,
 };
 
+use crate::displaced_block::{
+    build_displaced_block_archive_puts_for_change, read_displaced_block_archive_coverage,
+    read_displaced_block_by_hash, read_displaced_block_count, read_displaced_block_page,
+    read_displaced_blocks_for_event, read_newest_displaced_blocks,
+};
 use crate::{
     ArtifactFamily, ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEpochCommitted,
     ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainEventStreamResume, ChainRangeReverted,
@@ -29,24 +39,33 @@ use crate::{
     ReorgWindowChange, RocksDbResourceBudget, StoreError, StreamCursorTokenV1,
     block_artifact::read_block_header_artifact,
     block_hash_index::block_hash_index_put,
+    block_value_pool_balances::read_block_value_pool_balances,
     format::{
         CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
         MempoolEventKind, MempoolEventStreamFamily, SnapshotPageCursorAnchor,
-        SnapshotPageCursorPayload, SnapshotPageStreamFamily, StoreKey, decode_chain_epoch,
-        decode_chain_event_envelope, decode_mempool_event_envelope, decode_mempool_event_kind,
-        decode_mempool_event_observed_at, decode_mempool_event_position,
-        decode_transparent_output_block_index, encode_address_output_index_artifact,
-        encode_block_blob_artifact, encode_block_header_artifact,
-        encode_block_transaction_index_artifact, encode_chain_epoch, encode_chain_event_envelope,
-        encode_compact_block_artifact, encode_mempool_event_envelope, encode_subtree_root_artifact,
+        SnapshotPageCursorPayload, SnapshotPageStreamFamily, StoreKey,
+        decode_block_value_pool_balances, decode_chain_epoch, decode_chain_event_envelope,
+        decode_final_note_commitment_roots, decode_mempool_event_envelope,
+        decode_mempool_event_kind, decode_mempool_event_observed_at, decode_mempool_event_position,
+        decode_transaction_intrinsic_value_balances, decode_transparent_output_block_index,
+        encode_address_output_index_artifact, encode_block_blob_artifact,
+        encode_block_header_artifact, encode_block_transaction_index_artifact,
+        encode_block_value_pool_balances, encode_chain_epoch, encode_chain_event_envelope,
+        encode_compact_block_artifact, encode_final_note_commitment_roots,
+        encode_mempool_event_envelope, encode_subtree_root_artifact,
         encode_transaction_blob_artifact, encode_transaction_facts_artifact,
-        encode_transaction_location_artifact, encode_transparent_output_artifact,
-        encode_transparent_output_block_index, encode_transparent_spend_fact,
-        encode_transparent_spend_fact_block_index, encode_tree_state_artifact,
+        encode_transaction_intrinsic_value_balances, encode_transaction_location_artifact,
+        encode_transparent_output_artifact, encode_transparent_output_block_index,
+        encode_transparent_spend_fact, encode_transparent_spend_fact_block_index,
+        encode_tree_state_artifact,
     },
     kv::{
         PrefixScanControl, RocksChainStore, RocksChainStoreRead, StorageDelete, StoragePut,
         StorageTable, StoreReadCaller,
+    },
+    transaction_artifact::{
+        read_transaction_intrinsic_value_balances, read_transaction_location,
+        visible_transaction_source_epoch,
     },
     transparent_output::read_current_transparent_outputs_by_outpoints,
     transparent_spend_fact::{
@@ -59,7 +78,7 @@ use crate::{
 use schema_migration::migrate_primary_store_schema;
 use validation::{
     committed_block_range, validate_chain_epoch_artifacts, validate_chain_store_options,
-    validate_reorg_window_change, validate_visible_chain_commit,
+    validate_reorg_window_change, validate_value_pool_entries, validate_visible_chain_commit,
 };
 
 /// Raw-blob retention persisted by the writer and read by advertising readers.
@@ -101,6 +120,8 @@ impl RawBlobRetention {
 /// has no `Default` so callers must pick a posture explicitly. The
 /// `rocksdb_resource_budget` carries the bounded `RocksDB` resource budget
 /// described in [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
+/// Displaced-block archive rows are retained permanently. This release has no
+/// archive-retention option; callers must capacity-plan for monotonic growth.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChainStoreOptions {
     /// Number of near-tip blocks that may be replaced by a reorg.
@@ -207,7 +228,30 @@ const TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION: u16 = 11;
 /// `transparent_address_tx_index` column family. The typed
 /// `TransparentAddressTxIndexArtifact` remains the wallet/query response row,
 /// but materialization belongs to the derive plane.
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(13);
+///
+/// Version 14 adds per-block Sapling, Orchard, and Ironwood final
+/// note-commitment roots. Version-12 stores remain readable in place because
+/// the new artifact family is optional and can be enriched without replacing
+/// old epoch or event records. The next canonical commit stamps version 14.
+///
+/// Version 15 adds optional transaction-intrinsic Sprout, Sapling, Orchard,
+/// and Ironwood value balances. Versions 12 through 14 remain readable because
+/// absence of this family is explicit and historical rows can be enriched in
+/// place. The next canonical commit stamps version 15.
+///
+/// Version 16 adds optional cumulative value-pool balances bound to an exact
+/// canonical block hash and time. Versions 12 through 15 remain readable
+/// because absence is explicit and historical blocks can be enriched in place.
+/// The next canonical commit stamps version 16.
+///
+/// Version 17 adds optional final note-commitment roots to newly captured
+/// displaced-block rows, plus a writer-owned reverse index and an independent
+/// activation-limited coverage record. Versions 12 through 16 remain readable:
+/// pre-version-17 archive rows decode with unknown roots and are excluded from
+/// displaced-root coverage counters. The next canonical commit stamps version 17.
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(17);
+/// Oldest durable artifact schema version this binary can read.
+pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 12;
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 /// Artifact schema the store-schema-10-to-11 rebuild produces.
@@ -220,6 +264,42 @@ const REBUILT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVer
 
 /// Default maximum chain events returned by one history read.
 pub const DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+
+/// Maximum final-root artifacts accepted by one historical enrichment write.
+pub const MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH: usize = 10_000;
+
+/// Maximum block value-pool balance artifacts accepted by one enrichment write.
+pub const MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH: usize = 10_000;
+
+/// Maximum transaction intrinsic-balance artifacts accepted by one enrichment write.
+pub const MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH: usize = 10_000;
+
+/// Result of enriching final-root artifacts without publishing a new chain epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalNoteCommitmentRootEnrichmentOutcome {
+    /// Canonical epoch against which every artifact was validated and written.
+    pub chain_epoch: ChainEpoch,
+    /// Number of distinct artifacts supplied by the caller.
+    pub artifact_count: usize,
+}
+
+/// Result of enriching block value-pool balances without publishing a new chain epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockValuePoolBalanceEnrichmentOutcome {
+    /// Canonical epoch against which every artifact was validated and written.
+    pub chain_epoch: ChainEpoch,
+    /// Number of distinct artifacts supplied by the caller.
+    pub artifact_count: usize,
+}
+
+/// Result of enriching transaction-intrinsic value balances without publishing an epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionIntrinsicValueBalanceEnrichmentOutcome {
+    /// Canonical epoch against which every artifact was validated and written.
+    pub chain_epoch: ChainEpoch,
+    /// Number of distinct artifacts supplied by the caller.
+    pub artifact_count: usize,
+}
 
 /// Chain-event retention state observed after a pruning or inspection pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -361,6 +441,7 @@ struct ChainStoreInner {
     options: ChainStoreOptions,
     cursor_auth_key: [u8; 32],
     read_posture: ChainStoreReadPosture,
+    secondary_visible_epoch: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -591,6 +672,42 @@ impl PrimaryChainStore {
         let outcome = self.store.commit_chain_epoch(artifacts)?;
         *self.cached_visible_chain_epoch.write() = Some(outcome.chain_epoch);
         Ok(outcome)
+    }
+
+    /// Enriches final note-commitment roots for currently canonical blocks.
+    ///
+    /// This ingest-writer operation serializes with canonical commits, writes
+    /// no chain event, and leaves the visible chain epoch unchanged.
+    pub fn enrich_final_note_commitment_roots(
+        &self,
+        roots_by_block: &[BlockFinalNoteCommitmentRoots],
+    ) -> Result<FinalNoteCommitmentRootEnrichmentOutcome, StoreError> {
+        self.store
+            .enrich_final_note_commitment_roots(roots_by_block)
+    }
+
+    /// Enriches cumulative value-pool balances for currently canonical blocks.
+    ///
+    /// This ingest-writer operation serializes with canonical commits, writes
+    /// no chain event, and leaves the visible chain epoch unchanged.
+    pub fn enrich_block_value_pool_balances(
+        &self,
+        balances_by_block: &[BlockValuePoolBalances],
+    ) -> Result<BlockValuePoolBalanceEnrichmentOutcome, StoreError> {
+        self.store
+            .enrich_block_value_pool_balances(balances_by_block)
+    }
+
+    /// Enriches intrinsic value balances for settled canonical transactions.
+    ///
+    /// This ingest-writer operation serializes with canonical commits, writes
+    /// no chain event, and leaves the visible chain epoch unchanged.
+    pub fn enrich_transaction_intrinsic_value_balances(
+        &self,
+        artifacts: &[TransactionIntrinsicValueBalancesArtifact],
+    ) -> Result<TransactionIntrinsicValueBalanceEnrichmentOutcome, StoreError> {
+        self.store
+            .enrich_transaction_intrinsic_value_balances(artifacts)
     }
 
     /// Reads a bounded page of retained chain events strictly after the request cursor.
@@ -864,6 +981,9 @@ impl SecondaryChainStore {
         let before = self.store.current_chain_epoch_id()?;
         self.store.inner.try_catch_up_with_primary()?;
         let after = self.store.current_chain_epoch_id()?;
+        if let Some(visible_epoch) = &self.store.secondary_visible_epoch {
+            visible_epoch.store(after.map_or(0, ChainEpochId::value), Ordering::Release);
+        }
 
         Ok(SecondaryCatchupOutcome::new(before, after))
     }
@@ -890,6 +1010,7 @@ impl ChainStoreInner {
             options,
             cursor_auth_key,
             read_posture,
+            secondary_visible_epoch: None,
         })
     }
 
@@ -905,12 +1026,15 @@ impl ChainStoreInner {
             ensure_supported_artifact_schema(inner.as_ref())?;
             read_cursor_auth_key(inner.as_ref())?
         };
+        let visible_epoch =
+            read_current_chain_epoch_id(inner.as_ref())?.map_or(0, ChainEpochId::value);
 
         Ok(Self {
             inner,
             options,
             cursor_auth_key,
             read_posture,
+            secondary_visible_epoch: Some(Arc::new(AtomicU64::new(visible_epoch))),
         })
     }
 
@@ -926,7 +1050,11 @@ impl ChainStoreInner {
     fn current_chain_epoch_reader(&self) -> Result<ChainEpochReader<'_>, StoreError> {
         let read_view = self.read_view();
         let chain_epoch = require_current_chain_epoch(&read_view)?;
-        Ok(ChainEpochReader::current(chain_epoch, read_view))
+        Ok(ChainEpochReader::current(
+            chain_epoch,
+            read_view,
+            self.secondary_visible_epoch.clone(),
+        ))
     }
 
     /// Opens a reader pinned to a specific chain epoch.
@@ -946,7 +1074,11 @@ impl ChainStoreInner {
     ) -> Result<ChainEpochReader<'_>, StoreError> {
         let read_view = self.read_view_for(caller);
         let chain_epoch = read_chain_epoch(&read_view, chain_epoch)?;
-        Ok(ChainEpochReader::at_epoch(chain_epoch, read_view))
+        Ok(ChainEpochReader::at_epoch(
+            chain_epoch,
+            read_view,
+            self.secondary_visible_epoch.clone(),
+        ))
     }
 
     /// Atomically commits artifacts for one chain epoch and advances the visible pointer.
@@ -974,16 +1106,8 @@ impl ChainStoreInner {
         let chain_epoch = artifacts.chain_epoch;
         let block_range = committed_block_range(&artifacts, current_chain_epoch)?;
         let reorg_window_change = artifacts.reorg_window_change.clone();
-        let current_projection_protected_outpoints = artifacts
-            .transparent_outputs_by_outpoint
-            .iter()
-            .map(|prevout| (prevout.outpoint, prevout.block_height))
-            .collect::<HashMap<_, _>>();
-        let current_spend_projection_protected_outpoints = artifacts
-            .transparent_spend_facts
-            .iter()
-            .map(|spend| spend.spent_outpoint)
-            .collect::<HashSet<_>>();
+        let (current_projection_protected_outpoints, current_spend_projection_protected_outpoints) =
+            protected_transparent_outpoints(&artifacts);
         let retention_sweep =
             if precomputed_retention_sweep.swept_marker_unchanged(&commit_read_view)? {
                 precomputed_retention_sweep
@@ -1000,6 +1124,13 @@ impl ChainStoreInner {
             cursor_auth_key: self.cursor_auth_key,
         })?;
         let mut puts = build_chain_epoch_puts(artifacts, &event_envelope)?;
+        puts.extend(build_displaced_block_archive_puts_for_change(
+            self.inner.as_ref(),
+            current_chain_epoch,
+            chain_epoch,
+            event_sequence,
+            &reorg_window_change,
+        )?);
         if let Some(store_metadata_put) = store_metadata_put {
             puts.push(store_metadata_put);
         }
@@ -1033,6 +1164,271 @@ impl ChainStoreInner {
         log_safe_tip_retention_sweep(retention_sweep_advance.as_ref());
 
         Ok(ChainEpochCommitOutcome::new(committed, event_envelope))
+    }
+
+    fn enrich_final_note_commitment_roots(
+        &self,
+        roots_by_block: &[BlockFinalNoteCommitmentRoots],
+    ) -> Result<FinalNoteCommitmentRootEnrichmentOutcome, StoreError> {
+        if roots_by_block.len() > MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "final note-commitment root enrichment batch exceeds the store limit",
+            });
+        }
+
+        let _control_guard = self.inner.lock_control();
+        let chain_epoch = require_current_chain_epoch(self.inner.as_ref())?;
+        let read_view = self
+            .inner
+            .direct_read_view_for(StoreReadCaller::CommitFallback);
+        let mut heights = HashSet::with_capacity(roots_by_block.len());
+        let mut puts = Vec::with_capacity(roots_by_block.len().saturating_mul(2));
+
+        for roots in roots_by_block {
+            if !heights.insert(roots.height) {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "final note-commitment root enrichment cannot repeat a block height",
+                });
+            }
+            let Some(block) = read_block_header_artifact(&read_view, chain_epoch, roots.height)?
+            else {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "final note-commitment root enrichment height is not canonical",
+                });
+            };
+            if block.block_hash != roots.block_hash {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "final note-commitment root enrichment block hash is stale",
+                });
+            }
+            if let Some(existing) =
+                crate::final_note_commitment_roots::read_final_note_commitment_roots(
+                    &read_view,
+                    chain_epoch,
+                    roots.height,
+                )?
+            {
+                if existing != *roots {
+                    return Err(StoreError::InvalidChainEpochArtifacts {
+                        reason: "final note-commitment root enrichment conflicts with visible roots",
+                    });
+                }
+                continue;
+            }
+
+            let artifact_key = StoreKey::final_note_commitment_roots(
+                chain_epoch.network,
+                chain_epoch.id,
+                roots.height,
+            );
+            if let Some(existing_bytes) = self.inner.get(
+                StoreReadCaller::CommitFallback,
+                StorageTable::FinalNoteCommitmentRoots,
+                &artifact_key,
+            )? {
+                let existing = decode_final_note_commitment_roots(&artifact_key, &existing_bytes)?;
+                if existing != *roots {
+                    return Err(StoreError::InvalidChainEpochArtifacts {
+                        reason: "final note-commitment root enrichment conflicts with stored roots",
+                    });
+                }
+            }
+
+            puts.push(StoragePut {
+                table: StorageTable::FinalNoteCommitmentRoots,
+                key: artifact_key,
+                value: encode_final_note_commitment_roots(*roots)?,
+            });
+            puts.push(StoragePut {
+                table: StorageTable::ReorgWindow,
+                key: StoreKey::visible_final_note_commitment_roots_epoch(
+                    chain_epoch.network,
+                    roots.height,
+                    chain_epoch.id,
+                ),
+                value: visibility_value(chain_epoch),
+            });
+        }
+
+        self.inner.write_batch(puts, Vec::new())?;
+        Ok(FinalNoteCommitmentRootEnrichmentOutcome {
+            chain_epoch,
+            artifact_count: roots_by_block.len(),
+        })
+    }
+
+    fn enrich_block_value_pool_balances(
+        &self,
+        balances_by_block: &[BlockValuePoolBalances],
+    ) -> Result<BlockValuePoolBalanceEnrichmentOutcome, StoreError> {
+        if balances_by_block.len() > MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block value-pool balance enrichment batch exceeds the store limit",
+            });
+        }
+
+        let _control_guard = self.inner.lock_control();
+        let chain_epoch = require_current_chain_epoch(self.inner.as_ref())?;
+        let read_view = self
+            .inner
+            .direct_read_view_for(StoreReadCaller::CommitFallback);
+        let mut heights = HashSet::with_capacity(balances_by_block.len());
+        let mut puts = Vec::with_capacity(balances_by_block.len().saturating_mul(2));
+
+        for balances in balances_by_block {
+            validate_value_pool_entries(balances)?;
+            if !heights.insert(balances.block_id.height) {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "block value-pool balance enrichment cannot repeat a block height",
+                });
+            }
+            let Some(block) =
+                read_block_header_artifact(&read_view, chain_epoch, balances.block_id.height)?
+            else {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "block value-pool balance enrichment height is not canonical",
+                });
+            };
+            if block.block_hash != balances.block_id.hash {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "block value-pool balance enrichment block hash is stale",
+                });
+            }
+            if block.block_time != balances.block_time_seconds {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "block value-pool balance enrichment block time is stale",
+                });
+            }
+            if let Some(existing) =
+                read_block_value_pool_balances(&read_view, chain_epoch, balances.block_id.height)?
+            {
+                if existing != *balances {
+                    return Err(StoreError::InvalidChainEpochArtifacts {
+                        reason: "block value-pool balance enrichment conflicts with visible balances",
+                    });
+                }
+                continue;
+            }
+
+            let artifact_key = StoreKey::block_value_pool_balances(
+                chain_epoch.network,
+                chain_epoch.id,
+                balances.block_id.height,
+            );
+            validate_stored_block_value_pool_balances(
+                self.inner.as_ref(),
+                &artifact_key,
+                balances,
+            )?;
+
+            puts.push(StoragePut {
+                table: StorageTable::BlockValuePoolBalances,
+                key: artifact_key,
+                value: encode_block_value_pool_balances(balances)?,
+            });
+            puts.push(StoragePut {
+                table: StorageTable::ReorgWindow,
+                key: StoreKey::visible_block_value_pool_balances_epoch(
+                    chain_epoch.network,
+                    balances.block_id.height,
+                    chain_epoch.id,
+                ),
+                value: visibility_value(chain_epoch),
+            });
+        }
+
+        self.inner.write_batch(puts, Vec::new())?;
+        Ok(BlockValuePoolBalanceEnrichmentOutcome {
+            chain_epoch,
+            artifact_count: balances_by_block.len(),
+        })
+    }
+
+    fn enrich_transaction_intrinsic_value_balances(
+        &self,
+        artifacts: &[TransactionIntrinsicValueBalancesArtifact],
+    ) -> Result<TransactionIntrinsicValueBalanceEnrichmentOutcome, StoreError> {
+        if artifacts.len() > MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transaction intrinsic value-balance enrichment batch exceeds the store limit",
+            });
+        }
+
+        let _control_guard = self.inner.lock_control();
+        let chain_epoch = require_current_chain_epoch(self.inner.as_ref())?;
+        let read_view = self
+            .inner
+            .direct_read_view_for(StoreReadCaller::CommitFallback);
+        let mut transaction_ids = HashSet::with_capacity(artifacts.len());
+        let mut puts = Vec::with_capacity(artifacts.len());
+
+        for artifact in artifacts {
+            let transaction_id = artifact.location.transaction_id;
+            if !transaction_ids.insert(transaction_id) {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "transaction intrinsic value-balance enrichment cannot repeat a transaction id",
+                });
+            }
+            if artifact.location.block_height > chain_epoch.settled_tip_height {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "transaction intrinsic value-balance enrichment requires a settled transaction",
+                });
+            }
+            let canonical_location =
+                read_transaction_location(&read_view, chain_epoch, transaction_id)?;
+            if canonical_location != Some(artifact.location) {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "transaction intrinsic value-balance enrichment location is stale or not canonical",
+                });
+            }
+            if let Some(existing) =
+                read_transaction_intrinsic_value_balances(&read_view, chain_epoch, transaction_id)?
+            {
+                if existing != *artifact {
+                    return Err(StoreError::InvalidChainEpochArtifacts {
+                        reason: "transaction intrinsic value-balance enrichment conflicts with visible balances",
+                    });
+                }
+                continue;
+            }
+
+            let Some((source_epoch, _seek_key)) =
+                visible_transaction_source_epoch(&read_view, chain_epoch, transaction_id)?
+            else {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "transaction intrinsic value-balance enrichment transaction is not visible",
+                });
+            };
+            let artifact_key = StoreKey::transaction_intrinsic_value_balances(
+                chain_epoch.network,
+                source_epoch,
+                transaction_id,
+            );
+            if let Some(existing_bytes) = self.inner.get(
+                StoreReadCaller::CommitFallback,
+                StorageTable::TransactionIntrinsicValueBalances,
+                &artifact_key,
+            )? {
+                let existing =
+                    decode_transaction_intrinsic_value_balances(&artifact_key, &existing_bytes)?;
+                if existing != *artifact {
+                    return Err(StoreError::InvalidChainEpochArtifacts {
+                        reason: "transaction intrinsic value-balance enrichment conflicts with stored balances",
+                    });
+                }
+            }
+            puts.push(StoragePut {
+                table: StorageTable::TransactionIntrinsicValueBalances,
+                key: artifact_key,
+                value: encode_transaction_intrinsic_value_balances(*artifact)?,
+            });
+        }
+
+        self.inner.write_batch(puts, Vec::new())?;
+        Ok(TransactionIntrinsicValueBalanceEnrichmentOutcome {
+            chain_epoch,
+            artifact_count: artifacts.len(),
+        })
     }
 
     /// Reads a bounded page of retained chain events strictly after the request cursor.
@@ -1922,6 +2318,47 @@ const fn u32_to_usize(count: u32) -> usize {
     count as usize
 }
 
+fn protected_transparent_outpoints(
+    artifacts: &ChainEpochArtifacts,
+) -> (
+    HashMap<TransparentOutPoint, BlockHeight>,
+    HashSet<TransparentOutPoint>,
+) {
+    let outputs = artifacts
+        .transparent_outputs_by_outpoint
+        .iter()
+        .map(|output| (output.outpoint, output.block_height))
+        .collect();
+    let spends = artifacts
+        .transparent_spend_facts
+        .iter()
+        .map(|spend| spend.spent_outpoint)
+        .collect();
+    (outputs, spends)
+}
+
+fn validate_stored_block_value_pool_balances(
+    store: &RocksChainStore,
+    artifact_key: &StoreKey,
+    balances: &BlockValuePoolBalances,
+) -> Result<(), StoreError> {
+    let Some(existing_bytes) = store.get(
+        StoreReadCaller::CommitFallback,
+        StorageTable::BlockValuePoolBalances,
+        artifact_key,
+    )?
+    else {
+        return Ok(());
+    };
+    let existing = decode_block_value_pool_balances(artifact_key, &existing_bytes)?;
+    if existing != *balances {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "block value-pool balance enrichment conflicts with stored balances",
+        });
+    }
+    Ok(())
+}
+
 impl ChainEpochReadApi for PrimaryChainStore {
     fn current_chain_epoch_reader(&self) -> Result<ChainEpochReader<'_>, StoreError> {
         self.current_chain_epoch_reader()
@@ -1992,6 +2429,146 @@ impl ChainEpochReadApi for SecondaryChainStore {
     }
 }
 
+impl crate::DisplacedBlockStore for PrimaryChainStore {
+    fn displaced_block_page(
+        &self,
+        after: Option<&crate::DisplacedBlockCursor>,
+        limit: NonZeroU32,
+    ) -> Result<crate::DisplacedBlockPage, StoreError> {
+        let network = self
+            .store
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "displaced block archive reads require an explicit network",
+            })?;
+        read_displaced_block_page(&self.store.read_view(), network, after, limit)
+    }
+
+    fn newest_displaced_blocks(
+        &self,
+        limit: NonZeroU32,
+    ) -> Result<Vec<DisplacedBlock>, StoreError> {
+        let network = self
+            .store
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "displaced block archive reads require an explicit network",
+            })?;
+        read_newest_displaced_blocks(&self.store.read_view(), network, limit)
+    }
+
+    fn displaced_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<DisplacedBlock>, StoreError> {
+        let network = self
+            .store
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "displaced block archive reads require an explicit network",
+            })?;
+        read_displaced_block_by_hash(&self.store.read_view(), network, block_hash)
+    }
+
+    fn displaced_blocks_for_event(
+        &self,
+        event_sequence: u64,
+        limit: NonZeroU32,
+    ) -> Result<Vec<DisplacedBlock>, StoreError> {
+        let network = self
+            .store
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "displaced block archive reads require an explicit network",
+            })?;
+        read_displaced_blocks_for_event(&self.store.read_view(), network, event_sequence, limit)
+    }
+
+    fn displaced_block_count(&self) -> Result<u64, StoreError> {
+        read_displaced_block_count(&self.store.read_view())
+    }
+
+    fn displaced_block_archive_coverage(
+        &self,
+    ) -> Result<Option<DisplacedBlockArchiveCoverage>, StoreError> {
+        read_displaced_block_archive_coverage(&self.store.read_view())
+    }
+}
+
+impl crate::DisplacedBlockStore for SecondaryChainStore {
+    fn displaced_block_page(
+        &self,
+        after: Option<&crate::DisplacedBlockCursor>,
+        limit: NonZeroU32,
+    ) -> Result<crate::DisplacedBlockPage, StoreError> {
+        let network = self
+            .store
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "displaced block archive reads require an explicit network",
+            })?;
+        read_displaced_block_page(&self.store.read_view(), network, after, limit)
+    }
+
+    fn newest_displaced_blocks(
+        &self,
+        limit: NonZeroU32,
+    ) -> Result<Vec<DisplacedBlock>, StoreError> {
+        let network = self
+            .store
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "displaced block archive reads require an explicit network",
+            })?;
+        read_newest_displaced_blocks(&self.store.read_view(), network, limit)
+    }
+
+    fn displaced_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<DisplacedBlock>, StoreError> {
+        let network = self
+            .store
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "displaced block archive reads require an explicit network",
+            })?;
+        read_displaced_block_by_hash(&self.store.read_view(), network, block_hash)
+    }
+
+    fn displaced_blocks_for_event(
+        &self,
+        event_sequence: u64,
+        limit: NonZeroU32,
+    ) -> Result<Vec<DisplacedBlock>, StoreError> {
+        let network = self
+            .store
+            .options
+            .network
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "displaced block archive reads require an explicit network",
+            })?;
+        read_displaced_blocks_for_event(&self.store.read_view(), network, event_sequence, limit)
+    }
+
+    fn displaced_block_count(&self) -> Result<u64, StoreError> {
+        read_displaced_block_count(&self.store.read_view())
+    }
+
+    fn displaced_block_archive_coverage(
+        &self,
+    ) -> Result<Option<DisplacedBlockArchiveCoverage>, StoreError> {
+        read_displaced_block_archive_coverage(&self.store.read_view())
+    }
+}
+
 fn ensure_store_metadata(
     inner: &RocksChainStore,
     expected_network: Network,
@@ -2037,10 +2614,10 @@ fn ensure_supported_artifact_schema(inner: &impl RocksChainStoreRead) -> Result<
             supported_version: MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
         });
     }
-    if persisted_version < CURRENT_ARTIFACT_SCHEMA_VERSION.value() {
+    if persisted_version < MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION {
         return Err(StoreError::SchemaTooOld {
             persisted_version,
-            required_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+            required_version: MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
         });
     }
 
@@ -2554,8 +3131,11 @@ fn build_chain_epoch_puts(
         block_transaction_index,
         transaction_locations,
         transaction_facts,
+        transaction_intrinsic_value_balances,
         transaction_blobs,
         tree_states,
+        final_note_commitment_roots,
+        block_value_pool_balances,
         subtree_roots,
         transparent_outputs_by_outpoint,
         transparent_spend_facts,
@@ -2574,8 +3154,15 @@ fn build_chain_epoch_puts(
     push_block_transaction_index_artifact_puts(&mut puts, chain_epoch, block_transaction_index)?;
     push_transaction_location_puts(&mut puts, chain_epoch, transaction_locations)?;
     push_transaction_facts_artifact_puts(&mut puts, chain_epoch, transaction_facts)?;
+    push_transaction_intrinsic_value_balance_puts(
+        &mut puts,
+        chain_epoch,
+        transaction_intrinsic_value_balances,
+    )?;
     push_transaction_blob_artifact_puts(&mut puts, chain_epoch, transaction_blobs)?;
     push_tree_state_artifact_puts(&mut puts, chain_epoch, tree_states)?;
+    push_final_note_commitment_roots_puts(&mut puts, chain_epoch, final_note_commitment_roots)?;
+    push_block_value_pool_balance_puts(&mut puts, chain_epoch, block_value_pool_balances)?;
     push_subtree_root_artifact_puts(&mut puts, chain_epoch, subtree_roots)?;
     push_transparent_output_artifact_puts(&mut puts, chain_epoch, transparent_outputs_by_outpoint)?;
     push_transparent_spend_fact_puts(&mut puts, chain_epoch, transparent_spend_facts)?;
@@ -3147,7 +3734,7 @@ fn read_reverted_transparent_output_outpoints(
     Ok(outpoints)
 }
 
-fn read_visible_transparent_output_block_outpoints(
+pub(crate) fn read_visible_transparent_output_block_outpoints(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     height: BlockHeight,
@@ -3351,6 +3938,27 @@ fn push_transaction_facts_artifact_puts(
     Ok(())
 }
 
+fn push_transaction_intrinsic_value_balance_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    artifacts: Vec<TransactionIntrinsicValueBalancesArtifact>,
+) -> Result<(), StoreError> {
+    for artifact in artifacts {
+        let transaction_id = artifact.location.transaction_id;
+        puts.push(StoragePut {
+            table: StorageTable::TransactionIntrinsicValueBalances,
+            key: StoreKey::transaction_intrinsic_value_balances(
+                chain_epoch.network,
+                chain_epoch.id,
+                transaction_id,
+            ),
+            value: encode_transaction_intrinsic_value_balances(artifact)?,
+        });
+    }
+
+    Ok(())
+}
+
 fn push_transaction_blob_artifact_puts(
     puts: &mut Vec<StoragePut>,
     chain_epoch: ChainEpoch,
@@ -3385,6 +3993,58 @@ fn push_tree_state_artifact_puts(
         puts.push(StoragePut {
             table: StorageTable::ReorgWindow,
             key: StoreKey::visible_tree_state_epoch(chain_epoch.network, height, chain_epoch.id),
+            value: visibility_value(chain_epoch),
+        });
+    }
+
+    Ok(())
+}
+
+fn push_final_note_commitment_roots_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    roots_by_block: Vec<BlockFinalNoteCommitmentRoots>,
+) -> Result<(), StoreError> {
+    for roots in roots_by_block {
+        let height = roots.height;
+        puts.push(StoragePut {
+            table: StorageTable::FinalNoteCommitmentRoots,
+            key: StoreKey::final_note_commitment_roots(chain_epoch.network, chain_epoch.id, height),
+            value: encode_final_note_commitment_roots(roots)?,
+        });
+        puts.push(StoragePut {
+            table: StorageTable::ReorgWindow,
+            key: StoreKey::visible_final_note_commitment_roots_epoch(
+                chain_epoch.network,
+                height,
+                chain_epoch.id,
+            ),
+            value: visibility_value(chain_epoch),
+        });
+    }
+
+    Ok(())
+}
+
+fn push_block_value_pool_balance_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    balances_by_block: Vec<BlockValuePoolBalances>,
+) -> Result<(), StoreError> {
+    for balances in balances_by_block {
+        let height = balances.block_id.height;
+        puts.push(StoragePut {
+            table: StorageTable::BlockValuePoolBalances,
+            key: StoreKey::block_value_pool_balances(chain_epoch.network, chain_epoch.id, height),
+            value: encode_block_value_pool_balances(&balances)?,
+        });
+        puts.push(StoragePut {
+            table: StorageTable::ReorgWindow,
+            key: StoreKey::visible_block_value_pool_balances_epoch(
+                chain_epoch.network,
+                height,
+                chain_epoch.id,
+            ),
             value: visibility_value(chain_epoch),
         });
     }
@@ -4033,7 +4693,8 @@ mod tests {
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 13);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 17);
+        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 12);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()

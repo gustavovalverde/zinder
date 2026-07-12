@@ -281,6 +281,15 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
 
 fn assert_chain_event_cursors_advanced(derive_store: &zinder_derive::DeriveStore) -> Result<()> {
     for consumer_name in zinder_derive::DeriveStore::bundled_chain_event_consumer_names() {
+        if *consumer_name == zinder_derive::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME {
+            assert!(
+                derive_store
+                    .get_chain_event_cursor(*consumer_name)?
+                    .is_none(),
+                "snapshot-owned ranking must not adopt a cursor before bootstrap activation"
+            );
+            continue;
+        }
         assert!(
             derive_store
                 .get_chain_event_cursor(*consumer_name)?

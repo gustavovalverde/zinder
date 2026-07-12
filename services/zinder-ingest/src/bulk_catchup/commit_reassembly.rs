@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use futures_util::{Stream, StreamExt};
 use zinder_core::{BlockId, ChainEpoch, ChainEpochId, Network, TreeStateArtifact};
-use zinder_source::{NodeSource, SourceError};
+use zinder_source::NodeSource;
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, PrimaryChainStore, ReorgWindowChange,
 };
@@ -22,9 +22,9 @@ use crate::artifact_builder::{CommitmentTreeSizes, finalize_derived_block};
 use crate::chain_ingest::{
     CanonicalBatch, CanonicalBatchBudget, CanonicalBatchCloseTrigger, CanonicalBatchCost,
     IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
-    current_unix_millis, fetch_tree_state_for_block_with_retry, next_chain_epoch_id,
-    next_chain_epoch_id_after, populate_subtree_root_artifacts, record_ingest_batch_commit_trigger,
-    record_ingest_batch_work_cost,
+    current_unix_millis, next_chain_epoch_id, next_chain_epoch_id_after,
+    observe_final_note_commitment_roots, populate_subtree_root_artifacts,
+    record_ingest_batch_commit_trigger, record_ingest_batch_work_cost,
 };
 
 #[allow(
@@ -326,15 +326,7 @@ where
         }
     };
 
-    if let Err(error) =
-        populate_bulk_catchup_tree_state_checkpoint(&run, &mut batch, &mut retry_state).await
-    {
-        return Err(CanonicalCommitFailure {
-            error,
-            retry_state,
-            flush_state,
-        });
-    }
+    populate_bulk_catchup_tree_state_checkpoint(&run, &mut batch).await;
 
     let commit_outcome = match commit_built_bulk_catchup_batch(
         run.store,
@@ -369,6 +361,66 @@ where
         retry_state,
         flush_state,
     })
+}
+
+async fn populate_bulk_catchup_tree_state_checkpoint<Source>(
+    run: &BulkCatchupRunContext<'_, Source>,
+    batch: &mut CanonicalBatch,
+) where
+    Source: NodeSource,
+{
+    let started_at = Instant::now();
+    if !run
+        .source
+        .capabilities()
+        .supports(zinder_source::NodeCapability::TreeState)
+    {
+        return;
+    }
+    let existing_heights = batch
+        .tree_states
+        .iter()
+        .map(|tree_state| tree_state.height)
+        .collect::<std::collections::HashSet<_>>();
+    let mut checkpoint_targets = batch
+        .block_headers
+        .iter()
+        .filter(|header| {
+            header.height.value() % crate::chain_ingest::TREE_STATE_CHECKPOINT_STRIDE == 0
+                && !existing_heights.contains(&header.height)
+        })
+        .map(|header| header.height)
+        .collect::<std::collections::HashSet<_>>();
+    if let Some(tip) = batch.block_headers.last()
+        && !existing_heights.contains(&tip.height)
+    {
+        checkpoint_targets.insert(tip.height);
+    }
+    let mut targets = batch
+        .block_headers
+        .iter()
+        .filter(|header| checkpoint_targets.contains(&header.height))
+        .map(|header| BlockId::new(header.height, header.block_hash))
+        .collect::<Vec<_>>();
+    targets.sort_unstable_by_key(|block_id| block_id.height);
+    for block_id in targets {
+        let Some(tree_state) = observe_final_note_commitment_roots(
+            run.config.node.request_timeout,
+            run.source,
+            block_id,
+        )
+        .await
+        else {
+            continue;
+        };
+        batch.push_final_note_commitment_roots(tree_state.final_note_commitment_roots);
+        batch.push_tree_state_checkpoint(TreeStateArtifact::new(
+            tree_state.block_id.height,
+            tree_state.block_id.hash,
+            tree_state.payload_bytes,
+        ));
+    }
+    record_bulk_pipeline_stage_duration(BULK_STAGE_CHECKPOINT_TREE_STATE, started_at, None);
 }
 
 async fn wait_for_in_flight_canonical_commit(
@@ -503,70 +555,6 @@ where
         outcome.as_ref().err(),
     );
     outcome
-}
-
-async fn populate_bulk_catchup_tree_state_checkpoint<Source>(
-    run: &BulkCatchupRunContext<'_, Source>,
-    batch: &mut CanonicalBatch,
-    retry_state: &mut IngestRetryState,
-) -> Result<(), IngestError>
-where
-    Source: NodeSource,
-{
-    if !run
-        .source
-        .capabilities()
-        .supports(zinder_source::NodeCapability::TreeState)
-    {
-        return Ok(());
-    }
-
-    let existing_heights: std::collections::HashSet<_> =
-        batch.tree_states.iter().map(|ts| ts.height).collect();
-    let mut targets: Vec<(zinder_core::BlockHeight, zinder_core::BlockHash)> = batch
-        .block_headers
-        .iter()
-        .filter(|header| {
-            header.height.value() % crate::chain_ingest::TREE_STATE_CHECKPOINT_STRIDE == 0
-                && !existing_heights.contains(&header.height)
-        })
-        .map(|header| (header.height, header.block_hash))
-        .collect();
-    if let Some(tip) = batch.block_headers.last() {
-        let already_at_tip = targets.last().map(|(height, _)| *height) == Some(tip.height)
-            || existing_heights.contains(&tip.height);
-        if !already_at_tip {
-            targets.push((tip.height, tip.block_hash));
-        }
-    }
-
-    for (height, block_hash) in targets {
-        let block_id = BlockId::new(height, block_hash);
-        let started_at = Instant::now();
-        let outcome = fetch_tree_state_for_block_with_retry(
-            run.config.node.request_timeout,
-            run.source,
-            block_id,
-            retry_state,
-        )
-        .await;
-        record_bulk_pipeline_stage_duration(
-            BULK_STAGE_CHECKPOINT_TREE_STATE,
-            started_at,
-            outcome.as_ref().err(),
-        );
-        let source_tree_state = match outcome {
-            Ok(source_tree_state) => source_tree_state,
-            Err(IngestError::Source(SourceError::NodeCapabilityMissing { .. })) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        batch.push_tree_state_checkpoint(TreeStateArtifact::new(
-            source_tree_state.block_id.height,
-            source_tree_state.block_id.hash,
-            source_tree_state.payload_bytes,
-        ));
-    }
-    Ok(())
 }
 
 fn record_canonical_batch_commit_trigger(

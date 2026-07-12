@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use zinder_core::{
     BlockHeaderArtifact, BlockHeight, ChainEpoch, TransactionBlobArtifact,
-    TransactionFactsArtifact, TransactionId, TransactionLocation,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation,
 };
 
 use crate::{
@@ -13,7 +14,7 @@ use crate::{
     block_artifact::read_block_header_artifact,
     format::{
         StoreKey, decode_transaction_blob_artifact, decode_transaction_facts_artifact,
-        decode_transaction_location_artifact,
+        decode_transaction_intrinsic_value_balances, decode_transaction_location_artifact,
     },
     kv::{RocksChainStoreRead, StorageTable},
 };
@@ -54,6 +55,21 @@ pub trait TransactionBlobStore {
         &self,
         transaction_id: TransactionId,
     ) -> Result<Option<TransactionBlobArtifact>, StoreError>;
+}
+
+/// Read boundary for optional transaction-intrinsic shielded value balances.
+pub trait TransactionIntrinsicValueBalancesStore {
+    /// Reads intrinsic value balances for `transaction_id` in the reader's chain epoch.
+    fn transaction_intrinsic_value_balances_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionIntrinsicValueBalancesArtifact>, StoreError>;
+
+    /// Reads intrinsic value balances for many transaction ids in one batched store read.
+    fn transaction_intrinsic_value_balances_by_ids(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<HashMap<TransactionId, Option<TransactionIntrinsicValueBalancesArtifact>>, StoreError>;
 }
 
 pub(crate) fn read_transaction_facts_artifact(
@@ -105,13 +121,10 @@ fn seek_transaction_facts_keys(
     chain_epoch: ChainEpoch,
     transaction_ids: &[TransactionId],
 ) -> Result<TransactionFactsSeekResult, StoreError> {
-    let mut unique_ids: Vec<TransactionId> = Vec::with_capacity(transaction_ids.len());
-    let mut seen: HashSet<TransactionId> = HashSet::with_capacity(transaction_ids.len());
-    for &transaction_id in transaction_ids {
-        if seen.insert(transaction_id) {
-            unique_ids.push(transaction_id);
-        }
-    }
+    // Seek phase: per unique id, locate the visibility row and derive the
+    // Transaction-CF key. The visibility lookup is per-id because the seek
+    // prefix differs; RocksDB has no batched `seek_for_prev`.
+    let unique_ids = unique_transaction_ids(transaction_ids);
 
     let mut transaction_keys: Vec<StoreKey> = Vec::with_capacity(unique_ids.len());
     let mut seek_outcomes: Vec<(TransactionId, Option<StoreKey>)> =
@@ -277,7 +290,123 @@ pub(crate) fn read_transaction_blob_artifact(
     Ok(None)
 }
 
-fn visible_transaction_source_epoch(
+pub(crate) fn read_transaction_intrinsic_value_balances(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    transaction_id: TransactionId,
+) -> Result<Option<TransactionIntrinsicValueBalancesArtifact>, StoreError> {
+    let mut batch =
+        read_transaction_intrinsic_value_balances_batch(inner, chain_epoch, &[transaction_id])?;
+    Ok(batch.remove(&transaction_id).flatten())
+}
+
+/// Reads optional intrinsic value balances for many ids in one batched store read.
+///
+/// The returned map contains every unique input id. Unknown ids, ids without an
+/// additive intrinsic-balance artifact, and artifacts on reverted branches map
+/// to `None`.
+pub(crate) fn read_transaction_intrinsic_value_balances_batch(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    transaction_ids: &[TransactionId],
+) -> Result<HashMap<TransactionId, Option<TransactionIntrinsicValueBalancesArtifact>>, StoreError> {
+    let unique_ids = unique_transaction_ids(transaction_ids);
+
+    let mut artifact_keys = Vec::with_capacity(unique_ids.len());
+    let mut seek_outcomes = Vec::with_capacity(unique_ids.len());
+    for transaction_id in unique_ids {
+        let prefix =
+            StoreKey::visible_transaction_epoch_prefix(chain_epoch.network, transaction_id);
+        let seek_key = StoreKey::visible_transaction_epoch(
+            chain_epoch.network,
+            transaction_id,
+            chain_epoch.id,
+        );
+        let Some(source_epoch_bytes) =
+            inner.get_previous_by_prefix(StorageTable::ReorgWindow, &prefix, &seek_key)?
+        else {
+            seek_outcomes.push((transaction_id, None));
+            continue;
+        };
+        let source_epoch = decode_visible_source_epoch(
+            ArtifactFamily::TransactionIntrinsicValueBalances,
+            &seek_key,
+            &source_epoch_bytes,
+        )?;
+        let artifact_key = StoreKey::transaction_intrinsic_value_balances(
+            chain_epoch.network,
+            source_epoch,
+            transaction_id,
+        );
+        artifact_keys.push(artifact_key.clone());
+        seek_outcomes.push((transaction_id, Some(artifact_key)));
+    }
+
+    let mut artifact_values = inner
+        .multi_get(
+            StorageTable::TransactionIntrinsicValueBalances,
+            &artifact_keys,
+        )?
+        .into_iter();
+    let mut decoded = Vec::with_capacity(seek_outcomes.len());
+    let mut needed_heights = HashSet::new();
+    for (transaction_id, key_option) in seek_outcomes {
+        let Some(key) = key_option else {
+            decoded.push((transaction_id, None));
+            continue;
+        };
+        let envelope_value = artifact_values.next().ok_or(StoreError::ArtifactMissing {
+            family: ArtifactFamily::TransactionIntrinsicValueBalances,
+            key: key.clone().into(),
+        })?;
+        let Some(envelope_bytes) = envelope_value else {
+            decoded.push((transaction_id, None));
+            continue;
+        };
+        let artifact = decode_transaction_intrinsic_value_balances(&key, &envelope_bytes)?;
+        if artifact.location.transaction_id != transaction_id {
+            return Err(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::TransactionIntrinsicValueBalances,
+                key: key.into(),
+                reason: "transaction intrinsic value-balances id does not match its key",
+            });
+        }
+        needed_heights.insert(artifact.location.block_height);
+        decoded.push((transaction_id, Some(artifact)));
+    }
+
+    let mut canonical_blocks_by_height = HashMap::with_capacity(needed_heights.len());
+    for height in needed_heights {
+        if let Some(block) = read_block_header_artifact(inner, chain_epoch, height)? {
+            canonical_blocks_by_height.insert(height, block);
+        }
+    }
+
+    let mut artifacts_by_id = HashMap::with_capacity(decoded.len());
+    for (transaction_id, artifact) in decoded {
+        let retained = artifact.and_then(|artifact| {
+            canonical_blocks_by_height
+                .get(&artifact.location.block_height)
+                .filter(|block| block.block_hash == artifact.location.block_hash)
+                .map(|_| artifact)
+        });
+        artifacts_by_id.insert(transaction_id, retained);
+    }
+    Ok(artifacts_by_id)
+}
+
+fn unique_transaction_ids(transaction_ids: &[TransactionId]) -> Vec<TransactionId> {
+    let mut unique_ids = Vec::with_capacity(transaction_ids.len());
+    let mut seen = HashSet::with_capacity(transaction_ids.len());
+    for &transaction_id in transaction_ids {
+        if seen.insert(transaction_id) {
+            unique_ids.push(transaction_id);
+        }
+    }
+    unique_ids
+}
+
+pub(crate) fn visible_transaction_source_epoch(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     transaction_id: TransactionId,

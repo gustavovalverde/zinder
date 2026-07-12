@@ -912,6 +912,40 @@ fn mempool_snapshot_response_round_trips_events_resume_cursor() -> eyre::Result<
 }
 
 #[test]
+fn chain_value_pools_response_preserves_source_tip_presence() -> eyre::Result<()> {
+    let response = wallet::ChainValuePoolsAtTipResponse {
+        chain_view: None,
+        pools: vec![wallet::ChainValuePool {
+            id: "transparent".to_owned(),
+            monitored: true,
+            chain_value_zat: Some(42),
+        }],
+        source_tip: Some(wallet::BlockTip {
+            height: 1_234,
+            hash: "ab".repeat(32),
+        }),
+    };
+    let decoded = round_trip(&response)?;
+    let source_tip = decoded
+        .source_tip
+        .ok_or_else(|| eyre!("source_tip missing"))?;
+
+    assert_eq!(source_tip.height, 1_234);
+    assert_eq!(source_tip.hash, "ab".repeat(32));
+    assert!(
+        round_trip(&wallet::ChainValuePoolsAtTipResponse::default())?
+            .source_tip
+            .is_none()
+    );
+    assert!(
+        wallet::ChainValuePoolsAtTipResponse::decode([0x18, 0x2a].as_slice())?
+            .source_tip
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
     let server_info = ops::ServerInfo {
         network: "zcash-regtest".to_owned(),

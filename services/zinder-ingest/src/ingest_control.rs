@@ -25,7 +25,7 @@ use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
     ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest, PrimaryChainStore,
-    StoreError, StreamCursorTokenV1, chain_event_envelope_message,
+    StoreError, StreamCursorTokenV1, block_tip_message, chain_event_envelope_message,
     chain_event_stream_family_from_request, chain_view_message, event_stream_start_from_request,
     mempool_entry_message, mempool_event_envelope_message,
     mempool_event_stream_family_from_request, run_event_stream, status_from_store_error,
@@ -495,6 +495,7 @@ fn chain_value_pools_response(
     chain_epoch: ChainEpoch,
     value_pools: ChainValuePools,
 ) -> wallet::ChainValuePoolsAtTipResponse {
+    let source_tip = value_pools.source_tip;
     wallet::ChainValuePoolsAtTipResponse {
         chain_view: Some(chain_view_message(chain_epoch)),
         pools: value_pools
@@ -506,7 +507,7 @@ fn chain_value_pools_response(
                 chain_value_zat: pool.chain_value_zat,
             })
             .collect(),
-        tip_height: value_pools.tip_height.value(),
+        source_tip: Some(block_tip_message(source_tip.height, source_tip.hash)),
     }
 }
 

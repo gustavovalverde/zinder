@@ -25,7 +25,7 @@ bundled tailer.
 
 The explorer plane materializes column-family projections through reusable
 derive consumers: `BlockSummaryConsumer`, `TransactionFeesConsumer`,
-`TransparentAddressActivityConsumer`, and `RecentTransactionsConsumer`.
+`TransparentAddressActivityConsumer`, and `TransactionHistoryConsumer`.
 Each consumer needs (a) typed block-header and transaction facts at the height
 being applied, (b) transparent spend facts for the block's transparent inputs
 when the view computes fees or address deltas, and (c) a small per-height key
@@ -94,7 +94,7 @@ trailing tags. The conventions actually in use:
 - per-tx by id: `[transaction_id_internal(32)]`
   (`TransactionFeesConsumer` primary records)
 - per-block-position descending: `[height_key_descending(4) | in_block_position(4)]`
-  (`RecentTransactionsConsumer`)
+  (`TransactionHistoryConsumer`)
 - per-address descending: `[address_script_hash(32) | height_key_descending(4) | in_block_position(4)]`
   (`TransparentAddressActivityConsumer` primary records)
 - per-second: `[unix_seconds(8)]`
@@ -142,7 +142,7 @@ shape of the implementation depends on the key layout:
   height. The blanket `apply_chain_reorged` walks the reverted range
   and calls `revert_block` per height.
 - **Per-block-position descending composite**
-  (`RecentTransactionsConsumer`): one `delete_range_cf` per height over
+  (`TransactionHistoryConsumer`): one `delete_range_cf` per height over
   the 4-byte `height_key_descending` prefix.
 - **Composite where height is NOT a prefix**
   (`TransparentAddressActivityConsumer`,

@@ -3,7 +3,8 @@
 //! Cross-checks the single [`CAPABILITIES`] table against the compiled
 //! `FileDescriptorSet` so the two cannot drift. Every served RPC on
 //! `WalletQuery`, `ExplorerQuery`, and `IngestControl` must map to exactly one
-//! capability row, and every capability that names a method must name one the
+//! capability row, except for explicitly versioned additive capability rows
+//! on one RPC. Every capability that names a method must name one the
 //! descriptor actually serves. Field-level capabilities (a capability that
 //! gates a field on another RPC rather than a method of its own) carry
 //! `method: None` and are exempt from the method-existence half.
@@ -19,7 +20,10 @@ use eyre::{Result, eyre};
 use prost::Message;
 use prost_types::FileDescriptorSet;
 use zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET;
-use zinder_proto::capabilities::{CAPABILITIES, CapabilitySurface};
+use zinder_proto::capabilities::{
+    CAPABILITIES, CapabilitySurface, EXPLORER_TRANSACTION_HISTORY_V1,
+    EXPLORER_TRANSACTION_HISTORY_V2,
+};
 
 /// Fully qualified methods the descriptor serves but no capability of their
 /// own gates.
@@ -27,6 +31,11 @@ use zinder_proto::capabilities::{CAPABILITIES, CapabilitySurface};
 /// - `LatestSafeBlock` is the safe-tip companion of `LatestBlock`; it shares
 ///   the always-on read contract and never carries a capability.
 const UNCAPABILITIED_METHODS: &[&str] = &["zinder.v1.wallet.WalletQuery.LatestSafeBlock"];
+
+/// RPCs whose additive protocol revision is intentionally advertised beside
+/// its predecessor on the same method.
+const VERSIONED_CAPABILITY_METHODS: &[&str] =
+    &["zinder.v1.explorer.ExplorerQuery.TransactionHistory"];
 
 /// Proto service names that back each capability surface.
 const SURFACE_SERVICES: &[(CapabilitySurface, &str)] = &[
@@ -59,7 +68,10 @@ fn every_served_method_maps_to_exactly_one_capability() -> Result<()> {
         }
         match method_to_capabilities.get(method.as_str()) {
             None => unmapped.push(method),
-            Some(capabilities) if capabilities.len() > 1 => {
+            Some(capabilities)
+                if capabilities.len() > 1
+                    && !VERSIONED_CAPABILITY_METHODS.contains(&method.as_str()) =>
+            {
                 over_mapped.push((method, capabilities.clone()));
             }
             Some(_) => {}
@@ -79,6 +91,23 @@ fn every_served_method_maps_to_exactly_one_capability() -> Result<()> {
          method: None."
     );
     Ok(())
+}
+
+#[test]
+fn transaction_history_capability_versions_share_one_rpc() {
+    let history_capabilities: BTreeSet<&str> = CAPABILITIES
+        .iter()
+        .filter(|spec| spec.method == Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"))
+        .map(|spec| spec.string)
+        .collect();
+
+    assert_eq!(
+        history_capabilities,
+        BTreeSet::from([
+            EXPLORER_TRANSACTION_HISTORY_V1,
+            EXPLORER_TRANSACTION_HISTORY_V2,
+        ])
+    );
 }
 
 #[test]

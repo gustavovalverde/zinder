@@ -105,21 +105,16 @@ fn code_lines(source: &str) -> impl Iterator<Item = &str> {
 #[test]
 fn transport_construction_lives_only_in_transport_modules() -> Result<()> {
     let root = workspace_root()?;
-    let allowlist: Vec<PathBuf> = TRANSPORT_OWNERSHIP
-        .iter()
-        .map(|path| root.join(path))
-        .collect();
-
     let mut offenders: Vec<(PathBuf, String, &'static BannedPattern)> = Vec::new();
     for directory in SCANNED_DIRECTORIES {
         for source_path in production_source_files(&root.join(directory))? {
-            if allowlist.iter().any(|allowed| allowed == &source_path) {
-                continue;
-            }
             let contents = fs::read_to_string(&source_path)?;
             for line in code_lines(&contents) {
                 for pattern in BANNED_TRANSPORT_PATTERNS {
-                    if line.contains(pattern.needle) {
+                    let is_allowed_owner = TRANSPORT_OWNERSHIP
+                        .iter()
+                        .any(|owner| root.join(owner) == source_path);
+                    if line.contains(pattern.needle) && !is_allowed_owner {
                         offenders.push((source_path.clone(), line.trim().to_owned(), pattern));
                     }
                 }
@@ -145,7 +140,7 @@ fn transport_construction_lives_only_in_transport_modules() -> Result<()> {
         .join("\n");
 
     Err(eyre!(
-        "transport construction must live in one of the two owning modules \
+        "transport construction must live in its explicitly owning module \
          (see ADR-0019). Offending production-source sites:\n{formatted_offenders}",
     ))
 }

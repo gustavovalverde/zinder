@@ -7,11 +7,14 @@ mod address_output_index;
 mod artifact_visibility;
 mod block_artifact;
 mod block_hash_index;
+mod block_value_pool_balances;
 mod chain_epoch;
 mod chain_epoch_reader;
 mod chain_event;
 mod chain_store;
+mod displaced_block;
 mod event_stream;
+mod final_note_commitment_roots;
 mod format;
 mod grpc_status;
 mod kv;
@@ -26,11 +29,14 @@ mod transparent_output;
 mod transparent_spend_fact;
 mod tree_state;
 
-pub use address_output_index::AddressOutputIndexStore;
+pub use address_output_index::{
+    AddressOutputIndexStore, TransparentAddressBalanceSnapshot, TransparentAddressBalanceSummary,
+};
 pub use block_artifact::{
     BlockBlobStore, BlockHeaderStore, BlockTransactionIndexStore, CompactBlockStore,
 };
 pub use block_hash_index::BlockHashLookup;
+pub use block_value_pool_balances::BlockValuePoolBalancesStore;
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;
 pub use chain_event::{
@@ -38,14 +44,21 @@ pub use chain_event::{
     ChainRangeReverted,
 };
 pub use chain_store::{
-    AddressOutputIndexPage, AddressOutputIndexPageRequest, CURRENT_ARTIFACT_SCHEMA_VERSION,
-    ChainEpochReadApi, ChainEventHistoryRequest, ChainEventRetentionReport, ChainStoreOptions,
-    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
-    PrimaryChainStore, RawBlobRetention, SecondaryCatchupOutcome, SecondaryChainStore,
+    AddressOutputIndexPage, AddressOutputIndexPageRequest, BlockValuePoolBalanceEnrichmentOutcome,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochReadApi, ChainEventHistoryRequest,
+    ChainEventRetentionReport, ChainStoreOptions, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
+    FinalNoteCommitmentRootEnrichmentOutcome, MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH,
+    MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
+    MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH,
+    MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, RawBlobRetention,
+    SecondaryCatchupOutcome, SecondaryChainStore,
+    TransactionIntrinsicValueBalanceEnrichmentOutcome,
 };
+pub use displaced_block::{DisplacedBlockCursor, DisplacedBlockPage, DisplacedBlockStore};
 pub use event_stream::{
     ChainEventStreamResume, EventEnvelope, EventStreamStartPosition, run_event_stream,
 };
+pub use final_note_commitment_roots::FinalNoteCommitmentRootsStore;
 pub use format::{
     AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
     MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
@@ -82,6 +95,7 @@ pub use rocksdb_resource_budget::RocksDbResourceBudget;
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;
 pub use transaction_artifact::{
-    TransactionBlobStore, TransactionFactsStore, TransactionLocationStore,
+    TransactionBlobStore, TransactionFactsStore, TransactionIntrinsicValueBalancesStore,
+    TransactionLocationStore,
 };
 pub use tree_state::TreeStateStore;

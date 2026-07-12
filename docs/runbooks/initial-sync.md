@@ -66,6 +66,230 @@ docker logs zinder-ingest | grep ingest_phase_changed
 
 Steady-state operation emits `chain_committed` events with `phase=following_tip` and single-block ranges. The reader's `/readyz` (port 9106) shows the height the reader has visible through its secondary store handle; it can be `ready` while the writer is still in `bulk_catchup`.
 
+## Background projection work
+
+Canonical readiness does not imply that every historical projection is complete. Use this table as the operator checklist; each worker persists progress and resumes after restart.
+
+| Worker | Canonical boundary | Readiness effect | Capability and completion evidence | Restart behavior |
+| --- | --- | --- | --- | --- |
+| Commitment-root enrichment | Settled blocks from Sapling activation; live commits supply the tip | Does not gate canonical readiness | Root-search capability plus contiguous root coverage | Resumes bounded batches and revalidates block identity |
+| Transaction-component history | Height 1 through the live projection tip | Does not gate canonical readiness; coordinated derive schema upgrade | Component-summary capability plus historical/live coverage | Rebuilds only its consumer, then resumes from durable coverage |
+| Conventional-fee distribution | Configured history window joined to the live tail | Does not gate canonical readiness | Capability appears after materialized coverage; response reports requested-range completeness | Prepends newest-first from durable coverage |
+| Paid-fee distribution | Configured history window; only transactions with provable inputs contribute fees | Does not gate canonical readiness | Paid-fee capability, coverage, and unavailable count | Prepends newest-first; unresolved facts remain explicit |
+| Value-pool flow history | Configured settled history joined to the live tail | Does not gate canonical readiness | Flow capabilities plus consumer checkpoint and coverage | Resumes durable historical batches under the source-request budget |
+| Value-pool balance history | Height 1 through the fenced projection tip; daily rows select canonical candidates | Does not gate canonical readiness | Balance-history capability plus contiguous scanned-height coverage | Resumes scanning and rejects candidates whose block identity changed |
+| Transparent-address ranking | Matching settled output snapshot and lifetime deltas, then visible unsettled tail | Ranking capability withheld until activation | Ranking capability and active-generation coverage | Leaves the active generation untouched and resumes an inactive build |
+| Transaction-history verification | Height 1 through the fenced history tip | Does not gate canonical readiness | History v2 capability requires verified contiguous coverage and matching tip hash | Resumes verification; v1 remains available for bounded partial history |
+
+## Commitment-root enrichment
+
+Artifact schema 14 adds typed post-block Sapling, Orchard, and Ironwood final
+note-commitment roots without recreating the canonical store. Tip-follow writes
+roots for newly observed blocks. Bulk catchup reuses its existing sparse
+tree-state checkpoints rather than adding an RPC per block. One independent
+background task fills the remaining settled history from Sapling activation
+forward and updates the `CommitmentRootSearchConsumer` projection in bounded,
+resumable batches.
+
+The backfill does not gate canonical readiness or wallet serving. Until its
+coverage reaches the settled tip, `ExplorerQuery.CommitmentRootSearch` returns
+matches from the materialized range and marks negative results as incomplete.
+On an existing derive store, startup seeds the new root-search consumer's
+event cursor only when every pre-existing block consumer reports the same
+cursor. This lets current events continue without replaying unrelated
+consumers from genesis; historical root-search coverage still starts empty and
+belongs exclusively to the backfill. A fresh, partially rebuilt, or
+cursor-disagreeing store keeps the normal fail-closed replay behavior.
+Operators should monitor structured events rather than infer completion from
+ingest readiness:
+
+```text
+event=commitment_root_backfill_started from_height=...
+event=commitment_root_backfill_progress from_height=... through_height=... fetched_roots=...
+event=commitment_root_backfill_completed through_height=...
+event=commitment_root_backfill_retry error=... retry_delay_seconds=5
+event=commitment_root_search_cursor_seeded
+```
+
+The default bounds are explicit in resolved config and can be tuned without a
+schema change:
+
+```toml
+[ingest.commitment_root_backfill]
+enabled = true
+batch_blocks = 256
+fetch_concurrency = 8
+```
+
+Disabling the task stops historical progress but does not remove tip-follow
+root collection. Re-enabling resumes from the durable contiguous coverage row;
+it does not replay or advance the shared derive chain-event cursor.
+
+## Transaction-component history
+
+The transaction-component consumer is an additive derive schema; it does not
+change the canonical artifact schema or require a data-volume replacement.
+Its version-2 fixed-width rows are incompatible with version 1, so opening an
+existing store clears this consumer's rows and cursor only. Ingest then takes a
+unanimous cursor from the pre-existing block consumers and performs two bounded
+operations before its event tailer starts:
+
+This upgrade is a coordinated outage. Stop `zinder-ingest` and every process
+holding the derive store as a secondary, take a checkpoint, deploy version-2
+binaries, start the version-2 writer first, and start version-2 readers only
+after primary reconciliation completes. Reader-first rolling and side-by-side
+version-1/version-2 access are invalid.
+
+1. Historical backfill reads canonical block and transaction artifacts from
+   height 1 through the height immediately before the durable live-tail
+   boundary.
+2. Startup seeding writes the already-visible unsettled range into the live
+   tail without advancing the inherited cursor. Normal reorg events own those
+   rows after startup.
+
+The two ranges must touch before `TransactionComponentSummary` reports
+complete coverage. A restart can widen and revalidate a previously seeded tail
+without deleting its contribution rows. The existing canonical and unrelated
+derive families remain untouched.
+
+```text
+event=transaction_component_tail_boundary_initialized cursor_seeded=... tail_boundary=...
+event=transaction_component_backfill_started from_height=... batch_blocks=...
+event=transaction_component_backfill_progress from_height=... through_height=... transaction_count=...
+event=transaction_component_backfill_completed through_height=...
+event=transaction_component_backfill_retry error=... retry_delay_seconds=5
+```
+
+```toml
+[ingest.transaction_component_backfill]
+enabled = true
+batch_blocks = 256
+```
+
+This worker does not gate canonical readiness. Consumers must inspect the RPC
+coverage envelope until historical and live-tail ranges are contiguous.
+
+## Conventional-fee distribution history
+
+The conventional-fee distribution is another additive derive consumer. An
+existing volume upgrades in place: startup registers four new derive column
+families, seeds the visible live tail at the unanimous existing block-consumer
+cursor, and starts a cursor-neutral historical backfill from height 1. It does
+not change canonical artifact schema, replace the volume, clear unrelated
+derive rows, or require the chain to be reingested.
+
+```text
+event=conventional_fee_distribution_tail_boundary_initialized cursor_seeded=... tail_boundary=...
+event=conventional_fee_distribution_backfill_started from_height=1 batch_blocks=...
+event=conventional_fee_distribution_backfill_progress from_height=... through_height=... transaction_count=...
+event=conventional_fee_distribution_backfill_completed through_height=...
+event=conventional_fee_distribution_backfill_retry error=... retry_delay_seconds=5
+```
+
+```toml
+[ingest.conventional_fee_distribution_backfill]
+enabled = true
+batch_blocks = 256
+```
+
+The worker does not gate canonical readiness. The explorer omits
+`explorer.fee.conventional_distribution_v1` until coverage exists, and clients
+must keep honoring `requested_range_complete` while historical coverage is
+still joining the live tail. Before deploying the writer, take a normal Zinder
+checkpoint backup; rollback restores that checkpoint rather than deleting the
+new column families from a running RocksDB instance.
+
+Deploy every binary that opens the derive store from the same release before
+starting the upgraded writer. This includes `zinder-query`, even when it does
+not serve the new explorer method: secondary readers validate the complete
+bundled-consumer manifest and fail closed on an undeclared consumer. A safe
+rolling sequence is therefore: build all services, stop derive-store readers,
+replace the readers and writer, start ingest, then start readers after manifest
+reconciliation completes. Mixing an older reader with a writer that has
+registered `conventional_fee_distribution` makes that reader unavailable; it
+is not a signal to wipe or recreate the volume.
+
+## Actual paid-fee history
+
+Artifact schema 15 adds a separate canonical
+`TransactionIntrinsicValueBalances` family. Each row retains signed Sprout,
+Sapling, Orchard, and Ironwood balances parsed from the transaction bytes. The
+`PaidFeeDistributionConsumer` combines those values with resolved transparent
+prevouts and outputs, excludes coinbase and proven zero-fee transactions, and
+stores exact positive paid-fee frequencies. Missing source facts increase an
+explicit unavailable count; ZIP-317 conventional fees are never substituted.
+
+Existing volumes upgrade in place. Startup seeds the visible paid-fee tail at
+the unanimous event cursor, then the background task prepends settled history
+newest-first. This makes recent periods usable before the full 365-day window
+finishes and allows a later `history_days` increase to move the durable floor
+backward without clearing existing rows. Pre-upgrade tail blocks are enriched
+canonically as they settle.
+
+```toml
+[ingest.paid_fee_distribution_backfill]
+enabled = true
+batch_blocks = 256
+fetch_concurrency = 8
+history_days = 365
+timestamp_safety_seconds = 7200
+```
+
+Monitor explicit progress and coverage rather than ingest readiness:
+
+```text
+event=paid_fee_distribution_tail_boundary_initialized
+event=paid_fee_distribution_backfill_started direction=newest_first
+event=paid_fee_distribution_backfill_progress direction=newest_first
+event=paid_fee_distribution_settled_tail_reconciled
+event=paid_fee_distribution_backfill_completed
+event=paid_fee_distribution_backfill_retry
+```
+
+Consumers may prefer `explorer.fee.paid_distribution_v1` as soon as it is
+advertised. A native response is complete only when the requested time range is
+covered and its unavailable-transaction count is zero; otherwise it preserves
+the exact partial rows and explains the gap. Conventional-fee distribution is
+a separate native projection and must never be labeled as paid-fee history.
+
+## Transparent-address ranking bootstrap
+
+The transparent-address ranking is an additive derive projection. Schema 2
+adds P2PKH/P2SH aggregate counters to the same generation metadata and rebuilds
+only this consumer when upgrading from schema 1. On the first
+startup that introduces it, ingest catches existing consumers up to the
+canonical tail, then builds an inactive generation from two matching settled
+sources: the canonical address-output snapshot and complete lifetime address
+deltas. It reconciles every address before writing the generation, applies the
+visible unsettled tail with undo journals, and atomically activates the result
+at the existing unanimous event cursor.
+
+This bootstrap can take tens of seconds on testnet, but it does not change the
+canonical artifact schema or wipe the volume. Interruption leaves the active
+generation untouched and resumes only the inactive build. If lifetime source
+coverage is incomplete, startup continues with the ranking capability omitted;
+it never exposes partial lifetime values as complete.
+
+```text
+event=transparent_address_ranking_activated generation=... through_height=... positive_address_count=... total_positive_balance_zat=...
+```
+
+Routine restarts on the same derive schema do not rebuild an active generation. Operators should verify
+that `ExplorerQuery.ServerInfo` advertises
+`explorer.transparent_address.ranking_v1`, then call
+`ExplorerQuery.TransparentAddressRanking` and confirm that its coverage reaches
+the response's visible tip. A canonical volume replacement is neither required
+nor expected.
+
+`ExplorerQuery.TransparentAddressActivity` v2 reuses this active generation for
+its per-address confirmed summary and reuses the existing activity projection
+plus retained canonical transaction facts for rows. Enabling v2 does not add a
+consumer schema, rebuild the ranking, replay chain events, or backfill canonical
+data. Operators should verify
+`explorer.transparent_address.activity_v2`; a missing capability means the
+ranking has no active complete generation or the explorer lacks the required
+read stores, not that the canonical volume should be wiped.
+
 ## Upstream sync diagnostic
 
 `/readyz` distinguishes "the upstream is itself behind the network tip" from other not-ready causes through the `upstream_not_ready` cause. The signal is sourced from Zebra in one of two ways.

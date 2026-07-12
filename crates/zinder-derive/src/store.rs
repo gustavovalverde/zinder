@@ -19,11 +19,12 @@ use std::{
     sync::Arc,
 };
 
+use parking_lot::{RwLock, RwLockReadGuard};
 use rust_rocksdb::{
-    Cache, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
-    checkpoint::Checkpoint,
+    Cache, ColumnFamilyDescriptor, DB, IteratorMode, Options, ReadOptions, Snapshot, WriteBatch,
+    WriteOptions, checkpoint::Checkpoint,
 };
-use zinder_core::{BlockHeight, ChainEpoch};
+use zinder_core::{BlockHash, BlockHeight, ChainEpoch, ChainEpochId};
 use zinder_store::{
     ChainEvent, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
     RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory, open_bounded_rocksdb,
@@ -32,18 +33,34 @@ use zinder_store::{
 
 use crate::{
     consumer::block_summary::{BLOCK_SUMMARY_CONSUMER_NAME, BLOCK_SUMMARY_SCHEMA},
+    consumer::commitment_root_search::{
+        COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, COMMITMENT_ROOT_SEARCH_SCHEMA,
+    },
+    consumer::conventional_fee_distribution::{
+        CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME, CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA,
+    },
     consumer::ironwood_migration::{IRONWOOD_MIGRATION_CONSUMER_NAME, IRONWOOD_MIGRATION_SCHEMA},
     consumer::mempool_event_counts::MEMPOOL_EVENT_COUNTS_SCHEMA,
+    consumer::paid_fee_distribution::PAID_FEE_DISTRIBUTION_SCHEMA,
     consumer::recent_transactions::{
         RECENT_TRANSACTIONS_CONSUMER_NAME, RECENT_TRANSACTIONS_SCHEMA,
     },
     consumer::reorg_incidents::{REORG_INCIDENTS_CONSUMER_NAME, REORG_INCIDENTS_SCHEMA},
+    consumer::transaction_component_summary::{
+        TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, TRANSACTION_COMPONENT_SUMMARY_SCHEMA,
+    },
     consumer::transaction_fees::{TRANSACTION_FEES_CONSUMER_NAME, TRANSACTION_FEES_SCHEMA},
+    consumer::transaction_history::{
+        TRANSACTION_HISTORY_CONSUMER_NAME, TRANSACTION_HISTORY_SCHEMA,
+    },
     consumer::transparent_address_activity::{
         TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
     },
     consumer::transparent_address_deltas::{
         TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
+    },
+    consumer::transparent_address_ranking::{
+        TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_SCHEMA,
     },
     consumer::transparent_address_transaction_history::{
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
@@ -52,9 +69,13 @@ use crate::{
     consumer::transparent_outpoint_spend::{
         TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
     },
+    consumer::value_pool_balance_history::VALUE_POOL_BALANCE_HISTORY_SCHEMA,
+    consumer::value_pool_flow_history::{
+        VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, VALUE_POOL_FLOW_HISTORY_SCHEMA,
+    },
     consumer::{
-        BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
-        CommittedRange, DeriveConsumer, DeriveConsumerCtx, DeriveConsumerName,
+        BlockCommitContext, BlockKeyedConsumer, BlockProjectionCheckpoint, ChainCommittedEvent,
+        ChainReorgedEvent, CommittedRange, DeriveConsumer, DeriveConsumerCtx, DeriveConsumerName,
         DeriveConsumerSchema, DeriveMempoolConsumer, RevertedRange,
         apply_chain_committed_in_memory, apply_chain_reorged_in_memory,
     },
@@ -88,6 +109,9 @@ pub const DERIVE_STORE_FORMAT_VERSION: u16 = 7;
 const STORE_FORMAT_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const DERIVE_STATUS_KEY: &[u8] = b"\x00\x02derive_status";
 const CONSUMER_SCHEMA_KEY_PREFIX: &[u8] = b"\x00\x03consumer_schema:";
+const CONSUMER_PROJECTION_STATE_KEY_PREFIX: &[u8] = b"\x00\x04consumer_projection_state:";
+const CONSUMER_PROJECTION_STATE_VERSION: u8 = 1;
+const CONSUMER_PROJECTION_STATE_LEN: usize = 94;
 const ROCKSDB_DEFAULT_COLUMN_FAMILY: &str = "default";
 
 /// Inclusive lower bound for a full column-family clear: the empty key sorts
@@ -103,24 +127,38 @@ const CLEAR_RANGE_UPPER_BOUND: &[u8] = &[0xff; 512];
 const BUNDLED_CONSUMERS: &[DeriveConsumerSchema] = &[
     BLOCK_SUMMARY_SCHEMA,
     IRONWOOD_MIGRATION_SCHEMA,
+    COMMITMENT_ROOT_SEARCH_SCHEMA,
+    CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA,
     MEMPOOL_EVENT_COUNTS_SCHEMA,
+    PAID_FEE_DISTRIBUTION_SCHEMA,
     RECENT_TRANSACTIONS_SCHEMA,
+    TRANSACTION_HISTORY_SCHEMA,
     REORG_INCIDENTS_SCHEMA,
     TRANSACTION_FEES_SCHEMA,
+    TRANSACTION_COMPONENT_SUMMARY_SCHEMA,
     TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
     TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
+    TRANSPARENT_ADDRESS_RANKING_SCHEMA,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
     TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
+    VALUE_POOL_BALANCE_HISTORY_SCHEMA,
+    VALUE_POOL_FLOW_HISTORY_SCHEMA,
 ];
 const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
     BLOCK_SUMMARY_CONSUMER_NAME,
     IRONWOOD_MIGRATION_CONSUMER_NAME,
-    TRANSACTION_FEES_CONSUMER_NAME,
+    COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
+    CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
     RECENT_TRANSACTIONS_CONSUMER_NAME,
+    TRANSACTION_FEES_CONSUMER_NAME,
+    TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
+    TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+    VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
 ];
 const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] =
     &[REORG_INCIDENTS_CONSUMER_NAME];
@@ -319,6 +357,32 @@ pub struct ChainEventDispatchInputs<'event> {
     pub safe_tip_height: BlockHeight,
 }
 
+/// One verified contiguous range within a consumer projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsumerProjectionCoverage {
+    /// First verified canonical height.
+    pub complete_from_height: BlockHeight,
+    /// Last verified canonical height.
+    pub complete_through_height: BlockHeight,
+    /// Canonical hash at [`Self::complete_through_height`].
+    pub complete_through_hash: BlockHash,
+}
+
+/// Atomic read fence and optional verified coverage for one derive consumer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsumerProjectionState {
+    /// Canonical epoch whose projection writes are visible.
+    pub projection_epoch_id: ChainEpochId,
+    /// Highest canonical height reflected by the projection.
+    pub projection_tip_height: BlockHeight,
+    /// Canonical hash at [`Self::projection_tip_height`].
+    pub projection_tip_hash: BlockHash,
+    /// Monotonic projection mutation and coverage revision.
+    pub revision: u64,
+    /// Verified contiguous coverage, when verification has started.
+    pub coverage: Option<ConsumerProjectionCoverage>,
+}
+
 /// Consumers that participate in one chain-event derive-store write.
 pub struct ChainEventDispatchConsumers<
     'block_slices,
@@ -346,11 +410,274 @@ pub struct DeriveStore {
     consumers: &'static [DeriveConsumerSchema],
     rocksdb_resource_budget: RocksDbResourceBudget,
     is_secondary: bool,
+    catch_up_barrier: Arc<RwLock<()>>,
     block_cache: Cache,
     write_buffer_manager: rust_rocksdb::WriteBufferManager,
     statistics: Arc<Options>,
     io_mode: RocksDbIoMode,
     resource_gauge_throttle: Arc<ResourceGaugeThrottle>,
+}
+
+/// Consistent read view over one `DeriveStore` sequence.
+///
+/// Every method reads through the same storage snapshot, so projection
+/// metadata, consumer rows, bounds, and exact counts cannot observe different
+/// commits during one request. The underlying storage handles remain private.
+pub struct DeriveStoreReadSnapshot<'store> {
+    store: &'store DeriveStore,
+    consistency: DeriveReadConsistency<'store>,
+}
+
+enum DeriveReadConsistency<'store> {
+    Primary(Snapshot<'store>),
+    Secondary {
+        _catch_up_guard: RwLockReadGuard<'store, ()>,
+    },
+}
+
+impl DeriveStoreReadSnapshot<'_> {
+    fn read_options(&self) -> ReadOptions {
+        let mut options = ReadOptions::default();
+        if let DeriveReadConsistency::Primary(snapshot) = &self.consistency {
+            options.set_snapshot(snapshot);
+        }
+        options
+    }
+
+    /// Reads one consumer's projection fence and verified coverage.
+    pub fn consumer_projection_state(
+        &self,
+        consumer: DeriveConsumerName,
+    ) -> Result<Option<ConsumerProjectionState>, DeriveStoreError> {
+        let column_family = self
+            .store
+            .column_family(DeriveStoreTable::ConsumerMetadata)?;
+        let key = consumer_projection_state_key(consumer.as_str());
+        self.store
+            .db
+            .get_cf_opt(&column_family, key, &self.read_options())
+            .map_err(|source| DeriveStoreError::Operation {
+                operation: "get",
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                source,
+            })?
+            .map(|payload| decode_consumer_projection_state(&payload))
+            .transpose()
+    }
+
+    /// Reads a single value from a consumer-owned column family.
+    pub fn get_consumer(
+        &self,
+        column_family: &'static str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        let handle = self.store.consumer_column_family(column_family)?;
+        self.store
+            .db
+            .get_cf_opt(&handle, key, &self.read_options())
+            .map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "get",
+                name: column_family,
+                source,
+            })
+    }
+
+    /// Batch-reads consumer keys in input order from this snapshot.
+    pub fn multi_get_consumer<K>(
+        &self,
+        column_family: &'static str,
+        keys: &[K],
+    ) -> Result<Vec<Option<Vec<u8>>>, DeriveStoreError>
+    where
+        K: AsRef<[u8]>,
+    {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let handle = self.store.consumer_column_family(column_family)?;
+        let inputs = keys
+            .iter()
+            .map(|key| (&handle, key.as_ref()))
+            .collect::<Vec<_>>();
+        self.store
+            .db
+            .multi_get_cf_opt(inputs, &self.read_options())
+            .into_iter()
+            .map(|outcome| {
+                outcome.map_err(|source| DeriveStoreError::ConsumerOperation {
+                    operation: "multi_get",
+                    name: column_family,
+                    source,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns at most `entries_cap` rows from an inclusive consumer-key range.
+    pub fn range_iterate_consumer(
+        &self,
+        column_family: &'static str,
+        start_key: &[u8],
+        end_key_inclusive: &[u8],
+        entries_cap: usize,
+    ) -> Result<Vec<ConsumerEntry>, DeriveStoreError> {
+        if entries_cap == 0 {
+            return Ok(Vec::new());
+        }
+        let handle = self.store.consumer_column_family(column_family)?;
+        let iterator = self.store.db.iterator_cf_opt(
+            &handle,
+            self.read_options(),
+            IteratorMode::From(start_key, rust_rocksdb::Direction::Forward),
+        );
+        let mut entries = Vec::with_capacity(entries_cap.min(64));
+        for entry in iterator {
+            let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "range_iterate",
+                name: column_family,
+                source,
+            })?;
+            if key.as_ref() > end_key_inclusive {
+                break;
+            }
+            entries.push((key.to_vec(), payload.to_vec()));
+            if entries.len() >= entries_cap {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Returns the lexicographically first consumer key, if one exists.
+    pub fn first_consumer_key(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        self.consumer_edge_key(column_family, IteratorMode::Start, "first_key")
+    }
+
+    /// Returns the lexicographically last consumer key, if one exists.
+    pub fn last_consumer_key(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        self.consumer_edge_key(column_family, IteratorMode::End, "last_key")
+    }
+
+    /// Returns the lowest height in a descending-height consumer keyspace.
+    pub fn first_materialized_height_descending(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<BlockHeight>, DeriveStoreError> {
+        let key = self.last_consumer_key(column_family)?;
+        decode_descending_height_prefix(key.as_deref(), column_family, "last")
+    }
+
+    /// Returns the highest height in a descending-height consumer keyspace.
+    pub fn last_materialized_height_descending(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<BlockHeight>, DeriveStoreError> {
+        let key = self.first_consumer_key(column_family)?;
+        decode_descending_height_prefix(key.as_deref(), column_family, "first")
+    }
+
+    /// Counts every row in a consumer-owned column family exactly.
+    pub fn consumer_row_count(&self, column_family: &'static str) -> Result<u64, DeriveStoreError> {
+        let handle = self.store.consumer_column_family(column_family)?;
+        let mut row_count = 0_u64;
+        for entry in
+            self.store
+                .db
+                .iterator_cf_opt(&handle, self.read_options(), IteratorMode::Start)
+        {
+            entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "count_rows",
+                name: column_family,
+                source,
+            })?;
+            row_count = row_count.saturating_add(1);
+        }
+        Ok(row_count)
+    }
+
+    /// Counts exactly the consumer rows accepted by `predicate`.
+    pub fn count_consumer_rows_matching(
+        &self,
+        column_family: &'static str,
+        mut predicate: impl FnMut(&[u8], &[u8]) -> Result<bool, String>,
+    ) -> Result<u64, DeriveStoreError> {
+        let handle = self.store.consumer_column_family(column_family)?;
+        let mut matching_count = 0_u64;
+        for entry in
+            self.store
+                .db
+                .iterator_cf_opt(&handle, self.read_options(), IteratorMode::Start)
+        {
+            let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "count_matching_rows",
+                name: column_family,
+                source,
+            })?;
+            if predicate(&key, &payload).map_err(|reason| {
+                DeriveStoreError::ConsumerPayloadDecode {
+                    name: column_family,
+                    reason,
+                }
+            })? {
+                matching_count = matching_count.saturating_add(1);
+            }
+        }
+        Ok(matching_count)
+    }
+
+    fn consumer_edge_key(
+        &self,
+        column_family: &'static str,
+        mode: IteratorMode<'_>,
+        operation: &'static str,
+    ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        let handle = self.store.consumer_column_family(column_family)?;
+        let mut iterator = self
+            .store
+            .db
+            .iterator_cf_opt(&handle, self.read_options(), mode);
+        let Some(entry) = iterator.next() else {
+            return Ok(None);
+        };
+        let (key, _payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+            operation,
+            name: column_family,
+            source,
+        })?;
+        Ok(Some(key.to_vec()))
+    }
+}
+
+fn decode_descending_height_prefix(
+    key: Option<&[u8]>,
+    column_family: &'static str,
+    edge: &'static str,
+) -> Result<Option<BlockHeight>, DeriveStoreError> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let prefix = key.get(..zinder_core::wire::HEIGHT_KEY_LEN).ok_or_else(|| {
+        DeriveStoreError::Decode {
+            column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+            reason: format!(
+                "consumer column family `{column_family}` {edge} key is shorter than the descending-height prefix"
+            ),
+        }
+    })?;
+    zinder_core::wire::decode_height_key_descending(prefix)
+        .map(Some)
+        .map_err(|error| DeriveStoreError::Decode {
+            column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+            reason: format!(
+                "consumer column family `{column_family}` {edge} key descending-height prefix invalid: {error}"
+            ),
+        })
 }
 
 impl fmt::Debug for DeriveStore {
@@ -363,6 +690,7 @@ impl fmt::Debug for DeriveStore {
             .field("consumers", &self.consumers)
             .field("rocksdb_resource_budget", &self.rocksdb_resource_budget)
             .field("is_secondary", &self.is_secondary)
+            .field("catch_up_barrier", &self.catch_up_barrier)
             .field("io_mode", &self.io_mode)
             .field("block_cache_usage_bytes", &self.block_cache.get_usage())
             .field(
@@ -378,6 +706,22 @@ impl fmt::Debug for DeriveStore {
 }
 
 impl DeriveStore {
+    /// Captures a consistent read view at the store's current sequence.
+    #[must_use]
+    pub fn read_snapshot(&self) -> DeriveStoreReadSnapshot<'_> {
+        let consistency = if self.is_secondary {
+            DeriveReadConsistency::Secondary {
+                _catch_up_guard: self.catch_up_barrier.read(),
+            }
+        } else {
+            DeriveReadConsistency::Primary(Snapshot::new(self.db.as_ref()))
+        };
+        DeriveStoreReadSnapshot {
+            store: self,
+            consistency,
+        }
+    }
+
     /// Returns the conventional derive-store path for a canonical-store
     /// path.
     ///
@@ -463,6 +807,7 @@ impl DeriveStore {
             consumers: options.consumers,
             rocksdb_resource_budget: options.rocksdb_resource_budget,
             is_secondary: false,
+            catch_up_barrier: Arc::new(RwLock::new(())),
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             statistics: bounded_open.statistics,
@@ -534,6 +879,7 @@ impl DeriveStore {
             consumers: options.consumers,
             rocksdb_resource_budget: options.rocksdb_resource_budget,
             is_secondary: true,
+            catch_up_barrier: Arc::new(RwLock::new(())),
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             statistics: bounded_open.statistics,
@@ -555,6 +901,7 @@ impl DeriveStore {
         if !self.is_secondary {
             return Ok(());
         }
+        let _catch_up_guard = self.catch_up_barrier.write();
         self.db
             .try_catch_up_with_primary()
             .map_err(|source| DeriveStoreError::Operation {
@@ -741,9 +1088,19 @@ impl DeriveStore {
             store: self,
             batch: &mut batch,
         };
+        let projection_checkpoint = block_projection_checkpoint(inputs, blocks);
 
         for consumer in block_consumers.iter_mut() {
+            consumer
+                .begin_batch(&mut ctx)
+                .map_err(DeriveError::Consumer)?;
             dispatch_chain_event_to_block_consumer(&mut **consumer, inputs, &mut ctx, blocks)?;
+            consumer
+                .finish_batch(&mut ctx)
+                .map_err(DeriveError::Consumer)?;
+            consumer
+                .stage_chain_event_checkpoint(projection_checkpoint, &mut ctx)
+                .map_err(DeriveError::Consumer)?;
         }
         for consumer in event_consumers.iter_mut() {
             dispatch_chain_event_to_consumer(&mut **consumer, inputs, &mut ctx)?;
@@ -808,14 +1165,28 @@ impl DeriveStore {
         cursor_bytes: &[u8],
     ) -> Result<(), DeriveStoreError> {
         let mut batch = WriteBatch::default();
-        let column_family = self.column_family(DeriveStoreTable::ChainEventCursor)?;
-        batch.put_cf(&column_family, consumer.as_str().as_bytes(), cursor_bytes);
+        self.stage_chain_event_cursor(&mut batch, consumer, cursor_bytes)?;
         self.write(&batch)
             .map_err(|source| DeriveStoreError::Operation {
                 operation: "put_chain_event_cursor",
                 column_family: DeriveStoreColumnFamily::ChainEventCursor,
                 source,
             })
+    }
+
+    /// Stages one chain-event cursor in a caller-owned atomic write batch.
+    ///
+    /// Snapshot-backed consumers use this to activate materialized state and
+    /// adopt the event boundary in the same commit.
+    pub fn stage_chain_event_cursor(
+        &self,
+        batch: &mut WriteBatch,
+        consumer: DeriveConsumerName,
+        cursor_bytes: &[u8],
+    ) -> Result<(), DeriveStoreError> {
+        let column_family = self.column_family(DeriveStoreTable::ChainEventCursor)?;
+        batch.put_cf(&column_family, consumer.as_str().as_bytes(), cursor_bytes);
+        Ok(())
     }
 
     /// Atomically persists `cursor_bytes` for a mempool-event consumer.
@@ -948,6 +1319,44 @@ impl DeriveStore {
         self.get(DeriveStoreTable::ConsumerMetadata, DERIVE_STATUS_KEY)
     }
 
+    /// Reads one consumer's atomic projection fence and verified coverage.
+    pub fn consumer_projection_state(
+        &self,
+        consumer: DeriveConsumerName,
+    ) -> Result<Option<ConsumerProjectionState>, DeriveStoreError> {
+        let key = consumer_projection_state_key(consumer.as_str());
+        self.get(DeriveStoreTable::ConsumerMetadata, &key)?
+            .map(|payload| decode_consumer_projection_state(&payload))
+            .transpose()
+    }
+
+    /// Stages one consumer's projection state in a caller-owned atomic batch.
+    pub fn stage_consumer_projection_state(
+        &self,
+        batch: &mut WriteBatch,
+        consumer: DeriveConsumerName,
+        state: ConsumerProjectionState,
+    ) -> Result<(), DeriveStoreError> {
+        let column_family = self.column_family(DeriveStoreTable::ConsumerMetadata)?;
+        batch.put_cf(
+            &column_family,
+            consumer_projection_state_key(consumer.as_str()),
+            encode_consumer_projection_state(state),
+        );
+        Ok(())
+    }
+
+    /// Atomically persists one consumer's projection state.
+    pub fn put_consumer_projection_state(
+        &self,
+        consumer: DeriveConsumerName,
+        state: ConsumerProjectionState,
+    ) -> Result<(), DeriveStoreError> {
+        let mut batch = WriteBatch::default();
+        self.stage_consumer_projection_state(&mut batch, consumer, state)?;
+        self.write_batch(&batch)
+    }
+
     /// Batch-reads multiple keys from a consumer-owned column family.
     ///
     /// Returns one entry per input key in input order: `None` when the key
@@ -1017,6 +1426,156 @@ impl DeriveStore {
             }
         }
         Ok(entries)
+    }
+
+    /// Reads a bounded page from an inclusive consumer-key range.
+    ///
+    /// Rows before `offset` are scanned but never retained, so legacy offset
+    /// pagination cannot allocate in proportion to an untrusted offset.
+    pub fn page_consumer_range(
+        &self,
+        column_family: &'static str,
+        key_range: std::ops::RangeInclusive<&[u8]>,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<ConsumerEntry>, DeriveStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let handle = self.consumer_column_family(column_family)?;
+        let (start_key, end_key_inclusive) = key_range.into_inner();
+        let iterator = self.db.iterator_cf(
+            &handle,
+            IteratorMode::From(start_key, rust_rocksdb::Direction::Forward),
+        );
+        let mut skipped = 0_u64;
+        let mut entries = Vec::with_capacity(limit.min(64));
+        for entry in iterator {
+            let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "page_range",
+                name: column_family,
+                source,
+            })?;
+            if key.as_ref() > end_key_inclusive {
+                break;
+            }
+            if skipped < offset {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            entries.push((key.to_vec(), payload.to_vec()));
+            if entries.len() == limit {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Counts the rows in one consumer-owned column family without copying
+    /// or decoding their payloads.
+    pub fn consumer_row_count(&self, column_family: &'static str) -> Result<u64, DeriveStoreError> {
+        let handle = self.consumer_column_family(column_family)?;
+        let mut row_count = 0_u64;
+        for entry in self.db.iterator_cf(&handle, IteratorMode::Start) {
+            entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "count_rows",
+                name: column_family,
+                source,
+            })?;
+            row_count = row_count.saturating_add(1);
+        }
+        Ok(row_count)
+    }
+
+    /// Visits every row in one consumer-owned column family without copying
+    /// the table into an intermediate collection.
+    ///
+    /// The visitor borrows each key and payload directly from the `RocksDB`
+    /// iterator. Returning an error fails the scan closed as an invalid
+    /// consumer row.
+    pub fn visit_consumer_rows(
+        &self,
+        column_family: &'static str,
+        mut visitor: impl FnMut(&[u8], &[u8]) -> Result<(), String>,
+    ) -> Result<(), DeriveStoreError> {
+        let handle = self.consumer_column_family(column_family)?;
+        for entry in self.db.iterator_cf(&handle, IteratorMode::Start) {
+            let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "visit_rows",
+                name: column_family,
+                source,
+            })?;
+            visitor(&key, &payload).map_err(|reason| DeriveStoreError::ConsumerPayloadDecode {
+                name: column_family,
+                reason,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Visits every row in an inclusive consumer-key range without copying
+    /// the range into an intermediate collection.
+    ///
+    /// The visitor borrows each key and payload directly from the `RocksDB`
+    /// iterator. Returning an error fails the scan closed as an invalid
+    /// consumer row.
+    pub fn visit_consumer_range(
+        &self,
+        column_family: &'static str,
+        key_range: std::ops::RangeInclusive<&[u8]>,
+        mut visitor: impl FnMut(&[u8], &[u8]) -> Result<(), String>,
+    ) -> Result<(), DeriveStoreError> {
+        let handle = self.consumer_column_family(column_family)?;
+        let (start_key, end_key_inclusive) = key_range.into_inner();
+        let iterator = self.db.iterator_cf(
+            &handle,
+            IteratorMode::From(start_key, rust_rocksdb::Direction::Forward),
+        );
+        for entry in iterator {
+            let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "visit_range",
+                name: column_family,
+                source,
+            })?;
+            if key.as_ref() > end_key_inclusive {
+                break;
+            }
+            visitor(&key, &payload).map_err(|reason| DeriveStoreError::ConsumerPayloadDecode {
+                name: column_family,
+                reason,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Counts consumer rows accepted by `predicate` without copying payloads.
+    ///
+    /// The predicate receives each key and payload directly from the storage
+    /// iterator. Returning an error fails the scan closed as an invalid
+    /// consumer payload.
+    pub fn count_consumer_rows_matching(
+        &self,
+        column_family: &'static str,
+        mut predicate: impl FnMut(&[u8], &[u8]) -> Result<bool, String>,
+    ) -> Result<u64, DeriveStoreError> {
+        let handle = self.consumer_column_family(column_family)?;
+        let mut matching_count = 0_u64;
+        for entry in self.db.iterator_cf(&handle, IteratorMode::Start) {
+            let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+                operation: "count_matching_rows",
+                name: column_family,
+                source,
+            })?;
+            if predicate(&key, &payload).map_err(|reason| {
+                DeriveStoreError::ConsumerPayloadDecode {
+                    name: column_family,
+                    reason,
+                }
+            })? {
+                matching_count = matching_count.saturating_add(1);
+            }
+        }
+        Ok(matching_count)
     }
 
     /// Returns the lexicographically last key in a consumer-owned column
@@ -1578,9 +2137,11 @@ impl DeriveStore {
     fn reset_consumer_cursors(&self, name: &str) -> Result<(), DeriveStoreError> {
         let chain_cf = self.column_family(DeriveStoreTable::ChainEventCursor)?;
         let mempool_cf = self.column_family(DeriveStoreTable::MempoolEventCursor)?;
+        let metadata_cf = self.column_family(DeriveStoreTable::ConsumerMetadata)?;
         let mut batch = WriteBatch::default();
         batch.delete_cf(&chain_cf, name.as_bytes());
         batch.delete_cf(&mempool_cf, name.as_bytes());
+        batch.delete_cf(&metadata_cf, consumer_projection_state_key(name));
         self.write_batch(&batch)
     }
 
@@ -1728,6 +2289,41 @@ where
     }
 }
 
+fn block_projection_checkpoint<'event, S>(
+    inputs: ChainEventDispatchInputs<'event>,
+    blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
+) -> BlockProjectionCheckpoint<'event>
+where
+    S: BuildHasher,
+{
+    let projected_range = match inputs.chain_event {
+        ChainEvent::ChainCommitted { committed } | ChainEvent::ChainReorged { committed, .. } => {
+            Some(committed.block_range)
+        }
+        _ => None,
+    };
+    let projected_tip = projected_range.and_then(|range| {
+        if range.start > range.end {
+            return Some((
+                inputs.chain_epoch.visible_tip_height,
+                inputs.chain_epoch.visible_tip_hash,
+            ));
+        }
+        if !range.into_iter().all(|height| blocks.contains_key(&height)) {
+            return None;
+        }
+        blocks
+            .get(&range.end)
+            .map(|block| (block.height, block.block_hash))
+    });
+    BlockProjectionCheckpoint {
+        chain_epoch: inputs.chain_epoch,
+        chain_event: inputs.chain_event,
+        projection_tip_height: projected_tip.map(|(height, _hash)| height),
+        projection_tip_hash: projected_tip.map(|(_height, hash)| hash),
+    }
+}
+
 fn dispatch_chain_event_to_consumer<C>(
     consumer: &mut C,
     inputs: ChainEventDispatchInputs<'_>,
@@ -1797,6 +2393,119 @@ fn consumer_schema_manifest_key(name: &str) -> Vec<u8> {
     key.extend_from_slice(CONSUMER_SCHEMA_KEY_PREFIX);
     key.extend_from_slice(name.as_bytes());
     key
+}
+
+fn consumer_projection_state_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CONSUMER_PROJECTION_STATE_KEY_PREFIX.len() + name.len());
+    key.extend_from_slice(CONSUMER_PROJECTION_STATE_KEY_PREFIX);
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+fn encode_consumer_projection_state(
+    state: ConsumerProjectionState,
+) -> [u8; CONSUMER_PROJECTION_STATE_LEN] {
+    let mut payload = [0_u8; CONSUMER_PROJECTION_STATE_LEN];
+    let mut offset = 0;
+    payload[offset] = CONSUMER_PROJECTION_STATE_VERSION;
+    offset += 1;
+    payload[offset..offset + 8].copy_from_slice(&state.projection_epoch_id.value().to_be_bytes());
+    offset += 8;
+    payload[offset..offset + 4].copy_from_slice(&state.projection_tip_height.value().to_be_bytes());
+    offset += 4;
+    payload[offset..offset + 32].copy_from_slice(&state.projection_tip_hash.as_bytes());
+    offset += 32;
+    payload[offset..offset + 8].copy_from_slice(&state.revision.to_be_bytes());
+    offset += 8;
+    if let Some(coverage) = state.coverage {
+        payload[offset] = 1;
+        offset += 1;
+        payload[offset..offset + 4]
+            .copy_from_slice(&coverage.complete_from_height.value().to_be_bytes());
+        offset += 4;
+        payload[offset..offset + 4]
+            .copy_from_slice(&coverage.complete_through_height.value().to_be_bytes());
+        offset += 4;
+        payload[offset..offset + 32].copy_from_slice(&coverage.complete_through_hash.as_bytes());
+    }
+    payload
+}
+
+fn decode_consumer_projection_state(
+    payload: &[u8],
+) -> Result<ConsumerProjectionState, DeriveStoreError> {
+    let bytes: [u8; CONSUMER_PROJECTION_STATE_LEN] = payload.try_into().map_err(|_| {
+        projection_state_decode_error("consumer projection state length is invalid")
+    })?;
+    if bytes[0] != CONSUMER_PROJECTION_STATE_VERSION {
+        return Err(projection_state_decode_error(
+            "consumer projection state version is unsupported",
+        ));
+    }
+    let projection_epoch_id =
+        ChainEpochId::new(u64::from_be_bytes(bytes[1..9].try_into().map_err(
+            |_| projection_state_decode_error("projection epoch is malformed"),
+        )?));
+    let projection_tip_height =
+        BlockHeight::new(u32::from_be_bytes(bytes[9..13].try_into().map_err(
+            |_| projection_state_decode_error("projection tip height is malformed"),
+        )?));
+    let projection_tip_hash = BlockHash::from_bytes(
+        bytes[13..45]
+            .try_into()
+            .map_err(|_| projection_state_decode_error("projection tip hash is malformed"))?,
+    );
+    let revision = u64::from_be_bytes(
+        bytes[45..53]
+            .try_into()
+            .map_err(|_| projection_state_decode_error("projection revision is malformed"))?,
+    );
+    let coverage =
+        match bytes[53] {
+            0 => None,
+            1 => Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(u32::from_be_bytes(
+                    bytes[54..58].try_into().map_err(|_| {
+                        projection_state_decode_error("coverage start height is malformed")
+                    })?,
+                )),
+                complete_through_height: BlockHeight::new(u32::from_be_bytes(
+                    bytes[58..62].try_into().map_err(|_| {
+                        projection_state_decode_error("coverage end height is malformed")
+                    })?,
+                )),
+                complete_through_hash: BlockHash::from_bytes(bytes[62..94].try_into().map_err(
+                    |_| projection_state_decode_error("coverage end hash is malformed"),
+                )?),
+            }),
+            _ => {
+                return Err(projection_state_decode_error(
+                    "consumer projection coverage presence is invalid",
+                ));
+            }
+        };
+    if coverage.is_some_and(|coverage| {
+        coverage.complete_from_height > coverage.complete_through_height
+            || coverage.complete_through_height > projection_tip_height
+    }) {
+        return Err(projection_state_decode_error(
+            "consumer projection coverage bounds are invalid",
+        ));
+    }
+    Ok(ConsumerProjectionState {
+        projection_epoch_id,
+        projection_tip_height,
+        projection_tip_hash,
+        revision,
+        coverage,
+    })
+}
+
+fn projection_state_decode_error(reason: &'static str) -> DeriveStoreError {
+    DeriveStoreError::Decode {
+        column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+        reason: reason.to_owned(),
+    }
 }
 
 fn encode_manifest_entry(
@@ -1901,6 +2610,8 @@ fn read_manifest_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::mpsc, thread, time::Duration};
+
     use eyre::Result;
     use tempfile::tempdir;
 
@@ -1923,6 +2634,15 @@ mod tests {
         assert!(
             DeriveStore::bundled_event_only_chain_event_consumer_names()
                 .contains(&REORG_INCIDENTS_CONSUMER_NAME)
+        );
+    }
+
+    #[test]
+    fn paid_fee_schema_is_bundled_before_ingest_dispatch_is_wired() {
+        assert!(DeriveStore::bundled_consumers().contains(&PAID_FEE_DISTRIBUTION_SCHEMA));
+        assert!(
+            !DeriveStore::bundled_chain_event_consumer_names()
+                .contains(&PAID_FEE_DISTRIBUTION_SCHEMA.name)
         );
     }
 
@@ -2005,6 +2725,245 @@ mod tests {
         Ok(())
     }
 
+    fn assert_snapshot_point_reads(
+        snapshot: &DeriveStoreReadSnapshot<'_>,
+        initial_state: ConsumerProjectionState,
+        height_10_key: [u8; 4],
+        height_20_key: [u8; 4],
+        height_30_key: [u8; 4],
+    ) -> Result<()> {
+        assert_eq!(
+            snapshot.consumer_projection_state(TEST_CONSUMER)?,
+            Some(initial_state)
+        );
+        assert_eq!(
+            snapshot.get_consumer(TEST_CONSUMER_CF, &height_20_key)?,
+            Some(b"match-before".to_vec())
+        );
+        assert_eq!(
+            snapshot.multi_get_consumer(
+                TEST_CONSUMER_CF,
+                &[height_10_key, height_20_key, height_30_key],
+            )?,
+            vec![Some(b"skip".to_vec()), Some(b"match-before".to_vec()), None,]
+        );
+        Ok(())
+    }
+
+    fn assert_snapshot_scan_reads(
+        snapshot: &DeriveStoreReadSnapshot<'_>,
+        height_10_key: [u8; 4],
+        height_20_key: [u8; 4],
+    ) -> Result<()> {
+        assert_eq!(
+            snapshot.range_iterate_consumer(
+                TEST_CONSUMER_CF,
+                &height_20_key,
+                &height_10_key,
+                usize::MAX,
+            )?,
+            vec![
+                (height_20_key.to_vec(), b"match-before".to_vec()),
+                (height_10_key.to_vec(), b"skip".to_vec()),
+            ]
+        );
+        assert_eq!(
+            snapshot.first_consumer_key(TEST_CONSUMER_CF)?,
+            Some(height_20_key.to_vec())
+        );
+        assert_eq!(
+            snapshot.last_consumer_key(TEST_CONSUMER_CF)?,
+            Some(height_10_key.to_vec())
+        );
+        assert_eq!(
+            snapshot.first_materialized_height_descending(TEST_CONSUMER_CF)?,
+            Some(BlockHeight::new(10))
+        );
+        assert_eq!(
+            snapshot.last_materialized_height_descending(TEST_CONSUMER_CF)?,
+            Some(BlockHeight::new(20))
+        );
+        assert_eq!(snapshot.consumer_row_count(TEST_CONSUMER_CF)?, 2);
+        assert_eq!(
+            snapshot.count_consumer_rows_matching(TEST_CONSUMER_CF, |_key, payload| {
+                Ok(payload.starts_with(b"match"))
+            })?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_snapshot_keeps_all_consumer_reads_on_one_sequence() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = DeriveStore::open(
+            tempdir.path(),
+            DeriveStoreOptions {
+                consumers: &[TEST_CONSUMER_SCHEMA],
+                ..DeriveStoreOptions::default()
+            },
+        )?;
+        let height_5_key = zinder_core::wire::encode_height_key_descending(BlockHeight::new(5));
+        let height_10_key = zinder_core::wire::encode_height_key_descending(BlockHeight::new(10));
+        let height_20_key = zinder_core::wire::encode_height_key_descending(BlockHeight::new(20));
+        let height_30_key = zinder_core::wire::encode_height_key_descending(BlockHeight::new(30));
+        store.put_consumer(TEST_CONSUMER_CF, &height_10_key, b"skip")?;
+        store.put_consumer(TEST_CONSUMER_CF, &height_20_key, b"match-before")?;
+        let initial_state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(1),
+            projection_tip_height: BlockHeight::new(20),
+            projection_tip_hash: BlockHash::from_bytes([0x20; 32]),
+            revision: 1,
+            coverage: None,
+        };
+        store.put_consumer_projection_state(TEST_CONSUMER, initial_state)?;
+
+        let snapshot = store.read_snapshot();
+
+        let advanced_state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(1),
+            projection_tip_height: BlockHeight::new(30),
+            projection_tip_hash: BlockHash::from_bytes([0x30; 32]),
+            revision: 2,
+            coverage: None,
+        };
+        store.put_consumer(TEST_CONSUMER_CF, &height_5_key, b"match-after")?;
+        store.put_consumer(TEST_CONSUMER_CF, &height_20_key, b"match-after")?;
+        store.put_consumer(TEST_CONSUMER_CF, &height_30_key, b"match-after")?;
+        store.put_consumer_projection_state(TEST_CONSUMER, advanced_state)?;
+
+        assert_eq!(
+            store.get_consumer(TEST_CONSUMER_CF, &height_20_key)?,
+            Some(b"match-after".to_vec())
+        );
+        assert_eq!(store.consumer_row_count(TEST_CONSUMER_CF)?, 4);
+        assert_eq!(
+            store.consumer_projection_state(TEST_CONSUMER)?,
+            Some(advanced_state)
+        );
+
+        assert_snapshot_point_reads(
+            &snapshot,
+            initial_state,
+            height_10_key,
+            height_20_key,
+            height_30_key,
+        )?;
+        assert_snapshot_scan_reads(&snapshot, height_10_key, height_20_key)?;
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_read_snapshot_blocks_catch_up_until_reads_finish() -> Result<()> {
+        let primary_directory = tempdir()?;
+        let secondary_directory = tempdir()?;
+        let options = DeriveStoreOptions {
+            consumers: &[TEST_CONSUMER_SCHEMA],
+            ..DeriveStoreOptions::default()
+        };
+        let primary = DeriveStore::open(primary_directory.path(), options)?;
+        primary.put_consumer(TEST_CONSUMER_CF, b"before", b"visible")?;
+        let secondary = DeriveStore::open_secondary(
+            primary_directory.path(),
+            secondary_directory.path(),
+            options,
+        )?;
+        let snapshot = secondary.read_snapshot();
+        primary.put_consumer(TEST_CONSUMER_CF, b"after", b"new")?;
+
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let catch_up_store = secondary.clone();
+        let catch_up = thread::spawn(move || {
+            let _ = started_sender.send(());
+            let outcome = catch_up_store.try_catch_up().is_ok();
+            let _ = finished_sender.send(outcome);
+        });
+        started_receiver.recv_timeout(Duration::from_secs(1))?;
+        assert!(finished_receiver.try_recv().is_err());
+        assert_eq!(snapshot.get_consumer(TEST_CONSUMER_CF, b"after")?, None);
+
+        drop(snapshot);
+        assert!(finished_receiver.recv_timeout(Duration::from_secs(2))?);
+        assert!(catch_up.join().is_ok());
+        assert_eq!(
+            secondary.get_consumer(TEST_CONSUMER_CF, b"after")?,
+            Some(b"new".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn visit_consumer_rows_streams_rows_and_fails_closed() -> Result<()> {
+        let tempdir = tempdir()?;
+        let options = DeriveStoreOptions {
+            consumers: &[TEST_CONSUMER_SCHEMA],
+            ..DeriveStoreOptions::default()
+        };
+        let store = DeriveStore::open(tempdir.path(), options)?;
+        store.put_consumer(TEST_CONSUMER_CF, b"a", b"one")?;
+        store.put_consumer(TEST_CONSUMER_CF, b"b", b"two")?;
+
+        let mut visited = Vec::new();
+        store.visit_consumer_rows(TEST_CONSUMER_CF, |key, payload| {
+            visited.push((key.to_vec(), payload.to_vec()));
+            Ok(())
+        })?;
+        assert_eq!(
+            visited,
+            vec![
+                (b"a".to_vec(), b"one".to_vec()),
+                (b"b".to_vec(), b"two".to_vec())
+            ]
+        );
+
+        let invalid = store.visit_consumer_rows(TEST_CONSUMER_CF, |_key, _payload| {
+            Err("invalid fixture row".to_owned())
+        });
+        assert!(matches!(
+            invalid,
+            Err(DeriveStoreError::ConsumerPayloadDecode { name, reason })
+                if name == TEST_CONSUMER_CF && reason == "invalid fixture row"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn visit_consumer_range_streams_only_inclusive_bounds_and_fails_closed() -> Result<()> {
+        let tempdir = tempdir()?;
+        let options = DeriveStoreOptions {
+            consumers: &[TEST_CONSUMER_SCHEMA],
+            ..DeriveStoreOptions::default()
+        };
+        let store = DeriveStore::open(tempdir.path(), options)?;
+        for key in [b"a", b"b", b"c", b"d"] {
+            store.put_consumer(TEST_CONSUMER_CF, key, key)?;
+        }
+
+        let mut visited = Vec::new();
+        store.visit_consumer_range(
+            TEST_CONSUMER_CF,
+            b"b".as_slice()..=b"c".as_slice(),
+            |key, _| {
+                visited.push(key.to_vec());
+                Ok(())
+            },
+        )?;
+        assert_eq!(visited, vec![b"b".to_vec(), b"c".to_vec()]);
+
+        let invalid = store.visit_consumer_range(
+            TEST_CONSUMER_CF,
+            b"b".as_slice()..=b"c".as_slice(),
+            |_key, _payload| Err("invalid bounded fixture row".to_owned()),
+        );
+        assert!(matches!(
+            invalid,
+            Err(DeriveStoreError::ConsumerPayloadDecode { name, reason })
+                if name == TEST_CONSUMER_CF && reason == "invalid bounded fixture row"
+        ));
+        Ok(())
+    }
+
     #[test]
     fn reopening_a_store_with_an_advanced_store_format_version_returns_mismatch() -> Result<()> {
         let tempdir = tempdir()?;
@@ -2076,6 +3035,47 @@ mod tests {
             vec!["alpha".to_owned(), "beta_index".to_owned()]
         );
         Ok(())
+    }
+
+    #[test]
+    fn consumer_projection_state_round_trips_verified_coverage() -> Result<()> {
+        let state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(42),
+            projection_tip_height: BlockHeight::new(100),
+            projection_tip_hash: BlockHash::from_bytes([0xA1; 32]),
+            revision: 7,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(1),
+                complete_through_height: BlockHeight::new(90),
+                complete_through_hash: BlockHash::from_bytes([0xB2; 32]),
+            }),
+        };
+
+        let decoded = decode_consumer_projection_state(&encode_consumer_projection_state(state))?;
+
+        assert_eq!(decoded, state);
+        Ok(())
+    }
+
+    #[test]
+    fn consumer_projection_state_rejects_coverage_past_projection_tip() {
+        let state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(42),
+            projection_tip_height: BlockHeight::new(10),
+            projection_tip_hash: BlockHash::from_bytes([0xA1; 32]),
+            revision: 7,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(1),
+                complete_through_height: BlockHeight::new(11),
+                complete_through_hash: BlockHash::from_bytes([0xB2; 32]),
+            }),
+        };
+
+        let outcome = decode_consumer_projection_state(&encode_consumer_projection_state(state));
+
+        assert!(
+            matches!(outcome, Err(DeriveStoreError::Decode { reason, .. }) if reason.contains("coverage bounds"))
+        );
     }
 
     #[test]

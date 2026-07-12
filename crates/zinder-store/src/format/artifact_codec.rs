@@ -1,18 +1,23 @@
 //! Protobuf and envelope codecs for persisted chain records.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use prost::Message;
 use zinder_core::{
-    ArtifactSchemaVersion, AuthDigest, BlockBlobArtifact, BlockHash, BlockHeaderArtifact,
-    BlockHeight, BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, ConsensusBranchId, LockTime, MempoolEntry,
-    MempoolEvictionReason, Network, PrivacyShape, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact,
-    TransactionComponentCounts, TransactionFactsArtifact, TransactionId, TransactionLocation,
-    TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
-    TransparentMempoolOutput, TransparentMempoolSpend, TransparentOutPoint,
+    ArtifactSchemaVersion, AuthDigest, BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash,
+    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, BlockTransactionIndexArtifact,
+    BlockValuePoolBalances, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
+    ConsensusBranchId, DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,
+    FinalNoteCommitmentRoot, LockTime, MempoolEntry, MempoolEvictionReason, Network, PrivacyShape,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    TransactionBlobArtifact, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash,
+    TransparentInputFact, TransparentMempoolOutput, TransparentMempoolSpend, TransparentOutPoint,
     TransparentOutputArtifact, TransparentOutputFact, TransparentSpendFact,
-    TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection, Wtxid,
+    TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection,
+    ValuePoolBalance, Wtxid,
 };
 
 use crate::{
@@ -623,6 +628,189 @@ pub(crate) fn encode_block_header_artifact(
     )
 }
 
+pub(crate) fn encode_displaced_block(block: &DisplacedBlock) -> Result<Vec<u8>, StoreError> {
+    encode_artifact_record(
+        PayloadFormat::ZinderDisplacedBlockV1,
+        &DisplacedBlockRecord {
+            block_hash: block.block_hash.as_bytes().to_vec(),
+            header: Some(block_header_artifact_record(&block.header)),
+            transaction_ids: block
+                .transaction_ids
+                .iter()
+                .map(|transaction_id| transaction_id.as_bytes().to_vec())
+                .collect(),
+            coinbase_outputs: block
+                .coinbase_outputs
+                .iter()
+                .map(|output| DisplacedBlockCoinbaseOutputRecord {
+                    output_index: output.output_index,
+                    value_zat: output.value_zat,
+                    script_pub_key: Bytes::copy_from_slice(&output.script_pub_key),
+                })
+                .collect(),
+            raw_block_bytes: block.raw_block_bytes.as_deref().map(Bytes::copy_from_slice),
+            displacement_event_sequence: block.displacement_event_sequence,
+            displacement_epoch: block.displacement_epoch.value(),
+            displaced_at_unix_millis: block.displaced_at.value(),
+            final_note_commitment_roots: block.final_note_commitment_roots.map(|roots| {
+                DisplacedBlockFinalNoteCommitmentRootsRecord {
+                    sapling: roots.sapling.map(|root| root.as_bytes().to_vec()),
+                    orchard: roots.orchard.map(|root| root.as_bytes().to_vec()),
+                    ironwood: roots.ironwood.map(|root| root.as_bytes().to_vec()),
+                }
+            }),
+        },
+    )
+}
+
+pub(crate) fn decode_displaced_block(
+    key: &StoreKey,
+    envelope_bytes: &[u8],
+) -> Result<DisplacedBlock, StoreError> {
+    let payload_bytes = decode_artifact_payload(
+        ArtifactFamily::DisplacedBlock,
+        key,
+        envelope_bytes,
+        PayloadFormat::ZinderDisplacedBlockV1,
+    )?;
+    let record =
+        DisplacedBlockRecord::decode(payload_bytes).map_err(|_| StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::DisplacedBlock,
+            key: key.clone().into(),
+            reason: "displaced block record is not valid protobuf",
+        })?;
+    let header_record = record.header.ok_or(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::DisplacedBlock,
+        key: key.clone().into(),
+        reason: "displaced block record is missing its header",
+    })?;
+    let header =
+        decode_block_header_artifact_record(ArtifactFamily::DisplacedBlock, key, &header_record)?;
+    let block_hash = decode_block_hash(ArtifactFamily::DisplacedBlock, key, &record.block_hash)?;
+    if header.block_hash != block_hash {
+        return Err(StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::DisplacedBlock,
+            key: key.clone().into(),
+            reason: "displaced block identity does not match its header",
+        });
+    }
+    let transaction_ids = record
+        .transaction_ids
+        .iter()
+        .map(|bytes| decode_transaction_id_for_family(ArtifactFamily::DisplacedBlock, key, bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let coinbase_outputs = record
+        .coinbase_outputs
+        .into_iter()
+        .map(|output| {
+            DisplacedBlockCoinbaseOutput::new(
+                output.output_index,
+                output.value_zat,
+                output.script_pub_key.to_vec(),
+            )
+        })
+        .collect();
+    let final_note_commitment_roots = record
+        .final_note_commitment_roots
+        .map(|roots| {
+            Ok(BlockFinalNoteCommitmentRoots::new(
+                header.height,
+                block_hash,
+                decode_optional_final_note_commitment_root(
+                    ArtifactFamily::DisplacedBlock,
+                    key,
+                    roots.sapling.as_deref(),
+                )?,
+                decode_optional_final_note_commitment_root(
+                    ArtifactFamily::DisplacedBlock,
+                    key,
+                    roots.orchard.as_deref(),
+                )?,
+                decode_optional_final_note_commitment_root(
+                    ArtifactFamily::DisplacedBlock,
+                    key,
+                    roots.ironwood.as_deref(),
+                )?,
+            ))
+        })
+        .transpose()?;
+
+    Ok(DisplacedBlock {
+        block_hash,
+        header,
+        transaction_ids,
+        coinbase_outputs,
+        raw_block_bytes: record.raw_block_bytes.map(|bytes| bytes.to_vec()),
+        final_note_commitment_roots,
+        displacement_event_sequence: record.displacement_event_sequence,
+        displacement_epoch: ChainEpochId::new(record.displacement_epoch),
+        displaced_at: UnixTimestampMillis::new(record.displaced_at_unix_millis),
+    })
+}
+
+pub(crate) fn encode_displaced_block_archive_coverage(
+    coverage: DisplacedBlockArchiveCoverage,
+) -> Vec<u8> {
+    DisplacedBlockArchiveCoverageRecord {
+        activation_event_sequence: coverage.activation_event_sequence,
+        activation_epoch: coverage.activation_epoch.value(),
+        activated_at_unix_millis: coverage.activated_at.value(),
+    }
+    .encode_to_vec()
+}
+
+pub(crate) fn decode_displaced_block_archive_coverage(
+    key: &StoreKey,
+    record_bytes: &[u8],
+) -> Result<DisplacedBlockArchiveCoverage, StoreError> {
+    let record = DisplacedBlockArchiveCoverageRecord::decode(record_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::DisplacedBlock,
+            key: key.clone().into(),
+            reason: "displaced block archive coverage record is not valid protobuf",
+        }
+    })?;
+    Ok(DisplacedBlockArchiveCoverage {
+        activation_event_sequence: record.activation_event_sequence,
+        activation_epoch: ChainEpochId::new(record.activation_epoch),
+        activated_at: UnixTimestampMillis::new(record.activated_at_unix_millis),
+    })
+}
+
+fn block_header_artifact_record(block: &BlockHeaderArtifact) -> BlockHeaderArtifactRecord {
+    BlockHeaderArtifactRecord {
+        height: block.height.value(),
+        block_hash: block.block_hash.as_bytes().to_vec(),
+        parent_hash: block.parent_hash.as_bytes().to_vec(),
+        merkle_root_hash: block.merkle_root_hash.to_vec(),
+        commitment_bytes: block.commitment_bytes.to_vec(),
+        block_time: block.block_time,
+        bits: block.bits,
+        nonce: block.nonce.to_vec(),
+        version: block.version,
+        block_size_bytes: block.block_size_bytes,
+    }
+}
+
+fn decode_block_header_artifact_record(
+    family: ArtifactFamily,
+    key: &StoreKey,
+    record: &BlockHeaderArtifactRecord,
+) -> Result<BlockHeaderArtifact, StoreError> {
+    Ok(BlockHeaderArtifact::new(
+        BlockHeight::new(record.height),
+        decode_block_hash(family, key, &record.block_hash)?,
+        decode_block_hash(family, key, &record.parent_hash)?,
+        decode_fixed_32(family, key, &record.merkle_root_hash, "merkle root hash")?,
+        decode_fixed_32(family, key, &record.commitment_bytes, "commitment bytes")?,
+        record.block_time,
+        record.bits,
+        decode_fixed_32(family, key, &record.nonce, "nonce")?,
+        record.version,
+        record.block_size_bytes,
+    ))
+}
+
 pub(crate) fn decode_block_header_artifact(
     key: &StoreKey,
     envelope_bytes: &[u8],
@@ -862,6 +1050,66 @@ pub(crate) fn decode_transaction_facts_artifact(
     decode_transaction_facts_artifact_record(key, record)
 }
 
+pub(crate) fn encode_transaction_intrinsic_value_balances(
+    artifact: TransactionIntrinsicValueBalancesArtifact,
+) -> Result<Vec<u8>, StoreError> {
+    encode_artifact_record(
+        PayloadFormat::ZinderTransactionIntrinsicValueBalancesV1,
+        &TransactionIntrinsicValueBalancesRecord {
+            transaction_id: artifact.location.transaction_id.as_bytes().to_vec(),
+            block_height: artifact.location.block_height.value(),
+            block_hash: artifact.location.block_hash.as_bytes().to_vec(),
+            tx_index_in_block: artifact.location.tx_index_in_block,
+            sprout_zat: artifact.value_balances.sprout_zat,
+            sapling_zat: artifact.value_balances.sapling_zat,
+            orchard_zat: artifact.value_balances.orchard_zat,
+            ironwood_zat: artifact.value_balances.ironwood_zat,
+        },
+    )
+}
+
+pub(crate) fn decode_transaction_intrinsic_value_balances(
+    key: &StoreKey,
+    envelope_bytes: &[u8],
+) -> Result<TransactionIntrinsicValueBalancesArtifact, StoreError> {
+    let payload_bytes = decode_artifact_payload(
+        ArtifactFamily::TransactionIntrinsicValueBalances,
+        key,
+        envelope_bytes,
+        PayloadFormat::ZinderTransactionIntrinsicValueBalancesV1,
+    )?;
+    let record = TransactionIntrinsicValueBalancesRecord::decode(payload_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::TransactionIntrinsicValueBalances,
+            key: key.clone().into(),
+            reason: "transaction intrinsic value-balances record is not valid protobuf",
+        }
+    })?;
+    let location = TransactionLocation::new(
+        decode_transaction_id_for_family(
+            ArtifactFamily::TransactionIntrinsicValueBalances,
+            key,
+            &record.transaction_id,
+        )?,
+        BlockHeight::new(record.block_height),
+        decode_block_hash(
+            ArtifactFamily::TransactionIntrinsicValueBalances,
+            key,
+            &record.block_hash,
+        )?,
+        record.tx_index_in_block,
+    );
+    Ok(TransactionIntrinsicValueBalancesArtifact::new(
+        location,
+        TransactionIntrinsicValueBalances::new(
+            record.sprout_zat,
+            record.sapling_zat,
+            record.orchard_zat,
+            record.ironwood_zat,
+        ),
+    ))
+}
+
 pub(crate) fn encode_transaction_blob_artifact(
     artifact: TransactionBlobArtifact,
 ) -> Result<Vec<u8>, StoreError> {
@@ -945,6 +1193,149 @@ pub(crate) fn decode_tree_state_artifact(
         BlockHeight::new(record.height),
         decode_block_hash(ArtifactFamily::TreeState, key, &record.block_hash)?,
         record.payload_bytes.to_vec(),
+    ))
+}
+
+pub(crate) fn encode_final_note_commitment_roots(
+    roots: BlockFinalNoteCommitmentRoots,
+) -> Result<Vec<u8>, StoreError> {
+    encode_artifact_record(
+        PayloadFormat::ZinderBlockFinalNoteCommitmentRootsV1,
+        &BlockFinalNoteCommitmentRootsRecord {
+            height: roots.height.value(),
+            block_hash: roots.block_hash.as_bytes().to_vec(),
+            sapling: roots.sapling.map(|root| root.as_bytes().to_vec()),
+            orchard: roots.orchard.map(|root| root.as_bytes().to_vec()),
+            ironwood: roots.ironwood.map(|root| root.as_bytes().to_vec()),
+        },
+    )
+}
+
+pub(crate) fn decode_final_note_commitment_roots(
+    key: &StoreKey,
+    envelope_bytes: &[u8],
+) -> Result<BlockFinalNoteCommitmentRoots, StoreError> {
+    let payload_bytes = decode_artifact_payload(
+        ArtifactFamily::FinalNoteCommitmentRoots,
+        key,
+        envelope_bytes,
+        PayloadFormat::ZinderBlockFinalNoteCommitmentRootsV1,
+    )?;
+    let record = BlockFinalNoteCommitmentRootsRecord::decode(payload_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::FinalNoteCommitmentRoots,
+            key: key.clone().into(),
+            reason: "final note-commitment roots record is not valid protobuf",
+        }
+    })?;
+
+    Ok(BlockFinalNoteCommitmentRoots::new(
+        BlockHeight::new(record.height),
+        decode_block_hash(
+            ArtifactFamily::FinalNoteCommitmentRoots,
+            key,
+            &record.block_hash,
+        )?,
+        decode_optional_final_note_commitment_root(
+            ArtifactFamily::FinalNoteCommitmentRoots,
+            key,
+            record.sapling.as_deref(),
+        )?,
+        decode_optional_final_note_commitment_root(
+            ArtifactFamily::FinalNoteCommitmentRoots,
+            key,
+            record.orchard.as_deref(),
+        )?,
+        decode_optional_final_note_commitment_root(
+            ArtifactFamily::FinalNoteCommitmentRoots,
+            key,
+            record.ironwood.as_deref(),
+        )?,
+    ))
+}
+
+pub(crate) fn encode_block_value_pool_balances(
+    balances: &BlockValuePoolBalances,
+) -> Result<Vec<u8>, StoreError> {
+    encode_artifact_record(
+        PayloadFormat::ZinderBlockValuePoolBalancesV1,
+        &BlockValuePoolBalancesRecord {
+            height: balances.block_id.height.value(),
+            block_hash: balances.block_id.hash.as_bytes().to_vec(),
+            block_time_seconds: balances.block_time_seconds,
+            pools: balances
+                .pools
+                .iter()
+                .map(|pool| ValuePoolBalanceRecord {
+                    id: pool.id.clone(),
+                    monitored: pool.monitored,
+                    value_zat: pool.value_zat,
+                })
+                .collect(),
+        },
+    )
+}
+
+pub(crate) fn decode_block_value_pool_balances(
+    key: &StoreKey,
+    envelope_bytes: &[u8],
+) -> Result<BlockValuePoolBalances, StoreError> {
+    let payload_bytes = decode_artifact_payload(
+        ArtifactFamily::BlockValuePoolBalances,
+        key,
+        envelope_bytes,
+        PayloadFormat::ZinderBlockValuePoolBalancesV1,
+    )?;
+    let record = BlockValuePoolBalancesRecord::decode(payload_bytes).map_err(|_| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::BlockValuePoolBalances,
+            key: key.clone().into(),
+            reason: "block value-pool balances record is not valid protobuf",
+        }
+    })?;
+    if record.pools.is_empty() {
+        return Err(StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::BlockValuePoolBalances,
+            key: key.clone().into(),
+            reason: "block value-pool balances record contains no pools",
+        });
+    }
+
+    let mut pool_ids = HashSet::with_capacity(record.pools.len());
+    let mut pools = Vec::with_capacity(record.pools.len());
+    for pool in record.pools {
+        if pool.id.is_empty() {
+            return Err(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::BlockValuePoolBalances,
+                key: key.clone().into(),
+                reason: "block value-pool balances record contains an empty pool id",
+            });
+        }
+        if !pool_ids.insert(pool.id.clone()) {
+            return Err(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::BlockValuePoolBalances,
+                key: key.clone().into(),
+                reason: "block value-pool balances record contains a duplicate pool id",
+            });
+        }
+        pools.push(ValuePoolBalance::new(
+            pool.id,
+            pool.monitored,
+            pool.value_zat,
+        ));
+    }
+
+    Ok(BlockValuePoolBalances::new(
+        BlockId::new(
+            BlockHeight::new(record.height),
+            decode_block_hash(
+                ArtifactFamily::BlockValuePoolBalances,
+                key,
+                &record.block_hash,
+            )?,
+        ),
+        record.block_time_seconds,
+        pools,
     ))
 }
 
@@ -1944,6 +2335,13 @@ const fn artifact_family_for_payload_format(payload_format: PayloadFormat) -> Ar
         PayloadFormat::ZinderCompactBlockArtifactV1 => ArtifactFamily::CompactBlock,
         PayloadFormat::ZinderTransactionFactsArtifactV1 => ArtifactFamily::TransactionFacts,
         PayloadFormat::ZinderTreeStateArtifactV1 => ArtifactFamily::TreeState,
+        PayloadFormat::ZinderBlockFinalNoteCommitmentRootsV1 => {
+            ArtifactFamily::FinalNoteCommitmentRoots
+        }
+        PayloadFormat::ZinderTransactionIntrinsicValueBalancesV1 => {
+            ArtifactFamily::TransactionIntrinsicValueBalances
+        }
+        PayloadFormat::ZinderBlockValuePoolBalancesV1 => ArtifactFamily::BlockValuePoolBalances,
         PayloadFormat::ZinderSubtreeRootArtifactV1 => ArtifactFamily::SubtreeRoot,
         PayloadFormat::ZinderTransparentUnspentOutputV1 => ArtifactFamily::AddressOutputIndex,
         PayloadFormat::ZinderTransparentSpendFactV2
@@ -1958,6 +2356,7 @@ const fn artifact_family_for_payload_format(payload_format: PayloadFormat) -> Ar
         }
         PayloadFormat::ZinderTransactionLocationArtifactV1 => ArtifactFamily::TransactionLocation,
         PayloadFormat::ZinderTransactionBlobArtifactV1 => ArtifactFamily::TransactionBlob,
+        PayloadFormat::ZinderDisplacedBlockV1 => ArtifactFamily::DisplacedBlock,
     }
 }
 
@@ -2043,6 +2442,24 @@ fn decode_subtree_root_hash(
         })?;
 
     Ok(SubtreeRootHash::from_bytes(root_hash_bytes))
+}
+
+fn decode_optional_final_note_commitment_root(
+    family: ArtifactFamily,
+    key: &StoreKey,
+    root_bytes: Option<&[u8]>,
+) -> Result<Option<FinalNoteCommitmentRoot>, StoreError> {
+    root_bytes
+        .map(|bytes| {
+            decode_fixed_32(
+                family,
+                key,
+                bytes,
+                "final note-commitment root must be 32 bytes",
+            )
+            .map(FinalNoteCommitmentRoot::from_bytes)
+        })
+        .transpose()
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -2179,6 +2596,58 @@ struct BlockTransactionIndexArtifactRecord {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct DisplacedBlockRecord {
+    #[prost(bytes, tag = "1")]
+    block_hash: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    header: Option<BlockHeaderArtifactRecord>,
+    #[prost(bytes, repeated, tag = "3")]
+    transaction_ids: Vec<Vec<u8>>,
+    #[prost(message, repeated, tag = "4")]
+    coinbase_outputs: Vec<DisplacedBlockCoinbaseOutputRecord>,
+    #[prost(bytes = "bytes", optional, tag = "5")]
+    raw_block_bytes: Option<Bytes>,
+    #[prost(uint64, tag = "6")]
+    displacement_event_sequence: u64,
+    #[prost(uint64, tag = "7")]
+    displacement_epoch: u64,
+    #[prost(uint64, tag = "8")]
+    displaced_at_unix_millis: u64,
+    #[prost(message, optional, tag = "9")]
+    final_note_commitment_roots: Option<DisplacedBlockFinalNoteCommitmentRootsRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DisplacedBlockFinalNoteCommitmentRootsRecord {
+    #[prost(bytes, optional, tag = "1")]
+    sapling: Option<Vec<u8>>,
+    #[prost(bytes, optional, tag = "2")]
+    orchard: Option<Vec<u8>>,
+    #[prost(bytes, optional, tag = "3")]
+    ironwood: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DisplacedBlockCoinbaseOutputRecord {
+    #[prost(uint32, tag = "1")]
+    output_index: u32,
+    #[prost(uint64, tag = "2")]
+    value_zat: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    script_pub_key: Bytes,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+struct DisplacedBlockArchiveCoverageRecord {
+    #[prost(uint64, tag = "1")]
+    activation_event_sequence: u64,
+    #[prost(uint64, tag = "2")]
+    activation_epoch: u64,
+    #[prost(uint64, tag = "3")]
+    activated_at_unix_millis: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct TransactionLocationArtifactRecord {
     #[prost(bytes, tag = "1")]
     transaction_id: Vec<u8>,
@@ -2311,6 +2780,26 @@ struct TransactionBlobArtifactRecord {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct TransactionIntrinsicValueBalancesRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    block_height: u32,
+    #[prost(bytes, tag = "3")]
+    block_hash: Vec<u8>,
+    #[prost(uint32, tag = "4")]
+    tx_index_in_block: u32,
+    #[prost(sint64, tag = "5")]
+    sprout_zat: i64,
+    #[prost(sint64, tag = "6")]
+    sapling_zat: i64,
+    #[prost(sint64, tag = "7")]
+    orchard_zat: i64,
+    #[prost(sint64, tag = "8")]
+    ironwood_zat: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct TreeStateArtifactRecord {
     #[prost(uint32, tag = "1")]
     height: u32,
@@ -2318,6 +2807,42 @@ struct TreeStateArtifactRecord {
     block_hash: Vec<u8>,
     #[prost(bytes = "bytes", tag = "3")]
     payload_bytes: Bytes,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct BlockFinalNoteCommitmentRootsRecord {
+    #[prost(uint32, tag = "1")]
+    height: u32,
+    #[prost(bytes, tag = "2")]
+    block_hash: Vec<u8>,
+    #[prost(bytes, optional, tag = "3")]
+    sapling: Option<Vec<u8>>,
+    #[prost(bytes, optional, tag = "4")]
+    orchard: Option<Vec<u8>>,
+    #[prost(bytes, optional, tag = "5")]
+    ironwood: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct BlockValuePoolBalancesRecord {
+    #[prost(uint32, tag = "1")]
+    height: u32,
+    #[prost(bytes, tag = "2")]
+    block_hash: Vec<u8>,
+    #[prost(sint64, tag = "3")]
+    block_time_seconds: i64,
+    #[prost(message, repeated, tag = "4")]
+    pools: Vec<ValuePoolBalanceRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ValuePoolBalanceRecord {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(bool, tag = "2")]
+    monitored: bool,
+    #[prost(uint64, optional, tag = "3")]
+    value_zat: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -2507,4 +3032,76 @@ struct TransparentMempoolSpendRecord {
     spent_output_index: u32,
     #[prost(bytes, tag = "3")]
     spending_transaction_id: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn displaced_block_codec_reads_rows_written_before_root_capture() -> Result<(), StoreError> {
+        let block_hash = BlockHash::from_bytes([0x21; 32]);
+        let header = BlockHeaderArtifact::new(
+            BlockHeight::new(42),
+            block_hash,
+            BlockHash::from_bytes([0x20; 32]),
+            [0x22; 32],
+            [0x23; 32],
+            1_700_000_000,
+            0x1d00_ffff,
+            [0x24; 32],
+            4,
+            1_024,
+        );
+        let encoded = encode_artifact_record(
+            PayloadFormat::ZinderDisplacedBlockV1,
+            &DisplacedBlockRecord {
+                block_hash: block_hash.as_bytes().to_vec(),
+                header: Some(block_header_artifact_record(&header)),
+                transaction_ids: Vec::new(),
+                coinbase_outputs: Vec::new(),
+                raw_block_bytes: None,
+                displacement_event_sequence: 7,
+                displacement_epoch: 8,
+                displaced_at_unix_millis: 9,
+                final_note_commitment_roots: None,
+            },
+        )?;
+        let key =
+            StoreKey::displaced_block_by_order(Network::ZcashRegtest, 7, BlockHeight::new(42));
+
+        let decoded = decode_displaced_block(&key, &encoded)?;
+        assert_eq!(decoded.block_hash, block_hash);
+        assert_eq!(decoded.final_note_commitment_roots, None);
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_intrinsic_value_balances_codec_preserves_signed_i64_fields()
+    -> Result<(), StoreError> {
+        let transaction_id = TransactionId::from_bytes([17; 32]);
+        let location = TransactionLocation::new(
+            transaction_id,
+            BlockHeight::new(42),
+            BlockHash::from_bytes([18; 32]),
+            3,
+        );
+        let artifact = TransactionIntrinsicValueBalancesArtifact::new(
+            location,
+            TransactionIntrinsicValueBalances::new(i64::MIN, -1, 1, i64::MAX),
+        );
+        let key = StoreKey::transaction_intrinsic_value_balances(
+            Network::ZcashRegtest,
+            ChainEpochId::new(9),
+            transaction_id,
+        );
+
+        let encoded = encode_transaction_intrinsic_value_balances(artifact)?;
+        assert_eq!(
+            decode_transaction_intrinsic_value_balances(&key, &encoded)?,
+            artifact
+        );
+
+        Ok(())
+    }
 }

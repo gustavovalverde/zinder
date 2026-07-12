@@ -603,6 +603,35 @@ impl RocksChainStore {
         scan_outcome
     }
 
+    pub(crate) fn scan_prefix_reverse_before(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        before: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        let column_family = self.column_family(table)?;
+        let mut iterator = self.db.raw_iterator_cf(&column_family);
+        iterator.seek_for_prev(before.as_bytes());
+        if iterator.key() == Some(before.as_bytes()) {
+            iterator.prev();
+        }
+        while iterator.valid() {
+            let Some((key, row_value)) = iterator.item() else {
+                iterator.status().map_err(StoreError::storage_unavailable)?;
+                return Ok(());
+            };
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
+                break;
+            }
+            iterator.prev();
+        }
+        iterator.status().map_err(StoreError::storage_unavailable)
+    }
+
     pub(crate) fn scan_forward(
         &self,
         caller: StoreReadCaller,
@@ -1159,6 +1188,14 @@ pub(crate) trait RocksChainStoreRead {
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError>;
 
+    fn scan_prefix_reverse_before(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        before: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError>;
+
     fn scan_forward(
         &self,
         table: StorageTable,
@@ -1237,6 +1274,16 @@ impl RocksChainStoreRead for RocksChainStore {
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError> {
         Self::scan_prefix_reverse(self, StoreReadCaller::Query, table, prefix, visit)
+    }
+
+    fn scan_prefix_reverse_before(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        before: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        Self::scan_prefix_reverse_before(self, table, prefix, before, visit)
     }
 
     fn scan_forward(
@@ -1329,6 +1376,23 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
             Self::Snapshot(snapshot) => snapshot.scan_prefix_reverse(table, prefix, visit),
             Self::Direct { store, caller } => {
                 store.scan_prefix_reverse(*caller, table, prefix, visit)
+            }
+        }
+    }
+
+    fn scan_prefix_reverse_before(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        before: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Snapshot(snapshot) => {
+                snapshot.scan_prefix_reverse_before(table, prefix, before, visit)
+            }
+            Self::Direct { store, caller: _ } => {
+                store.scan_prefix_reverse_before(table, prefix, before, visit)
             }
         }
     }
@@ -1487,6 +1551,35 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
         record_store_scan_outcome(self.caller, table, started_at, &scan_outcome);
 
         scan_outcome
+    }
+
+    fn scan_prefix_reverse_before(
+        &self,
+        table: StorageTable,
+        prefix: &StoreKey,
+        before: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        let column_family = self.store.column_family(table)?;
+        let mut iterator = self.snapshot.raw_iterator_cf(&column_family);
+        iterator.seek_for_prev(before.as_bytes());
+        if iterator.key() == Some(before.as_bytes()) {
+            iterator.prev();
+        }
+        while iterator.valid() {
+            let Some((key, row_value)) = iterator.item() else {
+                iterator.status().map_err(StoreError::storage_unavailable)?;
+                return Ok(());
+            };
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
+                break;
+            }
+            iterator.prev();
+        }
+        iterator.status().map_err(StoreError::storage_unavailable)
     }
 
     fn scan_forward(

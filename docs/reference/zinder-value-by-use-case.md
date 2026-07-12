@@ -1,141 +1,45 @@
-# What Zinder Adds By Use Case
+# Zinder Information by Use Case
 
-Zinder is a service-oriented indexer for Zcash applications. It reads validated chain data from a node, stores the public facts that products share, and exposes stable APIs for explorers, wallets, and payment services.
+This catalog is the single reference for public chain information gathered or derived by Zinder. It describes native Zinder data, not compatibility adapters or competitor parity. A row represents an information family rather than an individual RPC.
 
-Zinder does not validate consensus and does not hold wallet keys. Use Zebra for full-node validation and node-owned indexed state. Use lightwalletd when an integration needs the reference LightWallet gRPC server exactly as existing clients expect it. Use Zaino when an integration needs a faster reimplementation of that same protocol plus selected zcashd-compatible RPCs. Use Zinder when several services need the same public chain data at the same committed chain epoch, with explicit freshness, reorg, and feature-negotiation semantics.
+Availability is part of the contract. Consumers must use capability discovery, freshness envelopes, canonical artifact versions, and per-projection coverage instead of inferring completeness from a successful response.
 
-## Layer Choice
+| Domain | Information gathered or derived | Source and retention | Public surface | Availability and completeness | Use case and value |
+| --- | --- | --- | --- | --- | --- |
+| Consistency and discovery | Network, service version, capabilities, canonical artifact schema, visible and settled tips, and source observation | Service configuration, canonical store, and live source probes; current state | Wallet and Explorer `ServerInfo`, `ChainView`, and freshness envelopes | Always explicit; optional surfaces are callable only when their capability is advertised | Lets developers, users, and agents negotiate features and detect stale or incompatible deployments before trusting data |
+| Blocks and shielded trees | Canonical block identity, header fields, time, size, transaction ids, compact blocks, and optional raw blocks | Parsed node blocks; canonical retention plus configured raw-blob retention | Wallet block selectors, compact/full block reads, Explorer block detail and block ranges | Epoch-pinned; raw bytes may be unavailable by retention policy | Wallet synchronization, explorer block pages, audit trails, and deterministic joins |
+| Blocks and shielded trees | Sapling, Orchard, and Ironwood tree state, subtree roots, final note-commitment roots, and tree sizes | Node tree state and parsed blocks; canonical artifacts with resumable historical enrichment for final roots | Wallet tree-state/subtree RPCs and Explorer commitment-root search | Pool fields are activation-aware; final-root capability and coverage identify enriched history | Wallet witness construction, migration analysis, root lookup, and chain-integrity diagnostics |
+| Blocks and shielded trees | Block production series and weekday/hour activity distribution | Block-summary projection | Explorer production and activity RPCs | Bounded by the projection checkpoint and reported coverage | Explorer charts, operational analysis, and machine-readable activity patterns |
+| Transactions | Canonical transaction location, status, raw bytes, parsed public facts, component counts, privacy shape, and pool action counts | Parsed node transactions; facts retained canonically, raw bytes policy-controlled | Wallet transaction lookup; Explorer detail, block transactions, recent transactions, generic history, and component summary | Missing raw bytes or optional facts remain unknown; history responses carry projection fences and coverage | Transaction pages, wallet confirmation tracking, search results, analytics, and agent-safe inspection |
+| Transactions | Transaction-intrinsic Sprout, Sapling, Orchard, and Ironwood value balances | Parsed transaction bytes; canonical artifact from schema 15 with resumable enrichment | Explorer transaction detail and generic transaction history | Capability requires schema 15 or newer; absence means unknown, not zero | Shielded-flow analysis without repeated transaction parsing |
+| Transactions | Resolved transparent inputs, outputs, prevouts, spends, and paid fee | Canonical transaction facts plus outpoint resolution; facts retained while raw bytes follow policy | Explorer transaction detail and paid-fee projections; Wallet outpoint reads | Paid fee is present only when every required prevout resolves at the pinned view | Accurate fee displays, transaction accounting, and spend provenance |
+| Transparent state | Address balance, UTXOs, transaction ids, history, value deltas, lifetime totals, and coherent activity | Canonical transparent facts plus derive projections | Wallet transparent APIs; Explorer activity and delta RPCs | Epoch-pinned; each derive-backed response uses its own projection checkpoint | Wallet support, explorer address pages, accounting, and reusable address analytics |
+| Transparent state | Address ranking by received, sent, balance, and transaction activity with script-type totals | Snapshot plus incremental transparent-address projection | Explorer transparent-address ranking | Capability is withheld until snapshot coverage is activated and caught up | Rich-list views, distribution analysis, and bounded agent queries |
+| Transparent state | UTXO-set count, total value, and optional commitment | Canonical transparent-output projection | Wallet and Explorer UTXO-set summary | Commitment availability is explicit; response does not claim format-dependent node hashes | Supply and integrity dashboards without exposing storage implementation details |
+| Mempool | Coherent transaction snapshot, count, bytes, fees, action counts, activity windows, event counts, and resumable events | Live source polling/streaming and bounded mempool store | Wallet mempool events; Explorer snapshot, summary, activity, and event-count RPCs | Snapshot fields share one observation; freshness reports upstream age and ingest lag | Wallet pending state, explorer mempool pages, alerting, and automation |
+| Fees | Per-transaction paid fee and aggregate paid-fee distribution | Resolved canonical prevouts and transaction-fee projections | Explorer transaction detail, fee summary, and paid-fee distribution | Proven fees only; unresolved transactions are counted as incomplete rather than assigned a value | Honest fee-market analysis and transaction cost reporting |
+| Fees | ZIP-317 conventional fee and conventional-fee distribution | Transaction component facts and ZIP-317 calculation | Explorer conventional-fee distribution | Derived independently of paid-fee availability; coverage identifies the complete range | Fee-policy comparison, wallet tuning, and anomaly detection |
+| Value pools and economics | Source-reported chain value pools at tip and canonical per-block balances | Node value-pool response plus schema-16 canonical block artifacts | Wallet chain value pools; Explorer value-pool summary and balance history | Source tip is explicit; historical capability requires schema 16 and complete enrichment coverage | Supply dashboards, pool adoption analysis, and cross-checking source state |
+| Value pools and economics | Per-transaction value-pool flow events and time/range summaries | Intrinsic balances plus canonical transaction context; derive history | Explorer flow history, aggregate, threshold, and rounded-amount RPCs | Projection checkpoint and coverage bound every result; transparent flow is excluded when prevouts are unavailable | Shielded-pool migration analysis, privacy research, and bounded analytics |
+| Value pools and economics | Ironwood migration totals, cohorts, and denominations | Ironwood migration derive projection | Explorer migration RPCs | Capability and projection freshness are explicit | Network-upgrade monitoring, migration audits, and product reporting |
+| Reorgs | Durable committed/reverted chain events and summarized reorg incidents | Canonical writer event log and derive projection | Wallet chain events and Explorer reorg history | Cursor-resumable and epoch-aware; retention limits are explicit | Wallet rollback, payment lifecycle correction, explorer fork context, and incident analysis |
+| Reorgs | Displaced-block facts, canonical replacement at the former height, payout script, and final roots when captured | Writer-owned displaced-block archive from schema 17 | Explorer displaced-block history/detail and root search | Archive coverage starts at its activation boundary; retention policy is operator-visible | Fork monitoring and post-reorg analysis without conflating displaced blocks with canonical blocks |
+| Search and privacy | Typed search results for supported public identifiers plus explicit privacy refusals | Canonical indexes and address parsing | Explorer search | Unsupported private-address searches fail explicitly rather than returning misleading empty results | Predictable UX and agent behavior while preserving privacy boundaries |
+| Commands and verification | Typed transaction broadcast outcomes | Node submission through the source boundary | Wallet broadcast RPC | Accepted, duplicate, queued, rejected, and unknown outcomes remain distinct | Idempotent payment submission and actionable user errors |
+| Commands and verification | Payment-disclosure verification contract | Operator-configured verifier; no verifier is bundled by default | Reserved Explorer verification RPC | Capability remains absent until a verifier is configured and online | Future receipt verification without falsely advertising unsupported behavior |
 
-| Surface | Primary role | Choose it when |
-| --- | --- | --- |
-| Zebra node and state indexes | Full node, consensus validation, peer networking, mempool, persistent chain state, UTXO data, and zcashd-compatible RPC reads. | The consumer needs validator-coupled data, raw node behavior, or indexed RPCs owned by the node. |
-| Zebra indexer gRPC | Node-adjacent stream for chain-tip changes, non-finalized-state changes, mempool changes, and block fetches. | A trusted service needs to synchronize from Zebra's own state and non-finalized chain view. |
-| lightwalletd | Reference Go implementation of the LightWallet gRPC service (`CompactTxStreamer`), adapting a single zcashd or Zebra JSON-RPC backend for mobile wallet clients. | An integration needs the unmodified reference server that other LightWallet-compatible services are measured against. |
-| Zaino | Compatibility indexer for LightWallet gRPC, selected zcashd-compatible RPCs, and node-backed chain fetch. | Existing clients expect LightWallet or zcashd-shaped APIs, and the deployment wants a Rust reimplementation of that surface. |
-| Zinder | Consumer-neutral chain data plane with epoch-pinned reads, chain events, explorer views, wallet sync data, and typed broadcast results. | Multiple products need consistent chain data without each one rebuilding its own indexer. |
+## Contract Rules
 
-## Zebra Indexed State
-
-Zebra already indexes chain data as part of running a node. Its state stores the best chain, blocks, the UTXO set, and other indexes, and Zebra exposes useful indexed reads through RPC. That includes transparent address balances, address transaction IDs, address UTXOs, raw transaction lookup, tree state, subtree roots, mempool data, and block lookup by hash or height.
-
-Those indexes are node-owned. They serve validation, node operation, compatibility, and node-adjacent synchronization. Zinder builds on that kind of verified source data, but it answers a different question: how should products consume the same chain facts safely and consistently?
-
-## Feature And Index Matrix
-
-This table compares public information surfaces, not private implementation details. It is grounded in Zebra's node RPCs and indexer gRPC service, reference lightwalletd's `CompactTxStreamer` service, Zaino's LightWallet and zcashd-compatible APIs, and Zinder's wallet, explorer, and capability services.
-
-`Yes` means the project exposes the information as a current public surface. `Partial` means the data exists only through a raw, compatibility-shaped, deployment-gated, or lower-level surface. `No` means there is no current public surface for that information in that project.
-
-| Information or index | Zebra node/indexer | lightwalletd | Zaino | Zinder |
-| --- | --- | --- | --- | --- |
-| Consensus validation and peer network | Yes: full node | No | No | No |
-| Persistent best-chain state and UTXO set | Yes: node state | Partial: local compact-block cache only, no UTXO set | Partial: indexer cache and chain state | Partial: product facts, not validator state |
-| Full block by hash or height | Yes: `getblock` | No: full raw transaction lookup only, no full raw block RPC | Yes: zcashd-compatible block fetch | Partial: `WalletQuery.FullBlock`, when blobs are retained |
-| Compact blocks for light clients | No | Yes: `GetBlock`, `GetBlockRange` | Yes: `GetBlock`, `GetBlockRange` | Yes: `WalletQuery.CompactBlock`, lightwalletd compat |
-| Block headers and block identity | Yes: `getblockheader`, `getblockhash` | Partial: height and hash only, via `BlockID`, no dedicated header RPC | Yes: zcashd-compatible block headers | Yes: `BlockHeaderBySelector`, `BlockIdBySelector` |
-| Tree state and subtree roots | Yes: `z_gettreestate`, `z_getsubtreesbyindex` | Yes: `GetTreeState`, `GetSubtreeRoots` (Sapling and Orchard only) | Yes: `GetTreeState`, `GetSubtreeRoots` | Yes: `TreeStateAtHeight`, `SubtreeRoots` |
-| Raw transaction by transaction id | Yes: `getrawtransaction` | Yes: `GetTransaction` | Yes: `GetTransaction`, `getrawtransaction` | Partial: `WalletQuery.Transaction`, with raw bytes when retained |
-| Transaction status by transaction id | Partial: raw lookup or mempool lookup | Partial: height-sentinel values on `RawTransaction`, no explicit status field | Partial: raw lookup or LightWallet result | Yes: mined, mempool, conflicting, or missing |
-| Parsed public transaction facts | Partial: raw or verbose transaction data | No: raw or compact transaction bytes only, client parses | Partial: raw or compact transaction data | Yes: `ExplorerQuery.TransactionDetail` |
-| Paid fee and prevout resolution | Partial: infer from raw inputs and UTXOs | Partial: infer from raw inputs and UTXOs | Partial: infer from raw inputs and UTXOs | Yes: transaction fee fields, when prevouts resolve |
-| Transparent address balance | Yes: `getaddressbalance` | Yes: `GetTaddressBalance`, `GetTaddressBalanceStream` | Yes: `GetTaddressBalance`, `getaddressbalance` | Yes: `TransparentAddressBalance` |
-| Transparent address UTXOs | Yes: `getaddressutxos` | Yes: `GetAddressUtxos`, `GetAddressUtxosStream` | Yes: `GetAddressUtxos`, `getaddressutxos` | Yes: `TransparentAddressUnspentOutputs` |
-| Transparent address transaction history | Yes: `getaddresstxids` | Yes: `GetTaddressTxids` (deprecated), `GetTaddressTransactions` | Yes: `getaddresstxids`, `GetTaddressTransactions` | Yes: `TransparentAddressTxIdsInRange`, address activity |
-| Transparent address value deltas | No | No | Yes: `getaddressdeltas` | Yes: `TransparentAddressDeltas` |
-| Transparent outpoint lookup | Partial: `gettxout` for unspent outputs | No | Partial: `gettxout` for unspent outputs | Yes: output, spend, and unspent-by-outpoint reads |
-| Transparent UTXO-set summary | No | No | Yes: `gettxoutsetinfo` | Partial: count, total value, optional commitment |
-| Value-pool summary | Yes: `getblockchaininfo` | No | Yes: `getblockchaininfo` | Yes: source-backed `ValuePoolSummary`, `ChainValuePoolsAtTip` |
-| Mempool list and summary | Yes: `getrawmempool`, `getmempoolinfo` | Partial: `GetMempoolTx` snapshot stream, no count or size summary RPC | Yes: `GetMempoolTx`, `GetMempoolStream`, mempool RPCs | Yes: `MempoolSnapshot`, `MempoolSummary` |
-| Mempool event stream | Partial: indexer gRPC `MempoolChange` | Partial: `GetMempoolStream` closes on tip change | Partial: mempool streams close on tip change | Yes: cursor-resumable `MempoolEvents` |
-| Chain tip and non-finalized changes | Yes: indexer gRPC streams | Partial: unary `GetLatestBlock` poll only, no push stream | Partial: state library and service internals | Partial: committed `ChainEvents`, not non-finalized reads |
-| Reorg history for products | Partial: derive from node state changes | No | Partial: handled by indexer state | Yes: `ChainEvents`, `ChainReorgHistory` |
-| Explorer block summaries and recent transactions | No | No | No | Yes: `BlockSummariesInRange`, `RecentTransactions` |
-| Explorer search and privacy refusal | No | No | No | Yes: typed `Search` responses |
-| Fee, mempool, and overview dashboards | No | No | No | Yes: `FeeSummary`, `MempoolSummary`, `OverviewSnapshot` |
-| Payment disclosure verification | No | No | No | No: `VerifyPaymentDisclosure` is reserved but has no bundled verifier |
-| Feature discovery and freshness envelope | Partial: node RPC status | Partial: `GetLightdInfo` version and height fields, no capability negotiation | Partial: service and sync status | Yes: `ServerInfo`, capabilities, freshness |
-| Transaction broadcast | Yes: `sendrawtransaction` | Yes: `SendTransaction` | Yes: `SendTransaction`, `sendrawtransaction` | Yes: typed broadcast outcomes |
-
-## Lightwalletd, Zaino, And Zinder
-
-lightwalletd, Zaino, and Zinder all sit above a node, but they optimize for different integration contracts.
-
-lightwalletd is the reference implementation of the LightWallet gRPC protocol. It streams compact blocks, tree state, and transparent-address data from a single zcashd or Zebra JSON-RPC backend, and existing mobile wallet clients were built against its exact behavior.
-
-Zaino is compatibility-first. It reimplements that same `CompactTxStreamer` surface in Rust, and adds selected zcashd-compatible RPCs, compact-block data, transaction submission, and a Rust chain fetch library for services that run close to a node.
-
-Zinder is designed around product APIs. It keeps the compatibility path available through a `CompactTxStreamer` adapter, but its main contract is a typed data plane shared by explorers, wallets, and payment services. That contract makes consistency visible through `ChainEpoch`, makes reorgs visible through `ChainEvents`, and lets clients negotiate features through capability discovery.
-
-## Shared Guarantees
-
-| Zinder guarantee | What clients get |
-| --- | --- |
-| Epoch-pinned reads | A request reads from one committed chain view instead of mixing data across competing tips. |
-| Reorg-aware streams | Clients can resume from cursors and react to committed or reverted ranges. |
-| Freshness envelopes | UIs and services can tell whether the node, ingest loop, projection, or query layer is stale. |
-| Capability discovery | Clients can check which optional views are available before calling them. |
-| Typed broadcast outcomes | Services can distinguish accepted, duplicate, queued, rejected, and unknown transaction states. |
-| Shared projections | Explorers, wallets, and payment services can reuse the same derived chain facts. |
-
-## Block Explorers
-
-Zebra supplies validated blocks, transactions, mempool state, node status, and indexed address and tree-state RPCs. An explorer still needs page-ready answers: recent activity, parsed transaction facts, address views, search behavior, reorg context, and freshness. Zinder provides those answers as stable product APIs.
-
-| Explorer need | Zinder provides |
-| --- | --- |
-| Recent activity | Block summaries, block detail, and recent transaction lists. |
-| Transaction pages | Parsed public facts, component counts, privacy shape, fees when resolvable, V6 fields, and Ironwood action counts. |
-| Fee and mempool pages | Fee summaries, mempool summaries, activity windows, and event counts. |
-| Transparent address pages | Address activity, deltas, balances, UTXOs, and pagination-ready history. |
-| Search | Typed results for blocks, transactions, transparent addresses, TEX addresses, and unified addresses, plus explicit privacy refusals. |
-| Reorg context | Reorg history and chain-event streams that explain when a page or payment state moved backward. |
-| Dashboard coherence | Overview snapshots and freshness data so one screen does not silently mix different tips. |
-
-Zebra, lightwalletd, and Zaino overlap with some explorer needs through node-owned indexes, LightWallet methods, and zcashd-compatible methods. Zinder's added value is the explorer-shaped contract: the response already carries the projection, consistency, and freshness semantics an explorer needs to render safely.
-
-## Wallets
-
-Wallets still own keys, trial decryption, note state, witnesses, account balances, transaction construction, proving, signing, labels, and user policy. Zinder only owns the chain-data side of wallet sync.
-
-| Wallet need | Zinder provides | Wallet still owns |
-| --- | --- | --- |
-| Shielded sync input | Compact blocks, tree state, and subtree roots. | Trial decryption, notes, witnesses, and balances. |
-| Transparent wallet support | UTXOs, transaction history, transparent balances, and prevout resolution. | Address ownership, labels, and user notifications. |
-| Broadcast | Typed transaction outcomes. | Construction, signing, proofs, and fee policy. |
-| Reorg recovery | Chain events with committed and reverted ranges. | Wallet-specific rollbacks and rescans. |
-| Compatibility | A lightwalletd protocol adapter over the same store. | Wallet UX, seed handling, and local storage. |
-
-A wallet that expects the LightWallet protocol is not limited to lightwalletd or Zaino: Zinder's `zinder-compat-lightwalletd` adapter serves the same `CompactTxStreamer` surface over its own store. Reach for lightwalletd specifically when the wallet needs the unmodified reference server as its compatibility baseline, or for Zaino when an exact raw zcashd JSON-RPC method is a hard dependency. Zinder provides native semantic equivalents for `getaddressdeltas` (`ExplorerQuery.TransparentAddressDeltas`) and `gettxoutsetinfo` (`WalletQuery.TransparentUtxoSetSummary`); neither preserves the zcashd method name or raw response shape. The UTXO summary deliberately omits zcashd's format-dependent serialized-set hash and byte size. Zinder is the better fit when the wallet wants that same protocol plus typed errors, explicit feature negotiation, epoch-aware reads, and the same chain data contract used by other services.
-
-## Payment Facilitators
-
-Payment facilitators do not need to become wallets or full nodes. They need to prepare a payment, broadcast a wallet-signed transaction, confirm it, handle reorgs, and expose a clean lifecycle to their own callers.
-
-| Facilitator need | Zinder provides |
-| --- | --- |
-| Expiry and confirmation math | Current tip, visible tip, settled tip, and chain-view data. |
-| Broadcast handling | Typed outcomes that make duplicate broadcasts idempotent and rejected transactions actionable. |
-| Confirmation tracking | Transaction lookup plus chain events. |
-| Reorg handling | A way to move a payment back from confirmed to pending when the chain reverts. |
-| Receipt verification | Transaction facts; payment-disclosure verification is not currently provided. |
-| Service boundary | A private gRPC dependency that lets the facilitator expose its own public HTTP API. |
-
-The difference from calling Zebra directly is lifecycle semantics. Zinder gives the facilitator chain data already shaped for expiry, broadcast, confirmation, settlement, and reorg correction.
-
-## When Not To Use Zinder
-
-Use Zebra directly for node operation, mining, tools that work directly with validator behavior, indexed node RPCs, and low-level RPC workflows.
-
-Use lightwalletd directly when an integration wants the unmodified reference LightWallet gRPC server as its compatibility baseline. Use Zaino when a Rust reimplementation of that same protocol is preferred, or when a raw zcashd JSON-RPC method is needed directly. Zinder's typed address-delta and UTXO-summary reads are semantic equivalents, not zcashd RPC compatibility shims.
-
-Use a wallet library or wallet process for keys, viewing keys, account state, note detection, signing, labels, and user-specific policy.
-
-Use Zinder when the answer is public chain data, the answer must be consistent for every caller at the same committed chain epoch, and more than one product can reuse it.
+1. A canonical artifact schema version describes writer/read compatibility for canonical facts. It does not prove that an independently backfilled derive projection is complete.
+2. Each derive-backed RPC uses that consumer's projection checkpoint and coverage as its read fence. The block-summary tip is useful dashboard context, not a completeness proof for every projection.
+3. Absent optional facts mean unknown or unavailable. APIs must not convert missing retention, unresolved prevouts, pre-activation pools, or incomplete enrichment into fabricated zero values.
+4. Compatibility adapters may translate these native contracts, but they do not define Zinder's storage model, public vocabulary, or feature lifecycle.
 
 ## References
 
-- [What Zinder is and is not](../architecture/indexer-wallet-boundary.md)
-- [Integration surfaces](integration-surfaces.md)
-- [Server-side wallet pattern](server-side-wallet-pattern.md)
+- [Public interfaces](../architecture/public-interfaces.md)
 - [Explorer plane](../architecture/explorer-plane.md)
 - [Wallet data plane](../architecture/wallet-data-plane.md)
+- [Derive plane](../architecture/derive-plane.md)
+- [Storage backend](../architecture/storage-backend.md)
+- [Initial synchronization](../runbooks/initial-sync.md)

@@ -860,8 +860,10 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// Reads chain-wide value-pool totals at the upstream node's current tip.
     ///
     /// The response is bound to the Zinder chain epoch visible when the writer
-    /// answered the proxied source read. The upstream value-pool list is
-    /// preserved as entries rather than projected into fixed pool names.
+    /// answered the proxied source read. The response carries the source tip's
+    /// height and hash so callers can verify the snapshot against a canonical
+    /// chain identity. The upstream value-pool list is preserved as entries
+    /// rather than projected into fixed pool names.
     ///
     /// # Examples
     ///

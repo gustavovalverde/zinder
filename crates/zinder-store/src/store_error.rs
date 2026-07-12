@@ -39,10 +39,16 @@ pub enum ArtifactFamily {
     TransactionLocation,
     /// Canonical transaction facts.
     TransactionFacts,
+    /// Optional transaction-intrinsic shielded value balances.
+    TransactionIntrinsicValueBalances,
     /// Optional raw transaction blob.
     TransactionBlob,
     /// Commitment tree-state artifact.
     TreeState,
+    /// Final note-commitment roots after a canonical block.
+    FinalNoteCommitmentRoots,
+    /// Optional cumulative value-pool balances after a canonical block.
+    BlockValuePoolBalances,
     /// Commitment subtree-root artifact.
     SubtreeRoot,
     /// Transparent address output artifact.
@@ -53,6 +59,8 @@ pub enum ArtifactFamily {
     TransparentSpendFact,
     /// Best-chain block-hash to height index entry.
     BlockHashIndex,
+    /// Block displaced from the canonical branch.
+    DisplacedBlock,
     /// Mempool event envelope.
     MempoolEvent,
 }
@@ -77,13 +85,17 @@ impl ArtifactFamily {
             Self::BlockTransactionIndex => family::BLOCK_TRANSACTION_INDEX,
             Self::TransactionLocation => family::TRANSACTION_LOCATION,
             Self::TransactionFacts => family::TRANSACTION_FACTS,
+            Self::TransactionIntrinsicValueBalances => family::TRANSACTION_INTRINSIC_VALUE_BALANCES,
             Self::TransactionBlob => family::TRANSACTION_BLOB,
             Self::TreeState => family::TREE_STATE,
+            Self::FinalNoteCommitmentRoots => "zinder.block_final_note_commitment_roots",
+            Self::BlockValuePoolBalances => family::BLOCK_VALUE_POOL_BALANCES,
             Self::SubtreeRoot => family::SUBTREE_ROOT,
             Self::AddressOutputIndex => family::ADDRESS_OUTPUT_INDEX,
             Self::TransparentOutput => family::TRANSPARENT_OUTPUT,
             Self::TransparentSpendFact => family::TRANSPARENT_SPEND_FACT,
             Self::BlockHashIndex => family::BLOCK_HASH_INDEX,
+            Self::DisplacedBlock => family::DISPLACED_BLOCK,
             Self::MempoolEvent => family::MEMPOOL_EVENT,
         }
     }
@@ -169,6 +181,10 @@ pub enum StoreError {
         /// Attempted commit network.
         attempted: Network,
     },
+
+    /// Displaced-block history cursor does not identify an archived ordering row.
+    #[error("displaced block cursor is invalid")]
+    DisplacedBlockCursorInvalid,
 
     /// Persisted store schema version does not match the binary's expected version.
     ///

@@ -658,6 +658,7 @@ mod tests {
                 block_time_unix_seconds: 1_700_000_000,
                 block_size_bytes: 0,
                 transactions: vec![transaction],
+                final_note_commitment_roots: None,
             },
             TransparentSpendFacts::Offline,
         )
@@ -694,6 +695,7 @@ mod tests {
                 block_time_unix_seconds: 1_700_000_500,
                 block_size_bytes: 0,
                 transactions: vec![transaction],
+                final_note_commitment_roots: None,
             },
             TransparentSpendFacts::Static(Arc::new(spends)),
         )
@@ -810,6 +812,7 @@ mod tests {
                 block_time_unix_seconds: 1_700_001_000,
                 block_size_bytes: 0,
                 transactions: vec![first, second],
+                final_note_commitment_roots: None,
             },
             TransparentSpendFacts::Offline,
         )

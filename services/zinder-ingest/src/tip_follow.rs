@@ -16,7 +16,7 @@ use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock
 
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessState};
 use zinder_source::{
-    ChainTipNotificationSource, NodeCapability, NodeSource, NodeTarget, SourceBlock, SourceError,
+    ChainTipNotificationSource, NodeCapability, NodeSource, NodeTarget, SourceBlock,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
@@ -29,8 +29,8 @@ use crate::artifact_builder::{
 };
 use crate::chain_ingest::{
     CanonicalBatch, IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
-    current_unix_millis, fetch_block_with_retry, fetch_tree_state_for_block_with_retry,
-    next_chain_epoch_id_after, next_chain_epoch_id_from, populate_subtree_root_artifacts,
+    current_unix_millis, fetch_block_with_retry, next_chain_epoch_id_after,
+    next_chain_epoch_id_from, observe_final_note_commitment_roots, populate_subtree_root_artifacts,
     record_commit_outcome, record_ingest_block_prepare_outcome, select_best_chain,
 };
 use crate::mempool::MempoolReadyGate;
@@ -852,7 +852,7 @@ where
         retry_state,
     )
     .await?;
-    populate_tip_follow_tree_state_checkpoint(config, source, &mut batch, retry_state).await?;
+    populate_tip_follow_tree_state_artifacts(config, source, &mut batch).await;
     let chain_epoch_id = next_chain_epoch_id_from(current_chain_epoch.as_ref())?;
     let chain_epoch = chain_epoch_for_tip_commit(
         config.node.network,
@@ -864,17 +864,15 @@ where
     commit_ingest_batch(store, chain_epoch, &mut batch, plan.reorg_window_change).await
 }
 
-async fn populate_tip_follow_tree_state_checkpoint<Source>(
+async fn populate_tip_follow_tree_state_artifacts<Source>(
     config: &TipFollowConfig,
     source: &Source,
     batch: &mut CanonicalBatch,
-    retry_state: &mut IngestRetryState,
-) -> Result<(), IngestError>
-where
+) where
     Source: NodeSource,
 {
     if !source.capabilities().supports(NodeCapability::TreeState) {
-        return Ok(());
+        return;
     }
 
     // Stride checkpoints across the batch using the same cadence as
@@ -885,44 +883,45 @@ where
     // wide enough to wedge the wallet on the next resume.
     let existing_heights: std::collections::HashSet<_> =
         batch.tree_states.iter().map(|ts| ts.height).collect();
-    let mut targets: Vec<(zinder_core::BlockHeight, zinder_core::BlockHash)> = batch
+    let mut checkpoint_targets: std::collections::HashSet<_> = batch
         .block_headers
         .iter()
         .filter(|header| {
             header.height.value() % crate::chain_ingest::TREE_STATE_CHECKPOINT_STRIDE == 0
                 && !existing_heights.contains(&header.height)
         })
-        .map(|header| (header.height, header.block_hash))
+        .map(|header| header.height)
         .collect();
     if let Some(tip) = batch.block_headers.last() {
-        let already_at_tip = targets.last().map(|(height, _)| *height) == Some(tip.height)
-            || existing_heights.contains(&tip.height);
+        let already_at_tip =
+            checkpoint_targets.contains(&tip.height) || existing_heights.contains(&tip.height);
         if !already_at_tip {
-            targets.push((tip.height, tip.block_hash));
+            checkpoint_targets.insert(tip.height);
         }
     }
 
-    for (height, block_hash) in targets {
-        let block_id = BlockId::new(height, block_hash);
-        let source_tree_state = match fetch_tree_state_for_block_with_retry(
-            config.node.request_timeout,
-            source,
-            block_id,
-            retry_state,
-        )
-        .await
-        {
-            Ok(source_tree_state) => source_tree_state,
-            Err(IngestError::Source(SourceError::NodeCapabilityMissing { .. })) => return Ok(()),
-            Err(error) => return Err(error),
+    let block_ids = batch
+        .block_headers
+        .iter()
+        .map(|header| BlockId::new(header.height, header.block_hash))
+        .collect::<Vec<_>>();
+    for block_id in block_ids {
+        let height = block_id.height;
+        let Some(source_tree_state) =
+            observe_final_note_commitment_roots(config.node.request_timeout, source, block_id)
+                .await
+        else {
+            continue;
         };
-        batch.push_tree_state_checkpoint(TreeStateArtifact::new(
-            source_tree_state.block_id.height,
-            source_tree_state.block_id.hash,
-            source_tree_state.payload_bytes,
-        ));
+        batch.push_final_note_commitment_roots(source_tree_state.final_note_commitment_roots);
+        if checkpoint_targets.contains(&height) {
+            batch.push_tree_state_checkpoint(TreeStateArtifact::new(
+                source_tree_state.block_id.height,
+                source_tree_state.block_id.hash,
+                source_tree_state.payload_bytes,
+            ));
+        }
     }
-    Ok(())
 }
 
 fn chain_epoch_for_tip_commit(
@@ -1022,12 +1021,14 @@ mod tests {
     use futures_util::stream;
     use parking_lot::Mutex;
     use tempfile::tempdir;
-    use zinder_core::{SubtreeRootHash, SubtreeRootIndex};
+    use zinder_core::{
+        BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, SubtreeRootHash, SubtreeRootIndex,
+    };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_runtime::ReadinessCause;
     use zinder_source::{
         ChainTipNotification, ChainTipNotificationStream, NodeCapabilities, SourceBlockHeader,
-        SourceError, SourceSubtreeRoot, SourceSubtreeRoots, ZebraJsonRpcSource,
+        SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
     };
 
     use super::*;
@@ -1061,6 +1062,33 @@ mod tests {
             BlockHeight::new(0)
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tip_follow_attaches_roots_without_retaining_every_tree_state()
+    -> Result<(), Box<dyn Error>> {
+        let config = test_tip_follow_config(Path::new("/tmp/tip-follow-root-artifacts"), 10);
+        let source = TestNodeSource::linear(3);
+        let mut batch = CanonicalBatch::default();
+        let mut running_tree_sizes = CommitmentTreeSizes::default();
+        for height in 1..=3 {
+            let source_block = source.fetch_block_at(BlockHeight::new(height)).await?;
+            let derived = test_derive_block_fn(&source_block)?;
+            batch.absorb(finalize_derived_block(derived, &mut running_tree_sizes)?);
+        }
+
+        populate_tip_follow_tree_state_artifacts(&config, &source, &mut batch).await;
+
+        assert_eq!(batch.final_note_commitment_roots.len(), 3);
+        assert_eq!(batch.tree_states.len(), 1);
+        assert_eq!(
+            batch
+                .tree_states
+                .first()
+                .map(|tree_state| tree_state.height),
+            Some(BlockHeight::new(3))
+        );
         Ok(())
     }
 
@@ -1481,6 +1509,7 @@ mod tests {
             block_transaction_index: Vec::new(),
             transaction_locations: Vec::new(),
             transaction_facts: Vec::new(),
+            transaction_intrinsic_value_balances: Vec::new(),
             transaction_blobs: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
         })
@@ -1624,6 +1653,24 @@ mod tests {
                 protocol,
                 start_index,
                 subtree_roots,
+            ))
+        }
+
+        async fn fetch_tree_state_for_block(
+            &self,
+            block_id: BlockId,
+        ) -> Result<SourceTreeState, SourceError> {
+            Ok(SourceTreeState::with_final_note_commitment_roots(
+                BlockFinalNoteCommitmentRoots::new(
+                    block_id.height,
+                    block_id.hash,
+                    Some(FinalNoteCommitmentRoot::from_bytes(
+                        [block_id.height.value().to_le_bytes()[0]; 32],
+                    )),
+                    None,
+                    None,
+                ),
+                format!("tree-state-{}", block_id.height.value()).into_bytes(),
             ))
         }
     }

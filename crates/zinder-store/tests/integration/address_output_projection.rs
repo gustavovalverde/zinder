@@ -16,10 +16,204 @@ use zinder_core::{
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore,
-    ReorgWindowChange, SecondaryChainStore,
+    ReorgWindowChange, SecondaryChainStore, StoreError,
 };
 
 const ADDRESS_SCRIPT_HASH: [u8; 32] = [71; 32];
+
+#[test]
+fn balance_snapshot_groups_all_visible_scripts_and_excludes_recent_spends() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let standard_script = [0x76, 0xa9, 0x14, 1, 2, 3, 0x88, 0xac];
+    let nonstandard_script = [0x6a, 2, 0xca, 0xfe];
+    let zero_script = [0x51];
+    let standard_hash = TransparentAddressScriptHash::of_script_pub_key(&standard_script);
+    let nonstandard_hash = TransparentAddressScriptHash::of_script_pub_key(&nonstandard_script);
+    let standard_first = output_with_script(
+        BlockHeight::new(1),
+        [1; 32],
+        10,
+        standard_script.to_vec(),
+        standard_hash,
+    );
+    let standard_second = output_with_script(
+        BlockHeight::new(2),
+        [2; 32],
+        20,
+        standard_script.to_vec(),
+        standard_hash,
+    );
+    let nonstandard = output_with_script(
+        BlockHeight::new(3),
+        [3; 32],
+        7,
+        nonstandard_script.to_vec(),
+        nonstandard_hash,
+    );
+    let zero = output_with_script(
+        BlockHeight::new(4),
+        [4; 32],
+        0,
+        zero_script.to_vec(),
+        TransparentAddressScriptHash::of_script_pub_key(&zero_script),
+    );
+    let recently_spent = output_with_script(
+        BlockHeight::new(1),
+        [5; 32],
+        100,
+        standard_script.to_vec(),
+        standard_hash,
+    );
+
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 5)
+            .with_transparent_outputs_by_outpoint(vec![
+                standard_first,
+                standard_second,
+                nonstandard,
+                zero,
+                recently_spent.clone(),
+            ])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(5), &recently_spent)]),
+    )?;
+
+    let snapshot = store
+        .current_chain_epoch_reader()?
+        .transparent_address_balance_snapshot()?;
+    assert_eq!(snapshot.indexed_output_count, 5);
+    assert_eq!(snapshot.utxo_count, 4);
+    assert_eq!(snapshot.positive_script_hash_count, 2);
+    assert_eq!(snapshot.total_positive_balance_zat, 37);
+    assert_eq!(snapshot.summarized_height, BlockHeight::new(5));
+    assert_eq!(snapshot.chain_epoch.visible_tip_height, BlockHeight::new(5));
+    assert_eq!(
+        snapshot.balances_by_script_hash.get(&standard_hash),
+        Some(&zinder_store::TransparentAddressBalanceSummary {
+            script_pub_key: standard_script.to_vec(),
+            balance_zat: 30,
+            utxo_count: 2,
+        })
+    );
+    assert_eq!(
+        snapshot.balances_by_script_hash.get(&nonstandard_hash),
+        Some(&zinder_store::TransparentAddressBalanceSummary {
+            script_pub_key: nonstandard_script.to_vec(),
+            balance_zat: 7,
+            utxo_count: 1,
+        })
+    );
+
+    assert_settled_balance_snapshot(&store, standard_hash, &standard_script)?;
+
+    Ok(())
+}
+
+fn assert_settled_balance_snapshot(
+    store: &PrimaryChainStore,
+    standard_hash: TransparentAddressScriptHash,
+    standard_script: &[u8],
+) -> eyre::Result<()> {
+    let snapshot = store
+        .current_chain_epoch_reader()?
+        .settled_transparent_address_balance_snapshot()?;
+    assert_eq!(snapshot.summarized_height, BlockHeight::new(1));
+    assert_eq!(snapshot.utxo_count, 2);
+    assert_eq!(snapshot.positive_script_hash_count, 1);
+    assert_eq!(snapshot.total_positive_balance_zat, 110);
+    assert_eq!(
+        snapshot.balances_by_script_hash.get(&standard_hash),
+        Some(&zinder_store::TransparentAddressBalanceSummary {
+            script_pub_key: standard_script.to_vec(),
+            balance_zat: 110,
+            utxo_count: 2,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn balance_snapshot_rejects_conflicting_scripts_for_one_hash() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let shared_hash = TransparentAddressScriptHash::from_bytes([8; 32]);
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 2).with_transparent_outputs_by_outpoint(vec![
+            output_with_script(
+                BlockHeight::new(1),
+                [8; 32],
+                1,
+                b"first-script".to_vec(),
+                shared_hash,
+            ),
+            output_with_script(
+                BlockHeight::new(2),
+                [9; 32],
+                1,
+                b"second-script".to_vec(),
+                shared_hash,
+            ),
+        ]),
+    )?;
+
+    let Err(error) = store
+        .current_chain_epoch_reader()?
+        .transparent_address_balance_snapshot()
+    else {
+        return Err(eyre!("conflicting scripts must fail closed"));
+    };
+    assert!(matches!(error, StoreError::ArtifactCorrupt { .. }));
+
+    Ok(())
+}
+
+#[test]
+fn balance_snapshot_rejects_balance_overflow() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let script = b"overflow-script".to_vec();
+    let script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+    store.commit_chain_epoch(
+        epoch_artifacts(1, 1, 2).with_transparent_outputs_by_outpoint(vec![
+            output_with_script(
+                BlockHeight::new(1),
+                [10; 32],
+                u64::MAX,
+                script.clone(),
+                script_hash,
+            ),
+            output_with_script(BlockHeight::new(2), [11; 32], 1, script, script_hash),
+        ]),
+    )?;
+
+    let Err(error) = store
+        .current_chain_epoch_reader()?
+        .transparent_address_balance_snapshot()
+    else {
+        return Err(eyre!("balance overflow must fail closed"));
+    };
+    assert!(matches!(error, StoreError::ArtifactCorrupt { .. }));
+
+    Ok(())
+}
+
+#[test]
+fn balance_snapshot_rejects_historical_reader() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    store.commit_chain_epoch(epoch_artifacts(1, 1, 1))?;
+    let epoch_id = store.current_chain_epoch_reader()?.chain_epoch().id;
+
+    let Err(error) = store
+        .chain_epoch_reader_at(epoch_id)?
+        .transparent_address_balance_snapshot()
+    else {
+        return Err(eyre!("historical projection reads must fail closed"));
+    };
+    assert!(matches!(error, StoreError::Unsupported { .. }));
+
+    Ok(())
+}
 
 #[test]
 fn spend_reverted_by_replace_resurfaces_address_row_without_new_writes() -> eyre::Result<()> {
@@ -802,6 +996,23 @@ fn output_at(height: BlockHeight, txid_seed: [u8; 32]) -> TransparentOutputArtif
         50_000,
         b"projection-script".to_vec(),
         TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH),
+        height,
+        block_hash(height.value()),
+    )
+}
+
+fn output_with_script(
+    height: BlockHeight,
+    txid_seed: [u8; 32],
+    value_zat: u64,
+    script_pub_key: Vec<u8>,
+    address_script_hash: TransparentAddressScriptHash,
+) -> TransparentOutputArtifact {
+    TransparentOutputArtifact::new(
+        TransparentOutPoint::new(TransactionId::from_bytes(txid_seed), 0),
+        value_zat,
+        script_pub_key,
+        address_script_hash,
         height,
         block_hash(height.value()),
     )

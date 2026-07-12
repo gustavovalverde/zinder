@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use zinder_core::{
-    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
-    CompactBlockArtifact, SubtreeRootArtifact, TransactionFactsArtifact, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
+    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    BlockValuePoolBalances, ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact,
+    TransactionFactsArtifact, TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact,
+    TreeStateArtifact,
 };
 
 use crate::{
@@ -70,7 +71,21 @@ pub(super) fn validate_chain_epoch_artifacts(
         tip_height,
         &block_hash_by_height,
     )?;
+    validate_transaction_intrinsic_value_balances(
+        &artifacts.transaction_intrinsic_value_balances,
+        &artifacts.transaction_facts,
+    )?;
     validate_tree_state_artifacts(&artifacts.tree_states, tip_height, &block_hash_by_height)?;
+    validate_final_note_commitment_roots(
+        &artifacts.final_note_commitment_roots,
+        tip_height,
+        &block_hash_by_height,
+    )?;
+    validate_block_value_pool_balances(
+        &artifacts.block_value_pool_balances,
+        tip_height,
+        &artifacts.block_headers,
+    )?;
     validate_subtree_root_artifacts(&artifacts.subtree_roots, tip_height, &block_hash_by_height)?;
     validate_transparent_output_artifacts(
         &artifacts.transparent_outputs_by_outpoint,
@@ -133,7 +148,10 @@ fn safe_tip_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> bo
     ) && artifacts.block_headers.is_empty()
         && artifacts.compact_blocks.is_empty()
         && artifacts.transaction_facts.is_empty()
+        && artifacts.transaction_intrinsic_value_balances.is_empty()
         && artifacts.tree_states.is_empty()
+        && artifacts.final_note_commitment_roots.is_empty()
+        && artifacts.block_value_pool_balances.is_empty()
         && artifacts.subtree_roots.is_empty()
         && artifacts.transparent_outputs_by_outpoint.is_empty()
         && artifacts.transparent_spend_facts.is_empty()
@@ -688,6 +706,33 @@ fn validate_transaction_facts_artifacts(
     Ok(())
 }
 
+fn validate_transaction_intrinsic_value_balances(
+    intrinsic_balances: &[zinder_core::TransactionIntrinsicValueBalancesArtifact],
+    transaction_facts: &[TransactionFactsArtifact],
+) -> Result<(), StoreError> {
+    let locations_by_transaction_id = transaction_facts
+        .iter()
+        .map(|facts| (facts.location.transaction_id, facts.location))
+        .collect::<HashMap<_, _>>();
+    let mut transaction_ids = HashSet::new();
+    for artifact in intrinsic_balances {
+        if !transaction_ids.insert(artifact.location.transaction_id) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transaction intrinsic value balances cannot repeat a transaction id",
+            });
+        }
+        if locations_by_transaction_id.get(&artifact.location.transaction_id)
+            != Some(&artifact.location)
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "transaction intrinsic value balances must match transaction facts in the same commit",
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_tree_state_artifacts(
     tree_states: &[TreeStateArtifact],
     tip_height: BlockHeight,
@@ -703,6 +748,101 @@ fn validate_tree_state_artifacts(
         if block_hash_by_height.get(&tree_state.height) != Some(&tree_state.block_hash) {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "tree-state artifact must match a block artifact at the same height",
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_final_note_commitment_roots(
+    roots_by_block: &[BlockFinalNoteCommitmentRoots],
+    tip_height: BlockHeight,
+    block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
+) -> Result<(), StoreError> {
+    let mut heights = HashSet::new();
+    for roots in roots_by_block {
+        if roots.height > tip_height {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "final note-commitment roots height cannot exceed tip height",
+            });
+        }
+        if block_hash_by_height.get(&roots.height) != Some(&roots.block_hash) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "final note-commitment roots must match a block artifact at the same height",
+            });
+        }
+        if !heights.insert(roots.height) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "final note-commitment roots cannot repeat a block height",
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_block_value_pool_balances(
+    balances_by_block: &[BlockValuePoolBalances],
+    tip_height: BlockHeight,
+    block_headers: &[BlockHeaderArtifact],
+) -> Result<(), StoreError> {
+    let block_headers_by_height = block_headers
+        .iter()
+        .map(|block| (block.height, block))
+        .collect::<HashMap<_, _>>();
+    let mut heights = HashSet::new();
+    for balances in balances_by_block {
+        if balances.block_id.height > tip_height {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block value-pool balances height cannot exceed tip height",
+            });
+        }
+        let Some(block) = block_headers_by_height.get(&balances.block_id.height) else {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block value-pool balances must match a block artifact at the same height",
+            });
+        };
+        if block.block_hash != balances.block_id.hash {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block value-pool balances hash must match the block artifact",
+            });
+        }
+        if block.block_time != balances.block_time_seconds {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block value-pool balances time must match the block artifact",
+            });
+        }
+        if !heights.insert(balances.block_id.height) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block value-pool balances cannot repeat a block height",
+            });
+        }
+        validate_value_pool_entries(balances)?;
+    }
+
+    Ok(())
+}
+
+pub(super) fn validate_value_pool_entries(
+    balances: &BlockValuePoolBalances,
+) -> Result<(), StoreError> {
+    if balances.pools.is_empty() {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "block value-pool balances must contain at least one pool",
+        });
+    }
+
+    let mut pool_ids = HashSet::with_capacity(balances.pools.len());
+    for pool in &balances.pools {
+        if pool.id.is_empty() {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block value-pool balances cannot contain an empty pool id",
+            });
+        }
+        if !pool_ids.insert(pool.id.as_str()) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block value-pool balances cannot contain duplicate pool ids",
             });
         }
     }

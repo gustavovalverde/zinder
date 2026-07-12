@@ -171,6 +171,14 @@ pub enum DeriveStoreError {
         #[source]
         source: rust_rocksdb::Error,
     },
+    /// A consumer-owned row could not be interpreted by a bounded scan.
+    #[error("derive store payload decode failed for consumer column family {name}: {reason}")]
+    ConsumerPayloadDecode {
+        /// Consumer-owned column family being scanned.
+        name: &'static str,
+        /// Operator-facing reason describing the invalid row.
+        reason: String,
+    },
     /// A checkpoint was requested from a secondary reader.
     #[error("derive store checkpoint requires a primary store; opened secondary at {path:?}")]
     CheckpointRequiresPrimary {

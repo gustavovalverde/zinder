@@ -62,6 +62,8 @@ pub(crate) fn decode_visible_source_epoch(
 pub(crate) enum HeightVisibilityIndex {
     SafeBlock,
     CompactBlock,
+    FinalNoteCommitmentRoots,
+    BlockValuePoolBalances,
 }
 
 impl HeightVisibilityIndex {
@@ -69,6 +71,12 @@ impl HeightVisibilityIndex {
         match self {
             Self::SafeBlock => StoreKey::visible_block_epoch_prefix(network, height),
             Self::CompactBlock => StoreKey::visible_compact_block_epoch_prefix(network, height),
+            Self::FinalNoteCommitmentRoots => {
+                StoreKey::visible_final_note_commitment_roots_epoch_prefix(network, height)
+            }
+            Self::BlockValuePoolBalances => {
+                StoreKey::visible_block_value_pool_balances_epoch_prefix(network, height)
+            }
         }
     }
 
@@ -82,6 +90,12 @@ impl HeightVisibilityIndex {
             Self::SafeBlock => StoreKey::visible_block_epoch(network, height, chain_epoch),
             Self::CompactBlock => {
                 StoreKey::visible_compact_block_epoch(network, height, chain_epoch)
+            }
+            Self::FinalNoteCommitmentRoots => {
+                StoreKey::visible_final_note_commitment_roots_epoch(network, height, chain_epoch)
+            }
+            Self::BlockValuePoolBalances => {
+                StoreKey::visible_block_value_pool_balances_epoch(network, height, chain_epoch)
             }
         }
     }

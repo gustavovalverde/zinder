@@ -149,9 +149,9 @@ Wire responses populate `human_reason` from these constants. UI consumers can ei
 
 The list grows additively. A new condition adds a new constant; existing constants are stable and grep-able.
 
-### Indexed tip is computed at response time; derive health is persisted
+### Dashboard freshness and projection completeness are separate
 
-The explorer reads the highest materialized `BlockSummary` row at response time and returns it as `chain_view.indexed_tip` (a `BlockTip` plus block time). All chain-event derive consumers advance under one shared cursor, so the block-summary head is an accurate indexed tip for every capability: a single value, not one per consumer. The consumer computes index lag as `chain_view.chain_epoch.visible_tip.height - chain_view.indexed_tip.tip.height`.
+The explorer reads the highest materialized `BlockSummary` row at response time and returns it as `chain_view.indexed_tip` (a `BlockTip` plus block time). That value describes the general explorer dashboard head. It does not prove that every independently backfilled projection is complete. Each derive-backed method reads its consumer checkpoint, coverage, rows, and counts from one snapshot and uses that projection state as the authoritative read fence. The consumer computes general index lag as `chain_view.chain_epoch.visible_tip.height - chain_view.indexed_tip.tip.height`; method-specific completeness comes from the projection response and capability gate.
 
 Block lag alone cannot distinguish a derive plane that is healthily catching up from one that has stalled; a paused replay holds the lag constant. The ingest plane therefore persists a `DeriveStatus { health, indexed_height, lag_blocks, observed_at_millis }` record into the shared derive store on every replay tick, including the paused branch. The explorer folds it into `chain_view.derive` on derive-backed responses and onto `ExplorerServerInfo.derive_status`. `DeriveStatus` and `DeriveHealth` live in `wallet.proto` as part of the chain-view family:
 

@@ -13,23 +13,40 @@
 pub(crate) mod address_value_event;
 pub(crate) mod block_commit_context;
 pub(crate) mod block_summary;
+pub(crate) mod commitment_root_search;
+pub(crate) mod conventional_fee_distribution;
 pub(crate) mod ironwood_migration;
 pub(crate) mod mempool_event_counts;
+pub(crate) mod paid_fee_distribution;
 pub(crate) mod recent_transactions;
 pub(crate) mod reorg_incidents;
+pub(crate) mod transaction_component_summary;
 pub(crate) mod transaction_fees;
+pub(crate) mod transaction_history;
 pub(crate) mod transparent_address_activity;
 pub(crate) mod transparent_address_deltas;
+pub(crate) mod transparent_address_ranking;
 pub(crate) mod transparent_address_transaction_history;
 pub(crate) mod transparent_outpoint_spend;
+pub(crate) mod value_pool_balance_history;
+pub(crate) mod value_pool_flow_history;
 
 use std::collections::HashMap;
 
 use rust_rocksdb::WriteBatch;
-use zinder_core::{BlockHeight, ChainEpoch};
+use zinder_core::{BlockHash, BlockHeight, ChainEpoch};
+use zinder_store::ChainEvent;
 
 pub use block_commit_context::{
-    BlockCommitContext, BlockCommitContextError, BlockCommitPayload, TransparentSpendFacts,
+    BlockCommitContext, BlockCommitContextError, BlockCommitPayload, BlockValuePoolBalanceFacts,
+    TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
+};
+pub use commitment_root_search::{
+    COMMITMENT_ROOT_SEARCH_COLUMN_FAMILIES, COMMITMENT_ROOT_SEARCH_COLUMN_FAMILY,
+    COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, COMMITMENT_ROOT_SEARCH_COVERAGE_COLUMN_FAMILY,
+    COMMITMENT_ROOT_SEARCH_INDEX_COLUMN_FAMILY, COMMITMENT_ROOT_SEARCH_SCHEMA,
+    CommitmentRootBackfillCoverage, CommitmentRootIndexEntry, CommitmentRootSearchConsumer,
+    CommitmentRootSearchConsumerError,
 };
 
 use crate::store::DeriveStore;
@@ -153,6 +170,19 @@ pub struct DeriveConsumerCtx<'a> {
     pub store: &'a DeriveStore,
     /// Write batch the consumer stages its data writes into.
     pub batch: &'a mut WriteBatch,
+}
+
+/// Projection fence derived from one block-consumer dispatch batch.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockProjectionCheckpoint<'event> {
+    /// Canonical epoch carried by the chain event.
+    pub chain_epoch: ChainEpoch,
+    /// Event or replay chunk whose rows were staged.
+    pub chain_event: &'event ChainEvent,
+    /// Highest staged canonical height when every required block context was present.
+    pub projection_tip_height: Option<BlockHeight>,
+    /// Canonical hash at [`Self::projection_tip_height`].
+    pub projection_tip_hash: Option<BlockHash>,
 }
 
 /// Typed wrapper for a `ChainCommitted` chain event delivered to a consumer.
@@ -334,6 +364,16 @@ pub trait BlockKeyedConsumer: Send + Sync {
     /// Stable consumer identity used for cursor and metadata key prefixes.
     fn name(&self) -> DeriveConsumerName;
 
+    /// Starts one atomic block batch.
+    ///
+    /// Most consumers stage independent per-block rows and use this default
+    /// no-op. Consumers that maintain shared aggregate rows can reset their
+    /// batch-local overlay here before the dispatcher invokes `apply_block`
+    /// or `revert_block` more than once against the same `WriteBatch`.
+    fn begin_batch(&mut self, _ctx: &mut DeriveConsumerCtx<'_>) -> Result<(), DeriveConsumerError> {
+        Ok(())
+    }
+
     /// Stages per-height writes derived from `block`. Implementations write
     /// into `ctx.batch`; the SDK appends the cursor advance and commits
     /// atomically.
@@ -351,6 +391,30 @@ pub trait BlockKeyedConsumer: Send + Sync {
         height: BlockHeight,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError>;
+
+    /// Finishes one atomic block batch.
+    ///
+    /// Aggregate consumers stage their final shared rows here after every
+    /// per-block mutation is known. The default is a no-op.
+    fn finish_batch(
+        &mut self,
+        _ctx: &mut DeriveConsumerCtx<'_>,
+    ) -> Result<(), DeriveConsumerError> {
+        Ok(())
+    }
+
+    /// Stages event-aware projection metadata in the same batch as rows.
+    ///
+    /// The default is a no-op. Consumers that publish coverage or read fences
+    /// use this hook because [`Self::finish_batch`] deliberately has no chain
+    /// event semantics.
+    fn stage_chain_event_checkpoint(
+        &mut self,
+        _checkpoint: BlockProjectionCheckpoint<'_>,
+        _ctx: &mut DeriveConsumerCtx<'_>,
+    ) -> Result<(), DeriveConsumerError> {
+        Ok(())
+    }
 }
 
 /// Dispatches a committed range against a [`BlockKeyedConsumer`] from

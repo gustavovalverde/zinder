@@ -87,6 +87,34 @@ pub enum SourceError {
         byte_count: usize,
     },
 
+    /// A final note-commitment root did not have the expected JSON shape.
+    #[error("{protocol:?} final note-commitment root is malformed: {reason}")]
+    MalformedFinalNoteCommitmentRoot {
+        /// Shielded protocol whose root was malformed.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Expected JSON shape that was violated.
+        reason: &'static str,
+    },
+
+    /// A final note-commitment root was not valid hex.
+    #[error("{protocol:?} final note-commitment root is not valid hex")]
+    InvalidFinalNoteCommitmentRootHex {
+        /// Shielded protocol whose root was invalid.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Hex decoding failure.
+        #[source]
+        source: hex::FromHexError,
+    },
+
+    /// A final note-commitment root decoded to a length other than 32 bytes.
+    #[error("{protocol:?} final note-commitment root must be 32 bytes, got {byte_count}")]
+    InvalidFinalNoteCommitmentRootLength {
+        /// Shielded protocol whose root had the wrong length.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Decoded byte length.
+        byte_count: usize,
+    },
+
     /// Raw block bytes could not be parsed as a Zcash block.
     ///
     /// Prefer this variant when bytes decoded from hex successfully but the
@@ -425,6 +453,9 @@ impl SourceError {
             | Self::InvalidTransactionIdLength { .. }
             | Self::InvalidSubtreeRootHex { .. }
             | Self::InvalidSubtreeRootLength { .. }
+            | Self::MalformedFinalNoteCommitmentRoot { .. }
+            | Self::InvalidFinalNoteCommitmentRootHex { .. }
+            | Self::InvalidFinalNoteCommitmentRootLength { .. }
             | Self::RawBlockParseFailed { .. }
             | Self::RawTransactionParseFailed { .. }
             | Self::TransactionComponentIndexOverflow { .. }

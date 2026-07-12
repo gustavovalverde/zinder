@@ -2,9 +2,11 @@
 
 Status: Shipped
 Date: 2026-05-18
-Last updated: 2026-05-19
+Last updated: 2026-07-12
 Owner: ZFND
 Reference consumer: zexplorer (M0+)
+
+This PRD records the original explorer requirements. The current normative wire, capability, and projection semantics live in [Public interfaces](../architecture/public-interfaces.md) and [Explorer plane](../architecture/explorer-plane.md). Later additive projections do not retroactively replace shipped requirements.
 
 ## Implementation Summary (2026-05-19)
 
@@ -21,7 +23,7 @@ All R-* requirements landed in one branch:
 - R-ADDR-1: rebuilt `TransparentAddressActivity` on top of a derive-backed
   consumer; the entry shape changed (drops mempool overlay fields, adds
   `net_value_zat`, `transparent_input_count`, `transparent_output_count`).
-- R-TX-2: new `RecentTransactionsConsumer` + streaming `RecentTransactions` RPC.
+- R-TX-2: `RecentTransactionsConsumer` + bounded `RecentTransactions` RPC.
 - R-SEARCH-1: extended `NotPubliclyIndexableReason` with mainnet/testnet
   shielded variants and the unified-without-transparent variant; classifier
   emits the right reason per network.
@@ -178,49 +180,9 @@ Capability: `explorer.transaction.detail_v3` is the current transaction-detail c
 
 #### R-TX-2. `RecentTransactions(limit)` composite RPC
 
-Now: the dashboard's "recent transactions" panel walks back from tip by calling `BlockSummariesInRange(tip - N, tip)`, then `BlockDetail(height)` per block (one round trip each), then `TransactionDetail(txid)` per transaction (one round trip each). For a panel showing eight transactions this is `1 + 4 + 8 = 13` round trips, gated on the slowest one.
+The shipped `RecentTransactions` method and `recent_transactions` consumer satisfy the dashboard's bounded newest-first requirement and remove public `N+1` composition. They remain part of the native contract and advertise `explorer.transaction.recent_v1`.
 
-Why this belongs upstream: every consumer that wants a "newest transactions" surface (the dashboard, search ranking, a future API) needs the same composition. The composition is straightforward at the derive layer and avoids `N+1` round trips on the public path.
-
-Proposed change: add a streaming RPC:
-
-```proto
-service ExplorerQuery {
-  // ... existing methods ...
-  rpc RecentTransactions(RecentTransactionsRequest)
-      returns (stream RecentTransactionsChunk);
-}
-
-message RecentTransactionsRequest {
-  uint32 max_entries = 1;        // hard cap on the handler side
-  optional bytes from_cursor = 2;
-}
-
-message RecentTransactionsChunk {
-  ExplorerFreshness freshness = 1;
-  bytes cursor = 2;
-  repeated RecentTransactionEntry entries = 3;
-}
-
-message RecentTransactionEntry {
-  bytes transaction_id = 1;
-  uint32 block_height = 2;
-  bytes block_hash = 3;
-  int64 block_time_unix_seconds = 4;
-  bool is_coinbase = 5;
-  PrivacyShape privacy_shape = 6;
-  TransactionComponentCounts component_counts = 7;
-  uint32 size_bytes = 8;
-  // ZIP-317 conventional floor; same caveat as R-TX-1.
-  uint64 zip317_conventional_fee_zat = 9;
-  // Set only when R-TX-1 prevout resolution is online for this tx.
-  optional uint64 paid_fee_zat = 10;
-}
-```
-
-A new `recent_transactions` column family on the consumer store, keyed by `(reverse_height, in_block_position)`, holds the entries. The derive consumer writes one row per transaction at block-finalize time. Reorg rewind deletes the affected key range before the replacement is written.
-
-Capability: `explorer.transaction.recent_v1`.
+The later `TransactionHistory` method is additive. It owns a separate consumer, filters, opaque paging, projection read fence, verified coverage, and exact-count scope. It advertises `explorer.transaction.history_v1` and conditionally `explorer.transaction.history_v2`; it does not rename or remove `RecentTransactions`.
 
 ### Address view
 
@@ -476,6 +438,7 @@ Document this in the explorer-plane architecture doc and surface it as `CursorEx
 | `explorer.block.summary_v2` | `BlockSummariesInRange` (extended payload) | 1 |
 | `explorer.transaction.detail_v3` | `TransactionDetail` (paid fee, prevout status) | 2 |
 | `explorer.transaction.recent_v1` | `RecentTransactions` | 3 |
+| `explorer.transaction.history_v1` | `TransactionHistory` | additive |
 | `explorer.transparent_address.activity_v1` | `TransparentAddressActivity` | 2 |
 | `explorer.mempool.activity_v2` | `MempoolActivity` (entry fees) | 2 |
 | `explorer.mempool.event_counts_v1` | `MempoolEventCounts` | 2 |

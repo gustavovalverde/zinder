@@ -55,6 +55,9 @@ This documentation set defines Zinder's product scope, service boundaries, and v
 - [ADR-0027: Explicit event-stream start positions](adrs/0027-event-stream-start-positions.md)
 - [ADR-0028: Per-consumer derive schema versioning](adrs/0028-per-consumer-derive-schema-versioning.md)
 - [ADR-0029: Durable transparent-outpoint spend projection and retention release floor](adrs/0029-durable-transparent-outpoint-spend-projection.md)
+- [ADR-0030: Compatible canonical artifact enrichment](adrs/0030-compatible-canonical-artifact-enrichment.md)
+- [ADR-0031: Projection checkpoints and backfill coverage](adrs/0031-projection-checkpoints-and-backfill-coverage.md)
+- [ADR-0032: Writer-owned displaced-block archive](adrs/0032-writer-owned-displaced-block-archive.md)
 
 ## Reference
 
@@ -62,7 +65,7 @@ Current integration references and API support material:
 
 - [Server-side wallet pattern](reference/server-side-wallet-pattern.md): the canonical recipe for building a server-side Zcash wallet on Zinder + librustzcash.
 - [Integration surfaces](reference/integration-surfaces.md): supported client and operator integration paths.
-- [What Zinder adds by use case](reference/zinder-value-by-use-case.md): how Zinder fits with Zebra's indexed node state and Zaino for explorers, wallets, and payment facilitators.
+- [Zinder information by use case](reference/zinder-value-by-use-case.md): the canonical catalog of information Zinder gathers or derives, its availability, and its product value.
 - [Error vocabulary](reference/error-vocabulary.md): every `ErrorReason` value, its gRPC `Status` code, and the retry policy clients should follow.
 
 ## Investigations
@@ -73,6 +76,7 @@ Current integration references and API support material:
 ## Plans
 
 - [Lightwalletd compatibility certification](plans/lightwalletd-compatibility-certification.md): bounded, evidence-backed replacement claims for the compatibility adapter.
+- [Native indexer projections merge](plans/native-indexer-projections-merge.md): native-only scope, schema ladder, coverage matrix, review sequence, and merge constraints for this branch.
 
 ## Runbooks
 

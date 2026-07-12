@@ -86,6 +86,12 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("memory_pause_ratio = 0.99"));
     assert!(stdout.contains("memory_resume_ratio = 0.8"));
     assert!(stdout.contains("min_replay_batch_blocks = 10"));
+    assert!(stdout.contains("[ingest.commitment_root_backfill]"));
+    assert!(stdout.contains("enabled = true"));
+    assert!(stdout.contains("batch_blocks = 256"));
+    assert!(stdout.contains("fetch_concurrency = 8"));
+    assert!(stdout.contains("[ingest.conventional_fee_distribution_backfill]"));
+    assert!(stdout.contains("[ingest.transaction_component_backfill]"));
     assert!(stdout.contains("[ingest.bulk_catchup]"));
     assert!(stdout.contains("canonical_batch_max_blocks = 1000"));
     assert!(stdout.contains("canonical_batch_max_artifact_bytes = 536870912"));
@@ -105,6 +111,71 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("allow_near_tip_finalize = false"));
     assert!(stdout.contains("coverage = \"explicit\""));
 
+    Ok(())
+}
+
+#[test]
+fn commitment_root_backfill_env_overrides_print_config() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("root-backfill-env-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_INGEST__COMMITMENT_ROOT_BACKFILL__ENABLED", "false")
+        .env(
+            "ZINDER_INGEST__COMMITMENT_ROOT_BACKFILL__BATCH_BLOCKS",
+            "64",
+        )
+        .env(
+            "ZINDER_INGEST__COMMITMENT_ROOT_BACKFILL__FETCH_CONCURRENCY",
+            "2",
+        )
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    let section = stdout
+        .split("[ingest.commitment_root_backfill]")
+        .nth(1)
+        .and_then(|tail| tail.split("\n[").next())
+        .ok_or("commitment-root backfill section missing")?;
+    assert!(section.contains("enabled = false"));
+    assert!(section.contains("batch_blocks = 64"));
+    assert!(section.contains("fetch_concurrency = 2"));
+    Ok(())
+}
+
+#[test]
+fn conventional_fee_distribution_backfill_env_overrides_print_config() -> Result<(), Box<dyn Error>>
+{
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("fee-distribution-backfill-env-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env(
+            "ZINDER_INGEST__CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL__ENABLED",
+            "false",
+        )
+        .env(
+            "ZINDER_INGEST__CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL__BATCH_BLOCKS",
+            "64",
+        )
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    let section = stdout
+        .split("[ingest.conventional_fee_distribution_backfill]")
+        .nth(1)
+        .and_then(|tail| tail.split("\n[").next())
+        .ok_or("conventional-fee distribution backfill section missing")?;
+    assert!(section.contains("enabled = false"));
+    assert!(section.contains("batch_blocks = 64"));
     Ok(())
 }
 

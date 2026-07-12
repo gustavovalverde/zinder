@@ -31,6 +31,8 @@ pub enum NodeCapability {
     /// Source can report chain-wide value pool totals (Zebra's
     /// `getblockchaininfo.valuePools`).
     ChainValuePools,
+    /// Source can report cumulative value-pool balances for an exact block.
+    BlockValuePoolBalances,
 }
 
 impl fmt::Display for NodeCapability {
@@ -55,6 +57,7 @@ impl NodeCapability {
             Self::JsonRpc => "json_rpc",
             Self::OpenRpcDiscovery => "openrpc_discovery",
             Self::ChainValuePools => "chain_value_pools",
+            Self::BlockValuePoolBalances => "block_value_pool_balances",
         }
     }
 }
@@ -71,6 +74,7 @@ const ORDERED_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::JsonRpc,
     NodeCapability::OpenRpcDiscovery,
     NodeCapability::ChainValuePools,
+    NodeCapability::BlockValuePoolBalances,
 ];
 
 const fn capability_bit(capability: NodeCapability) -> u16 {
@@ -86,6 +90,7 @@ const fn capability_bit(capability: NodeCapability) -> u16 {
         NodeCapability::JsonRpc => 1 << 8,
         NodeCapability::OpenRpcDiscovery => 1 << 9,
         NodeCapability::ChainValuePools => 1 << 10,
+        NodeCapability::BlockValuePoolBalances => 1 << 11,
     }
 }
 

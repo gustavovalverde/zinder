@@ -14,8 +14,9 @@ use zebra_chain::{
 use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockTransactionIndexArtifact,
     ChainTipMetadata, CompactBlockArtifact, NetworkUpgradeActivations, ShieldedProtocol,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentOutputArtifact,
     wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 
@@ -304,6 +305,8 @@ pub struct DerivedBlockArtifacts {
     pub transaction_locations: Vec<TransactionLocation>,
     /// Per-transaction public facts.
     pub transaction_facts: Vec<TransactionFactsArtifact>,
+    /// Per-transaction signed shielded-pool balances.
+    pub transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
     /// Optional raw transaction blobs.
     pub transaction_blobs: Vec<TransactionBlobArtifact>,
     /// Transparent-output artifacts for this block. One per transparent
@@ -385,6 +388,8 @@ pub fn derive_block_with_raw_blob_policy(
         block_transaction_index: transaction_artifacts.block_transaction_index,
         transaction_locations: transaction_artifacts.transaction_locations,
         transaction_facts: transaction_artifacts.transaction_facts,
+        transaction_intrinsic_value_balances: transaction_artifacts
+            .transaction_intrinsic_value_balances,
         transaction_blobs: transaction_artifacts.transaction_blobs,
         transparent_outputs_by_outpoint,
     })
@@ -409,6 +414,7 @@ pub fn finalize_derived_block(
         block_transaction_index,
         transaction_locations,
         transaction_facts,
+        transaction_intrinsic_value_balances,
         transaction_blobs,
         transparent_outputs_by_outpoint,
     } = derived;
@@ -431,6 +437,7 @@ pub fn finalize_derived_block(
         block_transaction_index,
         transaction_locations,
         transaction_facts,
+        transaction_intrinsic_value_balances,
         transaction_blobs,
         transparent_outputs_by_outpoint,
         tip_metadata: final_tree_sizes.tip_metadata(),
@@ -441,6 +448,7 @@ struct DerivedTransactionArtifacts {
     block_transaction_index: Vec<BlockTransactionIndexArtifact>,
     transaction_locations: Vec<TransactionLocation>,
     transaction_facts: Vec<TransactionFactsArtifact>,
+    transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
     transaction_blobs: Vec<TransactionBlobArtifact>,
 }
 
@@ -453,6 +461,8 @@ fn derive_transaction_artifacts_from_parsed(
     let mut block_transaction_index = Vec::with_capacity(parsed_block.transactions.len());
     let mut transaction_locations = Vec::with_capacity(parsed_block.transactions.len());
     let mut transaction_facts = Vec::with_capacity(parsed_block.transactions.len());
+    let mut transaction_intrinsic_value_balances =
+        Vec::with_capacity(parsed_block.transactions.len());
     let mut transaction_blobs = Vec::with_capacity(parsed_block.transactions.len());
 
     for (tx_index_in_block, transaction) in parsed_block.transactions.iter().enumerate() {
@@ -487,6 +497,10 @@ fn derive_transaction_artifacts_from_parsed(
             TransactionFactsArtifact::new(location, fact_set.public_facts)
                 .with_transparent_facts(fact_set.transparent_inputs, fact_set.transparent_outputs),
         );
+        transaction_intrinsic_value_balances.push(TransactionIntrinsicValueBalancesArtifact::new(
+            location,
+            fact_set.intrinsic_value_balances,
+        ));
         if raw_blob_policy.writes_transaction_blobs() {
             transaction_blobs.push(TransactionBlobArtifact::new(location, payload_bytes));
         } else {
@@ -498,6 +512,7 @@ fn derive_transaction_artifacts_from_parsed(
         block_transaction_index,
         transaction_locations,
         transaction_facts,
+        transaction_intrinsic_value_balances,
         transaction_blobs,
     })
 }

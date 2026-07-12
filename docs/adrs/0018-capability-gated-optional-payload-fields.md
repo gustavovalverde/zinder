@@ -22,7 +22,7 @@ upstream state the operator may or may not have wired:
   non-coinbase transaction in the block.
 - `TransparentAddressActivityEntry.net_value_zat` requires the same
   prevout resolution; the row materializes either way.
-- `RecentTransactionEntry.zip317_conventional_fee_zat` is unset for
+- `TransactionHistoryEntry.zip317_conventional_fee_zat` is unset for
   coinbase rows; non-coinbase rows always carry a value.
 
 We need one convention for "this field is present when capability X is
@@ -89,6 +89,10 @@ convention. Specifically:
 | `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v1` | `prevout_resolution_status` on the record |
 | `RecentTransactionEntry.zip317_conventional_fee_zat` | `explorer.transaction.recent_v1` | (none; `is_coinbase = true` explains absence) |
 | `RecentTransactionEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
+| `TransactionHistoryEntry.zip317_conventional_fee_zat` | `explorer.transaction.history_v1` | (none; `is_coinbase = true` explains absence) |
+| `TransactionHistoryEntry.intrinsic_value_balances` | `explorer.transaction.intrinsic_value_balances_v1` | (none; absence remains unknown and never means all-zero balances) |
+| `TransactionDetailResponse.intrinsic_value_balances` | `explorer.transaction.intrinsic_value_balances_v1` | (none; absence remains unknown and never means all-zero balances) |
+| `TransactionHistoryEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
 | `MinedTransaction.raw_transaction_bytes` | `wallet.read.transaction_bytes_v1` | (none; absence means "transaction blob not retained") |
 
 `MinedTransaction.raw_transaction_bytes` is the wallet-surface example.
@@ -117,6 +121,10 @@ control lock; readers read it. An absent key on a legacy store reads
 back as `none`, so the deployment advertises the minimum until the next
 ingest restart persists the real signal. The signal needs no schema
 bump: `StorageControl` is an unstructured key-value bag.
+
+## Projection capabilities require projection evidence
+
+An online derive store is not enough to advertise a backfilled projection as complete. The service evaluates the named consumer's checkpoint and coverage from one read snapshot. A base capability may be advertised when partial rows are useful and the response exposes their bounds. A completeness capability is advertised only when verified contiguous coverage reaches the fenced projection tip and the ending hash matches. Canonical artifact schema, block-summary freshness, and global ingest readiness are inputs, not substitutes for this evidence.
 
 ## Consequences
 

@@ -22,6 +22,10 @@ pub const BLOCK_TRANSACTION_INDEX: &str = "block_transaction_index";
 pub const TRANSACTION_LOCATION: &str = "transaction_location";
 /// Canonical transaction facts.
 pub const TRANSACTION_FACTS: &str = "transaction_facts";
+/// Optional transaction-intrinsic shielded value balances.
+pub const TRANSACTION_INTRINSIC_VALUE_BALANCES: &str = "transaction_intrinsic_value_balances";
+/// Optional cumulative value-pool balances after a canonical block.
+pub const BLOCK_VALUE_POOL_BALANCES: &str = "block_value_pool_balances";
 /// Optional raw transaction blob.
 pub const TRANSACTION_BLOB: &str = "transaction_blob";
 /// Commitment tree-state artifact.
@@ -38,6 +42,8 @@ pub const TRANSPARENT_OUTPUT: &str = "transparent_output";
 pub const TRANSPARENT_ADDRESS_TX_INDEX: &str = "transparent_address_tx_index";
 /// Best-chain block-hash to height index entry.
 pub const BLOCK_HASH_INDEX: &str = "block_hash_index";
+/// Block displaced from the canonical branch.
+pub const DISPLACED_BLOCK: &str = "displaced_block";
 /// Live mempool entry.
 pub const MEMPOOL_ENTRY: &str = "mempool_entry";
 /// Mempool event envelope.

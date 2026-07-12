@@ -344,6 +344,10 @@ message TransactionDetailRequest {
 // transactions have no payload and therefore return empty lists. Addresses
 // remain an edge concern derived from standard scripts; Zinder returns
 // scriptPubKey bytes.
+//
+// `intrinsic_value_balances` is populated only for mined transactions when
+// the canonical artifact or retained transaction blob is available at the
+// response's pinned chain epoch. Absence is distinct from an all-zero balance.
 message TransactionDetailResponse {
   ExplorerFreshness freshness = 1;
   TransactionPublicFacts facts = 2;
@@ -354,6 +358,7 @@ message TransactionDetailResponse {
   reserved 8;
   reserved "transparent_input_outpoints";
   repeated TransparentOutput transparent_outputs = 9;
+  TransactionIntrinsicValueBalances intrinsic_value_balances = 10;
 }
 
 // Compact summary of one canonical block.
@@ -398,8 +403,9 @@ message BlockSummary {
   // values; consumers fall back to `fees_collected_zat`.
   optional uint64 paid_fees_collected_zat = 8;
 
-  // Value the coinbase output(s) paid out, in zatoshis. Includes any
-  // shielded coinbase outputs per [ZIP-213](https://zips.z.cash/zip-0213).
+  // Sum of transparent coinbase outputs, in zatoshis. Shielded coinbase
+  // outputs are not included because `BlockSummaryConsumer` currently
+  // materializes only transparent output values.
   uint64 coinbase_reward_zat = 9;
 
   // Sum of Sapling output counts across every transaction in the block.
@@ -501,8 +507,9 @@ message CoinbaseTransactionSummary {
   repeated zinder.v1.wallet.TransparentOutput transparent_outputs = 2;
 
   // True when the coinbase also creates Sapling, Orchard, Ironwood, or Sprout
-  // shielded outputs. Shielded values and receivers remain encrypted.
-  bool has_shielded_outputs = 3;
+  // shielded outputs. Absent when unsupported transaction sections prevent a
+  // complete classification. Shielded values and receivers remain encrypted.
+  optional bool has_shielded_outputs = 3;
 }
 
 // `ExplorerQuery.BlockProductionSeries` request.
@@ -656,6 +663,23 @@ message BlockTransactionsResponse {
   ExplorerFreshness freshness = 1;
   BlockSummary summary = 2;
   repeated BlockTransaction transactions = 3;
+
+  // Final post-block note-commitment-tree roots when the canonical artifact is
+  // available for this height. Individual roots remain absent before their
+  // protocol activates; an absent enclosing message means this height has not
+  // yet been enriched.
+  BlockFinalNoteCommitmentRoots final_note_commitment_roots = 4;
+}
+
+// Final note-commitment-tree roots after one block.
+//
+// Bytes retain the same order Zebra emits through
+// `z_gettreestate.*.commitments.finalRoot`; hex-encoding them produces the
+// root string used by `CommitmentRootSearch` and explorer UIs.
+message BlockFinalNoteCommitmentRoots {
+  optional bytes sapling = 1;
+  optional bytes orchard = 2;
+  optional bytes ironwood = 3;
 }
 
 // Per-arm privacy refusal payload returned for shielded receivers,
@@ -898,6 +922,103 @@ message SearchResponse {
   repeated SearchCandidate candidates = 2;
 }
 
+// `ExplorerQuery.CommitmentRootSearch` request.
+//
+// Searches final, post-block note-commitment-tree roots. It intentionally does
+// not search transaction-intermediate anchors or completed 2^16-leaf subtree
+// roots: those are different protocol facts.
+message CommitmentRootSearchRequest {
+  // Final note-commitment-tree root bytes. Exactly 32 bytes, in the same byte
+  // order Zebra emits as `z_gettreestate.*.commitments.finalRoot`; hex-encoding
+  // these bytes produces the root string shown by explorer APIs.
+  bytes root = 1;
+
+  // Maximum matches to return, ordered newest-first. Zero asks for the server
+  // default; the server clamps larger values.
+  uint32 max_matches = 2;
+}
+
+// One canonical block whose final root matches the requested bytes.
+message CommitmentRootMatch {
+  uint32 block_height = 1;
+
+  // Canonical block hash in RPC byte order (64 lowercase hex characters).
+  string block_hash = 2;
+
+  int64 block_time_unix_seconds = 3;
+  ShieldedProtocol protocol = 4;
+}
+
+// Historical coverage of the commitment-root projection.
+//
+// The projection can serve newly committed blocks while an older range is
+// still backfilling. Consumers must not interpret an empty `matches` list as a
+// definitive absence unless `canonical_history_complete` is true.
+message CommitmentRootSearchCoverage {
+  // First height in the contiguous historical backfill range. Absent until the
+  // backfill has committed its first batch.
+  optional uint32 complete_from_height = 1;
+
+  // Last height in the contiguous historical backfill range. Absent until the
+  // backfill has committed its first batch.
+  optional uint32 complete_through_height = 2;
+
+  // Highest canonical height with a materialized root row. This may be ahead
+  // of `complete_through_height` while tip-follow and backfill run together.
+  optional uint32 latest_indexed_height = 3;
+
+  // True only when every root-bearing canonical height through the response's
+  // visible tip is covered by the contiguous historical range.
+  bool canonical_history_complete = 4;
+}
+
+// Historical coverage of displaced commitment-root matches.
+//
+// This is independent from canonical-root coverage. The archive begins at an
+// activation event and can retain a displaced block whose final roots were not
+// available at capture time. Consumers must not interpret an empty
+// `displaced_matches` list as a definitive absence before activation, or when
+// `root_artifact_unavailable_count` is nonzero. Even a definitive negative is
+// limited to the captured range, never all historical displaced blocks.
+message CommitmentRootSearchDisplacedCoverage {
+  // First event covered by displaced-root capture. Absent before activation,
+  // so negative displaced-root results remain indeterminate.
+  optional uint64 activation_event_sequence = 1;
+
+  // Epoch made visible by the activation event.
+  optional uint64 activation_epoch_id = 2;
+
+  // Wall-clock time when displaced-root capture became active.
+  optional uint64 activated_at_millis = 3;
+
+  // Number of displaced blocks captured at or after activation.
+  uint64 captured_block_count = 4;
+
+  // Captured displaced blocks whose final-root artifact was unavailable.
+  // A nonzero value makes a negative displaced-root result indeterminate.
+  uint64 root_artifact_unavailable_count = 5;
+
+  // True only when capture has activated and every captured displaced block
+  // has a searchable final-root artifact. This says nothing about displaced
+  // blocks from before activation.
+  bool captured_range_complete = 6;
+}
+
+// `ExplorerQuery.CommitmentRootSearch` response.
+message CommitmentRootSearchResponse {
+  ExplorerFreshness freshness = 1;
+  repeated CommitmentRootMatch matches = 2;
+  CommitmentRootSearchCoverage coverage = 3;
+
+  // Retained displaced blocks whose final root matches the request. Each row
+  // supplies the hash accepted by `DisplacedBlockDetail`; coinbase and product
+  // metadata remain on that dedicated RPC.
+  repeated CommitmentRootMatch displaced_matches = 4;
+
+  // Coverage for `displaced_matches`, independent from canonical `coverage`.
+  CommitmentRootSearchDisplacedCoverage displaced_coverage = 5;
+}
+
 // Per-shape count carried by [`MempoolSummaryResponse`].
 message PrivacyShapeCount {
   PrivacyShape shape = 1;
@@ -1087,6 +1208,10 @@ message TransparentAddressActivityRequest {
 
   // Optional chain-epoch id pin.
   optional uint64 at_epoch_id = 7;
+
+  // Number of matching rows to skip before collecting the page. Intended for
+  // bounded page-number adapters. Must be zero when `from_cursor` is non-empty.
+  uint64 offset = 8;
 }
 
 // One transparent-address confirmed-activity row.
@@ -1123,6 +1248,55 @@ message TransparentAddressActivityEntry {
 
   // Why `net_value_zat` is or is not set. Always populated.
   PrevoutResolutionStatus prevout_resolution_status = 7;
+
+  // Canonical zero-based position inside the block. Absent when retained
+  // canonical transaction facts are unavailable.
+  optional uint32 transaction_index = 8;
+
+  // Raw transaction byte length. Absent when retained canonical transaction
+  // facts are unavailable.
+  optional uint32 size_bytes = 9;
+
+  // Full transaction component counts. Absent when retained canonical
+  // transaction facts are unavailable. The address-specific `input_count`
+  // and `output_count` above retain their existing meaning.
+  TransactionComponentCounts component_counts = 10;
+
+  // Sum of resolved transparent inputs spent from the requested address.
+  // Present only when every non-coinbase transparent input was resolved.
+  optional uint64 input_value_zat = 11;
+
+  // Sum of intrinsic transparent outputs paid to the requested address.
+  // Present whenever retained canonical transaction facts are available.
+  optional uint64 output_value_zat = 12;
+
+  // Deduplicated raw scripts for resolved inputs spent from other addresses,
+  // in first-input order. May be partial when `input_facts_complete` is false.
+  repeated bytes other_input_script_pub_keys = 13;
+
+  // Deduplicated raw scripts for intrinsic outputs paid to other addresses,
+  // in first-output order. Complete whenever `component_counts` is present.
+  repeated bytes other_output_script_pub_keys = 14;
+
+  // True when every transparent input script and value is known. Coinbase has
+  // a complete empty input set. False when transaction or parent facts are
+  // unavailable; `input_value_zat` is absent in that case.
+  bool input_facts_complete = 15;
+}
+
+// Current balance and lifetime facts for one transparent script hash.
+//
+// Lifetime fields are absent for a valid address with no retained history.
+// `script_pub_key` is absent when the request supplied only a script hash and
+// neither snapshot nor tail facts retained the corresponding raw script.
+message TransparentAddressSummary {
+  optional bytes script_pub_key = 1;
+  uint64 balance_zat = 2;
+  optional uint64 total_received_zat = 3;
+  optional uint64 total_sent_zat = 4;
+  optional uint64 distinct_transaction_count = 5;
+  optional int64 first_seen_unix_seconds = 6;
+  optional int64 last_seen_unix_seconds = 7;
 }
 
 // `ExplorerQuery.TransparentAddressActivity` response.
@@ -1130,6 +1304,8 @@ message TransparentAddressActivityResponse {
   ExplorerFreshness freshness = 1;
   repeated TransparentAddressActivityEntry entries = 2;
   bytes next_cursor = 3;
+  TransparentAddressSummary summary = 4;
+  TransparentAddressRankingCoverage coverage = 5;
 }
 
 // `ExplorerQuery.TransparentAddressDeltas` request.
@@ -1411,6 +1587,243 @@ message MigrationDenominationsResponse {
   uint32 total_tx = 3;
 }
 
+// `ExplorerQuery.ConventionalFeeDistribution` request.
+//
+// Selects the half-open block-time range
+// `[start_time_unix_seconds, end_time_unix_seconds)`. Boundary UTC days are
+// clipped to transactions in the requested range.
+message ConventionalFeeDistributionRequest {
+  int64 start_time_unix_seconds = 1;
+  int64 end_time_unix_seconds = 2;
+}
+
+// One exact ZIP-317 conventional-fee frequency.
+//
+// This is the ZIP-317 conventional fee, not the miner-collected fee.
+message ConventionalFeeFrequency {
+  uint64 zip317_conventional_fee_zat = 1;
+  uint64 transaction_count = 2;
+}
+
+// Exact conventional-fee frequencies for one UTC day, clipped to the
+// request's half-open time range.
+message ConventionalFeeDistributionDay {
+  // UTC midnight as Unix seconds.
+  int64 day_start_unix_seconds = 1;
+
+  // Frequencies sorted by `zip317_conventional_fee_zat` ascending.
+  repeated ConventionalFeeFrequency frequencies = 2;
+
+  // Transactions whose ZIP-317 conventional fee was unavailable.
+  uint64 unavailable_transaction_count = 3;
+}
+
+// Contiguous projection coverage for a conventional-fee distribution query.
+message ConventionalFeeDistributionCoverage {
+  optional uint32 complete_from_height = 1;
+  optional uint32 complete_through_height = 2;
+  optional int64 complete_from_time_unix_seconds = 3;
+  optional int64 complete_through_time_unix_seconds = 4;
+
+  // True only when projection coverage includes the full requested range.
+  bool requested_range_complete = 5;
+}
+
+// `ExplorerQuery.ConventionalFeeDistribution` response.
+message ConventionalFeeDistributionResponse {
+  ExplorerFreshness freshness = 1;
+  repeated ConventionalFeeDistributionDay days = 2;
+  ConventionalFeeDistributionCoverage coverage = 3;
+}
+
+// `ExplorerQuery.PaidFeeDistribution` request.
+//
+// Selects the half-open block-time range
+// `[start_time_unix_seconds, end_time_unix_seconds)`. Boundary UTC days are
+// clipped to transactions in the requested range.
+message PaidFeeDistributionRequest {
+  int64 start_time_unix_seconds = 1;
+  int64 end_time_unix_seconds = 2;
+}
+
+// One exact positive miner-collected fee frequency. Proven zero-fee
+// transactions are omitted and are not counted as unavailable.
+message PaidFeeFrequency {
+  uint64 paid_fee_zat = 1;
+  uint64 transaction_count = 2;
+}
+
+// Exact paid-fee frequencies for one UTC day, clipped to the request's
+// half-open time range.
+message PaidFeeDistributionDay {
+  // UTC midnight as Unix seconds.
+  int64 day_start_unix_seconds = 1;
+
+  // Positive frequencies sorted by `paid_fee_zat` ascending.
+  repeated PaidFeeFrequency frequencies = 2;
+
+  // Non-coinbase transactions whose exact paid fee was unavailable.
+  uint64 unavailable_transaction_count = 3;
+}
+
+// Contiguous projection coverage for a paid-fee distribution query.
+message PaidFeeDistributionCoverage {
+  optional uint32 complete_from_height = 1;
+  optional uint32 complete_through_height = 2;
+  optional int64 complete_from_time_unix_seconds = 3;
+  optional int64 complete_through_time_unix_seconds = 4;
+
+  // True only when projection coverage includes the full requested range.
+  bool requested_range_complete = 5;
+}
+
+// `ExplorerQuery.PaidFeeDistribution` response.
+message PaidFeeDistributionResponse {
+  ExplorerFreshness freshness = 1;
+  repeated PaidFeeDistributionDay days = 2;
+  PaidFeeDistributionCoverage coverage = 3;
+}
+
+// Additive public transaction-component totals over a canonical time range.
+//
+// Component counters and transaction predicates are public protocol facts.
+// Predicate counters name their exact protocol scope so callers do not infer
+// behavior for future pools.
+message TransactionComponentTotals {
+  uint64 transaction_count = 1;
+  uint64 transparent_input_count = 2;
+  uint64 transparent_output_count = 3;
+  uint64 sapling_spend_count = 4;
+  uint64 sapling_output_count = 5;
+  uint64 orchard_action_count = 6;
+  uint64 ironwood_action_count = 7;
+  uint64 sprout_joinsplit_count = 8;
+  uint64 sapling_transaction_count = 9;
+  uint64 orchard_transaction_count = 10;
+  uint64 ironwood_transaction_count = 11;
+  uint64 sprout_transaction_count = 12;
+  uint64 legacy_shielded_transaction_count = 13;
+  uint64 legacy_sapling_only_transaction_count = 14;
+  uint64 legacy_orchard_only_transaction_count = 15;
+  uint64 legacy_sapling_and_orchard_transaction_count = 16;
+  uint64 legacy_fully_shielded_transaction_count = 17;
+  // Includes coinbase transactions with at least one Sapling, Orchard, or
+  // Ironwood component. Sprout-only transactions do not count.
+  uint64 sapling_orchard_or_ironwood_transaction_count = 18;
+  // Non-coinbase transactions without Sapling, Orchard, or Ironwood
+  // components. Sprout-only transactions count.
+  uint64 non_coinbase_without_sapling_orchard_or_ironwood_transaction_count = 19;
+  // Non-coinbase transactions with a Sapling, Orchard, or Ironwood component
+  // and at least one transparent input and output.
+  uint64 non_coinbase_sapling_orchard_or_ironwood_with_transparent_inputs_and_outputs_transaction_count = 20;
+  // Non-coinbase transactions with a Sapling, Orchard, or Ironwood component
+  // and no transparent inputs or outputs.
+  uint64 non_coinbase_sapling_orchard_or_ironwood_without_transparent_inputs_or_outputs_transaction_count = 21;
+  // Coinbase transactions, independent of their component counts.
+  uint64 coinbase_transaction_count = 22;
+  // Transactions excluded from every predicate counter because the parsed
+  // public facts retain unsupported sections. Predicate totals are exact only
+  // when this count is zero.
+  uint64 transaction_predicate_unavailable_count = 23;
+}
+
+// One UTC-day bucket clipped to the request's half-open time range.
+message TransactionComponentDay {
+  // UTC midnight as Unix seconds.
+  int64 day_start_unix_seconds = 1;
+  TransactionComponentTotals totals = 2;
+  optional int64 first_legacy_shielded_transaction_time_unix_seconds = 3;
+  optional int64 last_legacy_shielded_transaction_time_unix_seconds = 4;
+}
+
+// Historical range whose transaction-component projection is contiguous.
+message TransactionComponentCoverage {
+  uint32 complete_from_height = 1;
+  uint32 complete_through_height = 2;
+  int64 complete_from_time_unix_seconds = 3;
+  int64 complete_through_time_unix_seconds = 4;
+  bool requested_range_complete = 5;
+}
+
+// `ExplorerQuery.TransactionComponentSummary` request.
+//
+// Includes transactions whose canonical block timestamp is in
+// `[start_time_unix_seconds, end_time_unix_seconds)`.
+message TransactionComponentSummaryRequest {
+  int64 start_time_unix_seconds = 1;
+  int64 end_time_unix_seconds = 2;
+  // False returns UTC-day buckets. Set true to return only the range totals
+  // and coverage.
+  bool totals_only = 3;
+}
+
+// `ExplorerQuery.TransactionComponentSummary` response.
+message TransactionComponentSummaryResponse {
+  ExplorerFreshness freshness = 1;
+  TransactionComponentTotals totals = 2;
+  repeated TransactionComponentDay days = 3;
+  TransactionComponentCoverage coverage = 4;
+}
+
+// `ExplorerQuery.TransparentAddressRanking` request.
+//
+// Offset is a rank offset in the response's deterministic
+// `(balance descending, script hash ascending)` order. The server caps limit;
+// callers must not assume an unbounded page.
+message TransparentAddressRankingRequest {
+  uint32 limit = 1;
+  uint64 offset = 2;
+}
+
+// One positive-balance standard transparent script in rank order.
+//
+// Address string encoding remains an edge concern because it depends on the
+// target network. The native surface returns the canonical raw script.
+message TransparentAddressRankingEntry {
+  uint64 rank = 1;
+  bytes script_pub_key = 2;
+  uint64 balance_zat = 3;
+  optional uint64 total_received_zat = 4;
+  optional uint64 total_sent_zat = 5;
+  optional uint64 distinct_transaction_count = 6;
+  optional int64 first_seen_unix_seconds = 7;
+  optional int64 last_seen_unix_seconds = 8;
+}
+
+// Recovery coverage for transparent-address ranking and lifetime facts.
+message TransparentAddressRankingCoverage {
+  uint32 balance_complete_through_height = 1;
+  optional uint32 history_complete_from_height = 2;
+  optional uint32 history_complete_through_height = 3;
+  bool lifetime_statistics_complete = 4;
+}
+
+// Standard transparent script template represented by a ranking aggregate.
+enum TransparentScriptType {
+  TRANSPARENT_SCRIPT_TYPE_UNSPECIFIED = 0;
+  TRANSPARENT_SCRIPT_TYPE_P2PKH = 1;
+  TRANSPARENT_SCRIPT_TYPE_P2SH = 2;
+}
+
+// Positive-address count and balance for one standard script template.
+message TransparentAddressScriptTypeSummary {
+  TransparentScriptType script_type = 1;
+  uint64 positive_address_count = 2;
+  uint64 total_positive_balance_zat = 3;
+}
+
+// `ExplorerQuery.TransparentAddressRanking` response.
+message TransparentAddressRankingResponse {
+  ExplorerFreshness freshness = 1;
+  repeated TransparentAddressRankingEntry entries = 2;
+  uint64 positive_address_count = 3;
+  uint64 total_positive_balance_zat = 4;
+  uint64 top_10_balance_zat = 5;
+  uint64 top_100_balance_zat = 6;
+  TransparentAddressRankingCoverage coverage = 7;
+  repeated TransparentAddressScriptTypeSummary script_type_summaries = 8;
+}
+
 // Explorer-shaped read surface served by zinder-explorer.
 service ExplorerQuery {
   // Returns the consumer-side capability descriptor.
@@ -1438,6 +1851,18 @@ service ExplorerQuery {
   rpc BlockActivityDistribution(BlockActivityDistributionRequest)
       returns (BlockActivityDistributionResponse);
 
+  // Returns canonical transaction-component totals and UTC-day buckets over
+  // one half-open block-time range. Capability:
+  // `explorer.transaction.component_summary_v2`.
+  rpc TransactionComponentSummary(TransactionComponentSummaryRequest)
+      returns (TransactionComponentSummaryResponse);
+
+  // Returns positive standard transparent scripts in deterministic balance
+  // order with optional lifetime activity facts. Capability:
+  // `explorer.transparent_address.ranking_v1`.
+  rpc TransparentAddressRanking(TransparentAddressRankingRequest)
+      returns (TransparentAddressRankingResponse);
+
   // Returns one `BlockSummary` plus the canonical-ordered transaction ids
   // for the requested block. Capability: `explorer.block.detail_v1`.
   rpc BlockDetail(BlockDetailRequest) returns (BlockDetailResponse);
@@ -1452,6 +1877,14 @@ service ExplorerQuery {
   // unified addresses route to the typed `NotPubliclyIndexable` arm and
   // never reach a storage read. Capability: `explorer.search_v1`.
   rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Finds canonical blocks whose post-block Sapling, Orchard, or Ironwood
+  // note-commitment-tree root equals the requested bytes. The response carries
+  // explicit backfill coverage so an empty partial-history result is never
+  // mistaken for proof of absence. Capability:
+  // `explorer.commitment_root.search_v1`.
+  rpc CommitmentRootSearch(CommitmentRootSearchRequest)
+      returns (CommitmentRootSearchResponse);
 
   // Aggregates the current mempool snapshot into a single explorer-shaped
   // response: total counts, byte size, privacy-shape distribution,
@@ -1473,7 +1906,7 @@ service ExplorerQuery {
   // by `TransparentAddressActivityConsumer`. The mempool view for an
   // address is served separately through `MempoolActivity` so each
   // surface has one source of truth. Capability:
-  // `explorer.transparent_address.activity_v1`.
+  // `explorer.transparent_address.activity_v2`.
   rpc TransparentAddressActivity(TransparentAddressActivityRequest)
       returns (TransparentAddressActivityResponse);
 
@@ -1491,6 +1924,20 @@ service ExplorerQuery {
   // `explorer.fee.summary_v1`.
   rpc FeeSummary(FeeSummaryRequest) returns (FeeSummaryResponse);
 
+  // Returns exact per-UTC-day ZIP-317 conventional-fee frequencies over a
+  // half-open block-time range. This does not report miner-collected fees or
+  // compute consumer-specific percentiles. Capability:
+  // `explorer.fee.conventional_distribution_v1`.
+  rpc ConventionalFeeDistribution(ConventionalFeeDistributionRequest)
+      returns (ConventionalFeeDistributionResponse);
+
+  // Returns exact per-UTC-day miner-collected fee frequencies over a
+  // half-open block-time range. Missing canonical inputs remain explicit and
+  // no conventional-fee fallback is substituted. Capability:
+  // `explorer.fee.paid_distribution_v1`.
+  rpc PaidFeeDistribution(PaidFeeDistributionRequest)
+      returns (PaidFeeDistributionResponse);
+
   // Returns chain-wide value pool totals at the upstream node's tip.
   // Composed from `WalletQuery.ChainValuePoolsAtTip`. Capability:
   // `explorer.value_pool.summary_v1`.
@@ -1502,6 +1949,34 @@ service ExplorerQuery {
   // Capability: `explorer.network_upgrade.status_v1`.
   rpc NetworkUpgradeStatus(NetworkUpgradeStatusRequest)
       returns (NetworkUpgradeStatusResponse);
+  // Returns canonical transparent-to-shielded flow events, newest first.
+  // Capability: `explorer.value_pool.flow_history_v1`.
+  rpc ValuePoolFlowHistory(ValuePoolFlowHistoryRequest)
+      returns (ValuePoolFlowHistoryResponse);
+
+  // Aggregates canonical value-pool flow events into UTC hour or day buckets
+  // over one half-open time range. Capability:
+  // `explorer.value_pool.flow_summary_v1`.
+  rpc ValuePoolFlowSummary(ValuePoolFlowSummaryRequest)
+      returns (ValuePoolFlowSummaryResponse);
+
+  // Returns exact counts and amount sums for each requested minimum flow
+  // amount over one half-open time range. Capability:
+  // `explorer.value_pool.flow_amount_threshold_summary_v1`.
+  rpc ValuePoolFlowAmountThresholdSummary(ValuePoolFlowAmountThresholdSummaryRequest)
+      returns (ValuePoolFlowAmountThresholdSummaryResponse);
+
+  // Groups canonical value-pool flow events by rounded raw amount over one
+  // half-open time range. Capability:
+  // `explorer.value_pool.flow_rounded_amount_summary_v1`.
+  rpc ValuePoolFlowRoundedAmountSummary(ValuePoolFlowRoundedAmountSummaryRequest)
+      returns (ValuePoolFlowRoundedAmountSummaryResponse);
+
+  // Returns authoritative cumulative value-pool balances at canonical
+  // UTC-day boundaries, newest first. Capability:
+  // `explorer.value_pool.balance_history_v1`.
+  rpc ValuePoolBalanceHistory(ValuePoolBalanceHistoryRequest)
+      returns (ValuePoolBalanceHistoryResponse);
 
   // Returns the chain-wide transparent UTXO-set summary: the count and total
   // value of unspent transparent outputs at the settled tip. Composed from
@@ -1515,6 +1990,18 @@ service ExplorerQuery {
   rpc ChainReorgHistory(ChainReorgHistoryRequest)
       returns (ChainReorgHistoryResponse);
 
+  // Returns a bounded newest-first page from the writer-owned archive of
+  // formerly canonical blocks. Capability:
+  // `explorer.chain.displaced_block_history_v1`.
+  rpc DisplacedBlockHistory(DisplacedBlockHistoryRequest)
+      returns (DisplacedBlockHistoryResponse);
+
+  // Returns one displaced block by hash and its current canonical counterpart
+  // at the former height. Capability:
+  // `explorer.chain.displaced_block_detail_v1`.
+  rpc DisplacedBlockDetail(DisplacedBlockDetailRequest)
+      returns (DisplacedBlockDetailResponse);
+
   // Returns rolling counts of mempool events from the per-second counter
   // column family. Replaces consumer-side in-memory ring buffers.
   // Capability: `explorer.mempool.event_counts_v1`.
@@ -1526,6 +2013,11 @@ service ExplorerQuery {
   // `explorer.transaction.recent_v1`.
   rpc RecentTransactions(RecentTransactionsRequest)
       returns (stream RecentTransactionsChunk);
+
+  // Returns one filtered, newest-first page of canonical transaction history.
+  // Capability: `explorer.transaction.history_v1`.
+  rpc TransactionHistory(TransactionHistoryRequest)
+      returns (TransactionHistoryResponse);
 
   // Verifies a [ZIP-311](https://zips.z.cash/zip-0311) payment disclosure
   // in-process. Operator opt-in. When the capability
@@ -1577,14 +2069,262 @@ message ValuePoolSummaryRequest {}
 // the cumulative chain totals reported by the upstream node, not
 // per-block deltas.
 message ValuePoolSummaryResponse {
+  reserved 3;
+  reserved "tip_height";
+
   ExplorerFreshness freshness = 1;
 
   // Upstream value-pool entries, preserved in upstream order so unknown
   // future pools can flow through without a wire-shape change.
   repeated zinder.v1.wallet.ChainValuePool pools = 2;
 
-  // Tip height the upstream node observed when computing the pools.
-  uint32 tip_height = 3;
+  // Source tip returned by the same upstream observation as `pools`.
+  zinder.v1.wallet.BlockTip source_tip = 4;
+}
+
+// Direction of one net flow between the transparent and shielded value pools.
+enum ValuePoolFlowDirection {
+  VALUE_POOL_FLOW_DIRECTION_UNSPECIFIED = 0;
+  // Transparent value enters one or more shielded pools.
+  VALUE_POOL_FLOW_DIRECTION_SHIELD = 1;
+  // Shielded value exits to the transparent pool.
+  VALUE_POOL_FLOW_DIRECTION_DESHIELD = 2;
+}
+
+// Shielded-pool attribution for one net value-pool flow event.
+enum ValuePoolFlowPool {
+  VALUE_POOL_FLOW_POOL_UNSPECIFIED = 0;
+  VALUE_POOL_FLOW_POOL_SPROUT = 1;
+  VALUE_POOL_FLOW_POOL_SAPLING = 2;
+  VALUE_POOL_FLOW_POOL_ORCHARD = 3;
+  VALUE_POOL_FLOW_POOL_IRONWOOD = 4;
+  // More than one shielded pool has a nonzero transaction-intrinsic balance.
+  VALUE_POOL_FLOW_POOL_MIXED = 5;
+}
+
+// Typed filters applied to a value-pool flow history page.
+message ValuePoolFlowFilter {
+  // Empty means either direction.
+  repeated ValuePoolFlowDirection directions = 1;
+  // Empty means every pool attribution, including `MIXED`.
+  repeated ValuePoolFlowPool pools = 2;
+  // Excludes events whose unsigned net amount is below this threshold.
+  uint64 minimum_amount_zat = 3;
+}
+
+// One canonical transaction crossing the transparent/shielded boundary.
+message ValuePoolFlowEvent {
+  // Canonical transaction id in RPC byte order (64 lowercase hex characters).
+  string transaction_id = 1;
+  uint32 block_height = 2;
+  int64 block_time_unix_seconds = 3;
+  uint32 transaction_index_in_block = 4;
+  ValuePoolFlowDirection direction = 5;
+  ValuePoolFlowPool pool = 6;
+  uint64 amount_zat = 7;
+  // Signed transaction-intrinsic balances for every shielded pool.
+  TransactionIntrinsicValueBalances pool_balances = 8;
+}
+
+// Historical and live-tail coverage of the value-pool flow event projection.
+//
+// The historical segment is populated by an explicit backfill. The live-tail
+// segment begins at `live_tail_from_height` and advances from canonical ingest.
+// Callers can compare both segments with `freshness.chain_view` before making
+// a completeness claim for a requested range.
+message ValuePoolFlowCoverage {
+  // Boundary timestamps describe the blocks at the historical height bounds;
+  // they are not time extrema because canonical block times are non-monotonic.
+  optional uint32 historical_from_height = 1;
+  optional uint32 historical_through_height = 2;
+  optional int64 historical_from_time_unix_seconds = 3;
+  optional int64 historical_through_time_unix_seconds = 4;
+  optional uint32 live_tail_from_height = 5;
+  optional uint32 live_tail_through_height = 6;
+  optional int64 live_tail_through_time_unix_seconds = 7;
+  // True only when contiguous coverage starts at height 1 and reaches the
+  // response's current visible tip. This full-domain proof makes the requested
+  // half-open time range complete even when block times are non-monotonic.
+  // History pages leave this false because they do not carry a time range.
+  bool requested_range_complete = 8;
+}
+
+// `ExplorerQuery.ValuePoolFlowHistory` request.
+message ValuePoolFlowHistoryRequest {
+  // Zero asks for the server default; the server clamps larger values.
+  uint32 page_size = 1;
+  // Opaque continuation bound to this request's filter and the last scanned
+  // canonical event anchor. Native clients should not construct or inspect it.
+  bytes cursor = 2;
+  ValuePoolFlowFilter filter = 3;
+  // Exact counts are returned only when projection coverage is contiguous from
+  // height 1 through the response's current visible tip. Otherwise the field
+  // remains absent even when requested.
+  bool include_total_count = 4;
+}
+
+// One bounded, newest-first value-pool flow page.
+message ValuePoolFlowHistoryResponse {
+  ExplorerFreshness freshness = 1;
+  repeated ValuePoolFlowEvent events = 2;
+  bytes next_cursor = 3;
+  bool has_more = 4;
+  optional uint64 total_matching_events = 5;
+  uint32 scanned_event_count = 6;
+  bool scan_limit_reached = 7;
+  ValuePoolFlowCoverage coverage = 8;
+}
+
+// UTC bucket width requested from `ExplorerQuery.ValuePoolFlowSummary`.
+enum ValuePoolFlowSummaryResolution {
+  VALUE_POOL_FLOW_SUMMARY_RESOLUTION_UNSPECIFIED = 0;
+  VALUE_POOL_FLOW_SUMMARY_RESOLUTION_HOUR = 1;
+  VALUE_POOL_FLOW_SUMMARY_RESOLUTION_DAY = 2;
+}
+
+// `ExplorerQuery.ValuePoolFlowSummary` request.
+message ValuePoolFlowSummaryRequest {
+  // Inclusive Unix timestamp lower bound.
+  int64 start_time_unix_seconds = 1;
+  // Exclusive Unix timestamp upper bound.
+  int64 end_time_unix_seconds = 2;
+  // Empty means every pool attribution, including `MIXED`.
+  repeated ValuePoolFlowPool pools = 3;
+  ValuePoolFlowSummaryResolution resolution = 4;
+}
+
+// Exact flow totals for one UTC-aligned bucket.
+message ValuePoolFlowSummaryBucket {
+  int64 bucket_start_time_unix_seconds = 1;
+  uint64 shield_event_count = 2;
+  uint64 deshield_event_count = 3;
+  uint64 shield_amount_zat = 4;
+  uint64 deshield_amount_zat = 5;
+}
+
+// `ExplorerQuery.ValuePoolFlowSummary` response.
+message ValuePoolFlowSummaryResponse {
+  ExplorerFreshness freshness = 1;
+  repeated ValuePoolFlowSummaryBucket buckets = 2;
+  ValuePoolFlowCoverage coverage = 3;
+}
+
+// `ExplorerQuery.ValuePoolFlowAmountThresholdSummary` request.
+message ValuePoolFlowAmountThresholdSummaryRequest {
+  // Inclusive Unix timestamp lower bound.
+  int64 start_time_unix_seconds = 1;
+  // Exclusive Unix timestamp upper bound.
+  int64 end_time_unix_seconds = 2;
+  // Empty means every pool attribution, including `MIXED`.
+  repeated ValuePoolFlowPool pools = 3;
+  // Strictly increasing unique thresholds, limited to 32 entries.
+  repeated uint64 minimum_amounts_zat = 4;
+}
+
+// Exact value-pool flow totals at one requested minimum amount.
+message ValuePoolFlowAmountThresholdSummaryRow {
+  uint64 minimum_amount_zat = 1;
+  uint64 shield_event_count = 2;
+  uint64 deshield_event_count = 3;
+  uint64 shield_amount_zat = 4;
+  uint64 deshield_amount_zat = 5;
+}
+
+// `ExplorerQuery.ValuePoolFlowAmountThresholdSummary` response.
+message ValuePoolFlowAmountThresholdSummaryResponse {
+  ExplorerFreshness freshness = 1;
+  // Exactly one row per requested threshold, in request order.
+  repeated ValuePoolFlowAmountThresholdSummaryRow thresholds = 2;
+  ValuePoolFlowCoverage coverage = 3;
+}
+
+// `ExplorerQuery.ValuePoolFlowRoundedAmountSummary` request.
+message ValuePoolFlowRoundedAmountSummaryRequest {
+  // Inclusive Unix timestamp lower bound.
+  int64 start_time_unix_seconds = 1;
+  // Exclusive Unix timestamp upper bound.
+  int64 end_time_unix_seconds = 2;
+  // Empty means every pool attribution, including `MIXED`.
+  repeated ValuePoolFlowPool pools = 3;
+  // Inclusive lower bound applied to each event's raw amount before rounding.
+  uint64 minimum_raw_amount_zat = 4;
+  // Optional exclusive upper bound applied to each event's raw amount before
+  // rounding.
+  optional uint64 maximum_raw_amount_zat = 5;
+  // Positive zatoshi quantum. Each selected raw amount rounds to the nearest
+  // multiple before events are grouped; positive exact-half ties round upward.
+  uint64 rounding_quantum_zat = 6;
+  // Rows whose combined shield and deshield event count is below this value
+  // are omitted. Zero includes every non-empty rounded-amount group.
+  uint64 minimum_event_count = 7;
+  // Maximum rows to return. Zero requests the server default; larger values
+  // are clamped by the server.
+  uint32 max_rows = 8;
+}
+
+// Exact value-pool flow event counts for one rounded raw amount.
+message ValuePoolFlowRoundedAmountSummaryRow {
+  // Raw amount rounded according to `rounding_quantum_zat`, with positive
+  // exact-half ties rounded upward.
+  uint64 rounded_amount_zat = 1;
+  uint64 shield_event_count = 2;
+  uint64 deshield_event_count = 3;
+}
+
+// `ExplorerQuery.ValuePoolFlowRoundedAmountSummary` response.
+message ValuePoolFlowRoundedAmountSummaryResponse {
+  ExplorerFreshness freshness = 1;
+  // Rows are ordered by descending combined shield and deshield event count,
+  // then ascending `rounded_amount_zat`. The effective `max_rows` bounds this
+  // ranked sequence after the minimum-event-count filter.
+  repeated ValuePoolFlowRoundedAmountSummaryRow rows = 2;
+  ValuePoolFlowCoverage coverage = 3;
+}
+
+// One cumulative balance for a dynamically identified consensus value pool.
+message ValuePoolBalance {
+  string id = 1;
+  bool monitored = 2;
+  // Absent when the upstream node advertises the pool without exposing a value.
+  optional uint64 value_zat = 3;
+}
+
+// One canonical highest-height snapshot observed in a UTC calendar day.
+message ValuePoolBalanceHistoryPoint {
+  int64 day_start_unix_seconds = 1;
+  uint32 block_height = 2;
+  // Canonical block hash in RPC byte order (64 lowercase hex characters).
+  string block_hash = 3;
+  int64 block_time_unix_seconds = 4;
+  repeated ValuePoolBalance pools = 5;
+}
+
+// Height-domain coverage for cumulative value-pool history.
+message ValuePoolBalanceHistoryCoverage {
+  optional uint32 historical_from_height = 1;
+  optional uint32 historical_through_height = 2;
+  optional uint32 live_tail_from_height = 3;
+  optional uint32 live_tail_through_height = 4;
+  // True only when contiguous coverage starts at height 1 and reaches the
+  // response's visible tip. Timestamps never establish this claim.
+  bool complete_through_visible_tip = 5;
+}
+
+// `ExplorerQuery.ValuePoolBalanceHistory` request.
+message ValuePoolBalanceHistoryRequest {
+  // Zero asks for the server default; the server clamps larger values.
+  uint32 page_size = 1;
+  // Opaque continuation bound to the last returned UTC day.
+  bytes cursor = 2;
+}
+
+// One bounded newest-first page of canonical daily balance snapshots.
+message ValuePoolBalanceHistoryResponse {
+  ExplorerFreshness freshness = 1;
+  repeated ValuePoolBalanceHistoryPoint points = 2;
+  bytes next_cursor = 3;
+  bool has_more = 4;
+  ValuePoolBalanceHistoryCoverage coverage = 5;
 }
 
 // `ExplorerQuery.NetworkUpgradeStatus` request.
@@ -1730,11 +2470,8 @@ message TransactionFeesRecord {
 
 // `ExplorerQuery.RecentTransactions` request.
 //
-// Streams the newest-first projection of canonical transactions
-// materialized by `RecentTransactionsConsumer`. Replaces the
-// `BlockSummariesInRange` + per-block `BlockDetail` + per-tx
-// `TransactionDetail` round-trip tree a consumer would otherwise issue
-// for a "recent transactions" surface.
+// Streams the newest-first projection of canonical transactions materialized
+// by `RecentTransactionsConsumer`.
 message RecentTransactionsRequest {
   // Hard cap on entries returned across all stream chunks. Server clamps
   // to the configured maximum.
@@ -1754,19 +2491,132 @@ message RecentTransactionsChunk {
 
 // One row in the `recent_transactions` projection.
 //
-// Denormalized to keep a "recent transactions" panel renderable from one
-// streaming RPC.
-//
-// Field-presence rules (see ADR-0018):
-// - `zip317_conventional_fee_zat` is set for every non-coinbase row and
-//   unset for coinbase. (Coinbase transactions collect block rewards
-//   rather than paying fees; treating zero as "no fee" would conflate
-//   "coinbase reward path" with "paid no fee", and a `Some(0)` sentinel
-//   would force readers to special-case coinbase anyway.)
-// - `paid_fee_zat` is set only when the consumer resolved every transparent
-//   prevout via `WalletQuery.TransparentOutputsByOutpoint` AND the transaction
-//   is classified `TRANSPARENT_ONLY`.
+// Denormalized to keep a recent-transactions panel renderable from one
+// streaming RPC. `zip317_conventional_fee_zat` is unset for coinbase rows;
+// `paid_fee_zat` is set only when every transparent prevout was resolved.
 message RecentTransactionEntry {
+  // Canonical transaction id in RPC byte order (64 lowercase hex characters).
+  string transaction_id = 1;
+  uint32 block_height = 2;
+  // Canonical block hash in RPC byte order (64 lowercase hex characters).
+  string block_hash = 3;
+  int64 block_time_unix_seconds = 4;
+  bool is_coinbase = 5;
+  PrivacyShape privacy_shape = 6;
+  TransactionComponentCounts component_counts = 7;
+  uint32 size_bytes = 8;
+  optional uint64 zip317_conventional_fee_zat = 9;
+  optional uint64 paid_fee_zat = 10;
+  // ZIP-317 logical-action count before applying the fee layer's grace floor.
+  uint32 logical_actions = 11;
+}
+
+// Direction from a transaction-history anchor. Responses remain newest-first
+// in both directions.
+enum TransactionHistoryDirection {
+  TRANSACTION_HISTORY_DIRECTION_UNSPECIFIED = 0;
+  TRANSACTION_HISTORY_DIRECTION_OLDER = 1;
+  TRANSACTION_HISTORY_DIRECTION_NEWER = 2;
+}
+
+// Read fence for the transaction-history projection and the canonical chain
+// snapshot used to produce a response.
+message TransactionHistoryReadFence {
+  uint64 chain_epoch_id = 1;
+  uint64 projection_revision = 2;
+  uint32 projection_tip_height = 3;
+  string projection_tip_hash = 4;
+}
+
+// Verified contiguous coverage of the transaction-history projection.
+message TransactionHistoryCoverage {
+  uint32 complete_from_height = 1;
+  uint32 complete_through_height = 2;
+  string complete_through_hash = 3;
+}
+
+// Scope proven by an optional transaction-history count.
+enum TransactionHistoryCountScope {
+  TRANSACTION_HISTORY_COUNT_SCOPE_UNSPECIFIED = 0;
+  TRANSACTION_HISTORY_COUNT_SCOPE_COVERED_RANGE = 1;
+  TRANSACTION_HISTORY_COUNT_SCOPE_FULL_HISTORY = 2;
+}
+
+// Shielded protocols whose presence can select transaction-history rows.
+enum ShieldedProtocol {
+  SHIELDED_PROTOCOL_UNSPECIFIED = 0;
+  SHIELDED_PROTOCOL_SPROUT = 1;
+  SHIELDED_PROTOCOL_SAPLING = 2;
+  SHIELDED_PROTOCOL_ORCHARD = 3;
+  SHIELDED_PROTOCOL_IRONWOOD = 4;
+}
+
+// Product-neutral filters over retained public transaction facts. Repeated
+// fields use OR semantics within the field and AND semantics across fields.
+message TransactionHistoryFilter {
+  optional bool is_coinbase = 1;
+  repeated PrivacyShape privacy_shapes = 2;
+  repeated ShieldedProtocol contains_any_protocol = 3;
+  // Require at least one shielded component count to meet this threshold.
+  // Zero disables the threshold.
+  uint32 minimum_shielded_component_count = 4;
+}
+
+// Canonical transaction coordinate accepted as a stateless starting point.
+//
+// Native clients should resume with an opaque cursor; compatibility adapters
+// can map a legacy height/index pair through this shape.
+message TransactionHistoryAnchor {
+  uint32 block_height = 1;
+  uint32 transaction_index = 2;
+}
+
+// `ExplorerQuery.TransactionHistory` request.
+message TransactionHistoryRequest {
+  // Zero asks for the server default; the server clamps larger values.
+  uint32 page_size = 1;
+  oneof start {
+    bytes cursor = 2;
+    TransactionHistoryAnchor anchor = 3;
+  }
+  TransactionHistoryDirection direction = 4;
+  TransactionHistoryFilter filter = 5;
+  // Exact counts are optional and may be unavailable for a filter.
+  bool include_total_count = 6;
+  TransactionHistoryReadFence read_fence = 7;
+}
+
+// One bounded canonical transaction-history page.
+message TransactionHistoryResponse {
+  ExplorerFreshness freshness = 1;
+  repeated TransactionHistoryEntry entries = 2;
+  bytes older_cursor = 3;
+  bytes newer_cursor = 4;
+  bool has_older = 5;
+  bool has_newer = 6;
+  optional uint64 total_matching_transactions = 7;
+  uint32 scanned_entry_count = 8;
+  bool scan_limit_reached = 9;
+  TransactionHistoryReadFence read_fence = 10;
+  TransactionHistoryCoverage coverage = 11;
+  TransactionHistoryCountScope count_scope = 12;
+}
+
+// Signed transaction-intrinsic shielded value balances.
+//
+// Values use Zebra's transaction-pool sign convention: positive value enters
+// the transaction from the named pool, while negative value leaves the
+// transaction for that pool. Transparent value is deliberately absent because
+// it requires resolving previous outputs.
+message TransactionIntrinsicValueBalances {
+  sint64 sprout_zat = 1;
+  sint64 sapling_zat = 2;
+  sint64 orchard_zat = 3;
+  sint64 ironwood_zat = 4;
+}
+
+// One canonical transaction-history row.
+message TransactionHistoryEntry {
   // Canonical transaction id in RPC byte order (64 lowercase hex
   // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
   string transaction_id = 1;
@@ -1787,6 +2637,14 @@ message RecentTransactionEntry {
   // floor is applied at the fee layer, but the unfloored count here is
   // the raw shape value).
   uint32 logical_actions = 11;
+  // Canonical zero-based position inside the block.
+  uint32 transaction_index = 12;
+  // Present when the canonical schema-15-or-newer intrinsic-balance artifact,
+  // or a retained canonical transaction blob that can derive it, is available
+  // at the response's pinned chain epoch. Absence is distinct from an all-zero
+  // balance and is gated by
+  // `explorer.transaction.intrinsic_value_balances_v1`.
+  TransactionIntrinsicValueBalances intrinsic_value_balances = 13;
 }
 
 // `ExplorerQuery.MempoolEventCounts` request.
@@ -1875,6 +2733,107 @@ message ChainReorgHistoryEvent {
 
   // Replacement range committed by this reorg.
   zinder.v1.wallet.ChainEpochCommitted committed = 8;
+}
+
+// One transparent coinbase payout retained with a displaced block.
+//
+// The native contract exposes the raw script instead of an address string so
+// network-specific encodings and miner branding remain consumer concerns.
+message DisplacedBlockCoinbaseOutput {
+  uint32 output_index = 1;
+  uint64 value_zat = 2;
+  bytes script_pub_key = 3;
+}
+
+// Product-neutral facts captured when a previously canonical block is
+// displaced by an accepted replacement branch.
+message DisplacedBlockSummary {
+  uint32 block_height = 1;
+  string block_hash = 2;
+  string previous_block_hash = 3;
+  int64 block_time_unix_seconds = 4;
+  uint64 total_size_bytes = 5;
+  uint32 difficulty_bits = 6;
+  repeated string transaction_ids = 7;
+  repeated DisplacedBlockCoinbaseOutput coinbase_outputs = 8;
+  uint64 displacement_event_sequence = 9;
+  uint64 displacement_epoch_id = 10;
+  uint64 displaced_at_millis = 11;
+}
+
+// Current canonical block facts compared with one displaced block at the same
+// height.
+//
+// This deliberately stays narrower than `BlockSummary`: every field is
+// read directly from the pinned canonical store and no derive-only aggregate
+// is silently emitted as zero.
+message DisplacedBlockCanonicalCounterpart {
+  uint32 block_height = 1;
+  string block_hash = 2;
+  string previous_block_hash = 3;
+  int64 block_time_unix_seconds = 4;
+  uint64 total_size_bytes = 5;
+  uint32 difficulty_bits = 6;
+  uint32 transaction_count = 7;
+  repeated DisplacedBlockCoinbaseOutput coinbase_outputs = 8;
+}
+
+// One displaced block and the canonical block currently visible at its former
+// height, both resolved against the response freshness epoch.
+message DisplacedBlockHistoryEntry {
+  DisplacedBlockSummary block = 1;
+  DisplacedBlockCanonicalCounterpart current_canonical_block = 2;
+}
+
+// Explicit coverage boundary for the additive displaced-block archive.
+//
+// The archive guarantees capture only for replacement events at or after this
+// activation event. It does not claim historical completeness before then.
+message DisplacedBlockArchiveCoverage {
+  uint64 activation_event_sequence = 1;
+  uint64 activation_epoch_id = 2;
+  uint64 activated_at_millis = 3;
+}
+
+// `ExplorerQuery.DisplacedBlockHistory` request.
+message DisplacedBlockHistoryRequest {
+  // Maximum rows to return. Zero selects the server default; values above the
+  // server cap are clamped.
+  uint32 page_size = 1;
+  // Empty starts at the newest archived block. Non-empty resumes strictly
+  // after this opaque cursor from a previous response.
+  bytes cursor = 2;
+}
+
+// `ExplorerQuery.DisplacedBlockHistory` response.
+message DisplacedBlockHistoryResponse {
+  ExplorerFreshness freshness = 1;
+  // Newest displacement first; blocks from one event are ordered by descending
+  // former height.
+  repeated DisplacedBlockHistoryEntry entries = 2;
+  bytes next_cursor = 3;
+  bool has_more = 4;
+  uint64 total_count = 5;
+  DisplacedBlockArchiveCoverage coverage = 6;
+}
+
+// `ExplorerQuery.DisplacedBlockDetail` request.
+message DisplacedBlockDetailRequest {
+  // Displaced block hash in RPC byte order.
+  string block_hash = 1;
+}
+
+// `ExplorerQuery.DisplacedBlockDetail` response.
+message DisplacedBlockDetailResponse {
+  ExplorerFreshness freshness = 1;
+  DisplacedBlockSummary block = 2;
+  // Current canonical block at the displaced block's former height, resolved
+  // against the same freshness epoch. Absent if that height is unavailable.
+  DisplacedBlockCanonicalCounterpart current_canonical_block = 3;
+  // Serialized consensus bytes only when they were already retained before
+  // displacement. Absence is unavailable data, never an empty block.
+  optional bytes raw_block_bytes = 4;
+  DisplacedBlockArchiveCoverage coverage = 5;
 }
 
 // `ExplorerQuery.VerifyPaymentDisclosure` request.
@@ -2017,9 +2976,9 @@ message OverviewSnapshotResponse {
   // Top-N recent canonical transactions, newest-first. The consumer
   // uses this single array for both the "recent transactions" list
   // (typically the first 8) and the "privacy mix" aggregation (typically
-  // all 32). Mirrors the per-entry shape `RecentTransactionEntry`
+  // all 32). Mirrors the per-entry shape `TransactionHistoryEntry`
   // returned by `ExplorerQuery.RecentTransactions`.
-  repeated RecentTransactionEntry recent_transactions = 8;
+  repeated TransactionHistoryEntry recent_transactions = 8;
 }
 
 // Mempool sub-field of `OverviewSnapshotResponse`.

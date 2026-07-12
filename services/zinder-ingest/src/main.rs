@@ -17,15 +17,25 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
+    CommitmentRootBackfillContext, ConventionalFeeDistributionBackfillContext,
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
     IngestControlGrpcAdapter, IngestError, IngestModifiers, MempoolIndex,
-    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, TipFollowSubsystems,
-    TipFollowSubsystemsLauncher, classify_phase, current_chain_height,
-    ensure_spend_projection_not_behind_retention_sweep, mempool_ready_channel,
-    open_primary_derive_store_for_canonical, run_ingest_loop, run_mempool_orchestrator,
-    spawn_chain_event_retention_task, spawn_derive_replay_budget_metrics_task,
+    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind,
+    PaidFeeDistributionBackfillContext, TipFollowSubsystems, TipFollowSubsystemsLauncher,
+    TransactionComponentBackfillContext, TransactionHistoryVerifierContext,
+    ValuePoolBalanceBackfillContext, ValuePoolFlowBackfillContext,
+    bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical, classify_phase,
+    current_chain_height, ensure_spend_projection_not_behind_retention_sweep,
+    mempool_ready_channel, open_primary_derive_store_for_canonical, run_ingest_loop,
+    run_mempool_orchestrator, seed_backfill_owned_consumer_cursors,
+    seed_paid_fee_distribution_cursor_and_tail, seed_value_pool_flow_cursor_and_tail,
+    spawn_chain_event_retention_task, spawn_commitment_root_backfill_task,
+    spawn_conventional_fee_distribution_backfill_task, spawn_derive_replay_budget_metrics_task,
     spawn_derive_tailer_task, spawn_mempool_event_retention_task,
-    spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
+    spawn_paid_fee_distribution_backfill_task, spawn_runtime_memory_metrics_task,
+    spawn_transaction_component_backfill_task, spawn_transaction_history_verifier_task,
+    spawn_upstream_health_probe_task, spawn_value_pool_balance_backfill_task,
+    spawn_value_pool_flow_backfill_task,
 };
 use zinder_runtime::{
     Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase,
@@ -469,6 +479,61 @@ async fn run_ingest(
         start_api_phase.fail(&wrapped);
         return Err(wrapped);
     }
+    let paid_fee_distribution_backfill_context = PaidFeeDistributionBackfillContext::new(
+        command_config.loop_config.node.request_timeout,
+        Arc::clone(&network_upgrade_activations),
+        Arc::new(source.clone()),
+        store.clone(),
+        derive_store.clone(),
+    );
+    let value_pool_flow_backfill_context = ValuePoolFlowBackfillContext::new(
+        store.clone(),
+        derive_store.clone(),
+        paid_fee_distribution_backfill_context.clone(),
+    );
+    if let Err(error) = seed_paid_fee_distribution_cursor_and_tail(
+        command_config.paid_fee_distribution_backfill,
+        &paid_fee_distribution_backfill_context,
+    )
+    .await
+    {
+        let wrapped: IngestConfigError = error.into();
+        open_storage_phase.fail(&wrapped);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    }
+    if let Err(error) = seed_value_pool_flow_cursor_and_tail(
+        command_config.value_pool_flow_backfill,
+        &value_pool_flow_backfill_context,
+    )
+    .await
+    {
+        let wrapped: IngestConfigError = error.into();
+        open_storage_phase.fail(&wrapped);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    }
+    if let Err(error) = seed_backfill_owned_consumer_cursors(&store, &derive_store) {
+        let wrapped: IngestConfigError = error.into();
+        open_storage_phase.fail(&wrapped);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    }
+    if let Err(error) =
+        catch_up_derive_store_to_canonical(&store, &derive_store, command_config.loop_config.derive)
+            .await
+    {
+        let wrapped: IngestConfigError = error.into();
+        open_storage_phase.fail(&wrapped);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    }
+    if let Err(error) = bootstrap_transparent_address_ranking(&store, &derive_store).await {
+        let wrapped: IngestConfigError = error.into();
+        open_storage_phase.fail(&wrapped);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    }
     let derive_tailer_handle = spawn_derive_tailer_task(
         store.clone(),
         derive_store.clone(),
@@ -484,6 +549,53 @@ async fn run_ingest(
         DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
         DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
         readiness.clone(),
+        cancel.clone(),
+    );
+    let commitment_root_backfill_handle = spawn_commitment_root_backfill_task(
+        command_config.loop_config.commitment_root_backfill,
+        CommitmentRootBackfillContext::new(
+            command_config.loop_config.node.request_timeout,
+            Arc::clone(&network_upgrade_activations),
+            Arc::new(source.clone()),
+            store.clone(),
+            derive_store.clone(),
+        ),
+        cancel.clone(),
+    );
+    let transaction_component_backfill_handle = spawn_transaction_component_backfill_task(
+        command_config.transaction_component_backfill,
+        TransactionComponentBackfillContext::new(store.clone(), derive_store.clone()),
+        cancel.clone(),
+    );
+    let transaction_history_verifier_handle = spawn_transaction_history_verifier_task(
+        command_config.transaction_history_verifier,
+        TransactionHistoryVerifierContext::new(store.clone(), derive_store.clone()),
+        cancel.clone(),
+    );
+    let conventional_fee_distribution_backfill_handle =
+        spawn_conventional_fee_distribution_backfill_task(
+            command_config.conventional_fee_distribution_backfill,
+            ConventionalFeeDistributionBackfillContext::new(store.clone(), derive_store.clone()),
+            cancel.clone(),
+        );
+    let paid_fee_distribution_backfill_handle = spawn_paid_fee_distribution_backfill_task(
+        command_config.paid_fee_distribution_backfill,
+        paid_fee_distribution_backfill_context,
+        cancel.clone(),
+    );
+    let value_pool_flow_backfill_handle = spawn_value_pool_flow_backfill_task(
+        command_config.value_pool_flow_backfill,
+        value_pool_flow_backfill_context,
+        cancel.clone(),
+    );
+    let value_pool_balance_backfill_handle = spawn_value_pool_balance_backfill_task(
+        command_config.value_pool_balance_backfill,
+        ValuePoolBalanceBackfillContext::new(
+            command_config.loop_config.node.request_timeout,
+            Arc::new(source.clone()),
+            store.clone(),
+            derive_store.clone(),
+        ),
         cancel.clone(),
     );
     open_storage_phase.complete();
@@ -545,6 +657,26 @@ async fn run_ingest(
         derive_memory_pause_ratio = command_config.loop_config.derive.memory_pause_ratio,
         derive_memory_resume_ratio = command_config.loop_config.derive.memory_resume_ratio,
         derive_min_replay_batch_blocks = command_config.loop_config.derive.min_replay_batch_blocks.get(),
+        commitment_root_backfill_enabled = command_config.loop_config.commitment_root_backfill.enabled,
+        commitment_root_backfill_batch_blocks = command_config.loop_config.commitment_root_backfill.batch_blocks.get(),
+        commitment_root_backfill_fetch_concurrency = command_config.loop_config.commitment_root_backfill.fetch_concurrency.get(),
+        conventional_fee_distribution_backfill_enabled = command_config.conventional_fee_distribution_backfill.enabled,
+        conventional_fee_distribution_backfill_batch_blocks = command_config.conventional_fee_distribution_backfill.batch_blocks.get(),
+        paid_fee_distribution_backfill_enabled = command_config.paid_fee_distribution_backfill.enabled,
+        paid_fee_distribution_backfill_batch_blocks = command_config.paid_fee_distribution_backfill.batch_blocks.get(),
+        paid_fee_distribution_backfill_fetch_concurrency = command_config.paid_fee_distribution_backfill.fetch_concurrency.get(),
+        paid_fee_distribution_backfill_history_days = command_config.paid_fee_distribution_backfill.history_days.get(),
+        paid_fee_distribution_backfill_timestamp_safety_seconds = command_config.paid_fee_distribution_backfill.timestamp_safety_seconds,
+        transaction_component_backfill_enabled = command_config.transaction_component_backfill.enabled,
+        transaction_component_backfill_batch_blocks = command_config.transaction_component_backfill.batch_blocks.get(),
+        transaction_history_verifier_enabled = command_config.transaction_history_verifier.enabled,
+        transaction_history_verifier_batch_blocks = command_config.transaction_history_verifier.batch_blocks.get(),
+        value_pool_flow_backfill_enabled = command_config.value_pool_flow_backfill.enabled,
+        value_pool_flow_backfill_batch_blocks = command_config.value_pool_flow_backfill.batch_blocks.get(),
+        value_pool_flow_backfill_fetch_concurrency = command_config.value_pool_flow_backfill.fetch_concurrency.get(),
+        value_pool_balance_backfill_enabled = command_config.value_pool_balance_backfill.enabled,
+        value_pool_balance_backfill_batch_blocks = command_config.value_pool_balance_backfill.batch_blocks.get(),
+        value_pool_balance_backfill_fetch_concurrency = command_config.value_pool_balance_backfill.fetch_concurrency.get(),
         poll_interval_ms = u64::try_from(
             command_config.loop_config.tip_follow.poll_interval.as_millis()
         )
@@ -601,6 +733,76 @@ async fn run_ingest(
             event = "derive_replay_budget_metrics_join_failed",
             error = %join_error,
             "derive replay budget metrics task failed during shutdown"
+        );
+    }
+    if let Some(handle) = commitment_root_backfill_handle
+        && let Err(join_error) = handle.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "commitment_root_backfill_join_failed",
+            error = %join_error,
+            "commitment-root backfill task failed during shutdown"
+        );
+    }
+    if let Some(handle) = conventional_fee_distribution_backfill_handle
+        && let Err(join_error) = handle.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "conventional_fee_distribution_backfill_join_failed",
+            error = %join_error,
+            "conventional-fee distribution backfill task failed during shutdown"
+        );
+    }
+    if let Some(handle) = paid_fee_distribution_backfill_handle
+        && let Err(join_error) = handle.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "paid_fee_distribution_backfill_join_failed",
+            error = %join_error,
+            "paid-fee distribution backfill task failed during shutdown"
+        );
+    }
+    if let Some(handle) = transaction_component_backfill_handle
+        && let Err(join_error) = handle.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "transaction_component_backfill_join_failed",
+            error = %join_error,
+            "transaction-component backfill task failed during shutdown"
+        );
+    }
+    if let Some(handle) = transaction_history_verifier_handle
+        && let Err(join_error) = handle.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "transaction_history_verifier_join_failed",
+            error = %join_error,
+            "transaction-history verifier task failed during shutdown"
+        );
+    }
+    if let Some(handle) = value_pool_flow_backfill_handle
+        && let Err(join_error) = handle.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "value_pool_flow_backfill_join_failed",
+            error = %join_error,
+            "value-pool flow backfill task failed during shutdown"
+        );
+    }
+    if let Some(handle) = value_pool_balance_backfill_handle
+        && let Err(join_error) = handle.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "value_pool_balance_backfill_join_failed",
+            error = %join_error,
+            "value-pool balance backfill task failed during shutdown"
         );
     }
 

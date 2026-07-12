@@ -940,6 +940,10 @@ fn chain_value_pools_at_tip_from_message(
 ) -> Result<ChainValuePoolsAtTip, IndexerError> {
     let chain_epoch =
         chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
+    let source_tip = message
+        .source_tip
+        .ok_or_else(|| IndexerError::malformed("source_tip", "field is missing"))?;
+    let source_tip_hash = block_hash_from_rpc_hex("source_tip.hash", &source_tip.hash)?;
     let pools = message
         .pools
         .into_iter()
@@ -947,7 +951,7 @@ fn chain_value_pools_at_tip_from_message(
         .collect();
     Ok(ChainValuePoolsAtTip {
         chain_epoch,
-        tip_height: BlockHeight::new(message.tip_height),
+        source_tip: BlockId::new(BlockHeight::new(source_tip.height), source_tip_hash),
         pools,
     })
 }

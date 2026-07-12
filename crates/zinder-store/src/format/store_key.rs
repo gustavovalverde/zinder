@@ -3,8 +3,9 @@
 use std::mem::size_of;
 
 use zinder_core::{
-    BlockHash, BlockHeight, ChainEpochId, Network, ShieldedProtocol, SubtreeRootIndex,
-    TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    BlockHash, BlockHeight, BlockId, ChainEpochId, FinalNoteCommitmentRoot, Network,
+    ShieldedProtocol, SubtreeRootIndex, TransactionId, TransparentAddressScriptHash,
+    TransparentOutPoint,
 };
 
 /// Ordered key bytes used inside `RocksDB` column families.
@@ -28,12 +29,20 @@ const BLOCK_TRANSACTION_INDEX_KEY_KIND: u8 = 15;
 const TRANSACTION_LOCATION_KEY_KIND: u8 = 16;
 const TRANSACTION_BLOB_KEY_KIND: u8 = 17;
 const TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND: u8 = 19;
-// Key kinds 20..=32 are reserved for future artifact families; visibility keys start at 33.
+const FINAL_NOTE_COMMITMENT_ROOTS_KEY_KIND: u8 = 20;
+const TRANSACTION_INTRINSIC_VALUE_BALANCES_KEY_KIND: u8 = 21;
+const BLOCK_VALUE_POOL_BALANCES_KEY_KIND: u8 = 22;
+const DISPLACED_BLOCK_BY_ORDER_KEY_KIND: u8 = 23;
+const DISPLACED_BLOCK_BY_HASH_KEY_KIND: u8 = 24;
+const DISPLACED_ROOT_INDEX_KEY_KIND: u8 = 25;
+// Key kinds 26..=32 are reserved for future artifact families; visibility keys start at 33.
 const VISIBLE_BLOCK_EPOCH_KEY_KIND: u8 = 33;
 const VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND: u8 = 34;
 const VISIBLE_TREE_STATE_EPOCH_KEY_KIND: u8 = 35;
 const VISIBLE_TRANSACTION_EPOCH_KEY_KIND: u8 = 36;
 const VISIBLE_SUBTREE_ROOT_EPOCH_KEY_KIND: u8 = 37;
+const VISIBLE_FINAL_NOTE_COMMITMENT_ROOTS_EPOCH_KEY_KIND: u8 = 38;
+const VISIBLE_BLOCK_VALUE_POOL_BALANCES_EPOCH_KEY_KIND: u8 = 39;
 
 const STORE_KEY_HEADER_LEN: usize = 2;
 const NETWORK_ID_LEN: usize = 4;
@@ -42,6 +51,15 @@ const TRANSACTION_ID_LEN: usize = 32;
 const CHAIN_EPOCH_ID_LEN: usize = 8;
 const SHIELDED_PROTOCOL_LEN: usize = 1;
 const SUBTREE_ROOT_INDEX_LEN: usize = 4;
+const FINAL_NOTE_COMMITMENT_ROOT_LEN: usize = 32;
+const DISPLACEMENT_EVENT_SEQUENCE_LEN: usize = 8;
+const BLOCK_HASH_LEN: usize = 32;
+const DISPLACED_ROOT_INDEX_PREFIX_LEN: usize =
+    STORE_KEY_HEADER_LEN + NETWORK_ID_LEN + FINAL_NOTE_COMMITMENT_ROOT_LEN + SHIELDED_PROTOCOL_LEN;
+const DISPLACED_ROOT_INDEX_KEY_LEN: usize = DISPLACED_ROOT_INDEX_PREFIX_LEN
+    + DISPLACEMENT_EVENT_SEQUENCE_LEN
+    + BLOCK_HEIGHT_LEN
+    + BLOCK_HASH_LEN;
 const HEIGHT_VISIBILITY_PREFIX_LEN: usize =
     STORE_KEY_HEADER_LEN + NETWORK_ID_LEN + BLOCK_HEIGHT_LEN;
 const TRANSACTION_VISIBILITY_PREFIX_LEN: usize =
@@ -100,6 +118,18 @@ impl StoreKey {
 
     pub(crate) fn transparent_retention_deleted_through_height() -> Self {
         Self(vec![KEY_VERSION, 18])
+    }
+
+    pub(crate) fn displaced_block_archive_coverage() -> Self {
+        Self(vec![KEY_VERSION, 19])
+    }
+
+    pub(crate) fn displaced_block_count() -> Self {
+        Self(vec![KEY_VERSION, 20])
+    }
+
+    pub(crate) fn displaced_root_archive_coverage() -> Self {
+        Self(vec![KEY_VERSION, 21])
     }
 
     pub(crate) fn chain_epoch(chain_epoch: ChainEpochId) -> Self {
@@ -197,12 +227,44 @@ impl StoreKey {
         Self(key)
     }
 
+    pub(crate) fn transaction_intrinsic_value_balances(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        transaction_id: TransactionId,
+    ) -> Self {
+        let mut key = artifact_key_prefix(TRANSACTION_INTRINSIC_VALUE_BALANCES_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&chain_epoch.value().to_be_bytes());
+        key.extend_from_slice(&transaction_id.as_bytes());
+        Self(key)
+    }
+
     pub(crate) fn tree_state(
         network: Network,
         chain_epoch: ChainEpochId,
         height: BlockHeight,
     ) -> Self {
         let mut key = artifact_key_prefix(TREE_STATE_KEY_KIND);
+        push_network_epoch_height(&mut key, network, chain_epoch, height);
+        Self(key)
+    }
+
+    pub(crate) fn final_note_commitment_roots(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key = artifact_key_prefix(FINAL_NOTE_COMMITMENT_ROOTS_KEY_KIND);
+        push_network_epoch_height(&mut key, network, chain_epoch, height);
+        Self(key)
+    }
+
+    pub(crate) fn block_value_pool_balances(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key = artifact_key_prefix(BLOCK_VALUE_POOL_BALANCES_KEY_KIND);
         push_network_epoch_height(&mut key, network, chain_epoch, height);
         Self(key)
     }
@@ -343,6 +405,84 @@ impl StoreKey {
         Self(key)
     }
 
+    pub(crate) fn displaced_block_order_prefix(network: Network) -> Self {
+        let mut key = artifact_key_prefix(DISPLACED_BLOCK_BY_ORDER_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn displaced_block_by_order(
+        network: Network,
+        event_sequence: u64,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key = Self::displaced_block_order_prefix(network).0;
+        key.extend_from_slice(&event_sequence.to_be_bytes());
+        key.extend_from_slice(&height.value().to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn displaced_block_event_prefix(network: Network, event_sequence: u64) -> Self {
+        let mut key = Self::displaced_block_order_prefix(network).0;
+        key.extend_from_slice(&event_sequence.to_be_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn displaced_block_by_hash(network: Network, block_hash: BlockHash) -> Self {
+        let mut key = artifact_key_prefix(DISPLACED_BLOCK_BY_HASH_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&block_hash.as_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn displaced_root_index_prefix(
+        network: Network,
+        root: FinalNoteCommitmentRoot,
+        protocol: ShieldedProtocol,
+    ) -> Self {
+        let mut key = artifact_key_prefix(DISPLACED_ROOT_INDEX_KEY_KIND);
+        key.extend_from_slice(&network.id().to_be_bytes());
+        key.extend_from_slice(&root.as_bytes());
+        key.push(protocol.id());
+        Self(key)
+    }
+
+    pub(crate) fn displaced_root_index(
+        network: Network,
+        root: FinalNoteCommitmentRoot,
+        protocol: ShieldedProtocol,
+        position: (u64, BlockId),
+    ) -> Self {
+        let (event_sequence, block_id) = position;
+        let mut key = Self::displaced_root_index_prefix(network, root, protocol).0;
+        key.extend_from_slice(&event_sequence.to_be_bytes());
+        key.extend_from_slice(&block_id.height.value().to_be_bytes());
+        key.extend_from_slice(&block_id.hash.as_bytes());
+        Self(key)
+    }
+
+    pub(crate) fn displaced_root_index_position(key_bytes: &[u8]) -> Option<(u64, BlockId)> {
+        if key_bytes.len() != DISPLACED_ROOT_INDEX_KEY_LEN
+            || key_bytes.first().copied() != Some(KEY_VERSION)
+            || key_bytes.get(1).copied() != Some(DISPLACED_ROOT_INDEX_KEY_KIND)
+        {
+            return None;
+        }
+        let event_start = DISPLACED_ROOT_INDEX_PREFIX_LEN;
+        let height_start = event_start + DISPLACEMENT_EVENT_SEQUENCE_LEN;
+        let hash_start = height_start + BLOCK_HEIGHT_LEN;
+        let event_bytes = key_bytes[event_start..height_start].try_into().ok()?;
+        let height_bytes = key_bytes[height_start..hash_start].try_into().ok()?;
+        let block_hash_bytes = key_bytes[hash_start..].try_into().ok()?;
+        Some((
+            u64::from_be_bytes(event_bytes),
+            BlockId::new(
+                BlockHeight::new(u32::from_be_bytes(height_bytes)),
+                BlockHash::from_bytes(block_hash_bytes),
+            ),
+        ))
+    }
+
     pub(crate) fn chain_event(event_sequence: u64) -> Self {
         let mut key = vec![KEY_VERSION];
         key.extend_from_slice(&event_sequence.to_be_bytes());
@@ -396,6 +536,54 @@ impl StoreKey {
     ) -> Self {
         visible_height_epoch_key(
             VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND,
+            network,
+            height,
+            chain_epoch,
+        )
+    }
+
+    pub(crate) fn visible_final_note_commitment_roots_epoch_prefix(
+        network: Network,
+        height: BlockHeight,
+    ) -> Self {
+        visible_height_epoch_prefix(
+            VISIBLE_FINAL_NOTE_COMMITMENT_ROOTS_EPOCH_KEY_KIND,
+            network,
+            height,
+        )
+    }
+
+    pub(crate) fn visible_final_note_commitment_roots_epoch(
+        network: Network,
+        height: BlockHeight,
+        chain_epoch: ChainEpochId,
+    ) -> Self {
+        visible_height_epoch_key(
+            VISIBLE_FINAL_NOTE_COMMITMENT_ROOTS_EPOCH_KEY_KIND,
+            network,
+            height,
+            chain_epoch,
+        )
+    }
+
+    pub(crate) fn visible_block_value_pool_balances_epoch_prefix(
+        network: Network,
+        height: BlockHeight,
+    ) -> Self {
+        visible_height_epoch_prefix(
+            VISIBLE_BLOCK_VALUE_POOL_BALANCES_EPOCH_KEY_KIND,
+            network,
+            height,
+        )
+    }
+
+    pub(crate) fn visible_block_value_pool_balances_epoch(
+        network: Network,
+        height: BlockHeight,
+        chain_epoch: ChainEpochId,
+    ) -> Self {
+        visible_height_epoch_key(
+            VISIBLE_BLOCK_VALUE_POOL_BALANCES_EPOCH_KEY_KIND,
             network,
             height,
             chain_epoch,
@@ -483,7 +671,9 @@ impl StoreKey {
         let prefix_len = match key_bytes[1] {
             VISIBLE_BLOCK_EPOCH_KEY_KIND
             | VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND
-            | VISIBLE_TREE_STATE_EPOCH_KEY_KIND => HEIGHT_VISIBILITY_PREFIX_LEN,
+            | VISIBLE_TREE_STATE_EPOCH_KEY_KIND
+            | VISIBLE_FINAL_NOTE_COMMITMENT_ROOTS_EPOCH_KEY_KIND
+            | VISIBLE_BLOCK_VALUE_POOL_BALANCES_EPOCH_KEY_KIND => HEIGHT_VISIBILITY_PREFIX_LEN,
             VISIBLE_TRANSACTION_EPOCH_KEY_KIND => TRANSACTION_VISIBILITY_PREFIX_LEN,
             VISIBLE_SUBTREE_ROOT_EPOCH_KEY_KIND => SUBTREE_ROOT_VISIBILITY_PREFIX_LEN,
             _ => return None,
@@ -582,7 +772,7 @@ fn visible_height_epoch_key(
 mod tests {
     use std::collections::HashSet;
 
-    use zinder_core::{Network, ShieldedProtocol};
+    use zinder_core::{FinalNoteCommitmentRoot, Network, ShieldedProtocol};
 
     use super::{BlockHeight, ChainEpochId, StoreKey, SubtreeRootIndex, TransactionId};
 
@@ -593,11 +783,15 @@ mod tests {
         let height = BlockHeight::new(42);
         let transaction_id = TransactionId::from_bytes([0x11; 32]);
         let subtree_index = SubtreeRootIndex::new(3);
+        let block_hash = zinder_core::BlockHash::from_bytes([0x22; 32]);
+        let root = FinalNoteCommitmentRoot::from_bytes([0x33; 32]);
         let artifact_prefixes = [
             StoreKey::block_header(network, chain_epoch, height),
             StoreKey::compact_block(network, chain_epoch, height),
             StoreKey::transaction_facts(network, chain_epoch, transaction_id),
+            StoreKey::transaction_intrinsic_value_balances(network, chain_epoch, transaction_id),
             StoreKey::tree_state(network, chain_epoch, height),
+            StoreKey::final_note_commitment_roots(network, chain_epoch, height),
             StoreKey::subtree_root(
                 network,
                 chain_epoch,
@@ -621,11 +815,20 @@ mod tests {
             ),
             StoreKey::transparent_output_block_index(network, height, chain_epoch),
             StoreKey::mempool_event(99),
+            StoreKey::displaced_block_by_order(network, 99, height),
+            StoreKey::displaced_block_by_hash(network, block_hash),
+            StoreKey::displaced_root_index(
+                network,
+                root,
+                ShieldedProtocol::Sapling,
+                (99, zinder_core::BlockId::new(height, block_hash)),
+            ),
         ]
         .map(|key| key.as_bytes()[..2].to_vec());
         let visibility_prefixes = [
             StoreKey::visible_block_epoch_prefix(network, height),
             StoreKey::visible_compact_block_epoch_prefix(network, height),
+            StoreKey::visible_final_note_commitment_roots_epoch_prefix(network, height),
             StoreKey::visible_transaction_epoch_prefix(network, transaction_id),
             StoreKey::visible_tree_state_epoch_prefix(network, height),
             StoreKey::visible_subtree_root_epoch_prefix(
@@ -662,12 +865,15 @@ mod tests {
             StoreKey::raw_blob_retention(),
             StoreKey::transparent_retention_release_height(),
             StoreKey::transparent_retention_deleted_through_height(),
+            StoreKey::displaced_block_archive_coverage(),
+            StoreKey::displaced_block_count(),
+            StoreKey::displaced_root_archive_coverage(),
         ]
         .map(StoreKey::into_bytes)
         .into_iter()
         .collect::<HashSet<_>>();
 
-        assert_eq!(storage_control_keys.len(), 11);
+        assert_eq!(storage_control_keys.len(), 14);
         for chain_epoch in [
             ChainEpochId::new(0),
             ChainEpochId::new(1),
@@ -685,5 +891,22 @@ mod tests {
                     .contains(&StoreKey::mempool_event(chain_epoch.value()).into_bytes())
             );
         }
+    }
+
+    #[test]
+    fn displaced_root_index_key_round_trips_occurrence_position() {
+        let height = BlockHeight::new(42);
+        let block_hash = zinder_core::BlockHash::from_bytes([0x44; 32]);
+        let key = StoreKey::displaced_root_index(
+            Network::ZcashRegtest,
+            FinalNoteCommitmentRoot::from_bytes([0x55; 32]),
+            ShieldedProtocol::Orchard,
+            (73, zinder_core::BlockId::new(height, block_hash)),
+        );
+
+        assert_eq!(
+            StoreKey::displaced_root_index_position(key.as_bytes()),
+            Some((73, zinder_core::BlockId::new(height, block_hash)))
+        );
     }
 }

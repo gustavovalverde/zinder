@@ -13,6 +13,7 @@ mod block_header;
 mod block_id;
 mod chain_epoch;
 mod chain_value_pools;
+mod displaced_block;
 pub mod explorer_reasons;
 pub mod explorer_search;
 mod mempool;
@@ -42,7 +43,13 @@ pub use chain_epoch::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter,
     ChainEpoch, ChainEpochId, ChainTipMetadata, Network, UnixTimestampMillis,
 };
-pub use chain_value_pools::{ChainValuePool, ChainValuePools, ChainValuePoolsAtTip};
+pub use chain_value_pools::{
+    BlockValuePoolBalances, ChainValuePool, ChainValuePools, ChainValuePoolsAtTip, ValuePoolBalance,
+};
+pub use displaced_block::{
+    DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,
+    DisplacedRootArchiveCoverage, DisplacedRootCandidate,
+};
 pub use mempool::{
     MempoolEntry, MempoolEvictionReason, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend,
@@ -59,8 +66,9 @@ pub use transaction::{
     AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
     BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, MAX_RAW_TRANSACTION_BYTES,
     MinedDetails, MinedTransaction, RawTransactionBytes, TransactionBlobArtifact,
-    TransactionBroadcastResult, TransactionFactsArtifact, TransactionId, TransactionLocation,
-    TxStatus,
+    TransactionBroadcastResult, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TxStatus,
 };
 pub use transaction_public_facts::{
     LockTime, PrivacyShape, TransactionComponentCounts, TransactionPublicFacts, TransactionVersion,
@@ -76,4 +84,4 @@ pub use transparent_output::{
     TransparentUnspentOutputsByOutpointResponse,
 };
 pub use transparent_utxo_set_summary::TransparentUtxoSetSummary;
-pub use tree_state::TreeStateArtifact;
+pub use tree_state::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, TreeStateArtifact};

@@ -24,10 +24,10 @@ use zinder_proto::capabilities::{
     EXPLORER_BLOCK_TRANSACTIONS_V2,
 };
 use zinder_proto::v1::explorer::{
-    BlockDetailRequest, BlockDetailResponse, BlockProductionPoint, BlockProductionSeriesRequest,
-    BlockProductionSeriesResponse, BlockSummariesInRangeRequest, BlockSummariesInRangeResponse,
-    BlockSummary, BlockSummaryRecord, BlockTransaction, BlockTransactionsResponse,
-    CoinbaseTransactionSummary, block_detail_request,
+    BlockDetailRequest, BlockDetailResponse, BlockFinalNoteCommitmentRoots, BlockProductionPoint,
+    BlockProductionSeriesRequest, BlockProductionSeriesResponse, BlockSummariesInRangeRequest,
+    BlockSummariesInRangeResponse, BlockSummary, BlockSummaryRecord, BlockTransaction,
+    BlockTransactionsResponse, CoinbaseTransactionSummary, block_detail_request,
 };
 use zinder_proto::v1::wallet::{
     self, BlockSelector, LatestBlockRequest, block_selector, wallet_query_client::WalletQueryClient,
@@ -271,7 +271,6 @@ fn attach_coinbase_summaries(
             .into());
         }
     }
-
     for point in points {
         let summary = point
             .summary
@@ -294,7 +293,7 @@ fn attach_coinbase_summaries(
                     script_pub_key: output.script_pub_key.clone(),
                 })
                 .collect(),
-            has_shielded_outputs: artifact.public_facts.counts.has_shielded_output(),
+            has_shielded_outputs: Some(artifact.public_facts.counts.has_shielded_output()),
         });
     }
     Ok(())
@@ -320,21 +319,6 @@ fn validate_coinbase_artifact(
         )
         .into());
     }
-    let expected_output_count =
-        usize::try_from(artifact.public_facts.counts.transparent_output_count)
-            .unwrap_or(usize::MAX);
-    if artifact.transparent_outputs.len() != expected_output_count
-        || artifact
-            .transparent_outputs
-            .iter()
-            .enumerate()
-            .any(|(index, output)| output.output_index != u32::try_from(index).unwrap_or(u32::MAX))
-    {
-        return Err(ExplorerError::internal(
-            "canonical coinbase transaction fact has malformed transparent outputs",
-        )
-        .into());
-    }
     Ok(())
 }
 
@@ -348,7 +332,6 @@ fn join_block_production_points(
         .into_iter()
         .map(|summary| (summary.block_height, summary))
         .collect();
-
     headers
         .into_iter()
         .enumerate()
@@ -356,10 +339,10 @@ fn join_block_production_points(
             let height = start_height.checked_add(u32::try_from(offset).ok()?)?;
             let header = header?;
             let mut summary = summaries_by_height.remove(&height)?;
-            let header_matches_summary = header.height.value() == height
-                && summary.block_hash == encode_rpc_block_hash_hex(header.block_hash)
-                && summary.block_time_unix_seconds == header.block_time;
-            if !header_matches_summary {
+            if header.height.value() != height
+                || summary.block_hash != encode_rpc_block_hash_hex(header.block_hash)
+                || summary.block_time_unix_seconds != header.block_time
+            {
                 return None;
             }
             annotate_request_time_fields(&mut summary, canonical_tip);
@@ -380,7 +363,6 @@ pub(crate) async fn handle_block_detail(
 ) -> Result<Response<BlockDetailResponse>, Status> {
     let inner = request.into_inner();
     let materialized = read_materialized_block_view(derive_store, wallet_client, &inner).await?;
-
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -391,7 +373,6 @@ pub(crate) async fn handle_block_detail(
         )?,
     )
     .await;
-
     Ok(Response::new(BlockDetailResponse {
         freshness: Some(freshness),
         summary: Some(materialized.summary),
@@ -409,6 +390,8 @@ pub(crate) async fn handle_block_transactions(
     let inner = request.into_inner();
     let materialized = read_materialized_block_view(derive_store, wallet_client, &inner).await?;
     let transactions = read_block_transaction_rows(chain_store, derive_store, &materialized)?;
+    let final_note_commitment_roots =
+        read_block_final_note_commitment_roots(chain_store, &materialized)?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
@@ -425,7 +408,33 @@ pub(crate) async fn handle_block_transactions(
         freshness: Some(freshness),
         summary: Some(materialized.summary),
         transactions,
+        final_note_commitment_roots,
     }))
+}
+
+fn read_block_final_note_commitment_roots(
+    chain_store: &SecondaryChainStore,
+    materialized: &MaterializedBlockView,
+) -> Result<Option<BlockFinalNoteCommitmentRoots>, Status> {
+    chain_store
+        .try_catch_up()
+        .map_err(|error| status_from_store_error(&error))?;
+    let core_epoch = chain_epoch_from_message(materialized.chain_epoch.clone())
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let reader = chain_store
+        .chain_epoch_reader_at(core_epoch.id)
+        .map_err(|error| status_from_store_error(&error))?;
+    require_matching_chain_epoch(core_epoch, reader.chain_epoch())?;
+    reader
+        .final_note_commitment_roots_at(BlockHeight::new(materialized.summary.block_height))
+        .map(|roots| {
+            roots.map(|roots| BlockFinalNoteCommitmentRoots {
+                sapling: roots.sapling.map(|root| root.as_bytes().to_vec()),
+                orchard: roots.orchard.map(|root| root.as_bytes().to_vec()),
+                ironwood: roots.ironwood.map(|root| root.as_bytes().to_vec()),
+            })
+        })
+        .map_err(|error| status_from_store_error(&error))
 }
 
 fn read_block_transaction_rows(
@@ -632,7 +641,8 @@ mod tests {
     use super::{attach_coinbase_summaries, join_block_production_points};
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, TransactionFactsArtifact, TransactionId,
-        TransactionLocation, TransparentAddressScriptHash, TransparentOutputFact,
+        TransactionLocation, TransactionVersion, TransparentAddressScriptHash,
+        TransparentOutputFact,
         wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex},
     };
     use zinder_proto::v1::explorer::{BlockProductionPoint, BlockSummary, BlockSummaryRecord};
@@ -654,6 +664,8 @@ mod tests {
         };
         let mut public_facts = synthetic_transaction_public_facts(transaction_id, 64);
         public_facts.is_coinbase = true;
+        public_facts.version = TransactionVersion::V5;
+        public_facts.unsupported_sections.clear();
         public_facts.counts.transparent_output_count = 1;
         let script_pub_key = vec![0x51];
         let artifact = TransactionFactsArtifact::new(
@@ -676,7 +688,7 @@ mod tests {
             coinbase: None,
         }];
 
-        attach_coinbase_summaries(&mut points, &[record], &artifacts)?;
+        attach_coinbase_summaries(&mut points, std::slice::from_ref(&record), &artifacts)?;
 
         let coinbase = points[0]
             .coinbase
@@ -688,7 +700,12 @@ mod tests {
         );
         assert_eq!(coinbase.transparent_outputs.len(), 1);
         assert_eq!(coinbase.transparent_outputs[0].value_zat, 137_500_000);
-        assert!(!coinbase.has_shielded_outputs);
+        assert_eq!(coinbase.has_shielded_outputs, Some(false));
+
+        points[0].coinbase = None;
+        let unavailable_artifacts = HashMap::from([(transaction_id, None)]);
+        attach_coinbase_summaries(&mut points, &[record], &unavailable_artifacts)?;
+        assert!(points[0].coinbase.is_none());
         Ok(())
     }
 

@@ -10,15 +10,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use zinder_core::{
-    BlockHash, BlockHeight, TransactionFactsArtifact, TransparentOutPoint, TransparentSpendFact,
+    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalances, TransparentOutPoint, TransparentSpendFact, ValuePoolBalance,
 };
 
-/// Errors surfaced while reading a block context's hydrated transparent spends.
+/// Errors surfaced while reading a block context's hydrated canonical facts.
 #[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BlockCommitContextError {
     /// Reserved for future in-process hydration failures.
-    #[error("transparent spend hydration failed: {reason}")]
+    #[error("block context fact hydration failed: {reason}")]
     Hydration {
         /// Human-readable failure reason.
         reason: String,
@@ -37,6 +38,75 @@ pub enum TransparentSpendFacts {
     Offline,
     /// In-process hydration: the caller provides the precomputed spend map.
     Static(Arc<HashMap<TransparentOutPoint, TransparentSpendFact>>),
+}
+
+/// Canonical intrinsic value-balance artifacts available to derive consumers.
+///
+/// Row absence is distinct from an all-zero value balance. Consumers that
+/// require exact fees must preserve that distinction as explicit unavailable
+/// output rather than assuming zero balances.
+#[derive(Clone)]
+pub enum TransactionIntrinsicValueBalanceFacts {
+    /// Intrinsic-value-balance hydration is not available.
+    Offline,
+    /// In-process hydration keyed by canonical transaction identifier.
+    Static(Arc<HashMap<TransactionId, TransactionIntrinsicValueBalances>>),
+}
+
+impl TransactionIntrinsicValueBalanceFacts {
+    /// Wraps a precomputed intrinsic-value-balance map into the `Static` variant.
+    #[must_use]
+    pub fn from_map(map: Arc<HashMap<TransactionId, TransactionIntrinsicValueBalances>>) -> Self {
+        Self::Static(map)
+    }
+}
+
+/// Canonical chain-wide value-pool snapshot available to derive consumers.
+///
+/// The list remains dynamic and preserves upstream order. `Offline` is
+/// distinct from an authoritative empty snapshot.
+#[derive(Clone)]
+pub enum BlockValuePoolBalanceFacts {
+    /// Chain value-pool hydration is not available.
+    Offline,
+    /// In-process hydration from the authoritative snapshot for this block.
+    Static(Arc<Vec<ValuePoolBalance>>),
+}
+
+impl BlockValuePoolBalanceFacts {
+    /// Wraps an authoritative list-shaped chain value-pool snapshot.
+    #[must_use]
+    pub fn from_pools(pools: Vec<ValuePoolBalance>) -> Self {
+        Self::Static(Arc::new(pools))
+    }
+}
+
+impl std::fmt::Debug for BlockValuePoolBalanceFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Offline => formatter.write_str("BlockValuePoolBalanceFacts::Offline"),
+            Self::Static(pools) => {
+                write!(
+                    formatter,
+                    "BlockValuePoolBalanceFacts::Static({})",
+                    pools.len()
+                )
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for TransactionIntrinsicValueBalanceFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Offline => formatter.write_str("TransactionIntrinsicValueBalanceFacts::Offline"),
+            Self::Static(map) => write!(
+                formatter,
+                "TransactionIntrinsicValueBalanceFacts::Static({})",
+                map.len()
+            ),
+        }
+    }
 }
 
 impl TransparentSpendFacts {
@@ -70,7 +140,11 @@ pub struct BlockCommitContext {
     pub block_size_bytes: u64,
     /// Ordered transaction facts for every transaction in the block.
     pub transactions: Vec<TransactionFactsArtifact>,
+    /// Typed final note-commitment roots when canonical enrichment is present.
+    pub final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
     transparent_spends: TransparentSpendFacts,
+    transaction_intrinsic_value_balances: TransactionIntrinsicValueBalanceFacts,
+    block_value_pool_balances: BlockValuePoolBalanceFacts,
 }
 
 /// Canonical fact payload [`BlockCommitContext::new`] takes by value.
@@ -87,6 +161,8 @@ pub struct BlockCommitPayload {
     pub block_size_bytes: u64,
     /// Ordered transaction facts for every transaction in the block.
     pub transactions: Vec<TransactionFactsArtifact>,
+    /// Typed final note-commitment roots when canonical enrichment is present.
+    pub final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
 }
 
 impl BlockCommitContext {
@@ -100,8 +176,31 @@ impl BlockCommitContext {
             block_time_unix_seconds: payload.block_time_unix_seconds,
             block_size_bytes: payload.block_size_bytes,
             transactions: payload.transactions,
+            final_note_commitment_roots: payload.final_note_commitment_roots,
             transparent_spends,
+            transaction_intrinsic_value_balances: TransactionIntrinsicValueBalanceFacts::Offline,
+            block_value_pool_balances: BlockValuePoolBalanceFacts::Offline,
         }
+    }
+
+    /// Attaches canonical per-transaction intrinsic value balances.
+    #[must_use]
+    pub fn with_transaction_intrinsic_value_balances(
+        mut self,
+        transaction_intrinsic_value_balances: TransactionIntrinsicValueBalanceFacts,
+    ) -> Self {
+        self.transaction_intrinsic_value_balances = transaction_intrinsic_value_balances;
+        self
+    }
+
+    /// Attaches the authoritative chain-wide value-pool snapshot for this block.
+    #[must_use]
+    pub fn with_block_value_pool_balances(
+        mut self,
+        block_value_pool_balances: BlockValuePoolBalanceFacts,
+    ) -> Self {
+        self.block_value_pool_balances = block_value_pool_balances;
+        self
     }
 
     /// Returns the hydrated transparent spend map for the block's transparent inputs.
@@ -119,6 +218,35 @@ impl BlockCommitContext {
         Ok(match &self.transparent_spends {
             TransparentSpendFacts::Offline => None,
             TransparentSpendFacts::Static(map) => Some(Arc::clone(map)),
+        })
+    }
+
+    /// Returns canonical intrinsic value balances keyed by transaction id.
+    ///
+    /// `Ok(None)` means the caller did not hydrate this artifact family.
+    /// `Ok(Some(map))` preserves missing per-transaction rows as map absence.
+    pub fn transaction_intrinsic_value_balances(
+        &self,
+    ) -> Result<
+        Option<Arc<HashMap<TransactionId, TransactionIntrinsicValueBalances>>>,
+        BlockCommitContextError,
+    > {
+        Ok(match &self.transaction_intrinsic_value_balances {
+            TransactionIntrinsicValueBalanceFacts::Offline => None,
+            TransactionIntrinsicValueBalanceFacts::Static(map) => Some(Arc::clone(map)),
+        })
+    }
+
+    /// Returns the authoritative chain-wide value-pool snapshot for this block.
+    ///
+    /// `Ok(None)` means this artifact family was not hydrated. `Ok(Some(_))`
+    /// preserves an authoritative empty pool list.
+    pub fn block_value_pool_balances(
+        &self,
+    ) -> Result<Option<Arc<Vec<ValuePoolBalance>>>, BlockCommitContextError> {
+        Ok(match &self.block_value_pool_balances {
+            BlockValuePoolBalanceFacts::Offline => None,
+            BlockValuePoolBalanceFacts::Static(pools) => Some(Arc::clone(pools)),
         })
     }
 }

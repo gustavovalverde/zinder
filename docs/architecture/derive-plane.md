@@ -45,19 +45,26 @@ A feature belongs in the derive plane when **any** of the following are true:
 - The view has different retention or freshness requirements than canonical state. Example: a 24-hour rolling activity feed; a permanent address-volume archive.
 - The view's failure does not block wallet correctness. Example: an explorer that goes stale by an hour does not affect a wallet's ability to sync or broadcast.
 
-A feature belongs in the canonical plane (`zinder-store` artifact families, served via `WalletQueryApi`) when:
+A fact belongs in the canonical plane (`zinder-store` artifact families) when:
 
 - The view is required for wallet sync correctness. Example: compact blocks, tree state, subtree roots.
 - The view is required for transaction submission. Example: mempool snapshot.
 - The view is required for chain-event subscription. Example: `ChainEventEnvelope` retention.
+- A reusable immutable block or transaction fact is absent from retained
+  canonical inputs and a deterministic derive view would otherwise have to
+  call the upstream node. Final post-block note-commitment roots are the
+  reference case: ingest obtains them through the typed source boundary and
+  persists them canonically, while root-to-block lookup remains derived.
 
 The decision procedure when adding a new feature:
 
 ```text
-Does the feature affect a wallet's ability to sync, scan, or broadcast?
-├── Yes → canonical (extend an existing artifact family, or add one per
-│         the extending-artifacts cookbook)
-└── No  → derive plane
+Is this an immutable source fact or a query-specific view?
+├── Immutable fact
+│   ├── Already retained canonically → consume the existing artifact
+│   └── Missing but reusable         → extend the typed source boundary and
+│                                      canonical artifacts
+└── Query-specific view              → derive plane
 ```
 
 The DX/AX corollary: if you find yourself extending `zinder-store` to support an explorer dashboard or analytics view, stop. You are likely growing the canonical surface for non-canonical reasons. The derive plane is the right boundary.
@@ -95,6 +102,15 @@ occasional historical lookups. Steady-state operation should use Channel A or B.
 A derive consumer that repeatedly scans canonical history outside the tailer is
 a smell: the data should probably be carried in the chain event context, or the
 view is in the wrong plane.
+
+When a newly introduced canonical fact needs historical upstream enrichment,
+`zinder-ingest` owns that source operation before the derive consumer runs. The
+commitment-root backfill is the reference pattern: ingest fetches settled
+`z_gettreestate` observations through `NodeSource`, idempotently enriches the
+matching canonical block artifact, then feeds bounded canonical contexts to
+`CommitmentRootSearchConsumer`. The consumer itself never imports
+`zinder-source`, and its coverage row advances atomically with its index rows
+without moving the shared chain-event cursor.
 
 A fresh derive consumer whose persisted cursor sits below the canonical event retention floor needs a cold-start path that rebuilds from canonical artifacts and then resumes ingest-hosted event dispatch without dropping or duplicating events. Stateful derive consumers own this path; the framework provides the atomic-cursor contract, and the writer provides the gap-fill loop.
 
@@ -169,6 +185,29 @@ This contract is what distinguishes derive from canonical. A canonical artifact,
 
 The recovery rule has a corollary for testing: an incompatible schema change must exercise full rebuild from its oldest supported recovery point, while a row-compatible change must prove that predecessor rows and cursors survive and that the new reader safely interprets them. A `cursor = None` replay over only the current retention window is not proof of complete historical recovery.
 
+This contract is what distinguishes derive from canonical. A canonical artifact, once written, is the source of truth. A derive view is one possible projection, but operators drop and rebuild it only when its declared recovery source still covers the rows being replaced.
+
+The recovery rule has a corollary for testing: an incompatible schema change must exercise full rebuild from its oldest supported recovery point, while a row-compatible change must prove that predecessor rows and cursors survive and that the new reader safely interprets them. A `cursor = None` replay over only the current retention window is not proof of complete historical recovery.
+
+## Projection state and read snapshots
+
+Consumers that need to make completeness claims persist a
+`ConsumerProjectionState` beside their rows. The state names the canonical epoch,
+projection tip height and hash, monotonic revision, and optional contiguous
+`ConsumerProjectionCoverage`. A block-keyed consumer stages this state in the
+same `WriteBatch` as its projection rows and chain-event cursor, so a crash
+cannot publish a new tip, revision, or coverage boundary without the rows that
+justify it. Reorg handling may advance, retain, or clear coverage according to
+the consumer's proof; it must not infer completeness from cursor position alone.
+
+`DeriveStore::read_snapshot` binds projection metadata, point reads, range
+scans, joins, and exact counts to one store sequence. Primary stores use a
+RocksDB snapshot. Secondary stores hold a shared catch-up barrier for the
+snapshot lifetime, while `try_catch_up` takes the exclusive side, so one logical
+response cannot straddle a secondary refresh. A public read fence can therefore
+identify the snapshot by epoch, projection revision, and projection tip. Paged
+cursors and follow-up requests must reject a fence that no longer matches.
+
 ## Schema versioning
 
 Derive views version their schemas independently from canonical artifacts and from each other. A derive consumer's schema-version field has nothing to do with `ChainEpoch::artifact_schema_version`.
@@ -177,7 +216,127 @@ Each consumer declares its schema version alongside its name, column families, a
 
 The rebuild path is conditional, not a failsafe. Scoping rebuild to one consumer keeps unrelated data intact, but the consumer must still prove its source coverage. `TransactionFeesConsumer` version 2 is row-compatible with version 1: new writes omit unprovable shielded fees, readers suppress legacy values, and missing or partial input rows recover from retained parent transaction facts without clearing the projection. The `transparent_outpoint_spend` consumer has a stricter limit: the canonical safe-tip sweep deletes source rows behind its durable height, so an incompatible schema bump can escalate to a full canonical re-ingest ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
 
+`TransactionHistoryConsumer` version 1 is the reference additive projection
+with atomic projection state. It owns the `transaction_history` column family
+and consumer cursor independently from `recent_transactions`, and uses its row
+key as the authoritative transaction index. A background,
+non-readiness-blocking verifier compares bounded height batches with canonical
+transaction facts, resumes after the last verified height, and publishes a new
+coverage boundary only when the canonical epoch and projection head still match
+the values observed before verification. Normal chain-event dispatch advances
+rows, projection state, coverage, and cursor atomically. This establishes
+height-1-through-tip completeness without replacing the canonical or derive
+volume.
+
+`CommitmentRootSearchConsumer` version 1 owns three column families: newest-first
+root matches, per-height deletion keys, and contiguous historical coverage.
+Normal chain-event dispatch tolerates a not-yet-enriched canonical height and
+materializes an empty height row; the ingest-owned backfill later replaces it
+from the canonical root artifact. Reorg rewind deletes every protocol match for
+the reverted height. Negative search results are authoritative only when the
+response reports complete coverage through the settled tip and contiguous
+recent rows through the visible tip.
+
+Introducing this consumer does not force unrelated block consumers to replay
+from retained history. Before the tailer starts, ingest may seed only the new
+consumer's event cursor from the unanimous cursor of every pre-existing bundled
+block consumer. It does so only while the root consumer has no cursor of its
+own. A missing or disagreeing predecessor cursor leaves the root cursor unset
+and retains the generic full-replay behavior. The cursor seed establishes the
+future event boundary; it never claims historical root coverage, which remains
+owned by the separate contiguous backfill row.
+
 This lets explorers iterate on dashboards without touching canonical storage and without coordinating with wallet sync.
+
+`TransactionComponentSummaryConsumer` version 2 owns per-block component
+contributions, a height index, UTC-day aggregates, historical coverage, and a
+separate live-tail coverage row. It supplies exact half-open time-range totals
+for transparent inputs and outputs, Sapling spends and outputs, Orchard and
+Ironwood actions, Sprout JoinSplits, legacy Sapling/Orchard classifications,
+and neutral transaction predicates. The protocol-scoped fields are named
+`sapling_orchard_or_ironwood_transaction_count`,
+`non_coinbase_without_sapling_orchard_or_ironwood_transaction_count`,
+`non_coinbase_sapling_orchard_or_ironwood_with_transparent_inputs_and_outputs_transaction_count`,
+and
+`non_coinbase_sapling_orchard_or_ironwood_without_transparent_inputs_or_outputs_transaction_count`.
+Their scope, coinbase handling, and Sprout-only behavior are therefore visible
+at the call site. Transactions with unsupported sections contribute only to
+`transaction_predicate_unavailable_count`; predicate totals are exact only when
+that count is zero. Version 2 appends those predicate counters to fixed-width rows, so
+opening a version-1 store clears this consumer's rows and cursor only; its
+existing canonical-artifact backfill and live tail then rebuild it. Reorgs
+remove the reverted block contribution and recompute affected day extrema
+before applying replacements.
+
+Schema version 2 is a coordinated outage: stop the writer and every derive
+secondary, take a checkpoint, deploy version-2 binaries, start the version-2
+writer to reconcile the primary, then start version-2 readers. Reader-first
+rolling and side-by-side version-1/version-2 access are invalid.
+
+Existing stores use a two-owner bootstrap rather than replaying every bundled
+consumer. The historical worker reads canonical artifacts from height 1
+through the height immediately before the durable tail boundary. Before the
+chain-event tailer starts, ingest seeds the already-visible unsettled range
+into the new consumer without advancing its inherited cursor. Those rows then
+belong to normal reorg dispatch. Startup may widen an older tail boundary and
+revalidate preserved contribution rows; it resets only tail progress metadata,
+not the projection or canonical store. The historical and live ranges join
+only when contiguous, so a crash or partial seed produces explicit incomplete
+coverage rather than a false complete result.
+
+`ConventionalFeeDistributionConsumer` version 1 follows the same split-tail
+bootstrap contract, but stores a different reusable fact: exact frequency
+counts of ZIP-317 conventional fees. It owns one block-time-keyed contribution
+per canonical block, a height index for rewind, one aggregate row per UTC day,
+and historical/live-tail coverage. Each non-coinbase transaction contributes
+one frequency count derived from its component shape. Transactions with an
+unsupported section contribute only to an explicit unavailable count; the
+consumer never substitutes or labels a paid fee.
+
+The per-block contribution is retained even after its day aggregate is built.
+This makes rollback exact when a reorg crosses a UTC boundary and lets clipped
+first or last query days use block-time predicates while complete middle days
+use one aggregate read each. Backfill coverage advances atomically with each
+canonical batch. Startup seeds the already-visible tail before inheriting the
+unanimous event cursor, and the background worker fills height 1 through the
+height immediately before that tail. Adding this consumer creates only its
+four derive column families; it does not change canonical schema or clear any
+existing consumer.
+
+`PaidFeeDistributionConsumer` version 1 is deliberately separate from the
+conventional-fee projection. It combines resolved transparent inputs and
+outputs with schema-15 `TransactionIntrinsicValueBalances` artifacts, excludes
+coinbase and proven zero-fee transactions, and records exact positive
+miner-collected fee frequencies. Missing prevouts or intrinsic artifacts
+increase an unavailable count instead of falling back to a conventional fee.
+
+Startup seeds the visible tail before assigning the existing unanimous event
+cursor. Historical coverage then prepends settled blocks newest-first, allowing
+short recent periods to become complete while the configured 365-day window
+continues filling. The durable target floor can move only backward when an
+operator increases retention. Each batch validates source block identity,
+enriches missing canonical intrinsic facts in place, and atomically advances
+projection coverage; it never clears unrelated derive consumers or recreates
+the canonical volume.
+
+`TransparentAddressRankingConsumer` version 2 owns an immutable active
+generation, an optional in-progress generation, balance-ordered rows, lifetime
+address summaries, concentration totals, P2PKH/P2SH address and balance totals,
+and per-height undo journals. Existing
+stores bootstrap without replaying unrelated consumers: ingest snapshots the
+settled canonical address-output projection, reconciles it against complete
+transparent-address deltas through the same height, applies the visible
+unsettled tail into the inactive generation, and atomically activates that
+generation at the unanimous chain-event cursor. A crash resumes or discards
+only the inactive generation; readers continue using the previous active
+generation. Normal chain-event dispatch and undo journals own updates after
+activation.
+
+Ranking activation requires exact balance and lifetime coverage. Missing
+historical delta coverage leaves the capability unavailable instead of
+publishing partial lifetime totals. This is an additive derive schema: it does
+not change `ChainEpoch::artifact_schema_version`, rewrite canonical rows, or
+require a canonical volume wipe.
 
 ## Operator surface
 

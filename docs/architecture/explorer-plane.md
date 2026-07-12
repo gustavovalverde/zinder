@@ -113,12 +113,28 @@ size, rewards, and component counts. A point is emitted only when the summary's
 hash and block time agree with the header visible at the requested chain epoch;
 the response reports covered and missing heights explicitly so a concurrent
 reorg cannot produce a mixed-epoch series.
+the block views. Version 2 joins existing `BlockSummaryRecord` rows to one
+batched canonical header-range read, adds the compact difficulty target
+(`bits`), then batch-loads the retained transaction-fact artifacts for the
+matched records' leading transaction ids. Each point may therefore carry the
+validated canonical coinbase transaction id, its ordered intrinsic transparent
+outputs, and whether shielded outputs are known to exist. Missing retained
+coinbase facts leave `coinbase` absent; they do not remove an otherwise covered
+point or fabricate an empty coinbase. Points remain ascending and reuse
+`BlockSummary` for transaction counts, fee fields, size, rewards, and component
+counts. A point is emitted only when the summary's hash and block time agree
+with the header visible at the requested chain epoch; the response reports
+covered and missing heights explicitly so a concurrent reorg cannot produce a
+mixed-epoch series.
 
 The series is assembled at request time from the existing derive and canonical
 stores. It adds no consumer, column family, schema version, replay, backfill, or
 data-wipe requirement. Product adapters own presentation formulas such as
-rolling averages, relative difficulty, or Cipherscan's `difficulty / interval`
+rolling averages, relative difficulty, or consumer-specific `difficulty / interval`
 solrate approximation; Zinder returns the reusable source facts and their units.
+rolling averages, relative difficulty, coinbase-address decoding, payout-role
+classification, or a consumer-specific `difficulty / interval` solrate approximation;
+Zinder returns the reusable source facts and their units.
 
 The materialized record covers all block-view reads: `BlockDetail` performs one
 RocksDB get, `BlockTransactions` adds canonical batches for the block
@@ -126,6 +142,9 @@ transactions and their unique parents plus one compatible fee-record batch,
 `BlockSummariesInRange` performs one derive range scan, and
 `BlockProductionSeries` adds one canonical batched header-range read to that
 range scan. Storage cost is dominated by the transaction-id list:
+`BlockProductionSeries` adds one canonical batched header-range read and one
+bounded transaction-fact batch to that range scan. Storage cost is dominated by
+the transaction-id list:
 `~32 bytes × tx_count` per block, plus the summary fields. Neither page-ready
 transactions nor block production adds a projection or schema because their
 canonical facts are already retained.
@@ -139,7 +158,7 @@ over the existing `BlockSummaryRecord` rows. The request names an inclusive
 height range; the server caps that range at 20,000 blocks and returns the
 requested bounds, materialized-row count, missing-row count, first and last
 observed block times, total transaction count, and a complete 168-cell
-weekday/hour grid. Weekdays use the Cipherscan-compatible `Sunday = 0` order;
+weekday/hour grid. Weekdays use the explicit `Sunday = 0` order;
 zero-valued cells are emitted so clients never need to infer absent activity
 from an omitted bucket.
 
@@ -190,16 +209,44 @@ The age fields are wall-clock deltas computed at response time against the entry
 
 `ExplorerQuery.MempoolActivity` paginates the same snapshot into typed entry rows sorted by newest-first observation time. Each row includes the parsed component counts and the sum of its transparent outputs in zatoshis. Both values are derived from the in-memory `MempoolEntry` at request time, so this surface neither requires a durable projection nor changes the chain-store schema. The cursor is opaque: 12 bytes packing `(first_seen_unix_millis, transaction_id_tail_4_bytes)` big-endian. Mempool state is transient, so subsequent pages may interleave with new arrivals; clients that need a consistent paged read should treat any single response as a snapshot and re-pin if needed.
 
+`ExplorerQuery.MempoolActivity` paginates the same snapshot into typed entry rows sorted by newest-first observation time. Each row includes the parsed component counts and the sum of its transparent outputs in zatoshis. Both values are derived from the in-memory `MempoolEntry` at request time, so this surface neither requires a durable projection nor changes the chain-store schema. The cursor is opaque: 12 bytes packing `(first_seen_unix_millis, transaction_id_tail_4_bytes)` big-endian. Mempool state is transient, so subsequent pages may interleave with new arrivals; clients that need a consistent paged read should treat any single response as a snapshot and re-pin if needed.
+
 ## Transparent-address activity
 
-`ExplorerQuery.TransparentAddressActivity` is the single RPC explorer pages call to render the per-address activity feed. It composes two existing wallet primitives at request time:
+`ExplorerQuery.TransparentAddressActivity` v2 is the single confirmed-address
+read for explorer pages and compatibility adapters. It combines three
+product-neutral sources without adding another projection:
 
-1. `WalletQuery.TransparentAddressTxIdsInRange` for the confirmed slice (server-streamed; the explorer handler consumes up to `max_entries` rows and forwards the wallet cursor as the page's `next_cursor`).
-2. `WalletQuery.TransparentMempoolOutputsByAddress` plus `WalletQuery.MempoolSnapshot` for the mempool overlay (the snapshot join hydrates `first_seen_unix_millis` per mempool entry).
+1. `TransparentAddressActivityConsumer` supplies newest-first transaction rows
+   and the opaque cursor. A bounded `offset` is also available for legacy
+   page-number adapters and is mutually exclusive with the cursor.
+2. The atomically active `TransparentAddressRanking` generation supplies the
+   current confirmed balance, lifetime received and sent totals, exact distinct
+   transaction count, first and last activity timestamps, and explicit
+   coverage. A valid address absent from the generation returns a typed zero
+   summary rather than a not-found error.
+3. The explorer's local canonical secondary batch-loads retained transaction
+   and parent facts at the response epoch. Rows gain canonical index, size,
+   component counts, address-specific input and output values, and deduplicated
+   raw scripts for other transparent inputs and outputs. Missing retained facts
+   stay optional, and `input_facts_complete` prevents a partial input sum or
+   receiving counterparty from being presented as complete.
 
-The mempool overlay is emitted only on the first page (`from_cursor` empty and `include_mempool=true`) so subsequent pages stay deterministic. Mempool entries lead when `descending=true`; the confirmed slice leads when `descending=false`. Each row carries either the confirmed fields (`block_height`, `block_hash`, `tx_index_in_block`) or the mempool fields (`in_mempool=true`, `first_seen_unix_millis`); the two arms never coexist on one entry.
+The handler resolves its epoch from the same local canonical secondary used for
+transaction enrichment. It does not label ranking or canonical facts with an
+independently advancing `WalletQuery` reader epoch. Ranking coverage newer than
+the selected epoch is rejected; active metadata is read again after the summary
+to close generation activation and live-tail races. `ExplorerFreshness` carries
+the shared derive indexed tip, including its hash, so adapters can mark a
+same-height canonical mismatch as degraded. This design remains correct during
+ordinary one-block reader skew without requiring retries or returning a mixed
+snapshot.
 
-The handler dedupes against the mempool overlay's transaction ids when streaming the confirmed slice so a transaction that mines between the two reads never appears twice in one response.
+Offset paging, summary composition, and canonical enrichment are request-time
+contract extensions. They reuse the existing activity and ranking projections
+and retained canonical facts, so v2 requires no schema migration, replay,
+backfill, or volume replacement. Mempool address activity remains a separate
+surface; confirmed pagination therefore stays deterministic.
 
 ## Transparent-address deltas
 
@@ -209,17 +256,78 @@ Both surfaces fold the same per-event attribution. `TransparentAddressDeltasCons
 
 Received-output events are always exact. Spend events carry `spent_value_zat` from the canonical spend fact, so they need no prevout re-resolution at read time. A spend whose prevout cannot be resolved (or when transparent-spend hydration is off) produces no delta event rather than a wrong number; the activity surface's `prevout_resolution_status` reports the same partial state for that transaction. The range read is paged with the standard opaque cursor and capped at 256 rows per page.
 
+## Transparent-address ranking
+
+`ExplorerQuery.TransparentAddressRanking` returns positive-balance standard
+transparent scripts ordered by `(balance_zat descending, script hash
+ascending)`. The native boundary returns raw `script_pub_key` bytes because
+network-specific address encoding belongs to clients and adapters. Pages are
+offset-based, capped at 500 rows, and include the positive-address count,
+positive-balance total, top-10 and top-100 totals, and explicit balance and
+lifetime-history coverage. The response also carries ordered P2PKH and P2SH
+aggregate rows. Their counts and balances must sum exactly to the generation
+totals, so consumers can distinguish standard script templates without scanning
+or decoding every ranked row.
+
+The method is available only while an active materialized generation exists.
+Its `ExplorerFreshness` must describe the same derive cursor and canonical epoch
+as that generation; an in-progress replacement generation is never visible.
+This gives dashboards and agents a stable rank snapshot while ingest constructs
+or resumes a replacement after a schema change or interrupted bootstrap.
+
 ## Fee summary
 
 `ExplorerQuery.FeeSummary` aggregates per-transaction [ZIP-317](https://zips.z.cash/zip-0317) conventional fee floors across an inclusive block range. The fee fields are the ZIP-317 floor `MARGINAL_FEE × max(logical_actions, GRACE_ACTIONS)`, not miner-collected fees: computing actual fees requires resolving every transparent input via `WalletQuery.TransparentOutputsByOutpoint`, and that fan-out is intentionally out of scope for `v1`. The conventional-fee floor is the minimum a wallet should attach to a transaction with the given shape; aggregates over many blocks give an explorer page a useful approximation of fee floors without prevout resolution.
 
 `logical_actions = max(transparent_input_count, transparent_output_count, max(sapling_spend_count, sapling_output_count), orchard_action_count) + ironwood_action_count`. The derive plane computes component counts from `TransactionFactsArtifact` once and materializes per-block fee aggregates in `BlockSummaryRecord`. The handler scans those typed records; it does not request raw blocks or parse `zebra-chain` bytes on the read path. The fee helper lives on `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat` so the same formula is reusable from any handler that builds the count shape. The range cap is 256 blocks per request; coinbase transactions are excluded because they have no fee.
 
+## Conventional fee distribution
+
+`ExplorerQuery.ConventionalFeeDistribution` returns exact, sorted frequency
+counts for ZIP-317 conventional fees grouped by UTC day over a half-open block
+time range. It deliberately does not return percentiles, chart buckets, or
+compatibility-adapter field names. Those are consumer policies derived losslessly from
+the native frequencies. Coinbase transactions are excluded, zero-count rows
+are absent, and transactions whose complete component shape is unavailable
+are reported separately rather than silently omitted.
+
+The response carries `ExplorerFreshness` and independent contiguous coverage.
+The capability is advertised only after projection coverage exists. A range is
+complete only when its start is covered and the projection reaches the visible
+tip or its time boundary. Full UTC days use aggregate rows; clipped boundary
+days scan retained per-block contributions. This keeps 365-day reads bounded
+by daily rows while preserving exact rolling-cutoff semantics.
+
 ## Value pool summary
 
-`ExplorerQuery.ValuePoolSummary` wraps `WalletQuery.ChainValuePoolsAtTip` in the standard `ExplorerFreshness` envelope. It does not call upstream nodes directly and it does not project pool ids into fixed response fields. The response carries `repeated ChainValuePool pools` so existing UI can render known ids while future consensus pools remain visible without a new explorer wire shape.
+`ExplorerQuery.ValuePoolSummary` wraps `WalletQuery.ChainValuePoolsAtTip` in the standard `ExplorerFreshness` envelope. It does not call upstream nodes directly and it does not project pool ids into fixed response fields. The response carries `source_tip: BlockTip` plus `repeated ChainValuePool pools`, preserving the height/hash identity and pool list from the same upstream observation. Existing UI can render known ids while future consensus pools remain visible without a new explorer wire shape.
 
 `ValuePoolSummary` reports the upstream node's `getblockchaininfo.valuePools` totals; it is not a Zinder-computed UTXO accounting. The chain-wide transparent UTXO accounting is `UtxoSetSummary`.
+
+`ValuePoolSummary` is only the current source snapshot. Value-pool history and value-pool flow are separate future consumers because cumulative balances and transaction movement have different inputs, coverage, and replay behavior. This prerequisite does not create either consumer or a derive schema.
+
+## Transaction component summary
+
+`ExplorerQuery.TransactionComponentSummary` returns exact component totals and
+UTC-day rows for a half-open block-time range. The product-neutral fields
+include transparent inputs and outputs, Sapling spends and outputs, Orchard
+and Ironwood actions, Sprout JoinSplits, protocol transaction counts, and
+explicitly named legacy Sapling/Orchard classifications. Separate neutral
+predicate totals use protocol-scoped identifiers, including
+`sapling_orchard_or_ironwood_transaction_count` and three explicitly named
+non-coinbase predicates. Unsupported
+sections increment `transaction_predicate_unavailable_count` and contribute to
+none of those predicates, so clients must require an unavailable count of zero
+before claiming exact predicate totals. `totals_only` defaults to false and
+returns UTC-day rows; true omits the rows.
+
+The response carries the current `ChainEpoch` in `ExplorerFreshness` and a
+separate contiguous coverage envelope. `requested_range_complete` is true only
+after height-1 historical coverage has joined the cursor-seeded live tail and
+reaches the visible tip. This deliberately conservative rule accounts for
+non-monotonic block timestamps: the timestamp at the last indexed height alone
+cannot prove that a missing later height falls outside the requested range.
+Checkpoint-based stores therefore never claim full-chain completeness.
 
 ## UTXO-set summary
 
@@ -246,12 +354,17 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
 | `explorer.block.activity_distribution_v1` | `ExplorerQuery.BlockActivityDistribution` | When the block-summary consumer and wallet endpoint are available |
 | `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
+| `explorer.transparent_address.activity_v2` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint, activity and ranking consumers, and canonical secondary store are available, and the ranking has an active complete generation |
 | `explorer.transparent_address.deltas_v1` | `ExplorerQuery.TransparentAddressDeltas` | When the wallet endpoint is configured |
+| `explorer.transparent_address.ranking_v1` | `ExplorerQuery.TransparentAddressRanking` | When the ranking consumer has an active generation and the wallet endpoint is configured |
 | `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |
 | `explorer.mempool.snapshot_v1` | `ExplorerQuery.MempoolSnapshot` | When the wallet endpoint is configured |
 | `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | When the wallet endpoint is configured |
 | `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | When the wallet endpoint is configured |
+| `explorer.fee.conventional_distribution_v1` | `ExplorerQuery.ConventionalFeeDistribution` | When the conventional-fee projection has contiguous materialized coverage and the wallet endpoint is configured |
+| `explorer.fee.paid_distribution_v1` | `ExplorerQuery.PaidFeeDistribution` | When the paid-fee projection has materialized coverage and the wallet endpoint is configured |
 | `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the wallet endpoint is configured and `WalletQuery.ChainValuePoolsAtTip` is available |
+| `explorer.transaction.component_summary_v2` | `ExplorerQuery.TransactionComponentSummary` | When the transaction-component consumer and wallet endpoint are available |
 | `explorer.utxo_set.summary_v1` | `ExplorerQuery.UtxoSetSummary` | When the wallet endpoint is configured |
 | `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
 
@@ -358,11 +471,42 @@ The explorer plane never calls upstream Zcash node RPCs. When a view needs a fac
 3. The fact lands in `SourceBlock`, a typed `Source*` value, a source-backed control primitive, or a new canonical artifact family per [Extending artifacts](extending-artifacts.md).
 4. The explorer consumer subscribes to the new event or artifact, or composes through the new `WalletQuery` primitive when the fact is intentionally live-source-backed.
 
-Chain value pools (the `ValuePoolSummary` view) is the first source-boundary extension that stays live-source-backed. `zinder-source` parses `getblockchaininfo.valuePools`, `IngestControl` owns the writer-side source handle, `WalletQuery.ChainValuePoolsAtTip` proxies through that control plane, and `ExplorerQuery.ValuePoolSummary` wraps the wallet response in `ExplorerFreshness`.
+Chain value pools (the `ValuePoolSummary` view) is the first source-boundary extension that stays live-source-backed. `zinder-source` parses `getblockchaininfo.valuePools` together with that response's `blocks` and `bestblockhash`, `IngestControl` owns the writer-side source handle, `WalletQuery.ChainValuePoolsAtTip` proxies the hash-bound snapshot through that control plane, and `ExplorerQuery.ValuePoolSummary` wraps the wallet response in `ExplorerFreshness`.
+
+Final note-commitment roots use the durable variant of this pattern.
+`zinder-source` parses the post-block Sapling, Orchard, and Ironwood roots from
+`z_gettreestate`; `zinder-ingest` stores them as the canonical
+`BlockFinalNoteCommitmentRoots` artifact; and
+`CommitmentRootSearchConsumer` builds the product-neutral reverse index.
+`ExplorerQuery.BlockTransactions` exposes the optional roots for a selected
+block under `explorer.block.final_note_commitment_roots_v1`, while
+`ExplorerQuery.CommitmentRootSearch` returns canonical matches plus explicit
+coverage under `explorer.commitment_root.search_v1`. The search does not
+reinterpret transaction-intermediate anchors, and it does not claim orphaned
+matches without a separately designed non-canonical block archive.
 
 ## Derived views
 
-Explorer-derived views use the derive-plane SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, `TransparentAddressDeltasConsumer`, `RecentTransactionsConsumer`, and `ReorgIncidentsConsumer` write product-specific rows in the derive store while the canonical store remains the wallet-correctness boundary. `ReorgIncidentsConsumer` is an event-only chain-event consumer: it reads `ChainEventEnvelope` rows directly and never waits for block-context hydration. It backfills from the earliest retained chain event when first deployed and then preserves future incidents beyond chain-event retention; it cannot reconstruct incidents already pruned before deployment. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
+Explorer-derived views use the derive-plane SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, `TransparentAddressDeltasConsumer`, `TransparentAddressRankingConsumer`, `TransactionHistoryConsumer`, `CommitmentRootSearchConsumer`, and `ReorgIncidentsConsumer` write product-specific rows in the derive store while the canonical store remains the wallet-correctness boundary. `ReorgIncidentsConsumer` is an event-only chain-event consumer: it reads `ChainEventEnvelope` rows directly and never waits for block-context hydration. It backfills from the earliest retained chain event when first deployed and then preserves future incidents beyond chain-event retention; it cannot reconstruct incidents already pruned before deployment. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
+
+`ExplorerQuery.TransactionHistory` is the reference read-fenced derive query.
+Consumer schema v3 preserves earlier rows and the stable cursor while adding
+atomic projection epoch, tip, revision, and contiguous coverage state. A
+resumable ingest verifier establishes coverage from height 1 against canonical
+transaction facts. The handler reads projection state, rows, fee joins, and an
+optional exact count from one `DeriveStore` snapshot; on a secondary, the
+snapshot's catch-up barrier prevents the response from mixing pre-catch-up and
+post-catch-up state. The response returns the exact read fence and coverage.
+Opaque cursors bind both the filter and fence, and a supplied stale fence fails
+with `FAILED_PRECONDITION`.
+
+Capability advertisement follows live projection state. Version 1 is available
+when the projection and its `WalletQuery` dependency are online. Version 2 is
+advertised only when contiguous coverage starts at height 1 and reaches the
+current projection tip with the same hash. Exact totals are omitted unless that
+condition holds; when returned, their scope is `FULL_HISTORY`. Adapters that
+walk multiple pages or cache totals must carry the fence through every request
+and include it in cache identity.
 
 ## Cross-references
 

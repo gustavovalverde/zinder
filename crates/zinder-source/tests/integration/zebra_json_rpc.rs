@@ -14,7 +14,8 @@ use zinder_core::{
 };
 use zinder_source::{
     NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor, SourceChainUpdate,
-    SourceError, TransactionBroadcaster, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    SourceError, SourceTreeState, TransactionBroadcaster,
+    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
     decode_rpc_block_hash,
@@ -505,6 +506,158 @@ async fn bad_raw_block_hex_maps_to_invalid_raw_block_hex() -> eyre::Result<()> {
     };
 
     assert!(matches!(error, SourceError::InvalidRawBlockHex { .. }));
+
+    Ok(())
+}
+
+const TREE_STATE_BLOCK_HASH_HEX: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+
+async fn fetch_tree_state_response(
+    tree_state_response: Value,
+) -> eyre::Result<Result<SourceTreeState, SourceError>> {
+    let server = JsonRpcTestServer::start([
+        method("z_gettreestate").reply(RpcReply::result(tree_state_response))
+    ])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    let block_id = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0x11; 32]));
+
+    Ok(source.fetch_tree_state_for_block(block_id).await)
+}
+
+#[tokio::test]
+async fn tree_state_promotes_all_final_note_commitment_roots_without_reversing_bytes()
+-> eyre::Result<()> {
+    let tree_state_response = json!({
+        "network": "regtest",
+        "height": 1,
+        "hash": TREE_STATE_BLOCK_HASH_HEX,
+        "sapling": {"commitments": {
+            "finalRoot": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "finalState": "aabb"
+        }},
+        "orchard": {"commitments": {
+            "finalRoot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }},
+        "ironwood": {"commitments": {
+            "finalRoot": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }}
+    });
+
+    let tree_state = fetch_tree_state_response(tree_state_response.clone()).await??;
+    let roots = tree_state.final_note_commitment_roots;
+
+    assert_eq!(roots.height, BlockHeight::new(1));
+    assert_eq!(roots.block_hash, BlockHash::from_bytes([0x11; 32]));
+    assert_eq!(
+        roots
+            .sapling
+            .map(zinder_core::FinalNoteCommitmentRoot::as_bytes),
+        Some([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ])
+    );
+    assert_eq!(
+        roots
+            .orchard
+            .map(zinder_core::FinalNoteCommitmentRoot::as_bytes),
+        Some([0xaa; 32])
+    );
+    assert_eq!(
+        roots
+            .ironwood
+            .map(zinder_core::FinalNoteCommitmentRoot::as_bytes),
+        Some([0xff; 32])
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&tree_state.payload_bytes)?,
+        tree_state_response,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tree_state_maps_unavailable_final_note_commitment_roots_to_none() -> eyre::Result<()> {
+    let tree_state = fetch_tree_state_response(json!({
+        "network": "regtest",
+        "height": 1,
+        "hash": TREE_STATE_BLOCK_HASH_HEX,
+        "sapling": {"commitments": {}},
+        "orchard": {"commitments": {"finalRoot": null}}
+    }))
+    .await??;
+
+    assert_eq!(tree_state.final_note_commitment_roots.sapling, None);
+    assert_eq!(tree_state.final_note_commitment_roots.orchard, None);
+    assert_eq!(tree_state.final_note_commitment_roots.ironwood, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_final_note_commitment_root_has_typed_source_error() -> eyre::Result<()> {
+    let result = fetch_tree_state_response(json!({
+        "height": 1,
+        "hash": TREE_STATE_BLOCK_HASH_HEX,
+        "sapling": {"commitments": {"finalRoot": 7}}
+    }))
+    .await?;
+
+    assert!(matches!(
+        result,
+        Err(SourceError::MalformedFinalNoteCommitmentRoot {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_hex_final_note_commitment_root_has_typed_source_error() -> eyre::Result<()> {
+    let result = fetch_tree_state_response(json!({
+        "height": 1,
+        "hash": TREE_STATE_BLOCK_HASH_HEX,
+        "orchard": {"commitments": {"finalRoot": "not-hex"}}
+    }))
+    .await?;
+
+    assert!(matches!(
+        result,
+        Err(SourceError::InvalidFinalNoteCommitmentRootHex {
+            protocol: ShieldedProtocol::Orchard,
+            ..
+        })
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn wrong_length_final_note_commitment_root_has_typed_source_error() -> eyre::Result<()> {
+    let result = fetch_tree_state_response(json!({
+        "height": 1,
+        "hash": TREE_STATE_BLOCK_HASH_HEX,
+        "ironwood": {"commitments": {"finalRoot": "abcd"}}
+    }))
+    .await?;
+
+    assert!(matches!(
+        result,
+        Err(SourceError::InvalidFinalNoteCommitmentRootLength {
+            protocol: ShieldedProtocol::Ironwood,
+            byte_count: 2,
+        })
+    ));
 
     Ok(())
 }
@@ -1246,10 +1399,12 @@ async fn fetch_network_upgrade_activations_activates_nu6_2() -> eyre::Result<()>
 }
 
 #[tokio::test]
-async fn fetch_chain_value_pools_at_tip_preserves_upstream_pool_entries() -> eyre::Result<()> {
+async fn fetch_chain_value_pools_at_tip_preserves_source_tip_and_pool_entries() -> eyre::Result<()>
+{
     let server =
         JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
             "blocks": 1_234_567,
+            "bestblockhash": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
             "valuePools": [
                 {
                     "id": "transparent",
@@ -1276,7 +1431,17 @@ async fn fetch_chain_value_pools_at_tip_preserves_upstream_pool_entries() -> eyr
 
     let value_pools = source.fetch_chain_value_pools_at_tip().await?;
 
-    assert_eq!(value_pools.tip_height, BlockHeight::new(1_234_567));
+    assert_eq!(
+        value_pools.source_tip,
+        BlockId::new(
+            BlockHeight::new(1_234_567),
+            BlockHash::from_bytes([
+                0x1f, 0x1e, 0x1d, 0x1c, 0x1b, 0x1a, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12,
+                0x11, 0x10, 0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
+                0x03, 0x02, 0x01, 0x00,
+            ])
+        )
+    );
     assert_eq!(value_pools.pools.len(), 3);
     assert_eq!(value_pools.pools[0].id, "transparent");
     assert!(value_pools.pools[0].monitored);
@@ -1294,7 +1459,8 @@ async fn fetch_chain_value_pools_at_tip_preserves_upstream_pool_entries() -> eyr
 async fn fetch_chain_value_pools_at_tip_requires_value_pools_field() -> eyre::Result<()> {
     let server =
         JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
-            "blocks": 1_234_567
+            "blocks": 1_234_567,
+            "bestblockhash": "ab".repeat(32)
         })))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
@@ -1311,6 +1477,174 @@ async fn fetch_chain_value_pools_at_tip_requires_value_pools_field() -> eyre::Re
             capability: NodeCapability::ChainValuePools
         })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_block_value_pool_balances_binds_exact_block_and_preserves_pool_order()
+-> eyre::Result<()> {
+    let block_hash_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let block_id = BlockId::new(BlockHeight::new(42), decode_rpc_block_hash(block_hash_hex)?);
+    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
+        "hash": block_hash_hex,
+        "height": 42,
+        "time": 1_774_668_700,
+        "valuePools": [
+            {"id": "transparent", "monitored": true, "chainValueZat": 11},
+            {"id": "future-pool", "monitored": false},
+            {"id": "orchard", "monitored": true, "chainValueZat": 33}
+        ]
+    })))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    assert!(
+        source
+            .capabilities()
+            .supports(NodeCapability::BlockValuePoolBalances)
+    );
+
+    let balances = source.fetch_block_value_pool_balances(block_id).await?;
+
+    assert_eq!(balances.block_id, block_id);
+    assert_eq!(balances.block_time_seconds, 1_774_668_700);
+    assert_eq!(
+        balances
+            .pools
+            .iter()
+            .map(|pool| pool.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["transparent", "future-pool", "orchard"]
+    );
+    assert_eq!(balances.pools[0].value_zat, Some(11));
+    assert!(!balances.pools[1].monitored);
+    assert_eq!(balances.pools[1].value_zat, None);
+    assert_eq!(balances.pools[2].value_zat, Some(33));
+    assert!(
+        source
+            .capabilities()
+            .supports(NodeCapability::BlockValuePoolBalances)
+    );
+    assert_eq!(
+        server.requests_for("getblock")?[0].params,
+        json!([block_hash_hex, 1])
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_block_value_pool_balances_rejects_response_identity_mismatches() -> eyre::Result<()>
+{
+    let requested_hash_hex = "01".repeat(32);
+    let block_id = BlockId::new(
+        BlockHeight::new(42),
+        decode_rpc_block_hash(&requested_hash_hex)?,
+    );
+    for response in [
+        json!({
+            "hash": requested_hash_hex,
+            "height": 43,
+            "time": 1,
+            "valuePools": [{"id": "transparent", "monitored": true, "chainValueZat": 1}]
+        }),
+        json!({
+            "hash": "02".repeat(32),
+            "height": 42,
+            "time": 1,
+            "valuePools": [{"id": "transparent", "monitored": true, "chainValueZat": 1}]
+        }),
+    ] {
+        let server =
+            JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(response))])?;
+        let source = ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            server.url(),
+            NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+
+        assert!(matches!(
+            source.fetch_block_value_pool_balances(block_id).await,
+            Err(SourceError::SourceProtocolMismatch { .. })
+        ));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_block_value_pool_balances_rejects_invalid_pool_entries() -> eyre::Result<()> {
+    let block_hash_hex = "03".repeat(32);
+    let block_id = BlockId::new(
+        BlockHeight::new(42),
+        decode_rpc_block_hash(&block_hash_hex)?,
+    );
+    for value_pools in [
+        json!([{"id": "", "monitored": true, "chainValueZat": 1}]),
+        json!([
+            {"id": "sapling", "monitored": true, "chainValueZat": 1},
+            {"id": "sapling", "monitored": false}
+        ]),
+        json!([{"id": "orchard", "monitored": true, "chainValueZat": -1}]),
+    ] {
+        let server =
+            JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
+                "hash": block_hash_hex,
+                "height": 42,
+                "time": 1,
+                "valuePools": value_pools
+            })))])?;
+        let source = ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            server.url(),
+            NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+
+        assert!(matches!(
+            source.fetch_block_value_pool_balances(block_id).await,
+            Err(SourceError::SourceProtocolMismatch { .. })
+        ));
+        assert!(
+            source
+                .capabilities()
+                .supports(NodeCapability::BlockValuePoolBalances)
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_block_value_pool_balances_requires_verbose_value_pools() -> eyre::Result<()> {
+    let block_hash_hex = "04".repeat(32);
+    let block_id = BlockId::new(
+        BlockHeight::new(42),
+        decode_rpc_block_hash(&block_hash_hex)?,
+    );
+    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
+        "hash": block_hash_hex,
+        "height": 42,
+        "time": 1
+    })))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    assert!(matches!(
+        source.fetch_block_value_pool_balances(block_id).await,
+        Err(SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::BlockValuePoolBalances
+        })
+    ));
+
     Ok(())
 }
 

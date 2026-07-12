@@ -41,8 +41,9 @@ use crate::bulk_catchup::{
 };
 use crate::memory_pressure::wait_for_bulk_catchup_memory_headroom;
 use crate::{
-    BulkCatchupRunConfig, IngestError, MempoolReadyGate, NodeSourceKind, RawBlobPolicy,
-    TipFollowConfig, classify_phase, current_chain_height, tip_follow_with_primary_store,
+    BulkCatchupRunConfig, CommitmentRootBackfillConfig, IngestError, MempoolReadyGate,
+    NodeSourceKind, RawBlobPolicy, TipFollowConfig, classify_phase, current_chain_height,
+    tip_follow_with_primary_store,
 };
 
 /// Backoff applied when the source's `tip_id()` call fails at the unified
@@ -88,6 +89,8 @@ pub struct IngestLoopConfig {
     pub phases: PhasesConfig,
     /// Shared derive execution knobs (`[ingest.derive]`).
     pub derive: IngestDeriveConfig,
+    /// Settled-history root enrichment (`[ingest.commitment_root_backfill]`).
+    pub commitment_root_backfill: CommitmentRootBackfillConfig,
     /// Pipelined-fetch and commit knobs (`[ingest.bulk_catchup]`).
     pub bulk_catchup: BulkCatchupConfig,
     /// Serial-loop knobs (`[ingest.tip_follow]`).
@@ -734,6 +737,11 @@ mod tests {
                 memory_resume_ratio: 0.75,
                 min_replay_batch_blocks: NonZeroU32::new(10)
                     .ok_or("invalid minimum replay batch blocks")?,
+            },
+            commitment_root_backfill: CommitmentRootBackfillConfig {
+                enabled: true,
+                batch_blocks: NonZeroU32::new(256).ok_or("invalid root batch blocks")?,
+                fetch_concurrency: NonZeroU32::new(8).ok_or("invalid root fetch concurrency")?,
             },
             bulk_catchup: BulkCatchupConfig {
                 canonical_batch_max_blocks: NonZeroU32::new(1_000).ok_or("invalid batch size")?,

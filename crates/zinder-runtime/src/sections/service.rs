@@ -18,8 +18,6 @@ pub enum ServiceIdentifier {
     Query,
     /// `zinder-compat-lightwalletd`: lightwalletd-protocol compat reader.
     CompatLightwalletd,
-    /// `zinder-compat-cipherscan`: Cipherscan REST compat reader.
-    CompatCipherscan,
     /// `zinder-explorer`: explorer-plane derive reader.
     Explorer,
 }
@@ -33,7 +31,6 @@ impl ServiceIdentifier {
             Self::Ingest => "zinder-ingest",
             Self::Query => "zinder-query",
             Self::CompatLightwalletd => "zinder-compat-lightwalletd",
-            Self::CompatCipherscan => "zinder-compat-cipherscan",
             Self::Explorer => "zinder-explorer",
         }
     }
@@ -55,7 +52,6 @@ mod tests {
             ServiceIdentifier::Ingest,
             ServiceIdentifier::Query,
             ServiceIdentifier::CompatLightwalletd,
-            ServiceIdentifier::CompatCipherscan,
             ServiceIdentifier::Explorer,
         ] {
             assert_eq!(service.binary_name(), service.to_string());

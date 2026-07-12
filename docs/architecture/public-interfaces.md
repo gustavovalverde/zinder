@@ -61,6 +61,8 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `BlockBlobArtifact` | Optional raw block blob available only when raw blob policy stores blocks |
 | `CompactBlockArtifact` | Wallet-oriented compact block artifact |
 | `BlockId` | Stable block identity (`{ height: BlockHeight, hash: BlockHash }`); lives in `zinder-core` and is the canonical (height, hash) pair across the source boundary, the wallet protocol, and the reader API |
+| `ChainValuePools` | Live-source value-pool totals paired with `source_tip: BlockId`; Zebra supplies the height, hash, and pool list in one `getblockchaininfo` observation |
+| `ChainValuePoolsAtTip` | Wallet-facing value-pool totals paired with both the writer-visible `ChainEpoch` and the hash-bound source tip so consumers can verify canonical agreement |
 | `TransactionLocation` | Durable transaction id to block-location fact |
 | `TransactionFactsArtifact` | Durable typed public transaction facts parsed once by ingest |
 | `ReorgWindow` | Range within the reorg window where reorgs are expected and supported |
@@ -125,6 +127,15 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `ExplorerFreshness` | Explorer response envelope at field tag 1. Wraps the cross-plane `ChainView` (chain-state axes) and keeps only the metadata that varies per explorer call: `snapshot_age_millis`, `unavailable[]`, and `capability_version`. The upstream tip rides on `chain_view.upstream_tip`. See [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). |
 | `SearchCandidate` | Typed search-result oneof distinguishing every classifiable input class, including the `NotPubliclyIndexable` arm for shielded receivers. See [ADR-0012](../adrs/0012-typed-explorer-search-and-privacy-refusal.md). |
 | `ChainReorgHistory` | Explorer RPC returning recorded reorg incidents from the `ReorgIncidentsConsumer` derive projection. The projection starts from the earliest retained chain event when the consumer first runs and then keeps future incidents beyond chain-event retention; it does not reconstruct incidents already pruned before deployment. |
+| `DisplacedBlockArchive` | Writer-owned append-only archive of blocks displaced by an accepted canonical replacement. Capture is atomic with `ReorgWindowChange::Replace`; hash is identity, event/height is observation order, and explicit activation coverage prevents claims about earlier reorgs. |
+| `DisplacedBlockHistory` | Explorer RPC returning bounded newest-first displaced-block observations plus each block's current canonical counterpart at the former height. It exposes raw payout scripts and values without product-specific address labels or miner branding. |
+| `DisplacedBlockDetail` | Explorer hash lookup for one displaced block, its current canonical counterpart, optional already-retained consensus bytes, and archive activation coverage. |
+| `BlockFinalNoteCommitmentRoots` | Typed canonical artifact containing the post-block Sapling, Orchard, and Ironwood note-commitment-tree roots. Pool fields are optional before activation; an absent artifact means enrichment has not reached that height. Artifact schema 14 introduces the family while retaining schema-12 and schema-13 reads for in-place migration. |
+| `TransactionIntrinsicValueBalances` | Signed Sprout, Sapling, Orchard, and Ironwood value balances parsed from one transaction. Positive values enter the transaction from the named pool; negative values leave it for that pool. Transparent value is excluded because it requires prevout resolution. Artifact schema 15 introduces the separately enrichable transaction artifact while retaining schemas 12 through 14. |
+| `CommitmentRootSearch` | Explorer RPC that reverse-indexes canonical final note-commitment roots and returns explicit historical coverage. It does not claim transaction-intermediate anchors or orphaned blocks. |
+| `TransactionHistory` | Explorer RPC returning bounded, filter-aware, newest-first canonical transaction pages. Version 2 adds a projection read fence, verified contiguous coverage, and explicit count scope without replacing the v1 RPC or entry fields. |
+| `TransactionHistoryReadFence` | Exact identity of one history projection view: canonical chain epoch, projection revision, and projection tip height and hash. Requests and opaque cursors carrying a stale fence fail closed. |
+| `TransactionHistoryCoverage` | Verified contiguous height interval for the history projection. Full-history completeness requires height 1 through the fenced projection tip with the same tip hash. |
 
 ### Derive-plane SDK
 
@@ -135,6 +146,9 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `DeriveConsumerName` | Stable static identifier scoping cursor and metadata rows; renaming is a schema migration, not a config change |
 | `DeriveConsumer` | Rust trait every chain-events derive consumer implements: dispatches `ChainCommittedEvent` and `ChainReorgedEvent` through `apply_chain_committed` / `apply_chain_reorged` |
 | `ReorgIncidentsConsumer` | Event-only chain-event derive consumer that writes one durable `reorg_incidents` row per `ChainReorged` event, keyed by ascending `event_sequence`. It does not hydrate committed block contexts and has an event-only cursor independent from block-keyed derive replay. |
+| `CommitmentRootSearchConsumer` | Block-keyed derive consumer that maps each canonical final note-commitment root to newest-first block matches. Its resumable historical coverage is independent from the shared chain-event cursor because ingest first enriches the canonical artifact and then writes bounded backfill batches. |
+| `ConsumerProjectionState` | Per-consumer canonical epoch, projection tip, monotonic revision, and optional contiguous coverage. Block-keyed consumers stage it atomically with projection rows and their chain-event cursor. |
+| `DeriveStoreReadSnapshot` | One-sequence view used for projection metadata, rows, joins, and exact counts. A secondary snapshot holds the read side of the catch-up barrier until all request-local reads finish. |
 | `DeriveMempoolConsumer` | Rust trait for consumers that observe `MempoolEvents` instead of (or in addition to) chain events |
 | `DeriveConsumerCtx` | Per-event consumer context carrying a `&DeriveStore` borrow for reads and a `&mut WriteBatch` consumers stage their writes into; the SDK appends the cursor advance to the same batch and commits atomically |
 | `ChainCommittedEvent`, `ChainReorgedEvent` | Typed wrappers around the wire chain-event variants, decoded into `zinder-core` primitives so consumers never see prost-generated types |
@@ -675,7 +689,7 @@ Capability strings are exact-match (no version negotiation, no regex). New capab
 
 Capability strings are the deprecation boundary. A wire-shape change lands as a new `_vN` capability; removing an older capability requires the architecture doc for that surface to name the consumer constraint and removal rule.
 
-Pre-1.0, replaced RPCs are deleted rather than aliased: a renamed method removes its old capability string in the same change. Deploy order follows from that: Zinder services deploy before wallet consumers (zally, then fauzec). Between the deploys the old consumer receives `UNIMPLEMENTED` on the removed RPC and must degrade honestly until its own deploy lands.
+RPC removal is an explicit contract migration, not a side effect of adding a broader method. A replacement lands additively with its own capability. Removing the older method requires evidence that known consumers have migrated, a documented deployment and rollback sequence, and any required derive-store consumer removal migration. `RecentTransactions` therefore remains available alongside `TransactionHistory`.
 
 The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/src/capabilities.rs`](../../crates/zinder-proto/src/capabilities.rs). Each row binds a capability string to its surface (`Wallet`, `Explorer`, `Ingest`), the proto method it gates, and a declarative advertise policy. The three `ServerInfo` builders fold over the table filtered by surface and evaluate each row's policy against their own readiness; no service hand-maintains a parallel capability array. Two CI guards keep the table honest: `capability_descriptor_drift` cross-checks every row's proto-method binding against the compiled `FileDescriptorSet`, and `capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities` fails when the list below diverges from the wallet and explorer rows of the table.
 
@@ -684,6 +698,21 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 `wallet.read.compact_block_ironwood_v1` is `AlwaysOn` on every deployment of this binary and gates the `ironwoodActions`/`ironwoodCommitmentTreeSize` fields inside `CompactBlock.payload_bytes` (the vendored lightwalletd `CompactTx`/`ChainMetadata` shape, not a native `zinder.v1.wallet` field). A server advertising it has derived Ironwood action data for every block it serves, so an absent `ironwoodActions` on a given block means that block has no Ironwood activity. A server that does not advertise it predates Ironwood wallet-plane support: a missing `ironwoodActions` there is not authoritative, and a client must not read it as "no Ironwood activity".
 
 `wallet.read.subtree_roots_ironwood_v1` is `AlwaysOn` on every deployment of this binary and gates the Ironwood protocol on `WalletQuery.SubtreeRoots` and the lightwalletd-compat `GetSubtreeRoots` surface. A server that does not advertise it rejects Ironwood subtree-root requests; clients fall back to linear scanning of the Ironwood tree rather than reading an error (or an empty response from an older server) as "no completed subtrees".
+
+`explorer.transaction.intrinsic_value_balances_v1` gates the optional signed Sprout, Sapling, Orchard, and Ironwood balances on `TransactionHistoryEntry` and `TransactionDetailResponse`. It is advertised only when transaction history, transaction detail's WalletQuery dependency, and a canonical secondary at artifact schema 15 or newer are all online. Both reads prefer the materialized intrinsic-balance artifact and can bridge its unsettled-tip reconciliation lag from a retained canonical transaction blob at the same pinned epoch. An absent field remains unknown rather than an all-zero balance when neither source is available.
+
+`explorer.transaction.history_v1` is advertised when the transaction-history
+projection has persisted state and its `WalletQuery` dependency is online.
+`explorer.transaction.history_v2` is dynamic: it is advertised only when
+verified coverage starts at height 1, reaches the current projection tip, and
+ends at the same hash. The additive v2 fields are
+`TransactionHistoryReadFence`, `TransactionHistoryCoverage`, and
+`TransactionHistoryCountScope`. One request reads projection metadata, rows,
+joins, and any exact count from a single derive-store snapshot. Cursors bind the
+request filter and read fence; stale fences or cursors return
+`FAILED_PRECONDITION`. A requested count is present with `FULL_HISTORY` scope
+only under complete coverage. Partial or unverified projections keep v1
+available, omit the exact total, and do not advertise v2.
 
 <!-- capability-list:public-interfaces:start -->
 - `wallet.read.latest_block_v1`
@@ -723,22 +752,39 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 - `explorer.block.production_series_v2`
 - `explorer.block.detail_v1`
 - `explorer.block.transactions_v2`
+- `explorer.block.final_note_commitment_roots_v1`
 - `explorer.block.activity_distribution_v1`
 - `explorer.search_v1`
+- `explorer.commitment_root.search_v1`
+- `explorer.commitment_root.displaced_matches_v1`
 - `explorer.mempool.summary_v1`
 - `explorer.mempool.snapshot_v1`
 - `explorer.mempool.activity_v1`
-- `explorer.transparent_address.activity_v1`
+- `explorer.transparent_address.activity_v2`
 - `explorer.transparent_address.deltas_v1`
 - `explorer.fee.summary_v1`
+- `explorer.fee.conventional_distribution_v1`
+- `explorer.fee.paid_distribution_v1`
 - `explorer.value_pool.summary_v1`
 - `explorer.network_upgrade.status_v1`
+- `explorer.value_pool.flow_history_v1`
+- `explorer.value_pool.flow_summary_v1`
+- `explorer.value_pool.flow_amount_threshold_summary_v1`
+- `explorer.value_pool.flow_rounded_amount_summary_v1`
+- `explorer.value_pool.balance_history_v1`
 - `explorer.utxo_set.summary_v1`
 - `explorer.utxo_set.commitment_v1`
 - `explorer.chain.reorg_history_v1`
+- `explorer.chain.displaced_block_history_v1`
+- `explorer.chain.displaced_block_detail_v1`
 - `explorer.mempool.event_counts_v1`
 - `explorer.transaction.fees_v1`
+- `explorer.transaction.history_v1`
 - `explorer.transaction.recent_v1`
+- `explorer.transaction.history_v2`
+- `explorer.transaction.intrinsic_value_balances_v1`
+- `explorer.transaction.component_summary_v2`
+- `explorer.transparent_address.ranking_v1`
 - `explorer.payment_disclosure.verify_v1`
 - `explorer.overview.snapshot_v1`
 - `explorer.migration.overview_v1`
@@ -751,6 +797,83 @@ Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the
 `WalletQuery.TransparentAddressBalance` is served in the wallet plane and advertises `wallet.address.transparent_balance_v1` on every deployment. The handler sums the confirmed total in-process from the canonical unspent-output index, then overlays the signed mempool delta (`unconfirmed_delta_zat`) through the colocated ingest-control endpoint; deployments without that endpoint return a zero delta rather than failing. Lightwalletd-shaped confirmed-only balance stays on the compatibility plane: `GetTaddressBalance` projects the same wallet primitive into one `value_zat`.
 
 `WalletQuery.TransparentUtxoSetSummary` is served in the wallet plane and advertises `wallet.read.transparent_utxo_set_summary_v1` on every deployment. It is the chain-wide transparent UTXO accounting (`gettxoutsetinfo`-equivalent): a request-time streaming scan of the canonical current-UTXO projection that folds the set into `utxo_count` and `total_value_zat` without buffering it. The scan runs at the resolved epoch's settled tip, where the projection is the irreversible unspent set, so it applies no per-row spend re-check or block-visibility check; `summarized_height` reports that tip and an optional `at_epoch_id` pins it. There is no materialized counter and no new column family, so the cost is one full-set scan per call. The serialized-set hash and byte size of `gettxoutsetinfo` are not reported: both require a UTXO-set serialization ordering Zinder does not define. In their place the response carries an optional order-independent `commitment` (LtHash16, see [ADR-0026](../adrs/0026-utxo-set-commitment.md)) that binds full set membership and is reproducible across deployments at the same settled tip. The commitment fold has per-output CPU cost, so it is operator opt-in: it is present only when the deployment advertises `wallet.read.transparent_utxo_set_commitment_v1`, absent (`None`) otherwise. `ExplorerQuery.UtxoSetSummary` wraps this primitive in the `ExplorerFreshness` envelope and mirrors the commitment under `explorer.utxo_set.commitment_v1`.
+
+`ExplorerQuery.TransactionComponentSummary` advertises
+`explorer.transaction.component_summary_v2`. Requests carry an exact half-open
+Unix-second range. Responses carry typed totals, UTC-day rows, the current
+`ExplorerFreshness`, and contiguous historical/live coverage. Component names
+state the counted protocol object (`sapling_output_count`,
+`orchard_action_count`, and `ironwood_action_count`). Predicate counters state
+their exact Sapling/Orchard/Ironwood scope in their identifiers, including
+`sapling_orchard_or_ironwood_transaction_count` and three explicitly named
+non-coinbase predicates. Unsupported parsed
+sections increment `transaction_predicate_unavailable_count` and exclude the
+transaction from every predicate counter; consumers require that count to be
+zero before claiming exact predicate totals. `totals_only` defaults to false
+and includes UTC-day rows; true returns totals and coverage only. Completeness
+requires height-1 coverage joined through the visible tip and is never inferred
+from block timestamps alone.
+
+`ExplorerQuery.ConventionalFeeDistribution` advertises
+`explorer.fee.conventional_distribution_v1` only when its additive projection
+has materialized coverage. Requests carry an exact half-open Unix-second range.
+Responses contain sorted ZIP-317 conventional-fee frequency counts per UTC
+day, unavailable-transaction counts, `ExplorerFreshness`, and contiguous
+coverage. The contract never calls these values paid fees and does not expose
+percentiles or compatibility-adapter response vocabulary.
+
+`ExplorerQuery.PaidFeeDistribution` advertises
+`explorer.fee.paid_distribution_v1` only when its separate exact-fee
+projection has materialized coverage. Each fee combines resolved transparent
+prevouts and outputs with canonical signed Sprout, Sapling, Orchard, and
+Ironwood transaction value balances. Missing prevouts or intrinsic balance
+artifacts remain explicit unavailable counts; the method never substitutes a
+ZIP-317 conventional fee.
+
+`ExplorerQuery.ValuePoolFlowHistory`, `ExplorerQuery.ValuePoolFlowSummary`,
+`ExplorerQuery.ValuePoolFlowAmountThresholdSummary`, and
+`ExplorerQuery.ValuePoolFlowRoundedAmountSummary` advertise the corresponding
+`explorer.value_pool.flow_*_v1` capabilities. All four read one additive canonical
+per-transaction flow projection. History provides typed direction and pool
+filters, minimum net amount, opaque filter-bound paging, optional exact totals,
+and explicit historical/live-tail coverage. Summary aggregates the same events
+into UTC hour or day buckets over an exact half-open Unix-second range. The two
+amount summaries provide bounded exact cumulative thresholds and reusable
+nearest-quantum frequency groups, respectively; they do not persist a second
+analytics projection. The
+native contract retains signed Sprout, Sapling, Orchard, and Ironwood balances;
+it does not expose adapter database identifiers, REST cursors, address
+labels, risk classifications, or display units.
+
+`ExplorerQuery.ValuePoolBalanceHistory` advertises
+`explorer.value_pool.balance_history_v1`. It returns authoritative cumulative
+post-block balances sampled at the highest canonical height observed in each
+UTC day. Each point carries its exact height, hash, block time, and a dynamic
+list of `{id, monitored, value_zat}` entries, so transparent, Lockbox, and
+future pools remain first-class facts instead of being inferred from the four
+currently known shielded pools. Pages are bounded and newest first with an
+opaque day cursor. Completeness requires contiguous scanned heights from 1
+through the visible tip; block timestamps never establish coverage because
+they are not monotonic. Historical scanning fetches only daily candidates from
+Zebra's verbose `getblock`, while the replaceable live tail retains every
+block for exact reorg reconciliation. The optional schema-16 canonical
+artifact binds each source snapshot to the requested block hash and time;
+schemas 12 through 15 remain readable and enrichable in place.
+
+`ExplorerQuery.DisplacedBlockHistory` and
+`ExplorerQuery.DisplacedBlockDetail` advertise
+`explorer.chain.displaced_block_history_v1` and
+`explorer.chain.displaced_block_detail_v1`. The writer captures the old
+branch's complete header facts, ordered transaction identifiers, transparent
+coinbase payout scripts and values, and any already-retained raw block bytes in
+the same RocksDB batch that publishes the replacement branch. History uses an
+opaque `(event sequence, former height, block hash)` cursor and returns the
+current canonical block at each former height from one pinned epoch. Detail is
+hash-addressed. Coverage starts at the first replacement event observed by an
+archive-enabled writer; an empty archive before that event is valid, and no
+surface claims to reconstruct older displaced branches from the current best
+chain. Product-specific terms such as uncle, orphan, database id, miner pool,
+report source, and external node status stay outside the native contract.
 
 Do not add native capability strings for lightwalletd-shaped mempool products
 such as raw-transaction streams or compact-transaction streams. Those are
@@ -779,8 +902,10 @@ The current `zinder-source::NodeCapability` diagnostic names are:
 Do not advertise future source capabilities such as block-stream ingestion or
 spending-transaction lookup until the source adapter and runtime wiring both
 exist. `chain_value_pools` is source-backed by
-`getblockchaininfo.valuePools`; the wallet and explorer read planes proxy it
-through the ingest writer instead of opening independent upstream-node handles.
+`getblockchaininfo.valuePools`; the source response binds those totals to the
+same RPC response's `blocks` and `bestblockhash` as one `BlockId`. The wallet
+and explorer read planes proxy it through the ingest writer instead of opening
+independent upstream-node handles.
 
 ## Wire Conventions
 

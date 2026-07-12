@@ -199,6 +199,7 @@ mod tests {
             block_time_unix_seconds: 1_700_000_000,
             block_size_bytes: 0,
             transactions,
+            final_note_commitment_roots: None,
         };
         BlockCommitContext::new(payload, TransparentSpendFacts::Offline)
     }

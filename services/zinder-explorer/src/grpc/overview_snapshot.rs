@@ -21,12 +21,12 @@ use zinder_core::BlockHeight;
 use zinder_core::wire::encode_height_key_ascending;
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
-    MempoolEventCountsConsumer, RECENT_TRANSACTIONS_COLUMN_FAMILY,
+    MempoolEventCountsConsumer, TRANSACTION_HISTORY_COLUMN_FAMILY,
 };
 use zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1;
 use zinder_proto::v1::explorer::{
     BlockSummary, BlockSummaryRecord, OverviewFeeSummary, OverviewMempool, OverviewMempoolEvents,
-    OverviewSnapshotRequest, OverviewSnapshotResponse, RecentTransactionEntry,
+    OverviewSnapshotRequest, OverviewSnapshotResponse, TransactionHistoryEntry,
 };
 use zinder_proto::v1::wallet::{
     self, ChainValuePoolsAtTipRequest, LatestBlockRequest, MempoolSnapshotRequest,
@@ -38,6 +38,7 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
+use super::transaction_history::decode_history_entry;
 
 /// Range cap on `recent_blocks_limit`.
 const MIN_RECENT_BLOCKS_LIMIT: u32 = 1;
@@ -71,10 +72,6 @@ const DEFAULT_FEE_SUMMARY_BLOCK_COUNT: u32 = 50;
 /// wallet `MempoolSnapshot`. Mirrors the cap in the per-feature mempool
 /// handlers.
 const MAX_MEMPOOL_SNAPSHOT_ENTRIES: u32 = 4_096;
-
-/// Length of one row key in the `recent_transactions` projection
-/// (reverse-height encoded; see `RecentTransactionsConsumer`).
-const RECENT_TRANSACTIONS_ROW_KEY_LEN: usize = 8;
 
 /// Executes one `ExplorerQuery.OverviewSnapshot` request.
 pub(crate) async fn handle_overview_snapshot(
@@ -274,19 +271,16 @@ fn aggregate_fee_summary(records: &[BlockSummaryRecord], limit: u32) -> Overview
 fn read_recent_transactions(
     derive_store: &DeriveStore,
     limit: u32,
-) -> Result<Vec<RecentTransactionEntry>, Status> {
-    let start_key = [0u8; RECENT_TRANSACTIONS_ROW_KEY_LEN];
-    let end_key = [0xFFu8; RECENT_TRANSACTIONS_ROW_KEY_LEN];
+) -> Result<Vec<TransactionHistoryEntry>, Status> {
+    let start_key = [0u8; zinder_derive::TRANSACTION_HISTORY_KEY_LEN];
+    let end_key = [0xFFu8; zinder_derive::TRANSACTION_HISTORY_KEY_LEN];
     let cap = usize::try_from(limit).unwrap_or(MAX_RECENT_TRANSACTIONS_LIMIT as usize);
     let rows = derive_store
-        .range_iterate_consumer(RECENT_TRANSACTIONS_COLUMN_FAMILY, &start_key, &end_key, cap)
+        .range_iterate_consumer(TRANSACTION_HISTORY_COLUMN_FAMILY, &start_key, &end_key, cap)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mut entries = Vec::with_capacity(rows.len());
-    for (_, payload) in rows {
-        let entry = RecentTransactionEntry::decode(payload.as_slice()).map_err(|error| {
-            ExplorerError::internal(format!("RecentTransactionEntry decode failed: {error}"))
-        })?;
-        entries.push(entry);
+    for (key, payload) in rows {
+        entries.push(decode_history_entry(&key, &payload)?);
     }
     Ok(entries)
 }

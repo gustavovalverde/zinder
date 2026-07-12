@@ -67,10 +67,15 @@ async fn value_pool_summary_returns_upstream_pools_through_federation() -> Resul
             .is_some(),
         "value pool summary freshness must carry a chain epoch",
     );
+    let source_tip = response
+        .source_tip
+        .as_ref()
+        .ok_or_else(|| eyre!("ValuePoolSummary response missing source_tip"))?;
     assert!(
-        response.tip_height > 0,
-        "tip_height should be non-zero on any non-empty chain",
+        source_tip.height > 0,
+        "source_tip height should be non-zero on any non-empty chain",
     );
+    assert_eq!(source_tip.hash.len(), 64);
     assert!(
         !response.pools.is_empty(),
         "value pool summary must carry at least one upstream pool entry",
@@ -93,7 +98,8 @@ async fn value_pool_summary_returns_upstream_pools_through_federation() -> Resul
         target: "zinder::live",
         event = "value_pool_summary_validated",
         network = %encode_zinder_native_chain_name(fixture.network),
-        tip_height = response.tip_height,
+        source_tip_height = source_tip.height,
+        source_tip_hash = source_tip.hash,
         pool_count = response.pools.len(),
         "explorer value pool summary validated against live node",
     );

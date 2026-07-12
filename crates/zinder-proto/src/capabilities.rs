@@ -101,6 +101,9 @@ pub const WALLET_READ_TRANSPARENT_SPENDS_V1: &str = "wallet.read.transparent_spe
 pub const WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
     "wallet.read.transparent_unspent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.ChainValuePoolsAtTip`.
+///
+/// The response binds the upstream pool snapshot to one source tip height and
+/// hash.
 pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_value_pools_at_tip_v1";
 /// Capability advertised for `WalletQuery.TransparentUtxoSetSummary`.
 ///
@@ -187,6 +190,13 @@ pub const EXPLORER_BLOCK_DETAIL_V1: &str = "explorer.block.detail_v1";
 /// The response avoids a consumer-side `BlockDetail` plus per-transaction
 /// `TransactionDetail` fan-out and does not imply raw-byte retention.
 pub const EXPLORER_BLOCK_TRANSACTIONS_V2: &str = "explorer.block.transactions_v2";
+/// Field capability gating `BlockTransactionsResponse.final_note_commitment_roots`.
+///
+/// Presence means the explorer can read typed canonical root artifacts. The
+/// field remains absent for historical heights whose additive backfill has not
+/// reached them yet; individual pool fields remain absent before activation.
+pub const EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1: &str =
+    "explorer.block.final_note_commitment_roots_v1";
 /// Capability advertised for `ExplorerQuery.BlockActivityDistribution`.
 ///
 /// Signals that the explorer aggregates a bounded height range of existing
@@ -204,6 +214,21 @@ pub const EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1: &str = "explorer.block.activi
 /// read; gated on `wallet_query_endpoint.is_some()` because hash
 /// disambiguation routes through `WalletQuery`.
 pub const EXPLORER_SEARCH_V1: &str = "explorer.search_v1";
+/// Capability advertised for `ExplorerQuery.CommitmentRootSearch`.
+///
+/// Signals that the explorer plane can search canonical post-block Sapling,
+/// Orchard, and Ironwood note-commitment-tree roots through a durable reverse
+/// index. Responses carry explicit historical coverage while the additive
+/// projection backfills.
+pub const EXPLORER_COMMITMENT_ROOT_SEARCH_V1: &str = "explorer.commitment_root.search_v1";
+/// Field capability gating `CommitmentRootSearchResponse.displaced_matches`.
+///
+/// Presence means the root-search projection and writer-owned canonical archive
+/// are both available. The field remains empty for a root with no retained
+/// displaced match; callers use `displaced_coverage` to determine whether a
+/// negative result is definitive within the activation-limited captured range.
+pub const EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1: &str =
+    "explorer.commitment_root.displaced_matches_v1";
 /// Capability advertised for `ExplorerQuery.MempoolSummary`.
 ///
 /// Signals that the explorer plane aggregates the live mempool snapshot
@@ -226,14 +251,13 @@ pub const EXPLORER_MEMPOOL_SNAPSHOT_V1: &str = "explorer.mempool.snapshot_v1";
 pub const EXPLORER_MEMPOOL_ACTIVITY_V1: &str = "explorer.mempool.activity_v1";
 /// Capability advertised for `ExplorerQuery.TransparentAddressActivity`.
 ///
-/// Signals that the explorer plane composes
-/// `WalletQuery.TransparentAddressTxIdsInRange` and
-/// `WalletQuery.TransparentMempoolOutputsByAddress` into a unified
-/// confirmed-plus-pending activity feed. Pageable; the mempool overlay
-/// is emitted only on the first page so subsequent pages stay
-/// deterministic.
-pub const EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1: &str =
-    "explorer.transparent_address.activity_v1";
+/// Signals that the explorer serves cursor- or offset-paged confirmed address
+/// activity with current balance/lifetime coverage from the active ranking
+/// generation. Retained canonical transaction facts add block position,
+/// transaction shape, and request-time transparent counterparty facts without
+/// changing the persisted activity schema.
+pub const EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2: &str =
+    "explorer.transparent_address.activity_v2";
 /// Capability advertised for `ExplorerQuery.TransparentAddressDeltas`.
 ///
 /// Signals that the explorer plane serves the per-event signed value series
@@ -250,12 +274,40 @@ pub const EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1: &str = "explorer.transparent_a
 /// fees: computing actual fees requires transparent-output resolution and is
 /// materialized by the derive plane.
 pub const EXPLORER_FEE_SUMMARY_V1: &str = "explorer.fee.summary_v1";
+/// Capability advertised for `ExplorerQuery.ConventionalFeeDistribution`.
+///
+/// Signals that the explorer serves exact, sorted per-UTC-day frequencies of
+/// ZIP-317 conventional fees over half-open block-time ranges, with explicit
+/// unavailable-transaction counts and projection coverage. It does not
+/// describe miner-collected fees or consumer-specific percentiles.
+pub const EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1: &str =
+    "explorer.fee.conventional_distribution_v1";
+/// Capability advertised for `ExplorerQuery.PaidFeeDistribution`.
+///
+/// Signals that the explorer serves exact miner-collected fee frequencies
+/// from a dedicated derive projection. Missing intrinsic balances or
+/// transparent prevouts remain explicit unavailable counts.
+pub const EXPLORER_PAID_FEE_DISTRIBUTION_V1: &str = "explorer.fee.paid_distribution_v1";
+/// Capability advertised for `ExplorerQuery.TransactionComponentSummary`.
+///
+/// Signals that the explorer can aggregate canonical transaction component
+/// counts and protocol-scoped predicate totals over exact half-open block-time
+/// ranges with UTC-day buckets and explicit contiguous historical coverage.
+pub const EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2: &str =
+    "explorer.transaction.component_summary_v2";
+/// Capability advertised for `ExplorerQuery.TransparentAddressRanking`.
+///
+/// Signals that the explorer serves positive standard transparent scripts in
+/// deterministic balance order with integer concentration totals and explicit
+/// lifetime-history coverage.
+pub const EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1: &str = "explorer.transparent_address.ranking_v1";
 /// Capability advertised for `ExplorerQuery.ValuePoolSummary`.
 ///
 /// Signals that the explorer plane can surface upstream
 /// `getblockchaininfo.valuePools` through the wallet-plane
 /// `ChainValuePoolsAtTip` primitive. The response preserves upstream pool ids
-/// instead of projecting into a fixed list of known pools.
+/// instead of projecting into a fixed list of known pools and carries the
+/// source tip height and hash from the same upstream observation.
 pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1";
 /// Capability advertised for `ExplorerQuery.NetworkUpgradeStatus`.
 ///
@@ -265,6 +317,38 @@ pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1
 /// from a not-yet-active activation. The tip height rides on the wallet-plane
 /// `LatestBlock` primitive.
 pub const EXPLORER_NETWORK_UPGRADE_STATUS_V1: &str = "explorer.network_upgrade.status_v1";
+/// Capability advertised for `ExplorerQuery.ValuePoolFlowHistory`.
+///
+/// Signals that the explorer serves bounded newest-first pages of canonical
+/// transparent-to-shielded flow events with typed filters, opaque continuations,
+/// optional exact counts, and explicit materialization coverage.
+pub const EXPLORER_VALUE_POOL_FLOW_HISTORY_V1: &str = "explorer.value_pool.flow_history_v1";
+/// Capability advertised for `ExplorerQuery.ValuePoolFlowSummary`.
+///
+/// Signals that the explorer aggregates the canonical value-pool flow event
+/// projection into UTC hour or day buckets over a half-open time range.
+pub const EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1: &str = "explorer.value_pool.flow_summary_v1";
+/// Capability advertised for `ExplorerQuery.ValuePoolFlowAmountThresholdSummary`.
+///
+/// Signals that the explorer scans the canonical value-pool flow projection
+/// once to return exact event counts and amount sums for up to 32 requested
+/// minimum amounts over a half-open time range.
+pub const EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1: &str =
+    "explorer.value_pool.flow_amount_threshold_summary_v1";
+/// Capability advertised for `ExplorerQuery.ValuePoolFlowRoundedAmountSummary`.
+///
+/// Signals that the explorer groups canonical value-pool flow events by a
+/// caller-selected nearest raw-amount rounding quantum (with positive
+/// exact-half ties upward) over a half-open time range, with optional
+/// raw-amount and pool filters, frequency-ranked bounded rows, exact
+/// shield/deshield counts, and explicit materialization coverage.
+pub const EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1: &str =
+    "explorer.value_pool.flow_rounded_amount_summary_v1";
+/// Capability advertised for `ExplorerQuery.ValuePoolBalanceHistory`.
+///
+/// Signals that the explorer serves authoritative cumulative pool balances
+/// sampled at canonical UTC-day boundaries with explicit height coverage.
+pub const EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1: &str = "explorer.value_pool.balance_history_v1";
 /// Capability advertised for `ExplorerQuery.UtxoSetSummary`.
 ///
 /// Signals that the explorer plane can surface the chain-wide transparent
@@ -294,14 +378,28 @@ pub const EXPLORER_UTXO_SET_COMMITMENT_V1: &str = "explorer.utxo_set.commitment_
 pub const EXPLORER_TRANSACTION_FEES_V1: &str = "explorer.transaction.fees_v1";
 /// Capability advertised for `ExplorerQuery.RecentTransactions`.
 ///
-/// Signals that the explorer plane materializes a time-descending
-/// projection of the most recent transactions into the
-/// `recent_transactions` derive column family, served as a single
-/// streaming RPC. Eliminates the consumer-side N+1 round-trip tree of
-/// `BlockSummariesInRange` + per-block `BlockDetail` + per-tx
-/// `TransactionDetail` calls a "recent transactions" panel would
-/// otherwise issue.
+/// Signals that the explorer plane materializes a time-descending projection
+/// into the `recent_transactions` derive column family and serves it as one
+/// streaming RPC.
 pub const EXPLORER_TRANSACTION_RECENT_V1: &str = "explorer.transaction.recent_v1";
+/// Capability advertised for `ExplorerQuery.TransactionHistory`.
+///
+/// Signals that the explorer plane serves bounded, filter-aware,
+/// bidirectional pages over its canonical transaction-history projection.
+pub const EXPLORER_TRANSACTION_HISTORY_V1: &str = "explorer.transaction.history_v1";
+/// Capability advertised for the additive read-fenced `ExplorerQuery.TransactionHistory` contract.
+///
+/// The v2 capability preserves the v1 RPC and entry fields while adding a
+/// projection read fence, verified coverage, and count scope.
+pub const EXPLORER_TRANSACTION_HISTORY_V2: &str = "explorer.transaction.history_v2";
+/// Field capability gating transaction-detail and transaction-history intrinsic balances.
+///
+/// Advertised when the canonical secondary is online at artifact schema 15 or
+/// newer. A retained canonical transaction blob may bridge an unsettled artifact
+/// lag. Otherwise missing historical artifacts remain absent; clients must not
+/// interpret absence as an all-zero balance.
+pub const EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1: &str =
+    "explorer.transaction.intrinsic_value_balances_v1";
 /// Capability advertised for `ExplorerQuery.MempoolEventCounts`.
 ///
 /// Signals that the explorer plane materializes per-second counters of
@@ -317,6 +415,19 @@ pub const EXPLORER_MEMPOOL_EVENT_COUNTS_V1: &str = "explorer.mempool.event_count
 /// in the derive store. First deployment backfills retained chain events and
 /// future incidents survive chain-event retention.
 pub const EXPLORER_CHAIN_REORG_HISTORY_V1: &str = "explorer.chain.reorg_history_v1";
+/// Capability advertised for `ExplorerQuery.DisplacedBlockHistory`.
+///
+/// Signals that the explorer can read the writer-owned archive of blocks
+/// displaced by canonical replacement events. Coverage begins at the archive's
+/// explicit activation event and never implies earlier historical completeness.
+pub const EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1: &str =
+    "explorer.chain.displaced_block_history_v1";
+/// Capability advertised for `ExplorerQuery.DisplacedBlockDetail`.
+///
+/// Resolves one displaced block by hash and joins its current canonical
+/// counterpart at the former height against one pinned chain epoch.
+pub const EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1: &str =
+    "explorer.chain.displaced_block_detail_v1";
 /// Capability advertised for `ExplorerQuery.VerifyPaymentDisclosure`.
 ///
 /// Signals that the explorer plane runs the
@@ -379,6 +490,9 @@ pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1: &str =
 pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1: &str =
     "ingest.control.transparent_mempool_outputs_by_outpoint_v1";
 /// Capability advertised for `IngestControl.ChainValuePoolsAtTip`.
+///
+/// The response binds the upstream pool snapshot to one source tip height and
+/// hash.
 pub const INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1: &str =
     "ingest.control.chain_value_pools_at_tip_v1";
 
@@ -871,6 +985,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresDeriveStoreWalletQueryAndCanonicalStore,
     ),
     CapabilitySpec::new(
+        EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1,
+        CapabilitySurface::Explorer,
+        None,
+        AdvertisePolicy::RequiresDeriveStoreWalletQueryAndCanonicalStore,
+    ),
+    CapabilitySpec::new(
         EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockActivityDistribution"),
@@ -881,6 +1001,18 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.Search"),
         AdvertisePolicy::RequiresWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_COMMITMENT_ROOT_SEARCH_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.CommitmentRootSearch"),
+        AdvertisePolicy::RequiresDeriveStoreAndCanonicalStore,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1,
+        CapabilitySurface::Explorer,
+        None,
+        AdvertisePolicy::RequiresDeriveStoreAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_MEMPOOL_SUMMARY_V1,
@@ -901,10 +1033,10 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
-        EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V1,
+        EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressActivity"),
-        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+        AdvertisePolicy::RequiresDeriveStoreWalletQueryAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
@@ -919,6 +1051,30 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
+        EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ConventionalFeeDistribution"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_PAID_FEE_DISTRIBUTION_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.PaidFeeDistribution"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.TransactionComponentSummary"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressRanking"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
         EXPLORER_VALUE_POOL_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolSummary"),
@@ -929,6 +1085,36 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.NetworkUpgradeStatus"),
         AdvertisePolicy::RequiresWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowHistory"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowSummary"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowAmountThresholdSummary"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowRoundedAmountSummary"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ValuePoolBalanceHistory"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_UTXO_SET_SUMMARY_V1,
@@ -949,6 +1135,18 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresDeriveStore,
     ),
     CapabilitySpec::new(
+        EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.DisplacedBlockHistory"),
+        AdvertisePolicy::RequiresCanonicalStore,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.DisplacedBlockDetail"),
+        AdvertisePolicy::RequiresCanonicalStore,
+    ),
+    CapabilitySpec::new(
         EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolEventCounts"),
@@ -965,6 +1163,24 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.RecentTransactions"),
         AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_TRANSACTION_HISTORY_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_TRANSACTION_HISTORY_V2,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
+        CapabilitySurface::Explorer,
+        None,
+        AdvertisePolicy::RequiresDeriveStoreWalletQueryAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1,

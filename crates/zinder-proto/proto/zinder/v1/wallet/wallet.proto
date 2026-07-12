@@ -1405,6 +1405,9 @@ message ChainValuePoolsAtTipRequest {}
 
 // Wallet-plane response for chain-wide value-pool totals.
 message ChainValuePoolsAtTipResponse {
+  reserved 3;
+  reserved "tip_height";
+
   // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
   // Visible to Zinder when the upstream value-pool read was answered.
   ChainView chain_view = 1;
@@ -1413,8 +1416,10 @@ message ChainValuePoolsAtTipResponse {
   // future pools can flow through without a wire-shape change.
   repeated ChainValuePool pools = 2;
 
-  // Tip height the upstream node reported when computing the pools.
-  uint32 tip_height = 3;
+  // Source tip returned by the same upstream `getblockchaininfo` response as
+  // `pools`. Successful responses populate this field so consumers can verify
+  // both height and hash against a canonical chain identity.
+  BlockTip source_tip = 4;
 }
 
 // Snapshot scheme a TransparentUtxoSetCommitment was built under.
@@ -1674,9 +1679,10 @@ service WalletQuery {
       returns (TransparentAddressBalanceResponse);
 
   // Return chain-wide value-pool totals at the upstream node's current tip.
-  // Capability: `wallet.read.chain_value_pools_at_tip_v1`. Storage-only query
-  // deployments reject this call unless they are configured with the writer's
-  // ingest-control endpoint.
+  // The response binds the source snapshot to the upstream tip's height and
+  // hash. Capability: `wallet.read.chain_value_pools_at_tip_v1`. Storage-only
+  // query deployments reject this call unless they are configured with the
+  // writer's ingest-control endpoint.
   rpc ChainValuePoolsAtTip(ChainValuePoolsAtTipRequest)
       returns (ChainValuePoolsAtTipResponse);
 

@@ -6,13 +6,17 @@ use zinder_core::{
 };
 
 mod address_output_projection;
+mod block_value_pool_balances;
 mod chain_epoch_reader;
 mod chain_event;
 mod commit_chain_epoch;
+mod displaced_block;
+mod final_note_commitment_roots;
 mod mempool_event;
 mod primary_secondary;
 mod reorg_window;
 mod subtree_root;
+mod transaction_intrinsic_value_balances;
 
 pub(crate) fn synthetic_block_header(
     height: BlockHeight,

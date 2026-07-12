@@ -269,6 +269,68 @@ impl TransactionFactsArtifact {
     }
 }
 
+/// Signed transaction-intrinsic shielded value balances.
+///
+/// Values use Zebra's transaction-pool sign convention: positive value enters
+/// the transaction from the named pool, while negative value leaves the
+/// transaction for that pool. Transparent value is deliberately absent
+/// because computing it requires resolving previous outputs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransactionIntrinsicValueBalances {
+    /// Sprout `sum(vpub_new) - sum(vpub_old)` in zatoshi.
+    pub sprout_zat: i64,
+    /// Sapling `valueBalanceSapling` in zatoshi.
+    pub sapling_zat: i64,
+    /// Orchard `valueBalanceOrchard` in zatoshi.
+    pub orchard_zat: i64,
+    /// Ironwood `valueBalanceIronwood` in zatoshi.
+    pub ironwood_zat: i64,
+}
+
+impl TransactionIntrinsicValueBalances {
+    /// Creates transaction-intrinsic shielded value balances.
+    #[must_use]
+    pub const fn new(
+        sprout_zat: i64,
+        sapling_zat: i64,
+        orchard_zat: i64,
+        ironwood_zat: i64,
+    ) -> Self {
+        Self {
+            sprout_zat,
+            sapling_zat,
+            orchard_zat,
+            ironwood_zat,
+        }
+    }
+}
+
+/// Canonical transaction-intrinsic value-balance artifact.
+///
+/// The location binds source-derived intrinsic balances to a mined
+/// transaction and lets historical enrichment reject stale branch data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionIntrinsicValueBalancesArtifact {
+    /// Canonical location of the transaction carrying these balances.
+    pub location: TransactionLocation,
+    /// Signed balances parsed from the transaction's shielded bundles.
+    pub value_balances: TransactionIntrinsicValueBalances,
+}
+
+impl TransactionIntrinsicValueBalancesArtifact {
+    /// Creates a located transaction-intrinsic value-balance artifact.
+    #[must_use]
+    pub const fn new(
+        location: TransactionLocation,
+        value_balances: TransactionIntrinsicValueBalances,
+    ) -> Self {
+        Self {
+            location,
+            value_balances,
+        }
+    }
+}
+
 /// Optional cold-path raw transaction blob.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionBlobArtifact {

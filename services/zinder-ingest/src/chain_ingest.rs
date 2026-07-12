@@ -16,16 +16,16 @@ use std::{
 use thiserror::Error;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId, TransactionLocation,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
-    UnixTimestampMillis,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_source::{
-    NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits, SourceError,
-    SourceFailureClass, SourceSubtreeRoots, SourceTreeState,
+    NodeCapability, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
+    SourceError, SourceFailureClass, SourceSubtreeRoots, SourceTreeState,
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, PrimaryChainStore, ReorgWindowChange,
@@ -346,6 +346,8 @@ pub struct BuiltArtifacts {
     pub transaction_locations: Vec<TransactionLocation>,
     /// Per-transaction public facts.
     pub transaction_facts: Vec<TransactionFactsArtifact>,
+    /// Per-transaction signed shielded-pool balances.
+    pub transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
     /// Optional raw transaction blobs.
     pub transaction_blobs: Vec<TransactionBlobArtifact>,
     /// Transparent output artifacts keyed by outpoint. The store derives
@@ -364,8 +366,10 @@ pub(crate) struct CanonicalBatch {
     pub(crate) block_transaction_index: Vec<BlockTransactionIndexArtifact>,
     pub(crate) transaction_locations: Vec<TransactionLocation>,
     pub(crate) transaction_facts: Vec<TransactionFactsArtifact>,
+    pub(crate) transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
     pub(crate) transaction_blobs: Vec<TransactionBlobArtifact>,
     pub(crate) tree_states: Vec<TreeStateArtifact>,
+    pub(crate) final_note_commitment_roots: Vec<BlockFinalNoteCommitmentRoots>,
     pub(crate) subtree_roots: Vec<SubtreeRootArtifact>,
     pub(crate) transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
     pub(crate) transparent_spend_facts: Vec<TransparentSpendFact>,
@@ -416,6 +420,8 @@ impl CanonicalBatch {
         self.transaction_locations
             .extend(built.transaction_locations);
         self.transaction_facts.extend(built.transaction_facts);
+        self.transaction_intrinsic_value_balances
+            .extend(built.transaction_intrinsic_value_balances);
         self.transaction_blobs.extend(built.transaction_blobs);
         self.transparent_outputs_by_outpoint
             .extend(built.transparent_outputs_by_outpoint);
@@ -443,6 +449,13 @@ impl CanonicalBatch {
             .artifact_bytes
             .saturating_add(tree_state.payload_bytes.len());
         self.tree_states.push(tree_state);
+    }
+
+    pub(crate) fn push_final_note_commitment_roots(
+        &mut self,
+        roots: BlockFinalNoteCommitmentRoots,
+    ) {
+        self.final_note_commitment_roots.push(roots);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -768,31 +781,50 @@ where
     source_outcome
 }
 
-/// Fetches a source tree-state payload with the same retry policy as block fetches.
-pub(crate) async fn fetch_tree_state_for_block_with_retry<Source>(
+/// Observes one block's final roots without making canonical progress depend
+/// on explorer enrichment availability.
+pub(crate) async fn observe_final_note_commitment_roots<Source>(
     request_timeout: Duration,
     source: &Source,
     block_id: zinder_core::BlockId,
-    retry_state: &mut IngestRetryState,
-) -> Result<SourceTreeState, IngestError>
+) -> Option<SourceTreeState>
 where
     Source: NodeSource,
 {
-    let started_at = Instant::now();
-    let _active = SourceFetchActiveGauge::enter("fetch_tree_state_for_block");
-    let source_outcome = retry_source_request(
-        "fetch_tree_state_for_block",
-        format!(
-            "fetch tree-state checkpoint at height {}",
-            block_id.height.value()
-        ),
-        request_timeout,
-        retry_state,
-        || async { source.fetch_tree_state_for_block(block_id).await },
-    )
-    .await;
-    record_ingest_source_outcome("fetch_tree_state_for_block", started_at, &source_outcome);
-    source_outcome
+    if !source.capabilities().supports(NodeCapability::TreeState) {
+        return None;
+    }
+    let outcome =
+        tokio::time::timeout(request_timeout, source.fetch_tree_state_for_block(block_id)).await;
+    match outcome {
+        Ok(Ok(tree_state)) => Some(tree_state),
+        Ok(Err(error)) => {
+            record_optional_root_observation_failure(block_id, &error);
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "final_note_commitment_roots_observation_failed",
+                height = block_id.height.value(),
+                block_hash = %hex::encode(block_id.hash.as_bytes()),
+                error = %error,
+                "final note-commitment roots are absent from this canonical commit; background backfill will retry"
+            );
+            None
+        }
+    }
+}
+
+fn record_optional_root_observation_failure(block_id: zinder_core::BlockId, error: &SourceError) {
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "final_note_commitment_roots_observation_failed",
+        height = block_id.height.value(),
+        block_hash = %hex::encode(block_id.hash.as_bytes()),
+        error = %error,
+        "final note-commitment roots are absent from this canonical commit; background backfill will retry"
+    );
 }
 
 /// Fetches subtree roots from the node source with the same retry policy
@@ -1287,11 +1319,21 @@ fn drain_batch_into_chain_epoch_artifacts(
     if !batch.transaction_facts.is_empty() {
         artifacts = artifacts.with_transaction_facts(std::mem::take(&mut batch.transaction_facts));
     }
+    if !batch.transaction_intrinsic_value_balances.is_empty() {
+        artifacts = artifacts.with_transaction_intrinsic_value_balances(std::mem::take(
+            &mut batch.transaction_intrinsic_value_balances,
+        ));
+    }
     if !batch.transaction_blobs.is_empty() {
         artifacts = artifacts.with_transaction_blobs(std::mem::take(&mut batch.transaction_blobs));
     }
     if !batch.tree_states.is_empty() {
         artifacts = artifacts.with_tree_states(std::mem::take(&mut batch.tree_states));
+    }
+    if !batch.final_note_commitment_roots.is_empty() {
+        artifacts = artifacts.with_final_note_commitment_roots(std::mem::take(
+            &mut batch.final_note_commitment_roots,
+        ));
     }
     if !batch.subtree_roots.is_empty() {
         artifacts = artifacts.with_subtree_roots(std::mem::take(&mut batch.subtree_roots));

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use tonic::Request;
 use zinder_core::{
-    BlockHeight, BlockId, ChainValuePool, ChainValuePools, Network, ShieldedProtocol,
+    BlockHash, BlockHeight, BlockId, ChainValuePool, ChainValuePools, Network, ShieldedProtocol,
     SubtreeRootIndex,
 };
 use zinder_ingest::IngestControlGrpcAdapter;
@@ -48,7 +48,10 @@ async fn ingest_control_advertises_value_pools_only_when_source_supports_them() 
         IngestControlGrpcAdapter::new(Network::ZcashRegtest, store_fixture.chain_store().clone())
             .with_node_source(Arc::new(StaticValuePoolSource::new(
                 NodeCapabilities::new([NodeCapability::ChainValuePools])?,
-                ChainValuePools::new(BlockHeight::new(2), Vec::new()),
+                ChainValuePools::new(
+                    BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+                    Vec::new(),
+                ),
             )));
     let info_with_source =
         IngestControlService::server_info(&adapter_with_source, Request::new(ServerInfoRequest {}))
@@ -77,7 +80,14 @@ async fn ingest_control_chain_value_pools_at_tip_uses_node_source() -> Result<()
             .with_node_source(Arc::new(StaticValuePoolSource::new(
                 NodeCapabilities::new([NodeCapability::ChainValuePools])?,
                 ChainValuePools::new(
-                    BlockHeight::new(1_234),
+                    BlockId::new(
+                        BlockHeight::new(1_234),
+                        BlockHash::from_bytes([
+                            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+                            0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+                        ]),
+                    ),
                     vec![
                         ChainValuePool::new("transparent", true, Some(100)),
                         ChainValuePool::new("lockbox", false, None),
@@ -98,7 +108,14 @@ async fn ingest_control_chain_value_pools_at_tip_uses_node_source() -> Result<()
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre::eyre!("chain_view.chain_epoch missing"))?;
     assert_eq!(chain_epoch.chain_epoch_id, expected_epoch.id.value());
-    assert_eq!(response.tip_height, 1_234);
+    let source_tip = response
+        .source_tip
+        .ok_or_else(|| eyre::eyre!("source_tip missing"))?;
+    assert_eq!(source_tip.height, 1_234);
+    assert_eq!(
+        source_tip.hash,
+        "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+    );
     assert_eq!(response.pools.len(), 2);
     assert_eq!(response.pools[0].id, "transparent");
     assert!(response.pools[0].monitored);

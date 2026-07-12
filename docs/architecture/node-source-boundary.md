@@ -61,6 +61,8 @@ pub trait NodeSource: Send + Sync + 'static {
         start_index: SubtreeRootIndex,
         max_entries: NonZeroU32,
     ) -> Result<SourceSubtreeRoots, SourceError>;
+
+    async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError>;
 }
 ```
 
@@ -69,6 +71,8 @@ The bulk-catchup phase of the unified ingest loop ([ADR-0022](../adrs/0022-resou
 Tip-follow and reorg-ancestor traversal use `fetch_block_at` directly because random access at the live edge is the natural shape. Native streaming transports can satisfy the same `SourceChainUpdate` values behind `fetch_chain_segment` without changing canonical ingest.
 
 `tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality. The Zebra JSON-RPC adapter implements it as `getbestblockhash` followed by `getblockheader(best_hash, true)` so the height and hash come from the same observation.
+
+`fetch_chain_value_pools_at_tip()` returns `ChainValuePools { source_tip: BlockId, pools }`. The Zebra adapter decodes `blocks`, `bestblockhash`, and `valuePools` from one `getblockchaininfo` response, preserving the authoritative height/hash pair attached to those totals. Callers compare `source_tip` with a canonical chain identity before accepting the snapshot; height equality alone is insufficient across reorgs.
 
 Transaction broadcast uses a separate boundary because it is a command, not a chain observation stream:
 

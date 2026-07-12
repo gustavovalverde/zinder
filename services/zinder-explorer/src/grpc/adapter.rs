@@ -19,28 +19,45 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
-use zinder_core::{Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name};
+use zinder_core::{
+    BlockHeight, Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name,
+};
 use zinder_proto::capabilities::{
-    CapabilitySurface, EXPLORER_SERVER_INFO_V1, ExplorerReadiness, capabilities_for_surface,
+    CapabilitySurface, EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1,
+    EXPLORER_PAID_FEE_DISTRIBUTION_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_HISTORY_V1,
+    EXPLORER_TRANSACTION_HISTORY_V2, EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2, EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
+    ExplorerReadiness, capabilities_for_surface,
 };
 use zinder_proto::v1::{
     explorer::{
         BlockActivityDistributionRequest, BlockActivityDistributionResponse, BlockDetailRequest,
         BlockDetailResponse, BlockProductionSeriesRequest, BlockProductionSeriesResponse,
         BlockSummariesInRangeRequest, BlockSummariesInRangeResponse, BlockTransactionsResponse,
-        ChainReorgHistoryRequest, ChainReorgHistoryResponse, ExplorerServerInfo, FeeSummaryRequest,
-        FeeSummaryResponse, MempoolActivityRequest, MempoolActivityResponse,
-        MempoolEventCountsRequest, MempoolEventCountsResponse, MempoolSnapshotRequest,
-        MempoolSnapshotResponse, MempoolSummaryRequest, MempoolSummaryResponse,
-        MigrationCohortsRequest, MigrationCohortsResponse, MigrationDenominationsRequest,
-        MigrationDenominationsResponse, MigrationOverviewRequest, MigrationOverviewResponse,
-        NetworkUpgradeStatusRequest, NetworkUpgradeStatusResponse, OverviewSnapshotRequest,
-        OverviewSnapshotResponse, RecentTransactionsRequest, SearchRequest, SearchResponse,
-        ServerInfoRequest, ServerInfoResponse, TransactionDetailRequest, TransactionDetailResponse,
-        TransparentAddressActivityRequest, TransparentAddressActivityResponse,
-        TransparentAddressDeltasRequest, TransparentAddressDeltasResponse, UtxoSetSummaryRequest,
-        UtxoSetSummaryResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
-        VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
+        ChainReorgHistoryRequest, ChainReorgHistoryResponse, CommitmentRootSearchRequest,
+        CommitmentRootSearchResponse, ConventionalFeeDistributionRequest,
+        ConventionalFeeDistributionResponse, DisplacedBlockDetailRequest,
+        DisplacedBlockDetailResponse, DisplacedBlockHistoryRequest, DisplacedBlockHistoryResponse,
+        ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse, MempoolActivityRequest,
+        MempoolActivityResponse, MempoolEventCountsRequest, MempoolEventCountsResponse,
+        MempoolSnapshotRequest, MempoolSnapshotResponse, MempoolSummaryRequest,
+        MempoolSummaryResponse, MigrationCohortsRequest, MigrationCohortsResponse,
+        MigrationDenominationsRequest, MigrationDenominationsResponse, MigrationOverviewRequest,
+        MigrationOverviewResponse, NetworkUpgradeStatusRequest, NetworkUpgradeStatusResponse,
+        OverviewSnapshotRequest, OverviewSnapshotResponse, PaidFeeDistributionRequest,
+        PaidFeeDistributionResponse, RecentTransactionsRequest, SearchRequest, SearchResponse,
+        ServerInfoRequest, ServerInfoResponse, TransactionComponentSummaryRequest,
+        TransactionComponentSummaryResponse, TransactionDetailRequest, TransactionDetailResponse,
+        TransactionHistoryRequest, TransactionHistoryResponse, TransparentAddressActivityRequest,
+        TransparentAddressActivityResponse, TransparentAddressDeltasRequest,
+        TransparentAddressDeltasResponse, TransparentAddressRankingRequest,
+        TransparentAddressRankingResponse, UtxoSetSummaryRequest, UtxoSetSummaryResponse,
+        ValuePoolBalanceHistoryRequest, ValuePoolBalanceHistoryResponse,
+        ValuePoolFlowAmountThresholdSummaryRequest, ValuePoolFlowAmountThresholdSummaryResponse,
+        ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse,
+        ValuePoolFlowRoundedAmountSummaryRequest, ValuePoolFlowRoundedAmountSummaryResponse,
+        ValuePoolFlowSummaryRequest, ValuePoolFlowSummaryResponse, ValuePoolSummaryRequest,
+        ValuePoolSummaryResponse, VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -58,12 +75,17 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
     "zinder_explorer_request_total",
 );
 
+/// First canonical artifact schema that contains transaction-intrinsic balances.
+const MINIMUM_INTRINSIC_VALUE_BALANCE_HISTORY_SCHEMA_VERSION: u16 = 15;
 use super::block_activity::handle_block_activity_distribution;
 use super::block_view::{
     handle_block_detail, handle_block_production_series, handle_block_summaries_in_range,
     handle_block_transactions,
 };
 use super::chain_reorg_history::handle_chain_reorg_history;
+use super::commitment_root_search::handle_commitment_root_search;
+use super::conventional_fee_distribution::handle_conventional_fee_distribution;
+use super::displaced_block::{handle_displaced_block_detail, handle_displaced_block_history};
 use super::error::ExplorerError;
 use super::fee_summary::handle_fee_summary;
 use super::freshness::{
@@ -77,14 +99,25 @@ use super::migration::{
 };
 use super::network_upgrade_status::handle_network_upgrade_status;
 use super::overview_snapshot::handle_overview_snapshot;
+use super::paid_fee_distribution::handle_paid_fee_distribution;
 use super::recent_transactions::{RecentTransactionsStream, handle_recent_transactions};
 use super::search::handle_search;
+use super::transaction_component_summary::handle_transaction_component_summary;
 use super::transaction_detail::{TransactionDetailContext, handle_transaction_detail};
-use super::transparent_address_activity::handle_transparent_address_activity;
+use super::transaction_history::transaction_history;
+use super::transparent_address_activity::{
+    TransparentAddressActivityContext, handle_transparent_address_activity,
+};
 use super::transparent_address_deltas::handle_transparent_address_deltas;
+use super::transparent_address_ranking::handle_transparent_address_ranking;
 use super::utxo_set_summary::handle_utxo_set_summary;
+use super::value_pool_balance_history::handle_value_pool_balance_history;
+use super::value_pool_flow::{
+    handle_value_pool_flow_amount_threshold_summary, handle_value_pool_flow_history,
+    handle_value_pool_flow_rounded_amount_summary, handle_value_pool_flow_summary,
+};
 use super::value_pool_summary::handle_value_pool_summary;
-use zinder_derive::DeriveStore;
+use zinder_derive::{DeriveStore, TRANSACTION_HISTORY_CONSUMER_NAME};
 use zinder_store::SecondaryChainStore;
 
 /// Settings the binary populates before constructing the adapter.
@@ -284,11 +317,86 @@ impl ExplorerQueryGrpcAdapter {
             prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
             payment_disclosure_verifier_online: self.payment_disclosure_verifier_online,
         };
+        let ranking_active = self.derive_store.as_ref().is_some_and(|store| {
+            zinder_derive::TransparentAddressRankingConsumer::active_metadata(store)
+                .ok()
+                .flatten()
+                .is_some()
+        });
+        let conventional_fee_distribution_covered =
+            self.derive_store.as_ref().is_some_and(|store| {
+                zinder_derive::ConventionalFeeDistributionConsumer::coverage(store)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+        let paid_fee_distribution_covered = self.derive_store.as_ref().is_some_and(|store| {
+            zinder_derive::PaidFeeDistributionConsumer::coverage(store)
+                .ok()
+                .flatten()
+                .is_some()
+        });
+        let transaction_intrinsic_value_balances_available =
+            self.canonical_store.as_ref().is_some_and(|store| {
+                store.try_catch_up().is_ok()
+                    && store.current_chain_epoch().is_ok_and(|chain_epoch| {
+                        chain_epoch.is_some_and(intrinsic_value_balance_schema_supported)
+                    })
+            });
+        let (transaction_history_v1_available, transaction_history_v2_available) =
+            transaction_history_projection_capabilities(self.derive_store.as_ref());
         capabilities_for_surface(CapabilitySurface::Explorer)
             .filter(|spec| spec.policy.explorer_satisfied(readiness))
+            .filter(|spec| {
+                !matches!(
+                    spec.string,
+                    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2
+                        | EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1
+                ) || ranking_active
+            })
+            .filter(|spec| {
+                spec.string != EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1
+                    || conventional_fee_distribution_covered
+            })
+            .filter(|spec| {
+                spec.string != EXPLORER_PAID_FEE_DISTRIBUTION_V1 || paid_fee_distribution_covered
+            })
+            .filter(|spec| {
+                spec.string != EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1
+                    || transaction_intrinsic_value_balances_available
+            })
+            .filter(|spec| {
+                spec.string != EXPLORER_TRANSACTION_HISTORY_V1 || transaction_history_v1_available
+            })
+            .filter(|spec| {
+                spec.string != EXPLORER_TRANSACTION_HISTORY_V2 || transaction_history_v2_available
+            })
             .map(|spec| spec.string)
             .collect()
     }
+}
+
+fn transaction_history_projection_capabilities(derive_store: Option<&DeriveStore>) -> (bool, bool) {
+    let Some(state) = derive_store.and_then(|store| {
+        store
+            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)
+            .ok()
+            .flatten()
+    }) else {
+        return (false, false);
+    };
+
+    let v2_available = state.coverage.is_some_and(|coverage| {
+        coverage.complete_from_height == BlockHeight::new(1)
+            && coverage.complete_through_height == state.projection_tip_height
+            && coverage.complete_through_hash == state.projection_tip_hash
+    });
+    (true, v2_available)
+}
+
+fn intrinsic_value_balance_schema_supported(chain_epoch: zinder_core::ChainEpoch) -> bool {
+    chain_epoch.artifact_schema_version.value()
+        >= MINIMUM_INTRINSIC_VALUE_BALANCE_HISTORY_SCHEMA_VERSION
 }
 
 /// Pair of operation labels used by every `ExplorerQuery` handler.
@@ -447,6 +555,56 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         outcome
     }
 
+    async fn transaction_component_summary(
+        &self,
+        request: Request<TransactionComponentSummaryRequest>,
+    ) -> Result<Response<TransactionComponentSummaryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "TransactionComponentSummary",
+            metric: "transaction_component_summary",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_transaction_component_summary(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn transparent_address_ranking(
+        &self,
+        request: Request<TransparentAddressRankingRequest>,
+    ) -> Result<Response<TransparentAddressRankingResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "TransparentAddressRanking",
+            metric: "transparent_address_ranking",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_transparent_address_ranking(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
     async fn block_detail(
         &self,
         request: Request<BlockDetailRequest>,
@@ -514,6 +672,31 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 self.derive_store.as_ref(),
                 &mut client,
                 self.settings.network,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn commitment_root_search(
+        &self,
+        request: Request<CommitmentRootSearchRequest>,
+    ) -> Result<Response<CommitmentRootSearchResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "CommitmentRootSearch",
+            metric: "commitment_root_search",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let canonical_store = self.require_canonical_store(OP.method)?;
+            handle_commitment_root_search(
+                derive_store,
+                canonical_store,
                 &self.upstream_observation_cache,
                 request,
             )
@@ -616,10 +799,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             })?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_transparent_address_activity(
-                derive_store,
+                TransparentAddressActivityContext {
+                    derive_store,
+                    canonical_store: self.canonical_store.as_ref(),
+                    network: self.settings.network,
+                    upstream_observation_cache: &self.upstream_observation_cache,
+                },
                 &mut client,
-                self.settings.network,
-                &self.upstream_observation_cache,
                 request,
             )
             .await
@@ -684,6 +870,56 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         outcome
     }
 
+    async fn conventional_fee_distribution(
+        &self,
+        request: Request<ConventionalFeeDistributionRequest>,
+    ) -> Result<Response<ConventionalFeeDistributionResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ConventionalFeeDistribution",
+            metric: "conventional_fee_distribution",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_conventional_fee_distribution(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn paid_fee_distribution(
+        &self,
+        request: Request<PaidFeeDistributionRequest>,
+    ) -> Result<Response<PaidFeeDistributionResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "PaidFeeDistribution",
+            metric: "paid_fee_distribution",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_paid_fee_distribution(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
     async fn value_pool_summary(
         &self,
         request: Request<ValuePoolSummaryRequest>,
@@ -722,6 +958,131 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             handle_network_upgrade_status(
                 self.derive_store.as_ref(),
                 &self.network_upgrade_activations,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn value_pool_flow_history(
+        &self,
+        request: Request<ValuePoolFlowHistoryRequest>,
+    ) -> Result<Response<ValuePoolFlowHistoryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ValuePoolFlowHistory",
+            metric: "value_pool_flow_history",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_value_pool_flow_history(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn value_pool_flow_summary(
+        &self,
+        request: Request<ValuePoolFlowSummaryRequest>,
+    ) -> Result<Response<ValuePoolFlowSummaryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ValuePoolFlowSummary",
+            metric: "value_pool_flow_summary",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_value_pool_flow_summary(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn value_pool_flow_amount_threshold_summary(
+        &self,
+        request: Request<ValuePoolFlowAmountThresholdSummaryRequest>,
+    ) -> Result<Response<ValuePoolFlowAmountThresholdSummaryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ValuePoolFlowAmountThresholdSummary",
+            metric: "value_pool_flow_amount_threshold_summary",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_value_pool_flow_amount_threshold_summary(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn value_pool_flow_rounded_amount_summary(
+        &self,
+        request: Request<ValuePoolFlowRoundedAmountSummaryRequest>,
+    ) -> Result<Response<ValuePoolFlowRoundedAmountSummaryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ValuePoolFlowRoundedAmountSummary",
+            metric: "value_pool_flow_rounded_amount_summary",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_value_pool_flow_rounded_amount_summary(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn value_pool_balance_history(
+        &self,
+        request: Request<ValuePoolBalanceHistoryRequest>,
+    ) -> Result<Response<ValuePoolBalanceHistoryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ValuePoolBalanceHistory",
+            metric: "value_pool_balance_history",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_value_pool_balance_history(
+                derive_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -780,6 +1141,52 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         outcome
     }
 
+    async fn displaced_block_history(
+        &self,
+        request: Request<DisplacedBlockHistoryRequest>,
+    ) -> Result<Response<DisplacedBlockHistoryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "DisplacedBlockHistory",
+            metric: "displaced_block_history",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let canonical_store = self.require_canonical_store(OP.method)?;
+            handle_displaced_block_history(
+                canonical_store,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn displaced_block_detail(
+        &self,
+        request: Request<DisplacedBlockDetailRequest>,
+    ) -> Result<Response<DisplacedBlockDetailResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "DisplacedBlockDetail",
+            metric: "displaced_block_detail",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let canonical_store = self.require_canonical_store(OP.method)?;
+            handle_displaced_block_detail(
+                canonical_store,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
     async fn mempool_event_counts(
         &self,
         request: Request<MempoolEventCountsRequest>,
@@ -809,6 +1216,36 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         outcome
     }
 
+    async fn transaction_history(
+        &self,
+        request: Request<TransactionHistoryRequest>,
+    ) -> Result<Response<TransactionHistoryResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "TransactionHistory",
+            metric: "transaction_history",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
+                ExplorerError::dependency_not_configured(
+                    "TransactionHistory requires a derive store",
+                )
+            })?;
+            let mut client = self.wallet_client(OP.method).await?;
+            transaction_history(
+                derive_store,
+                self.canonical_store.as_ref(),
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
     type RecentTransactionsStream = RecentTransactionsStream;
 
     async fn recent_transactions(
@@ -821,11 +1258,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
-                ExplorerError::dependency_not_configured(
-                    "RecentTransactions requires a derive store",
-                )
-            })?;
+            let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_recent_transactions(
                 derive_store,
@@ -1084,5 +1517,190 @@ fn status_error_class(status: &Status) -> &'static str {
         Code::DataLoss => "data_loss",
         Code::Unauthenticated => "unauthenticated",
         Code::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        missing_docs,
+        reason = "Unit test names describe the behavior under test."
+    )]
+
+    use tempfile::{TempDir, tempdir};
+    use zinder_core::{ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpochId, Network};
+    use zinder_derive::{
+        CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA, ConsumerProjectionCoverage, ConsumerProjectionState,
+        DeriveStoreOptions, PAID_FEE_DISTRIBUTION_SCHEMA,
+    };
+    use zinder_store::{ChainStoreOptions, RocksDbResourceBudget, SecondaryChainStore};
+    use zinder_testkit::{ChainFixture, StoreFixture};
+
+    use super::*;
+
+    fn adapter_with_transaction_history_state(
+        state: Option<ConsumerProjectionState>,
+        wallet_query_online: bool,
+    ) -> Result<(TempDir, ExplorerQueryGrpcAdapter), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let derive_store = DeriveStore::open(
+            tempdir.path(),
+            DeriveStoreOptions {
+                consumers: DeriveStore::bundled_consumers(),
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                sync_writes: false,
+            },
+        )?;
+        if let Some(state) = state {
+            derive_store.put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, state)?;
+        }
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_derive_store(derive_store);
+        let adapter = if wallet_query_online {
+            adapter.with_wallet_query_endpoint(String::from("http://127.0.0.1:1"))
+        } else {
+            adapter
+        };
+        Ok((tempdir, adapter))
+    }
+
+    #[test]
+    fn transaction_history_capabilities_follow_projection_state_and_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_tempdir, adapter) = adapter_with_transaction_history_state(None, true)?;
+        let capabilities = adapter.advertised_capabilities();
+        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
+        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+
+        let partial_state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(7),
+            projection_tip_height: BlockHeight::new(20),
+            projection_tip_hash: BlockHash::from_bytes([0x20; 32]),
+            revision: 1,
+            coverage: None,
+        };
+        let (_tempdir, adapter) =
+            adapter_with_transaction_history_state(Some(partial_state), true)?;
+        let capabilities = adapter.advertised_capabilities();
+        assert!(capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
+        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+
+        let complete_state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(7),
+            projection_tip_height: BlockHeight::new(20),
+            projection_tip_hash: BlockHash::from_bytes([0x20; 32]),
+            revision: 2,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(1),
+                complete_through_height: BlockHeight::new(20),
+                complete_through_hash: BlockHash::from_bytes([0x20; 32]),
+            }),
+        };
+        let (_tempdir, adapter) =
+            adapter_with_transaction_history_state(Some(complete_state), true)?;
+        let capabilities = adapter.advertised_capabilities();
+        assert!(capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
+        assert!(capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+
+        let mismatched_state = ConsumerProjectionState {
+            projection_tip_hash: BlockHash::from_bytes([0x21; 32]),
+            ..complete_state
+        };
+        let (_tempdir, adapter) =
+            adapter_with_transaction_history_state(Some(mismatched_state), true)?;
+        let capabilities = adapter.advertised_capabilities();
+        assert!(capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
+        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+
+        let (_tempdir, adapter) =
+            adapter_with_transaction_history_state(Some(complete_state), false)?;
+        let capabilities = adapter.advertised_capabilities();
+        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
+        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+        Ok(())
+    }
+
+    #[test]
+    fn fee_distribution_capabilities_are_hidden_without_projection_coverage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let derive_store = DeriveStore::open(
+            tempdir.path(),
+            DeriveStoreOptions {
+                consumers: &[
+                    CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA,
+                    PAID_FEE_DISTRIBUTION_SCHEMA,
+                ],
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                sync_writes: false,
+            },
+        )?;
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_derive_store(derive_store)
+            .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+
+        assert!(
+            !adapter
+                .advertised_capabilities()
+                .contains(&EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1)
+        );
+        assert!(
+            !adapter
+                .advertised_capabilities()
+                .contains(&EXPLORER_PAID_FEE_DISTRIBUTION_V1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intrinsic_value_balance_capability_requires_a_supported_canonical_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let store_fixture =
+            StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
+        let canonical_store = SecondaryChainStore::open(
+            store_fixture.tempdir_path(),
+            store_fixture
+                .tempdir_path()
+                .join("intrinsic-balance-capability-secondary"),
+            ChainStoreOptions::for_local_tests(),
+        )?;
+        canonical_store.try_catch_up()?;
+        let tempdir = tempdir()?;
+        let derive_store = DeriveStore::open(
+            tempdir.path(),
+            DeriveStoreOptions {
+                consumers: DeriveStore::bundled_consumers(),
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                sync_writes: false,
+            },
+        )?;
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_derive_store(derive_store)
+            .with_canonical_store(canonical_store);
+
+        assert!(
+            !adapter
+                .advertised_capabilities()
+                .contains(&EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1)
+        );
+
+        let adapter = adapter.with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+        assert!(
+            adapter
+                .advertised_capabilities()
+                .contains(&EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1)
+        );
+
+        let mut chain_epoch = chain_fixture
+            .chain_epoch(ChainEpochId::new(1))
+            .ok_or("fixture chain epoch missing")?;
+        chain_epoch.artifact_schema_version = ArtifactSchemaVersion::new(13);
+        assert!(!intrinsic_value_balance_schema_supported(chain_epoch));
+        chain_epoch.artifact_schema_version = ArtifactSchemaVersion::new(14);
+        assert!(!intrinsic_value_balance_schema_supported(chain_epoch));
+        chain_epoch.artifact_schema_version = ArtifactSchemaVersion::new(15);
+        assert!(intrinsic_value_balance_schema_supported(chain_epoch));
+        Ok(())
     }
 }

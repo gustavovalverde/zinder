@@ -101,6 +101,7 @@ fn block(height: u32, transactions: Vec<TransactionFactsArtifact>) -> BlockCommi
             block_time_unix_seconds: 0,
             block_size_bytes: 0,
             transactions,
+            final_note_commitment_roots: None,
         },
         TransparentSpendFacts::Offline,
     )

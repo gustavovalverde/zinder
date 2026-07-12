@@ -15,9 +15,9 @@ use zebra_chain::{
 };
 use zinder_core::{
     AuthDigest, BlockHeight, ConsensusBranchId, LockTime, NetworkUpgradeActivations,
-    TransactionComponentCounts, TransactionId, TransactionPublicFacts, TransactionVersion,
-    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
-    UnsupportedSection, Wtxid, classify_privacy_shape,
+    TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
+    TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
+    TransparentOutPoint, TransparentOutputFact, UnsupportedSection, Wtxid, classify_privacy_shape,
 };
 
 use crate::SourceError;
@@ -30,6 +30,8 @@ use crate::SourceError;
 pub struct TransactionPublicFactSet {
     /// Scalar transaction metadata and component counts.
     pub public_facts: TransactionPublicFacts,
+    /// Signed shielded-pool balances intrinsic to the transaction bytes.
+    pub intrinsic_value_balances: TransactionIntrinsicValueBalances,
     /// Ordered transparent inputs, excluding the coinbase sentinel.
     pub transparent_inputs: Vec<TransparentInputFact>,
     /// Ordered transparent outputs with intrinsic values and scripts.
@@ -85,11 +87,83 @@ pub fn parse_transaction_public_fact_set(
         mined_height,
         activations,
     );
+    let intrinsic_value_balances = transaction_intrinsic_value_balances(&transaction)?;
     let (transparent_inputs, transparent_outputs) = transaction_transparent_facts(&transaction)?;
     Ok(TransactionPublicFactSet {
         public_facts,
+        intrinsic_value_balances,
         transparent_inputs,
         transparent_outputs,
+    })
+}
+
+fn transaction_intrinsic_value_balances(
+    transaction: &ZebraTransaction,
+) -> Result<TransactionIntrinsicValueBalances, SourceError> {
+    let sprout_zat = match transaction {
+        ZebraTransaction::V2 {
+            joinsplit_data: Some(joinsplit_data),
+            ..
+        }
+        | ZebraTransaction::V3 {
+            joinsplit_data: Some(joinsplit_data),
+            ..
+        } => sum_sprout_joinsplit_balances_zat(
+            joinsplit_data
+                .joinsplits()
+                .map(|joinsplit| joinsplit.value_balance().zatoshis()),
+        )?,
+        ZebraTransaction::V4 {
+            joinsplit_data: Some(joinsplit_data),
+            ..
+        } => sum_sprout_joinsplit_balances_zat(
+            joinsplit_data
+                .joinsplits()
+                .map(|joinsplit| joinsplit.value_balance().zatoshis()),
+        )?,
+        ZebraTransaction::V1 { .. }
+        | ZebraTransaction::V2 {
+            joinsplit_data: None,
+            ..
+        }
+        | ZebraTransaction::V3 {
+            joinsplit_data: None,
+            ..
+        }
+        | ZebraTransaction::V4 {
+            joinsplit_data: None,
+            ..
+        }
+        | ZebraTransaction::V5 { .. }
+        | ZebraTransaction::V6 { .. } => 0,
+    };
+    let sapling_zat = transaction
+        .sapling_value_balance()
+        .sapling_amount()
+        .zatoshis();
+    let orchard_zat = transaction
+        .orchard_value_balance()
+        .orchard_amount()
+        .zatoshis();
+    let ironwood_zat = transaction
+        .ironwood_value_balance()
+        .ironwood_amount()
+        .zatoshis();
+
+    Ok(TransactionIntrinsicValueBalances::new(
+        sprout_zat,
+        sapling_zat,
+        orchard_zat,
+        ironwood_zat,
+    ))
+}
+
+fn sum_sprout_joinsplit_balances_zat(
+    joinsplit_balances_zat: impl Iterator<Item = i64>,
+) -> Result<i64, SourceError> {
+    let aggregate_zat = joinsplit_balances_zat.map(i128::from).sum::<i128>();
+    i64::try_from(aggregate_zat).map_err(|_| SourceError::RawTransactionParseFailed {
+        reason: "aggregate Sprout value balance exceeds i64".to_owned(),
     })
 }
 
@@ -285,4 +359,91 @@ fn zebra_network_upgrade_branch_id(
     network_upgrade
         .branch_id()
         .map(|branch_id| ConsensusBranchId::new(branch_id.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use zebra_chain::{
+        block::Height as ZebraHeight,
+        parameters::NetworkUpgrade,
+        serialization::ZcashSerialize,
+        transaction::{LockTime as ZebraLockTime, Transaction as ZebraTransaction},
+    };
+    use zinder_core::{Network, NetworkUpgradeActivations, TransactionIntrinsicValueBalances};
+
+    use super::{
+        SourceError, parse_transaction_public_fact_set, sum_sprout_joinsplit_balances_zat,
+    };
+
+    #[test]
+    fn parsed_v1_through_v6_transactions_expose_zero_intrinsic_balances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transactions = [
+            ZebraTransaction::V1 {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                lock_time: ZebraLockTime::unlocked(),
+            },
+            ZebraTransaction::V2 {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                lock_time: ZebraLockTime::unlocked(),
+                joinsplit_data: None,
+            },
+            ZebraTransaction::V3 {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                lock_time: ZebraLockTime::unlocked(),
+                expiry_height: ZebraHeight(0),
+                joinsplit_data: None,
+            },
+            ZebraTransaction::V4 {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                lock_time: ZebraLockTime::unlocked(),
+                expiry_height: ZebraHeight(0),
+                joinsplit_data: None,
+                sapling_shielded_data: None,
+            },
+            ZebraTransaction::V5 {
+                network_upgrade: NetworkUpgrade::Nu5,
+                lock_time: ZebraLockTime::unlocked(),
+                expiry_height: ZebraHeight(0),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                sapling_shielded_data: None,
+                orchard_shielded_data: None,
+            },
+            ZebraTransaction::V6 {
+                network_upgrade: NetworkUpgrade::Nu6_3,
+                lock_time: ZebraLockTime::unlocked(),
+                expiry_height: ZebraHeight(0),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                sapling_shielded_data: None,
+                orchard_shielded_data: None,
+                ironwood_shielded_data: None,
+            },
+        ];
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+
+        for transaction in transactions {
+            let raw_transaction = transaction.zcash_serialize_to_vec()?;
+            let fact_set = parse_transaction_public_fact_set(&raw_transaction, None, &activations)?;
+            assert_eq!(
+                fact_set.intrinsic_value_balances,
+                TransactionIntrinsicValueBalances::default()
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn sprout_joinsplit_balances_preserve_zebra_sign() -> Result<(), SourceError> {
+        let balance = sum_sprout_joinsplit_balances_zat([5_i64, -12].into_iter())?;
+
+        assert_eq!(balance, -7);
+        Ok(())
+    }
 }

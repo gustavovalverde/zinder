@@ -16,7 +16,10 @@ use crate::{
     block_artifact::read_block_header_artifact,
     format::{AddressOutputCursorPayload, StoreKey, decode_address_output_index_artifact},
     kv::{PrefixScanControl, RocksChainStoreRead, StorageTable},
-    transparent_spend_fact::read_visible_transparent_spend_facts_by_outpoints,
+    transparent_spend_fact::{
+        read_current_transparent_spend_facts_by_outpoints,
+        read_visible_transparent_spend_facts_by_outpoints,
+    },
 };
 
 /// Read boundary for transparent address output artifacts.
@@ -28,6 +31,252 @@ pub trait AddressOutputIndexStore {
         start_height: BlockHeight,
         max_entries: NonZeroU32,
     ) -> Result<Vec<TransparentUnspentOutput>, StoreError>;
+
+    /// Reads current positive transparent balances at the reader's visible epoch.
+    fn transparent_address_balance_snapshot(
+        &self,
+    ) -> Result<TransparentAddressBalanceSnapshot, StoreError>;
+
+    /// Reads positive transparent balances at the current settled tip.
+    fn settled_transparent_address_balance_snapshot(
+        &self,
+    ) -> Result<TransparentAddressBalanceSnapshot, StoreError>;
+}
+
+/// Current balance for every visible unspent output sharing one script hash.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentAddressBalanceSummary {
+    /// Canonical raw `scriptPubKey`; script classification remains edge-owned.
+    pub script_pub_key: Vec<u8>,
+    /// Checked sum of visible unspent output values, in zatoshi.
+    pub balance_zat: u64,
+    /// Number of visible unspent outputs included in `balance_zat`.
+    pub utxo_count: u64,
+}
+
+/// Exact current transparent balance snapshot bound to one visible chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentAddressBalanceSnapshot {
+    /// One positive balance per canonical raw-script hash.
+    pub balances_by_script_hash:
+        HashMap<TransparentAddressScriptHash, TransparentAddressBalanceSummary>,
+    /// Number of address-output projection rows inspected.
+    pub indexed_output_count: u64,
+    /// Number of visible unspent outputs, including zero-valued outputs.
+    pub utxo_count: u64,
+    /// Number of hashes with a positive balance.
+    pub positive_script_hash_count: u64,
+    /// Checked sum of all positive balances, in zatoshi.
+    pub total_positive_balance_zat: u64,
+    /// Visible tip height summarized by this snapshot.
+    pub summarized_height: BlockHeight,
+    /// Chain epoch that bounds every field in this snapshot.
+    pub chain_epoch: ChainEpoch,
+}
+
+#[derive(Default)]
+struct TransparentAddressBalanceAccumulator {
+    balances_by_script_hash:
+        HashMap<TransparentAddressScriptHash, TransparentAddressBalanceSummary>,
+    visible_block_hash_by_height: HashMap<BlockHeight, Option<BlockHash>>,
+    indexed_output_count: u64,
+    utxo_count: u64,
+    total_positive_balance_zat: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TransparentAddressBalanceBoundary {
+    chain_epoch: ChainEpoch,
+    summarized_height: BlockHeight,
+}
+
+/// Streams the network-wide current-UTXO projection into one balance per raw
+/// script hash at `chain_epoch.visible_tip_height`.
+pub(crate) fn read_transparent_address_balance_snapshot(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    summarized_height: BlockHeight,
+) -> Result<TransparentAddressBalanceSnapshot, StoreError> {
+    let prefix = StoreKey::address_output_index_network_prefix(chain_epoch.network);
+    let boundary = TransparentAddressBalanceBoundary {
+        chain_epoch,
+        summarized_height,
+    };
+    let mut accumulator = TransparentAddressBalanceAccumulator::default();
+    let mut candidates = Vec::with_capacity(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST);
+
+    inner.scan_prefix(
+        StorageTable::AddressOutputIndex,
+        &prefix,
+        &mut |_key_bytes, envelope_bytes| {
+            let output = decode_address_output_index_artifact(&prefix, envelope_bytes)?;
+            accumulator.indexed_output_count = checked_add(
+                &prefix,
+                accumulator.indexed_output_count,
+                1,
+                "transparent balance snapshot indexed-output count overflow",
+            )?;
+            candidates.push(output);
+            if candidates.len() == MAX_TRANSPARENT_OUTPUTS_PER_REQUEST {
+                accumulate_visible_balances(
+                    inner,
+                    boundary,
+                    &prefix,
+                    &candidates,
+                    &mut accumulator,
+                )?;
+                candidates.clear();
+            }
+            Ok(PrefixScanControl::Continue)
+        },
+    )?;
+    accumulate_visible_balances(inner, boundary, &prefix, &candidates, &mut accumulator)?;
+
+    accumulator
+        .balances_by_script_hash
+        .retain(|_, summary| summary.balance_zat > 0);
+    let positive_script_hash_count = u64::try_from(accumulator.balances_by_script_hash.len())
+        .map_err(|_| {
+            corrupt_snapshot(&prefix, "transparent balance snapshot hash count overflow")
+        })?;
+
+    Ok(TransparentAddressBalanceSnapshot {
+        balances_by_script_hash: accumulator.balances_by_script_hash,
+        indexed_output_count: accumulator.indexed_output_count,
+        utxo_count: accumulator.utxo_count,
+        positive_script_hash_count,
+        total_positive_balance_zat: accumulator.total_positive_balance_zat,
+        summarized_height,
+        chain_epoch,
+    })
+}
+
+fn accumulate_visible_balances(
+    inner: &impl RocksChainStoreRead,
+    boundary: TransparentAddressBalanceBoundary,
+    prefix: &StoreKey,
+    candidates: &[TransparentUnspentOutput],
+    accumulator: &mut TransparentAddressBalanceAccumulator,
+) -> Result<(), StoreError> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let outpoints = candidates
+        .iter()
+        .map(|output| output.outpoint)
+        .collect::<Vec<_>>();
+    let spent_outpoints =
+        read_current_transparent_spend_facts_by_outpoints(inner, boundary.chain_epoch, &outpoints)?;
+
+    for output in candidates {
+        if output.block_height > boundary.summarized_height
+            || spent_outpoints
+                .get(&output.outpoint)
+                .is_some_and(|spend| spend.block_height <= boundary.summarized_height)
+            || !creation_is_visible(inner, boundary, output, accumulator)?
+        {
+            continue;
+        }
+
+        accumulator.utxo_count = checked_add(
+            prefix,
+            accumulator.utxo_count,
+            1,
+            "transparent balance snapshot UTXO count overflow",
+        )?;
+        accumulator.total_positive_balance_zat = checked_add(
+            prefix,
+            accumulator.total_positive_balance_zat,
+            output.value_zat,
+            "transparent balance snapshot total balance overflow",
+        )?;
+
+        match accumulator
+            .balances_by_script_hash
+            .get_mut(&output.address_script_hash)
+        {
+            Some(summary) if summary.script_pub_key != output.script_pub_key => {
+                return Err(corrupt_snapshot(
+                    prefix,
+                    "transparent balance snapshot contains conflicting scripts for one hash",
+                ));
+            }
+            Some(summary) => {
+                summary.balance_zat = checked_add(
+                    prefix,
+                    summary.balance_zat,
+                    output.value_zat,
+                    "transparent address balance overflow",
+                )?;
+                summary.utxo_count = checked_add(
+                    prefix,
+                    summary.utxo_count,
+                    1,
+                    "transparent address UTXO count overflow",
+                )?;
+            }
+            None => {
+                accumulator.balances_by_script_hash.insert(
+                    output.address_script_hash,
+                    TransparentAddressBalanceSummary {
+                        script_pub_key: output.script_pub_key.clone(),
+                        balance_zat: output.value_zat,
+                        utxo_count: 1,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn creation_is_visible(
+    inner: &impl RocksChainStoreRead,
+    boundary: TransparentAddressBalanceBoundary,
+    output: &TransparentUnspentOutput,
+    accumulator: &mut TransparentAddressBalanceAccumulator,
+) -> Result<bool, StoreError> {
+    if output.block_height <= boundary.chain_epoch.settled_tip_height {
+        return Ok(true);
+    }
+
+    if output.block_height > boundary.summarized_height {
+        return Ok(false);
+    }
+
+    if let Some(block_hash) = accumulator
+        .visible_block_hash_by_height
+        .get(&output.block_height)
+    {
+        return Ok(*block_hash == Some(output.block_hash));
+    }
+
+    let block_hash = read_block_header_artifact(inner, boundary.chain_epoch, output.block_height)?
+        .map(|block| block.block_hash);
+    accumulator
+        .visible_block_hash_by_height
+        .insert(output.block_height, block_hash);
+    Ok(block_hash == Some(output.block_hash))
+}
+
+fn checked_add(
+    prefix: &StoreKey,
+    left: u64,
+    right: u64,
+    reason: &'static str,
+) -> Result<u64, StoreError> {
+    left.checked_add(right)
+        .ok_or_else(|| corrupt_snapshot(prefix, reason))
+}
+
+fn corrupt_snapshot(prefix: &StoreKey, reason: &'static str) -> StoreError {
+    StoreError::ArtifactCorrupt {
+        family: crate::ArtifactFamily::AddressOutputIndex,
+        key: prefix.clone().into(),
+        reason,
+    }
 }
 
 /// Chain-wide aggregate of the transparent UTXO-set projection.

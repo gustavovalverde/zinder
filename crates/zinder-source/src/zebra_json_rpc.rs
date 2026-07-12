@@ -1,5 +1,6 @@
 //! Zebra JSON-RPC source adapter.
 
+use std::collections::HashSet;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,11 +17,12 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, BroadcastAccepted, BroadcastDuplicate,
-    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
-    BroadcastUnknown, ChainValuePool, ChainValuePools, ConsensusBranchId, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
+    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, BlockValuePoolBalances,
+    BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
+    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainValuePool, ChainValuePools,
+    ConsensusBranchId, FinalNoteCommitmentRoot, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootHash,
+    SubtreeRootIndex, TransactionBroadcastResult, TransactionId, ValuePoolBalance,
 };
 
 use crate::{
@@ -31,7 +33,7 @@ use crate::{
     TreeStateUpstream, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
-    ZEBRA_REBUILD_THRESHOLD, decode_rpc_block_hash,
+    ZEBRA_REBUILD_THRESHOLD, decode_rpc_block_hash, encode_rpc_block_hash,
     source_block::wire_error_to_transaction_id_error,
     source_chain_update::SourceChainCursorPosition, zebra_ready_endpoint::ZebraReadyClient,
 };
@@ -76,6 +78,7 @@ fn default_zebra_capabilities() -> NodeCapabilities {
         NodeCapability::SubtreeRoots,
         NodeCapability::TransactionBroadcast,
         NodeCapability::ChainValuePools,
+        NodeCapability::BlockValuePoolBalances,
     ])
 }
 
@@ -922,10 +925,14 @@ impl NodeSource for ZebraJsonRpcSource {
                 },
             )
             .await?;
-        validate_zebra_tree_state(&tree_state, block_id.height, block_id.hash)?;
+        let final_note_commitment_roots =
+            parse_zebra_final_note_commitment_roots(&tree_state, block_id)?;
         let payload_bytes = serde_json::to_vec(&tree_state)
             .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })?;
-        Ok(SourceTreeState::new(block_id, payload_bytes))
+        Ok(SourceTreeState::with_final_note_commitment_roots(
+            final_note_commitment_roots,
+            payload_bytes,
+        ))
     }
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
@@ -1056,9 +1063,92 @@ impl NodeSource for ZebraJsonRpcSource {
             .map(|entry| ChainValuePool::new(entry.id, entry.monitored, entry.chain_value_zat))
             .collect();
         Ok(ChainValuePools::new(
-            BlockHeight::new(blockchain_info.blocks),
+            BlockId::new(
+                BlockHeight::new(blockchain_info.blocks),
+                decode_rpc_block_hash(&blockchain_info.best_block_hash)?,
+            ),
             pools,
         ))
+    }
+
+    async fn fetch_block_value_pool_balances(
+        &self,
+        block_id: BlockId,
+    ) -> Result<BlockValuePoolBalances, SourceError> {
+        let block_response: ZebraGetBlockValuePools = self
+            .call_typed(
+                "getblock",
+                positional_params([
+                    Value::from(encode_rpc_block_hash(block_id.hash)),
+                    Value::from(1),
+                ])?,
+                |error| SourceError::BlockUnavailable {
+                    height: block_id.height,
+                    reason: error.message,
+                },
+            )
+            .await?;
+        let response_hash = block_response
+            .hash
+            .ok_or(SourceError::SourceProtocolMismatch {
+                reason: "verbose getblock response is missing hash",
+            })?;
+        let response_height = block_response
+            .height
+            .ok_or(SourceError::SourceProtocolMismatch {
+                reason: "verbose getblock response is missing height",
+            })?;
+        let response_time = block_response
+            .time
+            .ok_or(SourceError::SourceProtocolMismatch {
+                reason: "verbose getblock response is missing time",
+            })?;
+        let value_pools = block_response
+            .value_pools
+            .ok_or(SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::BlockValuePoolBalances,
+            })?;
+
+        if response_height != block_id.height.value() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "verbose getblock height does not match requested block",
+            });
+        }
+        if decode_rpc_block_hash(&response_hash)? != block_id.hash {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "verbose getblock hash does not match requested block",
+            });
+        }
+        if value_pools.is_empty() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "verbose getblock valuePools is empty",
+            });
+        }
+
+        let mut pool_ids = HashSet::with_capacity(value_pools.len());
+        let mut pools = Vec::with_capacity(value_pools.len());
+        for entry in value_pools {
+            if entry.id.is_empty() {
+                return Err(SourceError::SourceProtocolMismatch {
+                    reason: "verbose getblock valuePools contains an empty pool id",
+                });
+            }
+            if !pool_ids.insert(entry.id.clone()) {
+                return Err(SourceError::SourceProtocolMismatch {
+                    reason: "verbose getblock valuePools contains a duplicate pool id",
+                });
+            }
+            let value_zat = entry
+                .chain_value_zat
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| SourceError::SourceProtocolMismatch {
+                    reason: "verbose getblock valuePools contains a negative balance",
+                })?;
+            pools.push(ValuePoolBalance::new(entry.id, entry.monitored, value_zat));
+        }
+
+        Ok(BlockValuePoolBalances::new(block_id, response_time, pools))
     }
 
     async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
@@ -1393,6 +1483,9 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
             | SourceError::InvalidTransactionIdLength { .. }
             | SourceError::InvalidSubtreeRootHex { .. }
             | SourceError::InvalidSubtreeRootLength { .. }
+            | SourceError::MalformedFinalNoteCommitmentRoot { .. }
+            | SourceError::InvalidFinalNoteCommitmentRootHex { .. }
+            | SourceError::InvalidFinalNoteCommitmentRootLength { .. }
             | SourceError::RawBlockParseFailed { .. }
             | SourceError::RawTransactionParseFailed { .. }
             | SourceError::TransactionComponentIndexOverflow { .. }
@@ -1424,6 +1517,7 @@ fn parse_openrpc_capabilities(openrpc_response: &Value) -> NodeCapabilities {
     let method_names = openrpc_method_names(openrpc_response);
     if method_names.contains(&"getblock") {
         probed_capabilities.push(NodeCapability::BestChainBlocks);
+        probed_capabilities.push(NodeCapability::BlockValuePoolBalances);
     }
     if method_names.contains(&"getblock") {
         probed_capabilities.push(NodeCapability::SourceChainSegments);
@@ -1570,6 +1664,56 @@ fn validate_zebra_tree_state(
     }
 
     Ok(())
+}
+
+fn parse_zebra_final_note_commitment_roots(
+    tree_state: &Value,
+    block_id: BlockId,
+) -> Result<BlockFinalNoteCommitmentRoots, SourceError> {
+    validate_zebra_tree_state(tree_state, block_id.height, block_id.hash)?;
+
+    Ok(BlockFinalNoteCommitmentRoots::new(
+        block_id.height,
+        block_id.hash,
+        parse_zebra_final_note_commitment_root(tree_state, ShieldedProtocol::Sapling)?,
+        parse_zebra_final_note_commitment_root(tree_state, ShieldedProtocol::Orchard)?,
+        parse_zebra_final_note_commitment_root(tree_state, ShieldedProtocol::Ironwood)?,
+    ))
+}
+
+fn parse_zebra_final_note_commitment_root(
+    tree_state: &Value,
+    protocol: ShieldedProtocol,
+) -> Result<Option<FinalNoteCommitmentRoot>, SourceError> {
+    let Some(pool) = tree_state.get(protocol.rpc_pool_name()) else {
+        return Ok(None);
+    };
+    let Some(commitments) = pool.get("commitments") else {
+        return Ok(None);
+    };
+    let Some(final_root) = commitments.get("finalRoot") else {
+        return Ok(None);
+    };
+    if final_root.is_null() {
+        return Ok(None);
+    }
+    let root_hex = final_root
+        .as_str()
+        .ok_or(SourceError::MalformedFinalNoteCommitmentRoot {
+            protocol,
+            reason: "finalRoot must be a hex string or null",
+        })?;
+    let root_bytes = hex::decode(root_hex)
+        .map_err(|source| SourceError::InvalidFinalNoteCommitmentRootHex { protocol, source })?;
+    let byte_count = root_bytes.len();
+    let root_bytes = <[u8; 32]>::try_from(root_bytes.as_slice()).map_err(|_| {
+        SourceError::InvalidFinalNoteCommitmentRootLength {
+            protocol,
+            byte_count,
+        }
+    })?;
+
+    Ok(Some(FinalNoteCommitmentRoot::from_bytes(root_bytes)))
 }
 
 fn decode_display_transaction_id(
@@ -1809,6 +1953,18 @@ struct ZebraGetBlockTrees {
 }
 
 #[derive(Deserialize)]
+struct ZebraGetBlockValuePools {
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    time: Option<i64>,
+    #[serde(rename = "valuePools", default)]
+    value_pools: Option<Vec<ZebraValuePoolEntry>>,
+}
+
+#[derive(Deserialize)]
 struct ZebraGetBlockchainInfoUpgrades {
     // Preserve the node's advertised order. `getblockchaininfo` lists upgrades
     // in activation sequence, so when several share an activation height
@@ -1852,6 +2008,8 @@ where
 #[derive(Deserialize)]
 struct ZebraGetBlockchainInfoValuePools {
     blocks: u32,
+    #[serde(rename = "bestblockhash")]
+    best_block_hash: String,
     #[serde(rename = "valuePools", default)]
     value_pools: Vec<ZebraValuePoolEntry>,
 }

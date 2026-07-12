@@ -1,19 +1,30 @@
 //! Epoch-bound chain artifact reader.
 
-use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU32;
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
-    CompactBlockArtifact, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionFactsArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentOutputEntry, TransparentSpendFact,
+    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockValuePoolBalances, ChainEpoch, ChainEpochId, CompactBlockArtifact,
+    DisplacedRootArchiveCoverage, DisplacedRootCandidate, FinalNoteCommitmentRoot,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentOutputEntry, TransparentSpendFact,
     TransparentUnspentOutput, TransparentUtxoSetSummary, TreeStateArtifact,
 };
 
 use crate::{
     StoreError,
     address_output_index::{
-        AddressOutputIndexStore, read_address_output_index, read_transparent_utxo_set_aggregate,
+        AddressOutputIndexStore, TransparentAddressBalanceSnapshot, read_address_output_index,
+        read_transparent_address_balance_snapshot, read_transparent_utxo_set_aggregate,
     },
     block_artifact::{
         BlockBlobStore, BlockHeaderStore, BlockTransactionIndexStore, CompactBlockStore,
@@ -23,13 +34,24 @@ use crate::{
         read_compact_block_artifacts,
     },
     block_hash_index::{BlockHashLookup, read_block_hash_lookup},
+    block_value_pool_balances::{
+        BlockValuePoolBalancesStore, read_block_value_pool_balances,
+        read_block_value_pool_balances_in_range,
+    },
+    displaced_block::{read_displaced_root_archive_coverage, read_displaced_root_candidates},
+    final_note_commitment_roots::{
+        FinalNoteCommitmentRootsStore, read_final_note_commitment_roots,
+        read_final_note_commitment_roots_in_range,
+    },
     kv::RocksChainStoreReadView,
     subtree_root::{SubtreeRootStore, read_subtree_root_artifacts},
     transaction_artifact::{
-        TransactionBlobStore, TransactionFactsStore, TransactionLocationStore,
-        read_transaction_blob_artifact, read_transaction_facts_artifact,
+        TransactionBlobStore, TransactionFactsStore, TransactionIntrinsicValueBalancesStore,
+        TransactionLocationStore, read_transaction_blob_artifact, read_transaction_facts_artifact,
         read_transaction_facts_artifacts_batch,
-        read_transaction_facts_artifacts_batch_with_known_headers, read_transaction_location,
+        read_transaction_facts_artifacts_batch_with_known_headers,
+        read_transaction_intrinsic_value_balances, read_transaction_intrinsic_value_balances_batch,
+        read_transaction_location,
     },
     transparent_output::{
         read_current_transparent_outputs_by_outpoints,
@@ -47,29 +69,58 @@ pub struct ChainEpochReader<'store> {
     chain_epoch: ChainEpoch,
     read_view: RocksChainStoreReadView<'store>,
     is_current: bool,
+    secondary_visible_epoch: Option<Arc<AtomicU64>>,
 }
 
 impl<'store> ChainEpochReader<'store> {
-    pub(crate) const fn current(
+    pub(crate) fn current(
         chain_epoch: ChainEpoch,
         read_view: RocksChainStoreReadView<'store>,
+        secondary_visible_epoch: Option<Arc<AtomicU64>>,
     ) -> Self {
         Self {
             chain_epoch,
             read_view,
             is_current: true,
+            secondary_visible_epoch,
         }
     }
 
-    pub(crate) const fn at_epoch(
+    pub(crate) fn at_epoch(
         chain_epoch: ChainEpoch,
         read_view: RocksChainStoreReadView<'store>,
+        secondary_visible_epoch: Option<Arc<AtomicU64>>,
     ) -> Self {
         Self {
             chain_epoch,
             read_view,
             is_current: false,
+            secondary_visible_epoch,
         }
+    }
+
+    fn read_at_pinned_secondary_epoch<T>(
+        &self,
+        read: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.ensure_secondary_epoch_is_pinned()?;
+        let read_outcome = read();
+        self.ensure_secondary_epoch_is_pinned()?;
+        read_outcome
+    }
+
+    fn ensure_secondary_epoch_is_pinned(&self) -> Result<(), StoreError> {
+        let Some(visible_epoch) = &self.secondary_visible_epoch else {
+            return Ok(());
+        };
+        let current = ChainEpochId::new(visible_epoch.load(Ordering::Acquire));
+        if current == self.chain_epoch.id {
+            return Ok(());
+        }
+        Err(StoreError::ChainEpochConflict {
+            current,
+            attempted: self.chain_epoch.id,
+        })
     }
 
     /// Returns the chain epoch this reader is pinned to.
@@ -83,7 +134,9 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         height: BlockHeight,
     ) -> Result<Option<BlockHeaderArtifact>, StoreError> {
-        read_block_header_artifact(&self.read_view, self.chain_epoch, height)
+        self.read_at_pinned_secondary_epoch(|| {
+            read_block_header_artifact(&self.read_view, self.chain_epoch, height)
+        })
     }
 
     /// Reads block-header facts in one batched store read.
@@ -203,6 +256,27 @@ impl<'store> ChainEpochReader<'store> {
         read_transaction_blob_artifact(&self.read_view, self.chain_epoch, transaction_id)
     }
 
+    /// Reads optional transaction-intrinsic shielded value balances by transaction id.
+    pub fn transaction_intrinsic_value_balances_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionIntrinsicValueBalancesArtifact>, StoreError> {
+        read_transaction_intrinsic_value_balances(&self.read_view, self.chain_epoch, transaction_id)
+    }
+
+    /// Reads optional transaction-intrinsic shielded value balances in one batched store read.
+    pub fn transaction_intrinsic_value_balances_by_ids(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<HashMap<TransactionId, Option<TransactionIntrinsicValueBalancesArtifact>>, StoreError>
+    {
+        read_transaction_intrinsic_value_balances_batch(
+            &self.read_view,
+            self.chain_epoch,
+            transaction_ids,
+        )
+    }
+
     /// Reads a checkpoint tree-state artifact at or before `max_height`.
     pub fn tree_state_checkpoint_at_or_before(
         &self,
@@ -214,6 +288,85 @@ impl<'store> ChainEpochReader<'store> {
     /// Reads the latest checkpoint tree-state artifact visible to this reader.
     pub fn latest_tree_state_checkpoint(&self) -> Result<Option<TreeStateArtifact>, StoreError> {
         self.tree_state_checkpoint_at_or_before(self.chain_epoch.visible_tip_height)
+    }
+
+    /// Reads final note-commitment roots associated with one canonical block.
+    pub fn final_note_commitment_roots_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockFinalNoteCommitmentRoots>, StoreError> {
+        self.read_at_pinned_secondary_epoch(|| {
+            read_final_note_commitment_roots(&self.read_view, self.chain_epoch, height)
+        })
+    }
+
+    /// Reads final note-commitment roots in ascending height order.
+    pub fn final_note_commitment_roots_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockFinalNoteCommitmentRoots>>, StoreError> {
+        read_final_note_commitment_roots_in_range(&self.read_view, self.chain_epoch, block_range)
+    }
+
+    /// Reads newest-first displaced occurrences matching one final root and protocol.
+    ///
+    /// The candidates share this reader's exact `RocksDB` snapshot with canonical
+    /// header validation and [`Self::displaced_root_archive_coverage`]. The
+    /// append-only reverse index is not epoch-versioned, so historical readers
+    /// reject this operation.
+    pub fn displaced_root_candidates(
+        &self,
+        protocol: ShieldedProtocol,
+        root: FinalNoteCommitmentRoot,
+        limit: NonZeroU32,
+    ) -> Result<Vec<DisplacedRootCandidate>, StoreError> {
+        if !self.is_current {
+            return Err(StoreError::Unsupported {
+                feature: "displaced root candidates on historical chain epochs",
+            });
+        }
+        self.read_at_pinned_secondary_epoch(|| {
+            read_displaced_root_candidates(
+                &self.read_view,
+                self.chain_epoch.network,
+                protocol,
+                root,
+                limit,
+            )
+        })
+    }
+
+    /// Reads displaced-root coverage from this reader's exact `RocksDB` snapshot.
+    ///
+    /// Historical readers reject this operation because coverage describes an
+    /// append-only writer sequence rather than a versioned canonical artifact.
+    pub fn displaced_root_archive_coverage(
+        &self,
+    ) -> Result<Option<DisplacedRootArchiveCoverage>, StoreError> {
+        if !self.is_current {
+            return Err(StoreError::Unsupported {
+                feature: "displaced root coverage on historical chain epochs",
+            });
+        }
+        self.read_at_pinned_secondary_epoch(|| {
+            read_displaced_root_archive_coverage(&self.read_view)
+        })
+    }
+
+    /// Reads cumulative value-pool balances after one canonical block.
+    pub fn block_value_pool_balances_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockValuePoolBalances>, StoreError> {
+        read_block_value_pool_balances(&self.read_view, self.chain_epoch, height)
+    }
+
+    /// Reads cumulative value-pool balances in ascending height order.
+    pub fn block_value_pool_balances_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockValuePoolBalances>>, StoreError> {
+        read_block_value_pool_balances_in_range(&self.read_view, self.chain_epoch, block_range)
     }
 
     /// Reads subtree-root artifacts in ascending subtree-index order.
@@ -237,6 +390,42 @@ impl<'store> ChainEpochReader<'store> {
             address_script_hash,
             start_height,
             max_entries,
+        )
+    }
+
+    /// Reads exact current transparent balances at this reader's visible tip.
+    ///
+    /// The current projection cannot reconstruct an older epoch after later
+    /// spends have changed it, so this operation is available only on a reader
+    /// returned by `current_chain_epoch_reader`.
+    pub fn transparent_address_balance_snapshot(
+        &self,
+    ) -> Result<TransparentAddressBalanceSnapshot, StoreError> {
+        if !self.is_current {
+            return Err(StoreError::Unsupported {
+                feature: "transparent address balance snapshots on historical chain epochs",
+            });
+        }
+        read_transparent_address_balance_snapshot(
+            &self.read_view,
+            self.chain_epoch,
+            self.chain_epoch.visible_tip_height,
+        )
+    }
+
+    /// Reads exact transparent balances at this reader's settled tip.
+    pub fn settled_transparent_address_balance_snapshot(
+        &self,
+    ) -> Result<TransparentAddressBalanceSnapshot, StoreError> {
+        if !self.is_current {
+            return Err(StoreError::Unsupported {
+                feature: "settled transparent address balance snapshots on historical chain epochs",
+            });
+        }
+        read_transparent_address_balance_snapshot(
+            &self.read_view,
+            self.chain_epoch,
+            self.chain_epoch.settled_tip_height,
         )
     }
 
@@ -474,12 +663,61 @@ impl TransactionBlobStore for ChainEpochReader<'_> {
     }
 }
 
+impl TransactionIntrinsicValueBalancesStore for ChainEpochReader<'_> {
+    fn transaction_intrinsic_value_balances_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionIntrinsicValueBalancesArtifact>, StoreError> {
+        self.transaction_intrinsic_value_balances_by_id(transaction_id)
+    }
+
+    fn transaction_intrinsic_value_balances_by_ids(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<HashMap<TransactionId, Option<TransactionIntrinsicValueBalancesArtifact>>, StoreError>
+    {
+        self.transaction_intrinsic_value_balances_by_ids(transaction_ids)
+    }
+}
+
 impl TreeStateStore for ChainEpochReader<'_> {
     fn tree_state_checkpoint_at_or_before(
         &self,
         max_height: BlockHeight,
     ) -> Result<Option<TreeStateArtifact>, StoreError> {
         self.tree_state_checkpoint_at_or_before(max_height)
+    }
+}
+
+impl FinalNoteCommitmentRootsStore for ChainEpochReader<'_> {
+    fn final_note_commitment_roots_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockFinalNoteCommitmentRoots>, StoreError> {
+        self.final_note_commitment_roots_at(height)
+    }
+
+    fn final_note_commitment_roots_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockFinalNoteCommitmentRoots>>, StoreError> {
+        self.final_note_commitment_roots_in_range(block_range)
+    }
+}
+
+impl BlockValuePoolBalancesStore for ChainEpochReader<'_> {
+    fn block_value_pool_balances_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockValuePoolBalances>, StoreError> {
+        self.block_value_pool_balances_at(height)
+    }
+
+    fn block_value_pool_balances_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockValuePoolBalances>>, StoreError> {
+        self.block_value_pool_balances_in_range(block_range)
     }
 }
 
@@ -500,5 +738,17 @@ impl AddressOutputIndexStore for ChainEpochReader<'_> {
         max_entries: NonZeroU32,
     ) -> Result<Vec<TransparentUnspentOutput>, StoreError> {
         self.address_output_index(address_script_hash, start_height, max_entries)
+    }
+
+    fn transparent_address_balance_snapshot(
+        &self,
+    ) -> Result<TransparentAddressBalanceSnapshot, StoreError> {
+        self.transparent_address_balance_snapshot()
+    }
+
+    fn settled_transparent_address_balance_snapshot(
+        &self,
+    ) -> Result<TransparentAddressBalanceSnapshot, StoreError> {
+        self.settled_transparent_address_balance_snapshot()
     }
 }

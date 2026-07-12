@@ -466,9 +466,11 @@ The read is canonical-only. The mempool overlay is intentionally absent: a mempo
 
 The native surface is `WalletQuery.ChainValuePoolsAtTip(ChainValuePoolsAtTipRequest) returns (ChainValuePoolsAtTipResponse)`. Capability `wallet.read.chain_value_pools_at_tip_v1` is advertised when the query deployment can proxy to an ingest writer whose source probe reported `chain_value_pools`.
 
-The response binds to the writer-visible `ChainEpoch`, carries the upstream tip height used by `getblockchaininfo`, and preserves `repeated ChainValuePool pools` in upstream order. Each pool entry carries `id`, `monitored`, and optional `chain_value_zat`. The list-shaped contract is intentional: consumers can render known pools by id without forcing Zinder to drop or rename future consensus pools.
+The response binds to the writer-visible `ChainEpoch`, carries `source_tip: BlockTip`, and preserves `repeated ChainValuePool pools` in upstream order. `source_tip` is the `blocks` plus `bestblockhash` pair returned by the same `getblockchaininfo` response as the pool totals. A caller accepting the snapshot as canonical compares both its height and hash with the intended canonical tip; height equality alone is not sufficient across a reorg. Each pool entry carries `id`, `monitored`, and optional `chain_value_zat`. The list-shaped contract is intentional: consumers can render known pools by id without forcing Zinder to drop or rename future consensus pools.
 
 `zinder-query` does not open an upstream-node connection for this method. It proxies through `IngestControl.ChainValuePoolsAtTip`, because the ingest writer owns the source handle and the source capability snapshot. Storage-only or unproxied query deployments reject the call with `UNAVAILABLE`; writers whose source lacks `chain_value_pools` reject with `FAILED_PRECONDITION`.
+
+This live snapshot is a prerequisite fact, not a value-pool history or value-flow projection. Historical pool totals and per-period movements remain separate future consumers with independent coverage and replay semantics.
 
 ## Transparent Address Balance
 

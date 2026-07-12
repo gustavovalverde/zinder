@@ -617,7 +617,13 @@ where
                      configure the writer endpoint",
                 )
                 .await?;
-            client.chain_value_pools_at_tip(request).await
+            let response = client.chain_value_pools_at_tip(request).await?;
+            if response.get_ref().source_tip.is_none() {
+                return Err(Status::data_loss(
+                    "ChainValuePoolsAtTipResponse.source_tip is missing",
+                ));
+            }
+            Ok(response)
         }
         .await;
         record_proxy_outcome("chain_value_pools_at_tip", started_at, &outcome);

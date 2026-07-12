@@ -1,10 +1,11 @@
 //! Chain epoch commit values.
 
 use zinder_core::{
-    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    BlockTransactionIndexArtifact, ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionLocation,
-    TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
+    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockTransactionIndexArtifact, BlockValuePoolBalances, ChainEpoch,
+    CompactBlockArtifact, SubtreeRootArtifact, TransactionBlobArtifact, TransactionFactsArtifact,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutputArtifact,
+    TransparentSpendFact, TreeStateArtifact,
 };
 
 /// Complete artifact set committed as one visible chain epoch.
@@ -24,10 +25,16 @@ pub struct ChainEpochArtifacts {
     pub transaction_locations: Vec<TransactionLocation>,
     /// Transaction fact rows included in this commit.
     pub transaction_facts: Vec<TransactionFactsArtifact>,
+    /// Optional transaction-intrinsic value-balance artifacts included in this commit.
+    pub transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
     /// Optional raw transaction blobs included in this commit.
     pub transaction_blobs: Vec<TransactionBlobArtifact>,
     /// Tree-state artifacts included in this commit.
     pub tree_states: Vec<TreeStateArtifact>,
+    /// Final note-commitment roots included in this commit.
+    pub final_note_commitment_roots: Vec<BlockFinalNoteCommitmentRoots>,
+    /// Optional cumulative value-pool balances included in this commit.
+    pub block_value_pool_balances: Vec<BlockValuePoolBalances>,
     /// Subtree-root artifacts included in this commit.
     pub subtree_roots: Vec<SubtreeRootArtifact>,
     /// Transparent output artifacts included in this commit. The store
@@ -55,8 +62,11 @@ impl ChainEpochArtifacts {
             block_transaction_index: Vec::new(),
             transaction_locations: Vec::new(),
             transaction_facts: Vec::new(),
+            transaction_intrinsic_value_balances: Vec::new(),
             transaction_blobs: Vec::new(),
             tree_states: Vec::new(),
+            final_note_commitment_roots: Vec::new(),
+            block_value_pool_balances: Vec::new(),
             subtree_roots: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
             transparent_spend_facts: Vec::new(),
@@ -101,6 +111,16 @@ impl ChainEpochArtifacts {
         self
     }
 
+    /// Adds optional transaction-intrinsic value balances to this commit value.
+    #[must_use]
+    pub fn with_transaction_intrinsic_value_balances(
+        mut self,
+        transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
+    ) -> Self {
+        self.transaction_intrinsic_value_balances = transaction_intrinsic_value_balances;
+        self
+    }
+
     /// Adds optional raw transaction blobs to this commit value.
     #[must_use]
     pub fn with_transaction_blobs(
@@ -115,6 +135,26 @@ impl ChainEpochArtifacts {
     #[must_use]
     pub fn with_tree_states(mut self, tree_states: Vec<TreeStateArtifact>) -> Self {
         self.tree_states = tree_states;
+        self
+    }
+
+    /// Adds final note-commitment roots to this commit value.
+    #[must_use]
+    pub fn with_final_note_commitment_roots(
+        mut self,
+        final_note_commitment_roots: Vec<BlockFinalNoteCommitmentRoots>,
+    ) -> Self {
+        self.final_note_commitment_roots = final_note_commitment_roots;
+        self
+    }
+
+    /// Adds cumulative block value-pool balances to this commit value.
+    #[must_use]
+    pub fn with_block_value_pool_balances(
+        mut self,
+        block_value_pool_balances: Vec<BlockValuePoolBalances>,
+    ) -> Self {
+        self.block_value_pool_balances = block_value_pool_balances;
         self
     }
 

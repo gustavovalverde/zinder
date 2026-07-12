@@ -35,6 +35,9 @@ pub(crate) async fn handle_value_pool_summary(
         .ok_or_else(|| {
             ExplorerError::internal("ChainValuePoolsAtTipResponse.chain_view.chain_epoch missing")
         })?;
+    let source_tip = response.source_tip.ok_or_else(|| {
+        ExplorerError::internal("ChainValuePoolsAtTipResponse.source_tip missing")
+    })?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
@@ -49,6 +52,6 @@ pub(crate) async fn handle_value_pool_summary(
     Ok(Response::new(ValuePoolSummaryResponse {
         freshness: Some(freshness),
         pools: response.pools,
-        tip_height: response.tip_height,
+        source_tip: Some(source_tip),
     }))
 }

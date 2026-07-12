@@ -71,6 +71,10 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `compact_block` | Protobuf-compatible compact block artifact envelopes |
 | `tree_state` | Sapling and Orchard tree state metadata needed by wallet APIs |
 | `transaction` | Transaction lookup records required by wallet and explorer APIs |
+| `transaction_intrinsic_value_balances` | Optional signed Sprout, Sapling, Orchard, and Ironwood balances parsed from one canonical transaction; introduced by artifact schema 15 and enrichable in place |
+| `final_note_commitment_roots` | Optional post-block Sapling, Orchard, and Ironwood roots with explicit historical enrichment coverage; introduced by artifact schema 14 |
+| `block_value_pool_balances` | Optional post-block cumulative value-pool balances bound to exact block identity and time; introduced by artifact schema 16 |
+| `displaced_block` and indexes | Writer-owned archive keyed by displaced block hash and observation order; capture begins at the schema-17 activation record and is retained permanently |
 | `address_output_index` | Reorg-safe current projection of unspent transparent outputs keyed `(network, address_script_hash, height, outpoint)`. Rows derive from `transparent_outputs_by_outpoint` at commit; spends hide rows at read time inside the reorg window, and the safe-tip retention sweep deletes finalized-spent rows |
 | `transparent_output` | Exact canonical `(network, outpoint)` projection for transparent-output resolution hot paths. Unspent rows are retained forever for prevout resolution; finalized-spent rows are deleted by the safe-tip retention sweep |
 | `transparent_output_block_index` | Block-local transparent outpoint lists used to bound current-projection repair during reorg replacement |
@@ -80,6 +84,10 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `reorg_window` | Visibility index for epoch-bound artifact overlays and replaceable links within the reorg window |
 | `chain_event` | Durable chain-event stream envelopes; retained per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) (default 168 hours, time-windowed pruning) |
 | `mempool_event` | Durable mempool-event log per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md); retained per kind (default 60 minutes for `Mined`, 24 hours for `Invalidated`, derived shorter window for `Added`) |
+
+Canonical artifact schema and derive-consumer schema are separate version domains. Canonical schemas 13 through 17 describe facts written or enriched by the single canonical writer. Each derive consumer independently versions its own rows and publishes a projection checkpoint and coverage. Neither version can be used as a substitute for the other.
+
+The displaced-block archive is intentionally permanent in this release. There is no retention knob and no pruning path. This preserves hash-addressed post-reorg evidence and makes coverage monotonic, but the archive and its indexes grow with accepted replacements. Any future bounded policy requires its own ADR covering cursor invalidation, coverage contraction, secondary-reader safety, and checkpoint restore behavior.
 
 Mempool state is split between in-memory and persistent storage. The live `MempoolIndex` lives in `zinder-ingest` as in-process state, not in canonical RocksDB. The `mempool_event` column family persists the typed event log for retention-dependent queries (rebroadcast detection, audit) and cursor resume on `WalletQuery.MempoolEvents`. Reads from the mempool event log go through `MempoolEventReadApi`, parallel to but distinct from `ChainEpochReadApi`; live snapshots and live stream tailing still require the ingest-owned private control surface because secondary RocksDB readers cannot observe the live in-process index. Mempool events do not participate in `commit_ingest_batch`; they are written by `zinder-ingest` as each `MempoolSourceEvent` arrives.
 

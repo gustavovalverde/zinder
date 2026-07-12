@@ -5,7 +5,58 @@
 //! instead of normalizing into a fixed set of known pool names so future
 //! pools can flow through the boundary without a wire-shape change.
 
-use crate::{BlockHeight, ChainEpoch};
+use crate::{BlockId, ChainEpoch};
+
+/// One cumulative value-pool balance reported for a historical block.
+///
+/// Pool identifiers are deliberately dynamic so a node can advertise future
+/// consensus pools without a Zinder type or storage-schema change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValuePoolBalance {
+    /// Stable upstream pool identifier.
+    pub id: String,
+    /// Whether the upstream node monitors this pool's value.
+    pub monitored: bool,
+    /// Cumulative pool balance after the block, in zatoshi.
+    ///
+    /// `None` preserves an advertised pool whose value is unavailable.
+    pub value_zat: Option<u64>,
+}
+
+impl ValuePoolBalance {
+    /// Builds one cumulative value-pool balance.
+    #[must_use]
+    pub fn new(id: impl Into<String>, monitored: bool, value_zat: Option<u64>) -> Self {
+        Self {
+            id: id.into(),
+            monitored,
+            value_zat,
+        }
+    }
+}
+
+/// Authoritative cumulative value-pool balances after one block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockValuePoolBalances {
+    /// Exact block identity attached to the upstream observation.
+    pub block_id: BlockId,
+    /// Block timestamp returned by the same upstream observation.
+    pub block_time_seconds: i64,
+    /// Value-pool balances in upstream-advertised order.
+    pub pools: Vec<ValuePoolBalance>,
+}
+
+impl BlockValuePoolBalances {
+    /// Builds one block-bound cumulative value-pool balance artifact.
+    #[must_use]
+    pub fn new(block_id: BlockId, block_time_seconds: i64, pools: Vec<ValuePoolBalance>) -> Self {
+        Self {
+            block_id,
+            block_time_seconds,
+            pools,
+        }
+    }
+}
 
 /// One upstream value-pool entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,11 +87,11 @@ impl ChainValuePool {
     }
 }
 
-/// Chain-wide value pool totals at a particular tip height.
+/// Chain-wide value pool totals at a particular source tip.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainValuePools {
-    /// Tip height the upstream node reported when computing the pools.
-    pub tip_height: BlockHeight,
+    /// Source tip the upstream node reported when computing the pools.
+    pub source_tip: BlockId,
     /// Upstream value-pool entries, preserved in upstream order.
     pub pools: Vec<ChainValuePool>,
 }
@@ -48,8 +99,8 @@ pub struct ChainValuePools {
 impl ChainValuePools {
     /// Builds a tip-bound value-pool snapshot.
     #[must_use]
-    pub fn new(tip_height: BlockHeight, pools: Vec<ChainValuePool>) -> Self {
-        Self { tip_height, pools }
+    pub fn new(source_tip: BlockId, pools: Vec<ChainValuePool>) -> Self {
+        Self { source_tip, pools }
     }
 }
 
@@ -59,8 +110,8 @@ pub struct ChainValuePoolsAtTip {
     /// Chain epoch visible to Zinder when the upstream value-pool read was
     /// answered.
     pub chain_epoch: ChainEpoch,
-    /// Tip height the upstream node reported when computing the pools.
-    pub tip_height: BlockHeight,
+    /// Source tip the upstream node reported when computing the pools.
+    pub source_tip: BlockId,
     /// Upstream value-pool entries, preserved in upstream order.
     pub pools: Vec<ChainValuePool>,
 }
@@ -71,8 +122,42 @@ impl ChainValuePoolsAtTip {
     pub fn from_source(chain_epoch: ChainEpoch, source_value_pools: ChainValuePools) -> Self {
         Self {
             chain_epoch,
-            tip_height: source_value_pools.tip_height,
+            source_tip: source_value_pools.source_tip,
             pools: source_value_pools.pools,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        ArtifactSchemaVersion, BlockHash, BlockHeight, BlockId, ChainEpoch, ChainEpochId,
+        ChainTipMetadata, Network, UnixTimestampMillis,
+    };
+
+    use super::{ChainValuePool, ChainValuePools, ChainValuePoolsAtTip};
+
+    #[test]
+    fn wallet_value_pools_preserve_source_tip_identity() {
+        let source_tip = BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32]));
+        let source_value_pools = ChainValuePools::new(
+            source_tip,
+            vec![ChainValuePool::new("transparent", true, Some(1))],
+        );
+
+        let chain_epoch = ChainEpoch {
+            id: ChainEpochId::new(7),
+            network: Network::ZcashRegtest,
+            visible_tip_height: source_tip.height,
+            visible_tip_hash: source_tip.hash,
+            settled_tip_height: source_tip.height,
+            settled_tip_hash: source_tip.hash,
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1),
+        };
+        let value_pools = ChainValuePoolsAtTip::from_source(chain_epoch, source_value_pools);
+
+        assert_eq!(value_pools.source_tip, source_tip);
     }
 }

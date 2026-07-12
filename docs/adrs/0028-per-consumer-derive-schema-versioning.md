@@ -104,8 +104,12 @@ declared consumer against the manifest:
   must never reinterpret a newer row contract as permission to rebuild it.
 - **Recorded but no longer declared.** Fail with `ConsumerNotDeclared` before
   mutation. Absence may mean rollback or configuration drift; it is not an
-  explicit destructive migration. Consumer removal is deferred until a real
-  removal use case defines its own operator-visible contract.
+  explicit destructive migration. Removal requires a separate store-format
+  migration that names the retired consumer, clears its rows and cursors
+  atomically, documents rollback, and is coordinated across every reader and
+  writer. Until that migration exists, `recent_transactions` and every other
+  recorded consumer remain declared even when a newer projection overlaps
+  their product use case.
 - **Declared but not recorded.** Clear the rows of its declared column
   families, then write its manifest entry at the declared version. Clearing
   starts the consumer from an empty projection, so a family that previously

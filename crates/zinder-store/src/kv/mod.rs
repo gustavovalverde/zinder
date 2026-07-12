@@ -20,8 +20,11 @@ pub(crate) enum StorageTable {
     BlockTransactionIndex,
     TransactionLocation,
     TransactionFacts,
+    TransactionIntrinsicValueBalances,
     TransactionBlob,
     TreeState,
+    FinalNoteCommitmentRoots,
+    BlockValuePoolBalances,
     SubtreeRoot,
     AddressOutputIndex,
     TransparentOutput,
@@ -32,6 +35,7 @@ pub(crate) enum StorageTable {
     ReorgWindow,
     ChainEvent,
     MempoolEvent,
+    DisplacedBlock,
 }
 
 impl StorageTable {
@@ -45,8 +49,11 @@ impl StorageTable {
             Self::BlockTransactionIndex => "block_transaction_index",
             Self::TransactionLocation => "transaction_location",
             Self::TransactionFacts => "transaction_facts",
+            Self::TransactionIntrinsicValueBalances => "transaction_intrinsic_value_balances",
             Self::TransactionBlob => "transaction_blob",
             Self::TreeState => "tree_state",
+            Self::FinalNoteCommitmentRoots => "final_note_commitment_roots",
+            Self::BlockValuePoolBalances => "block_value_pool_balances",
             Self::SubtreeRoot => "subtree_root",
             Self::AddressOutputIndex => "address_output_index",
             Self::TransparentOutput => "transparent_output",
@@ -57,10 +64,11 @@ impl StorageTable {
             Self::ReorgWindow => "reorg_window",
             Self::ChainEvent => "chain_event",
             Self::MempoolEvent => "mempool_event",
+            Self::DisplacedBlock => "displaced_block",
         }
     }
 
-    pub(crate) const fn all() -> [Self; 20] {
+    pub(crate) const fn all() -> [Self; 24] {
         [
             Self::StorageControl,
             Self::ChainEpoch,
@@ -70,8 +78,11 @@ impl StorageTable {
             Self::BlockTransactionIndex,
             Self::TransactionLocation,
             Self::TransactionFacts,
+            Self::TransactionIntrinsicValueBalances,
             Self::TransactionBlob,
             Self::TreeState,
+            Self::FinalNoteCommitmentRoots,
+            Self::BlockValuePoolBalances,
             Self::SubtreeRoot,
             Self::AddressOutputIndex,
             Self::TransparentOutput,
@@ -82,6 +93,7 @@ impl StorageTable {
             Self::ReorgWindow,
             Self::ChainEvent,
             Self::MempoolEvent,
+            Self::DisplacedBlock,
         ]
     }
 }

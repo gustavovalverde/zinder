@@ -139,7 +139,7 @@ fn block_production_series_round_trips_coverage_header_and_coinbase() -> eyre::R
                     value_zat: 137_500_000,
                     script_pub_key: vec![0x51],
                 }],
-                has_shielded_outputs: true,
+                has_shielded_outputs: Some(true),
             }),
         }],
     };
@@ -156,7 +156,7 @@ fn block_production_series_round_trips_coverage_header_and_coinbase() -> eyre::R
         .ok_or_else(|| eyre!("block production point missing coinbase"))?;
     assert_eq!(coinbase.transaction_id, "cd".repeat(32));
     assert_eq!(coinbase.transparent_outputs[0].value_zat, 137_500_000);
-    assert!(coinbase.has_shielded_outputs);
+    assert_eq!(coinbase.has_shielded_outputs, Some(true));
     assert_eq!(
         decoded.points[0]
             .summary
@@ -273,6 +273,7 @@ fn transaction_detail_response_fixture() -> explorer::TransactionDetailResponse 
                 }),
             }),
         }],
+        intrinsic_value_balances: None,
     }
 }
 
@@ -290,6 +291,7 @@ fn transaction_detail_response_carries_conflicting_location() -> eyre::Result<()
         prevout_resolution_status: 0,
         transparent_inputs: Vec::new(),
         transparent_outputs: Vec::new(),
+        intrinsic_value_balances: None,
     };
     let decoded = round_trip(&response)?;
 
@@ -406,6 +408,7 @@ fn block_transactions_response_fixture() -> explorer::BlockTransactionsResponse 
                 transparent_inputs: Vec::new(),
             },
         ],
+        final_note_commitment_roots: None,
     }
 }
 

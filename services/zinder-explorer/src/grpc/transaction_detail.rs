@@ -46,6 +46,7 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
+use super::intrinsic_value_balances::resolve_transaction_intrinsic_value_balances;
 use super::require_matching_chain_epoch;
 use super::transparent_input::{
     encode_mined_transparent_inputs, encode_unresolved_transparent_inputs, parent_transaction_ids,
@@ -129,6 +130,11 @@ pub(crate) async fn handle_transaction_detail(
         fees.as_ref(),
     )
     .await?;
+    let intrinsic_value_balances = resolve_detail_intrinsic_value_balances(
+        canonical_reader.as_ref(),
+        network,
+        transaction.canonical_artifact.as_ref(),
+    )?;
     let (paid_fee_zat, prevout_resolution_status) = fees.as_ref().map_or((None, 0), |record| {
         (record.paid_fee_zat, record.prevout_resolution_status)
     });
@@ -140,6 +146,7 @@ pub(crate) async fn handle_transaction_detail(
         prevout_resolution_status,
         transparent_inputs: transparent_rows.inputs,
         transparent_outputs: transparent_rows.outputs,
+        intrinsic_value_balances,
     }))
 }
 
@@ -153,6 +160,23 @@ struct ResolvedTransactionDetail {
 struct ResolvedTransparentRows {
     inputs: Vec<zinder_proto::v1::explorer::TransparentInput>,
     outputs: Vec<WireTransparentOutput>,
+}
+
+fn resolve_detail_intrinsic_value_balances(
+    canonical_reader: Option<&ChainEpochReader<'_>>,
+    network: zinder_core::Network,
+    transaction: Option<&TransactionFactsArtifact>,
+) -> Result<Option<zinder_proto::v1::explorer::TransactionIntrinsicValueBalances>, Status> {
+    let (Some(reader), Some(transaction)) = (canonical_reader, transaction) else {
+        return Ok(None);
+    };
+    let transaction_id = transaction.location.transaction_id;
+    Ok(resolve_transaction_intrinsic_value_balances(
+        reader,
+        network,
+        &[(transaction_id, transaction.location)],
+    )?
+    .remove(&transaction_id))
 }
 
 async fn resolve_transparent_rows(

@@ -40,6 +40,14 @@ pub(crate) enum PayloadFormat {
     ZinderTransactionBlobArtifactV1 = 14,
     /// Zinder protobuf payload for the transparent spend fact block index.
     ZinderTransparentSpendFactBlockIndexV1 = 15,
+    /// Zinder protobuf payload for final note-commitment roots after a block.
+    ZinderBlockFinalNoteCommitmentRootsV1 = 17,
+    /// Zinder protobuf payload for transaction-intrinsic value balances.
+    ZinderTransactionIntrinsicValueBalancesV1 = 18,
+    /// Zinder protobuf payload for cumulative block value-pool balances.
+    ZinderBlockValuePoolBalancesV1 = 19,
+    /// Zinder protobuf payload for a displaced block.
+    ZinderDisplacedBlockV1 = 20,
 }
 
 impl PayloadFormat {
@@ -59,6 +67,10 @@ impl PayloadFormat {
             14 => Some(Self::ZinderTransactionBlobArtifactV1),
             15 => Some(Self::ZinderTransparentSpendFactBlockIndexV1),
             16 => Some(Self::ZinderTransparentSpendFactV2),
+            17 => Some(Self::ZinderBlockFinalNoteCommitmentRootsV1),
+            18 => Some(Self::ZinderTransactionIntrinsicValueBalancesV1),
+            19 => Some(Self::ZinderBlockValuePoolBalancesV1),
+            20 => Some(Self::ZinderDisplacedBlockV1),
             _ => None,
         }
     }

@@ -2780,6 +2780,7 @@ mod tests {
             block_transaction_index: Vec::new(),
             transaction_locations: Vec::new(),
             transaction_facts: Vec::new(),
+            transaction_intrinsic_value_balances: Vec::new(),
             transaction_blobs: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
         }

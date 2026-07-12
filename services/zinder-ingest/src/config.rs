@@ -19,12 +19,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_ingest::{
-    BulkCatchupConfig, ChainEventRetentionConfig,
-    DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    BulkCatchupConfig, ChainEventRetentionConfig, CommitmentRootBackfillConfig,
+    ConventionalFeeDistributionBackfillConfig, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, DeriveReplayPolicy, IngestDeriveConfig, IngestError,
     IngestLoopConfig, IngestModifiers, MempoolEventRetentionWorkerConfig, NodeSourceKind,
-    PhasesConfig, RawBlobPolicy, TipFollowPhaseConfig, container_memory_budget_bytes,
+    PaidFeeDistributionBackfillConfig, PhasesConfig, RawBlobPolicy, TipFollowPhaseConfig,
+    TransactionComponentBackfillConfig, TransactionHistoryVerifierConfig,
+    ValuePoolBalanceBackfillConfig, ValuePoolFlowBackfillConfig, container_memory_budget_bytes,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
@@ -104,6 +106,26 @@ const DEFAULT_DERIVE_REPLAY_MEMORY_RESUME_RATIO: f64 = 0.80;
 const BLOCK_PREPARE_CONCURRENCY_CEILING: u32 = 16;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
+const DEFAULT_COMMITMENT_ROOT_BACKFILL_ENABLED: bool = true;
+const DEFAULT_COMMITMENT_ROOT_BACKFILL_BATCH_BLOCKS: u32 = 256;
+const DEFAULT_COMMITMENT_ROOT_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
+const DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_ENABLED: bool = true;
+const DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS: u32 = 256;
+const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_ENABLED: bool = true;
+const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS: u32 = 256;
+const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
+const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_HISTORY_DAYS: u32 = 365;
+const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_TIMESTAMP_SAFETY_SECONDS: u64 = 7_200;
+const DEFAULT_TRANSACTION_COMPONENT_BACKFILL_ENABLED: bool = true;
+const DEFAULT_TRANSACTION_COMPONENT_BACKFILL_BATCH_BLOCKS: u32 = 256;
+const DEFAULT_TRANSACTION_HISTORY_VERIFIER_ENABLED: bool = true;
+const DEFAULT_TRANSACTION_HISTORY_VERIFIER_BATCH_BLOCKS: u32 = 256;
+const DEFAULT_VALUE_POOL_FLOW_BACKFILL_ENABLED: bool = true;
+const DEFAULT_VALUE_POOL_FLOW_BACKFILL_BATCH_BLOCKS: u32 = 256;
+const DEFAULT_VALUE_POOL_FLOW_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
+const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_ENABLED: bool = true;
+const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_BATCH_BLOCKS: u32 = 10_000;
+const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
 const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
 
@@ -112,6 +134,12 @@ const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
 #[derive(Debug)]
 pub(crate) struct IngestCommandConfig {
     pub(crate) loop_config: IngestLoopConfig,
+    pub(crate) conventional_fee_distribution_backfill: ConventionalFeeDistributionBackfillConfig,
+    pub(crate) paid_fee_distribution_backfill: PaidFeeDistributionBackfillConfig,
+    pub(crate) transaction_component_backfill: TransactionComponentBackfillConfig,
+    pub(crate) transaction_history_verifier: TransactionHistoryVerifierConfig,
+    pub(crate) value_pool_flow_backfill: ValuePoolFlowBackfillConfig,
+    pub(crate) value_pool_balance_backfill: ValuePoolBalanceBackfillConfig,
     pub(crate) coverage: IngestCoverage,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
@@ -332,6 +360,86 @@ pub(crate) fn load_ingest_config(
             DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS,
         )?
         .with_default(
+            "ingest.commitment_root_backfill.enabled",
+            DEFAULT_COMMITMENT_ROOT_BACKFILL_ENABLED,
+        )?
+        .with_default(
+            "ingest.commitment_root_backfill.batch_blocks",
+            DEFAULT_COMMITMENT_ROOT_BACKFILL_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.commitment_root_backfill.fetch_concurrency",
+            DEFAULT_COMMITMENT_ROOT_BACKFILL_FETCH_CONCURRENCY,
+        )?
+        .with_default(
+            "ingest.conventional_fee_distribution_backfill.enabled",
+            DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_ENABLED,
+        )?
+        .with_default(
+            "ingest.conventional_fee_distribution_backfill.batch_blocks",
+            DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.paid_fee_distribution_backfill.enabled",
+            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_ENABLED,
+        )?
+        .with_default(
+            "ingest.paid_fee_distribution_backfill.batch_blocks",
+            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.paid_fee_distribution_backfill.fetch_concurrency",
+            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_FETCH_CONCURRENCY,
+        )?
+        .with_default(
+            "ingest.paid_fee_distribution_backfill.history_days",
+            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_HISTORY_DAYS,
+        )?
+        .with_default(
+            "ingest.paid_fee_distribution_backfill.timestamp_safety_seconds",
+            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_TIMESTAMP_SAFETY_SECONDS,
+        )?
+        .with_default(
+            "ingest.transaction_component_backfill.enabled",
+            DEFAULT_TRANSACTION_COMPONENT_BACKFILL_ENABLED,
+        )?
+        .with_default(
+            "ingest.transaction_component_backfill.batch_blocks",
+            DEFAULT_TRANSACTION_COMPONENT_BACKFILL_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.transaction_history_verifier.enabled",
+            DEFAULT_TRANSACTION_HISTORY_VERIFIER_ENABLED,
+        )?
+        .with_default(
+            "ingest.transaction_history_verifier.batch_blocks",
+            DEFAULT_TRANSACTION_HISTORY_VERIFIER_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.value_pool_flow_backfill.enabled",
+            DEFAULT_VALUE_POOL_FLOW_BACKFILL_ENABLED,
+        )?
+        .with_default(
+            "ingest.value_pool_flow_backfill.batch_blocks",
+            DEFAULT_VALUE_POOL_FLOW_BACKFILL_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.value_pool_flow_backfill.fetch_concurrency",
+            DEFAULT_VALUE_POOL_FLOW_BACKFILL_FETCH_CONCURRENCY,
+        )?
+        .with_default(
+            "ingest.value_pool_balance_backfill.enabled",
+            DEFAULT_VALUE_POOL_BALANCE_BACKFILL_ENABLED,
+        )?
+        .with_default(
+            "ingest.value_pool_balance_backfill.batch_blocks",
+            DEFAULT_VALUE_POOL_BALANCE_BACKFILL_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.value_pool_balance_backfill.fetch_concurrency",
+            DEFAULT_VALUE_POOL_BALANCE_BACKFILL_FETCH_CONCURRENCY,
+        )?
+        .with_default(
             "ingest.bulk_catchup.flush_interval_epochs",
             DEFAULT_FLUSH_INTERVAL_EPOCHS,
         )?
@@ -529,6 +637,20 @@ struct IngestSection {
     phases: IngestPhasesSection,
     /// Shared derive execution knobs.
     derive: IngestDeriveSection,
+    /// Settled historical final-root enrichment.
+    commitment_root_backfill: IngestCommitmentRootBackfillSection,
+    /// Historical ZIP-317 conventional-fee distribution projection.
+    conventional_fee_distribution_backfill: IngestConventionalFeeDistributionBackfillSection,
+    /// Exact paid-fee startup seed and newest-first historical projection.
+    paid_fee_distribution_backfill: IngestPaidFeeDistributionBackfillSection,
+    /// Settled historical transaction-component projection.
+    transaction_component_backfill: IngestTransactionComponentBackfillSection,
+    /// Canonical verification for the transaction-history projection.
+    transaction_history_verifier: IngestTransactionHistoryVerifierSection,
+    /// Settled historical value-pool flow projection.
+    value_pool_flow_backfill: IngestValuePoolFlowBackfillSection,
+    /// Source-backed cumulative value-pool balance history.
+    value_pool_balance_backfill: IngestValuePoolBalanceBackfillSection,
     /// Pipelined-fetch knobs for bulk catch-up.
     bulk_catchup: IngestBulkCatchupSection,
     /// Serial-loop knobs for tip-follow.
@@ -555,6 +677,61 @@ struct IngestDeriveSection {
     memory_pause_ratio: Option<f64>,
     memory_resume_ratio: Option<f64>,
     min_replay_batch_blocks: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestCommitmentRootBackfillSection {
+    enabled: Option<bool>,
+    batch_blocks: Option<u32>,
+    fetch_concurrency: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestConventionalFeeDistributionBackfillSection {
+    enabled: Option<bool>,
+    batch_blocks: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestPaidFeeDistributionBackfillSection {
+    enabled: Option<bool>,
+    batch_blocks: Option<u32>,
+    fetch_concurrency: Option<u32>,
+    history_days: Option<u32>,
+    timestamp_safety_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestTransactionComponentBackfillSection {
+    enabled: Option<bool>,
+    batch_blocks: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestTransactionHistoryVerifierSection {
+    enabled: Option<bool>,
+    batch_blocks: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestValuePoolFlowBackfillSection {
+    enabled: Option<bool>,
+    batch_blocks: Option<u32>,
+    fetch_concurrency: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestValuePoolBalanceBackfillSection {
+    enabled: Option<bool>,
+    batch_blocks: Option<u32>,
+    fetch_concurrency: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -812,6 +989,110 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .into());
     }
 
+    let commitment_root_backfill = CommitmentRootBackfillConfig {
+        enabled: require_field(
+            config.ingest.commitment_root_backfill.enabled,
+            "ingest.commitment_root_backfill.enabled",
+        )?,
+        batch_blocks: nonzero_u32_config(
+            config.ingest.commitment_root_backfill.batch_blocks,
+            "ingest.commitment_root_backfill.batch_blocks",
+        )?,
+        fetch_concurrency: nonzero_u32_config(
+            config.ingest.commitment_root_backfill.fetch_concurrency,
+            "ingest.commitment_root_backfill.fetch_concurrency",
+        )?,
+    };
+    let transaction_component_backfill = TransactionComponentBackfillConfig {
+        enabled: require_field(
+            config.ingest.transaction_component_backfill.enabled,
+            "ingest.transaction_component_backfill.enabled",
+        )?,
+        batch_blocks: nonzero_u32_config(
+            config.ingest.transaction_component_backfill.batch_blocks,
+            "ingest.transaction_component_backfill.batch_blocks",
+        )?,
+    };
+    let transaction_history_verifier = TransactionHistoryVerifierConfig {
+        enabled: require_field(
+            config.ingest.transaction_history_verifier.enabled,
+            "ingest.transaction_history_verifier.enabled",
+        )?,
+        batch_blocks: nonzero_u32_config(
+            config.ingest.transaction_history_verifier.batch_blocks,
+            "ingest.transaction_history_verifier.batch_blocks",
+        )?,
+    };
+    let value_pool_flow_backfill = ValuePoolFlowBackfillConfig {
+        enabled: require_field(
+            config.ingest.value_pool_flow_backfill.enabled,
+            "ingest.value_pool_flow_backfill.enabled",
+        )?,
+        batch_blocks: nonzero_u32_config(
+            config.ingest.value_pool_flow_backfill.batch_blocks,
+            "ingest.value_pool_flow_backfill.batch_blocks",
+        )?,
+        fetch_concurrency: nonzero_u32_config(
+            config.ingest.value_pool_flow_backfill.fetch_concurrency,
+            "ingest.value_pool_flow_backfill.fetch_concurrency",
+        )?,
+    };
+    let value_pool_balance_backfill = ValuePoolBalanceBackfillConfig {
+        enabled: require_field(
+            config.ingest.value_pool_balance_backfill.enabled,
+            "ingest.value_pool_balance_backfill.enabled",
+        )?,
+        batch_blocks: nonzero_u32_config(
+            config.ingest.value_pool_balance_backfill.batch_blocks,
+            "ingest.value_pool_balance_backfill.batch_blocks",
+        )?,
+        fetch_concurrency: nonzero_u32_config(
+            config.ingest.value_pool_balance_backfill.fetch_concurrency,
+            "ingest.value_pool_balance_backfill.fetch_concurrency",
+        )?,
+    };
+    let conventional_fee_distribution_backfill = ConventionalFeeDistributionBackfillConfig {
+        enabled: require_field(
+            config.ingest.conventional_fee_distribution_backfill.enabled,
+            "ingest.conventional_fee_distribution_backfill.enabled",
+        )?,
+        batch_blocks: nonzero_u32_config(
+            config
+                .ingest
+                .conventional_fee_distribution_backfill
+                .batch_blocks,
+            "ingest.conventional_fee_distribution_backfill.batch_blocks",
+        )?,
+    };
+    let paid_fee_distribution_backfill = PaidFeeDistributionBackfillConfig {
+        enabled: require_field(
+            config.ingest.paid_fee_distribution_backfill.enabled,
+            "ingest.paid_fee_distribution_backfill.enabled",
+        )?,
+        batch_blocks: nonzero_u32_config(
+            config.ingest.paid_fee_distribution_backfill.batch_blocks,
+            "ingest.paid_fee_distribution_backfill.batch_blocks",
+        )?,
+        fetch_concurrency: nonzero_u32_config(
+            config
+                .ingest
+                .paid_fee_distribution_backfill
+                .fetch_concurrency,
+            "ingest.paid_fee_distribution_backfill.fetch_concurrency",
+        )?,
+        history_days: nonzero_u32_config(
+            config.ingest.paid_fee_distribution_backfill.history_days,
+            "ingest.paid_fee_distribution_backfill.history_days",
+        )?,
+        timestamp_safety_seconds: require_field(
+            config
+                .ingest
+                .paid_fee_distribution_backfill
+                .timestamp_safety_seconds,
+            "ingest.paid_fee_distribution_backfill.timestamp_safety_seconds",
+        )?,
+    };
+
     let flush_interval_epochs_raw = require_field(
         config.ingest.bulk_catchup.flush_interval_epochs,
         "ingest.bulk_catchup.flush_interval_epochs",
@@ -922,6 +1203,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             memory_resume_ratio,
             min_replay_batch_blocks,
         },
+        commitment_root_backfill,
         bulk_catchup: BulkCatchupConfig {
             canonical_batch_max_blocks,
             canonical_batch_max_artifact_bytes,
@@ -945,6 +1227,12 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
 
     Ok(IngestCommandConfig {
         loop_config,
+        conventional_fee_distribution_backfill,
+        paid_fee_distribution_backfill,
+        transaction_component_backfill,
+        transaction_history_verifier,
+        value_pool_flow_backfill,
+        value_pool_balance_backfill,
         coverage,
         ingest_control_listen_addr,
         ingest_control_bearer_token_path,
@@ -1030,6 +1318,49 @@ impl RedactedIngestConfigToml {
                     memory_pause_ratio: loop_config.derive.memory_pause_ratio,
                     memory_resume_ratio: loop_config.derive.memory_resume_ratio,
                     min_replay_batch_blocks: loop_config.derive.min_replay_batch_blocks.get(),
+                },
+                commitment_root_backfill: IngestCommitmentRootBackfillToml {
+                    enabled: loop_config.commitment_root_backfill.enabled,
+                    batch_blocks: loop_config.commitment_root_backfill.batch_blocks.get(),
+                    fetch_concurrency: loop_config.commitment_root_backfill.fetch_concurrency.get(),
+                },
+                conventional_fee_distribution_backfill:
+                    IngestConventionalFeeDistributionBackfillToml {
+                        enabled: config.conventional_fee_distribution_backfill.enabled,
+                        batch_blocks: config
+                            .conventional_fee_distribution_backfill
+                            .batch_blocks
+                            .get(),
+                    },
+                paid_fee_distribution_backfill: IngestPaidFeeDistributionBackfillToml {
+                    enabled: config.paid_fee_distribution_backfill.enabled,
+                    batch_blocks: config.paid_fee_distribution_backfill.batch_blocks.get(),
+                    fetch_concurrency: config
+                        .paid_fee_distribution_backfill
+                        .fetch_concurrency
+                        .get(),
+                    history_days: config.paid_fee_distribution_backfill.history_days.get(),
+                    timestamp_safety_seconds: config
+                        .paid_fee_distribution_backfill
+                        .timestamp_safety_seconds,
+                },
+                transaction_component_backfill: IngestTransactionComponentBackfillToml {
+                    enabled: config.transaction_component_backfill.enabled,
+                    batch_blocks: config.transaction_component_backfill.batch_blocks.get(),
+                },
+                transaction_history_verifier: IngestTransactionHistoryVerifierToml {
+                    enabled: config.transaction_history_verifier.enabled,
+                    batch_blocks: config.transaction_history_verifier.batch_blocks.get(),
+                },
+                value_pool_flow_backfill: IngestValuePoolFlowBackfillToml {
+                    enabled: config.value_pool_flow_backfill.enabled,
+                    batch_blocks: config.value_pool_flow_backfill.batch_blocks.get(),
+                    fetch_concurrency: config.value_pool_flow_backfill.fetch_concurrency.get(),
+                },
+                value_pool_balance_backfill: IngestValuePoolBalanceBackfillToml {
+                    enabled: config.value_pool_balance_backfill.enabled,
+                    batch_blocks: config.value_pool_balance_backfill.batch_blocks.get(),
+                    fetch_concurrency: config.value_pool_balance_backfill.fetch_concurrency.get(),
                 },
                 bulk_catchup: IngestBulkCatchupToml {
                     canonical_batch_max_blocks: loop_config
@@ -1123,9 +1454,64 @@ struct IngestToml {
     reorg_window_blocks: u32,
     phases: IngestPhasesToml,
     derive: IngestDeriveToml,
+    commitment_root_backfill: IngestCommitmentRootBackfillToml,
+    conventional_fee_distribution_backfill: IngestConventionalFeeDistributionBackfillToml,
+    paid_fee_distribution_backfill: IngestPaidFeeDistributionBackfillToml,
+    transaction_component_backfill: IngestTransactionComponentBackfillToml,
+    transaction_history_verifier: IngestTransactionHistoryVerifierToml,
+    value_pool_flow_backfill: IngestValuePoolFlowBackfillToml,
+    value_pool_balance_backfill: IngestValuePoolBalanceBackfillToml,
     bulk_catchup: IngestBulkCatchupToml,
     tip_follow: IngestTipFollowToml,
     modifiers: IngestModifiersToml,
+}
+
+#[derive(Serialize)]
+struct IngestCommitmentRootBackfillToml {
+    enabled: bool,
+    batch_blocks: u32,
+    fetch_concurrency: u32,
+}
+
+#[derive(Serialize)]
+struct IngestConventionalFeeDistributionBackfillToml {
+    enabled: bool,
+    batch_blocks: u32,
+}
+
+#[derive(Serialize)]
+struct IngestPaidFeeDistributionBackfillToml {
+    enabled: bool,
+    batch_blocks: u32,
+    fetch_concurrency: u32,
+    history_days: u32,
+    timestamp_safety_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct IngestTransactionComponentBackfillToml {
+    enabled: bool,
+    batch_blocks: u32,
+}
+
+#[derive(Serialize)]
+struct IngestTransactionHistoryVerifierToml {
+    enabled: bool,
+    batch_blocks: u32,
+}
+
+#[derive(Serialize)]
+struct IngestValuePoolFlowBackfillToml {
+    enabled: bool,
+    batch_blocks: u32,
+    fetch_concurrency: u32,
+}
+
+#[derive(Serialize)]
+struct IngestValuePoolBalanceBackfillToml {
+    enabled: bool,
+    batch_blocks: u32,
+    fetch_concurrency: u32,
 }
 
 #[derive(Serialize)]
@@ -1255,5 +1641,121 @@ mod tests {
         // 128 MiB so the pipeline can always make forward progress.
         let result = default_pipeline_queue_bytes_from_budget(Some(4 * ONE_GIB), fallback);
         assert_eq!(result, MIN_PIPELINE_QUEUE_BYTES);
+    }
+
+    #[test]
+    fn commitment_root_backfill_batch_rejects_zero() {
+        let error = nonzero_u32_config(Some(0), "ingest.commitment_root_backfill.batch_blocks")
+            .err()
+            .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn commitment_root_backfill_concurrency_rejects_zero() {
+        let error =
+            nonzero_u32_config(Some(0), "ingest.commitment_root_backfill.fetch_concurrency")
+                .err()
+                .unwrap_or_else(|| ConfigError::invalid("zero fetch concurrency was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn transaction_component_backfill_batch_rejects_zero() {
+        let error = nonzero_u32_config(
+            Some(0),
+            "ingest.transaction_component_backfill.batch_blocks",
+        )
+        .err()
+        .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn transaction_history_verifier_batch_rejects_zero() {
+        let error = nonzero_u32_config(Some(0), "ingest.transaction_history_verifier.batch_blocks")
+            .err()
+            .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn value_pool_flow_backfill_batch_rejects_zero() {
+        let error = nonzero_u32_config(Some(0), "ingest.value_pool_flow_backfill.batch_blocks")
+            .err()
+            .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn value_pool_flow_backfill_concurrency_rejects_zero() {
+        let error =
+            nonzero_u32_config(Some(0), "ingest.value_pool_flow_backfill.fetch_concurrency")
+                .err()
+                .unwrap_or_else(|| ConfigError::invalid("zero fetch concurrency was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn value_pool_balance_backfill_batch_rejects_zero() {
+        let error = nonzero_u32_config(Some(0), "ingest.value_pool_balance_backfill.batch_blocks")
+            .err()
+            .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn value_pool_balance_backfill_concurrency_rejects_zero() {
+        let error = nonzero_u32_config(
+            Some(0),
+            "ingest.value_pool_balance_backfill.fetch_concurrency",
+        )
+        .err()
+        .unwrap_or_else(|| ConfigError::invalid("zero fetch concurrency was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn conventional_fee_distribution_backfill_batch_rejects_zero() {
+        let error = nonzero_u32_config(
+            Some(0),
+            "ingest.conventional_fee_distribution_backfill.batch_blocks",
+        )
+        .err()
+        .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn paid_fee_distribution_backfill_batch_rejects_zero() {
+        let error = nonzero_u32_config(
+            Some(0),
+            "ingest.paid_fee_distribution_backfill.batch_blocks",
+        )
+        .err()
+        .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn paid_fee_distribution_backfill_concurrency_rejects_zero() {
+        let error = nonzero_u32_config(
+            Some(0),
+            "ingest.paid_fee_distribution_backfill.fetch_concurrency",
+        )
+        .err()
+        .unwrap_or_else(|| ConfigError::invalid("zero fetch concurrency was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn paid_fee_distribution_backfill_history_rejects_zero_days() {
+        let error = nonzero_u32_config(
+            Some(0),
+            "ingest.paid_fee_distribution_backfill.history_days",
+        )
+        .err()
+        .unwrap_or_else(|| ConfigError::invalid("zero history days was accepted"));
+        assert!(error.to_string().contains("must be greater than zero"));
     }
 }

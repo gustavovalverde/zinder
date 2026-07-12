@@ -197,6 +197,11 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
             memory_resume_ratio: 0.75,
             min_replay_batch_blocks: NonZeroU32::new(10).ok_or_else(|| eyre!("nonzero"))?,
         },
+        commitment_root_backfill: zinder_ingest::CommitmentRootBackfillConfig {
+            enabled: true,
+            batch_blocks: NonZeroU32::new(256).ok_or_else(|| eyre!("nonzero"))?,
+            fetch_concurrency: NonZeroU32::new(8).ok_or_else(|| eyre!("nonzero"))?,
+        },
         bulk_catchup: BulkCatchupConfig {
             canonical_batch_max_blocks: NonZeroU32::new(1_000).ok_or_else(|| eyre!("nonzero"))?,
             canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
