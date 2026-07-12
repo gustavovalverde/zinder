@@ -3084,15 +3084,23 @@ async fn transaction_detail(
     } else {
         None
     };
+    let coinbase_data = if facts.is_coinbase {
+        raw_transaction_bytes(response.location.as_ref())
+            .map(cipherscan_coinbase_data)
+            .transpose()?
+    } else {
+        None
+    };
     Ok(json_response(
         StatusCode::OK,
-        transaction_detail_json(
-            adapter.network,
+        transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: adapter.network,
             facts,
-            response.location.as_ref(),
-            &response,
+            location: response.location.as_ref(),
+            response: &response,
             coinbase_total_output_zat,
-        ),
+            coinbase_data: coinbase_data.as_ref(),
+        }),
     ))
 }
 
@@ -6838,13 +6846,61 @@ fn sidecar_unavailable_response(error: &str, unavailable: &str) -> Response {
     )
 }
 
-fn transaction_detail_json(
+#[derive(Clone, Copy)]
+struct CipherscanTransactionDetailJsonInput<'a> {
     network: Network,
-    facts: &explorer::TransactionPublicFacts,
-    location: Option<&wallet::TransactionLocation>,
+    facts: &'a explorer::TransactionPublicFacts,
+    location: Option<&'a wallet::TransactionLocation>,
+    response: &'a explorer::TransactionDetailResponse,
+    coinbase_total_output_zat: Option<u64>,
+    coinbase_data: Option<&'a CipherscanCoinbaseData>,
+}
+
+struct CipherscanTransactionDetailZatoshiTotals {
+    input: Option<u64>,
+    output: Option<u64>,
+    value_balance: Option<i64>,
+}
+
+fn cipherscan_transaction_detail_totals(
     response: &explorer::TransactionDetailResponse,
     coinbase_total_output_zat: Option<u64>,
-) -> Value {
+) -> CipherscanTransactionDetailZatoshiTotals {
+    let input_zat = response
+        .transparent_inputs
+        .iter()
+        .try_fold(0_u64, |total, input| total.checked_add(input.value_zat?));
+    let transparent_output_zat = response
+        .transparent_outputs
+        .iter()
+        .try_fold(0_u64, |total, output| {
+            total.checked_add(output.output.as_ref()?.value_zat)
+        });
+    let value_balance_zat = response
+        .intrinsic_value_balances
+        .as_ref()
+        .and_then(|balances| {
+            balances
+                .sapling_zat
+                .checked_add(balances.orchard_zat)?
+                .checked_add(balances.ironwood_zat)
+        });
+    CipherscanTransactionDetailZatoshiTotals {
+        input: input_zat,
+        output: coinbase_total_output_zat.or(transparent_output_zat),
+        value_balance: value_balance_zat,
+    }
+}
+
+fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> Value {
+    let CipherscanTransactionDetailJsonInput {
+        network,
+        facts,
+        location,
+        response,
+        coinbase_total_output_zat,
+        coinbase_data,
+    } = input;
     let counts = facts.counts.as_ref();
     let fee = cipherscan_transaction_detail_fee(facts, response.paid_fee_zat);
     let mined = mined_location(location);
@@ -6853,31 +6909,31 @@ fn transaction_detail_json(
     let mined_details = mined.and_then(|mined_transaction| mined_transaction.details.as_ref());
     let transaction_rows = cipherscan_transaction_detail_rows(network, facts, response);
     let intrinsic_value_balances = response.intrinsic_value_balances.as_ref();
-    let mut unavailable = transaction_rows.unavailable;
-    if fee.source == "zip317-conventional" {
-        unavailable.push(
-            "Actual paid fees are unavailable for shielded transaction detail. fee is the ZIP-317 conventional fee.",
-        );
-    }
+    let totals = cipherscan_transaction_detail_totals(response, coinbase_total_output_zat);
+    let cipherscan_fee = fee.amount_zec.filter(|amount| *amount > 0.0);
+    let input_count = transaction_rows.inputs.len();
+    let output_count = transaction_rows.outputs.len();
+    let unavailable = transaction_rows.unavailable;
 
-    json!({
+    let mut transaction = json!({
         "txid": facts.transaction_id,
-        "blockHeight": block_location.map(|location| location.block_height),
+        "blockHeight": block_location.map(|location| location.block_height.to_string()),
         "blockHash": block_location.map(|location| location.block_hash.as_str()),
-        "blockTime": mined_details.map(|details| details.block_time),
+        "blockTime": mined_details.map(|details| details.block_time.to_string()),
         "confirmations": mined_details.map(|details| details.confirmations),
         "mempoolTime": mempool.map(|entry| entry.first_seen_unix_seconds),
         "status": transaction_status(location),
         "size": facts.size_bytes,
         "version": facts.version.as_ref().map(|version| version.effective_version),
         "versionKind": facts.version.as_ref().map(|version| version.kind),
-        "locktime": lock_time_json(facts.lock_time.as_ref()),
+        "locktime": cipherscan_lock_time_string(facts.lock_time.as_ref()),
         "expiryHeight": facts.expiry_height,
-        "fee": fee.amount_zec,
+        "fee": cipherscan_fee,
         "feeSource": fee.source,
         "paid_fee_zat": fee.paid_fee_zat,
         "isCoinbase": facts.is_coinbase,
-        "totalOutput": coinbase_total_output_zat.map(zec_from_unsigned_zatoshis),
+        "totalInput": totals.input.map(zec_from_unsigned_zatoshis),
+        "totalOutput": totals.output.map(zec_from_unsigned_zatoshis),
         "hasSapling": counts.map(has_sapling_counts),
         "hasOrchard": counts.map(|counts| counts.orchard_action_count > 0),
         "hasIronwood": counts.map(|counts| counts.ironwood_action_count > 0),
@@ -6895,7 +6951,26 @@ fn transaction_detail_json(
         "inputs": transaction_rows.inputs,
         "outputs": transaction_rows.outputs,
         "zinderUnavailable": unavailable,
-    })
+    });
+    if let Value::Object(fields) = &mut transaction {
+        fields.insert(
+            "valueBalance".to_owned(),
+            json!(totals.value_balance.map(zec_from_zatoshis)),
+        );
+        fields.insert("inputCount".to_owned(), json!(input_count));
+        fields.insert("outputCount".to_owned(), json!(output_count));
+        fields.insert(
+            "coinbaseHex".to_owned(),
+            json!(coinbase_data.map(|coinbase| coinbase.miner_data_hex.as_str())),
+        );
+        fields.insert(
+            "coinbaseText".to_owned(),
+            json!(coinbase_data.map(|coinbase| coinbase.miner_data_text.as_str())),
+        );
+        fields.insert("bridge".to_owned(), Value::Null);
+        fields.insert("stakingAction".to_owned(), Value::Null);
+    }
+    transaction
 }
 
 struct CipherscanTransactionDetailRows {
@@ -7019,10 +7094,17 @@ fn cipherscan_transaction_detail_unavailable(
             "Transparent outputs are unavailable because this transaction has no canonical facts artifact.",
         );
     }
+    if cipherscan_transaction_detail_fee(facts, response.paid_fee_zat).source
+        == "zip317-conventional"
+    {
+        unavailable.push(
+            "Actual paid fees are unavailable for shielded transaction detail. fee is the ZIP-317 conventional fee.",
+        );
+    }
     unavailable
 }
 
-/// Projects a complete native block row into Cipherscan's legacy REST shape.
+/// Projects a complete native block row into Cipherscan's existing REST shape.
 ///
 /// The caller withholds the table when any row lacks public facts, because the
 /// unchanged Cipherscan UI would otherwise infer a false coinbase status.
@@ -12534,6 +12616,15 @@ fn lock_time_json(lock_time: Option<&explorer::LockTime>) -> Value {
     }
 }
 
+fn cipherscan_lock_time_string(lock_time: Option<&explorer::LockTime>) -> Option<String> {
+    match lock_time.and_then(|lock_time| lock_time.kind.as_ref()) {
+        Some(lock_time::Kind::Unlocked(_)) => Some("0".to_owned()),
+        Some(lock_time::Kind::Height(height)) => Some(height.to_string()),
+        Some(lock_time::Kind::UnixSeconds(unix_seconds)) => Some(unix_seconds.to_string()),
+        None => None,
+    }
+}
+
 fn cipherscan_transaction_history_direction(
     direction: Option<&str>,
 ) -> TransactionHistoryDirection {
@@ -14205,18 +14296,30 @@ mod tests {
             ..Default::default()
         };
         let response = explorer::TransactionDetailResponse::default();
+        let coinbase_data = CipherscanCoinbaseData {
+            miner_data_hex: "04f09f8c".to_owned(),
+            miner_data_text: "....".to_owned(),
+        };
 
-        let transaction = transaction_detail_json(
-            Network::ZcashTestnet,
-            &facts,
-            None,
-            &response,
-            Some(137_500_000),
-        );
+        let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: Network::ZcashTestnet,
+            facts: &facts,
+            location: None,
+            response: &response,
+            coinbase_total_output_zat: Some(137_500_000),
+            coinbase_data: Some(&coinbase_data),
+        });
 
         assert_eq!(transaction["totalOutput"], json!(1.375));
-        assert_eq!(transaction["fee"], json!(0.0));
+        assert_eq!(transaction["totalInput"], json!(0.0));
+        assert_eq!(transaction["fee"], Value::Null);
         assert_eq!(transaction["feeSource"], json!("coinbase"));
+        assert_eq!(transaction["inputCount"], json!(0));
+        assert_eq!(transaction["outputCount"], json!(0));
+        assert_eq!(transaction["coinbaseHex"], json!("04f09f8c"));
+        assert_eq!(transaction["coinbaseText"], json!("...."));
+        assert_eq!(transaction["bridge"], Value::Null);
+        assert_eq!(transaction["stakingAction"], Value::Null);
         assert_eq!(transaction["inputs"], json!([]));
         assert_eq!(transaction["outputs"], json!([]));
         assert_eq!(transaction["zinderUnavailable"], json!([]));
@@ -14239,8 +14342,14 @@ mod tests {
         };
         let response = canonical_spent_transaction_detail_response(&script_pub_key);
 
-        let transaction =
-            transaction_detail_json(Network::ZcashTestnet, &facts, None, &response, None);
+        let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: Network::ZcashTestnet,
+            facts: &facts,
+            location: None,
+            response: &response,
+            coinbase_total_output_zat: None,
+            coinbase_data: None,
+        });
 
         assert_eq!(
             transaction["inputs"][0]["prev_txid"],
@@ -14380,8 +14489,14 @@ mod tests {
         };
 
         assert!(validate_transaction_detail_outputs(&facts, &response).is_ok());
-        let transaction =
-            transaction_detail_json(Network::ZcashTestnet, &facts, None, &response, None);
+        let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: Network::ZcashTestnet,
+            facts: &facts,
+            location: None,
+            response: &response,
+            coinbase_total_output_zat: None,
+            coinbase_data: None,
+        });
         assert_eq!(transaction["outputs"][0]["spent"], json!(false));
     }
 
@@ -14408,8 +14523,14 @@ mod tests {
             ..Default::default()
         };
 
-        let transaction =
-            transaction_detail_json(Network::ZcashTestnet, &facts, None, &response, None);
+        let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: Network::ZcashTestnet,
+            facts: &facts,
+            location: None,
+            response: &response,
+            coinbase_total_output_zat: None,
+            coinbase_data: None,
+        });
 
         assert_eq!(
             transaction["inputs"][0]["prev_txid"],
@@ -14446,8 +14567,14 @@ mod tests {
             ..Default::default()
         };
 
-        let transaction =
-            transaction_detail_json(Network::ZcashTestnet, &facts, None, &response, None);
+        let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: Network::ZcashTestnet,
+            facts: &facts,
+            location: None,
+            response: &response,
+            coinbase_total_output_zat: None,
+            coinbase_data: None,
+        });
 
         assert_eq!(transaction["fee"], json!(0.00035));
         assert_eq!(transaction["feeSource"], json!("zip317-conventional"));
@@ -14483,8 +14610,14 @@ mod tests {
             ..Default::default()
         };
 
-        let transaction =
-            transaction_detail_json(Network::ZcashTestnet, &facts, None, &response, None);
+        let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: Network::ZcashTestnet,
+            facts: &facts,
+            location: None,
+            response: &response,
+            coinbase_total_output_zat: None,
+            coinbase_data: None,
+        });
 
         assert_eq!(transaction["valueBalanceSapling"], json!(-1.25));
         assert_eq!(transaction["valueBalanceOrchard"], json!(0.25));
