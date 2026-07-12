@@ -540,6 +540,13 @@ Expected recovery behavior:
 - If `zinder-ingest` fails during an epoch commit, restart from the last committed epoch or fail with `storage_unavailable` or `schema_mismatch`.
 - If a reorg exceeds the configured window, fail closed and require operator action.
 
+Process supervision belongs to the deployment shape. The single-container image
+uses s6-overlay to respawn each failed long-running service in place after a
+short delay; one child failure does not terminate otherwise healthy sibling
+services. Per-service images delegate restart policy to the container
+orchestrator. In both shapes, repeated failures remain visible through logs and
+the affected service's liveness or readiness endpoint.
+
 ## Deployment Guidance
 
 Minimum production deployment:

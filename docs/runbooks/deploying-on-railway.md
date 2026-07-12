@@ -43,6 +43,11 @@ Railway specifics in this document are limited to its env-var UI and volume-bind
 
 Railway terminates TLS at its routing layer; the container serves plaintext gRPC over the configured port and Railway maps it to the public HTTPS endpoint.
 
+The container's s6 supervisor restarts an individual Zinder process in place
+after a two-second delay. A failed child process does not terminate the whole
+container, so use service logs and `/healthz` or `/readyz` failures to detect a
+persistent restart loop instead of relying on Railway container-restart events.
+
 ## Steps
 
 ### 1. Create the service
@@ -151,7 +156,7 @@ Remove `ZINDER_WIPE_PRIMARY_ON_BOOT` from the service as soon as the container b
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| Container crash-loops before `open_storage`; log names a rejected `ZINDER_*` variable | An env var does not map to a config field (stray marker, typo, single `_` where the schema expects `__`) | Remove or correct the variable; see [step 3](#3-inject-configuration-via-environment-variables) |
+| Service startup repeats before `open_storage`; log names a rejected `ZINDER_*` variable | An env var does not map to a config field (stray marker, typo, single `_` where the schema expects `__`) | Remove or correct the variable; see [step 3](#3-inject-configuration-via-environment-variables) |
 | Container restarts repeatedly | Health check fails during initial sync | Increase initial delay to 300s for fresh mainnet sync |
 | `/readyz` stays `node_unavailable` | Zebra not reachable from Railway | Ensure the Zebra service is in the same Railway project, or that the public endpoint resolves from Railway egress IPs |
 | `/readyz` is `node_capability_missing` | Zebra too old | Upgrade Zebra to the version pinned in this Zinder release |

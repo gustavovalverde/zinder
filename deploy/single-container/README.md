@@ -140,6 +140,19 @@ curl http://localhost:9106/metrics
 
 The Docker `HEALTHCHECK` directive probes `/readyz` every 30s; the first probe waits 90s for the initial sync to begin. Operators on Kubernetes/Nomad can wire equivalent readiness probes against the same endpoint.
 
+## Process recovery
+
+s6-overlay supervises `zinder-ingest`, `zinder-query`, `zinder-explorer`, and
+the multiplexer as independent long-running services. When one exits, its
+`finish` script waits two seconds and returns successfully so s6 restarts that
+service in place. The other services and the container remain running.
+
+This policy is required on platforms where a process-triggered container exit
+does not produce a replacement container. A persistent service failure
+therefore appears as repeated service startup logs and a failed liveness or
+readiness probe, not necessarily as a container restart. Operators should alert
+on both probe failures and repeated process exits.
+
 ## When NOT to use this image
 
 Use the per-service targets in `deploy/Dockerfile` when:

@@ -8,7 +8,7 @@ Branch: `feat/native-indexer-projections`
 
 This branch reconstructs reusable Zinder indexing work on top of current `main`. It contains native facts, projections, APIs, operations, tests, and documentation only. It intentionally excludes product-specific adapters, REST contracts, serializers, adapter deployment wiring, external pricing transport, and compatibility plans.
 
-Existing native surfaces remain available, including `RecentTransactions`, Ironwood migration RPCs, `NetworkUpgradeStatus`, `BlockTransactions`, mempool snapshots, reorg history, source fallback, bounded catchup, RocksDB instrumentation, and service-exit propagation.
+Existing native surfaces remain available, including `RecentTransactions`, Ironwood migration RPCs, `NetworkUpgradeStatus`, `BlockTransactions`, mempool snapshots, reorg history, source fallback, bounded catchup, RocksDB instrumentation, and supervised service recovery.
 
 ## Coverage
 
