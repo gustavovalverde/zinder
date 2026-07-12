@@ -182,3 +182,53 @@ pub fn install_tracing_subscriber() {
         .with_target(true)
         .init();
 }
+
+/// Verifies the host CPU provides every instruction-set feature this binary
+/// was compiled to require, logging the shortfall and returning `false` when
+/// it does not.
+///
+/// Release images compile with `-C target-cpu=x86-64-v3`, which lets both the
+/// Rust code and the vendored `RocksDB` C++ emit AVX2/BMI2 instructions
+/// unconditionally. A host below that baseline dies with `SIGILL` deep inside
+/// storage code, so binaries call this before opening storage and exit with a
+/// readable error instead. Builds without the flag (tests, local dev, non-x86
+/// images) require nothing and always pass.
+#[must_use]
+pub fn host_cpu_meets_compiled_baseline() -> bool {
+    let missing = missing_required_cpu_features();
+    if missing.is_empty() {
+        return true;
+    }
+    tracing::error!(
+        target: "zinder::runtime",
+        event = "host_cpu_below_compiled_baseline",
+        missing = missing.join(", "),
+        "this build requires x86-64-v3; refusing to start on this host"
+    );
+    false
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn missing_required_cpu_features() -> Vec<&'static str> {
+    let required = [
+        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
+        ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
+        ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
+        ("fma", std::arch::is_x86_feature_detected!("fma")),
+        ("lzcnt", std::arch::is_x86_feature_detected!("lzcnt")),
+        (
+            "pclmulqdq",
+            std::arch::is_x86_feature_detected!("pclmulqdq"),
+        ),
+    ];
+    required
+        .into_iter()
+        .filter(|(_, detected)| !detected)
+        .map(|(feature, _)| feature)
+        .collect()
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn missing_required_cpu_features() -> Vec<&'static str> {
+    Vec::new()
+}

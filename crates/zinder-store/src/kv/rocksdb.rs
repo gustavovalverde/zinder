@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
     sync::Arc,
@@ -1756,28 +1756,42 @@ fn record_store_scan_outcome(
 }
 
 fn record_write_batch_inputs(puts: &[StoragePut], deletes: &[StorageDelete]) {
+    let mut puts_by_table: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
     for put in puts {
+        let (rows, bytes) = puts_by_table
+            .entry(put.table.column_family_name())
+            .or_default();
+        *rows += 1;
+        *bytes += usize_to_u64(put.value.len());
+    }
+    for (table, (rows, bytes)) in puts_by_table {
         metrics::counter!(
             "zinder_store_write_batch_rows_total",
             "kind" => "put",
-            "table" => put.table.column_family_name()
+            "table" => table
         )
-        .increment(1);
+        .increment(rows);
         metrics::counter!(
             "zinder_store_write_batch_bytes_total",
             "kind" => "put",
-            "table" => put.table.column_family_name()
+            "table" => table
         )
-        .increment(usize_to_u64(put.value.len()));
+        .increment(bytes);
     }
 
+    let mut deletes_by_table: BTreeMap<&'static str, u64> = BTreeMap::new();
     for delete in deletes {
+        *deletes_by_table
+            .entry(delete.table.column_family_name())
+            .or_default() += 1;
+    }
+    for (table, rows) in deletes_by_table {
         metrics::counter!(
             "zinder_store_write_batch_rows_total",
             "kind" => "delete",
-            "table" => delete.table.column_family_name()
+            "table" => table
         )
-        .increment(1);
+        .increment(rows);
     }
 }
 

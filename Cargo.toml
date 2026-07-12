@@ -122,3 +122,6 @@ undocumented_unsafe_blocks = "deny"
 unwrap_used = "deny"
 wildcard_enum_match_arm = "deny"
 disallowed_types = "deny"
+
+[profile.release]
+lto = "thin"

@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use zinder_derive::{DeriveStore, DeriveStoreOptions};
 use zinder_runtime::{
     Readiness, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
-    install_tracing_subscriber, spawn_ops_endpoint_for,
+    host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
@@ -73,6 +73,10 @@ struct Cli {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     install_tracing_subscriber();
+
+    if !host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
 
     if cli.print_config {
         return run_print_config(cli);

@@ -39,7 +39,8 @@ use zinder_ingest::{
 };
 use zinder_runtime::{
     Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase,
-    cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
+    cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
+    spawn_ops_endpoint_for,
 };
 use zinder_source::{
     ChainTipNotificationSource, JsonRpcMempoolSource, MempoolSource, NodeCapabilities,
@@ -199,6 +200,10 @@ struct BackupArgs {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     install_tracing_subscriber();
+
+    if !host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
 
     if cli.print_config {
         return run_print_config(cli);
