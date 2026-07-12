@@ -70,7 +70,9 @@ services:
       # Default to Z3's in-network Zebra DNS name and per-network ports.
       # Override these if attaching to a Zebra elsewhere or running mainnet.
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
-      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR:-http://zebra:8230}
+      # An empty override selects JSON-RPC polling instead of the optional
+      # Zebra streaming-indexer endpoint.
+      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR-http://zebra:8230}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
       ZINDER_STORAGE__RAW_BLOB_POLICY: ${ZINDER_STORAGE__RAW_BLOB_POLICY:-none}

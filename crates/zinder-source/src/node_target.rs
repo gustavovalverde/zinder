@@ -235,7 +235,7 @@ impl NodeTarget {
             request_timeout,
             max_response_bytes,
         )
-        .with_indexer_grpc_addr(section.indexer_grpc_addr)
+        .with_indexer_grpc_addr(nonempty_optional(section.indexer_grpc_addr))
         .with_broadcast_timeout(broadcast_timeout)
         .with_health(health))
     }
@@ -531,6 +531,10 @@ fn read_optional(env_var: &'static str) -> Option<String> {
     std::env::var(env_var).ok()
 }
 
+fn nonempty_optional(text: Option<String>) -> Option<String> {
+    text.filter(|text| !text.trim().is_empty())
+}
+
 fn read_optional_parsed<TargetType>(
     env_var: &'static str,
     field: &'static str,
@@ -621,6 +625,23 @@ mod tests {
                 path: None,
                 cookie: None,
             },
+            health: NodeHealthSection::default(),
+        };
+        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
+
+        assert!(target.indexer_grpc_addr.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_omits_indexer_grpc_addr_when_blank() -> Result<(), NodeConfigError> {
+        let section = NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: Some("   ".to_owned()),
+            request_timeout_secs: None,
+            max_response_bytes: None,
+            broadcast_timeout_secs: None,
+            auth: NodeAuthSection::default(),
             health: NodeHealthSection::default(),
         };
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;

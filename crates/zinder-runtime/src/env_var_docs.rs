@@ -116,7 +116,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source \
-                      and chain-tip wakeups. Falls back to JSON-RPC polling when unset.",
+                      and chain-tip wakeups. Falls back to JSON-RPC polling when unset or empty.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__AUTH__METHOD",
