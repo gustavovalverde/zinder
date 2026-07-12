@@ -463,6 +463,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Defaults to 268435456 for writers and 16777216 for readers.",
     },
     EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__STATISTICS_LEVEL",
+        toml_path: "storage.canonical.rocksdb.statistics_level",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical-store RocksDB statistics collection gate: `off`, `tickers`, or \
+                      `full`. Defaults to `tickers`.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__BLOCK_CACHE_BYTES",
         toml_path: "storage.derive.rocksdb.block_cache_bytes",
         used_by: &[
@@ -545,6 +559,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Derive-store total RocksDB memtable budget across column families. Defaults \
                       to 67108864 for writers and 16777216 for readers.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__STATISTICS_LEVEL",
+        toml_path: "storage.derive.rocksdb.statistics_level",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive-store RocksDB statistics collection gate: `off`, `tickers`, or `full`. \
+                      Defaults to `tickers`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__SOURCE",

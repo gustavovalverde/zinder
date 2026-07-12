@@ -91,7 +91,7 @@ pub use proto_codec::{
     transparent_mempool_spend_from_message, transparent_mempool_spend_message,
     transparent_output_entry_message, transparent_output_message, transparent_spend_message,
 };
-pub use rocksdb_resource_budget::RocksDbResourceBudget;
+pub use rocksdb_resource_budget::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;
 pub use transaction_artifact::{

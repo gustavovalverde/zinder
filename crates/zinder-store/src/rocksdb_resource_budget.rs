@@ -57,6 +57,8 @@ pub struct RocksDbResourceBudget {
     pub max_write_buffer_count: i32,
     /// Total mutable and immutable memtable memory budget across column families.
     pub memtable_budget_bytes: u64,
+    /// `RocksDB` statistics collection gate.
+    pub statistics_level: RocksDbStatisticsLevel,
 }
 
 impl RocksDbResourceBudget {
@@ -104,6 +106,7 @@ impl RocksDbResourceBudget {
             write_buffer_bytes: 16 * MIB,
             max_write_buffer_count: 2,
             memtable_budget_bytes: 256 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
         }
     }
 
@@ -122,6 +125,7 @@ impl RocksDbResourceBudget {
             write_buffer_bytes: 8 * MIB,
             max_write_buffer_count: 2,
             memtable_budget_bytes: 64 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
         }
     }
 
@@ -141,6 +145,7 @@ impl RocksDbResourceBudget {
             write_buffer_bytes: 8 * MIB,
             max_write_buffer_count: 2,
             memtable_budget_bytes: 16 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
         }
     }
 
@@ -159,6 +164,7 @@ impl RocksDbResourceBudget {
             write_buffer_bytes: 4 * MIB,
             max_write_buffer_count: 2,
             memtable_budget_bytes: 16 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
         }
     }
 
@@ -177,6 +183,7 @@ impl RocksDbResourceBudget {
             write_buffer_bytes: 4 * MIB,
             max_write_buffer_count: 2,
             memtable_budget_bytes: 8 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
         }
     }
 
@@ -206,6 +213,52 @@ impl RocksDbResourceBudget {
             return Err("rocksdb_resource_budget.memtable_budget_bytes must be at least 4 MiB");
         }
         Ok(())
+    }
+}
+
+/// `RocksDB` statistics collection gate applied at open.
+///
+/// Statistics collection has measurable CPU cost on write-heavy paths;
+/// this gate lets an operator trade the `zinder_store_rocksdb_ticker`
+/// series away for that headroom without a code change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RocksDbStatisticsLevel {
+    /// No `enable_statistics()` call at all. The bounded LRU cache and
+    /// bloom filters still run; only their counters stop being collected.
+    /// `zinder_store_rocksdb_ticker` exports nothing at this level.
+    Off,
+    /// Ticker counters only (`StatsLevel::ExceptHistogramOrTimers`), the
+    /// production default since the 2026-07-12 telemetry audit.
+    #[default]
+    Tickers,
+    /// `RocksDB`'s own default level: tickers plus per-operation timer
+    /// histograms. Reserved for a live bloom/block-cache experiment that
+    /// needs histogram detail.
+    Full,
+}
+
+impl RocksDbStatisticsLevel {
+    /// Stable lowercase label used in TOML, environment variables, and
+    /// `--print-config` output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Tickers => "tickers",
+            Self::Full => "full",
+        }
+    }
+
+    /// Resolves the inverse of [`Self::as_str`], returning `None` for any
+    /// input other than `off`, `tickers`, or `full`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "off" => Some(Self::Off),
+            "tickers" => Some(Self::Tickers),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
     }
 }
 
@@ -298,5 +351,42 @@ mod tests {
         assert!(
             matches!(budget.validate(), Err(reason) if reason.contains("memtable_budget_bytes"))
         );
+    }
+
+    #[test]
+    fn every_default_budget_starts_at_tickers() {
+        for budget in [
+            RocksDbResourceBudget::canonical_writer_defaults(),
+            RocksDbResourceBudget::derive_writer_defaults(),
+            RocksDbResourceBudget::canonical_reader_defaults(),
+            RocksDbResourceBudget::derive_reader_defaults(),
+            RocksDbResourceBudget::for_local_tests(),
+        ] {
+            assert_eq!(budget.statistics_level, RocksDbStatisticsLevel::Tickers);
+        }
+    }
+
+    #[test]
+    fn statistics_level_default_is_tickers() {
+        assert_eq!(
+            RocksDbStatisticsLevel::default(),
+            RocksDbStatisticsLevel::Tickers
+        );
+    }
+
+    #[test]
+    fn statistics_level_round_trips_through_as_str() {
+        for level in [
+            RocksDbStatisticsLevel::Off,
+            RocksDbStatisticsLevel::Tickers,
+            RocksDbStatisticsLevel::Full,
+        ] {
+            assert_eq!(RocksDbStatisticsLevel::parse(level.as_str()), Some(level));
+        }
+    }
+
+    #[test]
+    fn statistics_level_rejects_unknown_text() {
+        assert_eq!(RocksDbStatisticsLevel::parse("verbose"), None);
     }
 }

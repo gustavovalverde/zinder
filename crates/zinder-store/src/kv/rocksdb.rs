@@ -9,11 +9,14 @@ use std::{
 use parking_lot::{Mutex, MutexGuard};
 use rust_rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, FlushOptions, Options, SliceTransform,
-    Snapshot, WriteBatch, WriteBufferManager, WriteOptions, checkpoint::Checkpoint,
-    statistics::Ticker,
+    Snapshot, WriteBatch, WriteBufferManager, WriteOptions,
+    checkpoint::Checkpoint,
+    statistics::{StatsLevel, Ticker},
 };
 
-use crate::{RocksDbResourceBudget, StoreError, format::StoreKey, kv::StorageTable};
+use crate::{
+    RocksDbResourceBudget, RocksDbStatisticsLevel, StoreError, format::StoreKey, kv::StorageTable,
+};
 
 type PrefixScanVisitor<'visitor> =
     &'visitor mut dyn FnMut(&[u8], &[u8]) -> Result<PrefixScanControl, StoreError>;
@@ -969,7 +972,9 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
         .set(usize_to_f64(inputs.block_cache.get_usage()));
     metrics::gauge!("zinder_store_block_cache_pinned_usage_bytes", "store_role" => store_role)
         .set(usize_to_f64(inputs.block_cache.get_pinned_usage()));
-    record_rocksdb_ticker_gauges(inputs.statistics, store_role);
+    if inputs.resource_budget.statistics_level != RocksDbStatisticsLevel::Off {
+        record_rocksdb_ticker_gauges(inputs.statistics, store_role);
+    }
     metrics::gauge!("zinder_store_memtable_budget_bytes", "store_role" => store_role)
         .set(usize_to_f64(inputs.write_buffer_manager.get_buffer_size()));
     metrics::gauge!("zinder_store_memtable_budget_usage_bytes", "store_role" => store_role)
@@ -1069,6 +1074,24 @@ impl Default for ResourceGaugeThrottle {
     }
 }
 
+/// Applies [`RocksDbResourceBudget::statistics_level`] to `db_options`.
+///
+/// `RocksDbStatisticsLevel::Off` skips `enable_statistics()` entirely, so
+/// `db_options.get_ticker_count` reads a null statistics pointer and
+/// returns `0` rather than erroring; [`record_rocksdb_resource_gauges`]
+/// still skips the ticker export at this level so the exported series
+/// stays absent rather than reporting fabricated zeros.
+fn apply_statistics_level(db_options: &mut Options, level: RocksDbStatisticsLevel) {
+    match level {
+        RocksDbStatisticsLevel::Off => {}
+        RocksDbStatisticsLevel::Tickers => {
+            db_options.enable_statistics();
+            db_options.set_statistics_level(StatsLevel::ExceptHistogramOrTimers);
+        }
+        RocksDbStatisticsLevel::Full => db_options.enable_statistics(),
+    }
+}
+
 /// Builds `RocksDB` options for any writer-posture instance in the workspace.
 ///
 /// The canonical chain store and the derive store both route through this
@@ -1088,7 +1111,7 @@ fn build_primary_db_options(
     let mut db_options = Options::default();
     db_options.create_if_missing(true);
     db_options.create_missing_column_families(true);
-    db_options.enable_statistics();
+    apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_total_wal_size(rocksdb_resource_budget.max_wal_bytes);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
     db_options.set_atomic_flush(true);
@@ -1111,7 +1134,7 @@ fn build_secondary_db_options(
     let mut db_options = Options::default();
     db_options.create_if_missing(false);
     db_options.create_missing_column_families(false);
-    db_options.enable_statistics();
+    apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
@@ -1929,6 +1952,16 @@ mod tests {
             false,
             RocksDbResourceBudget::for_local_tests(),
         )?;
+        store.record_rocksdb_properties();
+        Ok(())
+    }
+
+    #[test]
+    fn ticker_export_runs_on_an_open_store_with_statistics_off() -> Result<(), StoreError> {
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.statistics_level = RocksDbStatisticsLevel::Off;
+        let store_dir = tempfile::tempdir().map_err(StoreError::storage_unavailable)?;
+        let store = RocksChainStore::open_primary(store_dir.path(), false, budget)?;
         store.record_rocksdb_properties();
         Ok(())
     }

@@ -13,7 +13,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use zinder_store::RocksDbResourceBudget;
+use zinder_store::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 
 use crate::{
     ConfigError, canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
@@ -30,7 +30,7 @@ const DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS: u64 = 4;
 /// [ADR-0020](../../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
 /// Operators override any subset of fields; unspecified fields fall through
 /// to the role default selected by the resolver.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RocksDbResourceBudgetSection {
     /// Override [`RocksDbResourceBudget::block_cache_bytes`].
@@ -45,13 +45,24 @@ pub struct RocksDbResourceBudgetSection {
     pub max_write_buffer_count: Option<i32>,
     /// Override [`RocksDbResourceBudget::memtable_budget_bytes`].
     pub memtable_budget_bytes: Option<u64>,
+    /// Override [`RocksDbResourceBudget::statistics_level`]: `off`,
+    /// `tickers`, or `full`.
+    pub statistics_level: Option<String>,
 }
 
 impl RocksDbResourceBudgetSection {
-    /// Merges any `Some` overrides onto `defaults`. Use
-    /// writer or reader defaults for the selected store posture.
-    #[must_use]
-    pub const fn apply_to(self, mut defaults: RocksDbResourceBudget) -> RocksDbResourceBudget {
+    /// Merges any `Some` overrides onto `defaults`. Use writer or reader
+    /// defaults for the selected store posture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Invalid`] when `statistics_level` is set to a
+    /// value other than `off`, `tickers`, or `full`.
+    pub fn apply_to(
+        self,
+        mut defaults: RocksDbResourceBudget,
+        path: &'static str,
+    ) -> Result<RocksDbResourceBudget, ConfigError> {
         if let Some(bytes) = self.block_cache_bytes {
             defaults.block_cache_bytes = bytes;
         }
@@ -70,13 +81,21 @@ impl RocksDbResourceBudgetSection {
         if let Some(bytes) = self.memtable_budget_bytes {
             defaults.memtable_budget_bytes = bytes;
         }
-        defaults
+        if let Some(level_text) = self.statistics_level {
+            defaults.statistics_level = RocksDbStatisticsLevel::parse(&level_text)
+                .ok_or_else(|| {
+                    ConfigError::invalid(format!(
+                        "{path}.statistics_level must be one of off, tickers, full; got {level_text:?}"
+                    ))
+                })?;
+        }
+        Ok(defaults)
     }
 }
 
 /// Raw storage-role section consumed as `[storage.canonical]` and
 /// `[storage.derive]`.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageRoleSection {
     /// `RocksDB` resource budget overrides for this storage role.
@@ -194,7 +213,7 @@ fn resolve_rocksdb_resource_budget(
     defaults: RocksDbResourceBudget,
     path: &'static str,
 ) -> Result<RocksDbResourceBudget, ConfigError> {
-    let budget = section.apply_to(defaults);
+    let budget = section.apply_to(defaults, path)?;
     budget
         .validate()
         .map_err(|reason| ConfigError::invalid(format!("{path}: {reason}")))?;
@@ -371,6 +390,9 @@ pub struct RocksDbResourceBudgetToml {
     pub max_write_buffer_count: i32,
     /// Resolved [`RocksDbResourceBudget::memtable_budget_bytes`].
     pub memtable_budget_bytes: u64,
+    /// Resolved [`RocksDbResourceBudget::statistics_level`]: `off`,
+    /// `tickers`, or `full`.
+    pub statistics_level: &'static str,
 }
 
 impl RocksDbResourceBudgetToml {
@@ -384,6 +406,7 @@ impl RocksDbResourceBudgetToml {
             write_buffer_bytes: budget.write_buffer_bytes,
             max_write_buffer_count: budget.max_write_buffer_count,
             memtable_budget_bytes: budget.memtable_budget_bytes,
+            statistics_level: budget.statistics_level.as_str(),
         }
     }
 }
@@ -706,6 +729,7 @@ mod tests {
             write_buffer_bytes: Some(8 * 1024 * 1024),
             max_write_buffer_count: Some(3),
             memtable_budget_bytes: Some(16 * 1024 * 1024),
+            statistics_level: Some("off".to_owned()),
         })?;
         let defaults = RocksDbResourceBudget::canonical_writer_defaults();
         assert_eq!(resolved.block_cache_bytes, 8 * 1024 * 1024);
@@ -714,7 +738,35 @@ mod tests {
         assert_eq!(resolved.write_buffer_bytes, 8 * 1024 * 1024);
         assert_eq!(resolved.max_write_buffer_count, 3);
         assert_eq!(resolved.memtable_budget_bytes, 16 * 1024 * 1024);
+        assert_eq!(resolved.statistics_level, RocksDbStatisticsLevel::Off);
         Ok(())
+    }
+
+    #[test]
+    fn statistics_level_defaults_to_tickers() -> Result<(), ConfigError> {
+        let resolved =
+            resolve_canonical_writer_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
+        assert_eq!(resolved.statistics_level, RocksDbStatisticsLevel::Tickers);
+        Ok(())
+    }
+
+    #[test]
+    fn statistics_level_accepts_full() -> Result<(), ConfigError> {
+        let resolved = resolve_canonical_writer_rocksdb_budget(RocksDbResourceBudgetSection {
+            statistics_level: Some("full".to_owned()),
+            ..RocksDbResourceBudgetSection::default()
+        })?;
+        assert_eq!(resolved.statistics_level, RocksDbStatisticsLevel::Full);
+        Ok(())
+    }
+
+    #[test]
+    fn statistics_level_rejects_unknown_value() {
+        let outcome = resolve_canonical_writer_rocksdb_budget(RocksDbResourceBudgetSection {
+            statistics_level: Some("verbose".to_owned()),
+            ..RocksDbResourceBudgetSection::default()
+        });
+        assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
     }
 
     #[test]
