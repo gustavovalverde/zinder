@@ -1,6 +1,6 @@
 //! Cipherscan REST compatibility adapter over Zinder native read APIs.
 //!
-//! This crate intentionally keeps Cipherscan's legacy REST paths and JSON
+//! This crate intentionally keeps Cipherscan's REST paths and JSON
 //! field names at the service edge. Reusable chain facts still come from
 //! `ExplorerQuery` and `WalletQuery`; missing product-neutral facts should
 //! become native Zinder surfaces instead of growing a Cipherscan-shaped core.
@@ -55,6 +55,8 @@ use zebra_chain::{
         },
         testnet::RegtestParameters,
     },
+    serialization::ZcashDeserializeInto,
+    transaction::Transaction as ZebraTransaction,
     transparent,
     work::difficulty::CompactDifficulty,
 };
@@ -2682,7 +2684,9 @@ async fn cipherscan_block_detail_json(
     adapter: &CipherscanRestAdapter,
     response: explorer::BlockTransactionsResponse,
 ) -> Result<Value, CipherscanRestError> {
-    let at_epoch_id = explorer_chain_epoch_id(response.freshness.as_ref());
+    let chain_epoch_id = explorer_chain_epoch_id(response.freshness.as_ref()).ok_or(
+        CipherscanRestError::MissingUpstreamField("block_transactions.freshness.chain_epoch"),
+    )?;
     let final_note_commitment_roots = response
         .final_note_commitment_roots
         .as_ref()
@@ -2700,7 +2704,7 @@ async fn cipherscan_block_detail_json(
                     summary.block_height,
                 )),
             }),
-            at_epoch_id,
+            at_epoch_id: Some(chain_epoch_id),
         })
         .await?
         .into_inner()
@@ -2711,9 +2715,22 @@ async fn cipherscan_block_detail_json(
         .fetch_canonical_block_production_entry(
             summary.block_height,
             &summary.block_hash,
-            at_epoch_id,
+            Some(chain_epoch_id),
         )
         .await?;
+    let coinbase_data = match response.transactions.iter().find(|transaction| {
+        transaction
+            .public_facts
+            .as_ref()
+            .is_some_and(|facts| facts.is_coinbase)
+    }) {
+        Some(transaction) => {
+            adapter
+                .fetch_coinbase_data(&transaction.transaction_id, chain_epoch_id)
+                .await?
+        }
+        None => None,
+    };
     let mut transaction_rows = cipherscan_block_transaction_rows(
         adapter.network,
         &response.transactions,
@@ -2733,8 +2750,69 @@ async fn cipherscan_block_detail_json(
             transaction_rows: &transaction_rows,
             miner_address: production_entry.miner_address.as_deref(),
             final_note_commitment_roots: final_note_commitment_roots.as_ref(),
+            coinbase_data: coinbase_data.as_ref(),
         },
     ))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CipherscanCoinbaseData {
+    miner_data_hex: String,
+    miner_data_text: String,
+}
+
+impl CipherscanRestAdapter {
+    async fn fetch_coinbase_data(
+        &self,
+        transaction_id: &str,
+        at_epoch_id: u64,
+    ) -> Result<Option<CipherscanCoinbaseData>, CipherscanRestError> {
+        let response = self
+            .wallet_client()
+            .transaction(TransactionRequest {
+                transaction_id: transaction_id.to_owned(),
+                at_epoch_id: Some(at_epoch_id),
+            })
+            .await?
+            .into_inner();
+        let Some(raw_transaction_bytes) = raw_transaction_bytes(response.location.as_ref()) else {
+            return Ok(None);
+        };
+
+        cipherscan_coinbase_data(raw_transaction_bytes).map(Some)
+    }
+}
+
+fn cipherscan_coinbase_data(
+    raw_transaction_bytes: &[u8],
+) -> Result<CipherscanCoinbaseData, CipherscanRestError> {
+    let transaction = raw_transaction_bytes
+        .zcash_deserialize_into::<ZebraTransaction>()
+        .map_err(|_| {
+            CipherscanRestError::InvalidUpstreamField("location.mined.raw_transaction_bytes")
+        })?;
+    let miner_data = transaction
+        .inputs()
+        .iter()
+        .find_map(transparent::Input::miner_data)
+        .ok_or(CipherscanRestError::InvalidUpstreamField(
+            "coinbase_transaction.transparent_input",
+        ))?;
+    let miner_data_text = miner_data
+        .iter()
+        .map(|byte| {
+            if (0x20..=0x7e).contains(byte) {
+                char::from(*byte)
+            } else {
+                '.'
+            }
+        })
+        .collect();
+
+    Ok(CipherscanCoinbaseData {
+        miner_data_hex: hex::encode(miner_data),
+        miner_data_text,
+    })
 }
 
 struct CipherscanFinalNoteCommitmentRoots {
@@ -2839,6 +2917,7 @@ struct CipherscanBlockDetailResponseInput<'a> {
     transaction_rows: &'a CipherscanBlockTransactionRows,
     miner_address: Option<&'a str>,
     final_note_commitment_roots: Option<&'a CipherscanFinalNoteCommitmentRoots>,
+    coinbase_data: Option<&'a CipherscanCoinbaseData>,
 }
 
 fn cipherscan_block_detail_response_json(input: CipherscanBlockDetailResponseInput<'_>) -> Value {
@@ -2849,15 +2928,16 @@ fn cipherscan_block_detail_response_json(input: CipherscanBlockDetailResponseInp
         transaction_rows,
         miner_address,
         final_note_commitment_roots,
+        coinbase_data,
     } = input;
     json!({
-        "height": summary.block_height,
+        "height": summary.block_height.to_string(),
         "hash": summary.block_hash,
-        "timestamp": summary.block_time_unix_seconds,
+        "timestamp": summary.block_time_unix_seconds.to_string(),
         "transaction_count": summary.transaction_count,
         "transactionCount": summary.transaction_count,
         "size": summary.total_size_bytes,
-        "difficulty": header_fields.difficulty,
+        "difficulty": cipherscan_difficulty_string(header_fields.difficulty),
         "confirmations": summary.confirmations,
         "previous_block_hash": optional_string(&header.previous_block_hash),
         "next_block_hash": Value::Null,
@@ -2865,9 +2945,12 @@ fn cipherscan_block_detail_response_json(input: CipherscanBlockDetailResponseInp
         "merkle_root": header.merkle_root_hash,
         "bits": header_fields.bits,
         "nonce": header_fields.nonce,
-        "total_fees": summary.paid_fees_collected_zat.unwrap_or(summary.fees_collected_zat),
-        "coinbase_reward": summary.coinbase_reward_zat,
+        "total_fees": summary.paid_fees_collected_zat.unwrap_or(summary.fees_collected_zat).to_string(),
+        "coinbase_reward": summary.coinbase_reward_zat.to_string(),
         "miner_address": miner_address,
+        "miner_pool": Value::Null,
+        "miner_pool_url": Value::Null,
+        "miner_pool_region": Value::Null,
         "sapling_output_count": summary.sapling_output_count,
         "orchard_action_count": summary.orchard_action_count,
         "ironwood_action_count": summary.ironwood_action_count,
@@ -2877,7 +2960,9 @@ fn cipherscan_block_detail_response_json(input: CipherscanBlockDetailResponseInp
             .and_then(|roots| roots.orchard.as_deref()),
         "final_ironwood_root": final_note_commitment_roots
             .and_then(|roots| roots.ironwood.as_deref()),
-        "finality_status": block_finality_status(summary),
+        "coinbase_hex": coinbase_data.map(|coinbase| coinbase.miner_data_hex.as_str()),
+        "coinbase_text": coinbase_data.map(|coinbase| coinbase.miner_data_text.as_str()),
+        "finality_status": Value::Null,
         "isOrphaned": !summary.is_canonical,
         "transactions": transaction_rows.rows,
         "zinderUnavailable": transaction_rows.unavailable,
@@ -12776,16 +12861,6 @@ fn cipherscan_hashrate_string(hashrate: f64) -> String {
     format!("{scaled:.2} {unit}")
 }
 
-fn block_finality_status(summary: &explorer::BlockSummary) -> &'static str {
-    if !summary.is_canonical {
-        "non_canonical"
-    } else if summary.confirmations >= 100 {
-        "final"
-    } else {
-        "canonical"
-    }
-}
-
 fn cipherscan_block_finality_status(summary: &explorer::BlockSummary) -> &'static str {
     if summary.confirmations >= 100 {
         "Finalized"
@@ -14904,12 +14979,21 @@ mod tests {
             transaction_rows: &transaction_rows,
             miner_address: Some("tmUcufCrN94ZXNuffjzWPdB3PSAYpc2KmSw"),
             final_note_commitment_roots: None,
+            coinbase_data: None,
         });
 
         assert_eq!(
             response["miner_address"],
             json!("tmUcufCrN94ZXNuffjzWPdB3PSAYpc2KmSw")
         );
+        assert_eq!(response["height"], json!("42"));
+        assert_eq!(response["timestamp"], json!("0"));
+        assert_eq!(response["difficulty"], json!("1"));
+        assert_eq!(response["total_fees"], json!("0"));
+        assert_eq!(response["miner_pool"], Value::Null);
+        assert_eq!(response["miner_pool_url"], Value::Null);
+        assert_eq!(response["miner_pool_region"], Value::Null);
+        assert_eq!(response["finality_status"], Value::Null);
     }
 
     #[test]
@@ -14945,11 +15029,30 @@ mod tests {
             transaction_rows: &transaction_rows,
             miner_address: None,
             final_note_commitment_roots: Some(&roots),
+            coinbase_data: None,
         });
 
         assert_eq!(response["final_sapling_root"], json!("11".repeat(32)));
         assert_eq!(response["final_orchard_root"], json!("22".repeat(32)));
         assert_eq!(response["final_ironwood_root"], json!("33".repeat(32)));
+        Ok(())
+    }
+
+    #[test]
+    fn block_detail_decodes_cipherscan_coinbase_miner_data() -> Result<(), CipherscanRestError> {
+        let raw_transaction = hex::decode(
+            "0600008098b684d85b16a5370000000050743f00010000000000000000000000000000000000000000000000000000000000000000ffffffff160350743f04f09f8cb87a6b636c61756465636f646572ffffffff0240597307000000001976a9143f1d707eae9297983695aa5dbf983e03b638530c88ac20bcbe000000000017a9147a86d6c7eb12ce0aa309d7391a6f338eba3c242b8700000000",
+        )?;
+
+        let coinbase_data = cipherscan_coinbase_data(&raw_transaction)?;
+
+        assert_eq!(
+            coinbase_data,
+            CipherscanCoinbaseData {
+                miner_data_hex: "04f09f8cb87a6b636c61756465636f646572".to_owned(),
+                miner_data_text: ".....zkclaudecoder".to_owned(),
+            }
+        );
         Ok(())
     }
 
