@@ -71,7 +71,7 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `compact_block` | Protobuf-compatible compact block artifact envelopes |
 | `tree_state` | Sapling and Orchard tree state metadata needed by wallet APIs |
 | `transaction` | Transaction lookup records required by wallet and explorer APIs |
-| `transaction_intrinsic_value_balances` | Optional signed Sprout, Sapling, Orchard, and Ironwood balances parsed from one canonical transaction; introduced by artifact schema 15 and enrichable in place |
+| `transaction_intrinsic_value_balances` | Optional signed Sprout, Sapling, Orchard, and Ironwood balances parsed from one canonical transaction. The value-pool flow-history projection reads one such row per retained transparent-participating transaction, so a store persisted below artifact schema 17 is refused at open and rebuilt from genesis |
 | `final_note_commitment_roots` | Optional post-block Sapling, Orchard, and Ironwood roots with explicit historical enrichment coverage; introduced by artifact schema 14 |
 | `block_value_pool_balances` | Optional post-block cumulative value-pool balances bound to exact block identity and time; introduced by artifact schema 16 |
 | `displaced_block` and indexes | Writer-owned archive keyed by displaced block hash and observation order; capture begins at the schema-17 activation record and is retained permanently |

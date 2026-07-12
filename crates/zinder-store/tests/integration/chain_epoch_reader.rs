@@ -13,13 +13,14 @@ use std::{
 use eyre::eyre;
 use tempfile::{TempDir, tempdir};
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
-    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
+    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
     TransparentSpendFact, TransparentUnspentOutput, UnixTimestampMillis,
 };
 use zinder_store::{
-    BlockHashLookup, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
+    BlockHashLookup, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions,
+    PrimaryChainStore, ReorgWindowChange,
 };
 
 const CRASH_CHILD_ENV: &str = "ZINDER_STORE_CRASH_CHILD";
@@ -102,7 +103,7 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
         visible_tip_hash: replacement_hash,
         settled_tip_height: safe_tip_epoch.visible_tip_height,
         settled_tip_hash: safe_tip_epoch.visible_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -170,7 +171,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         visible_tip_hash: replacement_hash,
         settled_tip_height: safe_tip_epoch.visible_tip_height,
         settled_tip_hash: safe_tip_epoch.visible_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -203,7 +204,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         visible_tip_hash: reintroduced_hash,
         settled_tip_height: safe_tip_epoch.visible_tip_height,
         settled_tip_hash: safe_tip_epoch.visible_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
@@ -262,7 +263,7 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
         visible_tip_hash: replacement_hash,
         settled_tip_height: safe_tip_epoch.visible_tip_height,
         settled_tip_hash: safe_tip_epoch.visible_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -527,7 +528,7 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
         visible_tip_hash: replacement_hash,
         settled_tip_height: epoch_1.visible_tip_height,
         settled_tip_hash: epoch_1.visible_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
@@ -635,7 +636,7 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         visible_tip_hash: replacement_hash,
         settled_tip_height: safe_tip_epoch.visible_tip_height,
         settled_tip_hash: safe_tip_epoch.visible_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -721,7 +722,7 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
         visible_tip_hash: replacement_hash,
         settled_tip_height: safe_tip_epoch.visible_tip_height,
         settled_tip_hash: safe_tip_epoch.visible_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -1026,7 +1027,7 @@ fn synthetic_epoch(
             visible_tip_hash: source_hash,
             settled_tip_height: block_height,
             settled_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },
@@ -1108,7 +1109,7 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
         visible_tip_hash: replacement_hash,
         settled_tip_height: first_epoch.visible_tip_height,
         settled_tip_hash: first_epoch.visible_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };

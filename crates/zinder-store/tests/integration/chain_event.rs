@@ -8,13 +8,13 @@ use std::num::NonZeroU32;
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
+    BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainStoreOptions, EventStreamStartPosition, PrimaryChainStore,
-    ReorgWindowChange, StoreError, StreamCursorTokenV1,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEvent, ChainEventEnvelope,
+    ChainEventHistoryRequest, ChainEventStreamFamily, ChainStoreOptions, EventStreamStartPosition,
+    PrimaryChainStore, ReorgWindowChange, StoreError, StreamCursorTokenV1,
 };
 
 #[test]
@@ -69,7 +69,7 @@ fn checkpoint_bootstrap_cursor_resumes_after_artifactless_anchor() -> eyre::Resu
         visible_tip_hash: checkpoint_hash,
         settled_tip_height: checkpoint_height,
         settled_tip_hash: checkpoint_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_200_010),
     };
@@ -825,7 +825,7 @@ fn synthetic_epoch_with_safe_tip(
             visible_tip_hash: source_hash,
             settled_tip_height: BlockHeight::new(safe_tip_height),
             settled_tip_hash: block_hash(safe_tip_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),
         },

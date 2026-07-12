@@ -130,8 +130,8 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `DisplacedBlockArchive` | Writer-owned append-only archive of blocks displaced by an accepted canonical replacement. Capture is atomic with `ReorgWindowChange::Replace`; hash is identity, event/height is observation order, and explicit activation coverage prevents claims about earlier reorgs. |
 | `DisplacedBlockHistory` | Explorer RPC returning bounded newest-first displaced-block observations plus each block's current canonical counterpart at the former height. It exposes raw payout scripts and values without product-specific address labels or miner branding. |
 | `DisplacedBlockDetail` | Explorer hash lookup for one displaced block, its current canonical counterpart, optional already-retained consensus bytes, and archive activation coverage. |
-| `BlockFinalNoteCommitmentRoots` | Typed canonical artifact containing the post-block Sapling, Orchard, and Ironwood note-commitment-tree roots. Pool fields are optional before activation; an absent artifact means enrichment has not reached that height. Artifact schema 14 introduces the family while retaining schema-12 and schema-13 reads for in-place migration. |
-| `TransactionIntrinsicValueBalances` | Signed Sprout, Sapling, Orchard, and Ironwood value balances parsed from one transaction. Positive values enter the transaction from the named pool; negative values leave it for that pool. Transparent value is excluded because it requires prevout resolution. Artifact schema 15 introduces the separately enrichable transaction artifact while retaining schemas 12 through 14. |
+| `BlockFinalNoteCommitmentRoots` | Typed canonical artifact containing the post-block Sapling, Orchard, and Ironwood note-commitment-tree roots. Pool fields are optional before activation; an absent artifact means enrichment has not reached that height. A store persisted below artifact schema 17 is refused at open and rebuilt from genesis. |
+| `TransactionIntrinsicValueBalances` | Signed Sprout, Sapling, Orchard, and Ironwood value balances parsed from one transaction. Positive values enter the transaction from the named pool; negative values leave it for that pool. Transparent value is excluded because it requires prevout resolution. The value-pool flow-history projection reads one such row per retained transparent-participating transaction, so a store persisted below artifact schema 17 is refused at open and rebuilt from genesis. |
 | `CommitmentRootSearch` | Explorer RPC that reverse-indexes canonical final note-commitment roots and returns explicit historical coverage. It does not claim transaction-intermediate anchors or orphaned blocks. |
 | `TransactionHistory` | Explorer RPC returning bounded, filter-aware, newest-first canonical transaction pages. Version 2 adds a projection read fence, verified contiguous coverage, and explicit count scope without replacing the v1 RPC or entry fields. |
 | `TransactionHistoryReadFence` | Exact identity of one history projection view: canonical chain epoch, projection revision, and projection tip height and hash. Requests and opaque cursors carrying a stale fence fail closed. |
@@ -857,8 +857,9 @@ through the visible tip; block timestamps never establish coverage because
 they are not monotonic. Historical scanning fetches only daily candidates from
 Zebra's verbose `getblock`, while the replaceable live tail retains every
 block for exact reorg reconciliation. The optional schema-16 canonical
-artifact binds each source snapshot to the requested block hash and time;
-schemas 12 through 15 remain readable and enrichable in place.
+artifact binds each source snapshot to the requested block hash and time; a
+store persisted below artifact schema 17 is refused at open and rebuilt from
+genesis.
 
 `ExplorerQuery.DisplacedBlockHistory` and
 `ExplorerQuery.DisplacedBlockDetail` advertise

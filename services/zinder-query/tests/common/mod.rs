@@ -14,11 +14,12 @@
 
 use prost::Message;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
+    BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_proto::v1::wallet;
+use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
 
 /// Splits a `TransparentAddressUnspentOutputs` stream into the single leading
 /// `ChainView` header and the payload items that follow it.
@@ -108,7 +109,7 @@ pub fn synthetic_chain_epoch(
             visible_tip_hash: source_hash,
             settled_tip_height: block_height,
             settled_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_300_000 + u64::from(height)),
         },
@@ -155,7 +156,7 @@ pub fn synthetic_multi_block_epoch(
         visible_tip_hash: block_hash_from_seed(visible_tip),
         settled_tip_height: BlockHeight::new(settled_tip),
         settled_tip_hash: block_hash_from_seed(settled_tip),
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_000 + u64::from(visible_tip)),
     };

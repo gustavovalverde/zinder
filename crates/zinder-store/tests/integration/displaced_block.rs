@@ -3,15 +3,15 @@ use std::num::NonZeroU32;
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash,
-    BlockHeaderArtifact, BlockHeight, BlockId, BlockTransactionIndexArtifact, ChainEpoch,
-    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, FinalNoteCommitmentRoot, Network,
-    ShieldedProtocol, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentOutputArtifact, UnixTimestampMillis,
+    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockId, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, FinalNoteCommitmentRoot, Network, ShieldedProtocol, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
+    UnixTimestampMillis,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainEpochReader, ChainStoreOptions, DisplacedBlockStore,
-    PrimaryChainStore, ReorgWindowChange, SecondaryChainStore, StoreError,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochReader, ChainStoreOptions,
+    DisplacedBlockStore, PrimaryChainStore, ReorgWindowChange, SecondaryChainStore, StoreError,
 };
 
 #[test]
@@ -543,7 +543,7 @@ fn chain_epoch(id: u64, tip_hash: BlockHash, created_at: u64) -> ChainEpoch {
         visible_tip_hash: tip_hash,
         settled_tip_height: BlockHeight::new(1),
         settled_tip_hash: block_hash(1),
-        artifact_schema_version: ArtifactSchemaVersion::new(12),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(created_at),
     }

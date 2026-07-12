@@ -6,12 +6,12 @@
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
+    BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, RawBlobRetention,
-    SecondaryChainStore, StoreError,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore,
+    RawBlobRetention, SecondaryChainStore, StoreError,
 };
 
 #[test]
@@ -254,7 +254,7 @@ fn synthetic_epoch(
             visible_tip_hash: source_hash,
             settled_tip_height: block_height,
             settled_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },

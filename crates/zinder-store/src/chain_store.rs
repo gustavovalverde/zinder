@@ -230,28 +230,28 @@ const TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION: u16 = 11;
 /// but materialization belongs to the derive plane.
 ///
 /// Version 14 adds per-block Sapling, Orchard, and Ironwood final
-/// note-commitment roots. Version-12 stores remain readable in place because
-/// the new artifact family is optional and can be enriched without replacing
-/// old epoch or event records. The next canonical commit stamps version 14.
+/// note-commitment roots.
 ///
 /// Version 15 adds optional transaction-intrinsic Sprout, Sapling, Orchard,
-/// and Ironwood value balances. Versions 12 through 14 remain readable because
-/// absence of this family is explicit and historical rows can be enriched in
-/// place. The next canonical commit stamps version 15.
+/// and Ironwood value balances.
 ///
 /// Version 16 adds optional cumulative value-pool balances bound to an exact
-/// canonical block hash and time. Versions 12 through 15 remain readable
-/// because absence is explicit and historical blocks can be enriched in place.
-/// The next canonical commit stamps version 16.
+/// canonical block hash and time.
 ///
 /// Version 17 adds optional final note-commitment roots to newly captured
 /// displaced-block rows, plus a writer-owned reverse index and an independent
-/// activation-limited coverage record. Versions 12 through 16 remain readable:
-/// pre-version-17 archive rows decode with unknown roots and are excluded from
-/// displaced-root coverage counters. The next canonical commit stamps version 17.
+/// activation-limited coverage record. Archive rows captured before the
+/// coverage record's activation decode with unknown roots and are excluded
+/// from displaced-root coverage counters. The next canonical commit stamps
+/// version 17.
 pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(17);
 /// Oldest durable artifact schema version this binary can read.
-pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 12;
+///
+/// Version 17 first writes transaction-intrinsic value balances for every
+/// retained transparent-participating transaction, which the value-pool
+/// flow-history consumer reads during replay; a store below it is refused at
+/// open and rebuilt from genesis.
+pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 17;
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 /// Artifact schema the store-schema-10-to-11 rebuild produces.
@@ -4694,7 +4694,7 @@ mod tests {
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
         assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 17);
-        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 12);
+        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 17);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()

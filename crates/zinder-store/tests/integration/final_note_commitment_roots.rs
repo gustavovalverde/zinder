@@ -146,15 +146,15 @@ fn historical_enrichment_is_idempotent_rejects_stale_hashes_and_survives_commit(
 }
 
 #[test]
-fn artifact_schemas_12_through_17_are_readable_11_and_18_are_rejected_and_17_commits()
+fn only_artifact_schema_17_is_readable_older_and_newer_are_rejected_and_17_commits()
 -> eyre::Result<()> {
-    assert_schema_reopen(12, true)?;
-    assert_schema_reopen(13, true)?;
-    assert_schema_reopen(14, true)?;
-    assert_schema_reopen(15, true)?;
-    assert_schema_reopen(16, true)?;
     assert_schema_reopen(17, true)?;
     assert_schema_reopen(11, false)?;
+    assert_schema_reopen(12, false)?;
+    assert_schema_reopen(13, false)?;
+    assert_schema_reopen(14, false)?;
+    assert_schema_reopen(15, false)?;
+    assert_schema_reopen(16, false)?;
     assert_schema_reopen(18, false)?;
 
     let tempdir = tempdir()?;
@@ -187,7 +187,7 @@ fn assert_schema_reopen(version: u16, should_open: bool) -> eyre::Result<()> {
     );
     if let Err(error) = reopened {
         match version {
-            11 => assert!(matches!(error, StoreError::SchemaTooOld { .. })),
+            11..=16 => assert!(matches!(error, StoreError::SchemaTooOld { .. })),
             18 => assert!(matches!(error, StoreError::SchemaTooNew { .. })),
             _ => return Err(eyre::eyre!("unexpected schema reopen error: {error}")),
         }

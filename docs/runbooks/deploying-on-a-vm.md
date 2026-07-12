@@ -107,53 +107,22 @@ You should see structured tracing events with `phase=` and `phase_state=`:
 
 The expected readiness sequence is `phase=awaiting_upstream cause=starting` → `phase=bulk_catchup cause=syncing` → `phase=following_tip cause=syncing` → `phase=following_tip cause=ready`. While catching up, `/readyz` returns 503 with `{"status":"not_ready","phase":"bulk_catchup","cause":"syncing","lag_blocks":N,...}`. Once caught up, it returns 200 with `{"status":"ready","phase":"following_tip","cause":"ready",...}`. The startup tracing events (`phase=load_config`, `phase=open_storage`, etc.) shown above describe the process bring-up sequence and are distinct from the unified ingest loop's `IngestPhase` exposed on `/readyz`; the two share the field name `phase` but report different lifecycles. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md) for the runtime-phase taxonomy.
 
-### Artifact schema 13 to 14
+### Artifact schema upgrades
 
-Schema 14 is an additive, in-place migration for final note-commitment roots;
-it does not require deleting or recreating the data volume. It does require a
-coordinated restart because the writer creates a new canonical column family
-and derive-store families, and a schema-13 reader cannot interpret a newly
-committed schema-14 epoch.
+Every store persisted below artifact schema 17 is refused at open. The
+value-pool flow-history projection replays one transaction-intrinsic
+value-balance row per retained transparent-participating transaction, and
+stores written before schema 17 never wrote them, so there is no in-place
+upgrade path across the floor. Deploy the schema-17 service set against a fresh
+volume and resync from genesis; ingest opens the primary and stamps schema 17
+on its first canonical commit, and the query and explorer readers open once
+ingest is healthy.
 
-1. Build or pull all schema-14 service images before downtime.
-2. Stop `zinder-explorer`, `zinder-query`, and `zinder-ingest`.
-3. Using the stopped schema-13 ingest image, run
-   `zinder-ingest backup --config /etc/zinder/config.toml --to <checkpoint>`
-   against the existing volume. Keep the canonical and bundled `derive`
-   checkpoint together.
-4. Start schema-14 `zinder-ingest` first. Its primary opens the additive
-   column families and reconciles the new derive consumer manifest.
-5. After ingest is healthy and has committed a schema-14 epoch, start the
-   schema-14 query and explorer readers.
-6. Verify the volume creation timestamp is unchanged, all three health probes
-   pass, and commitment-root backfill progress is advancing.
+Schema 17 also introduces the writer-owned displaced-block archive with a
+permanent retention policy, so include its monotonic growth in capacity
+planning and checkpoint sizing.
 
-Do not perform a reader-first rolling restart for this migration. Do not roll
-back only one service: restoring a schema-13 binary after a schema-14 commit
-requires stopping the stack and serving the pre-migration checkpoint with the
-matching schema-13 service set.
-
-### Artifact schema 14 to 15
-
-Schema 15 adds canonical signed Sprout, Sapling, Orchard, and Ironwood
-transaction-intrinsic value balances. The new artifact family and exact
-paid-fee derive consumer are additive: existing schema-13 rows remain readable,
-and the current volume is upgraded in place rather than rebuilt or recreated.
-
-Use the same coordinated checkpoint procedure as schema 13 to 14. Every binary
-that opens the canonical or derive store must come from the schema-15 release.
-Start the new ingest writer before its readers so it can create the new
-canonical and derive column families and reconcile the bundled-consumer
-manifest. After the first schema-15 commit, an older binary fails closed by
-design. Rollback therefore restores the canonical-plus-derive checkpoint with
-the complete prior service set; it never deletes the new families from a live
-RocksDB instance.
-
-The paid-fee backfill grows newest-first from the seeded live tail. Monitor its
-explicit coverage and unavailable-transaction counts rather than canonical
-readiness. Seven-day queries can become complete while older history continues
-to prepend, and increasing the configured history window widens the durable
-floor without clearing existing paid-fee rows.
+### Derive-consumer version migrations
 
 Transaction-component history is a separate derive-consumer migration and does
 not increment the canonical artifact schema. Version 2 replaces its
@@ -167,14 +136,6 @@ event dispatcher starts, so the worker joins height-1 history to current chain
 coverage without waiting for another block. The migration clears only the
 transaction-component consumer and preserves the canonical volume plus every
 unrelated derive consumer; do not wipe or replay the canonical store.
-
-### Artifact schema 15 to 16
-
-Schema 16 adds canonical per-block value-pool balances. Existing schemas 12 through 15 remain readable while the resumable newest-first enrichment establishes historical coverage. Use the same coordinated checkpoint, writer-first start, and whole-stack rollback procedure. The value-pool balance capability is not a readiness proxy: verify its projection coverage reaches the response fence before claiming complete history.
-
-### Artifact schema 16 to 17
-
-Schema 17 adds final note-commitment roots to newly captured displaced-block rows and introduces the writer-owned displaced-root index and archive coverage record. Capture starts with the first replacement accepted by a schema-17 writer; it does not reconstruct older displaced branches. Archive retention is currently permanent, so operators must include its monotonic growth in capacity planning and checkpoint sizing. Rollback requires the pre-upgrade canonical-plus-derive checkpoint and the matching schema-16 service set.
 
 ### 5. Hit the probes
 
