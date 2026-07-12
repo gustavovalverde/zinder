@@ -850,6 +850,7 @@ explorer.fee.paid_distribution_v1
 explorer.value_pool.summary_v1
 explorer.network_upgrade.status_v1
 explorer.value_pool.flow_history_v1
+explorer.value_pool.flow_events_in_range_v1
 explorer.value_pool.flow_summary_v1
 explorer.value_pool.flow_amount_threshold_summary_v1
 explorer.value_pool.flow_rounded_amount_summary_v1

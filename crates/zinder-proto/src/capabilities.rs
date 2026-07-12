@@ -326,6 +326,13 @@ pub const EXPLORER_NETWORK_UPGRADE_STATUS_V1: &str = "explorer.network_upgrade.s
 /// transparent-to-shielded flow events with typed filters, opaque continuations,
 /// optional exact counts, and explicit materialization coverage.
 pub const EXPLORER_VALUE_POOL_FLOW_HISTORY_V1: &str = "explorer.value_pool.flow_history_v1";
+/// Capability advertised for `ExplorerQuery.ValuePoolFlowEventsInRange`.
+///
+/// Signals that the explorer serves bounded canonical value-pool flow events
+/// selected by half-open block-time range, direction, pool, and inclusive
+/// amount bounds, with explicit scan, result, freshness, and coverage metadata.
+pub const EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1: &str =
+    "explorer.value_pool.flow_events_in_range_v1";
 /// Capability advertised for `ExplorerQuery.ValuePoolFlowSummary`.
 ///
 /// Signals that the explorer aggregates the canonical value-pool flow event
@@ -1099,6 +1106,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowHistory"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowEventsInRange"),
         AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
     ),
     CapabilitySpec::new(

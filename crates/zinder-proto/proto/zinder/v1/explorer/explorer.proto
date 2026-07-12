@@ -1954,6 +1954,11 @@ service ExplorerQuery {
   rpc ValuePoolFlowHistory(ValuePoolFlowHistoryRequest)
       returns (ValuePoolFlowHistoryResponse);
 
+  // Returns bounded canonical value-pool flow events in one half-open time
+  // range. Capability: `explorer.value_pool.flow_events_in_range_v1`.
+  rpc ValuePoolFlowEventsInRange(ValuePoolFlowEventsInRangeRequest)
+      returns (ValuePoolFlowEventsInRangeResponse);
+
   // Aggregates canonical value-pool flow events into UTC hour or day buckets
   // over one half-open time range. Capability:
   // `explorer.value_pool.flow_summary_v1`.
@@ -2173,6 +2178,36 @@ message ValuePoolFlowHistoryResponse {
   uint32 scanned_event_count = 6;
   bool scan_limit_reached = 7;
   ValuePoolFlowCoverage coverage = 8;
+}
+
+// Bounded query for individual canonical value-pool flow events in one
+// half-open block-time range.
+message ValuePoolFlowEventsInRangeRequest {
+  // Inclusive Unix timestamp lower bound.
+  int64 start_time_unix_seconds = 1;
+  // Exclusive Unix timestamp upper bound.
+  int64 end_time_unix_seconds = 2;
+  // Empty means either direction.
+  repeated ValuePoolFlowDirection directions = 3;
+  // Empty means every pool attribution, including `MIXED`.
+  repeated ValuePoolFlowPool pools = 4;
+  // Inclusive unsigned amount lower bound.
+  uint64 minimum_amount_zat = 5;
+  // Inclusive unsigned amount upper bound. Absence means unbounded.
+  optional uint64 maximum_amount_zat = 6;
+  // Zero asks for the server default; the server clamps larger values.
+  uint32 max_events = 7;
+}
+
+// Bounded canonical events plus enough metadata to distinguish an empty
+// complete range from a truncated or incompletely indexed query.
+message ValuePoolFlowEventsInRangeResponse {
+  ExplorerFreshness freshness = 1;
+  repeated ValuePoolFlowEvent events = 2;
+  uint32 scanned_event_count = 3;
+  bool scan_limit_reached = 4;
+  bool event_limit_reached = 5;
+  ValuePoolFlowCoverage coverage = 6;
 }
 
 // UTC bucket width requested from `ExplorerQuery.ValuePoolFlowSummary`.

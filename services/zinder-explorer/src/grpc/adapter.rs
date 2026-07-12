@@ -54,6 +54,7 @@ use zinder_proto::v1::{
         TransparentAddressRankingResponse, UtxoSetSummaryRequest, UtxoSetSummaryResponse,
         ValuePoolBalanceHistoryRequest, ValuePoolBalanceHistoryResponse,
         ValuePoolFlowAmountThresholdSummaryRequest, ValuePoolFlowAmountThresholdSummaryResponse,
+        ValuePoolFlowEventsInRangeRequest, ValuePoolFlowEventsInRangeResponse,
         ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse,
         ValuePoolFlowRoundedAmountSummaryRequest, ValuePoolFlowRoundedAmountSummaryResponse,
         ValuePoolFlowSummaryRequest, ValuePoolFlowSummaryResponse, ValuePoolSummaryRequest,
@@ -113,8 +114,9 @@ use super::transparent_address_ranking::handle_transparent_address_ranking;
 use super::utxo_set_summary::handle_utxo_set_summary;
 use super::value_pool_balance_history::handle_value_pool_balance_history;
 use super::value_pool_flow::{
-    handle_value_pool_flow_amount_threshold_summary, handle_value_pool_flow_history,
-    handle_value_pool_flow_rounded_amount_summary, handle_value_pool_flow_summary,
+    handle_value_pool_flow_amount_threshold_summary, handle_value_pool_flow_events_in_range,
+    handle_value_pool_flow_history, handle_value_pool_flow_rounded_amount_summary,
+    handle_value_pool_flow_summary,
 };
 use super::value_pool_summary::handle_value_pool_summary;
 use zinder_derive::{DeriveStore, TRANSACTION_HISTORY_CONSUMER_NAME};
@@ -982,6 +984,31 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_value_pool_flow_history(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn value_pool_flow_events_in_range(
+        &self,
+        request: Request<ValuePoolFlowEventsInRangeRequest>,
+    ) -> Result<Response<ValuePoolFlowEventsInRangeResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ValuePoolFlowEventsInRange",
+            metric: "value_pool_flow_events_in_range",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_value_pool_flow_events_in_range(
                 derive_store,
                 &mut client,
                 &self.upstream_observation_cache,

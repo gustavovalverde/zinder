@@ -771,6 +771,7 @@ available, omit the exact total, and do not advertise v2.
 - `explorer.value_pool.summary_v1`
 - `explorer.network_upgrade.status_v1`
 - `explorer.value_pool.flow_history_v1`
+- `explorer.value_pool.flow_events_in_range_v1`
 - `explorer.value_pool.flow_summary_v1`
 - `explorer.value_pool.flow_amount_threshold_summary_v1`
 - `explorer.value_pool.flow_rounded_amount_summary_v1`
@@ -833,13 +834,17 @@ Ironwood transaction value balances. Missing prevouts or intrinsic balance
 artifacts remain explicit unavailable counts; the method never substitutes a
 ZIP-317 conventional fee.
 
-`ExplorerQuery.ValuePoolFlowHistory`, `ExplorerQuery.ValuePoolFlowSummary`,
+`ExplorerQuery.ValuePoolFlowHistory`, `ExplorerQuery.ValuePoolFlowEventsInRange`,
+`ExplorerQuery.ValuePoolFlowSummary`,
 `ExplorerQuery.ValuePoolFlowAmountThresholdSummary`, and
 `ExplorerQuery.ValuePoolFlowRoundedAmountSummary` advertise the corresponding
-`explorer.value_pool.flow_*_v1` capabilities. All four read one additive canonical
+`explorer.value_pool.flow_*_v1` capabilities. All five read one additive canonical
 per-transaction flow projection. History provides typed direction and pool
 filters, minimum net amount, opaque filter-bound paging, optional exact totals,
-and explicit historical/live-tail coverage. Summary aggregates the same events
+and explicit historical/live-tail coverage. Events-in-range provides a bounded,
+epoch-coherent half-open time-range read with typed direction and pool filters,
+inclusive amount bounds, explicit scan and result truncation, and coverage for
+the requested range. Summary aggregates the same events
 into UTC hour or day buckets over an exact half-open Unix-second range. The two
 amount summaries provide bounded exact cumulative thresholds and reusable
 nearest-quantum frequency groups, respectively; they do not persist a second
