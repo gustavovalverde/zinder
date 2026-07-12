@@ -76,6 +76,12 @@ Current integration references and API support material:
 - [Chain data catalog](reference/chain-data-catalog.md): the canonical catalog of information Zinder gathers or derives, its availability, and its product value.
 - [Error vocabulary](reference/error-vocabulary.md): every `ErrorReason` value, its gRPC `Status` code, and the retry policy clients should follow.
 
+## Product requirements
+
+- [Block explorer consumer](prd/block-explorer-consumer.md): explorer-facing product requirements, capability ownership, and acceptance boundaries.
+- [ZIP-311 payment disclosure verifier](prd/zip311-payment-disclosure-verifier.md): verifier requirements, trust boundaries, and delivery milestones.
+- [Wallet workload presets](prd/wallet-workload-presets.md): requirements for wallet-sized projection workloads, payload-policy independence, lifecycle safety, and evidence-gated support.
+
 ## Investigations
 
 - [Zaino feature comparison](investigations/zaino-feature-comparison.md): public-surface audit against zainod 0.3.1, including native equivalents, raw-RPC differences, and deliberate non-goals.
@@ -84,6 +90,7 @@ Current integration references and API support material:
 
 - [Lightwalletd compatibility certification](plans/lightwalletd-compatibility-certification.md): bounded, evidence-backed replacement claims for the compatibility adapter.
 - [Native indexer projections merge](plans/native-indexer-projections-merge.md): native-only scope, schema ladder, coverage matrix, review sequence, and merge constraints for this branch.
+- [Wallet workload presets](plans/wallet-workload-presets.md): investigation findings, invariants, tracer-bullet phases, stop conditions, and requirement traceability for the wallet workload PRD.
 
 ## Runbooks
 
@@ -114,4 +121,6 @@ Each tree under `docs/` has its own retire-on-ship rule.
 - **Architecture** (`docs/architecture/`): the durable spine. Explains why each contract exists, what its invariants are, and where its boundary lives. Edited in place when contracts change. Architecture docs reference other architecture docs and at most one ADR per topic.
 - **ADRs** (`docs/adrs/`): record of accepted design decisions in present tense. Edited in place when the decision rationale needs clarification; substantive design changes get a new ADR with a contiguous number. ADRs reference the owning architecture docs and only the predecessor decisions they directly build on.
 - **Reference** (`docs/reference/`): current integration patterns and API support material. Reference docs may point into architecture docs, but they should not carry transition history or dated validation notes.
+- **Product requirements** (`docs/prd/`): product contracts, user outcomes, acceptance boundaries, and open product decisions. PRDs stay active until their requirements ship or are explicitly superseded.
+- **Plans** (`docs/plans/`): implementation sequencing, evidence gates, and requirement traceability for approved or proposed work. Plans may incorporate investigation findings, but they do not replace durable architecture decisions.
 - **Runbooks** (`docs/runbooks/`): operational procedures with explicit prereqs, command lines, and expected outcomes. Edited in place as procedures evolve; reference architecture docs and ADRs (up) but do not describe architectural intent.

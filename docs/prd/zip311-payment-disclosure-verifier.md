@@ -2,7 +2,7 @@
 
 Status: Draft
 Date: 2026-05-26
-Owner: ZFND
+Author: Gustavo Valverde
 Reference consumer: zpay (Zcash-native payments facilitator), zexplorer (public `payment-disclosures/verify` endpoint)
 
 ## Problem Statement

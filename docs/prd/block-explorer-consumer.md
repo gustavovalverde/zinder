@@ -3,7 +3,7 @@
 Status: Shipped
 Date: 2026-05-18
 Last updated: 2026-07-12
-Owner: ZFND
+Author: Gustavo Valverde
 Reference consumer: zexplorer (M0+)
 
 This PRD records the original explorer requirements. The current normative wire, capability, and projection semantics live in [Public interfaces](../architecture/public-interfaces.md) and [Explorer plane](../architecture/explorer-plane.md). Later additive projections do not retroactively replace shipped requirements.
