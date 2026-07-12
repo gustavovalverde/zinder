@@ -300,6 +300,7 @@ fn derive_replay_config() -> Result<IngestDeriveConfig> {
         memory_degrade_ratio: 0.85,
         memory_pause_ratio: 0.95,
         memory_resume_ratio: 0.75,
+        startup_handoff_lag_blocks: 1_000,
     })
 }
 

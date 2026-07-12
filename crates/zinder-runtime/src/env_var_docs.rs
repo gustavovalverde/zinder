@@ -786,6 +786,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       to 10.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__DERIVE__STARTUP_HANDOFF_LAG_BLOCKS",
+        toml_path: "ingest.derive.startup_handoff_lag_blocks",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Residual derive lag in blocks at which the startup catch-up stops replaying \
+                      synchronously and hands the remainder to the always-on tailer, so the API \
+                      and ops surfaces come up while the tailer drains the rest. A bounded \
+                      wall-clock budget caps the startup catch-up regardless of this value. \
+                      Defaults to 1000.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS",
         toml_path: "ingest.bulk_catchup.flush_interval_epochs",
         used_by: &["zinder-ingest"],

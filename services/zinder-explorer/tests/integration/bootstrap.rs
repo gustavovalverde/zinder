@@ -1435,6 +1435,7 @@ fn test_derive_config() -> zinder_ingest::IngestDeriveConfig {
         memory_pause_ratio: 0.95,
         memory_resume_ratio: 0.75,
         min_replay_batch_blocks: NonZeroU32::new(10).unwrap_or(NonZeroU32::MIN),
+        startup_handoff_lag_blocks: 1_000,
     }
 }
 

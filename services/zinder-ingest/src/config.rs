@@ -100,6 +100,7 @@ fn default_pipeline_queue_bytes_from_budget(
 const DEFAULT_FLUSH_INTERVAL_EPOCHS: u32 = 5;
 const DEFAULT_DERIVE_REPLAY_BATCH_BLOCKS: u32 = 100;
 const DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS: u32 = 10;
+const DEFAULT_DERIVE_STARTUP_HANDOFF_LAG_BLOCKS: u32 = 1_000;
 const DEFAULT_DERIVE_REPLAY_MEMORY_DEGRADE_RATIO: f64 = 0.90;
 const DEFAULT_DERIVE_REPLAY_MEMORY_PAUSE_RATIO: f64 = 0.99;
 const DEFAULT_DERIVE_REPLAY_MEMORY_RESUME_RATIO: f64 = 0.80;
@@ -358,6 +359,10 @@ pub(crate) fn load_ingest_config(
         .with_default(
             "ingest.derive.min_replay_batch_blocks",
             DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS,
+        )?
+        .with_default(
+            "ingest.derive.startup_handoff_lag_blocks",
+            DEFAULT_DERIVE_STARTUP_HANDOFF_LAG_BLOCKS,
         )?
         .with_default(
             "ingest.commitment_root_backfill.enabled",
@@ -677,6 +682,7 @@ struct IngestDeriveSection {
     memory_pause_ratio: Option<f64>,
     memory_resume_ratio: Option<f64>,
     min_replay_batch_blocks: Option<u32>,
+    startup_handoff_lag_blocks: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -988,6 +994,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         )
         .into());
     }
+    let startup_handoff_lag_blocks = u64::from(require_field(
+        config.ingest.derive.startup_handoff_lag_blocks,
+        "ingest.derive.startup_handoff_lag_blocks",
+    )?);
 
     let commitment_root_backfill = CommitmentRootBackfillConfig {
         enabled: require_field(
@@ -1202,6 +1212,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             memory_pause_ratio,
             memory_resume_ratio,
             min_replay_batch_blocks,
+            startup_handoff_lag_blocks,
         },
         commitment_root_backfill,
         bulk_catchup: BulkCatchupConfig {
@@ -1318,6 +1329,7 @@ impl RedactedIngestConfigToml {
                     memory_pause_ratio: loop_config.derive.memory_pause_ratio,
                     memory_resume_ratio: loop_config.derive.memory_resume_ratio,
                     min_replay_batch_blocks: loop_config.derive.min_replay_batch_blocks.get(),
+                    startup_handoff_lag_blocks: loop_config.derive.startup_handoff_lag_blocks,
                 },
                 commitment_root_backfill: IngestCommitmentRootBackfillToml {
                     enabled: loop_config.commitment_root_backfill.enabled,
@@ -1539,6 +1551,7 @@ struct IngestDeriveToml {
     memory_pause_ratio: f64,
     memory_resume_ratio: f64,
     min_replay_batch_blocks: u32,
+    startup_handoff_lag_blocks: u64,
 }
 
 #[derive(Serialize)]

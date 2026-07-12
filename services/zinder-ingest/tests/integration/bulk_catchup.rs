@@ -269,6 +269,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             memory_resume_ratio: 0.75,
             min_replay_batch_blocks: NonZeroU32::new(1)
                 .ok_or_else(|| eyre!("invalid minimum replay batch blocks"))?,
+            startup_handoff_lag_blocks: 1_000,
         },
     )
     .await?;

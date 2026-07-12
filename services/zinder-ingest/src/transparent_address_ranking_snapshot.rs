@@ -26,7 +26,8 @@ pub enum TransparentAddressRankingBootstrapOutcome {
     Ready,
     /// Existing historical sources cannot prove complete lifetime statistics.
     SourceCoverageIncomplete,
-    /// No canonical chain or unanimous derive boundary exists yet.
+    /// No canonical chain or unanimous derive boundary exists yet, or derive
+    /// replay still trails the canonical event tail.
     ChainNotReady,
 }
 
@@ -120,10 +121,9 @@ fn bootstrap_boundary(
         .chain_event_history(ChainEventHistoryRequest::with_default_limit(Some(&cursor)))?
         .is_empty()
     {
-        return Err(IngestError::DeriveDispatch(
-            "transparent-address ranking bootstrap requires existing consumers at the canonical event tail"
-                .to_owned(),
-        ));
+        // Derive replay trails the canonical event tail: startup hands residual
+        // replay to the always-on tailer, so defer until a boot finds parity.
+        return Ok(BootstrapBoundary::NotReady);
     }
     let Some(chain_epoch) = chain_store.current_chain_epoch()? else {
         return Ok(BootstrapBoundary::NotReady);
@@ -134,10 +134,9 @@ fn bootstrap_boundary(
         if ranking_cursor.as_deref() != Some(cursor_bytes.as_slice())
             || active.coverage.balance_complete_through_height != chain_epoch.visible_tip_height
         {
-            return Err(IngestError::DeriveDispatch(
-                "active transparent-address ranking disagrees with the canonical derive boundary"
-                    .to_owned(),
-            ));
+            // The active ranking lags the canonical boundary; the tailer keeps
+            // advancing it, so defer rather than fail startup.
+            return Ok(BootstrapBoundary::NotReady);
         }
         return Ok(BootstrapBoundary::Ready);
     }

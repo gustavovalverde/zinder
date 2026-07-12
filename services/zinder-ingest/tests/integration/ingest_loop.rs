@@ -196,6 +196,7 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
             memory_pause_ratio: 0.95,
             memory_resume_ratio: 0.75,
             min_replay_batch_blocks: NonZeroU32::new(10).ok_or_else(|| eyre!("nonzero"))?,
+            startup_handoff_lag_blocks: 1_000,
         },
         commitment_root_backfill: zinder_ingest::CommitmentRootBackfillConfig {
             enabled: true,

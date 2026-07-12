@@ -140,6 +140,12 @@ pub struct IngestDeriveConfig {
     pub memory_resume_ratio: f64,
     /// Smallest effective replay batch while memory pressure is degraded.
     pub min_replay_batch_blocks: NonZeroU32,
+    /// Residual derive lag, in blocks, at which the startup catch-up stops
+    /// replaying synchronously and hands the remainder to the always-on
+    /// tailer. Startup returns once the derive plane is within this many
+    /// blocks of the canonical tip, letting the API and ops surfaces come up
+    /// while the tailer drains the rest.
+    pub startup_handoff_lag_blocks: u64,
 }
 
 /// Runtime policy for replaying retained chain events into derive consumers.
@@ -737,6 +743,7 @@ mod tests {
                 memory_resume_ratio: 0.75,
                 min_replay_batch_blocks: NonZeroU32::new(10)
                     .ok_or("invalid minimum replay batch blocks")?,
+                startup_handoff_lag_blocks: 1_000,
             },
             commitment_root_backfill: CommitmentRootBackfillConfig {
                 enabled: true,

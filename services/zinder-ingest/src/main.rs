@@ -24,8 +24,8 @@ use zinder_ingest::{
     PaidFeeDistributionBackfillContext, TipFollowSubsystems, TipFollowSubsystemsLauncher,
     TransactionComponentBackfillContext, TransactionHistoryVerifierContext,
     ValuePoolBalanceBackfillContext, ValuePoolFlowBackfillContext,
-    bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical, classify_phase,
-    current_chain_height, ensure_spend_projection_not_behind_retention_sweep,
+    bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical_until_handoff,
+    classify_phase, current_chain_height, ensure_spend_projection_not_behind_retention_sweep,
     mempool_ready_channel, open_primary_derive_store_for_canonical, run_ingest_loop,
     run_mempool_orchestrator, seed_backfill_owned_consumer_cursors,
     seed_paid_fee_distribution_cursor_and_tail, seed_value_pool_flow_cursor_and_tail,
@@ -519,9 +519,12 @@ async fn run_ingest(
         start_api_phase.fail(&wrapped);
         return Err(wrapped);
     }
-    if let Err(error) =
-        catch_up_derive_store_to_canonical(&store, &derive_store, command_config.loop_config.derive)
-            .await
+    if let Err(error) = catch_up_derive_store_to_canonical_until_handoff(
+        &store,
+        &derive_store,
+        command_config.loop_config.derive,
+    )
+    .await
     {
         let wrapped: IngestConfigError = error.into();
         open_storage_phase.fail(&wrapped);

@@ -208,6 +208,10 @@ struct DeriveReplayBudget {
     /// unified ingest loop stamps [`IngestPhase`] on this shared handle every
     /// iteration.
     phase_gate: Option<Readiness>,
+    /// Point at which the current pass stops draining and returns. The tailer
+    /// drains fully; startup returns once the derive plane reaches the handoff
+    /// lag or the wall-clock budget.
+    bound: DeriveCatchUpBound,
 }
 
 impl DeriveReplayBudget {
@@ -217,6 +221,7 @@ impl DeriveReplayBudget {
             memory_state: DeriveReplayBudgetState::Normal,
             applied_state: DeriveReplayBudgetState::Normal,
             phase_gate: None,
+            bound: DeriveCatchUpBound::Drain,
         }
     }
 
@@ -226,6 +231,7 @@ impl DeriveReplayBudget {
             memory_state: DeriveReplayBudgetState::Normal,
             applied_state: DeriveReplayBudgetState::Normal,
             phase_gate: Some(readiness),
+            bound: DeriveCatchUpBound::Drain,
         }
     }
 
@@ -860,6 +866,79 @@ pub fn spawn_derive_replay_budget_metrics_task(
     })
 }
 
+/// Wall-clock ceiling on the startup derive catch-up before it hands residual
+/// replay to the always-on tailer.
+///
+/// A dense-band restart can leave the canonical store leading the derive plane
+/// by tens of thousands of blocks. Draining that synchronously inside the fatal
+/// `open_storage` phase kept the whole service unavailable while it ran; this
+/// budget caps that window. The tailer resumes from the persisted consumer
+/// cursors, so any residual drains without data loss.
+const STARTUP_DERIVE_HANDOFF_BUDGET: Duration = Duration::from_secs(30);
+
+/// Bound on how far the derive catch-up drains before returning.
+#[derive(Clone, Copy, Debug)]
+enum DeriveCatchUpBound {
+    /// Drain every retained chain event. The always-on tailer runs this way.
+    Drain,
+    /// Return once the derive plane is within `max_lag_blocks` of the canonical
+    /// tip or `deadline` passes, whichever comes first. Startup runs this way
+    /// so the API and ops surfaces come up while the tailer drains the rest.
+    Handoff {
+        canonical_tip_height: Option<BlockHeight>,
+        max_lag_blocks: u64,
+        deadline: Instant,
+    },
+}
+
+impl DeriveCatchUpBound {
+    /// Returns whether the catch-up has drained enough to hand off, reading the
+    /// current block-summary head from the derive store.
+    fn handoff_reached(self, derive_store: &DeriveStore) -> Result<bool, IngestError> {
+        let Self::Handoff {
+            canonical_tip_height,
+            max_lag_blocks,
+            deadline,
+        } = self
+        else {
+            return Ok(false);
+        };
+        if Instant::now() >= deadline {
+            return Ok(true);
+        }
+        let head = derive_store.last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)?;
+        Ok(lag_within(canonical_tip_height, head, max_lag_blocks))
+    }
+
+    /// Returns whether the catch-up has drained enough to hand off given a
+    /// block-summary head already known from the in-flight replay, sparing a
+    /// store read.
+    fn handoff_reached_at(self, replayed_through: BlockHeight) -> bool {
+        let Self::Handoff {
+            canonical_tip_height,
+            max_lag_blocks,
+            deadline,
+        } = self
+        else {
+            return false;
+        };
+        Instant::now() >= deadline
+            || lag_within(canonical_tip_height, Some(replayed_through), max_lag_blocks)
+    }
+}
+
+fn lag_within(
+    canonical_tip_height: Option<BlockHeight>,
+    head: Option<BlockHeight>,
+    max_lag_blocks: u64,
+) -> bool {
+    let Some(tip) = canonical_tip_height else {
+        return true;
+    };
+    let head = head.map_or(0, BlockHeight::value);
+    u64::from(tip.value().saturating_sub(head)) <= max_lag_blocks
+}
+
 /// Replays retained canonical chain events that have not reached the
 /// ingest-owned derive store.
 ///
@@ -875,6 +954,35 @@ pub async fn catch_up_derive_store_to_canonical(
     let mut replay_budget = DeriveReplayBudget::new(derive_config);
     catch_up_derive_store_to_canonical_with_budget(chain_store, derive_store, &mut replay_budget)
         .await
+}
+
+/// Drains derive debt only to the handoff boundary, then returns.
+///
+/// Replay stops once the derive plane is within the configured handoff lag of
+/// the canonical tip or a bounded wall-clock budget elapses, so the API and ops
+/// surfaces start while the always-on tailer drains any remainder from the
+/// persisted consumer cursors. The persisted [`DeriveStatus`] is refreshed
+/// before returning so the first readiness read reflects the residual lag as
+/// catching-up rather than dark.
+pub async fn catch_up_derive_store_to_canonical_until_handoff(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    derive_config: IngestDeriveConfig,
+) -> Result<(), IngestError> {
+    let mut replay_budget = DeriveReplayBudget::new(derive_config);
+    replay_budget.bound = DeriveCatchUpBound::Handoff {
+        canonical_tip_height: record_current_derive_replay_tip(chain_store)?,
+        max_lag_blocks: derive_config.startup_handoff_lag_blocks,
+        deadline: Instant::now() + STARTUP_DERIVE_HANDOFF_BUDGET,
+    };
+    let outcome = catch_up_derive_store_to_canonical_with_budget(
+        chain_store,
+        derive_store,
+        &mut replay_budget,
+    )
+    .await;
+    persist_derive_status(chain_store, derive_store, replay_budget.applied_state);
+    outcome
 }
 
 async fn catch_up_derive_store_to_canonical_with_budget(
@@ -900,6 +1008,9 @@ async fn catch_up_derive_store_to_canonical_with_budget(
             DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
         );
         if effective_limits.state.is_paused() {
+            return Ok(());
+        }
+        if replay_budget.bound.handoff_reached(derive_store)? {
             return Ok(());
         }
 
@@ -948,6 +1059,9 @@ async fn catch_up_derive_store_to_canonical_with_budget(
                         replay_budget.applied_state,
                         &mut last_status_persist,
                     );
+                    if replay_budget.bound.handoff_reached(derive_store)? {
+                        return Ok(());
+                    }
                 }
                 DeriveReplayProgress::Yielded => return Ok(()),
             }
@@ -1203,32 +1317,57 @@ async fn replay_committed_event_to_derive_in_batches(
             }
         };
 
-        let inputs = ChainEventDispatchInputs {
-            chain_epoch: envelope.chain_epoch,
-            chain_event: &chunk_event,
-            chain_cursor: envelope.cursor.as_bytes(),
-            event_sequence: envelope.event_sequence,
-            safe_tip_height: envelope.safe_tip_height,
-        };
-        let dispatch_started_at = Instant::now();
-        let dispatch_outcome = dispatch_chain_event(derive_store, inputs, &contexts, final_chunk);
-        record_derive_replay_stage(
-            DERIVE_REPLAY_STAGE_DISPATCH_EVENT,
-            dispatch_started_at,
-            &dispatch_outcome,
-        );
-        if let Err(error) = dispatch_outcome {
+        if let Err(error) = dispatch_replay_chunk(
+            derive_store,
+            &envelope,
+            &chunk_event,
+            &contexts,
+            final_chunk,
+        ) {
             abort_pending_replay_batch(&mut pending_replay_batch);
             record_derive_replay_event(block_count, Some(&error));
             return Err(error);
         }
 
         next_height = following_height;
+        // Hand off mid-event once within the startup handoff bound. The cursor
+        // is not advanced until the final chunk, so the tailer re-reads this
+        // event and re-applies the already-written chunks idempotently.
+        if next_height <= committed_range.end
+            && replay_budget.bound.handoff_reached_at(replay_range.end)
+        {
+            abort_pending_replay_batch(&mut pending_replay_batch);
+            return Ok(DeriveReplayProgress::Yielded);
+        }
     }
 
     record_derive_replay_event(block_count, None);
     record_committed_replay_progress(chain_store, committed_range.end)?;
     Ok(DeriveReplayProgress::Advanced(envelope.cursor))
+}
+
+fn dispatch_replay_chunk(
+    derive_store: &DeriveStore,
+    envelope: &ChainEventEnvelope,
+    chunk_event: &ChainEvent,
+    contexts: &HashMap<BlockHeight, Arc<BlockCommitContext>>,
+    final_chunk: bool,
+) -> Result<(), IngestError> {
+    let inputs = ChainEventDispatchInputs {
+        chain_epoch: envelope.chain_epoch,
+        chain_event: chunk_event,
+        chain_cursor: envelope.cursor.as_bytes(),
+        event_sequence: envelope.event_sequence,
+        safe_tip_height: envelope.safe_tip_height,
+    };
+    let dispatch_started_at = Instant::now();
+    let dispatch_outcome = dispatch_chain_event(derive_store, inputs, contexts, final_chunk);
+    record_derive_replay_stage(
+        DERIVE_REPLAY_STAGE_DISPATCH_EVENT,
+        dispatch_started_at,
+        &dispatch_outcome,
+    );
+    dispatch_outcome
 }
 
 fn abort_pending_replay_batch(
@@ -2688,6 +2827,7 @@ mod tests {
             memory_pause_ratio: 0.95,
             memory_resume_ratio: 0.75,
             min_replay_batch_blocks: NonZeroU32::new(10).unwrap_or(NonZeroU32::MIN),
+            startup_handoff_lag_blocks: 1_000,
         }
     }
 
@@ -2787,6 +2927,46 @@ mod tests {
             replay_policy: DeriveReplayPolicy::Continuous,
             ..replay_config()
         }
+    }
+
+    #[test]
+    fn drain_bound_never_hands_off() {
+        assert!(!DeriveCatchUpBound::Drain.handoff_reached_at(BlockHeight::new(1)));
+    }
+
+    #[test]
+    fn handoff_bound_stops_within_lag_threshold() {
+        let bound = DeriveCatchUpBound::Handoff {
+            canonical_tip_height: Some(BlockHeight::new(1_000)),
+            max_lag_blocks: 100,
+            deadline: Instant::now() + Duration::from_hours(1),
+        };
+        // 1000 - 850 = 150 blocks of lag stays above the threshold.
+        assert!(!bound.handoff_reached_at(BlockHeight::new(850)));
+        // 1000 - 900 = 100 blocks of lag reaches the threshold.
+        assert!(bound.handoff_reached_at(BlockHeight::new(900)));
+        assert!(bound.handoff_reached_at(BlockHeight::new(950)));
+    }
+
+    #[test]
+    fn handoff_bound_stops_on_expired_deadline() {
+        let bound = DeriveCatchUpBound::Handoff {
+            canonical_tip_height: Some(BlockHeight::new(1_000)),
+            max_lag_blocks: 0,
+            deadline: Instant::now(),
+        };
+        // Lag is far above the zero threshold, but the deadline has passed.
+        assert!(bound.handoff_reached_at(BlockHeight::new(0)));
+    }
+
+    #[test]
+    fn handoff_bound_stops_when_canonical_tip_unknown() {
+        let bound = DeriveCatchUpBound::Handoff {
+            canonical_tip_height: None,
+            max_lag_blocks: 0,
+            deadline: Instant::now() + Duration::from_hours(1),
+        };
+        assert!(bound.handoff_reached_at(BlockHeight::new(0)));
     }
 
     #[test]
