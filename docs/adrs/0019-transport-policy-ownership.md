@@ -63,7 +63,7 @@ enforced by a structural invariant test
 
 ## Decision
 
-### Two transport modules, one per owning crate
+### Core transport modules, one per owning crate
 
 Transport policy lives in two named `transport` modules, one in each
 crate that owns an upstream surface:
@@ -90,6 +90,15 @@ Putting Zebra transport in `zinder-source` is mandated by ADR-0004;
 putting intra-Zinder transport in `zinder-runtime` is mandated by
 ADR-0006 and by `zinder-runtime`'s declared "no domain types" boundary.
 Collapsing the two into one crate would violate one of the two ADRs.
+
+Service-owned compatibility adapters may additionally own focused transport
+modules for external product dependencies that are neither Zebra nor another
+Zinder service. Those modules keep the external product's endpoint, timeout,
+response-bound, caching, and failure-shape policy at the service edge. They do
+not gain ownership of Zebra clients or intra-Zinder channels. The first such
+module is
+[`services/zinder-compat-cipherscan/src/market_price.rs`](../../services/zinder-compat-cipherscan/src/market_price.rs),
+which owns Cipherscan's external current-price request and bounded stale cache.
 
 ### Per-upstream policy, not one-size-fits-all
 
@@ -167,9 +176,10 @@ grep one log target for the lifecycle events.
 ### Structural invariant
 
 [`crates/zinder-source/tests/integration/transport_invariants.rs`](../../crates/zinder-source/tests/integration/transport_invariants.rs)
-walks the workspace source tree and asserts that
-`Endpoint::from_shared`, `HttpClientBuilder`, and `reqwest::Client::builder`
-are referenced *only* inside the two transport modules. New code that reaches around the boundary fails the
+walks the workspace source tree and asserts that `Endpoint::from_shared` and
+`HttpClientBuilder` are referenced only inside the two core transport modules.
+It separately permits `reqwest::Client::builder` only in explicitly listed
+service-owned external-product transport modules. New code that reaches around the boundary fails the
 test with a message naming the offending file and pointing at the
 module to import from. This is the same enforcement pattern that
 `crates/zinder-core/tests/wire_invariants.rs` uses for byte-level wire
@@ -188,6 +198,10 @@ translations.
   per-service connect helper is allowed; the structural invariant
   rejects direct `Endpoint::from_shared` calls outside the transport
   module.
+- A compatibility service may own a narrowly scoped external-product HTTP
+  transport without moving product-specific policy into `zinder-source`.
+  Adding one requires an explicit invariant allowlist entry; it does not relax
+  Zebra or intra-Zinder transport ownership.
 - The `arc-swap` crate enters the workspace dependency graph through
   `zinder-source`. It is small (~50 KB), widely deployed in the Rust
   async ecosystem, and the only `unsafe` it contains is in its

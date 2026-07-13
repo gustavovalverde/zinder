@@ -14,13 +14,15 @@ use zinder_derive::{
     ValuePoolFlowPool as DerivedPool, ValuePoolFlowTailCoverage,
 };
 use zinder_proto::capabilities::{
-    EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1, EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
+    EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
+    EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1, EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
     EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1, EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1,
 };
 use zinder_proto::v1::explorer::{
     TransactionIntrinsicValueBalances, ValuePoolFlowAmountThresholdSummaryRequest,
     ValuePoolFlowAmountThresholdSummaryResponse, ValuePoolFlowAmountThresholdSummaryRow,
-    ValuePoolFlowCoverage, ValuePoolFlowDirection, ValuePoolFlowEvent, ValuePoolFlowFilter,
+    ValuePoolFlowCoverage, ValuePoolFlowDirection, ValuePoolFlowEvent,
+    ValuePoolFlowEventsInRangeRequest, ValuePoolFlowEventsInRangeResponse, ValuePoolFlowFilter,
     ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse, ValuePoolFlowPool,
     ValuePoolFlowRoundedAmountSummaryRequest, ValuePoolFlowRoundedAmountSummaryResponse,
     ValuePoolFlowRoundedAmountSummaryRow, ValuePoolFlowSummaryBucket, ValuePoolFlowSummaryRequest,
@@ -33,11 +35,14 @@ use super::clamp_max_entries;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+    indexed_tip_matches_chain_epoch,
 };
 
 const DEFAULT_HISTORY_PAGE_SIZE: u32 = 64;
 const MAX_HISTORY_PAGE_SIZE: u32 = 256;
 const MAX_HISTORY_SCANNED_EVENTS: usize = 100_000;
+const DEFAULT_RANGE_MAX_EVENTS: u32 = 64;
+const MAX_RANGE_MAX_EVENTS: u32 = 1_024;
 const MAX_SUMMARY_SCANNED_EVENTS: usize = 500_000;
 const MAX_AMOUNT_THRESHOLDS: usize = 32;
 const DEFAULT_ROUNDED_AMOUNT_ROWS: u32 = 50;
@@ -113,6 +118,87 @@ pub(crate) async fn handle_value_pool_flow_history(
         scan_limit_reached: page.scan_limit_reached,
         coverage: Some(map_coverage(backfill_coverage, tail_coverage, false)),
     }))
+}
+
+/// Executes one `ExplorerQuery.ValuePoolFlowEventsInRange` request.
+pub(crate) async fn handle_value_pool_flow_events_in_range(
+    derive_store: &DeriveStore,
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    upstream_observation_cache: &UpstreamObservationCache,
+    request: Request<ValuePoolFlowEventsInRangeRequest>,
+) -> Result<Response<ValuePoolFlowEventsInRangeResponse>, Status> {
+    const MAX_EPOCH_STABILIZATION_ATTEMPTS: usize = 3;
+
+    let request = request.into_inner();
+    validate_flow_events_in_range_request(&request)?;
+    let max_events = clamp_max_entries(
+        request.max_events,
+        DEFAULT_RANGE_MAX_EVENTS,
+        MAX_RANGE_MAX_EVENTS,
+    );
+    let filter = FlowFilter::try_from(ValuePoolFlowFilter {
+        directions: request.directions,
+        pools: request.pools,
+        minimum_amount_zat: request.minimum_amount_zat,
+    })?;
+    for _ in 0..MAX_EPOCH_STABILIZATION_ATTEMPTS {
+        let chain_epoch = fetch_current_chain_epoch(wallet_client).await?;
+        let visible_tip_height = visible_tip_height(&chain_epoch)?;
+        let backfill_coverage = ValuePoolFlowHistoryConsumer::backfill_coverage(derive_store)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
+        let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(derive_store)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
+        let range = read_flow_events_in_range_blocking(
+            derive_store,
+            FlowEventsInRangeQuery {
+                start_time_unix_seconds: request.start_time_unix_seconds,
+                end_time_unix_seconds: request.end_time_unix_seconds,
+                filter,
+                maximum_amount_zat: request.maximum_amount_zat,
+                max_events,
+            },
+        )
+        .await?;
+        let observed_chain_epoch = fetch_current_chain_epoch(wallet_client).await?;
+        if observed_chain_epoch != chain_epoch {
+            continue;
+        }
+        let freshness = attach_upstream_observation(
+            upstream_observation_cache,
+            build_explorer_freshness(
+                Some(derive_store),
+                EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1,
+                Some(chain_epoch.clone()),
+                0,
+            )?,
+        )
+        .await;
+        let requested_range_complete =
+            coverage_reaches_visible_tip(backfill_coverage, tail_coverage, visible_tip_height)
+                && indexed_tip_matches_chain_epoch(&freshness, &chain_epoch);
+
+        return Ok(Response::new(ValuePoolFlowEventsInRangeResponse {
+            freshness: Some(freshness),
+            events: range
+                .events
+                .into_iter()
+                .map(map_event)
+                .collect::<Result<_, _>>()?,
+            scanned_event_count: range.scanned_event_count,
+            scan_limit_reached: range.scan_limit_reached,
+            event_limit_reached: range.event_limit_reached,
+            coverage: Some(map_coverage(
+                backfill_coverage,
+                tail_coverage,
+                requested_range_complete,
+            )),
+        }));
+    }
+
+    Err(ExplorerError::upstream_unreachable(
+        "chain epoch changed while reading value-pool flow events",
+    )
+    .into())
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowSummary` request.
@@ -343,6 +429,87 @@ async fn read_history_page_blocking(
     })?
 }
 
+struct FlowEventsInRange {
+    events: Vec<DerivedEvent>,
+    scanned_event_count: u32,
+    scan_limit_reached: bool,
+    event_limit_reached: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FlowEventsInRangeQuery {
+    start_time_unix_seconds: i64,
+    end_time_unix_seconds: i64,
+    filter: FlowFilter,
+    maximum_amount_zat: Option<u64>,
+    max_events: u32,
+}
+
+async fn read_flow_events_in_range_blocking(
+    derive_store: &DeriveStore,
+    query: FlowEventsInRangeQuery,
+) -> Result<FlowEventsInRange, Status> {
+    let derive_store = derive_store.clone();
+    tokio::task::spawn_blocking(move || {
+        let range_events = ValuePoolFlowHistoryConsumer::events_in_time_range(
+            &derive_store,
+            query.start_time_unix_seconds,
+            query.end_time_unix_seconds,
+            MAX_HISTORY_SCANNED_EVENTS.saturating_add(1),
+        )
+        .map_err(|error| Status::from(ExplorerError::internal(error.to_string())))?;
+        select_flow_events_in_range(
+            range_events,
+            query.filter,
+            query.maximum_amount_zat,
+            query.max_events,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ExplorerError::internal(format!("value-pool flow range scan failed: {error}"))
+    })?
+}
+
+fn select_flow_events_in_range(
+    mut range_events: Vec<DerivedEvent>,
+    filter: FlowFilter,
+    maximum_amount_zat: Option<u64>,
+    max_events: u32,
+) -> Result<FlowEventsInRange, Status> {
+    let scan_limit_reached = range_events.len() > MAX_HISTORY_SCANNED_EVENTS;
+    range_events.truncate(MAX_HISTORY_SCANNED_EVENTS);
+    let scanned_event_count = u32::try_from(range_events.len()).unwrap_or(u32::MAX);
+    let max_events = usize::try_from(max_events).unwrap_or(usize::MAX);
+    let mut selected_events = Vec::with_capacity(max_events);
+    let mut event_limit_reached = false;
+    for event in range_events {
+        if !filter
+            .matches(&event)
+            .map_err(|error| Status::from(ExplorerError::internal(error.to_string())))?
+        {
+            continue;
+        }
+        let amount_zat = event
+            .amount_zat()
+            .map_err(|error| Status::from(ExplorerError::internal(error.to_string())))?;
+        if maximum_amount_zat.is_some_and(|maximum| amount_zat > maximum) {
+            continue;
+        }
+        if selected_events.len() >= max_events {
+            event_limit_reached = true;
+            continue;
+        }
+        selected_events.push(event);
+    }
+    Ok(FlowEventsInRange {
+        events: selected_events,
+        scanned_event_count,
+        scan_limit_reached,
+        event_limit_reached,
+    })
+}
+
 async fn read_summary_buckets_blocking(
     derive_store: &DeriveStore,
     start_time_unix_seconds: i64,
@@ -571,6 +738,27 @@ fn validate_minimum_amounts(minimum_amounts_zat: &[u64]) -> Result<(), Status> {
     {
         return Err(ExplorerError::invalid_request(
             "minimum_amounts_zat must be strictly increasing and unique",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_flow_events_in_range_request(
+    request: &ValuePoolFlowEventsInRangeRequest,
+) -> Result<(), Status> {
+    if request.start_time_unix_seconds >= request.end_time_unix_seconds {
+        return Err(ExplorerError::invalid_request(
+            "start_time_unix_seconds must be less than end_time_unix_seconds",
+        )
+        .into());
+    }
+    if request
+        .maximum_amount_zat
+        .is_some_and(|maximum| maximum < request.minimum_amount_zat)
+    {
+        return Err(ExplorerError::invalid_request(
+            "maximum_amount_zat must be greater than or equal to minimum_amount_zat",
         )
         .into());
     }
@@ -1163,6 +1351,100 @@ mod tests {
                 ))
                 .is_ok_and(|matches| matches)
         );
+    }
+
+    #[test]
+    fn flow_event_range_validation_requires_ordered_time_and_amount_bounds() {
+        let valid = ValuePoolFlowEventsInRangeRequest {
+            start_time_unix_seconds: 10,
+            end_time_unix_seconds: 20,
+            minimum_amount_zat: 100,
+            maximum_amount_zat: Some(200),
+            ..Default::default()
+        };
+        assert!(validate_flow_events_in_range_request(&valid).is_ok());
+        assert!(
+            validate_flow_events_in_range_request(&ValuePoolFlowEventsInRangeRequest {
+                end_time_unix_seconds: 10,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_flow_events_in_range_request(&ValuePoolFlowEventsInRangeRequest {
+                maximum_amount_zat: Some(99),
+                ..valid
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn flow_event_range_completeness_requires_the_indexed_tip_identity() {
+        let visible_tip = zinder_proto::v1::wallet::BlockTip {
+            height: 42,
+            hash: "00".repeat(32),
+        };
+        let freshness = zinder_proto::v1::explorer::ExplorerFreshness {
+            chain_view: Some(zinder_proto::v1::wallet::ChainView {
+                indexed_tip: Some(zinder_proto::v1::wallet::IndexedTip {
+                    tip: Some(visible_tip.clone()),
+                    block_time_unix_seconds: 100,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let matching_epoch = zinder_proto::v1::wallet::ChainEpoch {
+            visible_tip: Some(visible_tip.clone()),
+            ..Default::default()
+        };
+        assert!(indexed_tip_matches_chain_epoch(&freshness, &matching_epoch));
+
+        let displaced_epoch = zinder_proto::v1::wallet::ChainEpoch {
+            visible_tip: Some(zinder_proto::v1::wallet::BlockTip {
+                hash: "11".repeat(32),
+                ..visible_tip
+            }),
+            ..Default::default()
+        };
+        assert!(!indexed_tip_matches_chain_epoch(
+            &freshness,
+            &displaced_epoch
+        ));
+    }
+
+    #[test]
+    fn flow_event_range_preserves_inclusive_amount_bounds_and_reports_result_limits()
+    -> Result<(), Status> {
+        let filter = FlowFilter {
+            direction_mask: direction_bit(DerivedDirection::Deshield),
+            pool_mask: pool_bit(DerivedPool::Sapling),
+            minimum_amount_zat: 100,
+        };
+        let selected = select_flow_events_in_range(
+            vec![
+                coinbase_event(100, TransactionIntrinsicValueBalances::new(0, 150, 0, 0)),
+                event(101, TransactionIntrinsicValueBalances::new(0, -150, 0, 0)),
+                event(102, TransactionIntrinsicValueBalances::new(0, 100, 0, 0)),
+                event(103, TransactionIntrinsicValueBalances::new(0, 200, 0, 0)),
+                event(104, TransactionIntrinsicValueBalances::new(0, 201, 0, 0)),
+            ],
+            filter,
+            Some(200),
+            1,
+        )?;
+
+        assert_eq!(selected.scanned_event_count, 5);
+        assert!(!selected.scan_limit_reached);
+        assert!(selected.event_limit_reached);
+        assert_eq!(selected.events.len(), 1);
+        assert!(
+            selected.events[0]
+                .amount_zat()
+                .is_ok_and(|amount| amount == 100)
+        );
+        Ok(())
     }
 
     #[test]

@@ -105,49 +105,42 @@ message BlockSummary {
 
 `ExplorerQuery.BlockTransactions` is the separately versioned, page-ready aggregate for a single block. Version 2 joins the materialized block record to the canonical `TransactionFactsArtifact` rows with one batched fact lookup, then batch-loads their unique retained parent transaction facts and compatible fee records. It returns transaction id, canonical block-local index, public facts, ordered transparent inputs, and ordered transparent outputs. Each transparent input carries its transaction-local index and spent outpoint plus independently optional parent value and script, using the same retention-safe resolution semantics as `TransactionDetail`. Standard-address decoding remains an adapter concern. A missing canonical transaction artifact keeps the id and index but returns `public_facts`, transparent inputs, and transparent outputs absent or empty; clients must treat that as unavailable data rather than a zero-valued transaction. The response never parses raw transaction bytes on the read path and does not imply raw-byte retention. Shielded value balances and encrypted shielded output values remain intentionally excluded.
 
-`ExplorerQuery.BlockProductionSeries` is the bounded time-series companion to
-the block views. It joins existing `BlockSummary` rows to one batched canonical
-header-range read and adds only the compact difficulty target (`bits`). Points
-remain ascending and reuse `BlockSummary` for transaction counts, fee fields,
-size, rewards, and component counts. A point is emitted only when the summary's
-hash and block time agree with the header visible at the requested chain epoch;
-the response reports covered and missing heights explicitly so a concurrent
-reorg cannot produce a mixed-epoch series.
+`ExplorerQuery.BlockProductionSeries` is the bounded height-series companion to
 the block views. Version 2 joins existing `BlockSummaryRecord` rows to one
 batched canonical header-range read, adds the compact difficulty target
-(`bits`), then batch-loads the retained transaction-fact artifacts for the
-matched records' leading transaction ids. Each point may therefore carry the
-validated canonical coinbase transaction id, its ordered intrinsic transparent
-outputs, and whether shielded outputs are known to exist. Missing retained
-coinbase facts leave `coinbase` absent; they do not remove an otherwise covered
-point or fabricate an empty coinbase. Points remain ascending and reuse
-`BlockSummary` for transaction counts, fee fields, size, rewards, and component
-counts. A point is emitted only when the summary's hash and block time agree
-with the header visible at the requested chain epoch; the response reports
-covered and missing heights explicitly so a concurrent reorg cannot produce a
-mixed-epoch series.
+(`bits`), and batch-loads retained facts for each record's leading transaction.
+A point may therefore carry the validated canonical coinbase transaction id,
+its ordered intrinsic transparent outputs, and whether shielded outputs are
+known to exist. Missing retained coinbase facts leave `coinbase` absent; they do
+not remove an otherwise covered point or fabricate an empty coinbase. The
+response reports covered and missing heights explicitly.
 
-The series is assembled at request time from the existing derive and canonical
-stores. It adds no consumer, column family, schema version, replay, backfill, or
-data-wipe requirement. Product adapters own presentation formulas such as
-rolling averages, relative difficulty, or consumer-specific `difficulty / interval`
-solrate approximation; Zinder returns the reusable source facts and their units.
-rolling averages, relative difficulty, coinbase-address decoding, payout-role
-classification, or a consumer-specific `difficulty / interval` solrate approximation;
-Zinder returns the reusable source facts and their units.
+`ExplorerQuery.BlockProductionInTimeRange` serves arbitrary half-open timestamp
+ranges from the dedicated `BlockProductionTimeConsumer`. Its signed timestamp,
+height, and hash key preserves equal and non-monotonic block times; a reverse
+height index makes reorg removal deterministic. The row value carries no
+product metadata. A background backfill builds historical rows from existing
+block summaries while chain events maintain the live tail.
 
-The materialized record covers all block-view reads: `BlockDetail` performs one
-RocksDB get, `BlockTransactions` adds canonical batches for the block
-transactions and their unique parents plus one compatible fee-record batch,
-`BlockSummariesInRange` performs one derive range scan, and
-`BlockProductionSeries` adds one canonical batched header-range read to that
-range scan. Storage cost is dominated by the transaction-id list:
-`BlockProductionSeries` adds one canonical batched header-range read and one
-bounded transaction-fact batch to that range scan. Storage cost is dominated by
-the transaction-id list:
-`~32 bytes × tx_count` per block, plus the summary fields. Neither page-ready
-transactions nor block production adds a projection or schema because their
-canonical facts are already retained.
+One derive-store snapshot supplies time rows, block summaries, paid-fee facts,
+projection state, and coverage. A canonical epoch reader validates headers and
+coinbase artifacts. The response exposes separate missing-block,
+missing-coinbase, and missing-paid-fee counts. Continuation cursors freeze the
+first page's projection tip: ordinary extensions may continue when that tip
+hash remains canonical, rows above the frozen height are excluded, and a reorg
+at or below the frozen tip invalidates the cursor. See
+[ADR-0033](../adrs/0033-time-indexed-block-production.md).
+
+Product adapters own rolling formulas, coinbase-address decoding, payout-role
+classification, pool labels, display units, and cache policy. Zinder returns
+reusable canonical facts, exact units, and mechanically checkable coverage.
+
+The block-summary record remains the base of every block view. `BlockDetail`
+performs one RocksDB get, `BlockTransactions` adds canonical transaction and
+parent batches, and `BlockProductionSeries` adds canonical header and coinbase
+batches to a bounded height scan. The separate time index pays one compact key
+and reverse-index entry per block so time completeness does not depend on
+height order.
 
 Reorg rewind deletes every record in the reverted height range and re-fetches the replacement range before committing the cursor advance, so the view never advertises a stale BlockSummary for a height that no longer maps to the canonical chain.
 
@@ -351,6 +344,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.transaction.detail_v3` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint and canonical store are configured |
 | `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
 | `explorer.block.production_series_v2` | `ExplorerQuery.BlockProductionSeries` | When the block-summary consumer and canonical secondary store are available |
+| `explorer.block.production_time_range_v1` | `ExplorerQuery.BlockProductionInTimeRange` | When the time index has contiguous height-domain coverage through its projection tip |
 | `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
 | `explorer.block.activity_distribution_v1` | `ExplorerQuery.BlockActivityDistribution` | When the block-summary consumer and wallet endpoint are available |
 | `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |

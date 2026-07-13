@@ -21,7 +21,7 @@ use crate::consumer::{
     BlockCommitContext, BlockCommitContextError, BlockKeyedConsumer, DeriveConsumerCtx,
     DeriveConsumerError, DeriveConsumerName, DeriveConsumerSchema,
 };
-use crate::{DeriveStore, DeriveStoreError};
+use crate::{DeriveStore, DeriveStoreError, DeriveStoreReadSnapshot};
 
 /// Per-block miner-collected fee contributions ordered by block time.
 pub const PAID_FEE_DISTRIBUTION_COLUMN_FAMILY: &str = "paid_fee_distribution";
@@ -67,6 +67,48 @@ const TAIL_COVERAGE_VALUE_LEN: usize = HEIGHT_KEY_LEN + 1 + HEIGHT_KEY_LEN + TIM
 const COVERAGE_KEY: &[u8] = b"canonical_backfill";
 const TAIL_COVERAGE_KEY: &[u8] = b"seeded_live_tail";
 type RawConsumerEntry = (Vec<u8>, Vec<u8>);
+
+#[derive(Clone, Copy)]
+enum PaidFeeDistributionRead<'store> {
+    Store(&'store DeriveStore),
+    Snapshot(&'store DeriveStoreReadSnapshot<'store>),
+}
+
+impl PaidFeeDistributionRead<'_> {
+    fn get_consumer(
+        self,
+        column_family: &'static str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        match self {
+            Self::Store(store) => store.get_consumer(column_family, key),
+            Self::Snapshot(snapshot) => snapshot.get_consumer(column_family, key),
+        }
+    }
+
+    fn range_iterate_consumer(
+        self,
+        column_family: &'static str,
+        start_key: &[u8],
+        end_key_inclusive: &[u8],
+        entries_cap: usize,
+    ) -> Result<Vec<RawConsumerEntry>, DeriveStoreError> {
+        match self {
+            Self::Store(store) => store.range_iterate_consumer(
+                column_family,
+                start_key,
+                end_key_inclusive,
+                entries_cap,
+            ),
+            Self::Snapshot(snapshot) => snapshot.range_iterate_consumer(
+                column_family,
+                start_key,
+                end_key_inclusive,
+                entries_cap,
+            ),
+        }
+    }
+}
 
 /// One exact positive miner-collected fee frequency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +202,15 @@ pub struct PaidFeeDistribution {
     pub days: Vec<PaidFeeDistributionDay>,
 }
 
+/// Exact paid-fee facts for one canonical block contribution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaidFeeBlockTotal {
+    /// Sum of every proven positive miner-collected transaction fee.
+    pub paid_fee_zat: u64,
+    /// Non-coinbase transactions whose exact fee could not be proven.
+    pub unavailable_transaction_count: u64,
+}
+
 /// Contiguous canonical history materialized by backfill and tailing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaidFeeDistributionBackfillCoverage {
@@ -249,6 +300,66 @@ impl PaidFeeDistributionConsumer {
         start_time_unix_seconds: i64,
         end_time_unix_seconds: i64,
     ) -> Result<PaidFeeDistribution, PaidFeeDistributionConsumerError> {
+        Self::read_distribution_in_time_range(
+            PaidFeeDistributionRead::Store(store),
+            start_time_unix_seconds,
+            end_time_unix_seconds,
+        )
+    }
+
+    /// Queries exact frequencies from one derive-store read snapshot.
+    pub fn distribution_in_time_range_snapshot(
+        snapshot: &DeriveStoreReadSnapshot<'_>,
+        start_time_unix_seconds: i64,
+        end_time_unix_seconds: i64,
+    ) -> Result<PaidFeeDistribution, PaidFeeDistributionConsumerError> {
+        Self::read_distribution_in_time_range(
+            PaidFeeDistributionRead::Snapshot(snapshot),
+            start_time_unix_seconds,
+            end_time_unix_seconds,
+        )
+    }
+
+    /// Reads one exact block contribution from a derive-store snapshot.
+    pub fn block_total_snapshot(
+        snapshot: &DeriveStoreReadSnapshot<'_>,
+        block_time_unix_seconds: i64,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Result<Option<PaidFeeBlockTotal>, PaidFeeDistributionConsumerError> {
+        let key = encode_contribution_key(block_time_unix_seconds, block_height, block_hash);
+        let Some(payload) = snapshot.get_consumer(PAID_FEE_DISTRIBUTION_COLUMN_FAMILY, &key)?
+        else {
+            return Ok(None);
+        };
+        let day = decode_distribution_value(&payload)?;
+        let contribution = BlockContribution { block_hash, day };
+        validate_contribution_key(&key, &contribution)?;
+        let paid_fee_zat =
+            contribution
+                .day
+                .frequencies
+                .iter()
+                .try_fold(0_u64, |total, frequency| {
+                    let subtotal = frequency
+                        .paid_fee_zat
+                        .checked_mul(frequency.transaction_count)
+                        .ok_or(PaidFeeDistributionConsumerError::CounterOverflow)?;
+                    total
+                        .checked_add(subtotal)
+                        .ok_or(PaidFeeDistributionConsumerError::CounterOverflow)
+                })?;
+        Ok(Some(PaidFeeBlockTotal {
+            paid_fee_zat,
+            unavailable_transaction_count: contribution.day.unavailable_transaction_count,
+        }))
+    }
+
+    fn read_distribution_in_time_range(
+        store: PaidFeeDistributionRead<'_>,
+        start_time_unix_seconds: i64,
+        end_time_unix_seconds: i64,
+    ) -> Result<PaidFeeDistribution, PaidFeeDistributionConsumerError> {
         if start_time_unix_seconds >= end_time_unix_seconds {
             return Err(PaidFeeDistributionConsumerError::InvalidTimeRange {
                 start: start_time_unix_seconds,
@@ -305,6 +416,12 @@ impl PaidFeeDistributionConsumer {
     pub fn backfill_coverage(
         store: &DeriveStore,
     ) -> Result<Option<PaidFeeDistributionBackfillCoverage>, DeriveStoreError> {
+        Self::read_backfill_coverage(PaidFeeDistributionRead::Store(store))
+    }
+
+    fn read_backfill_coverage(
+        store: PaidFeeDistributionRead<'_>,
+    ) -> Result<Option<PaidFeeDistributionBackfillCoverage>, DeriveStoreError> {
         let Some(payload) =
             store.get_consumer(PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY, COVERAGE_KEY)?
         else {
@@ -318,6 +435,12 @@ impl PaidFeeDistributionConsumer {
     /// Reads the durable live-tail boundary and contiguous tail tip.
     pub fn tail_coverage(
         store: &DeriveStore,
+    ) -> Result<Option<PaidFeeDistributionTailCoverage>, DeriveStoreError> {
+        Self::read_tail_coverage(PaidFeeDistributionRead::Store(store))
+    }
+
+    fn read_tail_coverage(
+        store: PaidFeeDistributionRead<'_>,
     ) -> Result<Option<PaidFeeDistributionTailCoverage>, DeriveStoreError> {
         let Some(payload) = store.get_consumer(
             PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY,
@@ -335,10 +458,23 @@ impl PaidFeeDistributionConsumer {
     pub fn coverage(
         store: &DeriveStore,
     ) -> Result<Option<PaidFeeDistributionBackfillCoverage>, DeriveStoreError> {
-        let Some(mut coverage) = Self::backfill_coverage(store)? else {
+        Self::read_coverage(PaidFeeDistributionRead::Store(store))
+    }
+
+    /// Reads complete coverage from one derive-store read snapshot.
+    pub fn coverage_snapshot(
+        snapshot: &DeriveStoreReadSnapshot<'_>,
+    ) -> Result<Option<PaidFeeDistributionBackfillCoverage>, DeriveStoreError> {
+        Self::read_coverage(PaidFeeDistributionRead::Snapshot(snapshot))
+    }
+
+    fn read_coverage(
+        store: PaidFeeDistributionRead<'_>,
+    ) -> Result<Option<PaidFeeDistributionBackfillCoverage>, DeriveStoreError> {
+        let Some(mut coverage) = Self::read_backfill_coverage(store)? else {
             return Self::tail_interval_coverage(store);
         };
-        let Some(tail) = Self::tail_coverage(store)? else {
+        let Some(tail) = Self::read_tail_coverage(store)? else {
             return Ok(Some(coverage));
         };
         let Some(tail_height) = tail.complete_through_height else {
@@ -358,9 +494,9 @@ impl PaidFeeDistributionConsumer {
 
     /// Synthesizes coverage from the live tail when no backfill has run.
     fn tail_interval_coverage(
-        store: &DeriveStore,
+        store: PaidFeeDistributionRead<'_>,
     ) -> Result<Option<PaidFeeDistributionBackfillCoverage>, DeriveStoreError> {
-        let Some(tail) = Self::tail_coverage(store)? else {
+        let Some(tail) = Self::read_tail_coverage(store)? else {
             return Ok(None);
         };
         let Some(through_height) = tail.complete_through_height else {
@@ -369,16 +505,15 @@ impl PaidFeeDistributionConsumer {
         let through_time = tail.complete_through_time_unix_seconds.ok_or_else(|| {
             store_decode_error(&PaidFeeDistributionConsumerError::MalformedTailCoverage)
         })?;
-        let (from_time, _) =
-            height_contribution_after_batch(store, &BTreeMap::new(), tail.boundary_height)
-                .map_err(|error| store_decode_error(&error))?
-                .ok_or_else(|| {
-                    store_decode_error(
-                        &PaidFeeDistributionConsumerError::MissingIndexedContribution {
-                            height: tail.boundary_height.value(),
-                        },
-                    )
-                })?;
+        let (from_time, _) = height_contribution(store, tail.boundary_height)
+            .map_err(|error| store_decode_error(&error))?
+            .ok_or_else(|| {
+                store_decode_error(
+                    &PaidFeeDistributionConsumerError::MissingIndexedContribution {
+                        height: tail.boundary_height.value(),
+                    },
+                )
+            })?;
         Ok(Some(PaidFeeDistributionBackfillCoverage::new(
             tail.boundary_height,
             through_height,
@@ -493,7 +628,7 @@ impl PaidFeeDistributionConsumer {
             .store
             .consumer_column_family(PAID_FEE_DISTRIBUTION_DAY_COLUMN_FAMILY)?;
         for day_start in affected_days {
-            let mut aggregate = read_day(ctx.store, day_start)?
+            let mut aggregate = read_day(PaidFeeDistributionRead::Store(ctx.store), day_start)?
                 .unwrap_or_else(|| PaidFeeDistributionDay::empty(day_start));
             for delta in &self.pending_day_deltas {
                 match delta {
@@ -841,6 +976,13 @@ fn height_contribution_after_batch(
             .map(|key| decode_contribution_key(&key).map(|(time, _, hash)| (time, hash)))
             .transpose();
     }
+    height_contribution(PaidFeeDistributionRead::Store(store), height)
+}
+
+fn height_contribution(
+    store: PaidFeeDistributionRead<'_>,
+    height: BlockHeight,
+) -> Result<Option<(i64, BlockHash)>, PaidFeeDistributionConsumerError> {
     let Some(index) = store.get_consumer(
         PAID_FEE_DISTRIBUTION_INDEX_COLUMN_FAMILY,
         &encode_height_key_ascending(height),
@@ -963,7 +1105,7 @@ fn validate_tail_seed_batch(
 }
 
 fn add_contributions_in_range(
-    store: &DeriveStore,
+    store: PaidFeeDistributionRead<'_>,
     start: i64,
     end: i64,
     days: &mut BTreeMap<i64, PaidFeeDistributionDay>,
@@ -980,7 +1122,7 @@ fn add_contributions_in_range(
 }
 
 fn contribution_entries_in_range(
-    store: &DeriveStore,
+    store: PaidFeeDistributionRead<'_>,
     start: i64,
     end: i64,
 ) -> Result<Vec<RawConsumerEntry>, PaidFeeDistributionConsumerError> {
@@ -1003,7 +1145,7 @@ fn contribution_entries_in_range(
 }
 
 fn read_day(
-    store: &DeriveStore,
+    store: PaidFeeDistributionRead<'_>,
     day_start: i64,
 ) -> Result<Option<PaidFeeDistributionDay>, PaidFeeDistributionConsumerError> {
     let Some(payload) = store.get_consumer(
@@ -1024,7 +1166,7 @@ fn read_day(
 }
 
 fn add_stored_day(
-    store: &DeriveStore,
+    store: PaidFeeDistributionRead<'_>,
     day_start: i64,
     days: &mut BTreeMap<i64, PaidFeeDistributionDay>,
 ) -> Result<(), PaidFeeDistributionConsumerError> {
@@ -1035,7 +1177,7 @@ fn add_stored_day(
 }
 
 fn add_stored_days_in_range(
-    store: &DeriveStore,
+    store: PaidFeeDistributionRead<'_>,
     start_day: i64,
     end_day_exclusive: i64,
     days: &mut BTreeMap<i64, PaidFeeDistributionDay>,
@@ -2096,6 +2238,42 @@ mod tests {
         assert_eq!(coverage.complete_through_height, BlockHeight::new(2));
         assert_eq!(coverage.complete_from_time_unix_seconds, 1_700_000_000);
         assert_eq!(coverage.complete_through_time_unix_seconds, 1_700_000_600);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_range_read_keeps_one_distribution_sequence() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = PaidFeeDistributionConsumer::new();
+        write_blocks(&store, &mut consumer, &[block(100, 1, 10, &[Some(10_000)])])?;
+        let snapshot = store.read_snapshot();
+
+        let replacement = block(100, 2, 20, &[Some(30_000)]);
+        replace_block(&store, &mut consumer, BlockHeight::new(100), &replacement)?;
+
+        let captured = PaidFeeDistributionConsumer::distribution_in_time_range_snapshot(
+            &snapshot,
+            0,
+            SECONDS_PER_DAY,
+        )?;
+        let captured_block = PaidFeeDistributionConsumer::block_total_snapshot(
+            &snapshot,
+            10,
+            BlockHeight::new(100),
+            block_hash(1),
+        )?;
+        drop(snapshot);
+        let current =
+            PaidFeeDistributionConsumer::distribution_in_time_range(&store, 0, SECONDS_PER_DAY)?;
+        assert_eq!(captured.days[0].frequencies[0].paid_fee_zat, 10_000);
+        assert_eq!(
+            captured_block,
+            Some(PaidFeeBlockTotal {
+                paid_fee_zat: 10_000,
+                unavailable_transaction_count: 0,
+            })
+        );
+        assert_eq!(current.days[0].frequencies[0].paid_fee_zat, 30_000);
         Ok(())
     }
 

@@ -1,0 +1,43 @@
+[package]
+name = "zinder-compat-cipherscan"
+version = "0.1.0"
+description = "Cipherscan-compatible REST adapter over Zinder explorer and wallet query data"
+edition.workspace = true
+readme = "README.md"
+keywords = ["zcash", "cipherscan", "rest"]
+categories = ["api-bindings"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = { workspace = true, features = ["ws"] }
+clap = { workspace = true, features = ["derive"] }
+config.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tonic = { workspace = true, features = ["transport"] }
+tracing.workspace = true
+zebra-chain.workspace = true
+zinder-core.workspace = true
+zinder-proto.workspace = true
+zinder-runtime.workspace = true
+zinder-source.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[[bin]]
+name = "zinder-compat-cipherscan"
+path = "src/bin/zinder-compat-cipherscan/main.rs"
+
+[lints]
+workspace = true

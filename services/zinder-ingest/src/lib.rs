@@ -6,6 +6,7 @@
 
 mod artifact_builder;
 pub mod bench_support;
+mod block_production_time_backfill;
 mod bulk_catchup;
 mod chain_ingest;
 mod commitment_root_backfill;
@@ -31,6 +32,7 @@ pub use artifact_builder::{
     ArtifactDeriveError, BlockMismatchField, CommitmentTreeSizes, DerivedBlockArtifacts,
     RawBlobPolicy, derive_block, derive_block_with_raw_blob_policy, finalize_derived_block,
 };
+pub use block_production_time_backfill::spawn_block_production_time_backfill_task;
 pub use bulk_catchup::{
     BulkCatchupRunConfig, run_bulk_catchup, run_bulk_catchup_until_complete,
     run_bulk_catchup_with_store,

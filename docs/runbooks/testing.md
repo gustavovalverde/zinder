@@ -832,6 +832,7 @@ explorer.server_info_v1
 explorer.transaction.detail_v3
 explorer.block.summary_v1
 explorer.block.production_series_v2
+explorer.block.production_time_range_v1
 explorer.block.detail_v1
 explorer.block.transactions_v2
 explorer.block.final_note_commitment_roots_v1
@@ -850,6 +851,7 @@ explorer.fee.paid_distribution_v1
 explorer.value_pool.summary_v1
 explorer.network_upgrade.status_v1
 explorer.value_pool.flow_history_v1
+explorer.value_pool.flow_events_in_range_v1
 explorer.value_pool.flow_summary_v1
 explorer.value_pool.flow_amount_threshold_summary_v1
 explorer.value_pool.flow_rounded_amount_summary_v1

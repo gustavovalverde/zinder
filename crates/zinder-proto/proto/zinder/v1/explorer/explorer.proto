@@ -540,6 +540,71 @@ message BlockProductionSeriesResponse {
   repeated BlockProductionPoint points = 6;
 }
 
+// `ExplorerQuery.BlockProductionInTimeRange` request.
+//
+// Returns a bounded page of canonical block-production observations whose
+// header timestamps are in `[start_time_unix_seconds, end_time_unix_seconds)`.
+// Points are ordered by `(block_time, block_height, block_hash)`, so equal and
+// non-monotonic timestamps remain deterministic. The cursor binds the time
+// bounds, resolved chain epoch, and projection revision so every page reads one
+// canonical projection fence.
+message BlockProductionInTimeRangeRequest {
+  // Inclusive Unix timestamp lower bound.
+  int64 start_time_unix_seconds = 1;
+
+  // Exclusive Unix timestamp upper bound.
+  int64 end_time_unix_seconds = 2;
+
+  // Maximum canonical block candidates scanned for this page. Zero selects the
+  // server default; values above the server cap are clamped. A candidate with
+  // missing or mismatched production facts still consumes this bound.
+  uint32 max_entries = 3;
+
+  // Empty starts at the first canonical candidate in the time range. Non-empty
+  // resumes strictly after the previous page's last scanned candidate. The
+  // cursor is opaque and is bound to the time bounds and chain epoch.
+  bytes from_cursor = 4;
+
+  // Optional chain-epoch read fence. Absent on the first page resolves to the
+  // visible epoch; later pages reuse the epoch encoded by `from_cursor`.
+  optional uint64 at_epoch_id = 5;
+}
+
+// `ExplorerQuery.BlockProductionInTimeRange` response.
+//
+// `covered_block_count` and `missing_block_count` describe the canonical
+// candidates scanned for this page. A covered candidate has a matching
+// canonical header and block-summary row and yields one point. A missing
+// candidate has incomplete or mismatched production facts and yields no
+// fabricated point. Their sum is the number of candidates scanned.
+message BlockProductionInTimeRangeResponse {
+  ExplorerFreshness freshness = 1;
+  repeated BlockProductionPoint points = 2;
+  bytes next_cursor = 3;
+  uint32 covered_block_count = 4;
+  uint32 missing_block_count = 5;
+  uint32 missing_coinbase_count = 6;
+  uint32 missing_paid_fee_count = 7;
+  BlockProductionTimeRangeCoverage coverage = 8;
+  BlockProductionTimeRangeReadFence read_fence = 9;
+}
+
+// Durable and request-specific coverage for a production-time query.
+message BlockProductionTimeRangeCoverage {
+  optional uint32 complete_from_height = 1;
+  optional uint32 complete_through_height = 2;
+  optional int64 complete_from_time_unix_seconds = 3;
+  optional int64 complete_through_time_unix_seconds = 4;
+  bool requested_range_complete = 5;
+}
+
+// Projection identity bound into every continuation cursor.
+message BlockProductionTimeRangeReadFence {
+  uint64 chain_epoch_id = 1;
+  uint64 projection_revision = 2;
+  zinder.v1.wallet.BlockTip projection_tip = 3;
+}
+
 // `ExplorerQuery.BlockActivityDistribution` request.
 //
 // Aggregates the existing materialized block-summary rows over the inclusive
@@ -1846,6 +1911,12 @@ service ExplorerQuery {
   rpc BlockProductionSeries(BlockProductionSeriesRequest)
       returns (BlockProductionSeriesResponse);
 
+  // Returns a bounded page of canonical block-production observations in one
+  // half-open block-time range. Capability:
+  // `explorer.block.production_time_range_v1`.
+  rpc BlockProductionInTimeRange(BlockProductionInTimeRangeRequest)
+      returns (BlockProductionInTimeRangeResponse);
+
   // Aggregates canonical block activity by weekday and hour across one bounded
   // height range. Capability: `explorer.block.activity_distribution_v1`.
   rpc BlockActivityDistribution(BlockActivityDistributionRequest)
@@ -1953,6 +2024,11 @@ service ExplorerQuery {
   // Capability: `explorer.value_pool.flow_history_v1`.
   rpc ValuePoolFlowHistory(ValuePoolFlowHistoryRequest)
       returns (ValuePoolFlowHistoryResponse);
+
+  // Returns bounded canonical value-pool flow events in one half-open time
+  // range. Capability: `explorer.value_pool.flow_events_in_range_v1`.
+  rpc ValuePoolFlowEventsInRange(ValuePoolFlowEventsInRangeRequest)
+      returns (ValuePoolFlowEventsInRangeResponse);
 
   // Aggregates canonical value-pool flow events into UTC hour or day buckets
   // over one half-open time range. Capability:
@@ -2173,6 +2249,36 @@ message ValuePoolFlowHistoryResponse {
   uint32 scanned_event_count = 6;
   bool scan_limit_reached = 7;
   ValuePoolFlowCoverage coverage = 8;
+}
+
+// Bounded query for individual canonical value-pool flow events in one
+// half-open block-time range.
+message ValuePoolFlowEventsInRangeRequest {
+  // Inclusive Unix timestamp lower bound.
+  int64 start_time_unix_seconds = 1;
+  // Exclusive Unix timestamp upper bound.
+  int64 end_time_unix_seconds = 2;
+  // Empty means either direction.
+  repeated ValuePoolFlowDirection directions = 3;
+  // Empty means every pool attribution, including `MIXED`.
+  repeated ValuePoolFlowPool pools = 4;
+  // Inclusive unsigned amount lower bound.
+  uint64 minimum_amount_zat = 5;
+  // Inclusive unsigned amount upper bound. Absence means unbounded.
+  optional uint64 maximum_amount_zat = 6;
+  // Zero asks for the server default; the server clamps larger values.
+  uint32 max_events = 7;
+}
+
+// Bounded canonical events plus enough metadata to distinguish an empty
+// complete range from a truncated or incompletely indexed query.
+message ValuePoolFlowEventsInRangeResponse {
+  ExplorerFreshness freshness = 1;
+  repeated ValuePoolFlowEvent events = 2;
+  uint32 scanned_event_count = 3;
+  bool scan_limit_reached = 4;
+  bool event_limit_reached = 5;
+  ValuePoolFlowCoverage coverage = 6;
 }
 
 // UTC bucket width requested from `ExplorerQuery.ValuePoolFlowSummary`.

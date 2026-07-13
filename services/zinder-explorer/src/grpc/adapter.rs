@@ -23,37 +23,39 @@ use zinder_core::{
     BlockHeight, Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name,
 };
 use zinder_proto::capabilities::{
-    CapabilitySurface, EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1,
-    EXPLORER_PAID_FEE_DISTRIBUTION_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_HISTORY_V1,
-    EXPLORER_TRANSACTION_HISTORY_V2, EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2, EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
-    ExplorerReadiness, capabilities_for_surface,
+    CapabilitySurface, EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
+    EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1, EXPLORER_PAID_FEE_DISTRIBUTION_V1,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_HISTORY_V1, EXPLORER_TRANSACTION_HISTORY_V2,
+    EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1, EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
+    EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1, ExplorerReadiness, capabilities_for_surface,
 };
 use zinder_proto::v1::{
     explorer::{
         BlockActivityDistributionRequest, BlockActivityDistributionResponse, BlockDetailRequest,
-        BlockDetailResponse, BlockProductionSeriesRequest, BlockProductionSeriesResponse,
-        BlockSummariesInRangeRequest, BlockSummariesInRangeResponse, BlockTransactionsResponse,
-        ChainReorgHistoryRequest, ChainReorgHistoryResponse, CommitmentRootSearchRequest,
-        CommitmentRootSearchResponse, ConventionalFeeDistributionRequest,
-        ConventionalFeeDistributionResponse, DisplacedBlockDetailRequest,
-        DisplacedBlockDetailResponse, DisplacedBlockHistoryRequest, DisplacedBlockHistoryResponse,
-        ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse, MempoolActivityRequest,
-        MempoolActivityResponse, MempoolEventCountsRequest, MempoolEventCountsResponse,
-        MempoolSnapshotRequest, MempoolSnapshotResponse, MempoolSummaryRequest,
-        MempoolSummaryResponse, MigrationCohortsRequest, MigrationCohortsResponse,
-        MigrationDenominationsRequest, MigrationDenominationsResponse, MigrationOverviewRequest,
-        MigrationOverviewResponse, NetworkUpgradeStatusRequest, NetworkUpgradeStatusResponse,
-        OverviewSnapshotRequest, OverviewSnapshotResponse, PaidFeeDistributionRequest,
-        PaidFeeDistributionResponse, RecentTransactionsRequest, SearchRequest, SearchResponse,
-        ServerInfoRequest, ServerInfoResponse, TransactionComponentSummaryRequest,
-        TransactionComponentSummaryResponse, TransactionDetailRequest, TransactionDetailResponse,
-        TransactionHistoryRequest, TransactionHistoryResponse, TransparentAddressActivityRequest,
+        BlockDetailResponse, BlockProductionInTimeRangeRequest, BlockProductionInTimeRangeResponse,
+        BlockProductionSeriesRequest, BlockProductionSeriesResponse, BlockSummariesInRangeRequest,
+        BlockSummariesInRangeResponse, BlockTransactionsResponse, ChainReorgHistoryRequest,
+        ChainReorgHistoryResponse, CommitmentRootSearchRequest, CommitmentRootSearchResponse,
+        ConventionalFeeDistributionRequest, ConventionalFeeDistributionResponse,
+        DisplacedBlockDetailRequest, DisplacedBlockDetailResponse, DisplacedBlockHistoryRequest,
+        DisplacedBlockHistoryResponse, ExplorerServerInfo, FeeSummaryRequest, FeeSummaryResponse,
+        MempoolActivityRequest, MempoolActivityResponse, MempoolEventCountsRequest,
+        MempoolEventCountsResponse, MempoolSnapshotRequest, MempoolSnapshotResponse,
+        MempoolSummaryRequest, MempoolSummaryResponse, MigrationCohortsRequest,
+        MigrationCohortsResponse, MigrationDenominationsRequest, MigrationDenominationsResponse,
+        MigrationOverviewRequest, MigrationOverviewResponse, NetworkUpgradeStatusRequest,
+        NetworkUpgradeStatusResponse, OverviewSnapshotRequest, OverviewSnapshotResponse,
+        PaidFeeDistributionRequest, PaidFeeDistributionResponse, RecentTransactionsRequest,
+        SearchRequest, SearchResponse, ServerInfoRequest, ServerInfoResponse,
+        TransactionComponentSummaryRequest, TransactionComponentSummaryResponse,
+        TransactionDetailRequest, TransactionDetailResponse, TransactionHistoryRequest,
+        TransactionHistoryResponse, TransparentAddressActivityRequest,
         TransparentAddressActivityResponse, TransparentAddressDeltasRequest,
         TransparentAddressDeltasResponse, TransparentAddressRankingRequest,
         TransparentAddressRankingResponse, UtxoSetSummaryRequest, UtxoSetSummaryResponse,
         ValuePoolBalanceHistoryRequest, ValuePoolBalanceHistoryResponse,
         ValuePoolFlowAmountThresholdSummaryRequest, ValuePoolFlowAmountThresholdSummaryResponse,
+        ValuePoolFlowEventsInRangeRequest, ValuePoolFlowEventsInRangeResponse,
         ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse,
         ValuePoolFlowRoundedAmountSummaryRequest, ValuePoolFlowRoundedAmountSummaryResponse,
         ValuePoolFlowSummaryRequest, ValuePoolFlowSummaryResponse, ValuePoolSummaryRequest,
@@ -79,8 +81,8 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
 const MINIMUM_INTRINSIC_VALUE_BALANCE_HISTORY_SCHEMA_VERSION: u16 = 15;
 use super::block_activity::handle_block_activity_distribution;
 use super::block_view::{
-    handle_block_detail, handle_block_production_series, handle_block_summaries_in_range,
-    handle_block_transactions,
+    handle_block_detail, handle_block_production_in_time_range, handle_block_production_series,
+    handle_block_summaries_in_range, handle_block_transactions,
 };
 use super::chain_reorg_history::handle_chain_reorg_history;
 use super::commitment_root_search::handle_commitment_root_search;
@@ -113,8 +115,9 @@ use super::transparent_address_ranking::handle_transparent_address_ranking;
 use super::utxo_set_summary::handle_utxo_set_summary;
 use super::value_pool_balance_history::handle_value_pool_balance_history;
 use super::value_pool_flow::{
-    handle_value_pool_flow_amount_threshold_summary, handle_value_pool_flow_history,
-    handle_value_pool_flow_rounded_amount_summary, handle_value_pool_flow_summary,
+    handle_value_pool_flow_amount_threshold_summary, handle_value_pool_flow_events_in_range,
+    handle_value_pool_flow_history, handle_value_pool_flow_rounded_amount_summary,
+    handle_value_pool_flow_summary,
 };
 use super::value_pool_summary::handle_value_pool_summary;
 use zinder_derive::{DeriveStore, TRANSACTION_HISTORY_CONSUMER_NAME};
@@ -336,6 +339,8 @@ impl ExplorerQueryGrpcAdapter {
                 .flatten()
                 .is_some()
         });
+        let block_production_time_covered =
+            block_production_time_projection_available(self.derive_store.as_ref());
         let transaction_intrinsic_value_balances_available =
             self.canonical_store.as_ref().is_some_and(|store| {
                 store.try_catch_up().is_ok()
@@ -362,6 +367,10 @@ impl ExplorerQueryGrpcAdapter {
                 spec.string != EXPLORER_PAID_FEE_DISTRIBUTION_V1 || paid_fee_distribution_covered
             })
             .filter(|spec| {
+                spec.string != EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1
+                    || block_production_time_covered
+            })
+            .filter(|spec| {
                 spec.string != EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1
                     || transaction_intrinsic_value_balances_available
             })
@@ -374,6 +383,27 @@ impl ExplorerQueryGrpcAdapter {
             .map(|spec| spec.string)
             .collect()
     }
+}
+
+fn block_production_time_projection_available(derive_store: Option<&DeriveStore>) -> bool {
+    let Some(store) = derive_store else {
+        return false;
+    };
+    let snapshot = store.read_snapshot();
+    let coverage = zinder_derive::BlockProductionTimeConsumer::coverage_snapshot(&snapshot)
+        .ok()
+        .flatten();
+    let projection_state = snapshot
+        .consumer_projection_state(zinder_derive::BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
+        .ok()
+        .flatten();
+    drop(snapshot);
+    coverage
+        .zip(projection_state)
+        .is_some_and(|(coverage, projection_state)| {
+            coverage.complete_from_height.value() <= 1
+                && coverage.complete_through_height >= projection_state.projection_tip_height
+        })
 }
 
 fn transaction_history_projection_capabilities(derive_store: Option<&DeriveStore>) -> (bool, bool) {
@@ -518,6 +548,31 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let derive_store = self.require_derive_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             handle_block_production_series(
+                derive_store,
+                canonical_store,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn block_production_in_time_range(
+        &self,
+        request: Request<BlockProductionInTimeRangeRequest>,
+    ) -> Result<Response<BlockProductionInTimeRangeResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "BlockProductionInTimeRange",
+            metric: "block_production_in_time_range",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let canonical_store = self.require_canonical_store(OP.method)?;
+            handle_block_production_in_time_range(
                 derive_store,
                 canonical_store,
                 &self.upstream_observation_cache,
@@ -982,6 +1037,31 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let derive_store = self.require_derive_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_value_pool_flow_history(
+                derive_store,
+                &mut client,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
+        }
+        .await;
+        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
+        outcome
+    }
+
+    async fn value_pool_flow_events_in_range(
+        &self,
+        request: Request<ValuePoolFlowEventsInRangeRequest>,
+    ) -> Result<Response<ValuePoolFlowEventsInRangeResponse>, Status> {
+        const OP: OperationNames = OperationNames {
+            method: "ValuePoolFlowEventsInRange",
+            metric: "value_pool_flow_events_in_range",
+        };
+        let started = Instant::now();
+        let outcome = async {
+            let derive_store = self.require_derive_store(OP.method)?;
+            let mut client = self.wallet_client(OP.method).await?;
+            handle_value_pool_flow_events_in_range(
                 derive_store,
                 &mut client,
                 &self.upstream_observation_cache,

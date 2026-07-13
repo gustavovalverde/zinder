@@ -179,6 +179,13 @@ pub const EXPLORER_BLOCK_SUMMARY_V1: &str = "explorer.block.summary_v1";
 /// assembled at request time and reports missing coverage explicitly; it does
 /// not imply a new durable projection.
 pub const EXPLORER_BLOCK_PRODUCTION_SERIES_V2: &str = "explorer.block.production_series_v2";
+/// Capability advertised for `ExplorerQuery.BlockProductionInTimeRange`.
+///
+/// Signals that the explorer can page canonical block-production observations
+/// through a half-open block-time range at one read-fenced epoch. Each page
+/// reports covered and missing production facts explicitly; it does not imply
+/// a new durable projection.
+pub const EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1: &str = "explorer.block.production_time_range_v1";
 /// Capability advertised for `ExplorerQuery.BlockDetail`.
 ///
 /// Signals that the explorer plane materialized the per-block transaction
@@ -326,6 +333,13 @@ pub const EXPLORER_NETWORK_UPGRADE_STATUS_V1: &str = "explorer.network_upgrade.s
 /// transparent-to-shielded flow events with typed filters, opaque continuations,
 /// optional exact counts, and explicit materialization coverage.
 pub const EXPLORER_VALUE_POOL_FLOW_HISTORY_V1: &str = "explorer.value_pool.flow_history_v1";
+/// Capability advertised for `ExplorerQuery.ValuePoolFlowEventsInRange`.
+///
+/// Signals that the explorer serves bounded canonical value-pool flow events
+/// selected by half-open block-time range, direction, pool, and inclusive
+/// amount bounds, with explicit scan, result, freshness, and coverage metadata.
+pub const EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1: &str =
+    "explorer.value_pool.flow_events_in_range_v1";
 /// Capability advertised for `ExplorerQuery.ValuePoolFlowSummary`.
 ///
 /// Signals that the explorer aggregates the canonical value-pool flow event
@@ -982,6 +996,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresDeriveStoreAndCanonicalStore,
     ),
     CapabilitySpec::new(
+        EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.BlockProductionInTimeRange"),
+        AdvertisePolicy::RequiresDeriveStoreAndCanonicalStore,
+    ),
+    CapabilitySpec::new(
         EXPLORER_BLOCK_DETAIL_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockDetail"),
@@ -1099,6 +1119,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowHistory"),
+        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowEventsInRange"),
         AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
     ),
     CapabilitySpec::new(

@@ -29,13 +29,13 @@ use zinder_ingest::{
     mempool_ready_channel, open_primary_derive_store_for_canonical, run_ingest_loop,
     run_mempool_orchestrator, seed_backfill_owned_consumer_cursors,
     seed_paid_fee_distribution_cursor_and_tail, seed_value_pool_flow_cursor_and_tail,
-    spawn_chain_event_retention_task, spawn_commitment_root_backfill_task,
-    spawn_conventional_fee_distribution_backfill_task, spawn_derive_replay_budget_metrics_task,
-    spawn_derive_tailer_task, spawn_mempool_event_retention_task,
-    spawn_paid_fee_distribution_backfill_task, spawn_runtime_memory_metrics_task,
-    spawn_transaction_component_backfill_task, spawn_transaction_history_verifier_task,
-    spawn_upstream_health_probe_task, spawn_value_pool_balance_backfill_task,
-    spawn_value_pool_flow_backfill_task,
+    spawn_block_production_time_backfill_task, spawn_chain_event_retention_task,
+    spawn_commitment_root_backfill_task, spawn_conventional_fee_distribution_backfill_task,
+    spawn_derive_replay_budget_metrics_task, spawn_derive_tailer_task,
+    spawn_mempool_event_retention_task, spawn_paid_fee_distribution_backfill_task,
+    spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
+    spawn_transaction_history_verifier_task, spawn_upstream_health_probe_task,
+    spawn_value_pool_balance_backfill_task, spawn_value_pool_flow_backfill_task,
 };
 use zinder_runtime::{
     Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase,
@@ -570,6 +570,8 @@ async fn run_ingest(
         ),
         cancel.clone(),
     );
+    let block_production_time_backfill_handle =
+        spawn_block_production_time_backfill_task(derive_store.clone(), cancel.clone());
     let transaction_component_backfill_handle = spawn_transaction_component_backfill_task(
         command_config.transaction_component_backfill,
         TransactionComponentBackfillContext::new(store.clone(), derive_store.clone()),
@@ -751,6 +753,14 @@ async fn run_ingest(
             event = "commitment_root_backfill_join_failed",
             error = %join_error,
             "commitment-root backfill task failed during shutdown"
+        );
+    }
+    if let Err(join_error) = block_production_time_backfill_handle.await {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "block_production_time_backfill_join_failed",
+            error = %join_error,
+            "block-production time backfill task failed during shutdown"
         );
     }
     if let Some(handle) = conventional_fee_distribution_backfill_handle
