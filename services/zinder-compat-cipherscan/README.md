@@ -24,6 +24,18 @@ the owner and current status of every route family.
 
 ## Requirements
 
+Obtain independent checkouts of [Z3](https://github.com/ZcashFoundation/z3),
+[Zinder](https://github.com/gustavovalverde/zinder), and
+[Cipherscan](https://github.com/Kenbak/cipherscan). They do not need to share a
+parent directory. Set these variables to their absolute locations before using
+the commands in this guide:
+
+```bash
+export Z3_ROOT="/absolute/path/to/z3"
+export ZINDER_ROOT="/absolute/path/to/zinder"
+export CIPHERSCAN_ROOT="/absolute/path/to/cipherscan"
+```
+
 Use matching revisions of these Zinder services:
 
 - `zinder-ingest`, caught up on the intended network;
@@ -45,21 +57,29 @@ Start the existing Z3 testnet and the Zinder testnet stack. This reuses the
 named `zinder-testnet-data` volume; it does not recreate or replace the store.
 
 ```bash
-cd ../z3
-docker compose --env-file .env.testnet up -d
-
-cd ../zinder
 docker compose \
-  --env-file deploy/.env.testnet \
-  -f deploy/docker-compose.yml \
+  --project-directory "$Z3_ROOT" \
+  --env-file "$Z3_ROOT/.env.testnet" \
+  -f "$Z3_ROOT/docker-compose.yml" \
+  up -d
+
+docker compose \
+  --project-directory "$ZINDER_ROOT" \
+  --env-file "$ZINDER_ROOT/deploy/.env.testnet" \
+  -f "$ZINDER_ROOT/deploy/docker-compose.yml" \
   up -d zinder-ingest zinder-query zinder-explorer
 ```
 
 Wait for the three Zinder services to become ready, then run the adapter on the
-host against the testnet reader ports:
+host against the testnet reader ports. The values below match
+`deploy/.env.testnet`; use the ports published by your deployment if you
+override that file:
 
 ```bash
-cargo run --locked -p zinder-compat-cipherscan -- \
+cargo run \
+  --manifest-path "$ZINDER_ROOT/Cargo.toml" \
+  --locked \
+  -p zinder-compat-cipherscan -- \
   --network zcash-testnet \
   --explorer-query-endpoint http://127.0.0.1:19068 \
   --wallet-query-endpoint http://127.0.0.1:19101 \
@@ -88,11 +108,10 @@ Crosslink deployment slot. Use that slot to run the source-unmodified UI
 against a local adapter:
 
 ```bash
-cd ../cipherscan
 NEXT_PUBLIC_NETWORK=crosslink-testnet \
 NEXT_PUBLIC_CROSSLINK_API_URL=http://127.0.0.1:9070 \
 CIPHERSCAN_API_URL=http://127.0.0.1:9070 \
-npm run dev -- --port 3003
+npm --prefix "$CIPHERSCAN_ROOT" run dev -- --port 3003
 ```
 
 Open <http://127.0.0.1:3003>. Core explorer workflows use the adapter.
@@ -142,8 +161,12 @@ separately; do not add their product schemas to Zinder.
 Build the release binary from the same revision as the Zinder readers:
 
 ```bash
-cargo build --locked --release --bin zinder-compat-cipherscan
-./target/release/zinder-compat-cipherscan --help
+cargo build \
+  --manifest-path "$ZINDER_ROOT/Cargo.toml" \
+  --locked \
+  --release \
+  --bin zinder-compat-cipherscan
+"$ZINDER_ROOT/target/release/zinder-compat-cipherscan" --help
 ```
 
 Install that binary in the same way as the other per-service Zinder binaries
@@ -202,13 +225,12 @@ Set them while building the production application, then provide the internal
 server URL when starting it:
 
 ```bash
-cd ../cipherscan
 NEXT_PUBLIC_NETWORK=crosslink-testnet \
 NEXT_PUBLIC_CROSSLINK_API_URL=https://api.example.test \
-npm run build
+npm --prefix "$CIPHERSCAN_ROOT" run build
 
 CIPHERSCAN_API_URL=http://zinder-compat-cipherscan:9070 \
-npm start
+npm --prefix "$CIPHERSCAN_ROOT" start
 ```
 
 Route `https://api.example.test` to the adapter. Route WebSocket upgrades on
