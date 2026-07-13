@@ -112,6 +112,14 @@ matching canonical block artifact, then feeds bounded canonical contexts to
 `zinder-source`, and its coverage row advances atomically with its index rows
 without moving the shared chain-event cursor.
 
+Ingest-owned historical enrichment and verification workers are subordinate to
+canonical phase ownership. They wait while the unified writer is unclassified,
+`AwaitingUpstream`, or in `BulkCatchup`, and may start their next bounded batch
+only in `FollowingTip`. If the writer returns to bulk catch-up, an already
+running batch may finish, but no subsequent batch starts until tip follow
+resumes. This keeps canonical initial sync from sharing RocksDB, CPU, memory, or
+upstream requests with rebuildable projection work.
+
 A fresh derive consumer whose persisted cursor sits below the canonical event retention floor needs a cold-start path that rebuilds from canonical artifacts and then resumes ingest-hosted event dispatch without dropping or duplicating events. Stateful derive consumers own this path; the framework provides the atomic-cursor contract, and the writer provides the gap-fill loop.
 
 ### What the derive plane must not consume

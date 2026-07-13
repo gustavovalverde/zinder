@@ -133,7 +133,7 @@ Implemented baseline metrics:
 | `zinder_ingest_derive_replay_effective_batch_blocks` | gauge | `zinder-ingest` | Effective replay batch size after memory degradation. |
 | `zinder_ingest_derive_replay_memory_budget_bytes` | gauge | `zinder-ingest` | Memory budget used for derive replay pressure decisions. |
 | `zinder_ingest_derive_replay_paused` | gauge | `zinder-ingest` | Compatibility operational gauge set to `1` only when derive replay is paused. |
-| `zinder_ingest_derive_replay_phase_gate` | gauge | `zinder-ingest` | Set to `1` while the canonical-phase gate throttles derive replay to residual capacity during `BulkCatchup`, `0` otherwise. |
+| `zinder_ingest_derive_replay_phase_gate` | gauge | `zinder-ingest` | Set to `1` while the canonical-phase gate pauses derive replay during `BulkCatchup`, `0` otherwise. |
 | `zinder_ingest_memory_pressure_ratio` | gauge | `zinder-ingest` | Scheduler pressure ratio. Uses cgroup working set (`memory.current - inactive_file`) over `memory.high` or `memory.max` when available, falling back to current cgroup pressure. |
 | `zinder_ingest_memory_current_pressure_ratio` | gauge | `zinder-ingest` | Raw cgroup `memory.current` pressure ratio over `memory.high` or `memory.max`. |
 | `zinder_ingest_memory_working_set_bytes` | gauge | `zinder-ingest` | Cgroup working set bytes after subtracting inactive file cache. |

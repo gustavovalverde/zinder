@@ -10,10 +10,12 @@ use zinder_derive::{
     ConventionalFeeDistributionBackfillCoverage, ConventionalFeeDistributionConsumer,
     ConventionalFeeDistributionTailCoverage, DeriveStore,
 };
+use zinder_runtime::Readiness;
 use zinder_store::PrimaryChainStore;
 
 use crate::{
     IngestError, derive_consumers::derive_projection_write_guard,
+    ingest_loop::wait_until_tip_follow_or_cancelled,
     transaction_component_backfill::read_canonical_context_batch,
 };
 
@@ -92,6 +94,7 @@ impl ConventionalFeeDistributionBackfillContext {
 pub fn spawn_conventional_fee_distribution_backfill_task(
     config: ConventionalFeeDistributionBackfillConfig,
     context: ConventionalFeeDistributionBackfillContext,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -104,13 +107,14 @@ pub fn spawn_conventional_fee_distribution_backfill_task(
     }
 
     Some(tokio::spawn(run_conventional_fee_distribution_backfill(
-        config, context, cancel,
+        config, context, readiness, cancel,
     )))
 }
 
 async fn run_conventional_fee_distribution_backfill(
     config: ConventionalFeeDistributionBackfillConfig,
     context: ConventionalFeeDistributionBackfillContext,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) {
     tracing::info!(
@@ -122,6 +126,9 @@ async fn run_conventional_fee_distribution_backfill(
     );
 
     loop {
+        if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+            return;
+        }
         let backfill = backfill_next_batch(config, context.clone());
         let progress = tokio::select! {
             () = cancel.cancelled() => {

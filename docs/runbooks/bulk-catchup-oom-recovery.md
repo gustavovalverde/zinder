@@ -222,7 +222,7 @@ The metric set shipped alongside the bounded resource budget catches the trap be
 - `zinder_startup_phase_duration_seconds` (histogram, labels `phase`, `outcome`, `service`) — the alert `ZinderStartupOpenStorageSlow` fires when `open_storage` p95 exceeds 60 seconds, the shape this trap takes during the restart loop.
 - `zinder_ingest_bulk_pipeline_queue_bytes{stage}` and `zinder_ingest_bulk_pipeline_reorder_buffer_bytes{stage}` distinguish active source/fact reservations from completed out-of-order backlog.
 - `zinder_ingest_derive_replay_budget_state{state}` and `zinder_ingest_derive_replay_effective_batch_blocks` show whether derive replay is normal, degraded, or paused under memory pressure.
-- `zinder_ingest_derive_replay_phase_gate` is `1` while the canonical-phase gate throttles derive replay to residual capacity so canonical bulk catch-up owns the storage budget; it drops to `0` when the writer reaches tip. During a from-genesis rebuild this gauge is expected to sit at `1`.
+- `zinder_ingest_derive_replay_phase_gate` is `1` while the canonical-phase gate pauses derive replay so canonical bulk catch-up owns the storage budget exclusively; it drops to `0` when the writer reaches tip. During a from-genesis rebuild this gauge is expected to sit at `1`.
 
 These signals appear on the relevant service `/metrics` endpoints and feed the existing Grafana dashboards under `observability/grafana/`.
 

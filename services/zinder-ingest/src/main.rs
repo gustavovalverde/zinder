@@ -568,34 +568,43 @@ async fn run_ingest(
             store.clone(),
             derive_store.clone(),
         ),
+        readiness.clone(),
         cancel.clone(),
     );
-    let block_production_time_backfill_handle =
-        spawn_block_production_time_backfill_task(derive_store.clone(), cancel.clone());
+    let block_production_time_backfill_handle = spawn_block_production_time_backfill_task(
+        derive_store.clone(),
+        readiness.clone(),
+        cancel.clone(),
+    );
     let transaction_component_backfill_handle = spawn_transaction_component_backfill_task(
         command_config.transaction_component_backfill,
         TransactionComponentBackfillContext::new(store.clone(), derive_store.clone()),
+        readiness.clone(),
         cancel.clone(),
     );
     let transaction_history_verifier_handle = spawn_transaction_history_verifier_task(
         command_config.transaction_history_verifier,
         TransactionHistoryVerifierContext::new(store.clone(), derive_store.clone()),
+        readiness.clone(),
         cancel.clone(),
     );
     let conventional_fee_distribution_backfill_handle =
         spawn_conventional_fee_distribution_backfill_task(
             command_config.conventional_fee_distribution_backfill,
             ConventionalFeeDistributionBackfillContext::new(store.clone(), derive_store.clone()),
+            readiness.clone(),
             cancel.clone(),
         );
     let paid_fee_distribution_backfill_handle = spawn_paid_fee_distribution_backfill_task(
         command_config.paid_fee_distribution_backfill,
         paid_fee_distribution_backfill_context,
+        readiness.clone(),
         cancel.clone(),
     );
     let value_pool_flow_backfill_handle = spawn_value_pool_flow_backfill_task(
         command_config.value_pool_flow_backfill,
         value_pool_flow_backfill_context,
+        readiness.clone(),
         cancel.clone(),
     );
     let value_pool_balance_backfill_handle = spawn_value_pool_balance_backfill_task(
@@ -606,6 +615,7 @@ async fn run_ingest(
             store.clone(),
             derive_store.clone(),
         ),
+        readiness.clone(),
         cancel.clone(),
     );
     open_storage_phase.complete();

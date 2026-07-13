@@ -14,21 +14,30 @@ use zinder_derive::{
     BlockProductionTimeRow, DeriveStore,
 };
 use zinder_proto::v1::explorer::BlockSummaryRecord;
+use zinder_runtime::Readiness;
 
-use crate::{IngestError, derive_consumers::derive_projection_write_guard};
+use crate::{
+    IngestError, derive_consumers::derive_projection_write_guard,
+    ingest_loop::wait_until_tip_follow_or_cancelled,
+};
 
 const BACKFILL_BATCH_BLOCKS: u32 = 4_096;
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Runs the full-history time-index backfill without gating ingest readiness.
+/// Runs the full-history time-index backfill, deferring its writes until
+/// canonical ingest reaches tip follow so bulk catch-up owns the storage budget.
 #[must_use = "await the handle during shutdown"]
 pub fn spawn_block_production_time_backfill_task(
     derive_store: DeriveStore,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut completion_logged = false;
         loop {
+            if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+                return;
+            }
             let wait_before_next_attempt = match backfill_next_batch(&derive_store) {
                 Ok(BackfillProgress::Advanced { from, through }) => {
                     completion_logged = false;

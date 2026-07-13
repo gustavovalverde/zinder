@@ -10,10 +10,11 @@ use zinder_derive::{
     BlockCommitContext, BlockCommitPayload, CommitmentRootBackfillCoverage,
     CommitmentRootSearchConsumer, DeriveStore, TransparentSpendFacts,
 };
+use zinder_runtime::Readiness;
 use zinder_source::NodeSource;
 use zinder_store::PrimaryChainStore;
 
-use crate::IngestError;
+use crate::{IngestError, ingest_loop::wait_until_tip_follow_or_cancelled};
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const BACKFILL_CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -64,6 +65,7 @@ impl CommitmentRootBackfillContext {
 pub fn spawn_commitment_root_backfill_task(
     config: CommitmentRootBackfillConfig,
     context: CommitmentRootBackfillContext,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -76,13 +78,14 @@ pub fn spawn_commitment_root_backfill_task(
     }
 
     Some(tokio::spawn(run_commitment_root_backfill(
-        config, context, cancel,
+        config, context, readiness, cancel,
     )))
 }
 
 async fn run_commitment_root_backfill(
     config: CommitmentRootBackfillConfig,
     context: CommitmentRootBackfillContext,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) {
     let Some(sapling_activation_height) = context.activations.activation_height_by_name("Sapling")
@@ -106,6 +109,9 @@ async fn run_commitment_root_backfill(
     );
 
     loop {
+        if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+            return;
+        }
         let backfill = backfill_next_batch(config, sapling_activation_height, &context);
         let progress = tokio::select! {
             () = cancel.cancelled() => {

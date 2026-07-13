@@ -11,10 +11,12 @@ use zinder_derive::{
     ConsumerProjectionState, DeriveStore, TRANSACTION_HISTORY_CONSUMER_NAME,
     TransactionHistoryConsumer, decode_stored_record,
 };
+use zinder_runtime::Readiness;
 use zinder_store::PrimaryChainStore;
 
 use crate::{
     IngestError, derive_consumers::derive_projection_write_guard,
+    ingest_loop::wait_until_tip_follow_or_cancelled,
     transaction_component_backfill::read_canonical_context_batch,
 };
 
@@ -54,6 +56,7 @@ impl TransactionHistoryVerifierContext {
 pub fn spawn_transaction_history_verifier_task(
     config: TransactionHistoryVerifierConfig,
     context: TransactionHistoryVerifierContext,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -64,12 +67,15 @@ pub fn spawn_transaction_history_verifier_task(
         );
         return None;
     }
-    Some(tokio::spawn(run_verifier(config, context, cancel)))
+    Some(tokio::spawn(run_verifier(
+        config, context, readiness, cancel,
+    )))
 }
 
 async fn run_verifier(
     config: TransactionHistoryVerifierConfig,
     context: TransactionHistoryVerifierContext,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) {
     tracing::info!(
@@ -80,6 +86,9 @@ async fn run_verifier(
         "transaction-history verification started"
     );
     loop {
+        if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+            return;
+        }
         let verification = verify_next_batch(config, context.clone());
         let progress = tokio::select! {
             () = cancel.cancelled() => {

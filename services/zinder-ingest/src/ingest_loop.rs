@@ -62,6 +62,7 @@ const TIP_OBSERVATION_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
 /// rarely need to tune this; the value is intentionally a private
 /// constant rather than a configuration knob.
 const PHASE_BOUNCE_BACK_WATCH_INTERVAL: Duration = Duration::from_mins(1);
+const BACKGROUND_WORK_PHASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Resolved configuration consumed by [`run_ingest_loop`].
 ///
@@ -274,6 +275,25 @@ pub struct TipFollowSubsystems {
 /// closure returns the [`TipFollowSubsystems`] handles + channel ends
 /// the loop holds for the life of the process.
 pub type TipFollowSubsystemsLauncher = Box<dyn FnOnce() -> TipFollowSubsystems + Send>;
+
+/// Waits until canonical ingest reaches tip follow, where rebuildable
+/// enrichment work may run without competing with bulk catch-up.
+///
+/// Returns `true` when cancellation wins and the caller should exit.
+pub(crate) async fn wait_until_tip_follow_or_cancelled(
+    readiness: &Readiness,
+    cancel: &CancellationToken,
+) -> bool {
+    loop {
+        if matches!(readiness.phase(), Some(IngestPhase::FollowingTip)) {
+            return false;
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return true,
+            () = tokio::time::sleep(BACKGROUND_WORK_PHASE_POLL_INTERVAL) => {}
+        }
+    }
+}
 
 /// Runs the unified ingest loop until `cancel` fires.
 ///
@@ -784,6 +804,44 @@ mod tests {
             },
             modifiers,
         })
+    }
+
+    #[tokio::test]
+    async fn background_work_gate_opens_only_during_tip_follow() {
+        let readiness = Readiness::default();
+        readiness.set_phase(IngestPhase::FollowingTip);
+        let cancel = CancellationToken::new();
+
+        assert!(!wait_until_tip_follow_or_cancelled(&readiness, &cancel).await);
+    }
+
+    #[tokio::test]
+    async fn background_work_gate_resumes_after_bulk_catchup() {
+        let readiness = Readiness::default();
+        readiness.set_phase(IngestPhase::BulkCatchup);
+        let cancel = CancellationToken::new();
+        let gate_readiness = readiness.clone();
+        let gate_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            wait_until_tip_follow_or_cancelled(&gate_readiness, &gate_cancel).await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        readiness.set_phase(IngestPhase::FollowingTip);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+        assert!(matches!(outcome, Ok(Ok(false))));
+    }
+
+    #[tokio::test]
+    async fn background_work_gate_exits_when_cancelled_before_tip_follow() {
+        let readiness = Readiness::default();
+        readiness.set_phase(IngestPhase::BulkCatchup);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        assert!(wait_until_tip_follow_or_cancelled(&readiness, &cancel).await);
     }
 
     #[test]

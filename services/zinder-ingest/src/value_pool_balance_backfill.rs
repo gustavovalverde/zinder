@@ -10,10 +10,14 @@ use zinder_derive::{
     BlockCommitContext, BlockCommitPayload, BlockValuePoolBalanceFacts, DeriveStore,
     TransparentSpendFacts, ValuePoolBalanceBackfillCoverage, ValuePoolBalanceHistoryConsumer,
 };
+use zinder_runtime::Readiness;
 use zinder_source::{NodeCapability, NodeSource};
 use zinder_store::PrimaryChainStore;
 
-use crate::{IngestError, derive_consumers::derive_projection_write_guard};
+use crate::{
+    IngestError, derive_consumers::derive_projection_write_guard,
+    ingest_loop::wait_until_tip_follow_or_cancelled,
+};
 
 const BACKFILL_START_HEIGHT: BlockHeight = BlockHeight::new(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -63,6 +67,7 @@ impl ValuePoolBalanceBackfillContext {
 pub fn spawn_value_pool_balance_backfill_task(
     config: ValuePoolBalanceBackfillConfig,
     context: ValuePoolBalanceBackfillContext,
+    readiness: Readiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -70,6 +75,9 @@ pub fn spawn_value_pool_balance_backfill_task(
     }
     Some(tokio::spawn(async move {
         loop {
+            if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+                return;
+            }
             let outcome = synchronize_once(config, &context).await;
             let delay = match outcome {
                 Ok(SyncProgress::Advanced {

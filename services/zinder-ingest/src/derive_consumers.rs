@@ -139,8 +139,8 @@ struct EffectiveDeriveReplayLimits {
     phase_gate_engaged: bool,
 }
 
-/// Returns whether the current ingest phase cedes the storage budget to
-/// canonical work, throttling derive replay to residual capacity.
+/// Returns whether the current ingest phase gives the storage budget
+/// exclusively to canonical work by pausing derive replay.
 ///
 /// [`IngestPhase::BulkCatchup`] is entered precisely when the canonical gap
 /// exceeds `ingest.phases.catchup_threshold_blocks`, so it is the
@@ -324,12 +324,9 @@ fn next_memory_budget_state(
 /// Composes the applied replay state from the memory hysteresis machine and the
 /// canonical-phase gate, letting the stricter of the two win.
 ///
-/// The gate throttles derive replay to residual (a [`DeriveReplayBudgetState::Degraded`]
-/// floor) during canonical bulk catch-up for every policy, so `continuous`
-/// keeps its meaning only as an at-tip override. Memory pressure still applies
-/// whenever the policy is `canonical-first` or the gate is engaged, and can
-/// escalate to [`DeriveReplayBudgetState::Paused`] below the gate's residual
-/// level.
+/// The gate pauses derive replay during canonical bulk catch-up for every
+/// policy, so `continuous` keeps its meaning only as an at-tip override.
+/// Rebuildable projections resume once canonical ingest enters tip follow.
 fn compose_replay_state(
     config: IngestDeriveConfig,
     memory_state: DeriveReplayBudgetState,
@@ -343,7 +340,7 @@ fn compose_replay_state(
         DeriveReplayBudgetState::Normal
     };
     let gate_floor = if phase_gate_engaged {
-        DeriveReplayBudgetState::Degraded
+        DeriveReplayBudgetState::Paused
     } else {
         DeriveReplayBudgetState::Normal
     };
@@ -874,14 +871,14 @@ fn log_phase_gate_transition(
                 target: "zinder::ingest",
                 event = "derive_replay_phase_gate_engaged",
                 replay_policy = replay_policy.as_kebab_case(),
-                "continuous derive replay throttled to residual capacity while canonical bulk catch-up owns the storage budget"
+                "continuous derive replay paused while canonical bulk catch-up owns the storage budget"
             );
         } else {
             tracing::info!(
                 target: "zinder::ingest",
                 event = "derive_replay_phase_gate_engaged",
                 replay_policy = replay_policy.as_kebab_case(),
-                "derive replay throttled to residual capacity while canonical bulk catch-up owns the storage budget"
+                "derive replay paused while canonical bulk catch-up owns the storage budget"
             );
         }
     } else if had_prior_state {
@@ -3041,14 +3038,14 @@ mod tests {
     }
 
     #[test]
-    fn continuous_bulk_catchup_engages_residual_replay() {
+    fn continuous_bulk_catchup_pauses_replay() {
         let mut budget = DeriveReplayBudget::new(continuous_config());
 
         let limits = budget.evaluate(memory_snapshot(800), Some(IngestPhase::BulkCatchup));
 
         assert!(limits.phase_gate_engaged);
-        assert_eq!(limits.state, DeriveReplayBudgetState::Degraded);
-        assert_eq!(limits.batch_blocks, 10);
+        assert_eq!(limits.state, DeriveReplayBudgetState::Paused);
+        assert_eq!(limits.batch_blocks, 0);
     }
 
     #[test]
@@ -3066,10 +3063,10 @@ mod tests {
     fn canonical_first_composes_memory_pause_with_bulk_catchup_gate() {
         let mut budget = DeriveReplayBudget::new(replay_config());
 
-        let residual = budget.evaluate(memory_snapshot(800), Some(IngestPhase::BulkCatchup));
-        assert!(residual.phase_gate_engaged);
-        assert_eq!(residual.state, DeriveReplayBudgetState::Degraded);
-        assert_eq!(residual.batch_blocks, 10);
+        let phase_paused = budget.evaluate(memory_snapshot(800), Some(IngestPhase::BulkCatchup));
+        assert!(phase_paused.phase_gate_engaged);
+        assert_eq!(phase_paused.state, DeriveReplayBudgetState::Paused);
+        assert_eq!(phase_paused.batch_blocks, 0);
 
         let paused = budget.evaluate(memory_snapshot(950), Some(IngestPhase::BulkCatchup));
         assert!(paused.phase_gate_engaged);
@@ -3083,8 +3080,8 @@ mod tests {
 
         let engaged = budget.evaluate(memory_snapshot(800), Some(IngestPhase::BulkCatchup));
         assert!(engaged.phase_gate_engaged);
-        assert_eq!(engaged.state, DeriveReplayBudgetState::Degraded);
-        assert_eq!(engaged.batch_blocks, 10);
+        assert_eq!(engaged.state, DeriveReplayBudgetState::Paused);
+        assert_eq!(engaged.batch_blocks, 0);
 
         let disengaged = budget.evaluate(memory_snapshot(800), Some(IngestPhase::FollowingTip));
         assert!(!disengaged.phase_gate_engaged);

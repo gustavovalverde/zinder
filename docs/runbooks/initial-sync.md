@@ -70,6 +70,13 @@ Steady-state operation emits `chain_committed` events with `phase=following_tip`
 
 Canonical readiness does not imply that every historical projection is complete. Use this table as the operator checklist; each worker persists progress and resumes after restart.
 
+During `BulkCatchup`, canonical ingest has priority over all rebuildable
+projection work. Derive replay reports a paused budget state, and the historical
+enrichment and verification workers wait before starting each bounded batch.
+They resume automatically in `FollowingTip`; no operator sequencing is needed.
+An in-flight enrichment batch may complete after a bounce back to bulk catch-up,
+but the worker cannot start another batch until tip follow resumes.
+
 | Worker | Canonical boundary | Readiness effect | Capability and completion evidence | Restart behavior |
 | --- | --- | --- | --- | --- |
 | Commitment-root enrichment | Settled blocks from Sapling activation; live commits supply the tip | Does not gate canonical readiness | Root-search capability plus contiguous root coverage | Resumes bounded batches and revalidates block identity |
