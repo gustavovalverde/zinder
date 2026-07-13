@@ -12,6 +12,7 @@
 
 pub(crate) mod address_value_event;
 pub(crate) mod block_commit_context;
+pub(crate) mod block_production_time;
 pub(crate) mod block_summary;
 pub(crate) mod commitment_root_search;
 pub(crate) mod conventional_fee_distribution;

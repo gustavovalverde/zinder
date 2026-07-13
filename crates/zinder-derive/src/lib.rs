@@ -24,6 +24,14 @@ pub mod error;
 pub mod store;
 pub mod value_pool_change;
 
+pub use consumer::block_production_time::{
+    BLOCK_PRODUCTION_TIME_COLUMN_FAMILIES, BLOCK_PRODUCTION_TIME_COLUMN_FAMILY,
+    BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_PRODUCTION_TIME_COVERAGE_COLUMN_FAMILY,
+    BLOCK_PRODUCTION_TIME_INDEX_COLUMN_FAMILY, BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE,
+    BLOCK_PRODUCTION_TIME_SCHEMA, BlockProductionTimeBackfillCoverage, BlockProductionTimeConsumer,
+    BlockProductionTimeConsumerError, BlockProductionTimeCursor, BlockProductionTimePage,
+    BlockProductionTimePageRequest, BlockProductionTimeRow, BlockProductionTimeTailCoverage,
+};
 pub use consumer::block_summary::{
     BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
     BLOCK_SUMMARY_SCHEMA, BlockSummaryConsumer, BlockSummaryConsumerError, decode_stored_record,
@@ -61,8 +69,8 @@ pub use consumer::paid_fee_distribution::{
     PAID_FEE_DISTRIBUTION_CAPABILITIES, PAID_FEE_DISTRIBUTION_COLUMN_FAMILIES,
     PAID_FEE_DISTRIBUTION_COLUMN_FAMILY, PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
     PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY, PAID_FEE_DISTRIBUTION_DAY_COLUMN_FAMILY,
-    PAID_FEE_DISTRIBUTION_INDEX_COLUMN_FAMILY, PAID_FEE_DISTRIBUTION_SCHEMA, PaidFeeDistribution,
-    PaidFeeDistributionBackfillCoverage, PaidFeeDistributionConsumer,
+    PAID_FEE_DISTRIBUTION_INDEX_COLUMN_FAMILY, PAID_FEE_DISTRIBUTION_SCHEMA, PaidFeeBlockTotal,
+    PaidFeeDistribution, PaidFeeDistributionBackfillCoverage, PaidFeeDistributionConsumer,
     PaidFeeDistributionConsumerError, PaidFeeDistributionDay, PaidFeeDistributionTailCoverage,
     PaidFeeFrequency,
 };

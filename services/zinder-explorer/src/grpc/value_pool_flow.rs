@@ -19,15 +19,14 @@ use zinder_proto::capabilities::{
     EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1, EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1,
 };
 use zinder_proto::v1::explorer::{
-    ExplorerFreshness, TransactionIntrinsicValueBalances,
-    ValuePoolFlowAmountThresholdSummaryRequest, ValuePoolFlowAmountThresholdSummaryResponse,
-    ValuePoolFlowAmountThresholdSummaryRow, ValuePoolFlowCoverage, ValuePoolFlowDirection,
-    ValuePoolFlowEvent, ValuePoolFlowEventsInRangeRequest, ValuePoolFlowEventsInRangeResponse,
-    ValuePoolFlowFilter, ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse,
-    ValuePoolFlowPool, ValuePoolFlowRoundedAmountSummaryRequest,
-    ValuePoolFlowRoundedAmountSummaryResponse, ValuePoolFlowRoundedAmountSummaryRow,
-    ValuePoolFlowSummaryBucket, ValuePoolFlowSummaryRequest, ValuePoolFlowSummaryResolution,
-    ValuePoolFlowSummaryResponse,
+    TransactionIntrinsicValueBalances, ValuePoolFlowAmountThresholdSummaryRequest,
+    ValuePoolFlowAmountThresholdSummaryResponse, ValuePoolFlowAmountThresholdSummaryRow,
+    ValuePoolFlowCoverage, ValuePoolFlowDirection, ValuePoolFlowEvent,
+    ValuePoolFlowEventsInRangeRequest, ValuePoolFlowEventsInRangeResponse, ValuePoolFlowFilter,
+    ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse, ValuePoolFlowPool,
+    ValuePoolFlowRoundedAmountSummaryRequest, ValuePoolFlowRoundedAmountSummaryResponse,
+    ValuePoolFlowRoundedAmountSummaryRow, ValuePoolFlowSummaryBucket, ValuePoolFlowSummaryRequest,
+    ValuePoolFlowSummaryResolution, ValuePoolFlowSummaryResponse,
 };
 use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
@@ -36,6 +35,7 @@ use super::clamp_max_entries;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+    indexed_tip_matches_chain_epoch,
 };
 
 const DEFAULT_HISTORY_PAGE_SIZE: u32 = 64;
@@ -175,7 +175,7 @@ pub(crate) async fn handle_value_pool_flow_events_in_range(
         .await;
         let requested_range_complete =
             coverage_reaches_visible_tip(backfill_coverage, tail_coverage, visible_tip_height)
-                && freshness_indexed_tip_matches_chain_epoch(&freshness, &chain_epoch);
+                && indexed_tip_matches_chain_epoch(&freshness, &chain_epoch);
 
         return Ok(Response::new(ValuePoolFlowEventsInRangeResponse {
             freshness: Some(freshness),
@@ -199,19 +199,6 @@ pub(crate) async fn handle_value_pool_flow_events_in_range(
         "chain epoch changed while reading value-pool flow events",
     )
     .into())
-}
-
-fn freshness_indexed_tip_matches_chain_epoch(
-    freshness: &ExplorerFreshness,
-    chain_epoch: &zinder_proto::v1::wallet::ChainEpoch,
-) -> bool {
-    freshness
-        .chain_view
-        .as_ref()
-        .and_then(|chain_view| chain_view.indexed_tip.as_ref())
-        .and_then(|indexed_tip| indexed_tip.tip.as_ref())
-        .zip(chain_epoch.visible_tip.as_ref())
-        .is_some_and(|(indexed_tip, visible_tip)| indexed_tip == visible_tip)
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowSummary` request.
@@ -1398,7 +1385,7 @@ mod tests {
             height: 42,
             hash: "00".repeat(32),
         };
-        let freshness = ExplorerFreshness {
+        let freshness = zinder_proto::v1::explorer::ExplorerFreshness {
             chain_view: Some(zinder_proto::v1::wallet::ChainView {
                 indexed_tip: Some(zinder_proto::v1::wallet::IndexedTip {
                     tip: Some(visible_tip.clone()),
@@ -1412,10 +1399,7 @@ mod tests {
             visible_tip: Some(visible_tip.clone()),
             ..Default::default()
         };
-        assert!(freshness_indexed_tip_matches_chain_epoch(
-            &freshness,
-            &matching_epoch
-        ));
+        assert!(indexed_tip_matches_chain_epoch(&freshness, &matching_epoch));
 
         let displaced_epoch = zinder_proto::v1::wallet::ChainEpoch {
             visible_tip: Some(zinder_proto::v1::wallet::BlockTip {
@@ -1424,7 +1408,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(!freshness_indexed_tip_matches_chain_epoch(
+        assert!(!indexed_tip_matches_chain_epoch(
             &freshness,
             &displaced_epoch
         ));

@@ -7,6 +7,7 @@
 
 mod blend_check;
 mod market_price;
+mod mining_pools;
 
 pub use market_price::MarketPriceInitializationError;
 
@@ -69,18 +70,19 @@ use zinder_core::{
     },
 };
 use zinder_proto::capabilities::{
-    EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1, EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1,
-    EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1, EXPLORER_PAID_FEE_DISTRIBUTION_V1,
-    EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2, EXPLORER_TRANSACTION_HISTORY_V2,
-    EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1, EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
-    EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
+    EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1,
+    EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1, EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1,
+    EXPLORER_PAID_FEE_DISTRIBUTION_V1, EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,
+    EXPLORER_TRANSACTION_HISTORY_V2, EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
+    EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1, EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
     EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1, EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
     EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1, EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1,
 };
 use zinder_proto::v1::{
     explorer::{
-        self, BlockActivityDistributionRequest, BlockDetailRequest, BlockProductionSeriesRequest,
-        ChainReorgHistoryRequest, CommitmentRootSearchRequest, ConventionalFeeDistributionRequest,
+        self, BlockActivityDistributionRequest, BlockDetailRequest,
+        BlockProductionInTimeRangeRequest, BlockProductionSeriesRequest, ChainReorgHistoryRequest,
+        CommitmentRootSearchRequest, ConventionalFeeDistributionRequest,
         ConventionalFeeDistributionResponse, DisplacedBlockDetailRequest,
         DisplacedBlockHistoryRequest, DisplacedBlockHistoryResponse, FeeSummaryRequest,
         MempoolSnapshotRequest, PaidFeeDistributionRequest, PaidFeeDistributionResponse,
@@ -112,6 +114,7 @@ use crate::blend_check::{
     nearby_popular_amounts, split_remainder_amounts,
 };
 use crate::market_price::{HistoricalMarketPriceResult, MarketPriceClient, MarketPriceError};
+use crate::mining_pools::get_pool_name;
 
 const DEFAULT_LIMIT: u32 = 10;
 const DEFAULT_ADDRESS_ACTIVITY_LIMIT: u32 = 25;
@@ -149,7 +152,7 @@ const TARGET_BLOCKS_PER_DAY: u32 = 1_152;
 // Testnet block production can materially exceed the target spacing. This
 // bound covers the default seven-day route from timestamps rather than from a
 // target-rate estimate while keeping longer analytical windows bounded.
-const MAX_MINING_REWARD_BLOCKS: u32 = 50_000;
+const MAX_MINING_PRODUCTION_BLOCKS: u32 = 50_000;
 const MAX_NETWORK_STATS_BLOCKS: u32 = 20_000;
 const DEFAULT_MINING_METRICS_WINDOW: i64 = 20;
 const MIN_MINING_METRICS_WINDOW: i64 = 5;
@@ -191,7 +194,7 @@ const CIPHERSCAN_VALUE_POOL_IDS: [&str; 6] = [
 const VALUE_POOL_TOTALS_UNAVAILABLE: &str = "One or more monitored value-pool totals are unavailable, so incomplete supply fields are null.";
 const UNKNOWN_VALUE_POOL_SEMANTICS_UNAVAILABLE: &str = "The current value-pool response contains a non-zero pool whose shielded semantics are unknown to Cipherscan.";
 const TRANSACTION_HISTORY_COUNT_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
-const MINING_REWARD_CACHE_TTL: StdDuration = StdDuration::from_mins(5);
+const MINING_PRODUCTION_CACHE_TTL: StdDuration = StdDuration::from_mins(5);
 const FEE_DISTRIBUTION_CACHE_TTL: StdDuration = StdDuration::from_hours(1);
 const FLOW_ANALYTICS_CACHE_TTL: StdDuration = StdDuration::from_hours(1);
 const COMMON_AMOUNTS_CACHE_TTL: StdDuration = StdDuration::from_mins(15);
@@ -292,7 +295,11 @@ pub struct CipherscanRestAdapter {
     realtime_tasks: TaskTracker,
     transaction_history_count_cache:
         Arc<RwLock<BTreeMap<TransactionHistoryCountCacheKey, CachedTransactionHistoryCount>>>,
-    mining_reward_cache: Arc<RwLock<BTreeMap<String, CachedMiningRewardResponse>>>,
+    mining_production_cache:
+        Arc<RwLock<BTreeMap<MiningProductionPeriod, CachedMiningProductionWindow>>>,
+    mining_production_refresh: Arc<Mutex<()>>,
+    mining_pool_distribution_cache:
+        Arc<RwLock<BTreeMap<String, CachedMiningPoolDistributionResponse>>>,
     fee_distribution_cache: Arc<RwLock<BTreeMap<String, CachedFeeDistributionResponse>>>,
     anonymity_set_cache: Arc<RwLock<BTreeMap<String, CachedFlowAnalyticsResponse>>>,
     shielding_distribution_cache: Arc<RwLock<BTreeMap<String, CachedFlowAnalyticsResponse>>>,
@@ -655,7 +662,12 @@ fn validate_orchard_candidate_scan_coverage(
     Ok(())
 }
 
-struct CachedMiningRewardResponse {
+struct CachedMiningProductionWindow {
+    window: Arc<MiningProductionWindow>,
+    expires_at: Instant,
+}
+
+struct CachedMiningPoolDistributionResponse {
     body: Value,
     expires_at: Instant,
 }
@@ -805,7 +817,9 @@ impl CipherscanRestAdapter {
             realtime_cancel,
             realtime_tasks: TaskTracker::new(),
             transaction_history_count_cache: Arc::new(RwLock::new(BTreeMap::new())),
-            mining_reward_cache: Arc::new(RwLock::new(BTreeMap::new())),
+            mining_production_cache: Arc::new(RwLock::new(BTreeMap::new())),
+            mining_production_refresh: Arc::new(Mutex::new(())),
+            mining_pool_distribution_cache: Arc::new(RwLock::new(BTreeMap::new())),
             fee_distribution_cache: Arc::new(RwLock::new(BTreeMap::new())),
             anonymity_set_cache: Arc::new(RwLock::new(BTreeMap::new())),
             shielding_distribution_cache: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1061,19 +1075,23 @@ impl CipherscanRestAdapter {
         NetworkActivityWindow::from_entries(&entries, tip_height, cutoff_unix_seconds)
     }
 
-    async fn fetch_mining_reward_window(
+    async fn fetch_mining_production_window(
         &self,
-        period: &str,
+        period: MiningProductionPeriod,
         generated_at: OffsetDateTime,
-    ) -> Result<MiningRewardWindow, CipherscanRestError> {
+    ) -> Result<MiningProductionWindow, CipherscanRestError> {
         let requested_cutoff_unix_seconds =
-            mining_reward_cutoff_unix_seconds(period, generated_at.unix_timestamp());
+            period.cutoff_unix_seconds(generated_at.unix_timestamp());
+        let requested_end_time_unix_seconds = generated_at.unix_timestamp().saturating_add(1);
         let (tip, at_epoch_id) = self.fetch_latest_block_context().await?;
+        let chain_epoch_id = at_epoch_id.ok_or(CipherscanRestError::MissingUpstreamField(
+            "latest_block.chain_view.chain_epoch",
+        ))?;
         let minimum_height = tip
             .height
-            .saturating_sub(MAX_MINING_REWARD_BLOCKS.saturating_sub(1));
+            .saturating_sub(MAX_MINING_PRODUCTION_BLOCKS.saturating_sub(1));
         let mut end_height = tip.height;
-        let mut summaries = Vec::new();
+        let mut entries = Vec::new();
         let mut scanned_block_count = 0_u32;
         let mut covered_from_unix_seconds = None::<i64>;
         let mut covered_through_unix_seconds = None::<i64>;
@@ -1084,16 +1102,14 @@ impl CipherscanRestAdapter {
                 .saturating_sub(BLOCK_SUMMARY_PAGE_SIZE.saturating_sub(1))
                 .max(minimum_height);
             let page = self
-                .fetch_block_list_entries_in_range(start_height, end_height, at_epoch_id)
-                .await?
-                .into_iter()
-                .map(|entry| entry.summary)
-                .collect::<Vec<_>>();
-            validate_mining_reward_page(&page, start_height, end_height)?;
+                .fetch_block_list_entries_in_range(start_height, end_height, Some(chain_epoch_id))
+                .await?;
+            validate_mining_production_page(&page, start_height, end_height)?;
 
             scanned_block_count =
                 scanned_block_count.saturating_add(u32::try_from(page.len()).unwrap_or(u32::MAX));
-            for summary in &page {
+            for entry in &page {
+                let summary = &entry.summary;
                 covered_from_unix_seconds = Some(
                     covered_from_unix_seconds.map_or(summary.block_time_unix_seconds, |current| {
                         current.min(summary.block_time_unix_seconds)
@@ -1108,9 +1124,13 @@ impl CipherscanRestAdapter {
             }
 
             let page_is_before_cutoff =
-                mining_reward_page_is_before_cutoff(&page, requested_cutoff_unix_seconds);
-            summaries.extend(page.into_iter().filter(|summary| {
-                mining_reward_summary_is_in_period(summary, requested_cutoff_unix_seconds)
+                mining_production_page_is_before_cutoff(&page, requested_cutoff_unix_seconds);
+            entries.extend(page.into_iter().filter(|entry| {
+                mining_production_entry_is_in_period(
+                    entry,
+                    requested_cutoff_unix_seconds,
+                    requested_end_time_unix_seconds,
+                )
             }));
 
             if page_is_before_cutoff || start_height == 0 {
@@ -1123,33 +1143,151 @@ impl CipherscanRestAdapter {
             end_height = start_height.saturating_sub(1);
         }
 
-        summaries.sort_unstable_by_key(|summary| summary.block_height);
-        Ok(MiningRewardWindow {
-            summaries,
+        entries.sort_unstable_by_key(|entry| entry.summary.block_height);
+        Ok(MiningProductionWindow {
+            entries,
             requested_cutoff_unix_seconds,
             covered_from_unix_seconds,
             covered_through_unix_seconds,
             scanned_block_count,
             coverage_complete,
+            generated_at,
         })
     }
 
-    async fn cached_mining_reward_response(&self, period: &str) -> Option<Value> {
-        let cache = self.mining_reward_cache.read().await;
+    async fn mining_production_window(
+        &self,
+        period: MiningProductionPeriod,
+    ) -> Result<Arc<MiningProductionWindow>, CipherscanRestError> {
+        if let Some(window) = self.cached_mining_production_window(period).await {
+            return Ok(window);
+        }
+
+        let _refresh_guard = self.mining_production_refresh.lock().await;
+        if let Some(window) = self.cached_mining_production_window(period).await {
+            return Ok(window);
+        }
+        let window = Arc::new(
+            self.fetch_mining_production_window(period, OffsetDateTime::now_utc())
+                .await?,
+        );
+        if window.coverage_complete {
+            self.cache_mining_production_window(period, Arc::clone(&window))
+                .await;
+        }
+        Ok(window)
+    }
+
+    async fn cached_mining_production_window(
+        &self,
+        period: MiningProductionPeriod,
+    ) -> Option<Arc<MiningProductionWindow>> {
+        let cache = self.mining_production_cache.read().await;
         cache
-            .get(period)
+            .get(&period)
+            .filter(|cached| cached.expires_at > Instant::now())
+            .map(|cached| Arc::clone(&cached.window))
+    }
+
+    async fn cache_mining_production_window(
+        &self,
+        period: MiningProductionPeriod,
+        window: Arc<MiningProductionWindow>,
+    ) {
+        let mut cache = self.mining_production_cache.write().await;
+        cache.retain(|_, cached| cached.expires_at > Instant::now());
+        cache.insert(
+            period,
+            CachedMiningProductionWindow {
+                window,
+                expires_at: Instant::now() + MINING_PRODUCTION_CACHE_TTL,
+            },
+        );
+    }
+
+    async fn fetch_mining_pool_distribution_window(
+        &self,
+        period: MiningProductionPeriod,
+        generated_at: OffsetDateTime,
+    ) -> Result<MiningPoolDistributionWindow, CipherscanRestError> {
+        let start_time_unix_seconds = period
+            .cutoff_unix_seconds(generated_at.unix_timestamp())
+            .unwrap_or(i64::MIN);
+        let end_time_unix_seconds = i64::MAX;
+        let mut client = self.explorer_client();
+        let mut cursor = Vec::new();
+        let mut chain_epoch_id = None;
+        let mut read_fence = None;
+        let mut payout_by_address = BTreeMap::<Option<String>, MiningPayoutAggregate>::new();
+
+        loop {
+            let response = client
+                .block_production_in_time_range(BlockProductionInTimeRangeRequest {
+                    start_time_unix_seconds,
+                    end_time_unix_seconds,
+                    max_entries: 1_000,
+                    from_cursor: cursor,
+                    at_epoch_id: chain_epoch_id,
+                })
+                .await?
+                .into_inner();
+            validate_mining_pool_distribution_page(&response, read_fence.as_ref())?;
+            let page_fence =
+                response
+                    .read_fence
+                    .clone()
+                    .ok_or(CipherscanRestError::MissingUpstreamField(
+                        "block_production_in_time_range.read_fence",
+                    ))?;
+            chain_epoch_id = Some(page_fence.chain_epoch_id);
+            read_fence = Some(page_fence);
+            for point in response.points {
+                let entry = CipherscanBlockListEntry::try_from_point(self.network, point)?;
+                let paid_fee_zat = entry.summary.paid_fees_collected_zat.ok_or(
+                    CipherscanRestError::MissingUpstreamField(
+                        "block_production_in_time_range.points.summary.paid_fees_collected_zat",
+                    ),
+                )?;
+                let payout = payout_by_address.entry(entry.miner_address).or_default();
+                payout.block_count = payout.block_count.checked_add(1).ok_or(
+                    CipherscanRestError::InvalidUpstreamField(
+                        "block_production_in_time_range.covered_block_count",
+                    ),
+                )?;
+                payout.total_fees_zat = payout.total_fees_zat.checked_add(paid_fee_zat).ok_or(
+                    CipherscanRestError::InvalidUpstreamField(
+                        "block_production_in_time_range.points.summary.paid_fees_collected_zat",
+                    ),
+                )?;
+            }
+            if response.next_cursor.is_empty() {
+                break;
+            }
+            cursor = response.next_cursor;
+        }
+
+        Ok(MiningPoolDistributionWindow {
+            payout_by_address,
+            generated_at,
+        })
+    }
+
+    async fn cached_mining_pool_distribution_response(&self, cache_key: &str) -> Option<Value> {
+        let cache = self.mining_pool_distribution_cache.read().await;
+        cache
+            .get(cache_key)
             .filter(|cached| cached.expires_at > Instant::now())
             .map(|cached| cached.body.clone())
     }
 
-    async fn cache_mining_reward_response(&self, period: String, body: Value) {
-        let mut cache = self.mining_reward_cache.write().await;
+    async fn cache_mining_pool_distribution_response(&self, cache_key: String, body: Value) {
+        let mut cache = self.mining_pool_distribution_cache.write().await;
         cache.retain(|_, cached| cached.expires_at > Instant::now());
         cache.insert(
-            period,
-            CachedMiningRewardResponse {
+            cache_key,
+            CachedMiningPoolDistributionResponse {
                 body,
-                expires_at: Instant::now() + MINING_REWARD_CACHE_TTL,
+                expires_at: Instant::now() + MINING_PRODUCTION_CACHE_TTL,
             },
         );
     }
@@ -5913,9 +6051,32 @@ async fn mining_metrics(
     ))
 }
 
-async fn mining_pool_distribution(Query(query): Query<PageQuery>) -> Response {
-    let period = query.period.unwrap_or_else(|| String::from("7d"));
-    json_response(StatusCode::OK, mining_pool_distribution_json(&period))
+async fn mining_pool_distribution(
+    State(adapter): State<CipherscanRestAdapter>,
+    Query(query): Query<PageQuery>,
+) -> Result<Response, CipherscanRestError> {
+    let period = query
+        .period
+        .filter(|period| !period.is_empty())
+        .unwrap_or_else(|| String::from("7d"));
+    let production_period = mining_production_period(&period);
+    if let Some(body) = adapter
+        .cached_mining_pool_distribution_response(&period)
+        .await
+    {
+        return Ok(json_response(StatusCode::OK, body));
+    }
+    adapter
+        .require_explorer_capability(EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1)
+        .await?;
+    let window = adapter
+        .fetch_mining_pool_distribution_window(production_period, OffsetDateTime::now_utc())
+        .await?;
+    let body = mining_pool_distribution_json(&period, &window)?;
+    adapter
+        .cache_mining_pool_distribution_response(period, body.clone())
+        .await;
+    Ok(json_response(StatusCode::OK, body))
 }
 
 async fn mining_pool_ranking(Query(query): Query<PageQuery>) -> Response {
@@ -5943,17 +6104,10 @@ async fn mining_rewards(
     Query(query): Query<PageQuery>,
 ) -> Result<Response, CipherscanRestError> {
     let period = query.period.unwrap_or_else(|| String::from("7d"));
-    if let Some(body) = adapter.cached_mining_reward_response(&period).await {
-        return Ok(json_response(StatusCode::OK, body));
-    }
-    let generated_at = OffsetDateTime::now_utc();
     let window = adapter
-        .fetch_mining_reward_window(&period, generated_at)
+        .mining_production_window(mining_production_period(&period))
         .await?;
-    let body = mining_rewards_json(&period, &window, generated_at);
-    adapter
-        .cache_mining_reward_response(period, body.clone())
-        .await;
+    let body = mining_rewards_json(&period, &window);
 
     Ok(json_response(StatusCode::OK, body))
 }
@@ -10397,17 +10551,75 @@ fn rich_list_offset(offset: Option<&str>) -> u64 {
     u64::try_from(parsed.max(0)).unwrap_or(u64::MAX)
 }
 
-fn mining_pool_distribution_json(period: &str) -> Value {
-    json!({
+fn mining_pool_distribution_json(
+    period: &str,
+    window: &MiningPoolDistributionWindow,
+) -> Result<Value, CipherscanRestError> {
+    let mut payout_rows = window.payout_by_address.iter().collect::<Vec<_>>();
+    payout_rows.sort_unstable_by(|(left_address, left), (right_address, right)| {
+        right
+            .block_count
+            .cmp(&left.block_count)
+            .then_with(|| left_address.cmp(right_address))
+    });
+    let mut pool_index_by_name = HashMap::<&'static str, usize>::new();
+    let mut pool_aggregates = Vec::<CipherscanMiningPoolAggregate>::new();
+    for (address, payout) in payout_rows {
+        let name = get_pool_name(address.as_deref()).unwrap_or("Unknown");
+        if let Some(index) = pool_index_by_name.get(name).copied() {
+            let pool = &mut pool_aggregates[index];
+            pool.block_count = pool.block_count.checked_add(payout.block_count).ok_or(
+                CipherscanRestError::InvalidUpstreamField(
+                    "block_production_in_time_range.covered_block_count",
+                ),
+            )?;
+            pool.total_fees_zat = pool
+                .total_fees_zat
+                .checked_add(payout.total_fees_zat)
+                .ok_or(CipherscanRestError::InvalidUpstreamField(
+                    "block_production_in_time_range.points.summary.paid_fees_collected_zat",
+                ))?;
+        } else {
+            pool_index_by_name.insert(name, pool_aggregates.len());
+            pool_aggregates.push(CipherscanMiningPoolAggregate {
+                address: address.clone(),
+                name,
+                block_count: payout.block_count,
+                total_fees_zat: payout.total_fees_zat,
+            });
+        }
+    }
+    let total_blocks = pool_aggregates.iter().try_fold(0_u32, |total, pool| {
+        total
+            .checked_add(pool.block_count)
+            .ok_or(CipherscanRestError::InvalidUpstreamField(
+                "block_production_in_time_range.covered_block_count",
+            ))
+    })?;
+    pool_aggregates.sort_unstable_by_key(|pool| std::cmp::Reverse(pool.block_count));
+    let pools = pool_aggregates
+        .into_iter()
+        .map(|pool| {
+            json!({
+                "address": pool.address,
+                "name": pool.name,
+                "blocks": pool.block_count,
+                "share": if total_blocks == 0 {
+                    0.0
+                } else {
+                    f64::from(pool.block_count) / f64::from(total_blocks)
+                },
+                "totalFeesZat": pool.total_fees_zat.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
         "period": period,
-        "totalBlocks": 0,
-        "pools": [],
-        "generatedAt": current_rfc3339_timestamp(),
-        "degraded": true,
-        "unavailable": [
-            "Mining pool attribution is Cipherscan sidecar data and is not a Zinder core chain fact."
-        ],
-    })
+        "totalBlocks": total_blocks,
+        "pools": pools,
+        "generatedAt": rfc3339_timestamp(window.generated_at),
+    }))
 }
 
 fn mining_pool_ranking_json(period: &str) -> Value {
@@ -10471,26 +10683,114 @@ struct MiningRewardDay {
     total_coinbase_zat: u64,
 }
 
-#[derive(Debug)]
-struct MiningRewardWindow {
-    summaries: Vec<explorer::BlockSummary>,
+#[derive(Debug, Default)]
+struct MiningPayoutAggregate {
+    block_count: u32,
+    total_fees_zat: u64,
+}
+
+struct MiningPoolDistributionWindow {
+    payout_by_address: BTreeMap<Option<String>, MiningPayoutAggregate>,
+    generated_at: OffsetDateTime,
+}
+
+struct CipherscanMiningPoolAggregate {
+    address: Option<String>,
+    name: &'static str,
+    block_count: u32,
+    total_fees_zat: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MiningProductionPeriod {
+    days: Option<u32>,
+}
+
+impl MiningProductionPeriod {
+    fn cutoff_unix_seconds(self, generated_at_unix_seconds: i64) -> Option<i64> {
+        self.days.map(|days| {
+            generated_at_unix_seconds
+                .saturating_sub(i64::from(days).saturating_mul(UNIX_SECONDS_PER_DAY))
+        })
+    }
+}
+
+fn mining_production_period(period: &str) -> MiningProductionPeriod {
+    MiningProductionPeriod {
+        days: match period {
+            "24h" => Some(1),
+            "3d" => Some(3),
+            "30d" => Some(30),
+            "90d" => Some(90),
+            "6m" => Some(180),
+            "1y" => Some(365),
+            // This includes `all`: Cipherscan maps it to null and then applies
+            // `|| map['7d']`, so the production route uses seven days.
+            _ => Some(7),
+        },
+    }
+}
+
+struct MiningProductionWindow {
+    entries: Vec<CipherscanBlockListEntry>,
     requested_cutoff_unix_seconds: Option<i64>,
     covered_from_unix_seconds: Option<i64>,
     covered_through_unix_seconds: Option<i64>,
     scanned_block_count: u32,
     coverage_complete: bool,
+    generated_at: OffsetDateTime,
 }
 
-fn mining_rewards_json(
-    period: &str,
-    window: &MiningRewardWindow,
-    generated_at: OffsetDateTime,
-) -> Value {
+fn validate_mining_pool_distribution_page(
+    response: &explorer::BlockProductionInTimeRangeResponse,
+    expected_fence: Option<&explorer::BlockProductionTimeRangeReadFence>,
+) -> Result<(), CipherscanRestError> {
+    let coverage = response
+        .coverage
+        .as_ref()
+        .ok_or(CipherscanRestError::MissingUpstreamField(
+            "block_production_in_time_range.coverage",
+        ))?;
+    let read_fence =
+        response
+            .read_fence
+            .as_ref()
+            .ok_or(CipherscanRestError::MissingUpstreamField(
+                "block_production_in_time_range.read_fence",
+            ))?;
+    if !coverage.requested_range_complete
+        || response.missing_block_count != 0
+        || response.missing_coinbase_count != 0
+        || response.missing_paid_fee_count != 0
+        || u32::try_from(response.points.len()).ok() != Some(response.covered_block_count)
+    {
+        return Err(CipherscanRestError::MissingUpstreamField(
+            "block_production_in_time_range.complete_points",
+        ));
+    }
+    if expected_fence.is_some_and(|expected| expected != read_fence)
+        || read_fence.projection_tip.as_ref().is_none_or(|tip| {
+            !is_rpc_hash(&tip.hash)
+                || coverage.complete_through_height != Some(tip.height)
+                || coverage
+                    .complete_from_height
+                    .is_none_or(|height| height > 1)
+        })
+    {
+        return Err(CipherscanRestError::InvalidUpstreamField(
+            "block_production_in_time_range.read_fence",
+        ));
+    }
+    Ok(())
+}
+
+fn mining_rewards_json(period: &str, window: &MiningProductionWindow) -> Value {
     let mut rewards_by_date = BTreeMap::<String, MiningRewardDay>::new();
     let mut paid_fee_block_count = 0_u32;
     let mut conventional_fee_block_count = 0_u32;
 
-    for summary in &window.summaries {
+    for entry in &window.entries {
+        let summary = &entry.summary;
         let Some(block_date) = mining_reward_block_date(summary.block_time_unix_seconds) else {
             continue;
         };
@@ -10544,7 +10844,7 @@ fn mining_rewards_json(
     json!({
         "period": period,
         "series": series,
-        "generatedAt": rfc3339_timestamp(generated_at),
+        "generatedAt": rfc3339_timestamp(window.generated_at),
         "source": CIPHERSCAN_ADAPTER_SOURCE,
         "coinbaseBasis": "transparent_outputs",
         "feeBasis": fee_basis,
@@ -10553,7 +10853,7 @@ fn mining_rewards_json(
             "coveredFrom": window.covered_from_unix_seconds.map(unix_timestamp_json),
             "coveredThrough": window.covered_through_unix_seconds.map(unix_timestamp_json),
             "scannedBlocks": window.scanned_block_count,
-            "includedBlocks": window.summaries.len(),
+            "includedBlocks": window.entries.len(),
             "paidFeeBlocks": paid_fee_block_count,
             "conventionalFeeBlocks": conventional_fee_block_count,
             "complete": window.coverage_complete,
@@ -10574,58 +10874,42 @@ fn mining_reward_block_date(block_time_unix_seconds: i64) -> Option<String> {
         .map(|timestamp| timestamp.date().to_string())
 }
 
-fn mining_reward_cutoff_unix_seconds(period: &str, generated_at_unix_seconds: i64) -> Option<i64> {
-    mining_reward_period_days(period).map(|days| {
-        generated_at_unix_seconds.saturating_sub(i64::from(days).saturating_mul(86_400))
-    })
-}
-
-fn mining_reward_period_days(period: &str) -> Option<u32> {
-    match period {
-        "24h" => Some(1),
-        "3d" => Some(3),
-        "30d" => Some(30),
-        "90d" => Some(90),
-        "6m" => Some(180),
-        "1y" => Some(365),
-        "all" => None,
-        _ => Some(7),
-    }
-}
-
-fn validate_mining_reward_page(
-    page: &[explorer::BlockSummary],
+fn validate_mining_production_page(
+    page: &[CipherscanBlockListEntry],
     start_height: u32,
     end_height: u32,
 ) -> Result<(), CipherscanRestError> {
     let expected_count = end_height.saturating_sub(start_height).saturating_add(1);
     if u32::try_from(page.len()).ok() != Some(expected_count)
-        || page.iter().enumerate().any(|(offset, summary)| {
+        || page.iter().enumerate().any(|(offset, entry)| {
             start_height.checked_add(u32::try_from(offset).unwrap_or(u32::MAX))
-                != Some(summary.block_height)
+                != Some(entry.summary.block_height)
         })
     {
         return Err(CipherscanRestError::InvalidUpstreamField(
-            "block_summaries_in_range.coverage",
+            "block_production_series.coverage",
         ));
     }
     Ok(())
 }
 
-fn mining_reward_summary_is_in_period(
-    summary: &explorer::BlockSummary,
+fn mining_production_entry_is_in_period(
+    entry: &CipherscanBlockListEntry,
     requested_cutoff_unix_seconds: Option<i64>,
+    requested_end_time_unix_seconds: i64,
 ) -> bool {
-    requested_cutoff_unix_seconds.is_none_or(|cutoff| summary.block_time_unix_seconds >= cutoff)
+    requested_cutoff_unix_seconds
+        .is_none_or(|cutoff| entry.summary.block_time_unix_seconds >= cutoff)
+        && entry.summary.block_time_unix_seconds < requested_end_time_unix_seconds
 }
 
-fn mining_reward_page_is_before_cutoff(
-    page: &[explorer::BlockSummary],
+fn mining_production_page_is_before_cutoff(
+    page: &[CipherscanBlockListEntry],
     requested_cutoff_unix_seconds: Option<i64>,
 ) -> bool {
     requested_cutoff_unix_seconds.is_some_and(|cutoff| {
         page.iter()
-            .all(|summary| summary.block_time_unix_seconds < cutoff)
+            .all(|entry| entry.summary.block_time_unix_seconds < cutoff)
     })
 }
 
@@ -18283,23 +18567,61 @@ mod tests {
     }
 
     #[test]
-    fn mining_pool_distribution_json_preserves_cipherscan_pool_shape() {
-        let distribution = mining_pool_distribution_json("bad");
+    fn mining_pool_distribution_groups_known_addresses_and_keeps_exact_fees()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let generated_at = OffsetDateTime::from_unix_timestamp(1_735_862_400)?;
+        let window = mining_pool_distribution_test_window(generated_at);
+        let distribution = mining_pool_distribution_json("bad", &window)?;
 
         assert_eq!(distribution["period"], json!("bad"));
-        assert_eq!(distribution["totalBlocks"], json!(0));
-        assert_eq!(distribution["pools"], json!([]));
-        assert!(
-            distribution["generatedAt"]
-                .as_str()
-                .is_some_and(|at| at.contains('T') && at.ends_with('Z'))
+        assert_eq!(distribution["totalBlocks"], json!(3));
+        assert_eq!(distribution["pools"][0]["name"], json!("AntPool"));
+        assert_eq!(distribution["pools"][0]["blocks"], json!(2));
+        assert_f64_close(
+            distribution["pools"][0]["share"]
+                .as_f64()
+                .unwrap_or_default(),
+            2.0 / 3.0,
         );
-        assert_eq!(distribution["degraded"], json!(true));
-        assert!(
-            distribution["unavailable"]
-                .as_array()
-                .is_some_and(|fields| !fields.is_empty())
-        );
+        assert_eq!(distribution["pools"][0]["totalFeesZat"], json!("17"));
+        assert_eq!(distribution["pools"][1]["name"], json!("Unknown"));
+        assert_eq!(distribution["pools"][1]["blocks"], json!(1));
+        assert_eq!(distribution["pools"][1]["totalFeesZat"], json!("3"));
+        assert_eq!(distribution["generatedAt"], json!("2025-01-03T00:00:00Z"));
+        assert!(distribution.get("degraded").is_none());
+        assert!(distribution.get("unavailable").is_none());
+        Ok(())
+    }
+
+    fn mining_pool_distribution_test_window(
+        generated_at: OffsetDateTime,
+    ) -> MiningPoolDistributionWindow {
+        MiningPoolDistributionWindow {
+            payout_by_address: BTreeMap::from([
+                (
+                    Some("t1ZVi2YGk98tEGYcNpXYnJFWCoLG2oYwv3J".to_owned()),
+                    MiningPayoutAggregate {
+                        block_count: 1,
+                        total_fees_zat: 7,
+                    },
+                ),
+                (
+                    Some("t1L2b66MXbgpVMXDfUa94GCBFAN4dCxGohM".to_owned()),
+                    MiningPayoutAggregate {
+                        block_count: 1,
+                        total_fees_zat: 10,
+                    },
+                ),
+                (
+                    Some("tmDominant".to_owned()),
+                    MiningPayoutAggregate {
+                        block_count: 1,
+                        total_fees_zat: 3,
+                    },
+                ),
+            ]),
+            generated_at,
+        }
     }
 
     #[test]
@@ -18393,41 +18715,53 @@ mod tests {
     #[test]
     fn mining_rewards_json_preserves_legacy_series_and_declares_semantics()
     -> Result<(), Box<dyn std::error::Error>> {
-        let summaries = vec![
-            explorer::BlockSummary {
-                block_height: 1,
-                block_time_unix_seconds: 1_735_689_600,
-                fees_collected_zat: 10,
-                paid_fees_collected_zat: Some(7),
-                coinbase_reward_zat: 100,
-                ..Default::default()
-            },
-            explorer::BlockSummary {
-                block_height: 2,
-                block_time_unix_seconds: 1_735_693_200,
-                fees_collected_zat: 20,
-                coinbase_reward_zat: 200,
-                ..Default::default()
-            },
-            explorer::BlockSummary {
-                block_height: 3,
-                block_time_unix_seconds: 1_735_776_000,
-                fees_collected_zat: 30,
-                paid_fees_collected_zat: Some(29),
-                coinbase_reward_zat: 300,
-                ..Default::default()
-            },
-        ];
         let generated_at = OffsetDateTime::from_unix_timestamp(1_735_862_400)?;
-        let window = MiningRewardWindow {
-            summaries,
+        let window = MiningProductionWindow {
+            entries: vec![
+                CipherscanBlockListEntry {
+                    summary: explorer::BlockSummary {
+                        block_height: 1,
+                        block_time_unix_seconds: 1_735_689_600,
+                        fees_collected_zat: 10,
+                        paid_fees_collected_zat: Some(7),
+                        coinbase_reward_zat: 100,
+                        ..Default::default()
+                    },
+                    difficulty: 1.0,
+                    miner_address: None,
+                },
+                CipherscanBlockListEntry {
+                    summary: explorer::BlockSummary {
+                        block_height: 2,
+                        block_time_unix_seconds: 1_735_693_200,
+                        fees_collected_zat: 20,
+                        coinbase_reward_zat: 200,
+                        ..Default::default()
+                    },
+                    difficulty: 1.0,
+                    miner_address: None,
+                },
+                CipherscanBlockListEntry {
+                    summary: explorer::BlockSummary {
+                        block_height: 3,
+                        block_time_unix_seconds: 1_735_776_000,
+                        fees_collected_zat: 30,
+                        paid_fees_collected_zat: Some(29),
+                        coinbase_reward_zat: 300,
+                        ..Default::default()
+                    },
+                    difficulty: 1.0,
+                    miner_address: None,
+                },
+            ],
             requested_cutoff_unix_seconds: Some(1_735_689_600),
             covered_from_unix_seconds: Some(1_735_600_000),
             covered_through_unix_seconds: Some(1_735_776_000),
             scanned_block_count: 4,
             coverage_complete: true,
+            generated_at,
         };
-        let rewards = mining_rewards_json("bad", &window, generated_at);
+        let rewards = mining_rewards_json("bad", &window);
 
         assert_eq!(rewards["period"], json!("bad"));
         assert_eq!(rewards["series"][0]["date"], json!("2025-01-01"));
@@ -18464,68 +18798,112 @@ mod tests {
     }
 
     #[test]
-    fn mining_reward_cutoff_matches_cipherscan_period_rules() {
+    fn mining_production_cutoff_matches_cipherscan_period_rules() {
         let generated_at = 1_735_862_400;
 
         assert_eq!(
-            mining_reward_cutoff_unix_seconds("24h", generated_at),
+            mining_production_period("24h").cutoff_unix_seconds(generated_at),
             Some(generated_at - 86_400)
         );
         assert_eq!(
-            mining_reward_cutoff_unix_seconds("7d", generated_at),
+            mining_production_period("7d").cutoff_unix_seconds(generated_at),
             Some(generated_at - 7 * 86_400)
         );
         assert_eq!(
-            mining_reward_cutoff_unix_seconds("bad", generated_at),
+            mining_production_period("bad").cutoff_unix_seconds(generated_at),
             Some(generated_at - 7 * 86_400)
         );
-        assert_eq!(mining_reward_cutoff_unix_seconds("all", generated_at), None);
+        assert_eq!(
+            mining_production_period("all").cutoff_unix_seconds(generated_at),
+            Some(generated_at - 7 * UNIX_SECONDS_PER_DAY)
+        );
     }
 
     #[test]
-    fn mining_reward_page_requires_contiguous_height_coverage() {
+    fn mining_production_page_requires_contiguous_height_coverage() {
         let complete_page = vec![
-            explorer::BlockSummary {
-                block_height: 10,
-                ..Default::default()
+            CipherscanBlockListEntry {
+                summary: explorer::BlockSummary {
+                    block_height: 10,
+                    ..Default::default()
+                },
+                difficulty: 1.0,
+                miner_address: None,
             },
-            explorer::BlockSummary {
+            CipherscanBlockListEntry {
+                summary: explorer::BlockSummary {
+                    block_height: 11,
+                    ..Default::default()
+                },
+                difficulty: 1.0,
+                miner_address: None,
+            },
+        ];
+        let missing_height_page = vec![CipherscanBlockListEntry {
+            summary: explorer::BlockSummary {
                 block_height: 11,
                 ..Default::default()
             },
-        ];
-        let missing_height_page = vec![explorer::BlockSummary {
-            block_height: 11,
-            ..Default::default()
+            difficulty: 1.0,
+            miner_address: None,
         }];
 
-        assert!(validate_mining_reward_page(&complete_page, 10, 11).is_ok());
-        assert!(validate_mining_reward_page(&missing_height_page, 10, 11).is_err());
+        assert!(validate_mining_production_page(&complete_page, 10, 11).is_ok());
+        assert!(validate_mining_production_page(&missing_height_page, 10, 11).is_err());
     }
 
     #[test]
-    fn mining_reward_cutoff_is_inclusive_and_requires_a_full_prior_page_to_stop() {
+    fn mining_production_cutoff_is_inclusive_and_requires_a_full_prior_page_to_stop() {
         let cutoff = 1_000;
-        let before = explorer::BlockSummary {
-            block_time_unix_seconds: cutoff - 1,
-            ..Default::default()
+        let before = CipherscanBlockListEntry {
+            summary: explorer::BlockSummary {
+                block_time_unix_seconds: cutoff - 1,
+                ..Default::default()
+            },
+            difficulty: 1.0,
+            miner_address: None,
         };
-        let at_cutoff = explorer::BlockSummary {
-            block_time_unix_seconds: cutoff,
-            ..Default::default()
+        let at_cutoff = CipherscanBlockListEntry {
+            summary: explorer::BlockSummary {
+                block_time_unix_seconds: cutoff,
+                ..Default::default()
+            },
+            difficulty: 1.0,
+            miner_address: None,
+        };
+        let at_end = CipherscanBlockListEntry {
+            summary: explorer::BlockSummary {
+                block_time_unix_seconds: cutoff + 100,
+                ..Default::default()
+            },
+            difficulty: 1.0,
+            miner_address: None,
         };
 
-        assert!(!mining_reward_summary_is_in_period(&before, Some(cutoff)));
-        assert!(mining_reward_summary_is_in_period(&at_cutoff, Some(cutoff)));
-        assert!(mining_reward_page_is_before_cutoff(
+        assert!(!mining_production_entry_is_in_period(
+            &before,
+            Some(cutoff),
+            cutoff + 100
+        ));
+        assert!(mining_production_entry_is_in_period(
+            &at_cutoff,
+            Some(cutoff),
+            cutoff + 100
+        ));
+        assert!(!mining_production_entry_is_in_period(
+            &at_end,
+            Some(cutoff),
+            cutoff + 100
+        ));
+        assert!(mining_production_page_is_before_cutoff(
             std::slice::from_ref(&before),
             Some(cutoff)
         ));
-        assert!(!mining_reward_page_is_before_cutoff(
+        assert!(!mining_production_page_is_before_cutoff(
             &[before, at_cutoff],
             Some(cutoff)
         ));
-        assert!(!mining_reward_page_is_before_cutoff(&[], None));
+        assert!(!mining_production_page_is_before_cutoff(&[], None));
     }
 
     #[test]

@@ -32,6 +32,9 @@ use zinder_store::{
 };
 
 use crate::{
+    consumer::block_production_time::{
+        BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_PRODUCTION_TIME_SCHEMA,
+    },
     consumer::block_summary::{BLOCK_SUMMARY_CONSUMER_NAME, BLOCK_SUMMARY_SCHEMA},
     consumer::commitment_root_search::{
         COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, COMMITMENT_ROOT_SEARCH_SCHEMA,
@@ -125,6 +128,7 @@ const CLEAR_RANGE_LOWER_BOUND: &[u8] = &[];
 const CLEAR_RANGE_UPPER_BOUND: &[u8] = &[0xff; 512];
 
 const BUNDLED_CONSUMERS: &[DeriveConsumerSchema] = &[
+    BLOCK_PRODUCTION_TIME_SCHEMA,
     BLOCK_SUMMARY_SCHEMA,
     IRONWOOD_MIGRATION_SCHEMA,
     COMMITMENT_ROOT_SEARCH_SCHEMA,
@@ -145,6 +149,7 @@ const BUNDLED_CONSUMERS: &[DeriveConsumerSchema] = &[
     VALUE_POOL_FLOW_HISTORY_SCHEMA,
 ];
 const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
+    BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
     BLOCK_SUMMARY_CONSUMER_NAME,
     IRONWOOD_MIGRATION_CONSUMER_NAME,
     COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
@@ -482,6 +487,21 @@ impl DeriveStoreReadSnapshot<'_> {
             })
     }
 
+    /// Reads the ingest plane's derive-status record from this snapshot.
+    pub fn get_derive_status(&self) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        let column_family = self
+            .store
+            .column_family(DeriveStoreTable::ConsumerMetadata)?;
+        self.store
+            .db
+            .get_cf_opt(&column_family, DERIVE_STATUS_KEY, &self.read_options())
+            .map_err(|source| DeriveStoreError::Operation {
+                operation: "get",
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                source,
+            })
+    }
+
     /// Batch-reads consumer keys in input order from this snapshot.
     pub fn multi_get_consumer<K>(
         &self,
@@ -562,6 +582,27 @@ impl DeriveStoreReadSnapshot<'_> {
         column_family: &'static str,
     ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
         self.consumer_edge_key(column_family, IteratorMode::End, "last_key")
+    }
+
+    /// Returns the last consumer entry visible in this snapshot.
+    pub fn last_consumer_entry(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<ConsumerEntry>, DeriveStoreError> {
+        let handle = self.store.consumer_column_family(column_family)?;
+        let mut iterator =
+            self.store
+                .db
+                .iterator_cf_opt(&handle, self.read_options(), IteratorMode::End);
+        let Some(entry) = iterator.next() else {
+            return Ok(None);
+        };
+        let (key, payload) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+            operation: "last_entry",
+            name: column_family,
+            source,
+        })?;
+        Ok(Some((key.to_vec(), payload.to_vec())))
     }
 
     /// Returns the lowest height in a descending-height consumer keyspace.
@@ -2810,6 +2851,10 @@ mod tests {
             Some(height_10_key.to_vec())
         );
         assert_eq!(
+            snapshot.last_consumer_entry(TEST_CONSUMER_CF)?,
+            Some((height_10_key.to_vec(), b"skip".to_vec()))
+        );
+        assert_eq!(
             snapshot.first_materialized_height_descending(TEST_CONSUMER_CF)?,
             Some(BlockHeight::new(10))
         );
@@ -2843,6 +2888,7 @@ mod tests {
         let height_30_key = zinder_core::wire::encode_height_key_descending(BlockHeight::new(30));
         store.put_consumer(TEST_CONSUMER_CF, &height_10_key, b"skip")?;
         store.put_consumer(TEST_CONSUMER_CF, &height_20_key, b"match-before")?;
+        store.put_derive_status(b"status-before")?;
         let initial_state = ConsumerProjectionState {
             projection_epoch_id: ChainEpochId::new(1),
             projection_tip_height: BlockHeight::new(20),
@@ -2865,6 +2911,7 @@ mod tests {
         store.put_consumer(TEST_CONSUMER_CF, &height_20_key, b"match-after")?;
         store.put_consumer(TEST_CONSUMER_CF, &height_30_key, b"match-after")?;
         store.put_consumer_projection_state(TEST_CONSUMER, advanced_state)?;
+        store.put_derive_status(b"status-after")?;
 
         assert_eq!(
             store.get_consumer(TEST_CONSUMER_CF, &height_20_key)?,
@@ -2875,6 +2922,11 @@ mod tests {
             store.consumer_projection_state(TEST_CONSUMER)?,
             Some(advanced_state)
         );
+        assert_eq!(store.get_derive_status()?, Some(b"status-after".to_vec()));
+        assert_eq!(
+            snapshot.get_derive_status()?,
+            Some(b"status-before".to_vec())
+        );
 
         assert_snapshot_point_reads(
             &snapshot,
@@ -2884,6 +2936,7 @@ mod tests {
             height_30_key,
         )?;
         assert_snapshot_scan_reads(&snapshot, height_10_key, height_20_key)?;
+        drop(snapshot);
         Ok(())
     }
 

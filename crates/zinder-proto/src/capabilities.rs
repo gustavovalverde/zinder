@@ -179,6 +179,13 @@ pub const EXPLORER_BLOCK_SUMMARY_V1: &str = "explorer.block.summary_v1";
 /// assembled at request time and reports missing coverage explicitly; it does
 /// not imply a new durable projection.
 pub const EXPLORER_BLOCK_PRODUCTION_SERIES_V2: &str = "explorer.block.production_series_v2";
+/// Capability advertised for `ExplorerQuery.BlockProductionInTimeRange`.
+///
+/// Signals that the explorer can page canonical block-production observations
+/// through a half-open block-time range at one read-fenced epoch. Each page
+/// reports covered and missing production facts explicitly; it does not imply
+/// a new durable projection.
+pub const EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1: &str = "explorer.block.production_time_range_v1";
 /// Capability advertised for `ExplorerQuery.BlockDetail`.
 ///
 /// Signals that the explorer plane materialized the per-block transaction
@@ -986,6 +993,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockProductionSeries"),
+        AdvertisePolicy::RequiresDeriveStoreAndCanonicalStore,
+    ),
+    CapabilitySpec::new(
+        EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
+        CapabilitySurface::Explorer,
+        Some("zinder.v1.explorer.ExplorerQuery.BlockProductionInTimeRange"),
         AdvertisePolicy::RequiresDeriveStoreAndCanonicalStore,
     ),
     CapabilitySpec::new(

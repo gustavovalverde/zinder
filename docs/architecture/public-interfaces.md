@@ -753,6 +753,7 @@ available, omit the exact total, and do not advertise v2.
 - `explorer.transaction.detail_v3`
 - `explorer.block.summary_v1`
 - `explorer.block.production_series_v2`
+- `explorer.block.production_time_range_v1`
 - `explorer.block.detail_v1`
 - `explorer.block.transactions_v2`
 - `explorer.block.final_note_commitment_roots_v1`

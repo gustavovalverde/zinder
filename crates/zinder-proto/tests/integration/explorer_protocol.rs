@@ -7,7 +7,8 @@ use eyre::eyre;
 use prost::Message;
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
-    EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MIGRATION_COHORTS_V1,
+    EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_BLOCK_TRANSACTIONS_V2,
+    EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MIGRATION_COHORTS_V1,
     EXPLORER_MIGRATION_DENOMINATIONS_V1, EXPLORER_MIGRATION_OVERVIEW_V1,
     EXPLORER_NETWORK_UPGRADE_STATUS_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1,
     EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1, EXPLORER_UTXO_SET_SUMMARY_V1,
@@ -164,6 +165,104 @@ fn block_production_series_round_trips_coverage_header_and_coinbase() -> eyre::R
             .ok_or_else(|| eyre!("block production point missing summary"))?
             .fees_collected_zat,
         65_000
+    );
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "One wire-contract test keeps the request and response round-trip assertions together."
+)]
+fn block_production_time_range_round_trips_request_coverage_and_read_fence() -> eyre::Result<()> {
+    let request = explorer::BlockProductionInTimeRangeRequest {
+        start_time_unix_seconds: 1_774_670_000,
+        end_time_unix_seconds: 1_774_671_800,
+        max_entries: 2,
+        from_cursor: vec![0x01, 0x02, 0x03],
+        at_epoch_id: Some(47),
+    };
+    let decoded_request = round_trip(&request)?;
+
+    assert_eq!(decoded_request.start_time_unix_seconds, 1_774_670_000);
+    assert_eq!(decoded_request.end_time_unix_seconds, 1_774_671_800);
+    assert_eq!(decoded_request.max_entries, 2);
+    assert_eq!(decoded_request.from_cursor, [0x01, 0x02, 0x03]);
+    assert_eq!(decoded_request.at_epoch_id, Some(47));
+
+    let response = explorer::BlockProductionInTimeRangeResponse {
+        freshness: Some(explorer::ExplorerFreshness {
+            capability_version: EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1.to_owned(),
+            ..Default::default()
+        }),
+        points: vec![explorer::BlockProductionPoint {
+            summary: Some(explorer::BlockSummary {
+                block_height: 2_530_000,
+                block_hash: "ab".repeat(32),
+                block_time_unix_seconds: 1_774_670_000,
+                ..Default::default()
+            }),
+            bits: 0x1c07_ffff,
+            coinbase: None,
+        }],
+        next_cursor: vec![0x04, 0x05],
+        covered_block_count: 1,
+        missing_block_count: 2,
+        missing_coinbase_count: 1,
+        missing_paid_fee_count: 1,
+        coverage: Some(explorer::BlockProductionTimeRangeCoverage {
+            complete_from_height: Some(1),
+            complete_through_height: Some(2_530_000),
+            complete_from_time_unix_seconds: Some(1_234),
+            complete_through_time_unix_seconds: Some(1_774_670_000),
+            requested_range_complete: true,
+        }),
+        read_fence: Some(explorer::BlockProductionTimeRangeReadFence {
+            chain_epoch_id: 47,
+            projection_revision: 9,
+            projection_tip: Some(wallet::BlockTip {
+                height: 2_530_000,
+                hash: "cd".repeat(32),
+            }),
+        }),
+    };
+    let decoded_response = round_trip(&response)?;
+
+    assert_eq!(decoded_response.points.len(), 1);
+    assert_eq!(decoded_response.next_cursor, [0x04, 0x05]);
+    assert_eq!(decoded_response.covered_block_count, 1);
+    assert_eq!(decoded_response.missing_block_count, 2);
+    assert_eq!(decoded_response.missing_coinbase_count, 1);
+    assert_eq!(decoded_response.missing_paid_fee_count, 1);
+    let coverage = decoded_response
+        .coverage
+        .ok_or_else(|| eyre!("block-production coverage missing after round-trip"))?;
+    assert_eq!(coverage.complete_from_height, Some(1));
+    assert_eq!(coverage.complete_through_height, Some(2_530_000));
+    assert_eq!(coverage.complete_from_time_unix_seconds, Some(1_234));
+    assert_eq!(
+        coverage.complete_through_time_unix_seconds,
+        Some(1_774_670_000)
+    );
+    assert!(coverage.requested_range_complete);
+    let read_fence = decoded_response
+        .read_fence
+        .ok_or_else(|| eyre!("block-production read fence missing after round-trip"))?;
+    assert_eq!(read_fence.chain_epoch_id, 47);
+    assert_eq!(read_fence.projection_revision, 9);
+    assert_eq!(
+        read_fence
+            .projection_tip
+            .ok_or_else(|| eyre!("block-production projection tip missing after round-trip"))?
+            .height,
+        2_530_000
+    );
+    assert_eq!(
+        decoded_response
+            .freshness
+            .ok_or_else(|| eyre!("freshness envelope missing after round-trip"))?
+            .capability_version,
+        EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1
     );
     Ok(())
 }

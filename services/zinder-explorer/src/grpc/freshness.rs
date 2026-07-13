@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
-use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
+use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, DeriveStoreReadSnapshot};
 
 use super::error::ExplorerError;
 use zinder_proto::v1::explorer::{BlockSummaryRecord, ExplorerFreshness};
@@ -112,19 +112,35 @@ pub(crate) fn read_indexed_tip(derive_store: &DeriveStore) -> Result<Option<Inde
     else {
         return Ok(None);
     };
-    let summary = BlockSummaryRecord::decode(payload.as_slice())
+    decode_indexed_tip(&payload).map(Some)
+}
+
+fn read_indexed_tip_snapshot(
+    snapshot: &DeriveStoreReadSnapshot<'_>,
+) -> Result<Option<IndexedTip>, Status> {
+    let Some((_, payload)) = snapshot
+        .last_consumer_entry(BLOCK_SUMMARY_COLUMN_FAMILY)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    decode_indexed_tip(&payload).map(Some)
+}
+
+fn decode_indexed_tip(payload: &[u8]) -> Result<IndexedTip, Status> {
+    let summary = BlockSummaryRecord::decode(payload)
         .map_err(|error| {
             ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
         })?
         .summary
         .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
-    Ok(Some(IndexedTip {
+    Ok(IndexedTip {
         tip: Some(wallet::BlockTip {
             height: summary.block_height,
             hash: summary.block_hash,
         }),
         block_time_unix_seconds: summary.block_time_unix_seconds,
-    }))
+    })
 }
 
 /// Builds the per-response [`ExplorerFreshness`] body shared by every read
@@ -151,6 +167,40 @@ pub(crate) fn build_explorer_freshness(
         Some(store) => (read_indexed_tip(store)?, read_derive_status(Some(store))?),
         None => (None, None),
     };
+    Ok(explorer_freshness(
+        indexed_tip,
+        derive,
+        capability_version,
+        chain_epoch,
+        snapshot_age_millis,
+    ))
+}
+
+/// Builds freshness from the same derive snapshot as a response's rows and coverage.
+pub(crate) fn build_explorer_freshness_from_snapshot(
+    snapshot: &DeriveStoreReadSnapshot<'_>,
+    capability_version: &str,
+    chain_epoch: Option<wallet::ChainEpoch>,
+    snapshot_age_millis: u64,
+) -> Result<ExplorerFreshness, Status> {
+    let indexed_tip = read_indexed_tip_snapshot(snapshot)?;
+    let derive = read_derive_status_snapshot(snapshot)?;
+    Ok(explorer_freshness(
+        indexed_tip,
+        derive,
+        capability_version,
+        chain_epoch,
+        snapshot_age_millis,
+    ))
+}
+
+fn explorer_freshness(
+    indexed_tip: Option<IndexedTip>,
+    derive: Option<DeriveStatus>,
+    capability_version: &str,
+    chain_epoch: Option<wallet::ChainEpoch>,
+    snapshot_age_millis: u64,
+) -> ExplorerFreshness {
     let chain_view = if chain_epoch.is_some() || indexed_tip.is_some() || derive.is_some() {
         Some(ChainView {
             chain_epoch,
@@ -161,12 +211,27 @@ pub(crate) fn build_explorer_freshness(
     } else {
         None
     };
-    Ok(ExplorerFreshness {
+    ExplorerFreshness {
         chain_view,
         snapshot_age_millis,
         capability_version: capability_version.to_owned(),
         unavailable: Vec::new(),
-    })
+    }
+}
+
+/// Returns true when the derive-plane indexed tip is the visible tip of the
+/// supplied canonical chain epoch.
+pub(crate) fn indexed_tip_matches_chain_epoch(
+    freshness: &ExplorerFreshness,
+    chain_epoch: &wallet::ChainEpoch,
+) -> bool {
+    freshness
+        .chain_view
+        .as_ref()
+        .and_then(|chain_view| chain_view.indexed_tip.as_ref())
+        .and_then(|indexed_tip| indexed_tip.tip.as_ref())
+        .zip(chain_epoch.visible_tip.as_ref())
+        .is_some_and(|(indexed_tip, visible_tip)| indexed_tip == visible_tip)
 }
 
 /// Reads the derive-status record the ingest plane persists, decoding it into
@@ -184,11 +249,25 @@ pub(crate) fn read_derive_status(
     else {
         return Ok(None);
     };
-    DeriveStatus::decode(bytes.as_slice())
-        .map(Some)
-        .map_err(|error| {
-            ExplorerError::internal(format!("DeriveStatus decode failed: {error}")).into()
-        })
+    decode_derive_status(&bytes).map(Some)
+}
+
+fn read_derive_status_snapshot(
+    snapshot: &DeriveStoreReadSnapshot<'_>,
+) -> Result<Option<DeriveStatus>, Status> {
+    let Some(bytes) = snapshot
+        .get_derive_status()
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    decode_derive_status(&bytes).map(Some)
+}
+
+fn decode_derive_status(bytes: &[u8]) -> Result<DeriveStatus, Status> {
+    DeriveStatus::decode(bytes).map_err(|error| {
+        ExplorerError::internal(format!("DeriveStatus decode failed: {error}")).into()
+    })
 }
 
 /// Spawns the background task that refreshes the

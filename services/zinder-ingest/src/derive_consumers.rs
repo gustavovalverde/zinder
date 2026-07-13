@@ -29,19 +29,21 @@ use zinder_core::{
     TransparentOutPoint, TransparentSpendFact,
 };
 use zinder_derive::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext, BlockCommitPayload, BlockSummaryConsumer,
+    BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext,
+    BlockCommitPayload, BlockProductionTimeConsumer, BlockSummaryConsumer,
     COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
-    ChainEventDispatchInputs, CommitmentRootSearchConsumer, ConventionalFeeDistributionConsumer,
-    DeriveConsumerName, DeriveStore, DeriveStoreOptions, IronwoodMigrationConsumer,
-    MempoolConsumerEvent, MempoolConsumerEventVariant, MempoolEventCountsConsumer,
-    PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PaidFeeDistributionConsumer, RecentTransactionsConsumer,
-    ReorgIncidentsConsumer, TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
-    TransactionComponentSummaryConsumer, TransactionFeesConsumer, TransactionHistoryConsumer,
-    TransactionIntrinsicValueBalanceFacts, TransparentAddressActivityConsumer,
-    TransparentAddressDeltasConsumer, TransparentAddressRankingConsumer,
-    TransparentAddressTransactionHistoryConsumer, TransparentOutpointSpendConsumer,
-    TransparentSpendFacts, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, ValuePoolFlowHistoryConsumer,
+    ChainEventDispatchInputs, CommitmentRootSearchConsumer, ConsumerProjectionState,
+    ConventionalFeeDistributionConsumer, DeriveConsumerName, DeriveStore, DeriveStoreOptions,
+    IronwoodMigrationConsumer, MempoolConsumerEvent, MempoolConsumerEventVariant,
+    MempoolEventCountsConsumer, PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PaidFeeDistributionConsumer,
+    RecentTransactionsConsumer, ReorgIncidentsConsumer,
+    TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionComponentSummaryConsumer,
+    TransactionFeesConsumer, TransactionHistoryConsumer, TransactionIntrinsicValueBalanceFacts,
+    TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
+    TransparentAddressRankingConsumer, TransparentAddressTransactionHistoryConsumer,
+    TransparentOutpointSpendConsumer, TransparentSpendFacts, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
+    ValuePoolFlowHistoryConsumer,
 };
 use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
 use zinder_runtime::{IngestPhase, Readiness};
@@ -389,7 +391,8 @@ pub fn open_primary_derive_store_for_canonical(
     )
 }
 
-const BACKFILL_OWNED_BLOCK_CONSUMERS: [DeriveConsumerName; 5] = [
+const BACKFILL_OWNED_BLOCK_CONSUMERS: [DeriveConsumerName; 6] = [
+    BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
     COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
     CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
     PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
@@ -428,6 +431,13 @@ pub fn seed_backfill_owned_consumer_cursors(
         &missing_consumers,
         authoritative_height,
     )?;
+    seed_block_production_time_cursor(
+        chain_store,
+        derive_store,
+        &cursor,
+        &missing_consumers,
+        authoritative_height,
+    )?;
     seed_transaction_component_cursor(
         chain_store,
         derive_store,
@@ -438,6 +448,7 @@ pub fn seed_backfill_owned_consumer_cursors(
     for consumer_name in missing_consumers.into_iter().filter(|name| {
         ![
             CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+            BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
             PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
             TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
             VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
@@ -451,6 +462,64 @@ pub fn seed_backfill_owned_consumer_cursors(
             consumer = consumer_name.as_str(),
             "derive consumer joined the existing event boundary; historical coverage remains backfill-owned"
         );
+    }
+    Ok(())
+}
+
+fn seed_block_production_time_cursor(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    cursor: &[u8],
+    missing_consumers: &[DeriveConsumerName],
+    authoritative_height: BlockHeight,
+) -> Result<(), IngestError> {
+    let cursor_is_missing = missing_consumers.contains(&BLOCK_PRODUCTION_TIME_CONSUMER_NAME);
+    if cursor_is_missing {
+        let boundary_height = authoritative_height.next().ok_or_else(|| {
+            IngestError::DeriveDispatch(
+                "block-production time tail boundary height overflow".to_owned(),
+            )
+        })?;
+        BlockProductionTimeConsumer::initialize_tail_boundary(derive_store, boundary_height)
+            .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+        derive_store.put_chain_event_cursor(BLOCK_PRODUCTION_TIME_CONSUMER_NAME, cursor)?;
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "block_production_time_tail_boundary_initialized",
+            tail_boundary = boundary_height.value(),
+            "block-production time consumer joined the existing derive event boundary"
+        );
+    }
+    if derive_store
+        .consumer_projection_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)?
+        .is_none()
+    {
+        let chain_epoch = chain_store.current_chain_epoch()?.ok_or_else(|| {
+            IngestError::DeriveDispatch(
+                "canonical chain epoch is missing while seeding block-production time state"
+                    .to_owned(),
+            )
+        })?;
+        let projection_tip_hash = chain_store
+            .chain_epoch_reader_at(chain_epoch.id)?
+            .block_header_at(authoritative_height)?
+            .ok_or_else(|| {
+                IngestError::DeriveDispatch(format!(
+                    "canonical block {} is missing while seeding block-production time state",
+                    authoritative_height.value(),
+                ))
+            })?
+            .block_hash;
+        derive_store.put_consumer_projection_state(
+            BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
+            ConsumerProjectionState {
+                projection_epoch_id: chain_epoch.id,
+                projection_tip_height: authoritative_height,
+                projection_tip_hash,
+                revision: 1,
+                coverage: None,
+            },
+        )?;
     }
     Ok(())
 }
@@ -1916,6 +1985,7 @@ pub(crate) fn dispatch_chain_event(
     advance_cursor: bool,
 ) -> Result<(), IngestError> {
     let _write_guard = derive_projection_write_guard();
+    let mut block_production_time = BlockProductionTimeConsumer::new();
     let mut block_summary = BlockSummaryConsumer::new();
     let mut ironwood_migration = IronwoodMigrationConsumer::new();
     let mut commitment_root_search = CommitmentRootSearchConsumer::new();
@@ -1932,6 +2002,7 @@ pub(crate) fn dispatch_chain_event(
     let mut transparent_outpoint_spend = TransparentOutpointSpendConsumer::new();
     let mut value_pool_flow_history = ValuePoolFlowHistoryConsumer::new();
     let mut consumers: Vec<&mut dyn zinder_derive::BlockKeyedConsumer> = vec![
+        &mut block_production_time,
         &mut block_summary,
         &mut ironwood_migration,
         &mut commitment_root_search,

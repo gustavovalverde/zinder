@@ -13,21 +13,26 @@ use std::collections::{HashMap, HashSet};
 use prost::Message as _;
 use tonic::{Request, Response, Status};
 use zinder_core::{
-    BlockHeight, BlockHeightRange, ChainEpochId, TransactionFactsArtifact, TransactionId,
+    BlockHash, BlockHeight, BlockHeightRange, ChainEpochId, TransactionFactsArtifact,
+    TransactionId,
     wire::{
-        decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, encode_height_key_ascending,
-        encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
+        decode_internal_block_hash, decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex,
+        encode_height_key_ascending, encode_internal_block_hash, encode_rpc_block_hash_hex,
+        encode_rpc_transaction_id_hex,
     },
 };
 use zinder_proto::capabilities::{
-    EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2, EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
+    EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_BLOCK_SUMMARY_V1,
     EXPLORER_BLOCK_TRANSACTIONS_V2,
 };
 use zinder_proto::v1::explorer::{
-    BlockDetailRequest, BlockDetailResponse, BlockFinalNoteCommitmentRoots, BlockProductionPoint,
-    BlockProductionSeriesRequest, BlockProductionSeriesResponse, BlockSummariesInRangeRequest,
-    BlockSummariesInRangeResponse, BlockSummary, BlockSummaryRecord, BlockTransaction,
-    BlockTransactionsResponse, CoinbaseTransactionSummary, block_detail_request,
+    BlockDetailRequest, BlockDetailResponse, BlockFinalNoteCommitmentRoots,
+    BlockProductionInTimeRangeRequest, BlockProductionInTimeRangeResponse, BlockProductionPoint,
+    BlockProductionSeriesRequest, BlockProductionSeriesResponse, BlockProductionTimeRangeCoverage,
+    BlockProductionTimeRangeReadFence, BlockSummariesInRangeRequest, BlockSummariesInRangeResponse,
+    BlockSummary, BlockSummaryRecord, BlockTransaction, BlockTransactionsResponse,
+    CoinbaseTransactionSummary, block_detail_request,
 };
 use zinder_proto::v1::wallet::{
     self, BlockSelector, LatestBlockRequest, block_selector, wallet_query_client::WalletQueryClient,
@@ -37,11 +42,16 @@ use zinder_runtime::AuthenticatedChannel;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+    build_explorer_freshness_from_snapshot,
 };
 use super::require_matching_chain_epoch;
 use super::transaction_detail::encode_public_facts;
 use super::transparent_input::{encode_mined_transparent_inputs, parent_transaction_ids};
-use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
+use zinder_derive::{
+    BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_SUMMARY_COLUMN_FAMILY, BlockProductionTimeConsumer,
+    BlockProductionTimeCursor, BlockProductionTimePageRequest, ConsumerProjectionState,
+    DeriveStore, DeriveStoreReadSnapshot, PaidFeeDistributionConsumer,
+};
 use zinder_store::{
     ChainEpochReader, SecondaryChainStore, chain_epoch_from_message, chain_epoch_message,
     status_from_store_error,
@@ -53,11 +63,37 @@ use zinder_store::{
 /// would blow up the gRPC buffer. The cap mirrors the bounded-page rule used
 /// across other explorer reads.
 const MAX_BLOCK_SUMMARIES_PER_REQUEST: u32 = 1024;
+const DEFAULT_BLOCK_PRODUCTION_TIME_PAGE_SIZE: usize = 256;
+const BLOCK_PRODUCTION_CURSOR_VERSION: u8 = 1;
+const BLOCK_PRODUCTION_CURSOR_FIXED_LEN: usize =
+    1 + 2 * size_of::<i64>() + 2 * size_of::<u64>() + size_of::<u32>() + 32 + size_of::<u16>();
 
 struct MaterializedBlockView {
     summary: zinder_proto::v1::explorer::BlockSummary,
     transaction_ids: Vec<String>,
     chain_epoch: wallet::ChainEpoch,
+}
+
+struct BlockProductionTimeCursorEnvelope {
+    start_time_unix_seconds: i64,
+    end_time_unix_seconds: i64,
+    chain_epoch_id: u64,
+    projection_revision: u64,
+    projection_tip_height: BlockHeight,
+    projection_tip_hash: BlockHash,
+    after: BlockProductionTimeCursor,
+}
+
+struct MaterializedProductionTimePage {
+    freshness: zinder_proto::v1::explorer::ExplorerFreshness,
+    points: Vec<BlockProductionPoint>,
+    next_cursor: Vec<u8>,
+    scanned_block_count: u32,
+    missing_block_count: u32,
+    missing_coinbase_count: u32,
+    missing_paid_fee_count: u32,
+    coverage: BlockProductionTimeRangeCoverage,
+    read_fence: BlockProductionTimeRangeReadFence,
 }
 
 pub(crate) async fn handle_block_summaries_in_range(
@@ -164,6 +200,468 @@ pub(crate) async fn handle_block_production_series(
         missing_block_count: requested_block_count.saturating_sub(covered_block_count),
         points,
     }))
+}
+
+pub(crate) async fn handle_block_production_in_time_range(
+    derive_store: &DeriveStore,
+    chain_store: &SecondaryChainStore,
+    upstream_observation_cache: &UpstreamObservationCache,
+    request: Request<BlockProductionInTimeRangeRequest>,
+) -> Result<Response<BlockProductionInTimeRangeResponse>, Status> {
+    let materialized =
+        read_block_production_time_page(derive_store, chain_store, &request.into_inner())?;
+    let freshness =
+        attach_upstream_observation(upstream_observation_cache, materialized.freshness).await;
+    Ok(Response::new(BlockProductionInTimeRangeResponse {
+        freshness: Some(freshness),
+        points: materialized.points,
+        next_cursor: materialized.next_cursor,
+        covered_block_count: materialized
+            .scanned_block_count
+            .saturating_sub(materialized.missing_block_count),
+        missing_block_count: materialized.missing_block_count,
+        missing_coinbase_count: materialized.missing_coinbase_count,
+        missing_paid_fee_count: materialized.missing_paid_fee_count,
+        coverage: Some(materialized.coverage),
+        read_fence: Some(materialized.read_fence),
+    }))
+}
+
+fn read_block_production_time_page(
+    derive_store: &DeriveStore,
+    chain_store: &SecondaryChainStore,
+    request: &BlockProductionInTimeRangeRequest,
+) -> Result<MaterializedProductionTimePage, Status> {
+    validate_block_production_time_request(request)?;
+    chain_store
+        .try_catch_up()
+        .map_err(|error| status_from_store_error(&error))?;
+    let reader = chain_store
+        .current_chain_epoch_reader()
+        .map_err(|error| status_from_store_error(&error))?;
+    let chain_epoch = reader.chain_epoch();
+    let snapshot = derive_store.read_snapshot();
+    let current_projection_state = snapshot
+        .consumer_projection_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .ok_or_else(|| {
+            ExplorerError::not_materialized(
+                "block-production time projection state is not available",
+            )
+        })?;
+    let (cursor, projection_state) = resolve_block_production_cursor_fence(
+        request,
+        current_projection_state,
+        chain_epoch.id,
+        &snapshot,
+    )?;
+    validate_frozen_projection_tip(&reader, projection_state)?;
+    let page = BlockProductionTimeConsumer::read_page_snapshot(
+        &snapshot,
+        BlockProductionTimePageRequest {
+            start_time_unix_seconds: request.start_time_unix_seconds,
+            end_time_unix_seconds: request.end_time_unix_seconds,
+            after: cursor.map(|cursor| cursor.after),
+            maximum_height: Some(projection_state.projection_tip_height),
+            limit: block_production_time_page_size(request.max_entries),
+        },
+    )
+    .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let coverage = BlockProductionTimeConsumer::coverage_snapshot(&snapshot)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let fence_tip_time = BlockProductionTimeConsumer::row_at_height_snapshot(
+        &snapshot,
+        projection_state.projection_tip_height,
+    )
+    .map_err(|error| ExplorerError::internal(error.to_string()))?
+    .filter(|row| row.block_hash == projection_state.projection_tip_hash)
+    .map(|row| row.block_time_unix_seconds);
+    let records = read_block_summary_records_for_time_rows(&snapshot, &page.rows)?;
+    let paid_fees = read_paid_fee_totals_for_time_rows(&snapshot, &page.rows)?;
+    let freshness = build_explorer_freshness_from_snapshot(
+        &snapshot,
+        EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
+        Some(chain_epoch_message(chain_epoch)),
+        0,
+    )?;
+    drop(snapshot);
+
+    let (points, missing_block_count, missing_coinbase_count, missing_paid_fee_count) =
+        materialize_block_production_time_points(&reader, &page.rows, records, paid_fees)?;
+    let next_cursor = page.next_cursor.map_or_else(Vec::new, |after| {
+        encode_block_production_cursor(
+            request.start_time_unix_seconds,
+            request.end_time_unix_seconds,
+            projection_state,
+            after,
+        )
+    });
+    let read_fence = block_production_time_read_fence(projection_state);
+    let coverage = block_production_time_coverage(coverage, projection_state, fence_tip_time);
+    Ok(MaterializedProductionTimePage {
+        freshness,
+        points,
+        next_cursor,
+        scanned_block_count: u32::try_from(page.rows.len()).unwrap_or(u32::MAX),
+        missing_block_count,
+        missing_coinbase_count,
+        missing_paid_fee_count,
+        coverage,
+        read_fence,
+    })
+}
+
+fn read_paid_fee_totals_for_time_rows(
+    snapshot: &DeriveStoreReadSnapshot<'_>,
+    rows: &[zinder_derive::BlockProductionTimeRow],
+) -> Result<Vec<Option<zinder_derive::PaidFeeBlockTotal>>, Status> {
+    rows.iter()
+        .map(|row| {
+            PaidFeeDistributionConsumer::block_total_snapshot(
+                snapshot,
+                row.block_time_unix_seconds,
+                row.block_height,
+                row.block_hash,
+            )
+            .map_err(|error| ExplorerError::internal(error.to_string()).into())
+        })
+        .collect()
+}
+
+fn validate_frozen_projection_tip(
+    reader: &ChainEpochReader<'_>,
+    projection_state: ConsumerProjectionState,
+) -> Result<(), Status> {
+    let header = reader
+        .block_header_at(projection_state.projection_tip_height)
+        .map_err(|error| status_from_store_error(&error))?;
+    if header.is_none_or(|header| header.block_hash != projection_state.projection_tip_hash) {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "block-production projection tip is not canonical in the current chain view",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_block_production_time_request(
+    request: &BlockProductionInTimeRangeRequest,
+) -> Result<(), Status> {
+    if request.start_time_unix_seconds >= request.end_time_unix_seconds {
+        return Err(ExplorerError::invalid_request(
+            "end_time_unix_seconds must be greater than start_time_unix_seconds",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn block_production_time_page_size(requested: u32) -> usize {
+    if requested == 0 {
+        DEFAULT_BLOCK_PRODUCTION_TIME_PAGE_SIZE
+    } else {
+        usize::try_from(requested)
+            .unwrap_or(usize::MAX)
+            .min(zinder_derive::BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE)
+    }
+}
+
+fn read_block_summary_records_for_time_rows(
+    snapshot: &DeriveStoreReadSnapshot<'_>,
+    rows: &[zinder_derive::BlockProductionTimeRow],
+) -> Result<Vec<Option<BlockSummaryRecord>>, Status> {
+    let keys = rows
+        .iter()
+        .map(|row| encode_height_key_ascending(row.block_height))
+        .collect::<Vec<_>>();
+    snapshot
+        .multi_get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &keys)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .into_iter()
+        .map(|payload| {
+            payload
+                .map(|payload| {
+                    BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
+                        ExplorerError::internal(format!(
+                            "BlockSummaryRecord decode failed: {error}"
+                        ))
+                        .into()
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+fn materialize_block_production_time_points(
+    reader: &ChainEpochReader<'_>,
+    rows: &[zinder_derive::BlockProductionTimeRow],
+    records: Vec<Option<BlockSummaryRecord>>,
+    paid_fees: Vec<Option<zinder_derive::PaidFeeBlockTotal>>,
+) -> Result<(Vec<BlockProductionPoint>, u32, u32, u32), Status> {
+    let canonical_tip = reader.chain_epoch().visible_tip_height.value();
+    let mut points = Vec::with_capacity(rows.len());
+    let mut point_records = Vec::with_capacity(rows.len());
+    let mut missing_block_count = 0_u32;
+    let mut missing_paid_fee_count = 0_u32;
+    for ((row, record), paid_fee) in rows.iter().zip(records).zip(paid_fees) {
+        let Some(record) = record else {
+            missing_block_count = missing_block_count.saturating_add(1);
+            continue;
+        };
+        let mut summary = validate_time_index_block_summary(row, &record)?;
+        let Some(header) = reader
+            .block_header_at(row.block_height)
+            .map_err(|error| status_from_store_error(&error))?
+        else {
+            missing_block_count = missing_block_count.saturating_add(1);
+            continue;
+        };
+        let expected_hash = row.block_hash;
+        let expected_time = row.block_time_unix_seconds;
+        if header.block_hash != expected_hash || header.block_time != expected_time {
+            return Err(ExplorerError::internal(
+                "block-production time row disagrees with its canonical header",
+            )
+            .into());
+        }
+        match paid_fee {
+            Some(paid_fee) if paid_fee.unavailable_transaction_count == 0 => {
+                summary.paid_fees_collected_zat = Some(paid_fee.paid_fee_zat);
+            }
+            Some(_) | None => {
+                missing_paid_fee_count = missing_paid_fee_count.saturating_add(1);
+            }
+        }
+        annotate_request_time_fields(&mut summary, canonical_tip);
+        points.push(BlockProductionPoint {
+            summary: Some(summary),
+            bits: header.bits,
+            coinbase: None,
+        });
+        point_records.push(record);
+    }
+    let artifacts = read_coinbase_artifacts(reader, &point_records)?;
+    attach_coinbase_summaries(&mut points, &point_records, &artifacts)?;
+    let missing_coinbase_count = u32::try_from(
+        points
+            .iter()
+            .filter(|point| point.coinbase.is_none())
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    Ok((
+        points,
+        missing_block_count,
+        missing_coinbase_count,
+        missing_paid_fee_count,
+    ))
+}
+
+fn validate_time_index_block_summary(
+    row: &zinder_derive::BlockProductionTimeRow,
+    record: &BlockSummaryRecord,
+) -> Result<BlockSummary, Status> {
+    let summary = record
+        .summary
+        .clone()
+        .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
+    let block_hash = decode_rpc_block_hash_hex(&summary.block_hash)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    if summary.block_height != row.block_height.value()
+        || block_hash != row.block_hash
+        || summary.block_time_unix_seconds != row.block_time_unix_seconds
+    {
+        return Err(ExplorerError::internal(
+            "block-production time row disagrees with its block summary",
+        )
+        .into());
+    }
+    Ok(summary)
+}
+
+fn block_production_time_coverage(
+    coverage: Option<zinder_derive::BlockProductionTimeBackfillCoverage>,
+    projection_state: ConsumerProjectionState,
+    fence_tip_time_unix_seconds: Option<i64>,
+) -> BlockProductionTimeRangeCoverage {
+    let coverage = coverage.map(|mut coverage| {
+        if coverage.complete_through_height > projection_state.projection_tip_height
+            && let Some(fence_tip_time_unix_seconds) = fence_tip_time_unix_seconds
+        {
+            coverage.complete_through_height = projection_state.projection_tip_height;
+            coverage.complete_through_time_unix_seconds = fence_tip_time_unix_seconds;
+        }
+        coverage
+    });
+    BlockProductionTimeRangeCoverage {
+        complete_from_height: coverage.map(|coverage| coverage.complete_from_height.value()),
+        complete_through_height: coverage.map(|coverage| coverage.complete_through_height.value()),
+        complete_from_time_unix_seconds: coverage
+            .map(|coverage| coverage.complete_from_time_unix_seconds),
+        complete_through_time_unix_seconds: coverage
+            .map(|coverage| coverage.complete_through_time_unix_seconds),
+        requested_range_complete: coverage.is_some_and(|coverage| {
+            coverage.complete_from_height.value() <= 1
+                && coverage.complete_through_height >= projection_state.projection_tip_height
+        }),
+    }
+}
+
+fn block_production_time_read_fence(
+    projection_state: ConsumerProjectionState,
+) -> BlockProductionTimeRangeReadFence {
+    BlockProductionTimeRangeReadFence {
+        chain_epoch_id: projection_state.projection_epoch_id.value(),
+        projection_revision: projection_state.revision,
+        projection_tip: Some(wallet::BlockTip {
+            height: projection_state.projection_tip_height.value(),
+            hash: encode_rpc_block_hash_hex(projection_state.projection_tip_hash),
+        }),
+    }
+}
+
+fn encode_block_production_cursor(
+    start_time_unix_seconds: i64,
+    end_time_unix_seconds: i64,
+    projection_state: ConsumerProjectionState,
+    after: BlockProductionTimeCursor,
+) -> Vec<u8> {
+    let after_bytes = after.as_bytes();
+    let after_len = u16::try_from(after_bytes.len()).unwrap_or(u16::MAX);
+    let mut cursor = Vec::with_capacity(BLOCK_PRODUCTION_CURSOR_FIXED_LEN + after_bytes.len());
+    cursor.push(BLOCK_PRODUCTION_CURSOR_VERSION);
+    cursor.extend_from_slice(&start_time_unix_seconds.to_be_bytes());
+    cursor.extend_from_slice(&end_time_unix_seconds.to_be_bytes());
+    cursor.extend_from_slice(&projection_state.projection_epoch_id.value().to_be_bytes());
+    cursor.extend_from_slice(&projection_state.revision.to_be_bytes());
+    cursor.extend_from_slice(&projection_state.projection_tip_height.value().to_be_bytes());
+    cursor.extend_from_slice(&encode_internal_block_hash(
+        projection_state.projection_tip_hash,
+    ));
+    cursor.extend_from_slice(&after_len.to_be_bytes());
+    cursor.extend_from_slice(after_bytes);
+    cursor
+}
+
+fn resolve_block_production_cursor_fence(
+    request: &BlockProductionInTimeRangeRequest,
+    current_projection_state: ConsumerProjectionState,
+    current_chain_epoch_id: ChainEpochId,
+    snapshot: &DeriveStoreReadSnapshot<'_>,
+) -> Result<
+    (
+        Option<BlockProductionTimeCursorEnvelope>,
+        ConsumerProjectionState,
+    ),
+    Status,
+> {
+    if request.from_cursor.is_empty() {
+        if request
+            .at_epoch_id
+            .is_some_and(|requested| requested != current_chain_epoch_id.value())
+        {
+            return Err(ExplorerError::unsatisfied_precondition(
+                "requested chain epoch is not the current canonical chain view",
+            )
+            .into());
+        }
+        return Ok((
+            None,
+            ConsumerProjectionState {
+                projection_epoch_id: current_chain_epoch_id,
+                ..current_projection_state
+            },
+        ));
+    }
+    let cursor = decode_and_validate_block_production_cursor_request(request)?;
+    let frozen_tip_is_still_canonical = current_projection_state.projection_tip_height
+        >= cursor.projection_tip_height
+        && BlockProductionTimeConsumer::row_at_height_snapshot(
+            snapshot,
+            cursor.projection_tip_height,
+        )
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .is_some_and(|row| row.block_hash == cursor.projection_tip_hash);
+    if !frozen_tip_is_still_canonical {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "block-production cursor projection fence is no longer current",
+        )
+        .into());
+    }
+    let frozen_projection_state = ConsumerProjectionState {
+        projection_epoch_id: ChainEpochId::new(cursor.chain_epoch_id),
+        projection_tip_height: cursor.projection_tip_height,
+        projection_tip_hash: cursor.projection_tip_hash,
+        revision: cursor.projection_revision,
+        coverage: None,
+    };
+    Ok((Some(cursor), frozen_projection_state))
+}
+
+fn decode_and_validate_block_production_cursor_request(
+    request: &BlockProductionInTimeRangeRequest,
+) -> Result<BlockProductionTimeCursorEnvelope, Status> {
+    let cursor = decode_block_production_cursor(&request.from_cursor)?;
+    let request_epoch_matches = request
+        .at_epoch_id
+        .is_none_or(|chain_epoch_id| chain_epoch_id == cursor.chain_epoch_id);
+    if cursor.start_time_unix_seconds != request.start_time_unix_seconds
+        || cursor.end_time_unix_seconds != request.end_time_unix_seconds
+        || !request_epoch_matches
+    {
+        return Err(ExplorerError::invalid_request(
+            "block-production cursor does not match the request bounds or chain epoch",
+        )
+        .into());
+    }
+    Ok(cursor)
+}
+
+fn decode_block_production_cursor(
+    bytes: &[u8],
+) -> Result<BlockProductionTimeCursorEnvelope, Status> {
+    if bytes.len() < BLOCK_PRODUCTION_CURSOR_FIXED_LEN
+        || bytes.first() != Some(&BLOCK_PRODUCTION_CURSOR_VERSION)
+    {
+        return Err(ExplorerError::invalid_request("block-production cursor is malformed").into());
+    }
+    let mut offset = 1;
+    let start_time_unix_seconds = i64::from_be_bytes(cursor_field(bytes, &mut offset)?);
+    let end_time_unix_seconds = i64::from_be_bytes(cursor_field(bytes, &mut offset)?);
+    let chain_epoch_id = u64::from_be_bytes(cursor_field(bytes, &mut offset)?);
+    let projection_revision = u64::from_be_bytes(cursor_field(bytes, &mut offset)?);
+    let projection_tip_height =
+        BlockHeight::new(u32::from_be_bytes(cursor_field(bytes, &mut offset)?));
+    let projection_tip_hash = decode_internal_block_hash(&bytes[offset..offset + 32])
+        .map_err(|_| ExplorerError::invalid_request("block-production cursor hash is malformed"))?;
+    offset += 32;
+    let after_len = usize::from(u16::from_be_bytes(cursor_field(bytes, &mut offset)?));
+    if bytes.len() != offset.saturating_add(after_len) {
+        return Err(ExplorerError::invalid_request("block-production cursor is malformed").into());
+    }
+    let after = BlockProductionTimeCursor::from_bytes(&bytes[offset..])
+        .map_err(|_| ExplorerError::invalid_request("block-production cursor key is malformed"))?;
+    Ok(BlockProductionTimeCursorEnvelope {
+        start_time_unix_seconds,
+        end_time_unix_seconds,
+        chain_epoch_id,
+        projection_revision,
+        projection_tip_height,
+        projection_tip_hash,
+        after,
+    })
+}
+
+fn cursor_field<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N], Status> {
+    let end = offset.saturating_add(N);
+    let field = bytes
+        .get(*offset..end)
+        .ok_or_else(|| ExplorerError::invalid_request("block-production cursor is malformed"))?;
+    *offset = end;
+    field
+        .try_into()
+        .map_err(|_| ExplorerError::invalid_request("block-production cursor is malformed").into())
 }
 
 fn validate_block_view_range(start_height: u32, end_height: u32) -> Result<u32, Status> {
@@ -638,14 +1136,26 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use super::{attach_coinbase_summaries, join_block_production_points};
-    use zinder_core::{
-        BlockHash, BlockHeaderArtifact, BlockHeight, TransactionFactsArtifact, TransactionId,
-        TransactionLocation, TransactionVersion, TransparentAddressScriptHash,
-        TransparentOutputFact,
-        wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex},
+    use super::{
+        attach_coinbase_summaries, block_production_time_coverage,
+        block_production_time_read_fence, decode_and_validate_block_production_cursor_request,
+        encode_block_production_cursor, join_block_production_points,
     };
-    use zinder_proto::v1::explorer::{BlockProductionPoint, BlockSummary, BlockSummaryRecord};
+    use zinder_core::{
+        BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpochId, TransactionFactsArtifact,
+        TransactionId, TransactionLocation, TransactionVersion, TransparentAddressScriptHash,
+        TransparentOutputFact,
+        wire::{
+            encode_height_key_ascending, encode_internal_block_hash, encode_rpc_block_hash_hex,
+            encode_rpc_transaction_id_hex,
+        },
+    };
+    use zinder_derive::{
+        BlockProductionTimeBackfillCoverage, BlockProductionTimeCursor, ConsumerProjectionState,
+    };
+    use zinder_proto::v1::explorer::{
+        BlockProductionInTimeRangeRequest, BlockProductionPoint, BlockSummary, BlockSummaryRecord,
+    };
     use zinder_testkit::synthetic_transaction_public_facts;
 
     #[test]
@@ -743,6 +1253,123 @@ mod tests {
                 .map(|summary| summary.block_height),
             Some(10)
         );
+    }
+
+    #[test]
+    fn block_production_time_cursor_binds_request_and_projection_fence() -> eyre::Result<()> {
+        let state = projection_state(9);
+        let after = cursor_after(
+            1_774_670_100,
+            BlockHeight::new(100),
+            state.projection_tip_hash,
+        )?;
+        let request = BlockProductionInTimeRangeRequest {
+            start_time_unix_seconds: 1_774_670_000,
+            end_time_unix_seconds: 1_774_671_000,
+            max_entries: 2,
+            from_cursor: encode_block_production_cursor(1_774_670_000, 1_774_671_000, state, after),
+            at_epoch_id: Some(state.projection_epoch_id.value()),
+        };
+
+        let decoded = decode_and_validate_block_production_cursor_request(&request)?;
+        assert_eq!(decoded.chain_epoch_id, state.projection_epoch_id.value());
+        assert_eq!(decoded.projection_revision, state.revision);
+        assert_eq!(decoded.projection_tip_height, state.projection_tip_height);
+        assert_eq!(decoded.projection_tip_hash, state.projection_tip_hash);
+        assert_eq!(decoded.after, after);
+
+        let mismatched_bounds = BlockProductionInTimeRangeRequest {
+            start_time_unix_seconds: 1_774_669_999,
+            ..request.clone()
+        };
+        let bounds_error = decode_and_validate_block_production_cursor_request(&mismatched_bounds)
+            .err()
+            .ok_or_else(|| eyre::eyre!("changed time bounds should reject the cursor"))?;
+        assert_eq!(bounds_error.code(), tonic::Code::InvalidArgument);
+
+        let mismatched_epoch = BlockProductionInTimeRangeRequest {
+            at_epoch_id: Some(state.projection_epoch_id.value() + 1),
+            ..request
+        };
+        let epoch_error = decode_and_validate_block_production_cursor_request(&mismatched_epoch)
+            .err()
+            .ok_or_else(|| eyre::eyre!("changed chain epoch should reject the cursor"))?;
+        assert_eq!(epoch_error.code(), tonic::Code::InvalidArgument);
+        Ok(())
+    }
+
+    #[test]
+    fn block_production_time_coverage_and_fence_map_one_projection_state() -> eyre::Result<()> {
+        let state = projection_state(9);
+        let coverage = BlockProductionTimeBackfillCoverage::new(
+            BlockHeight::new(1),
+            state.projection_tip_height,
+            1_234,
+            1_774_670_100,
+        );
+
+        let mapped_coverage =
+            block_production_time_coverage(Some(coverage), state, Some(1_774_670_100));
+        assert_eq!(mapped_coverage.complete_from_height, Some(1));
+        assert_eq!(
+            mapped_coverage.complete_through_height,
+            Some(state.projection_tip_height.value())
+        );
+        assert_eq!(mapped_coverage.complete_from_time_unix_seconds, Some(1_234));
+        assert_eq!(
+            mapped_coverage.complete_through_time_unix_seconds,
+            Some(1_774_670_100)
+        );
+        assert!(mapped_coverage.requested_range_complete);
+
+        let incomplete_coverage = block_production_time_coverage(
+            Some(BlockProductionTimeBackfillCoverage::new(
+                BlockHeight::new(2),
+                BlockHeight::new(99),
+                1_235,
+                1_774_670_099,
+            )),
+            state,
+            Some(1_774_670_100),
+        );
+        assert!(!incomplete_coverage.requested_range_complete);
+        assert!(!block_production_time_coverage(None, state, None).requested_range_complete);
+
+        let read_fence = block_production_time_read_fence(state);
+        assert_eq!(read_fence.chain_epoch_id, state.projection_epoch_id.value());
+        assert_eq!(read_fence.projection_revision, state.revision);
+        assert_eq!(
+            read_fence
+                .projection_tip
+                .ok_or_else(|| eyre::eyre!("read fence projection tip missing"))?
+                .height,
+            state.projection_tip_height.value()
+        );
+        Ok(())
+    }
+
+    fn projection_state(revision: u64) -> ConsumerProjectionState {
+        ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(47),
+            projection_tip_height: BlockHeight::new(100),
+            projection_tip_hash: BlockHash::from_bytes([0xa5; 32]),
+            revision,
+            coverage: None,
+        }
+    }
+
+    fn cursor_after(
+        block_time_unix_seconds: i64,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> eyre::Result<BlockProductionTimeCursor> {
+        let mut bytes = Vec::with_capacity(44);
+        bytes.extend_from_slice(
+            &(block_time_unix_seconds.cast_unsigned() ^ (1_u64 << 63)).to_be_bytes(),
+        );
+        bytes.extend_from_slice(&encode_height_key_ascending(block_height));
+        bytes.extend_from_slice(&encode_internal_block_hash(block_hash));
+        Ok(BlockProductionTimeCursor::from_bytes(&bytes)?)
     }
 
     fn block_header(
