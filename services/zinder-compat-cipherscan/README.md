@@ -22,16 +22,29 @@ cache behavior, mining-pool metadata, and product formulas. The
 [coverage matrix](../../docs/plans/cipherscan-adapter-architecture.md) records
 the owner and current status of every route family.
 
+## Related systems
+
+Z3 and Cipherscan are separate projects. This repository does not vendor them
+or own their deployment procedures.
+
+| System | Role in this topology | Repository and authoritative guide |
+| --- | --- | --- |
+| Z3 | Runs the Zebra node that Zinder ingests from. The adapter does not connect to Z3 directly. | [Z3 repository](https://github.com/ZcashFoundation/z3), [operator quick start](https://github.com/ZcashFoundation/z3#quick-start), [Compose-peer integration](https://github.com/ZcashFoundation/z3/blob/main/docs/integrations/compose-peer.md), and [platform contract](https://github.com/ZcashFoundation/z3/blob/main/docs/contract.md) |
+| Zinder | Indexes Zebra, owns reusable projections, and serves `WalletQuery` and `ExplorerQuery` to this adapter. | This repository and the [VM deployment runbook](../../docs/runbooks/deploying-on-a-vm.md) |
+| Cipherscan | Runs the Next.js product UI and any Cipherscan-owned sidecars an operator chooses to retain. | [Cipherscan repository](https://github.com/Kenbak/cipherscan) and [Cipherscan deployment guide](https://github.com/Kenbak/cipherscan/blob/main/DEPLOYMENT.md) |
+
+Follow each project's guide to deploy that project. This README defines the
+integration delta: attach Zinder to Z3, run this adapter against Zinder's two
+query services, and point Cipherscan's API traffic at the adapter.
+
 ## Requirements
 
-Obtain independent checkouts of [Z3](https://github.com/ZcashFoundation/z3),
-[Zinder](https://github.com/gustavovalverde/zinder), and
-[Cipherscan](https://github.com/Kenbak/cipherscan). They do not need to share a
-parent directory. Set these variables to their absolute locations before using
-the commands in this guide:
+After completing Z3's own setup guide, the local walkthrough uses independent
+Zinder and Cipherscan checkouts. They do not need to share a parent directory.
+Set these variables to their absolute locations before using the commands
+below:
 
 ```bash
-export Z3_ROOT="/absolute/path/to/z3"
 export ZINDER_ROOT="/absolute/path/to/zinder"
 export CIPHERSCAN_ROOT="/absolute/path/to/cipherscan"
 ```
@@ -53,16 +66,18 @@ routes; it does not replace missing prices with zero.
 
 ## Local testnet
 
-Start the existing Z3 testnet and the Zinder testnet stack. This reuses the
-named `zinder-testnet-data` volume; it does not recreate or replace the store.
+First complete Z3's
+[testnet quick start](https://github.com/ZcashFoundation/z3#quick-start),
+including its one-time network setup and Zebra readiness wait. That procedure
+creates the external `z3-testnet` network and `z3-testnet-cookie` volume used by
+Zinder. Do not replace it with a bare `docker compose up`: first-time setup and
+the two-phase sync sequence belong to Z3.
+
+After Z3 reports Zebra ready, start the Zinder testnet services. This reuses
+the named `zinder-testnet-data` volume; it does not recreate or replace the
+store.
 
 ```bash
-docker compose \
-  --project-directory "$Z3_ROOT" \
-  --env-file "$Z3_ROOT/.env.testnet" \
-  -f "$Z3_ROOT/docker-compose.yml" \
-  up -d
-
 docker compose \
   --project-directory "$ZINDER_ROOT" \
   --env-file "$ZINDER_ROOT/deploy/.env.testnet" \
@@ -103,6 +118,10 @@ capabilities remain visible.
 
 ### Run the unchanged Cipherscan UI
 
+Complete the dependency-installation steps in Cipherscan's
+[local development guide](https://github.com/Kenbak/cipherscan/blob/main/DEPLOYMENT.md#local-development)
+first. Do not start its full PostgreSQL/API/indexer stack for this test.
+
 Cipherscan currently exposes a configurable custom API URL through its
 Crosslink deployment slot. Use that slot to run the source-unmodified UI
 against a local adapter:
@@ -125,21 +144,47 @@ deployment.
 
 ## Deployment model
 
-Deploy the adapter with Zinder, not as another indexer inside Cipherscan:
+Deploy the adapter with Zinder, not as another indexer inside Cipherscan. The
+boxes below are independent deployment boundaries:
 
 ```text
-Z3 / Zebra
-    |
-zinder-ingest ---- persistent canonical and derive volume
-    |
-    +-- zinder-query --------+
-    |                        |
-    +-- zinder-explorer -----+--> zinder-compat-cipherscan
-                                      |
-                               TLS reverse proxy
-                                      |
-                                Cipherscan web
++---------------- Z3 deployment ----------------+
+| Zebra node                                     |
++----------------------|-------------------------+
+                       | JSON-RPC + cookie auth
++---------------- Zinder deployment ------------+
+| zinder-ingest -> canonical and derive volume  |
+|                       |                        |
+|            +----------+----------+             |
+|            |                     |             |
+|     zinder-query        zinder-explorer        |
+|            +----------+----------+             |
+|                       | gRPC                   |
+|            zinder-compat-cipherscan            |
++----------------------|-------------------------+
+                       | REST + WebSocket
+                 TLS reverse proxy
+                       |
++---------------- Cipherscan deployment --------+
+| Next.js web application                        |
+| Optional Cipherscan-owned sidecars             |
++------------------------------------------------+
 ```
+
+Deploy in this order:
+
+1. Deploy and synchronize Z3 using its
+   [operator guide](https://github.com/ZcashFoundation/z3#for-operators).
+2. Deploy Zinder against Z3 using the
+   [Zinder VM runbook](../../docs/runbooks/deploying-on-a-vm.md). Zinder's
+   Compose topology consumes the network and cookie identifiers defined by the
+   [Z3 platform contract](https://github.com/ZcashFoundation/z3/blob/main/docs/contract.md).
+3. Deploy `zinder-compat-cipherscan` beside the Zinder readers using the
+   configuration below.
+4. Deploy the Cipherscan frontend using its
+   [deployment guide](https://github.com/Kenbak/cipherscan/blob/main/DEPLOYMENT.md),
+   applying the API endpoint substitutions in
+   [Build Cipherscan for a custom endpoint](#build-cipherscan-for-a-custom-endpoint).
 
 The adapter:
 
@@ -220,8 +265,12 @@ not printed.
 
 ### Build Cipherscan for a custom endpoint
 
-Cipherscan's `NEXT_PUBLIC_*` values are compiled into the browser bundle.
-Set them while building the production application, then provide the internal
+Follow Cipherscan's
+[production deployment guide](https://github.com/Kenbak/cipherscan/blob/main/DEPLOYMENT.md#production-deployment)
+for frontend hosting, TLS, and Cipherscan-owned services. For an adapter-backed
+deployment, replace its API backend for covered routes with the adapter.
+Cipherscan's `NEXT_PUBLIC_*` values are compiled into the browser bundle, so
+set them while building the production application, then provide the internal
 server URL when starting it:
 
 ```bash
