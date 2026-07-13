@@ -196,8 +196,9 @@ jobs:
           ZINDER_TEST_PARITY_ZINDER_ADDR: http://127.0.0.1:9087
           ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR: http://127.0.0.1:9088
           ZINDER_TEST_PARITY_TRANSPARENT_ADDRESS: ${{ env.PARITY_TRANSPARENT_ADDRESS }}
-        run: cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
-          -E 'test(/^live::parity_against_lightwalletd::/)'
+        run: |
+          cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
+            -E 'test(/^live::parity_against_lightwalletd::/)'
 
       - name: Dump pipeline logs on failure
         if: failure()
