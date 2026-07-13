@@ -160,11 +160,23 @@ The current local validation source is the mainnet Zebra container
 Overwinter `347500`, Sapling `419200`, Blossom `653600`, Heartwood `903000`,
 Canopy `1046400`, NU5 `1687104`, NU6 `2726400`, and NU6.1 `3146400`.
 
-The parser benchmark uses local raw blocks from that node and runs Zinder's
-parser path: `SourceBlock::from_raw_block_bytes` followed by
-`derive_block_with_raw_blob_policy(..., RawBlobPolicy::None)`. JSON-RPC fetch
-time is excluded. The timings below are local-machine measurements, so they are
-useful for relative cost shape, not as an absolute SLA.
+The parser benchmark used local raw blocks from that node and ran the former
+Zinder parser path: `SourceBlock::from_raw_block_bytes` followed by
+`derive_block_with_raw_blob_policy(..., RawBlobPolicy::None)`. Those values are
+the pre-optimization baseline because that path parsed the complete block twice
+and serialized plus parsed each transaction again. The current bulk source
+parses only the header before canonical preparation, which parses the complete
+block once and builds facts directly from the parsed transactions. JSON-RPC
+fetch time is excluded. The timings below are local-machine measurements, so
+they are useful for relative cost shape, not as an absolute SLA.
+
+Use `zinder-bench` fixed-range replay for comparisons after the parse-once
+change. Its `stage_durations` report makes the acceptance boundary explicit:
+compare the same captured range, store state, retention policy, and prepare
+concurrency, then require higher `replay.blocks_per_second` without increased
+`commit_fallback_reads` or peak resident memory. Keep the heavy Orchard, heavy
+Sapling, and end-side ranges in the comparison so one workload shape cannot
+hide a regression in another.
 
 | Window | Range | Component evidence | `derive_block` timing |
 | --- | ---: | --- | --- |

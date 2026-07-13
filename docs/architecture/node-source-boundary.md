@@ -66,7 +66,7 @@ pub trait NodeSource: Send + Sync + 'static {
 }
 ```
 
-The bulk-catchup phase of the unified ingest loop ([ADR-0022](../adrs/0022-resource-budgeted-bulk-catchup.md)) drives `fetch_chain_segment` with `SourceChainSegmentLimits`. The limits express both the requested block ceiling and the response-byte target/hard cap. JSON-RPC segments fetch raw block bytes only; checkpoint tree state is fetched separately through `fetch_tree_state_for_block` for the committed batch tip.
+The bulk-catchup phase of the unified ingest loop ([ADR-0022](../adrs/0022-resource-budgeted-bulk-catchup.md)) drives `fetch_chain_segment` with `SourceChainSegmentLimits`. The limits express both the requested block ceiling and the response-byte target/hard cap. JSON-RPC segments decode raw block bytes and parse only the header prefix needed for parent-link validation; canonical preparation performs the single complete block parse and validates the coinbase height, hash, parent hash, and block time before writing artifacts. Checkpoint tree state is fetched separately through `fetch_tree_state_for_block` for the committed batch tip.
 
 Tip-follow and reorg-ancestor traversal use `fetch_block_at` directly because random access at the live edge is the natural shape. Native streaming transports can satisfy the same `SourceChainUpdate` values behind `fetch_chain_segment` without changing canonical ingest.
 

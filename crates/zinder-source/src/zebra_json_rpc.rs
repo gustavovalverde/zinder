@@ -662,10 +662,17 @@ impl ZebraJsonRpcSource {
             })?;
             response_payload_bytes =
                 response_payload_bytes.saturating_add(usize_to_u64_saturating(raw_block_hex.len()));
-            let raw_block_bytes = hex::decode(raw_block_hex)
+            let decode_started_at = Instant::now();
+            let raw_block_bytes_outcome = hex::decode(raw_block_hex)
                 .map_err(|source| SourceError::InvalidRawBlockHex { source })?;
-            let source_block =
-                SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes)?;
+            record_block_decode_stage("hex_decode", decode_started_at);
+            let header_started_at = Instant::now();
+            let source_block = SourceBlock::from_raw_block_bytes_using_header(
+                self.network,
+                height,
+                raw_block_bytes_outcome,
+            )?;
+            record_block_decode_stage("block_header", header_started_at);
             blocks.push(source_block);
         }
 
@@ -1405,6 +1412,15 @@ fn validate_source_block_links(blocks: &[SourceBlock]) -> Result<(), SourceError
 
 fn usize_to_u64_saturating(amount: usize) -> u64 {
     u64::try_from(amount).unwrap_or(u64::MAX)
+}
+
+fn record_block_decode_stage(stage: &'static str, started_at: Instant) {
+    metrics::histogram!(
+        "zinder_node_block_decode_stage_duration_seconds",
+        "source" => "zebra_json_rpc",
+        "stage" => stage
+    )
+    .record(started_at.elapsed());
 }
 
 fn record_json_rpc_source_outcome<Response>(

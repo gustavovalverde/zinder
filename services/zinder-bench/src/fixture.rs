@@ -19,9 +19,9 @@ use zinder_core::{
     wire::decode_zinder_native_chain_name,
 };
 use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainSegment,
-    SourceChainSegmentLimits, SourceChainUpdate, SourceError, SourceSubtreeRoot,
-    SourceSubtreeRoots,
+    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceBlockHeader,
+    SourceChainSegment, SourceChainSegmentLimits, SourceChainUpdate, SourceError,
+    SourceSubtreeRoot, SourceSubtreeRoots, block_header_info_from_raw_block_bytes,
 };
 
 use crate::error::BenchError;
@@ -448,7 +448,19 @@ fn read_and_decode_block(
             height,
             reason: format!("fixture read failed: {source}"),
         })?;
-    SourceBlock::from_raw_block_bytes(network, height, raw_block_bytes)
+    let header_info = block_header_info_from_raw_block_bytes(height, &raw_block_bytes)?;
+    let block_time_seconds =
+        u32::try_from(header_info.block_time).map_err(|_| SourceError::RawBlockTimeOutOfRange)?;
+    Ok(SourceBlock::new(
+        SourceBlockHeader {
+            network,
+            height,
+            hash: header_info.block_id.hash,
+            parent_hash: header_info.previous_block_hash,
+            block_time_seconds,
+        },
+        raw_block_bytes,
+    ))
 }
 
 impl FixtureNodeSource {

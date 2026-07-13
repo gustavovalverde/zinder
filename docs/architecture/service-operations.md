@@ -104,6 +104,7 @@ Implemented baseline metrics:
 | `zinder_readiness_replica_lag_chain_epochs` | gauge | `zinder-runtime` | Chain-epoch lag carried by `ReadinessCause::ReplicaLagging`, or `0` otherwise. |
 | `zinder_node_request_duration_seconds` | histogram | `zinder-source` | Upstream node JSON-RPC request latency by source, method, status, and error class. |
 | `zinder_node_request_total` | counter | `zinder-source` | Upstream node JSON-RPC request count by source, method, status, and error class. |
+| `zinder_node_block_decode_stage_duration_seconds` | histogram | `zinder-source` | Batched JSON-RPC block response CPU time by bounded stage: hex decoding or block-header parsing. |
 | `zinder_ingest_source_request_duration_seconds` | histogram | `zinder-ingest` | Ingest source fetch latency by operation, status, and error class. |
 | `zinder_ingest_source_request_total` | counter | `zinder-ingest` | Ingest source fetch count by operation, status, and error class. |
 | `zinder_ingest_source_retry_total` | counter | `zinder-ingest` | Retryable source failures by ingest operation. |
@@ -117,17 +118,20 @@ Implemented baseline metrics:
 | `zinder_ingest_bulk_pipeline_head_of_line_wait_seconds` | histogram | `zinder-ingest` | Time later source segments spend waiting for an earlier segment before ordered emission. |
 | `zinder_ingest_source_segment_reassembly_segments` | gauge | `zinder-ingest` | Completed source segments waiting for earlier heights before ordered bulk-catchup emission. |
 | `zinder_ingest_source_segment_reassembly_bytes` | gauge | `zinder-ingest` | Estimated response bytes held by completed source segments waiting in ordered reassembly. |
+| `zinder_ingest_source_segment_initial_probe_in_flight` | gauge | `zinder-ingest` | Set to `1` while the adaptive source scheduler waits for the first measured response in a consensus branch before filling the concurrent request queue. |
 | `zinder_ingest_block_prepare_duration_seconds` | histogram | `zinder-ingest` | Per-block block-prepare latency by status and error class. Bulk catchup includes derivation plus spent-transparent-output prefetch; tip follow records sequential derivation plus finalization. |
 | `zinder_ingest_block_prepare_total` | counter | `zinder-ingest` | Per-block block-prepare count by status and error class. |
+| `zinder_ingest_block_prepare_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk block-prepare task time split between `artifact_derive` and `transparent_prevout_prefetch`, labeled by status. |
+| `zinder_ingest_block_derive_stage_duration_seconds` | histogram | `zinder-ingest` | Canonical artifact CPU time split between `block_parse`, `identity_validation`, `compact_artifacts`, `transparent_output_artifacts`, `transaction_artifacts`, `block_header_artifact`, and `block_blob_artifact`, labeled by status. |
 | `zinder_ingest_block_prepare_reassembly_blocks` | gauge | `zinder-ingest` | Completed prepared blocks waiting for earlier heights before the serial finalization fold. |
 | `zinder_ingest_derive_tailer_tick_duration_seconds` | histogram | `zinder-ingest` | Derive tailer catch-up pass latency by status and error class. |
 | `zinder_ingest_derive_tailer_ticks_total` | counter | `zinder-ingest` | Derive tailer catch-up pass count by status and error class. |
 | `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Derive tailer replay stage latency by stage, status, and error class. Stages include `build_block_contexts` and `read_transparent_spend_facts`; the former wraps context construction, the latter is only the store read. |
 | `zinder_ingest_derive_replay_events_total` | counter | `zinder-ingest` | Derive tailer replay event count by status and error class. |
 | `zinder_ingest_derive_replay_blocks_total` | counter | `zinder-ingest` | Derive tailer replay block count by status and error class. |
-| `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed before a derive tailer catch-up pass. |
-| `zinder_ingest_derive_replay_height` | gauge | `zinder-ingest` | Latest canonical height replayed into the derive store by the tailer. |
-| `zinder_ingest_derive_replay_lag_blocks` | gauge | `zinder-ingest` | Derive lag between replay progress and canonical tip. |
+| `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed by the derive status tick, including while replay is phase-gated. |
+| `zinder_ingest_derive_replay_height` | gauge | `zinder-ingest` | Latest materialized derive height, refreshed by the status tick even while replay is phase-gated. |
+| `zinder_ingest_derive_replay_lag_blocks` | gauge | `zinder-ingest` | Derive lag between materialized progress and canonical tip, refreshed even while replay is phase-gated. |
 | `zinder_ingest_canonical_lag_blocks` | gauge | `zinder-ingest` | Chain-catchup lag between the upstream tip and the canonical writer tip, saturating at zero. Distinct from `zinder_ingest_derive_replay_lag_blocks`, which measures derive-vs-canonical freshness, not chain catchup. |
 | `zinder_ingest_derive_replay_budget_state` | gauge | `zinder-ingest` | Current derive replay memory-budget state by state label: `normal`, `degraded`, or `paused`. |
 | `zinder_ingest_derive_replay_effective_batch_blocks` | gauge | `zinder-ingest` | Effective replay batch size after memory degradation. |

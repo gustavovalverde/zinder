@@ -245,9 +245,24 @@ where
         let height = source_block.height;
         let block_prepare_started_at = Instant::now();
         let block_prepare_outcome = async {
-            let derived = derive_fn(source_block).await?;
-            let prefetched_spent_transparent_outputs =
-                prefetch_spent_transparent_outputs(store, &derived).await?;
+            let artifact_derive_started_at = Instant::now();
+            let artifact_derive_outcome = derive_fn(source_block).await;
+            record_block_prepare_stage(
+                "artifact_derive",
+                artifact_derive_started_at,
+                &artifact_derive_outcome,
+            );
+            let derived = artifact_derive_outcome?;
+
+            let prevout_prefetch_started_at = Instant::now();
+            let prevout_prefetch_outcome =
+                prefetch_spent_transparent_outputs(store, &derived).await;
+            record_block_prepare_stage(
+                "transparent_prevout_prefetch",
+                prevout_prefetch_started_at,
+                &prevout_prefetch_outcome,
+            );
+            let prefetched_spent_transparent_outputs = prevout_prefetch_outcome?;
             let prepared = PreparedBlockArtifacts {
                 derived,
                 prefetched_spent_transparent_outputs,
@@ -278,6 +293,19 @@ where
         .boxed(),
     );
     Ok(())
+}
+
+fn record_block_prepare_stage<T>(
+    stage: &'static str,
+    started_at: Instant,
+    outcome: &Result<T, IngestError>,
+) {
+    metrics::histogram!(
+        "zinder_ingest_block_prepare_stage_duration_seconds",
+        "stage" => stage,
+        "status" => if outcome.is_ok() { "ok" } else { "error" }
+    )
+    .record(started_at.elapsed());
 }
 
 fn insert_completed_block_prepare<F>(

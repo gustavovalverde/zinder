@@ -2428,11 +2428,22 @@ fn record_derive_replay_event(block_count: usize, error: Option<&IngestError>) {
 }
 
 fn record_derive_replay_progress(progress_height: BlockHeight, canonical_tip_height: BlockHeight) {
-    metrics::gauge!("zinder_ingest_derive_replay_height").set(f64::from(progress_height.value()));
+    record_derive_replay_status_metrics(
+        Some(progress_height.value()),
+        Some(canonical_tip_height.value()),
+    );
+}
+
+fn record_derive_replay_status_metrics(
+    indexed_height: Option<u32>,
+    canonical_tip_height: Option<u32>,
+) {
+    let indexed_height = indexed_height.unwrap_or(0);
+    let canonical_tip_height = canonical_tip_height.unwrap_or(0);
+    metrics::gauge!("zinder_ingest_derive_replay_height").set(f64::from(indexed_height));
+    metrics::gauge!("zinder_ingest_derive_replay_tip_height").set(f64::from(canonical_tip_height));
     metrics::gauge!("zinder_ingest_derive_replay_lag_blocks").set(f64::from(
-        canonical_tip_height
-            .value()
-            .saturating_sub(progress_height.value()),
+        canonical_tip_height.saturating_sub(indexed_height),
     ));
 }
 
@@ -2473,6 +2484,7 @@ fn persist_derive_status(
         (Some(tip), None) => u64::from(tip),
         (None, _) => 0,
     };
+    record_derive_replay_status_metrics(indexed_height, canonical_tip);
     let health = if budget_state.is_paused() {
         DeriveHealth::Paused
     } else if indexed_height.is_some() && lag_blocks == 0 {

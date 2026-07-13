@@ -52,7 +52,7 @@ pub use source_error::{SourceError, SourceFailureClass};
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
 pub use source_transaction::{
     TransactionPublicFactSet, parse_transaction_public_fact_set, parse_transaction_public_facts,
-    transaction_component_counts,
+    transaction_component_counts, transaction_public_fact_set_from_parsed,
 };
 pub use source_tree_state::SourceTreeState;
 pub use transparent_address::transparent_address_matches_network;

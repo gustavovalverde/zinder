@@ -67,6 +67,7 @@ pub(super) fn build_source_block_stream<'a, Source>(
 where
     Source: NodeSource + Clone + 'a,
 {
+    config.source_segment_sizer.lock().reset_probe_in_flight();
     let state = SourceBlockStreamState {
         source,
         request_timeout: config.request_timeout,
@@ -114,10 +115,6 @@ where
                 return None;
             }
 
-            state
-                .source_segment_sizer
-                .lock()
-                .record_segment(segment.stats());
             if let Err(error) = enqueue_source_segment_max_blocks(state, segment) {
                 return Some(Err(error));
             }
@@ -132,9 +129,15 @@ where
             }
             None => return None,
         };
+        let completed_start_height = prefetched_segment.start_height;
+        let completed_stats = prefetched_segment.segment.stats();
         if let Err(error) = insert_completed_source_segment(state, prefetched_segment) {
             return Some(Err(error));
         }
+        state
+            .source_segment_sizer
+            .lock()
+            .record_segment(completed_start_height, completed_stats);
         record_source_fetch_queue_state(state);
     }
 }
@@ -149,13 +152,17 @@ where
         let Some(next_height) = state.next_fetch_height else {
             break;
         };
-        let Some(source_segment_max_blocks) = state
+        let segment_plan = state
             .source_segment_sizer
             .lock()
-            .blocks_for_remaining_range(next_height, state.to_height)
-        else {
-            state.next_fetch_height = None;
-            break;
+            .plan_segment(next_height, state.to_height);
+        let source_segment_max_blocks = match segment_plan {
+            SourceSegmentPlan::Ready(max_blocks) => max_blocks,
+            SourceSegmentPlan::AwaitingFeedback => break,
+            SourceSegmentPlan::Complete => {
+                state.next_fetch_height = None;
+                break;
+            }
         };
 
         let cursor = SourceChainCursor::before_height(next_height);
@@ -166,6 +173,10 @@ where
         else {
             break;
         };
+        state
+            .source_segment_sizer
+            .lock()
+            .record_segment_scheduled(next_height);
         state
             .in_flight_segments
             .push(fetch_prefetched_chain_segment(SourceFetchRequest {
@@ -430,6 +441,13 @@ struct SourceSegmentDensitySample {
     connected_blocks: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceSegmentPlan {
+    Ready(NonZeroU32),
+    AwaitingFeedback,
+    Complete,
+}
+
 pub(super) struct SourceSegmentSizer {
     max_blocks: NonZeroU32,
     target_response_payload_bytes: NonZeroU64,
@@ -438,6 +456,7 @@ pub(super) struct SourceSegmentSizer {
     overshoot_clear_success_count: u32,
     overshoot_bytes_per_block: Option<u64>,
     active_branch_id: ConsensusBranchId,
+    initial_probe_in_flight: bool,
     activations: Arc<NetworkUpgradeActivations>,
     density_samples: VecDeque<SourceSegmentDensitySample>,
 }
@@ -464,6 +483,7 @@ impl SourceSegmentSizer {
             overshoot_clear_success_count: 0,
             overshoot_bytes_per_block: None,
             active_branch_id,
+            initial_probe_in_flight: false,
             activations,
             density_samples: VecDeque::new(),
         }
@@ -485,7 +505,45 @@ impl SourceSegmentSizer {
         NonZeroU32::new(remaining_blocks.min(self.current_blocks.get()))
     }
 
-    pub(super) fn record_segment(&mut self, stats: SourceChainSegmentStats) {
+    pub(super) fn plan_segment(
+        &mut self,
+        next_height: BlockHeight,
+        to_height: BlockHeight,
+    ) -> SourceSegmentPlan {
+        let Some(max_blocks) = self.blocks_for_remaining_range(next_height, to_height) else {
+            return SourceSegmentPlan::Complete;
+        };
+        if self.density_samples.is_empty() && self.initial_probe_in_flight {
+            return SourceSegmentPlan::AwaitingFeedback;
+        }
+        SourceSegmentPlan::Ready(max_blocks)
+    }
+
+    pub(super) fn record_segment_scheduled(&mut self, start_height: BlockHeight) {
+        if self.activations.consensus_branch_id_at(start_height) != self.active_branch_id
+            || !self.density_samples.is_empty()
+        {
+            return;
+        }
+        self.initial_probe_in_flight = true;
+        metrics::gauge!("zinder_ingest_source_segment_initial_probe_in_flight").set(1.0);
+    }
+
+    fn reset_probe_in_flight(&mut self) {
+        self.initial_probe_in_flight = false;
+        metrics::gauge!("zinder_ingest_source_segment_initial_probe_in_flight").set(0.0);
+    }
+
+    pub(super) fn record_segment(
+        &mut self,
+        start_height: BlockHeight,
+        stats: SourceChainSegmentStats,
+    ) {
+        if self.activations.consensus_branch_id_at(start_height) != self.active_branch_id {
+            return;
+        }
+        self.initial_probe_in_flight = false;
+        metrics::gauge!("zinder_ingest_source_segment_initial_probe_in_flight").set(0.0);
         self.record_density_sample(stats);
         self.record_overshoot_memory(stats);
         let previous_blocks = self.current_blocks;
@@ -644,7 +702,9 @@ impl SourceSegmentSizer {
         self.success_count = 0;
         self.overshoot_clear_success_count = 0;
         self.overshoot_bytes_per_block = None;
+        self.initial_probe_in_flight = false;
         self.density_samples.clear();
+        metrics::gauge!("zinder_ingest_source_segment_initial_probe_in_flight").set(0.0);
         record_source_segment_sizer_state(
             self.current_blocks,
             self.max_blocks,

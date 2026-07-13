@@ -81,14 +81,31 @@ pub fn parse_transaction_public_fact_set(
             .map_err(|source| SourceError::RawTransactionParseFailed {
                 reason: source.to_string(),
             })?;
-    let public_facts = transaction_public_facts(
+    transaction_public_fact_set_from_parsed(
         &transaction,
         raw_transaction_bytes.len(),
         mined_height,
         activations,
-    );
-    let intrinsic_value_balances = transaction_intrinsic_value_balances(&transaction)?;
-    let (transparent_inputs, transparent_outputs) = transaction_transparent_facts(&transaction)?;
+    )
+}
+
+/// Builds scalar and ordered transparent facts from an already parsed
+/// transaction.
+///
+/// Canonical block preparation uses this entry point so it can share the
+/// block parser's transaction values instead of serializing and deserializing
+/// every transaction again. Byte-oriented callers should continue to use
+/// [`parse_transaction_public_fact_set`].
+pub fn transaction_public_fact_set_from_parsed(
+    transaction: &ZebraTransaction,
+    serialized_size: usize,
+    mined_height: Option<BlockHeight>,
+    activations: &NetworkUpgradeActivations,
+) -> Result<TransactionPublicFactSet, SourceError> {
+    let public_facts =
+        transaction_public_facts(transaction, serialized_size, mined_height, activations);
+    let intrinsic_value_balances = transaction_intrinsic_value_balances(transaction)?;
+    let (transparent_inputs, transparent_outputs) = transaction_transparent_facts(transaction)?;
     Ok(TransactionPublicFactSet {
         public_facts,
         intrinsic_value_balances,
@@ -373,6 +390,7 @@ mod tests {
 
     use super::{
         SourceError, parse_transaction_public_fact_set, sum_sprout_joinsplit_balances_zat,
+        transaction_public_fact_set_from_parsed,
     };
 
     #[test]
@@ -430,10 +448,17 @@ mod tests {
         for transaction in transactions {
             let raw_transaction = transaction.zcash_serialize_to_vec()?;
             let fact_set = parse_transaction_public_fact_set(&raw_transaction, None, &activations)?;
+            let parsed_fact_set = transaction_public_fact_set_from_parsed(
+                &transaction,
+                raw_transaction.len(),
+                None,
+                &activations,
+            )?;
             assert_eq!(
                 fact_set.intrinsic_value_balances,
                 TransactionIntrinsicValueBalances::default()
             );
+            assert_eq!(parsed_fact_set, fact_set);
         }
 
         Ok(())

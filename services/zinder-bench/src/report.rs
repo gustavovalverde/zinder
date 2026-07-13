@@ -18,6 +18,14 @@ const COMMIT_DURATION_COUNT: &str = "zinder_ingest_commit_duration_seconds_count
 const COMMIT_FALLBACK_CALLER: &str = "commit_fallback";
 const HEAD_OF_LINE_WAIT_SUM: &str = "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum";
 const HEAD_OF_LINE_WAIT_COUNT: &str = "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_count";
+const BLOCK_PREPARE_STAGE_DURATION_COUNT: &str =
+    "zinder_ingest_block_prepare_stage_duration_seconds_count";
+const BLOCK_PREPARE_STAGE_DURATION_SUM: &str =
+    "zinder_ingest_block_prepare_stage_duration_seconds_sum";
+const BLOCK_DERIVE_STAGE_DURATION_COUNT: &str =
+    "zinder_ingest_block_derive_stage_duration_seconds_count";
+const BLOCK_DERIVE_STAGE_DURATION_SUM: &str =
+    "zinder_ingest_block_derive_stage_duration_seconds_sum";
 
 /// Fixture identity echoed into the report.
 #[derive(Clone, Debug, Serialize)]
@@ -95,6 +103,21 @@ pub struct StageWaitStat {
     pub wait_seconds: f64,
 }
 
+/// Aggregated work time for one block-prepare or block-derive substage.
+#[derive(Clone, Debug, Serialize)]
+pub struct StageDurationStat {
+    /// Metric family that owns the stage.
+    pub family: String,
+    /// Stable stage label.
+    pub stage: String,
+    /// Outcome label.
+    pub status: String,
+    /// Number of completed stage invocations.
+    pub call_count: u64,
+    /// Cumulative histogram seconds across the invocations.
+    pub task_seconds: f64,
+}
+
 /// One exported `RocksDB` statistics ticker.
 #[derive(Clone, Debug, Serialize)]
 pub struct TickerStat {
@@ -146,6 +169,8 @@ pub struct Report {
     pub multi_get: Vec<MultiGetStat>,
     /// Per-stage bulk-pipeline head-of-line wait totals.
     pub head_of_line_wait: Vec<StageWaitStat>,
+    /// Per-substage block preparation and derivation timing.
+    pub stage_durations: Vec<StageDurationStat>,
     /// Exported `RocksDB` statistics tickers.
     pub rocksdb_tickers: Vec<TickerStat>,
 }
@@ -161,6 +186,7 @@ pub fn build_report(
     let store_reads = aggregate_store_reads(&samples);
     let multi_get = aggregate_multi_get(&samples);
     let head_of_line_wait = aggregate_head_of_line_wait(&samples);
+    let stage_durations = aggregate_stage_durations(&samples);
     let rocksdb_tickers = aggregate_tickers(&samples);
     let epochs_committed = round_to_u64(sum_by_name(&samples, COMMIT_DURATION_COUNT));
     let commit_fallback_reads = store_reads
@@ -196,6 +222,7 @@ pub fn build_report(
         store_reads,
         multi_get,
         head_of_line_wait,
+        stage_durations,
         rocksdb_tickers,
     }
 }
@@ -315,6 +342,65 @@ fn aggregate_head_of_line_wait(samples: &[MetricSample]) -> Vec<StageWaitStat> {
         .collect()
 }
 
+fn aggregate_stage_durations(samples: &[MetricSample]) -> Vec<StageDurationStat> {
+    let metric_families = [
+        (
+            "block_prepare",
+            BLOCK_PREPARE_STAGE_DURATION_COUNT,
+            BLOCK_PREPARE_STAGE_DURATION_SUM,
+        ),
+        (
+            "block_derive",
+            BLOCK_DERIVE_STAGE_DURATION_COUNT,
+            BLOCK_DERIVE_STAGE_DURATION_SUM,
+        ),
+    ];
+    let mut counts: BTreeMap<(String, String, String), u64> = BTreeMap::new();
+    let mut seconds: BTreeMap<(String, String, String), f64> = BTreeMap::new();
+    for sample in samples {
+        let Some((family, is_count)) =
+            metric_families
+                .iter()
+                .find_map(|(family, count_name, sum_name)| {
+                    if sample.name == *count_name {
+                        Some((*family, true))
+                    } else if sample.name == *sum_name {
+                        Some((*family, false))
+                    } else {
+                        None
+                    }
+                })
+        else {
+            continue;
+        };
+        let (Some(stage), Some(status)) = (sample.label("stage"), sample.label("status")) else {
+            continue;
+        };
+        let key = (family.to_owned(), stage.to_owned(), status.to_owned());
+        if is_count {
+            *counts.entry(key).or_insert(0) += round_to_u64(sample.reading);
+        } else {
+            *seconds.entry(key).or_insert(0.0) += sample.reading;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|((family, stage, status), call_count)| {
+            let task_seconds = seconds
+                .get(&(family.clone(), stage.clone(), status.clone()))
+                .copied()
+                .unwrap_or(0.0);
+            StageDurationStat {
+                family,
+                stage,
+                status,
+                call_count,
+                task_seconds,
+            }
+        })
+        .collect()
+}
+
 fn aggregate_tickers(samples: &[MetricSample]) -> Vec<TickerStat> {
     let mut tickers: BTreeMap<(String, String), f64> = BTreeMap::new();
     for sample in samples {
@@ -356,4 +442,26 @@ fn round_to_u64(reading: f64) -> u64 {
 )]
 fn u64_to_f64(amount: u64) -> f64 {
     amount as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{aggregate_stage_durations, parse_prometheus_samples};
+
+    #[test]
+    fn stage_duration_report_preserves_family_stage_and_status() {
+        let samples = parse_prometheus_samples(
+            "zinder_ingest_block_derive_stage_duration_seconds_count{stage=\"block_parse\",status=\"ok\"} 4\n\
+             zinder_ingest_block_derive_stage_duration_seconds_sum{stage=\"block_parse\",status=\"ok\"} 1.5\n",
+        );
+
+        let stats = aggregate_stage_durations(&samples);
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].family, "block_derive");
+        assert_eq!(stats[0].stage, "block_parse");
+        assert_eq!(stats[0].status, "ok");
+        assert_eq!(stats[0].call_count, 4);
+        assert!((stats[0].task_seconds - 1.5).abs() < f64::EPSILON);
+    }
 }

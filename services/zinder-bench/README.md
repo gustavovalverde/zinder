@@ -95,14 +95,21 @@ Omit `--report` to print the JSON to stdout (progress logs go to stderr).
   histogram seconds, keyed by caller (`block_prefetch`, `commit_fallback`,
   `derive_hydration`, `retention_sweep`, `query`), table, and operation.
 - `multi_get`: per-caller requested and resolved key totals.
+- `stage_durations`: cumulative task seconds and call counts for block-prepare
+  stages (`artifact_derive`, `transparent_prevout_prefetch`) and block-derive
+  stages (`block_parse`, `identity_validation`, `compact_artifacts`,
+  `transparent_output_artifacts`, `transaction_artifacts`,
+  `block_header_artifact`, and `block_blob_artifact`).
 - `rocksdb_tickers`: exported `RocksDB` statistics tickers (bloom, block cache,
   bytes read/written, stall micros, compaction bytes) per store role.
 
 ## Scope and faithfulness
 
 - Source transport differs from production (fixture files instead of JSON-RPC),
-  so source-fetch timing is not representative. Everything downstream (prepare,
-  prefetch, reassembly, commit, derive) runs the real pipeline against the real
+  so source-fetch timing is not representative. Fixture replay parses only the
+  block header before handing the payload to canonical preparation, matching the
+  production batch-source boundary. Everything downstream (prepare, prefetch,
+  reassembly, commit, and derive) runs the real pipeline against the real
   canonical store.
 - Shielded subtree roots that complete inside the range are captured verbatim
   and served during replay, so post-Sapling ranges commit correctly.

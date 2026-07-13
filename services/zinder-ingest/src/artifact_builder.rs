@@ -1,6 +1,6 @@
 //! Deterministic source-block artifact builders.
 
-use std::fmt;
+use std::{fmt, time::Instant};
 
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ use zinder_proto::compat::lightwalletd::{
     CompactTx, CompactTxIn, TxOut as CompactTxOut,
 };
 use zinder_source::{
-    SourceBlock, block_header_info_from_raw_block_bytes, parse_transaction_public_fact_set,
+    SourceBlock, block_header_info_from_raw_block_bytes, transaction_public_fact_set_from_parsed,
 };
 use zinder_store::RawBlobRetention;
 
@@ -337,39 +337,56 @@ pub fn derive_block_with_raw_blob_policy(
     raw_blob_policy: RawBlobPolicy,
 ) -> Result<DerivedBlockArtifacts, ArtifactDeriveError> {
     validate_source_block_payload(source_block)?;
-    let parsed_block = parse_source_block(source_block)?;
-    validate_parsed_block_identity(&parsed_block, source_block)?;
-    let (compact_transactions, tree_size_additions) = compact_transactions(&parsed_block)?;
+    let parsed_block =
+        measure_block_derive_stage("block_parse", || parse_source_block(source_block))?;
+    measure_block_derive_stage("identity_validation", || {
+        validate_parsed_block_identity(&parsed_block, source_block)
+    })?;
+    let (compact_transactions, tree_size_additions) =
+        measure_block_derive_stage("compact_artifacts", || compact_transactions(&parsed_block))?;
     let transparent_outputs_by_outpoint =
-        transparent_output_artifacts(source_block, &compact_transactions)?;
-    let transaction_artifacts = derive_transaction_artifacts_from_parsed(
-        &parsed_block,
-        source_block,
-        activations,
-        raw_blob_policy,
-    )?;
-    let block_header_bytes = parsed_block
-        .header
-        .zcash_serialize_to_vec()
-        .map_err(|source| ArtifactDeriveError::BlockHeaderSerializationFailed { source })?;
-    let block_header = BlockHeaderArtifact::from_header_info_with_block_size(
-        block_header_info_from_raw_block_bytes(source_block.height, &source_block.raw_block_bytes)
-            .map_err(|source| ArtifactDeriveError::BlockHeaderParseFailed {
-                reason: source.to_string(),
-            })?,
-        usize_to_u64_saturating(source_block.raw_block_bytes.len()),
-    );
-    let block_blob = if raw_blob_policy.writes_block_blobs() {
-        Some(BlockBlobArtifact::new(
-            source_block.height,
-            source_block.hash,
-            source_block.parent_hash,
-            source_block.raw_block_bytes.clone(),
-        ))
-    } else {
-        record_raw_blob_disabled("block_blob", 1);
-        None
-    };
+        measure_block_derive_stage("transparent_output_artifacts", || {
+            transparent_output_artifacts(source_block, &compact_transactions)
+        })?;
+    let transaction_artifacts = measure_block_derive_stage("transaction_artifacts", || {
+        derive_transaction_artifacts_from_parsed(
+            &parsed_block,
+            source_block,
+            activations,
+            raw_blob_policy,
+        )
+    })?;
+    let (block_header_bytes, block_header) =
+        measure_block_derive_stage("block_header_artifact", || {
+            let block_header_bytes = parsed_block
+                .header
+                .zcash_serialize_to_vec()
+                .map_err(|source| ArtifactDeriveError::BlockHeaderSerializationFailed { source })?;
+            let block_header = BlockHeaderArtifact::from_header_info_with_block_size(
+                block_header_info_from_raw_block_bytes(
+                    source_block.height,
+                    &source_block.raw_block_bytes,
+                )
+                .map_err(|source| ArtifactDeriveError::BlockHeaderParseFailed {
+                    reason: source.to_string(),
+                })?,
+                usize_to_u64_saturating(source_block.raw_block_bytes.len()),
+            );
+            Ok((block_header_bytes, block_header))
+        })?;
+    let block_blob = measure_block_derive_stage("block_blob_artifact", || {
+        Ok(if raw_blob_policy.writes_block_blobs() {
+            Some(BlockBlobArtifact::new(
+                source_block.height,
+                source_block.hash,
+                source_block.parent_hash,
+                source_block.raw_block_bytes.clone(),
+            ))
+        } else {
+            record_raw_blob_disabled("block_blob", 1);
+            None
+        })
+    })?;
     let partial_compact_block = CompactBlock {
         height: u64::from(source_block.height.value()),
         hash: encode_internal_block_hash(source_block.hash).to_vec(),
@@ -468,9 +485,7 @@ fn derive_transaction_artifacts_from_parsed(
     for (tx_index_in_block, transaction) in parsed_block.transactions.iter().enumerate() {
         let tx_index_in_block = u32::try_from(tx_index_in_block)
             .map_err(|_| ArtifactDeriveError::TransactionIndexOverflow)?;
-        let payload_bytes = transaction
-            .zcash_serialize_to_vec()
-            .map_err(|source| ArtifactDeriveError::TransactionSerializationFailed { source })?;
+        let serialized_size = transaction.zcash_serialized_size();
         let transaction_id = TransactionId::from_bytes(transaction.hash().0);
         let location = TransactionLocation::new(
             transaction_id,
@@ -478,8 +493,9 @@ fn derive_transaction_artifacts_from_parsed(
             source_block.hash,
             tx_index_in_block,
         );
-        let fact_set = parse_transaction_public_fact_set(
-            &payload_bytes,
+        let fact_set = transaction_public_fact_set_from_parsed(
+            transaction,
+            serialized_size,
             Some(source_block.height),
             activations,
         )
@@ -502,6 +518,9 @@ fn derive_transaction_artifacts_from_parsed(
             fact_set.intrinsic_value_balances,
         ));
         if raw_blob_policy.writes_transaction_blobs() {
+            let payload_bytes = transaction
+                .zcash_serialize_to_vec()
+                .map_err(|source| ArtifactDeriveError::TransactionSerializationFailed { source })?;
             transaction_blobs.push(TransactionBlobArtifact::new(location, payload_bytes));
         } else {
             record_raw_blob_disabled("transaction_blob", 1);
@@ -520,6 +539,29 @@ fn derive_transaction_artifacts_from_parsed(
 fn record_raw_blob_disabled(table: &'static str, row_count: u64) {
     metrics::counter!("zinder_ingest_raw_blob_disabled_total", "table" => table)
         .increment(row_count);
+}
+
+fn record_block_derive_stage<T>(
+    stage: &'static str,
+    started_at: Instant,
+    outcome: &Result<T, ArtifactDeriveError>,
+) {
+    metrics::histogram!(
+        "zinder_ingest_block_derive_stage_duration_seconds",
+        "stage" => stage,
+        "status" => if outcome.is_ok() { "ok" } else { "error" }
+    )
+    .record(started_at.elapsed());
+}
+
+fn measure_block_derive_stage<T>(
+    stage: &'static str,
+    operation: impl FnOnce() -> Result<T, ArtifactDeriveError>,
+) -> Result<T, ArtifactDeriveError> {
+    let started_at = Instant::now();
+    let outcome = operation();
+    record_block_derive_stage(stage, started_at, &outcome);
+    outcome
 }
 
 fn usize_to_u64_saturating(amount: usize) -> u64 {

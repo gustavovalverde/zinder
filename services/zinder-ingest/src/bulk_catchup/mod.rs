@@ -26,6 +26,8 @@ use crate::source_recovery::{
 use block_prepare::{BulkCatchupBlockPrepareStreamConfig, build_block_prepare_stream};
 use commit_reassembly::run_commit_reassembly;
 pub(crate) use flush::flush_pending_bulk_catchup_writes;
+#[cfg(test)]
+use source_fetch::SourceSegmentPlan;
 use source_fetch::SourceSegmentSizer;
 use watermark::record_stage_duration;
 
@@ -920,6 +922,7 @@ mod tests {
         );
 
         sizer.record_segment(
+            BlockHeight::new(1),
             SourceChainSegmentStats::from_response_payload_bytes(20 * 1024 * 1024)
                 .with_connected_blocks(32)
                 .with_added_splits(1),
@@ -949,6 +952,7 @@ mod tests {
             BlockHeight::new(1),
         );
         sizer.record_segment(
+            BlockHeight::new(1),
             SourceChainSegmentStats::from_response_payload_bytes(20 * 1024 * 1024)
                 .with_connected_blocks(32)
                 .with_added_splits(1),
@@ -966,6 +970,48 @@ mod tests {
     }
 
     #[test]
+    fn source_segment_sizer_ignores_late_feedback_from_previous_upgrade()
+    -> Result<(), Box<dyn Error>> {
+        let activations = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x76b8_09bb),
+                activation_height: BlockHeight::new(5),
+                name: "Sapling".to_owned(),
+            }],
+        )?;
+        let mut sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(32).ok_or("invalid max segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid target bytes")?,
+            Arc::new(activations),
+            BlockHeight::new(1),
+        );
+        sizer.record_segment(
+            BlockHeight::new(1),
+            SourceChainSegmentStats::from_response_payload_bytes(20 * 1024 * 1024)
+                .with_connected_blocks(32)
+                .with_added_splits(1),
+        );
+        assert_eq!(
+            sizer.blocks_for_remaining_range(BlockHeight::new(5), BlockHeight::new(100)),
+            NonZeroU32::new(32)
+        );
+
+        sizer.record_segment(
+            BlockHeight::new(1),
+            SourceChainSegmentStats::from_response_payload_bytes(32 * 1024 * 1024)
+                .with_connected_blocks(32)
+                .with_added_splits(1),
+        );
+
+        assert_eq!(
+            sizer.blocks_for_remaining_range(BlockHeight::new(5), BlockHeight::new(100)),
+            NonZeroU32::new(32)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn source_segment_sizer_uses_heaviest_density_sample() -> Result<(), Box<dyn Error>> {
         let mut sizer = SourceSegmentSizer::new(
             NonZeroU32::new(32).ok_or("invalid max segment blocks")?,
@@ -975,10 +1021,12 @@ mod tests {
         );
 
         sizer.record_segment(
+            BlockHeight::new(1),
             SourceChainSegmentStats::from_response_payload_bytes(12 * 1024 * 1024)
                 .with_connected_blocks(12),
         );
         sizer.record_segment(
+            BlockHeight::new(13),
             SourceChainSegmentStats::from_response_payload_bytes(12 * 1024 * 1024)
                 .with_connected_blocks(4),
         );
@@ -986,6 +1034,37 @@ mod tests {
         assert_eq!(
             sizer.blocks_for_remaining_range(BlockHeight::new(17), BlockHeight::new(100)),
             NonZeroU32::new(4)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_segment_sizer_waits_for_initial_density_feedback() -> Result<(), Box<dyn Error>> {
+        let mut sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(32).ok_or("invalid max segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid target bytes")?,
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        );
+
+        assert_eq!(
+            sizer.plan_segment(BlockHeight::new(1), BlockHeight::new(100)),
+            SourceSegmentPlan::Ready(NonZeroU32::new(32).ok_or("invalid planned blocks")?)
+        );
+        sizer.record_segment_scheduled(BlockHeight::new(1));
+        assert_eq!(
+            sizer.plan_segment(BlockHeight::new(33), BlockHeight::new(100)),
+            SourceSegmentPlan::AwaitingFeedback
+        );
+
+        sizer.record_segment(
+            BlockHeight::new(1),
+            SourceChainSegmentStats::from_response_payload_bytes(12 * 1024 * 1024)
+                .with_connected_blocks(12),
+        );
+        assert_eq!(
+            sizer.plan_segment(BlockHeight::new(33), BlockHeight::new(100)),
+            SourceSegmentPlan::Ready(NonZeroU32::new(12).ok_or("invalid adapted blocks")?)
         );
         Ok(())
     }
