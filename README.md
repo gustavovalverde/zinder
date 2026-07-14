@@ -93,34 +93,22 @@ Point a wallet at `localhost:9101` (native `WalletQuery` gRPC) as soon as the re
 
 ## Architecture at a glance
 
-Zinder is one product split into independently scalable planes. One process writes canonical chain state; every other plane reads from it through a typed contract. The boundary rule is enforced by review, not by code: ingest is the only writer, and reads pin to a single `ChainEpoch` so a sync batch never mixes data across competing tips.
+Zinder indexes the chain once and serves one shared chain view to wallets,
+applications, and explorers. Canonical facts remain the source of truth, while
+selected projections provide rebuildable views for specific query workloads.
 
 ```mermaid
 flowchart LR
-    Zebra["Zebra node"]
-
-    subgraph zinder["Zinder"]
-        direction TB
-        Source["zinder-source<br/>(source adapters)"]
-        Ingest["zinder-ingest<br/>(sole writer)"]
-        Store[("zinder-store<br/>canonical RocksDB")]
-        Query["zinder-query<br/>WalletQuery API"]
-        Compat["zinder-compat-lightwalletd<br/>CompactTxStreamer"]
-        Explorer["zinder-explorer<br/>(optional)"]
-
-        Source --> Ingest
-        Ingest --> Store
-        Store --> Query
-        Compat --> Query
-        Ingest -. "ChainEvents subscription" .-> Query
-        Ingest -. "ChainEvents subscription" .-> Explorer
-    end
-
-    Zebra --> Source
-    Query --> NativeClients["native wallets, Rust libraries, applications"]
-    Compat --> LightwalletdClients["existing lightwalletd clients"]
-    Explorer --> Explorers["explorers, analytics"]
+    Zebra["Zebra node"] --> Ingest["zinder-ingest<br/>indexes the chain once"]
+    Ingest --> Canonical[("Canonical chain view<br/>shared source of truth")]
+    Canonical --> APIs["Zinder APIs<br/>WalletQuery · lightwalletd · ExplorerQuery"]
+    Canonical -->|"rebuildable events"| Projections[("Selected derived views<br/>wallet or complete")]
+    Projections --> APIs
+    APIs --> Consumers["Wallets · applications · explorers"]
 ```
+
+The [fact-first architecture](docs/architecture/fact-first-indexer.md) explains
+how canonical indexing, projection selection, and API serving fit together.
 
 ### Planes
 

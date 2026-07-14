@@ -4,19 +4,47 @@ Status: Current architecture
 
 Zinder is a fact-first Zcash indexer. The canonical store keeps typed public
 facts in hot tables, keeps raw payloads only as optional blob artifacts, and
-feeds rebuildable product projections through durable event streams.
+feeds selected, rebuildable projections through durable event streams.
 
 This document owns the storage vocabulary, ingest shape, derive-tailer
 boundary, source-boundary expectations, and public naming rules for that model.
 
 ## Boundary Model
 
-Zinder is split into three durable planes.
+Zinder indexes the chain once and serves one shared chain view through native,
+lightwalletd-compatible, and explorer APIs. Canonical facts remain the source
+of truth, while selected projections provide rebuildable views for specific
+query workloads.
+
+```mermaid
+flowchart LR
+    Zebra["Zebra node"] --> Ingest["zinder-ingest<br/>indexes the chain once"]
+    Ingest --> Canonical[("Canonical chain view<br/>shared source of truth")]
+    Canonical --> APIs["Zinder APIs<br/>WalletQuery · lightwalletd · ExplorerQuery"]
+    Canonical -->|"rebuildable events"| Projections[("Selected derived views<br/>wallet or complete")]
+    Projections --> APIs
+    APIs --> Consumers["Wallets · applications · explorers"]
+```
+
+Three independent configuration choices shape the indexed workload without
+changing this architecture:
+
+| Configuration | Values | Question it answers |
+| --- | --- | --- |
+| `ingest.modifiers.coverage` | `explicit`, `wallet-serving` | How far back should canonical indexing begin? |
+| `storage.raw_blob_policy` | `none`, `transactions`, `all` | Which original raw payloads should the canonical store retain? |
+| `ingest.projection_preset` | `wallet`, `complete` | Which derived views should Zinder build? |
+
+These choices are orthogonal. Coverage selects the canonical history floor,
+raw-blob policy selects retained source bytes, and the projection preset selects
+derived views.
+
+The implementation is split into three durable planes.
 
 | Plane | Owns | Must not own |
 | --- | --- | --- |
 | Canonical index plane | Epoch-consistent block identity, transaction location, transaction facts, transparent output facts, compact wallet artifacts, tree state, subtree roots, mempool events, chain events | Explorer summaries, analytics views, per-consumer state |
-| Derive plane | Rebuildable explorer and analytics projections fed by canonical events | Canonical truth, wallet correctness, source-node RPCs |
+| Derive plane | Selected, rebuildable wallet-serving, explorer, and analytics projections fed by canonical events | Canonical truth, source-node RPCs, per-wallet state |
 | Query planes | Wallet-shaped and explorer-shaped gRPC surfaces over canonical and derived facts | Storage migrations, background projection, chain ingestion |
 
 The canonical plane may duplicate raw payloads as cold blobs for explicit raw

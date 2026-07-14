@@ -21,9 +21,10 @@ stay ignorant of the derive plane ([ADR-0003](0003-canonical-storage-access-boun
 
 ## Decision
 
-A bundled derive consumer records durable spender identity, and canonical
-retention maintenance is clamped so it never deletes a fact the consumer has not yet
-recorded.
+A bundled derive consumer records durable spender identity from each child
+transaction's intrinsic input and mined location. The canonical retention sweep
+is clamped so it never deletes a spend fact before the consumer has durably
+materialized the corresponding block.
 
 ### Authority split
 
@@ -43,10 +44,12 @@ output index) valued with the spending transaction id, spending block hash,
 spending height, and transparent input index. A per-height index column family,
 written for every applied block even when empty, drives reorg rewind and reports
 the projection's durable height through `last_materialized_height_ascending`.
-Coinbase inputs carry no prevout and never produce a row. A block whose spend
-facts are unavailable at replay time is a hard error, never a skip: the durable
-height gates irreversible canonical deletion, so it must not advance past a
-block whose spenders the consumer could not observe.
+Coinbase inputs carry no prevout and never produce a row. Parent-output
+hydration is deliberately not an input to this projection: the child input
+already identifies the spent outpoint, input index, spending transaction, and
+mined block. A spend of an output below a checkpoint therefore produces the
+same durable row as a spend whose parent output is retained. Missing or offline
+parent facts must not cause the consumer to skip that row.
 
 Artifact schema 18 stores every observed input and the resolved spend facts in
 the canonical block-local spend index. Transparent-retention maintenance deletes the
@@ -122,3 +125,6 @@ projection.
   the canonical block-local replay source remains durable.
 - Deploying artifact schema 18/store schema 13 onto any older canonical volume
   fails closed and requires one genesis rebuild to establish that durable source.
+- The projection's schema can rebuild from retained transaction inputs, but a
+  new version must still preserve durable-commit-before-retention-release
+  ordering before it replaces the active projection.

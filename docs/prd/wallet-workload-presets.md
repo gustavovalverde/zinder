@@ -143,7 +143,7 @@ The raw payload policy remains a separate operator choice:
 - `transactions`: retain transaction blobs only.
 - `all`: retain block and transaction blobs.
 
-The wallet preset defaults to `transactions` and rejects `none` when the deployment claims the complete wallet and lightwalletd-compatible contract. A full-block wallet selects `all`. The complete projection preset does not imply `all`.
+Projection selection does not mutate payload retention. A deployment that claims the complete wallet and lightwalletd-compatible contract also selects `ingest.modifiers.coverage = "wallet-serving"`; that coverage profile defaults to `transactions` and rejects `none`. A full-block wallet selects `all`. The complete projection preset does not imply `all`.
 
 ### R-READ-1. Reads depend on projection-specific state
 

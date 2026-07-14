@@ -17,7 +17,8 @@ lcov.info
 CLAUDE.local.md
 
 # Local discovery notes kept out of the tracked doc tree.
-docs/investigations/
+docs/investigations/*
+!docs/investigations/2026-07-12-wallet-workload-preset-implementation-evidence.md
 
 # Browser-automation scratch (Playwright MCP).
 .playwright-mcp/

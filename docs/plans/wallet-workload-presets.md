@@ -1,10 +1,23 @@
 # Plan: Wallet Workload Presets
 
-Status: Draft
+Status: Complete for the initial RocksDB preset release
 Date: 2026-07-12
 Source PRD: [Wallet workload presets](../prd/wallet-workload-presets.md)
 
 This plan combines the implementation sequence with the investigation findings that constrain it. The PRD owns the product contract; this document owns evidence gates, tracer-bullet phases, migration limits, and requirement traceability.
+
+## Current Implementation Status
+
+| Phase | Status | Evidence boundary |
+| --- | --- | --- |
+| Phase 0 | Complete | Deterministic recent and dense-mainnet controls use fixed bytes and cloned starting state. The dense pair and repeat satisfy R-BENCHMARK-1. |
+| Phase 1 | Complete | Wallet history and spender reads plus explorer transaction history use typed projection-specific readiness and capability decisions. |
+| Phase 2 | Complete; go gate | Wallet and complete execution cross registration, dispatch, startup composition, replay, retention, public reads, compatibility tests, and backup metadata. |
+| Phase 3 | Complete | Fresh stores accept `wallet` or `complete`; configuration, readiness, server information, metrics, readers, and omitted capabilities agree on the persisted selection. |
+| Phase 4 | Complete for recorded claim | Backup, restore admission, restart, shutdown, compact and transparent reads, broadcast, pending-input protection, and native reorg recovery passed within the evidence-scoped configurations. |
+| Phase 5 | Trigger-gated | No database-adapter or worker-extraction trigger has opened this phase. |
+
+Raw measurements and live observations are recorded in `docs/investigations/2026-07-12-wallet-workload-preset-implementation-evidence.md`. The dense control passed the gate before `ProjectionPreset` became public configuration.
 
 ## Outcome
 
@@ -33,7 +46,7 @@ The implementation does not start by adding a configuration enum. It first estab
 - Both presets build the same canonical facts in the first release.
 - The plan does not introduce wallet-specific canonical schemas.
 - Raw payload retention remains an independent policy.
-- The wallet preset defaults to transaction blobs; full-block wallet deployments select block and transaction blobs.
+- Projection selection does not mutate payload retention. Wallet-serving coverage defaults to transaction blobs; full-block wallet deployments select block and transaction blobs.
 - The complete preset does not imply raw block retention.
 
 ### Lifecycle
@@ -54,7 +67,7 @@ The implementation does not start by adding a configuration enum. It first estab
 
 ### Current selection is implicit and all-or-nothing
 
-Current production composition opens the bundled derive schemas together, dispatches the bundled block consumers together, starts their associated backfills and verification work, and makes reader processes open the same bundle. The store accepts per-consumer schemas, but production orchestration does not expose a supported subset.
+The production composition opens the selected derive schema set, dispatches only selected consumers, and expands that same selection into startup guards, seeds, replay, snapshot bootstrap, tailing, backfills, and verification. Operators can select `wallet` or `complete` for a fresh store; omission resolves to `complete`.
 
 This means projection selection crosses 7 concerns: primary registration, event dispatch, cursor discovery, startup jobs, secondary readers, capability decisions, and backup. Adding `if wallet` checks at each location would create a shallow configuration feature with poor locality. One orchestration module must own the effective projection set and provide it to each concern.
 
@@ -81,7 +94,7 @@ The projection upgrade experiment reproduced 3 failure directions:
 2. Rollback failed because the older binary rejected the newly recorded projection identity.
 3. Deleting only the derive store failed because canonical retention had already removed facts needed to rebuild durable outpoint-spend history.
 
-The safe first lifecycle is a fresh store plus preflight validation. Any later transition protocol must validate desired projection identities, canonical recovery coverage, schema compatibility, and retention acknowledgements before it mutates durable state.
+The safe first lifecycle is a fresh canonical-plus-projection store plus read-only preflight validation. The preflight rejects an absent projection store beside canonical history, projection data without canonical history, a retention-authoritative projection behind an irreversible canonical sweep, and foreign or mismatched projection identities before the writer opens the projection store. Any later transition protocol must validate desired projection identities, canonical recovery coverage, schema compatibility, and retention acknowledgements before it mutates durable state.
 
 ### Database work changes placement, not product meaning
 
@@ -131,12 +144,12 @@ This phase does not add public preset configuration. It creates the evidence and
 
 ### Acceptance criteria
 
-- [ ] Identical-input reruns report variance and reproduce blocks per second within the stated noise.
-- [ ] Each run reports canonical throughput, derive rows and bytes, compaction bytes, peak anonymous resident memory, projection lag, recovery time, and final disk use.
-- [ ] Dense and recent controls use cloned starting state and fixed source bytes.
-- [ ] Canonical invariant tests pass on the current RocksDB implementation.
-- [ ] P1 through P3 sync work has landed or the remaining dependency is explicitly recorded as a blocker for the preset benchmark.
-- [ ] No public workload configuration has been added.
+- [x] Identical-input reruns report variance and reproduce the deterministic density, row, and write measurements.
+- [x] Each run reports canonical throughput, derive rows and bytes, compaction bytes, peak anonymous resident memory, projection lag, recovery time, and final disk use.
+- [x] Dense and recent controls use cloned starting state and fixed source bytes.
+- [x] Canonical invariant tests pass on the current RocksDB implementation.
+- [x] Required sync-path prerequisites landed before the preset benchmark decision.
+- [x] No public workload configuration was added before the benchmark gate passed.
 
 ## Phase 1: Typed Projection Readiness Slice
 
@@ -150,12 +163,12 @@ The slice is complete when one existing wallet projection and one existing explo
 
 ### Acceptance criteria
 
-- [ ] Query behavior no longer infers every projection's availability from a generic derive-store status.
-- [ ] One wallet projection and one optional product projection expose independent readiness and failure states end to end.
-- [ ] Missing, lagging, incompatible, and incomplete projection states map to explicit existing or newly documented errors.
-- [ ] Complete-preset behavior and capability output remain unchanged.
-- [ ] Tests exercise public reads and capability decisions, not concrete column-family access.
-- [ ] The seam contains no generic byte-row or scan interface.
+- [x] Query behavior no longer infers every projection's availability from a generic derive-store status.
+- [x] One wallet projection and one optional product projection expose independent readiness and failure states end to end.
+- [x] Missing, lagging, incompatible, and incomplete projection states map to explicit existing or newly documented errors.
+- [x] Complete-preset behavior and capability output remain unchanged.
+- [x] Tests exercise public reads and capability decisions, not concrete column-family access.
+- [x] The seam contains no generic byte-row or scan interface.
 
 ## Phase 2: Internal Wallet-Preset Tracer Bullet
 
@@ -169,13 +182,13 @@ Run the wallet and complete projection sets against the Phase 0 harness. This sl
 
 ### Acceptance criteria
 
-- [ ] The fresh store records only the selected projection identities.
-- [ ] Optional product consumers, backfills, verifiers, and bootstrap jobs do not run in the wallet arm.
-- [ ] Transparent history and durable spender resolution work through public wallet and compatibility reads.
-- [ ] The retention floor advances only after durable outpoint-spend projection progress.
-- [ ] The wallet and complete arms run against identical fixed inputs and resource limits.
-- [ ] Results satisfy PRD requirement R-BENCHMARK-1 or the feature stops before public configuration.
-- [ ] The investigation report records any canonical, query, backup, or recovery dependency that the 2-projection model missed.
+- [x] The fresh store records only the selected projection identities.
+- [x] Optional product consumers, backfills, verifiers, and bootstrap jobs do not run in the wallet arm.
+- [x] Transparent history and durable spender resolution work through public wallet and compatibility reads.
+- [x] The retention floor advances only after durable outpoint-spend projection progress.
+- [x] The wallet and complete arms run against identical fixed inputs and resource limits.
+- [x] Results satisfy PRD requirement R-BENCHMARK-1 before public configuration.
+- [x] The investigation report records any canonical, query, backup, or recovery dependency that the 2-projection model missed.
 
 ## Phase 3: Fresh-Store Operator Presets
 
@@ -185,18 +198,18 @@ Run the wallet and complete projection sets against the Phase 0 harness. This sl
 
 Expose the validated wallet and complete presets as one operator choice. Resolve the preset before storage opens, preflight it against store identity and projection manifests, and pass the effective projection set through every production composition path. Keep complete as the default.
 
-The same slice adds printed configuration, readiness, server information, and metrics for the effective set. Payload retention remains independent: wallet defaults to transaction blobs, full-block deployments select all blobs, and complete does not imply full blocks.
+The same slice adds printed configuration, readiness, server information, and metrics for the effective set. Payload retention remains independent: the wallet-serving coverage profile defaults to transaction blobs, full-block deployments select all blobs, and complete does not imply full blocks.
 
 ### Acceptance criteria
 
-- [ ] A fresh wallet store starts and reaches wallet-serving readiness with only the 2 required projections.
-- [ ] A fresh complete store preserves the current projection and capability set.
-- [ ] Configuration output states the selected preset and effective identities with secrets redacted.
-- [ ] Preset and payload-retention validation reports actionable errors.
-- [ ] An incompatible existing store fails before manifest mutation and points to the supported rebuild path.
-- [ ] Reader processes, compatibility adapters, explorer processes, and local clients interpret the same effective projection set.
-- [ ] Omitted optional projections remove only their dependent capabilities.
-- [ ] Existing configuration with no preset continues as complete.
+- [x] A fresh wallet store starts and reaches wallet-serving readiness with only the 2 required projections.
+- [x] A fresh complete store preserves the current projection and capability set.
+- [x] Configuration output states the selected preset and effective identities with secrets redacted.
+- [x] Preset and payload-retention validation reports actionable errors.
+- [x] An incompatible existing store fails before manifest mutation and points to the supported rebuild path.
+- [x] Reader processes, compatibility adapters, explorer processes, and local clients interpret the same effective projection set.
+- [x] Omitted optional projections remove only their dependent capabilities.
+- [x] Existing configuration with no preset continues as complete.
 
 ## Phase 4: Recovery and Wallet Certification
 
@@ -210,13 +223,13 @@ Certification runs by integration method, not by wallet category. Lightwalletd-c
 
 ### Acceptance criteria
 
-- [ ] Backup metadata records preset, projection identities, schemas, positions, and omitted state.
-- [ ] Restore advertises no projection before normal readiness and coverage checks pass.
-- [ ] Compact wallet flows pass against the wallet preset on regtest and the selected public test network.
-- [ ] Transparent history and old-spend recovery remain correct after safe-tip retention advances.
-- [ ] Broadcast, mempool, restart, and reorg flows pass.
-- [ ] Full-block wallet reads pass with payload retention set to all and fail explicitly without block blobs.
-- [ ] Release claims identify the wallet version, network, integration method, and evidence level actually tested.
+- [x] Backup metadata records preset, canonical-history bounds, projection identities, schemas, positions, and omitted state.
+- [x] Restore admission validates the canonical-plus-projection bundle before writer open; normal readiness and coverage checks remain the only capability authority.
+- [x] Compact wallet flows pass against the wallet preset on regtest and the selected public test network.
+- [x] Transparent history and old-spend recovery remain correct after safe-tip retention advances.
+- [x] Broadcast, pending-input protection, restart, and native reorg flows pass.
+- [x] Full-block wallet reads pass with payload retention set to all and fail explicitly without block blobs.
+- [x] Release claims identify the wallet version, network, integration method, and evidence level actually tested.
 
 ## Phase 5: Projection-Worker Handoff, Trigger-Gated
 

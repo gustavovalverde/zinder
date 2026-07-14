@@ -36,6 +36,14 @@ derive reads without also adding the public retention floor, cursor-expiry
 semantics, and tests proving readers fail explicitly instead of returning
 silent partial history.
 
+## Workload selection
+
+`zinder-ingest` exposes one closed `ingest.projection_preset` choice. `wallet` materializes `transparent_address_transaction_history` and `transparent_outpoint_spend`; `complete` materializes every projection bundled with the release and remains the default. The preset expands through one startup plan that owns registration, dispatch, replay, optional background work, reader discovery, capability decisions, and backup metadata.
+
+Preset selection is supported only when creating a fresh canonical-plus-projection store. Reopening a store with a different preset fails before manifest reconciliation and directs the operator to rebuild at a new empty storage path. Expanding, reducing, or reclaiming an existing projection store requires a separate migration design.
+
+The preset does not change canonical artifacts, event history, historical coverage, or `storage.raw_blob_policy`. Wallet-serving coverage and raw payload retention remain separate choices because a wallet may need transaction blobs, full block blobs, or neither independently of which read models are materialized.
+
 ## When to use the derive plane
 
 A feature belongs in the derive plane when **any** of the following are true:
@@ -222,7 +230,7 @@ Derive views version their schemas independently from canonical artifacts and fr
 
 Each consumer declares its schema version alongside its name, column families, and explicitly compatible older row versions in one `DeriveConsumerSchema`. The manifest records both the latest writer and every row schema still present. Exact matches and cumulative compatible predecessors with unchanged column-family ownership preserve rows and cursors; incompatible forward changes rebuild only that consumer. A persisted newer version, missing compatibility for any retained row version, or an undeclared manifest consumer fails closed. Secondary readers revalidate this contract after every catch-up. Reconciliation clears rows with range tombstones rather than dropping a column family in place, because a `drop_cf` edit crashes a secondary reader replaying it during catch-up. The manifest layout, compatibility rule, deployment ordering, crash-safe reconciliation, secondary-reader validation, and narrowed `DERIVE_STORE_FORMAT_VERSION` container gate are defined in [ADR-0028](../adrs/0028-per-consumer-derive-schema-versioning.md).
 
-The rebuild path is conditional, not a failsafe. Scoping rebuild to one consumer keeps unrelated data intact, but the consumer must still prove its source coverage. `TransactionFeesConsumer` version 2 is row-compatible with version 1: new writes omit unprovable shielded fees, readers suppress legacy values, and missing or partial input rows recover from retained parent transaction facts without clearing the projection. The `transparent_outpoint_spend` consumer has a stricter limit: the canonical safe-tip sweep deletes source rows behind its durable height, so an incompatible schema bump can escalate to a full canonical re-ingest ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
+The rebuild path is conditional, not a failsafe. Scoping rebuild to one consumer keeps unrelated data intact, but the consumer must still prove its source coverage. `TransactionFeesConsumer` version 2 is row-compatible with version 1: new writes omit unprovable shielded fees, readers suppress legacy values, and missing or partial input rows recover from retained parent transaction facts without clearing the projection. The wallet-critical `transparent_outpoint_spend` consumer derives spender identity from durable child transaction inputs rather than swept parent spend facts, so checkpoint-crossing spends and scoped rebuilds do not depend on parent-output hydration. Its replacement still must preserve durable-commit-before-retention-release ordering ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
 
 `TransactionHistoryConsumer` version 1 is the reference additive projection
 with atomic projection state. It owns the `transaction_history` column family

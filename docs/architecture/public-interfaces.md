@@ -464,6 +464,9 @@ mempool_cursor_at_risk_warning_minutes = 12
 # for the full enum vocabulary (`auto`, `zebra-json-rpc`,
 # `zebra-indexer-grpc`, `zebra-in-process`).
 source = "zebra-json-rpc"
+# Closed derive workload. Defaults to "complete". Selecting a different preset
+# requires a fresh canonical-plus-projection store.
+projection_preset = "complete" # "wallet" | "complete"
 # Chain-truth invariant; classifier defaults to this.
 reorg_window_blocks = 100
 
@@ -597,6 +600,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_STORAGE__DERIVE__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.derive.rocksdb.statistics_level` | Derive-store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md). |
 | `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Raw-byte blob write policy: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so fact-first indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because lightwalletd transaction and transparent-history methods require retained bytes. |
+| `ZINDER_INGEST__PROJECTION_PRESET` | zinder-ingest | Optional | `ingest.projection_preset` | Closed derive workload: `"wallet"` or `"complete"`. Defaults to `"complete"`. Selection is supported only when creating a fresh canonical-plus-projection store. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds finalization, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__PHASES__CATCHUP_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.phases.catchup_threshold_blocks` | Gap (in blocks) at which the unified loop transitions between `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
 | `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_max_blocks` | Block count per bulk-catchup commit batch. Defaults to 1000. |
@@ -639,7 +643,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 
 ### `--print-config`
 
-Every production binary exposes `--config` and `--print-config`. The print form shows explicit `[REDACTED]` markers for every sensitive field regardless of how the value was supplied (config file, env var, or CLI override). The output round-trips: feeding `--print-config` back as `--config` produces the same effective configuration.
+Every production binary exposes `--config` and `--print-config`. The print form shows explicit `[REDACTED]` markers for every sensitive field regardless of how the value was supplied (config file, env var, or CLI override). `zinder-ingest` prints `ingest.projection_preset` plus an `effective_projection_identities` comment derived from the closed preset; identities are observable but are not independently configurable. The output round-trips: feeding `--print-config` back as `--config` produces the same effective configuration.
 
 ### Avoid ambiguous names
 
@@ -666,6 +670,8 @@ message zinder.v1.ops.ServerInfo {
   string service_version = 3;          // semver of the running binary
   repeated string capabilities = 4;    // capability strings; clients match exact strings
   uint32 contract_revision = 5;        // monotonic in-place-revision marker (ADR-0027)
+  string projection_preset = 6;        // detected closed workload, or empty with no projection store
+  repeated string projection_identities = 7; // stable identities selected by that workload
 }
 
 message WalletServerInfo {
@@ -686,6 +692,12 @@ message NodeCapabilitiesDescriptor {
 ```
 
 `contract_revision` is a monotonically increasing marker, incremented whenever the semantics of an existing wire surface are revised in place. Capability strings identify wire shapes additively; the revision marker covers what they cannot: an RPC whose name and message tags survive while its meaning changes. The value is the single `zinder_proto::CONTRACT_REVISION` constant, currently 1. Consumers assert a minimum (`contract_revision >= N`) and refuse to run against an older server rather than misinterpreting its streams. See [ADR-0027](../adrs/0027-event-stream-start-positions.md).
+
+`projection_preset` and `projection_identities` report the workload discovered
+from the durable derive manifest. They are descriptive, not readiness claims:
+clients still use capability strings and projection-specific freshness to
+decide whether a method is currently safe. A process with no projection store
+leaves both fields empty. Identity order is not significant.
 
 ### Capability strings
 
@@ -1086,7 +1098,8 @@ Public shapes describe behavior that production code can actually reach.
 - Names identify the source of truth. Use `created_at` for the wall-clock time when Zinder created a record. Use a chain-derived name such as `tip_block_time_millis` when the value comes from block header time.
 - Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling, Orchard, and Ironwood note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size`, `orchard_commitment_tree_size`, and `ironwood_commitment_tree_size` directly.
 - Bulk-catchup ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.
-- Wallet-serving coverage is selected with `ingest.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zodl-specific mode. In that mode, ingest derives the bulk-catchup floor and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-safe-tip fixtures.
+- Wallet-serving coverage is selected with `ingest.modifiers.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zodl-specific mode. In that mode, ingest derives the bulk-catchup floor and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-safe-tip fixtures.
+- Projection workload is selected independently with `ingest.projection_preset = "wallet" | "complete"` or `zinder-ingest --projection-preset`. `complete` is the default. The first release permits selection only for a fresh canonical-plus-projection store; a persisted mismatch fails before projection-manifest mutation and directs the operator to rebuild at a new empty storage path.
 - Transition names match the visible state change. If finality advances, use a finality transition such as `FinalizeThrough`; if no visible transition side effect occurred, use `Unchanged`.
 - Cursor fields that are serialized and authenticated must either be validated on read or documented as reserved state in the owning cursor contract.
 - Operator-facing errors name the real cause and carry useful fields. Prefer `NoVisibleChainEpoch`, sequence-overflow, and payload-size errors over sentinel IDs or reused malformed-input errors.

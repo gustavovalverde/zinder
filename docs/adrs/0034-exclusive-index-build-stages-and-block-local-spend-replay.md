@@ -22,7 +22,7 @@ Canary traces exposed two further canonical-path delays. A 500,000-outpoint tran
 Initial indexing has three exclusive storage-budget owners, in priority order:
 
 1. Canonical bulk catchup runs while the unified ingest phase is `BulkCatchup`; derive replay and rebuildable historical work are paused.
-2. Derive replay runs after canonical enters `FollowingTip` and until its materialized block-summary height covers the canonical visible tip; historical backfills and verifiers remain closed.
+2. Derive replay runs after canonical enters `FollowingTip` and until the materialized transparent-spend projection shared by every supported preset covers the canonical visible tip; historical backfills and verifiers remain closed.
 3. Historical backfills, verifiers, and transparent-retention maintenance may start bounded batches only while canonical is following tip and derive is caught up. If derive falls behind again, the gate closes before another historical batch begins.
 
 Startup observes and publishes the canonical phase before it admits synchronous derive handoff work. Only a positively classified `FollowingTip` phase may replay; `BulkCatchup`, `AwaitingUpstream`, a failed tip observation, and the unclassified state fail closed. A restart during initial sync therefore resumes canonical work without first spending the bounded startup replay window on derive debt.

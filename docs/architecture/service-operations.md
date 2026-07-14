@@ -35,10 +35,17 @@ Readiness should include a machine-readable cause:
 {
   "status": "not_ready",
   "cause": "syncing",
-  "currentHeight": 1200000,
-  "targetHeight": 1200500
+  "current_height": 1200000,
+  "target_height": 1200500,
+  "projection_preset": "wallet",
+  "projection_identities": [
+    "transparent_address_transaction_history",
+    "transparent_outpoint_spend"
+  ]
 }
 ```
+
+`projection_preset` and `projection_identities` are present when the service has selected or opened a derive workload. They identify configured work; they do not replace the readiness cause, projection-specific coverage, or capability checks.
 
 Required readiness causes:
 
@@ -91,7 +98,7 @@ not start private metrics servers.
 
 Metric labels must stay bounded and operational: `operation`, `status`,
 `error_class`, `table`, `artifact_family`, `source`, `method`, `service`,
-`version`, `network`, and `cause` are acceptable. Do not label by block height,
+`version`, `network`, `cause`, `preset`, and the bounded projection `identity` or `projection` catalog are acceptable. Do not label by block height,
 block hash, transaction id, file path, peer address, or request payload value.
 
 Implemented baseline metrics:
@@ -102,6 +109,11 @@ Implemented baseline metrics:
 | `zinder_readiness_state` | gauge | `zinder-runtime` | Current readiness cause by service and network; active cause is `1`, inactive causes are `0`. |
 | `zinder_readiness_sync_lag_blocks` | gauge | `zinder-runtime` | Block lag carried by `ReadinessCause::Syncing`, or `0` when not syncing. |
 | `zinder_readiness_replica_lag_chain_epochs` | gauge | `zinder-runtime` | Chain-epoch lag carried by `ReadinessCause::ReplicaLagging`, or `0` otherwise. |
+| `zinder_projection_workload_info` | gauge | `zinder-runtime` | Selected closed workload by service, network, and preset. Present only when the service has selected or opened a derive workload. |
+| `zinder_projection_identity_info` | gauge | `zinder-runtime` | Effective bounded projection catalog by service, network, preset, and identity. |
+| `zinder_projection_rocksdb_property` | gauge | `zinder-derive` | Per-projection aggregate of its owned column families for live data, SST, memtable, reader-memory, pending-compaction-byte, and running-compaction properties. Labels use the stable projection identity rather than column-family names; DB-wide cumulative compaction tickers remain available on `zinder_store_rocksdb_ticker`. |
+| `zinder_projection_write_operations_total` | counter | `zinder-derive` | All successful event, backfill, seed, repair, cursor, and projection-metadata write operations attributed to stable projection identity. |
+| `zinder_projection_write_bytes_total` | counter | `zinder-derive` | Serialized bytes in all successful projection-owned write batches, attributed to stable projection identity. |
 | `zinder_node_request_duration_seconds` | histogram | `zinder-source` | Upstream node JSON-RPC request latency by source, method, status, and error class. |
 | `zinder_node_request_total` | counter | `zinder-source` | Upstream node JSON-RPC request count by source, method, status, and error class. |
 | `zinder_node_block_decode_stage_duration_seconds` | histogram | `zinder-source` | Batched JSON-RPC block response CPU time by bounded stage: hex decoding or block-header parsing. |
@@ -142,13 +154,22 @@ Implemented baseline metrics:
 | `zinder_ingest_derive_replay_tip_height` | gauge | `zinder-ingest` | Canonical tip height observed by the derive status tick, including while replay is phase-gated. |
 | `zinder_ingest_derive_replay_height` | gauge | `zinder-ingest` | Latest materialized derive height, refreshed by the status tick even while replay is phase-gated. |
 | `zinder_ingest_derive_replay_lag_blocks` | gauge | `zinder-ingest` | Derive lag between materialized progress and canonical tip, refreshed even while replay is phase-gated. |
+| `zinder_ingest_projection_replay_dispatches_total` | counter | `zinder-ingest` | Successful chain-event dispatches by stable projection identity. A chunked canonical event contributes one dispatch per chunk. |
+| `zinder_ingest_projection_replay_blocks_total` | counter | `zinder-ingest` | Committed or replacement block contexts replayed by stable projection identity. |
+| `zinder_ingest_projection_replay_height` | gauge | `zinder-ingest` | Latest fully committed canonical height replayed by each selected chain-event projection. |
+| `zinder_ingest_projection_replay_lag_blocks` | gauge | `zinder-ingest` | Live chain-event replay lag from canonical tip by selected projection. Historical backfill completeness remains projection-specific readiness state rather than being conflated with live replay lag. |
+| `zinder_ingest_projection_write_operations_total` | counter | `zinder-ingest` | Successful write-batch operations attributed to stable projection identity and chain- or mempool-event source. Cursor operations are included because they commit in the same atomic batch. |
+| `zinder_ingest_projection_write_bytes_total` | counter | `zinder-ingest` | Serialized successful write-batch bytes attributed to stable projection identity and event source. |
+| `zinder_ingest_projection_dispatch_duration_seconds` | histogram | `zinder-ingest` | Time spent applying one event and staging rows by stable projection identity and event source. |
+| `zinder_ingest_projection_startup_recovery_duration_seconds` | histogram | `zinder-ingest` | Total selected startup recovery duration attributed to each active projection identity and final status. Shared replay is intentionally visible on every selected projection because startup does not report success until the selected set reaches the handoff boundary. |
+| `zinder_ingest_projection_startup_recovery_total` | counter | `zinder-ingest` | Startup recovery attempts by selected projection identity and final status. |
 | `zinder_ingest_canonical_lag_blocks` | gauge | `zinder-ingest` | Chain-catchup lag between the upstream tip and the canonical writer tip, saturating at zero. Distinct from `zinder_ingest_derive_replay_lag_blocks`, which measures derive-vs-canonical freshness, not chain catchup. |
 | `zinder_ingest_derive_replay_budget_state` | gauge | `zinder-ingest` | Current derive replay memory-budget state by state label: `normal`, `degraded`, or `paused`. |
 | `zinder_ingest_derive_replay_effective_batch_blocks` | gauge | `zinder-ingest` | Effective replay batch size after memory degradation. |
 | `zinder_ingest_derive_replay_memory_budget_bytes` | gauge | `zinder-ingest` | Memory budget used for derive replay pressure decisions. |
 | `zinder_ingest_derive_replay_paused` | gauge | `zinder-ingest` | Compatibility operational gauge set to `1` only when derive replay is paused. |
-| `zinder_ingest_derive_replay_phase_gate` | gauge | `zinder-ingest` | Set to `1` while the canonical-phase gate pauses derive replay during `BulkCatchup`, `0` otherwise. |
-| `zinder_ingest_derive_replay_caught_up` | gauge | `zinder-ingest` | Set to `1` when the derive materialized block-summary height covers the canonical visible tip. |
+| `zinder_ingest_derive_replay_phase_gate` | gauge | `zinder-ingest` | Set to `1` until the canonical phase is positively classified as `FollowingTip`, `0` otherwise. |
+| `zinder_ingest_derive_replay_caught_up` | gauge | `zinder-ingest` | Set to `1` when the shared wallet-correctness transparent-spend projection covers the canonical visible tip. |
 | `zinder_ingest_historical_work_gate_open` | gauge | `zinder-ingest` | Set to `1` only when canonical is following tip and derive is caught up; historical backfills and verifiers wait while it is `0`. |
 | `zinder_ingest_memory_pressure_ratio` | gauge | `zinder-ingest` | Scheduler pressure ratio. Uses cgroup working set (`memory.current - inactive_file`) over `memory.high` or `memory.max` when available, falling back to current cgroup pressure. |
 | `zinder_ingest_memory_current_pressure_ratio` | gauge | `zinder-ingest` | Raw cgroup `memory.current` pressure ratio over `memory.high` or `memory.max`. |
@@ -548,13 +569,29 @@ token through `tokio::select!` instead of polling a boolean flag.
 
 `zinder-ingest backup --to <path>` uses `[network]` and `[storage]` plus a
 subcommand-specific `[backup] to_path` field when invoked through config. It
-opens the canonical store as `PrimaryChainStore`, opens the bundled derive
-store as primary, and creates RocksDB checkpoints for both stores; it does not
-connect to the upstream node.
+detects the effective workload from the durable derive manifest, opens the
+canonical store as `PrimaryChainStore`, opens that selected derive store as
+primary, and creates RocksDB checkpoints for both stores; it does not
+connect to the upstream node. The published directory also contains
+`zinder-backup-manifest.json`, which binds the network, workload, canonical
+history boundary, and every projection position to the reopened checkpoints.
 
 ## Recovery
 
 Expected recovery behavior:
+
+- Restore a backup into a new working directory while all Zinder processes are
+  stopped, then start `zinder-ingest` before any reader. Before opening a
+  primary writer, ingest fully reopens and recomputes the pending backup
+  manifest. Successful admission atomically renames it to
+  `zinder-restore-admission.json`; later restarts validate that historical
+  record structurally but use current durable projection state for readiness.
+  A pending and admitted record together, or any malformed or mismatched
+  record, fails closed.
+- Start query, compatibility, and explorer readers only after ingest admits the
+  restored pair. Manifest labels such as `exact` are historical evidence, not
+  capability state; each reader applies its normal schema, cursor, coverage,
+  and freshness checks.
 
 - If `zinder-query` fails, restart it without affecting ingestion.
 - If `zinder-explorer` fails, mark derived indexes stale and rebuild or resume later.

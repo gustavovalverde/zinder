@@ -359,7 +359,7 @@ docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
 
 (For testnet substitute `.env.testnet` + `zinder-testnet-data`; for regtest substitute `.env.regtest` + `zinder-regtest-data`.)
 
-The fresh start runs `BulkCatchup` from the wallet-serving floor (or genesis, depending on `ingest.coverage`) and transitions to `TipFollow` when it catches up. No manual sequencing is needed.
+The fresh start runs `BulkCatchup` from the wallet-serving floor (or genesis, depending on `ingest.modifiers.coverage`) and transitions to `TipFollow` when it catches up. No manual sequencing is needed.
 
 ## Schema v11: in-place rebuild at first open
 

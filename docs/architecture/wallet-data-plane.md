@@ -343,9 +343,12 @@ it. Missing indexed state is a readiness or artifact-availability failure; it
 is not a reason to bypass the wallet data plane.
 
 `GetLightdInfo.taddr_support` is `true` only when the adapter is explicitly
-configured to advertise transparent-address support after the serving process
-has wired stored transparent output artifacts and the derive-backed transparent
-transaction-history projection. It is a product contract for lightwalletd
+configured to advertise transparent-address support, transaction blobs are
+retained, and both wallet projections cover the canonical tip. Transparent
+output reads themselves remain available from canonical artifacts when raw
+payload retention is `none`, but lightwalletd transparent transaction history
+returns raw transaction bytes and therefore requires `raw_blob_policy` to be
+`transactions` or `all`. The flag is a product contract for lightwalletd
 clients, not a way to silence Android SDK logs.
 
 The native `WalletQuery` proto exposes the same artifact-backed read through
@@ -393,9 +396,12 @@ history pages keep that restart cost small.
 
 Operators must only publish a `zinder-compat-lightwalletd` deployment with
 `taddr_support=true` when the serving process explicitly opts in after opening
-a store produced with the wallet-serving coverage profile
-(`ingest.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`) and
-the derive-backed transparent transaction-history projection. A
+a store with transaction blobs retained and both
+`transparent_address_transaction_history` and `transparent_outpoint_spend`
+covering the canonical tip. The wallet-serving coverage profile
+(`ingest.modifiers.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`) is
+one supported way to select transaction retention; `projection_preset =
+"wallet"` alone is not. A
 recent-checkpoint or tip-bootstrapped store may have the address-output index
 family enabled but still lack the historical rows needed by wallet birthdays and
 resync anchors; that deployment posture is not wallet-serving.
@@ -453,7 +459,7 @@ The prevout-resolution surface is native-only. `CompactTxStreamer` has no prevou
 
 Reverse-spend resolution is the inverse of prevout resolution: given an `OutPoint`, it returns where that output was spent rather than the output itself. This is the getspentinfo-equivalent surface. Two RPCs cover the canonical and mempool chain views; a full getspentinfo composes both (this RPC for confirmed spends, the mempool RPC for unmined):
 
-- `WalletQuery.TransparentSpendsByOutpoint(TransparentSpendsByOutpointRequest) returns (TransparentSpendsByOutpointResponse)` resolves outpoints to their confirmed spend, arbitrarily far back: the answer is durable, not scoped to the reorg window. Capability `wallet.read.transparent_spends_by_outpoint_v1` is always advertised because the canonical spend-fact index is present on every wallet-plane deployment. The handler reads the `transparent_spend_fact` table through the epoch-bound `transparent_spend_facts_by_outpoints` reader; pinned reads (`at_epoch_id`) verify each spend's producing-block visibility against the requested epoch. Canonical misses are union-routed to the durable `transparent_outpoint_spend` derive projection per [ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md): a projection hit is surfaced only when its spend settled at or below the pinned epoch's settled tip and its stored block hash still matches the retained canonical header at that height, so a row from a reorged-out branch never surfaces as the spender. If canonical retention has deleted spend facts above the projection's durable height, the read refuses with the derive-lag vocabulary instead of answering incompletely. If real deletion has occurred but the query handle has no derive store, the read refuses with `DERIVE_PROJECTION_UNAVAILABLE`; it never converts an ambiguous miss into an absent spender. A store that never deleted a fact keeps the canonical-only absent semantics.
+- `WalletQuery.TransparentSpendsByOutpoint(TransparentSpendsByOutpointRequest) returns (TransparentSpendsByOutpointResponse)` resolves outpoints to their confirmed spend, arbitrarily far back: the answer is durable, not scoped to the reorg window. Capability `wallet.read.transparent_spends_by_outpoint_v1` is always advertised because the canonical spend-fact index is present on every wallet-plane deployment. The handler reads the `transparent_spend_fact` table through the epoch-bound `transparent_spend_facts_by_outpoints` reader; pinned reads (`at_epoch_id`) verify each spend's producing-block visibility against the requested epoch. Canonical misses are union-routed to the durable `transparent_outpoint_spend` derive projection per [ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md). That projection derives the spent outpoint and spender identity from the child transaction input plus its mined location, so a child retained above a checkpoint still records a spend whose parent output is below it. Parent-output hydration is not required. A projection hit is surfaced only when its spend settled at or below the pinned epoch's settled tip and its stored block hash still matches the retained canonical header at that height, so a row from a reorged-out branch never surfaces as the spender. If canonical retention has deleted spend facts above the projection's durable height, the read refuses with the derive-lag vocabulary instead of answering incompletely. If real deletion has occurred but the query handle has no derive store, the read refuses with `DERIVE_PROJECTION_UNAVAILABLE`; it never converts an ambiguous miss into an absent spender. A store that never deleted a fact keeps the canonical-only absent semantics.
 - `WalletQuery.TransparentMempoolSpendsByOutpoint(TransparentMempoolSpendsByOutpointRequest) returns (TransparentMempoolSpendsByOutpointResponse)` resolves outpoints to their unmined spend in the writer's live mempool index. Capability `wallet.mempool.transparent_spends_by_outpoint_v1`.
 
 The canonical response binds to a `ChainEpoch`, then carries `repeated TransparentSpend spends`. Each `TransparentSpend` carries the request's `spent_outpoint`, the `spending_transaction_id` (RPC byte order), the `input_index` of the spend within the spending transaction, and a `BlockTip spending_block` (height plus RPC-form hash of the block that mined the spend). The spent output's value and script are intentionally omitted: a consumer wanting them already has `TransparentOutputsByOutpoint`. Outpoints with no spend visible at the bound epoch and no durably recorded spender produce no entry; consumers key results by `spent_outpoint`. Absence alone never proves that an arbitrary outpoint exists and is unspent: `TransparentUnspentOutputsByOutpoint` is the direct durable spentness authority per [ADR-0026](../adrs/0026-utxo-set-commitment.md). A consumer that already holds the canonical output fact, such as `ExplorerQuery.TransactionDetail`, may interpret a successful complete lookup's absent spender as unspent at that epoch. Duplicate request outpoints collapse to one entry. Coinbase inputs spend no prevout and never appear in the spend-fact index; the coinbase sentinel outpoint is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter. One request is capped at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024`, identical to the prevout surface; callers with larger known output sets must issue epoch-pinned chunks and verify the complete epoch identity across every response.
@@ -559,7 +565,7 @@ A deployment may claim Android SDK or Zodl compatibility only when:
 - The serving store contains the subtree-root history required by fresh wallet
   bootstrap and tree-state history for every anchor height a supported wallet
   flow can request, including create, resync, and restore/import flows. Use
-  `zinder-ingest --wallet-serving` (or `ingest.coverage = "wallet-serving"`)
+  `zinder-ingest --wallet-serving` (or `ingest.modifiers.coverage = "wallet-serving"`)
   for this serving profile; recent checkpoints are validation fixtures, not
   wallet-serving stores.
 - The transparent output surface in [§Transparent Address Outputs](#transparent-address-outputs)
