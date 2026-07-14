@@ -24,7 +24,7 @@ use zinder_derive::{
     bundled_projection_definitions,
 };
 use zinder_store::{
-    ChainEpochReadApi, ChainEventHistoryRequest, ChainStoreOptions, PrimaryChainStore,
+    ChainEpochReadApi, ChainEvent, ChainEventHistoryRequest, ChainStoreOptions, PrimaryChainStore,
     RocksDbResourceBudget, SecondaryChainStore, StoreError, StreamCursorTokenV1,
 };
 
@@ -74,6 +74,19 @@ enum ProjectionBackupState {
     Exact,
     Behind,
     Omitted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ChainProjectionPosition {
+    Exact,
+    RecoverableBehind(ProjectionReplayStart),
+    Unrecoverable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProjectionReplayStart {
+    HistoryFloor,
+    AfterCursor(Box<ChainEvent>),
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -204,7 +217,13 @@ fn build_backup_manifest(
     let projections = bundled_projection_definitions()
         .iter()
         .map(|definition| {
-            projection_backup_position(canonical_store, derive_store, projection_preset, definition)
+            projection_backup_position(
+                canonical_store,
+                derive_store,
+                projection_preset,
+                definition,
+                &backup_config.storage_path,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BackupManifest {
@@ -234,6 +253,7 @@ fn projection_backup_position(
     derive_store: &DeriveStore,
     projection_preset: ProjectionPreset,
     definition: &ProjectionDefinition,
+    backup_path: &Path,
 ) -> Result<ProjectionBackupPosition, IngestError> {
     let schema = definition.schema;
     if !definition.included_in(projection_preset) {
@@ -262,19 +282,35 @@ fn projection_backup_position(
         ProjectionRecoverySource::CanonicalChainEvents => {
             let cursor_state =
                 classify_chain_projection_position(canonical_store, cursor.as_deref())?;
+            if cursor_state == ChainProjectionPosition::Unrecoverable {
+                return Err(unrecoverable_projection_error(
+                    backup_path,
+                    schema.name.as_str(),
+                ));
+            }
             if schema.name == TRANSACTION_HISTORY_CONSUMER_NAME {
-                classify_transaction_history_position(canonical_store, derive_store, cursor_state)?
+                classify_transaction_history_position(
+                    canonical_store,
+                    derive_store,
+                    &cursor_state,
+                    backup_path,
+                )?
             } else if matches!(
                 definition.role,
                 ProjectionRole::WalletCorrectness | ProjectionRole::WalletServing
             ) {
                 classify_wallet_projection_position(
                     canonical_store,
-                    materialized_height,
-                    cursor_state,
+                    derive_store,
+                    WalletProjectionPosition {
+                        identity: schema.name.as_str(),
+                        materialized_height,
+                        cursor_state,
+                        backup_path,
+                    },
                 )?
             } else {
-                cursor_state
+                chain_projection_backup_state(&cursor_state, backup_path, schema.name.as_str())?
             }
         }
         ProjectionRecoverySource::CanonicalBackfillAndChainEvents
@@ -315,71 +351,268 @@ fn projection_materialized_height(
     }
 }
 
+struct WalletProjectionPosition<'path> {
+    identity: &'path str,
+    materialized_height: Option<BlockHeight>,
+    cursor_state: ChainProjectionPosition,
+    backup_path: &'path Path,
+}
+
 fn classify_wallet_projection_position(
     canonical_store: &impl CanonicalBackupRead,
-    materialized_height: Option<BlockHeight>,
-    cursor_state: ProjectionBackupState,
+    derive_store: &DeriveStore,
+    position: WalletProjectionPosition<'_>,
 ) -> Result<ProjectionBackupState, IngestError> {
-    if cursor_state != ProjectionBackupState::Exact {
-        return Ok(cursor_state);
+    let WalletProjectionPosition {
+        identity,
+        materialized_height,
+        cursor_state,
+        backup_path,
+    } = position;
+    let canonical_epoch = canonical_store.current_backup_chain_epoch()?;
+    let history_bounds = canonical_store.canonical_history_bounds()?;
+    match cursor_state {
+        ChainProjectionPosition::Exact => {
+            let Some(epoch) = canonical_epoch else {
+                return Err(unrecoverable_projection_error(backup_path, identity));
+            };
+            let retention_coverage_is_exact =
+                if identity == TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str() {
+                    let Some(bounds) = history_bounds else {
+                        return Err(unrecoverable_projection_error(backup_path, identity));
+                    };
+                    transparent_outpoint_coverage_matches_tip(
+                        derive_store,
+                        epoch,
+                        bounds.first_available_height(),
+                    )?
+                } else {
+                    true
+                };
+            let exact = materialized_height == Some(epoch.visible_tip_height)
+                && retention_coverage_is_exact;
+            if exact {
+                Ok(ProjectionBackupState::Exact)
+            } else {
+                Err(unrecoverable_projection_error(backup_path, identity))
+            }
+        }
+        ChainProjectionPosition::RecoverableBehind(replay_start) => {
+            if identity == TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str()
+                && let ProjectionReplayStart::AfterCursor(first_pending_event) = replay_start
+            {
+                let Some(first_available_height) =
+                    history_bounds.map(CanonicalHistoryBounds::first_available_height)
+                else {
+                    return Err(unrecoverable_projection_error(backup_path, identity));
+                };
+                if !transparent_outpoint_coverage_connects_to_event(
+                    derive_store,
+                    materialized_height,
+                    first_available_height,
+                    first_pending_event.as_ref(),
+                )? {
+                    return Err(unrecoverable_projection_error(backup_path, identity));
+                }
+            }
+            Ok(ProjectionBackupState::Behind)
+        }
+        ChainProjectionPosition::Unrecoverable => {
+            Err(unrecoverable_projection_error(backup_path, identity))
+        }
     }
-    let exact = canonical_store
-        .current_backup_chain_epoch()?
-        .is_some_and(|epoch| materialized_height == Some(epoch.visible_tip_height));
-    Ok(if exact {
-        ProjectionBackupState::Exact
-    } else {
-        ProjectionBackupState::Behind
-    })
 }
 
 fn classify_transaction_history_position(
     canonical_store: &impl CanonicalBackupRead,
     derive_store: &DeriveStore,
-    cursor_state: ProjectionBackupState,
+    cursor_state: &ChainProjectionPosition,
+    backup_path: &Path,
 ) -> Result<ProjectionBackupState, IngestError> {
-    if cursor_state != ProjectionBackupState::Exact {
-        return Ok(cursor_state);
+    if matches!(cursor_state, ChainProjectionPosition::RecoverableBehind(_)) {
+        return Ok(ProjectionBackupState::Behind);
+    }
+    if matches!(cursor_state, ChainProjectionPosition::Unrecoverable) {
+        return Err(unrecoverable_projection_error(
+            backup_path,
+            TRANSACTION_HISTORY_CONSUMER_NAME.as_str(),
+        ));
     }
     let Some(chain_epoch) = canonical_store.current_backup_chain_epoch()? else {
-        return Ok(ProjectionBackupState::Behind);
+        return Err(unrecoverable_projection_error(
+            backup_path,
+            TRANSACTION_HISTORY_CONSUMER_NAME.as_str(),
+        ));
     };
     let Some(projection_state) =
         derive_store.consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)?
     else {
-        return Ok(ProjectionBackupState::Behind);
+        return Err(unrecoverable_projection_error(
+            backup_path,
+            TRANSACTION_HISTORY_CONSUMER_NAME.as_str(),
+        ));
     };
+    let history_bounds = canonical_store
+        .canonical_history_bounds()?
+        .ok_or(StoreError::CanonicalHistoryBoundsMissing)?;
     let complete = projection_state.coverage.is_some_and(|coverage| {
         projection_state.projection_epoch_id == chain_epoch.id
             && projection_state.projection_tip_height == chain_epoch.visible_tip_height
             && projection_state.projection_tip_hash == chain_epoch.visible_tip_hash
-            && coverage.complete_from_height == BlockHeight::new(1)
+            && coverage.complete_from_height <= history_bounds.first_available_height()
             && coverage.complete_through_height == chain_epoch.visible_tip_height
             && coverage.complete_through_hash == chain_epoch.visible_tip_hash
     });
-    Ok(if complete {
-        ProjectionBackupState::Exact
+    if complete {
+        Ok(ProjectionBackupState::Exact)
     } else {
-        ProjectionBackupState::Behind
-    })
+        Err(unrecoverable_projection_error(
+            backup_path,
+            TRANSACTION_HISTORY_CONSUMER_NAME.as_str(),
+        ))
+    }
 }
 
 fn classify_chain_projection_position(
     canonical_store: &impl CanonicalBackupRead,
     cursor_bytes: Option<&[u8]>,
-) -> Result<ProjectionBackupState, IngestError> {
+) -> Result<ChainProjectionPosition, IngestError> {
     let Some(cursor_bytes) = cursor_bytes else {
-        return Ok(ProjectionBackupState::Behind);
+        let Some(chain_epoch) = canonical_store.current_backup_chain_epoch()? else {
+            return Ok(ChainProjectionPosition::RecoverableBehind(
+                ProjectionReplayStart::HistoryFloor,
+            ));
+        };
+        let history_bounds = canonical_store
+            .canonical_history_bounds()?
+            .ok_or(StoreError::CanonicalHistoryBoundsMissing)?;
+        if chain_epoch.visible_tip_height < history_bounds.first_available_height() {
+            return Ok(ChainProjectionPosition::RecoverableBehind(
+                ProjectionReplayStart::HistoryFloor,
+            ));
+        }
+        let events = canonical_store
+            .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
+        let first_pending_event = events
+            .iter()
+            .find(|envelope| chain_event_committed_start(&envelope.event).is_some())
+            .map(|envelope| envelope.event.clone());
+        let replays_from_history_floor = first_pending_event.as_ref().is_some_and(|event| {
+            chain_event_committed_start(event) == Some(history_bounds.first_available_height())
+        });
+        return Ok(if replays_from_history_floor {
+            ChainProjectionPosition::RecoverableBehind(ProjectionReplayStart::HistoryFloor)
+        } else {
+            ChainProjectionPosition::Unrecoverable
+        });
     };
     let cursor = StreamCursorTokenV1::from_bytes(cursor_bytes.to_vec());
     let request = ChainEventHistoryRequest::new(Some(&cursor), NonZeroU32::MIN);
     match canonical_store.chain_event_history(request) {
-        Ok(events) if events.is_empty() => Ok(ProjectionBackupState::Exact),
-        Ok(_) | Err(StoreError::ChainEventCursorExpired { .. }) => {
-            Ok(ProjectionBackupState::Behind)
+        Ok(events) => {
+            let Some(first_pending_event) = events.first() else {
+                return Ok(ChainProjectionPosition::Exact);
+            };
+            Ok(ChainProjectionPosition::RecoverableBehind(
+                ProjectionReplayStart::AfterCursor(Box::new(first_pending_event.event.clone())),
+            ))
+        }
+        Err(StoreError::ChainEventCursorExpired { .. }) => {
+            Ok(ChainProjectionPosition::Unrecoverable)
         }
         Err(error) => Err(IngestError::Store(error)),
     }
+}
+
+fn chain_projection_backup_state(
+    position: &ChainProjectionPosition,
+    backup_path: &Path,
+    identity: &str,
+) -> Result<ProjectionBackupState, IngestError> {
+    match position {
+        ChainProjectionPosition::Exact => Ok(ProjectionBackupState::Exact),
+        ChainProjectionPosition::RecoverableBehind(_) => Ok(ProjectionBackupState::Behind),
+        ChainProjectionPosition::Unrecoverable => {
+            Err(unrecoverable_projection_error(backup_path, identity))
+        }
+    }
+}
+
+fn chain_event_committed_start(event: &ChainEvent) -> Option<BlockHeight> {
+    let (ChainEvent::ChainCommitted { committed } | ChainEvent::ChainReorged { committed, .. }) =
+        event
+    else {
+        return None;
+    };
+    (committed.block_range.start <= committed.block_range.end)
+        .then_some(committed.block_range.start)
+}
+
+fn transparent_outpoint_coverage_matches_tip(
+    derive_store: &DeriveStore,
+    canonical_epoch: ChainEpoch,
+    first_available_height: BlockHeight,
+) -> Result<bool, IngestError> {
+    let Some(state) =
+        derive_store.consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?
+    else {
+        return Ok(false);
+    };
+    Ok(state.coverage.is_some_and(|coverage| {
+        state.projection_epoch_id == canonical_epoch.id
+            && state.projection_tip_height == canonical_epoch.visible_tip_height
+            && state.projection_tip_hash == canonical_epoch.visible_tip_hash
+            && coverage.complete_from_height <= first_available_height
+            && coverage.complete_through_height == canonical_epoch.visible_tip_height
+            && coverage.complete_through_hash == canonical_epoch.visible_tip_hash
+    }))
+}
+
+fn transparent_outpoint_coverage_connects_to_event(
+    derive_store: &DeriveStore,
+    materialized_height: Option<BlockHeight>,
+    first_available_height: BlockHeight,
+    first_pending_event: &ChainEvent,
+) -> Result<bool, IngestError> {
+    let Some(state) =
+        derive_store.consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?
+    else {
+        return Ok(false);
+    };
+    let Some(coverage) = state.coverage else {
+        return Ok(false);
+    };
+    let state_is_contiguous = materialized_height == Some(state.projection_tip_height)
+        && coverage.complete_from_height <= first_available_height
+        && coverage.complete_through_height == state.projection_tip_height
+        && coverage.complete_through_hash == state.projection_tip_hash;
+    if !state_is_contiguous {
+        return Ok(false);
+    }
+    let connects = match first_pending_event {
+        ChainEvent::ChainCommitted { committed } => {
+            committed.block_range.start > committed.block_range.end
+                || coverage.complete_through_height.next() == Some(committed.block_range.start)
+        }
+        ChainEvent::ChainReorged {
+            reverted,
+            committed,
+        } => {
+            coverage.complete_through_height >= reverted.block_range.start
+                && committed.block_range.start == reverted.block_range.start
+        }
+        _ => false,
+    };
+    Ok(connects)
+}
+
+fn unrecoverable_projection_error(path: &Path, identity: &str) -> IngestError {
+    backup_validation_error(
+        path,
+        format!(
+            "included projection {identity} is behind canonical history without provable replay coverage"
+        ),
+    )
 }
 
 fn write_manifest_atomically(
@@ -798,7 +1031,7 @@ fn backup_validation_scratch_path(bundle_staging_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
-    use zinder_core::{ChainEpochId, Network};
+    use zinder_core::{BlockHeightRange, ChainEpochId, Network, UnixTimestampMillis};
     use zinder_derive::{
         BLOCK_SUMMARY_CONSUMER_NAME, ConsumerProjectionCoverage, ConsumerProjectionState,
         TRANSACTION_HISTORY_CONSUMER_NAME,
@@ -875,20 +1108,14 @@ mod tests {
             .chain_epoch_artifacts(ChainEpochId::new(1))
             .ok_or("chain fixture unexpectedly empty")?;
         let commit = canonical_store.commit_chain_epoch(artifacts)?;
-        {
-            let derive_store = DeriveStore::open_with_projection_preset(
-                DeriveStore::path_for_canonical(&storage_path),
-                ProjectionPreset::Wallet,
-                DeriveStoreOptions {
-                    rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-                    ..DeriveStoreOptions::default()
-                },
-            )?;
-            for schema in ProjectionPreset::Wallet.consumer_schemas() {
-                derive_store
-                    .put_chain_event_cursor(schema.name, commit.event_envelope.cursor.as_bytes())?;
-            }
-        }
+        drop(DeriveStore::open_with_projection_preset(
+            DeriveStore::path_for_canonical(&storage_path),
+            ProjectionPreset::Wallet,
+            DeriveStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..DeriveStoreOptions::default()
+            },
+        )?);
         let config = BackupCommandConfig {
             network: Network::ZcashRegtest,
             storage_path,
@@ -914,7 +1141,6 @@ mod tests {
         let projections = manifest["projections"]
             .as_array()
             .ok_or("projection manifest must be an array")?;
-        let expected_cursor = URL_SAFE_NO_PAD.encode(commit.event_envelope.cursor.as_bytes());
         for projection in projections {
             let identity = projection["identity"]
                 .as_str()
@@ -925,7 +1151,7 @@ mod tests {
                 .any(|schema| schema.name.as_str() == identity);
             if selected {
                 assert_eq!(projection["state"], "behind", "{identity}");
-                assert_eq!(projection["cursor"], expected_cursor, "{identity}");
+                assert!(projection["cursor"].is_null(), "{identity}");
                 assert!(projection["materialized_height"].is_null(), "{identity}");
             } else {
                 assert_eq!(projection["state"], "omitted", "{identity}");
@@ -1048,20 +1274,36 @@ mod tests {
             &canonical_store,
             &derive_store,
             ProjectionPreset::Wallet,
-        )?;
-        assert_wallet_positions(&cursor_only, ProjectionBackupState::Behind, None)?;
+        );
+        assert!(matches!(
+            cursor_only,
+            Err(IngestError::BackupCheckpointValidation { .. })
+        ));
 
-        let tip_key =
-            zinder_core::wire::encode_height_key_ascending(commit.chain_epoch.visible_tip_height);
-        derive_store.put_consumer(
-            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-            &tip_key,
-            &[],
-        )?;
-        derive_store.put_consumer(
-            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
-            &tip_key,
-            &[],
+        put_wallet_tip_indexes(&derive_store, commit.chain_epoch.visible_tip_height)?;
+        let materialized_without_coverage = build_backup_manifest(
+            &config,
+            &canonical_store,
+            &derive_store,
+            ProjectionPreset::Wallet,
+        );
+        assert!(matches!(
+            materialized_without_coverage,
+            Err(IngestError::BackupCheckpointValidation { .. })
+        ));
+        derive_store.put_consumer_projection_state(
+            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+            ConsumerProjectionState {
+                projection_epoch_id: commit.chain_epoch.id,
+                projection_tip_height: commit.chain_epoch.visible_tip_height,
+                projection_tip_hash: commit.chain_epoch.visible_tip_hash,
+                revision: 1,
+                coverage: Some(ConsumerProjectionCoverage {
+                    complete_from_height: BlockHeight::new(1),
+                    complete_through_height: commit.chain_epoch.visible_tip_height,
+                    complete_through_hash: commit.chain_epoch.visible_tip_hash,
+                }),
+            },
         )?;
         let materialized = build_backup_manifest(
             &config,
@@ -1075,6 +1317,205 @@ mod tests {
             Some(commit.chain_epoch.visible_tip_height.value()),
         )?;
         Ok(())
+    }
+
+    fn put_wallet_tip_indexes(
+        derive_store: &DeriveStore,
+        height: BlockHeight,
+    ) -> Result<(), zinder_derive::DeriveStoreError> {
+        let height_key = zinder_core::wire::encode_height_key_ascending(height);
+        derive_store.put_consumer(
+            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+            &height_key,
+            &[],
+        )?;
+        derive_store.put_consumer(
+            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+            &height_key,
+            &[],
+        )
+    }
+
+    #[test]
+    fn expired_wallet_projection_cursor_prevents_backup_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("source");
+        let checkpoint_path = tempdir.path().join("checkpoint");
+        let canonical_store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let stale_cursor = commit_three_events_and_prune(&canonical_store)?;
+        {
+            let derive_store = DeriveStore::open_with_projection_preset(
+                DeriveStore::path_for_canonical(&storage_path),
+                ProjectionPreset::Wallet,
+                DeriveStoreOptions {
+                    rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                    ..DeriveStoreOptions::default()
+                },
+            )?;
+            let height_key = zinder_core::wire::encode_height_key_ascending(BlockHeight::new(1));
+            for (identity, index_column_family) in [
+                (
+                    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+                    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+                ),
+                (
+                    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+                    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+                ),
+            ] {
+                derive_store.put_chain_event_cursor(identity, stale_cursor.as_bytes())?;
+                derive_store.put_consumer(index_column_family, &height_key, &[])?;
+            }
+        }
+        let config = BackupCommandConfig {
+            network: Network::ZcashRegtest,
+            storage_path,
+            canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            to_path: checkpoint_path.clone(),
+        };
+
+        let outcome =
+            create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Wallet);
+
+        assert!(matches!(
+            outcome,
+            Err(IngestError::BackupCheckpointValidation { .. })
+        ));
+        assert!(!checkpoint_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn behind_outpoint_cursor_without_contiguous_coverage_prevents_backup_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("source");
+        let checkpoint_path = tempdir.path().join("checkpoint");
+        let canonical_store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let first_cursor = commit_event_at(&canonical_store, 1)?;
+        commit_event_at(&canonical_store, 2)?;
+        {
+            let derive_store = DeriveStore::open_with_projection_preset(
+                DeriveStore::path_for_canonical(&storage_path),
+                ProjectionPreset::Wallet,
+                DeriveStoreOptions {
+                    rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                    ..DeriveStoreOptions::default()
+                },
+            )?;
+            let height_key = zinder_core::wire::encode_height_key_ascending(BlockHeight::new(1));
+            for (identity, index_column_family) in [
+                (
+                    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+                    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+                ),
+                (
+                    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+                    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+                ),
+            ] {
+                derive_store.put_chain_event_cursor(identity, first_cursor.as_bytes())?;
+                derive_store.put_consumer(index_column_family, &height_key, &[])?;
+            }
+        }
+        let config = BackupCommandConfig {
+            network: Network::ZcashRegtest,
+            storage_path,
+            canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            to_path: checkpoint_path.clone(),
+        };
+
+        let outcome =
+            create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Wallet);
+
+        assert!(matches!(
+            outcome,
+            Err(IngestError::BackupCheckpointValidation { .. })
+        ));
+        assert!(!checkpoint_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_wallet_cursor_without_full_event_history_prevents_backup_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("source");
+        let checkpoint_path = tempdir.path().join("checkpoint");
+        let canonical_store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        commit_three_events_and_prune(&canonical_store)?;
+        drop(DeriveStore::open_with_projection_preset(
+            DeriveStore::path_for_canonical(&storage_path),
+            ProjectionPreset::Wallet,
+            DeriveStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..DeriveStoreOptions::default()
+            },
+        )?);
+        let config = BackupCommandConfig {
+            network: Network::ZcashRegtest,
+            storage_path,
+            canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            to_path: checkpoint_path.clone(),
+        };
+
+        let outcome =
+            create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Wallet);
+
+        assert!(matches!(
+            outcome,
+            Err(IngestError::BackupCheckpointValidation { .. })
+        ));
+        assert!(!checkpoint_path.exists());
+        Ok(())
+    }
+
+    fn commit_three_events_and_prune(
+        canonical_store: &PrimaryChainStore,
+    ) -> Result<StreamCursorTokenV1, Box<dyn std::error::Error>> {
+        let stale_cursor = commit_event_at(canonical_store, 1)?;
+        commit_event_at(canonical_store, 2)?;
+        commit_event_at(canonical_store, 3)?;
+        canonical_store.prune_chain_events_before(UnixTimestampMillis::new(u64::MAX))?;
+        Ok(stale_cursor)
+    }
+
+    fn commit_event_at(
+        canonical_store: &PrimaryChainStore,
+        height: u32,
+    ) -> Result<StreamCursorTokenV1, Box<dyn std::error::Error>> {
+        let fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(height);
+        let block = fixture
+            .block_at(BlockHeight::new(height))
+            .ok_or("fixture block missing")?;
+        let chain_epoch = fixture
+            .chain_epoch(ChainEpochId::new(u64::from(height)))
+            .ok_or("fixture epoch missing")?;
+        let artifacts = zinder_store::ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block.block_header_artifact()],
+            vec![block.compact_block_artifact()],
+        )
+        .with_reorg_window_change(zinder_store::ReorgWindowChange::Extend {
+            block_range: BlockHeightRange::inclusive(block.height, block.height),
+        });
+        Ok(canonical_store
+            .commit_chain_epoch(artifacts)?
+            .event_envelope
+            .cursor)
     }
 
     fn assert_wallet_positions(
@@ -1139,18 +1580,16 @@ mod tests {
             to_path: tempdir.path().join("checkpoint"),
         };
 
-        let manifest = build_backup_manifest(
+        let incomplete = build_backup_manifest(
             &config,
             &canonical_store,
             &derive_store,
             ProjectionPreset::Complete,
-        )?;
-        let transaction_history = manifest
-            .projections
-            .iter()
-            .find(|projection| projection.identity == TRANSACTION_HISTORY_CONSUMER_NAME.as_str())
-            .ok_or("transaction-history projection missing")?;
-        assert_eq!(transaction_history.state, ProjectionBackupState::Behind);
+        );
+        assert!(matches!(
+            incomplete,
+            Err(IngestError::BackupCheckpointValidation { .. })
+        ));
 
         derive_store.put_consumer_projection_state(
             TRANSACTION_HISTORY_CONSUMER_NAME,

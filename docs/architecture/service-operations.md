@@ -575,6 +575,12 @@ primary, and creates RocksDB checkpoints for both stores; it does not
 connect to the upstream node. The published directory also contains
 `zinder-backup-manifest.json`, which binds the network, workload, canonical
 history boundary, and every projection position to the reopened checkpoints.
+A projection is recorded as `behind` only when its authenticated cursor can
+resume from retained events, or a missing cursor can replay from the canonical
+history boundary. An expired cursor, a retained suffix without that boundary,
+or a wallet projection at the event tip without complete materialization proof
+prevents publication; an unrecoverable state is never serialized into a backup
+artifact.
 
 ## Recovery
 
