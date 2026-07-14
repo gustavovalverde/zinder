@@ -19,8 +19,13 @@ use zinder_bench::{
     },
 };
 use zinder_core::{BlockHeight, Network, wire::encode_zinder_native_chain_name};
-use zinder_derive::{ProjectionPreset, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME};
+use zinder_derive::{
+    ProjectionPreset, TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TransparentAddressRankingConsumer,
+};
+use zinder_ingest::open_primary_derive_store_for_canonical_with_projection_preset;
 use zinder_source::SourceBlock;
+use zinder_store::RocksDbResourceBudget;
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 const REGTEST_BLOCK_1: &str =
@@ -141,6 +146,69 @@ async fn replay_commits_a_genesis_block_over_the_real_pipeline() -> Result<()> {
     )
     .await?;
     assert_projection_report(&complete_report, "complete");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_replay_bootstraps_ranking_while_wallet_remains_ranking_free() -> Result<()> {
+    let fixture_directory = write_regtest_fixture()?;
+    let complete_store_directory = tempdir()?;
+    replay_fixture(
+        replay_config(
+            &fixture_directory,
+            &complete_store_directory,
+            Some(ProjectionPreset::Complete),
+        )?,
+        None,
+    )
+    .await?;
+
+    let complete_store_path = complete_store_directory.path().join("canonical");
+    let complete_store = open_primary_derive_store_for_canonical_with_projection_preset(
+        &complete_store_path,
+        RocksDbResourceBudget::derive_writer_defaults(),
+        ProjectionPreset::Complete,
+    )?;
+    let active = TransparentAddressRankingConsumer::active_metadata(&complete_store)?
+        .ok_or_else(|| eyre!("complete replay must activate a ranking generation"))?;
+    assert!(active.generation > 0);
+    assert_eq!(
+        active.coverage.balance_complete_through_height,
+        BlockHeight::new(1)
+    );
+    assert!(TransparentAddressRankingConsumer::build_metadata(&complete_store)?.is_none());
+    let ranking_cursor = complete_store
+        .get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
+        .ok_or_else(|| eyre!("complete replay must commit the ranking cursor"))?;
+    assert_eq!(
+        Some(ranking_cursor),
+        complete_store.get_chain_event_cursor(TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME)?
+    );
+    drop(complete_store);
+
+    let wallet_store_directory = tempdir()?;
+    replay_fixture(
+        replay_config(
+            &fixture_directory,
+            &wallet_store_directory,
+            Some(ProjectionPreset::Wallet),
+        )?,
+        None,
+    )
+    .await?;
+
+    let wallet_store_path = wallet_store_directory.path().join("canonical");
+    let wallet_store = open_primary_derive_store_for_canonical_with_projection_preset(
+        &wallet_store_path,
+        RocksDbResourceBudget::derive_writer_defaults(),
+        ProjectionPreset::Wallet,
+    )?;
+    assert!(!wallet_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME));
+    assert_eq!(
+        wallet_store.get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?,
+        None
+    );
+
     Ok(())
 }
 

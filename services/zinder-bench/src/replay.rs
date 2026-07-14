@@ -13,7 +13,7 @@ use zinder_derive::{DeriveStore, ProjectionPreset, TRANSPARENT_ADDRESS_RANKING_C
 use zinder_ingest::{
     RawBlobPolicy,
     bench_support::{BenchBulkCatchupParams, bench_bulk_catchup_run_config, bench_derive_config},
-    catch_up_derive_store_to_canonical,
+    bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical,
     open_primary_derive_store_for_canonical_with_projection_preset, run_bulk_catchup_with_store,
 };
 use zinder_store::{
@@ -194,6 +194,9 @@ async fn measure_projection_replay(
     let write_bytes_before = derive_store.logical_write_bytes();
     catch_up_derive_store_to_canonical(canonical_store, &derive_store, bench_derive_config())
         .await?;
+    if derive_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME) {
+        let _ = bootstrap_transparent_address_ranking(canonical_store, &derive_store).await?;
+    }
     let wall_clock_seconds = derive_started_at.elapsed().as_secs_f64();
     let write_bytes = derive_store
         .logical_write_bytes()
