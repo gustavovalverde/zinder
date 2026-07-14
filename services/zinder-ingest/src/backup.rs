@@ -717,7 +717,12 @@ pub(crate) fn admit_restore_bundle_if_present(
     }
     if admission_exists {
         let admitted_manifest = read_backup_manifest(&admission_path)?;
-        validate_manifest_structure(&admitted_manifest, network, projection_preset, bundle_path)?;
+        validate_consumed_restore_evidence(
+            &admitted_manifest,
+            network,
+            projection_preset,
+            bundle_path,
+        )?;
         return Ok(RestoreAdmission::PreviouslyAdmitted);
     }
     if !pending_manifest_exists {
@@ -809,6 +814,81 @@ fn validate_manifest_structure(
             expected_preset,
             bundle_staging_path,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_consumed_restore_evidence(
+    manifest: &BackupManifest,
+    expected_network: Network,
+    expected_preset: ProjectionPreset,
+    bundle_path: &Path,
+) -> Result<(), IngestError> {
+    if manifest.format_version != BACKUP_MANIFEST_FORMAT_VERSION {
+        return Err(backup_validation_error(
+            bundle_path,
+            "consumed restore evidence format version is unsupported",
+        ));
+    }
+    if manifest.network != encode_zinder_native_chain_name(expected_network) {
+        return Err(backup_validation_error(
+            bundle_path,
+            "consumed restore evidence network does not match the opened store",
+        ));
+    }
+    if manifest.projection_preset != expected_preset.as_str() {
+        return Err(backup_validation_error(
+            bundle_path,
+            "consumed restore evidence preset does not match the opened store",
+        ));
+    }
+    if let Some(canonical) = &manifest.canonical_position {
+        decode_rpc_block_hash_hex(&canonical.visible_tip_hash).map_err(|_| {
+            backup_validation_error(bundle_path, "historical canonical tip hash is malformed")
+        })?;
+        validate_canonical_history_backup_bounds(canonical, bundle_path)?;
+    }
+    let mut identities = HashSet::with_capacity(manifest.projections.len());
+    for projection in &manifest.projections {
+        if projection.identity.is_empty() || !identities.insert(projection.identity.as_str()) {
+            return Err(backup_validation_error(
+                bundle_path,
+                "consumed restore evidence contains an invalid projection identity",
+            ));
+        }
+        if projection.state == ProjectionBackupState::Omitted
+            && (projection.cursor.is_some() || projection.materialized_height.is_some())
+        {
+            return Err(backup_validation_error(
+                bundle_path,
+                "historically omitted projection contains position evidence",
+            ));
+        }
+        if let Some(cursor) = &projection.cursor {
+            URL_SAFE_NO_PAD.decode(cursor).map_err(|_| {
+                backup_validation_error(bundle_path, "historical projection cursor is malformed")
+            })?;
+        }
+        if projection.state == ProjectionBackupState::Exact && projection.cursor.is_none() {
+            return Err(backup_validation_error(
+                bundle_path,
+                "historically exact projection is missing its cursor",
+            ));
+        }
+        if let Some(materialized_height) = projection.materialized_height {
+            let Some(canonical) = &manifest.canonical_position else {
+                return Err(backup_validation_error(
+                    bundle_path,
+                    "historical projection position exists without canonical history",
+                ));
+            };
+            if materialized_height > canonical.visible_tip_height {
+                return Err(backup_validation_error(
+                    bundle_path,
+                    "historical projection position exceeds its canonical tip",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1823,6 +1903,43 @@ mod tests {
             config.derive_rocksdb_budget,
         )?;
         assert_eq!(second_admission, RestoreAdmission::PreviouslyAdmitted);
+        Ok(())
+    }
+
+    #[test]
+    fn consumed_restore_evidence_survives_later_catalog_and_schema_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Complete)?;
+        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Complete)?;
+        assert_eq!(
+            admit_restore_bundle_if_present(
+                &config.to_path,
+                config.network,
+                ProjectionPreset::Complete,
+                config.canonical_rocksdb_budget,
+                config.derive_rocksdb_budget,
+            )?,
+            RestoreAdmission::NewlyAdmitted
+        );
+        let admission_path = config.to_path.join(RESTORE_ADMISSION_FILE_NAME);
+        let mut historical: serde_json::Value =
+            serde_json::from_slice(&fs::read(&admission_path)?)?;
+        let projections = historical["projections"]
+            .as_array_mut()
+            .ok_or("historical projections missing")?;
+        projections.pop().ok_or("historical projection missing")?;
+        projections[0]["schema_version"] = 0.into();
+        fs::write(&admission_path, serde_json::to_vec_pretty(&historical)?)?;
+
+        let admission = admit_restore_bundle_if_present(
+            &config.to_path,
+            config.network,
+            ProjectionPreset::Complete,
+            config.canonical_rocksdb_budget,
+            config.derive_rocksdb_budget,
+        )?;
+
+        assert_eq!(admission, RestoreAdmission::PreviouslyAdmitted);
         Ok(())
     }
 

@@ -591,7 +591,9 @@ Expected recovery behavior:
   primary writer, ingest fully reopens and recomputes the pending backup
   manifest. Successful admission atomically renames it to
   `zinder-restore-admission.json`; later restarts validate that historical
-  record structurally but use current durable projection state for readiness.
+  record structurally without comparing its projection count or schema versions
+  to the running catalog. Current durable projection state then follows normal
+  schema reconciliation and remains the only readiness authority.
   A pending and admitted record together, or any malformed or mismatched
   record, fails closed.
 - Start query, compatibility, and explorer readers only after ingest admits the
