@@ -4,6 +4,7 @@
 //! without computing percentiles or product-specific buckets.
 
 use tonic::{Request, Response, Status};
+use zinder_core::{BlockHeight, CanonicalHistoryBounds};
 use zinder_derive::{
     DeriveStore, PaidFeeDistribution as DerivedPaidFeeDistribution,
     PaidFeeDistributionBackfillCoverage, PaidFeeDistributionConsumer,
@@ -17,6 +18,7 @@ use zinder_proto::v1::explorer::{
 };
 use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
+use zinder_store::SecondaryChainStore;
 
 use super::error::ExplorerError;
 use super::freshness::{
@@ -27,6 +29,7 @@ use super::freshness::{
 /// Executes one `ExplorerQuery.PaidFeeDistribution` request.
 pub(crate) async fn handle_paid_fee_distribution(
     derive_store: &DeriveStore,
+    canonical_store: &SecondaryChainStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<PaidFeeDistributionRequest>,
@@ -38,6 +41,13 @@ pub(crate) async fn handle_paid_fee_distribution(
         request.start_time_unix_seconds,
         request.end_time_unix_seconds,
     )?;
+    canonical_store
+        .try_catch_up()
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let canonical_history_bounds = canonical_store
+        .current_chain_epoch_reader()
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .canonical_history_bounds();
 
     for _ in 0..MAX_EPOCH_STABILIZATION_ATTEMPTS {
         let (chain_epoch, visible_tip_height) = fetch_current_chain_epoch(wallet_client).await?;
@@ -77,8 +87,13 @@ pub(crate) async fn handle_paid_fee_distribution(
             days: map_distribution(distribution),
             coverage: Some(map_coverage(
                 coverage,
-                visible_tip_height,
-                indexed_tip_matches,
+                CoverageEvaluation {
+                    visible_tip_height,
+                    indexed_tip_matches,
+                    requested_start_time_unix_seconds: request.start_time_unix_seconds,
+                    requested_end_time_unix_seconds: request.end_time_unix_seconds,
+                    canonical_history_bounds,
+                },
             )),
         }));
     }
@@ -138,19 +153,39 @@ fn map_frequency(frequency: DerivedPaidFeeFrequency) -> PaidFeeFrequency {
     }
 }
 
-fn map_coverage(
-    coverage: PaidFeeDistributionBackfillCoverage,
+#[derive(Clone, Copy)]
+struct CoverageEvaluation {
     visible_tip_height: u32,
     indexed_tip_matches: bool,
+    requested_start_time_unix_seconds: i64,
+    requested_end_time_unix_seconds: i64,
+    canonical_history_bounds: CanonicalHistoryBounds,
+}
+
+fn map_coverage(
+    coverage: PaidFeeDistributionBackfillCoverage,
+    evaluation: CoverageEvaluation,
 ) -> PaidFeeDistributionCoverage {
+    let CoverageEvaluation {
+        visible_tip_height,
+        indexed_tip_matches,
+        requested_start_time_unix_seconds,
+        requested_end_time_unix_seconds,
+        canonical_history_bounds,
+    } = evaluation;
     PaidFeeDistributionCoverage {
         complete_from_height: Some(coverage.complete_from_height.value()),
         complete_through_height: Some(coverage.complete_through_height.value()),
         complete_from_time_unix_seconds: Some(coverage.complete_from_time_unix_seconds),
         complete_through_time_unix_seconds: Some(coverage.complete_through_time_unix_seconds),
         requested_range_complete: indexed_tip_matches
-            && coverage.complete_from_height.value() <= 1
-            && coverage.complete_through_height.value() >= visible_tip_height,
+            && !canonical_history_bounds.intentionally_excludes(BlockHeight::new(1))
+            && requested_start_time_unix_seconds >= coverage.complete_from_time_unix_seconds
+            && (requested_end_time_unix_seconds
+                <= coverage
+                    .complete_through_time_unix_seconds
+                    .saturating_add(1)
+                || coverage.complete_through_height.value() >= visible_tip_height),
     }
 }
 
@@ -163,7 +198,7 @@ mod tests {
 
     use super::*;
     use tonic::Code;
-    use zinder_core::BlockHeight;
+    use zinder_core::{BlockHash, BlockId, CanonicalHistoryBoundsError};
 
     #[test]
     fn rejects_empty_or_reversed_time_ranges() {
@@ -207,8 +242,13 @@ mod tests {
                 1_699_000_000,
                 1_700_000_000,
             ),
-            200,
-            true,
+            CoverageEvaluation {
+                visible_tip_height: 200,
+                indexed_tip_matches: true,
+                requested_start_time_unix_seconds: 1_699_500_000,
+                requested_end_time_unix_seconds: 1_700_100_000,
+                canonical_history_bounds: CanonicalHistoryBounds::complete(),
+            },
         );
         assert!(complete.requested_range_complete);
 
@@ -219,8 +259,13 @@ mod tests {
                 1_699_000_000,
                 1_700_000_000,
             ),
-            200,
-            true,
+            CoverageEvaluation {
+                visible_tip_height: 200,
+                indexed_tip_matches: true,
+                requested_start_time_unix_seconds: 1_698_999_999,
+                requested_end_time_unix_seconds: 1_700_100_000,
+                canonical_history_bounds: CanonicalHistoryBounds::complete(),
+            },
         );
         assert!(!missing_earlier_heights.requested_range_complete);
 
@@ -231,8 +276,13 @@ mod tests {
                 1_699_000_000,
                 1_700_000_000,
             ),
-            200,
-            true,
+            CoverageEvaluation {
+                visible_tip_height: 200,
+                indexed_tip_matches: true,
+                requested_start_time_unix_seconds: 1_699_500_000,
+                requested_end_time_unix_seconds: 1_700_100_000,
+                canonical_history_bounds: CanonicalHistoryBounds::complete(),
+            },
         );
         assert!(!ends_after_lagging_coverage.requested_range_complete);
 
@@ -243,9 +293,40 @@ mod tests {
                 1_699_000_000,
                 1_700_000_000,
             ),
-            200,
-            false,
+            CoverageEvaluation {
+                visible_tip_height: 200,
+                indexed_tip_matches: false,
+                requested_start_time_unix_seconds: 1_699_500_000,
+                requested_end_time_unix_seconds: 1_700_100_000,
+                canonical_history_bounds: CanonicalHistoryBounds::complete(),
+            },
         );
         assert!(!mismatched_indexed_tip.requested_range_complete);
+    }
+
+    #[test]
+    fn checkpointed_history_never_claims_requested_time_range_is_complete()
+    -> Result<(), CanonicalHistoryBoundsError> {
+        let coverage = map_coverage(
+            PaidFeeDistributionBackfillCoverage::new(
+                BlockHeight::new(501),
+                BlockHeight::new(700),
+                1_699_000_000,
+                1_700_000_000,
+            ),
+            CoverageEvaluation {
+                visible_tip_height: 700,
+                indexed_tip_matches: true,
+                requested_start_time_unix_seconds: 1_699_500_000,
+                requested_end_time_unix_seconds: 1_700_100_000,
+                canonical_history_bounds: CanonicalHistoryBounds::checkpointed(BlockId::new(
+                    BlockHeight::new(500),
+                    BlockHash::from_bytes([1; 32]),
+                ))?,
+            },
+        );
+
+        assert!(!coverage.requested_range_complete);
+        Ok(())
     }
 }

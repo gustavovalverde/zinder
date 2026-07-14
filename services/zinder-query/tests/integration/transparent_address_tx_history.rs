@@ -12,10 +12,19 @@ use zinder_core::{
     CompactBlockArtifact, Network, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, UnixTimestampMillis,
 };
+use zinder_derive::{
+    DeriveStore, DeriveStoreOptions, ProjectionPreset,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+};
+use zinder_proto::capabilities::{
+    WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
+};
 use zinder_proto::v1::wallet::{
     self, AddressLookup, address_lookup, wallet_query_server::WalletQuery as WalletQueryService,
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{
+    ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter, derive_store_wallet_projection_reader,
+};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, PrimaryChainStore, ReorgWindowChange,
 };
@@ -28,11 +37,22 @@ use crate::common::{block_hash_from_seed, split_tx_ids_stream, synthetic_chain_e
 
 const ADDRESS_SCRIPT_HASH_BYTES: [u8; 32] = [0xEF; 32];
 
+fn open_wallet_derive_store(canonical_path: &std::path::Path) -> eyre::Result<DeriveStore> {
+    Ok(DeriveStore::open_with_projection_preset(
+        DeriveStore::path_for_canonical(canonical_path),
+        ProjectionPreset::Wallet,
+        DeriveStoreOptions {
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
+        },
+    )?)
+}
+
 #[tokio::test]
 async fn transparent_address_tx_ids_in_range_round_trips_through_native_grpc() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
+    let derive_store = open_wallet_derive_store(store_fixture.tempdir_path())?;
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
     commit_tx_index(
         &store,
@@ -45,9 +65,31 @@ async fn transparent_address_tx_ids_in_range_round_trips_through_native_grpc() -
         },
     )?;
 
+    let projection_reader = derive_store_wallet_projection_reader(derive_store);
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_derive_store(derive_store);
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+        .with_wallet_projection_reader(Arc::clone(&projection_reader));
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default())
+        .with_wallet_projection_reader(projection_reader);
+
+    let server_info =
+        WalletQueryService::server_info(&grpc_adapter, Request::new(wallet::ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .info
+            .and_then(|info| info.common)
+            .ok_or_else(|| eyre::eyre!("wallet server info missing common descriptor"))?;
+    assert!(
+        server_info
+            .capabilities
+            .iter()
+            .any(|capability| capability == WALLET_ADDRESS_TRANSPARENT_HISTORY_V1)
+    );
+    assert!(
+        !server_info
+            .capabilities
+            .iter()
+            .any(|capability| capability == WALLET_READ_TRANSPARENT_SPENDS_V1)
+    );
 
     let mut stream = WalletQueryService::transparent_address_tx_ids_in_range(
         &grpc_adapter,
@@ -374,11 +416,15 @@ fn commit_tx_index(
         ));
     }
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
         vec![compact_block],
     ))?;
+    derive_store.put_chain_event_cursor(
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+        commit.event_envelope.cursor.as_bytes(),
+    )?;
     seed_transparent_address_transaction_history(derive_store, &artifacts)?;
     Ok(())
 }

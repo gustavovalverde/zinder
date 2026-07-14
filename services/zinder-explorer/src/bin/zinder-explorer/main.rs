@@ -144,6 +144,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             return Err(error);
         }
     };
+    report_projection_workload(&readiness, derive_store.as_ref());
 
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
@@ -202,6 +203,20 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     .await;
 
     server_result.map_err(ExplorerConfigError::Transport)
+}
+
+fn report_projection_workload(readiness: &Readiness, derive_store: Option<&DeriveStore>) {
+    let Some(projection_preset) = derive_store.map(DeriveStore::effective_projection_preset) else {
+        return;
+    };
+    readiness.set_projection_workload(
+        projection_preset.as_str(),
+        projection_preset
+            .consumer_schemas()
+            .iter()
+            .map(|schema| schema.name.as_str().to_owned())
+            .collect(),
+    );
 }
 
 async fn shutdown_background_tasks(
@@ -303,13 +318,41 @@ fn open_derive_store(
     let derive_path = DeriveStore::path_for_canonical(&explorer_config.storage.path);
     let secondary_path = explorer_config.storage.secondary_path.join("derive");
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    match DeriveStore::open_secondary(
+    let projection_preset = match DeriveStore::detect_projection_preset_at_path(&derive_path) {
+        Ok(Some(projection_preset)) => projection_preset,
+        Ok(None) => {
+            tracing::info!(
+                target: "zinder::explorer",
+                event = "derive_store_unavailable",
+                "derive store unavailable; derive-backed explorer capabilities disabled"
+            );
+            open_storage_phase.complete();
+            return Ok(None);
+        }
+        Err(error @ DeriveStoreError::Open { .. }) => {
+            tracing::info!(
+                target: "zinder::explorer",
+                event = "derive_store_unavailable",
+                error = %error,
+                "derive store unavailable; derive-backed explorer capabilities disabled"
+            );
+            open_storage_phase.complete();
+            return Ok(None);
+        }
+        Err(error) => {
+            let wrapped = ExplorerConfigError::Store(error);
+            open_storage_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    };
+    match DeriveStore::open_secondary_with_projection_preset(
         &derive_path,
         &secondary_path,
+        projection_preset,
         DeriveStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: explorer_config.storage.derive_rocksdb_budget,
+            ..DeriveStoreOptions::default()
         },
     ) {
         Ok(handle) => {

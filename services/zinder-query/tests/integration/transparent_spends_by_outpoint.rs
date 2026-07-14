@@ -11,6 +11,7 @@ use zinder_core::{
     BlockHeight, ChainEpochId, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
     TransparentOutputArtifact, TransparentSpendFact,
 };
+use zinder_derive::{DeriveStore, DeriveStoreOptions, ProjectionPreset};
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
     QueryError, ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
@@ -197,11 +198,22 @@ fn derive_only_spend(outpoint: TransparentOutPoint, height: BlockHeight) -> Tran
     )
 }
 
+fn open_wallet_derive_store(canonical_path: &std::path::Path) -> eyre::Result<DeriveStore> {
+    Ok(DeriveStore::open_with_projection_preset(
+        DeriveStore::path_for_canonical(canonical_path),
+        ProjectionPreset::Wallet,
+        DeriveStoreOptions {
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
+        },
+    )?)
+}
+
 #[tokio::test]
 async fn transparent_spends_by_outpoint_resolves_swept_spend_from_derive() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
+    let derive_store = open_wallet_derive_store(store_fixture.tempdir_path())?;
     commit_to_settled_tip_two(&store)?;
 
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x41; 32]), 0);

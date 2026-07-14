@@ -29,7 +29,8 @@ use zinder_store::{
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
 use crate::{
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, WalletQueryApi,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
+    WalletProjectionReadApi, WalletQueryApi,
 };
 
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
@@ -71,6 +72,7 @@ const TRANSACTION_NOT_FOUND_REASON: &str =
 pub struct WalletQueryGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     server_info: ServerInfoSettings,
+    wallet_projection_reader: Option<Arc<dyn WalletProjectionReadApi>>,
     ingest_control_proxy_endpoint: Option<String>,
     ingest_control_bearer_token: Option<BearerToken>,
     /// One cached HTTP/2 channel to the ingest-control writer, dialed lazily
@@ -88,6 +90,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         Self {
             query_api,
             server_info,
+            wallet_projection_reader: None,
             ingest_control_proxy_endpoint: None,
             ingest_control_bearer_token: None,
             ingest_control_channel: Arc::new(OnceCell::new()),
@@ -110,6 +113,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         Self {
             query_api,
             server_info,
+            wallet_projection_reader: None,
             ingest_control_proxy_endpoint: Some(ingest_control_proxy_endpoint),
             ingest_control_bearer_token: None,
             ingest_control_channel: Arc::new(OnceCell::new()),
@@ -122,6 +126,16 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_ingest_control_bearer_token(mut self, bearer_token: BearerToken) -> Self {
         self.ingest_control_bearer_token = Some(bearer_token);
+        self
+    }
+
+    /// Supplies the typed projection-readiness source used by `ServerInfo`.
+    #[must_use]
+    pub fn with_wallet_projection_reader(
+        mut self,
+        wallet_projection_reader: Arc<dyn WalletProjectionReadApi>,
+    ) -> Self {
+        self.wallet_projection_reader = Some(wallet_projection_reader);
         self
     }
 
@@ -729,7 +743,36 @@ where
         &self,
         _request: Request<wallet::ServerInfoRequest>,
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
-        let mut wallet_info = build_wallet_server_info(&self.server_info);
+        let mut server_info = self.server_info.clone();
+        if let Some(wallet_projection_reader) = self.wallet_projection_reader.clone() {
+            let visible_tip_height = self
+                .query_api
+                .latest_block(None)
+                .await
+                .map_err(|error| status_from_query_error(&error))?
+                .chain_epoch
+                .visible_tip_height;
+            let readiness =
+                tokio::task::spawn_blocking(move || wallet_projection_reader.readiness())
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "wallet projection readiness task failed: {error}"
+                        ))
+                    })?
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "wallet projection readiness read failed: {error}"
+                        ))
+                    })?;
+            server_info.transparent_address_history_available = readiness
+                .transparent_address_history
+                .covers(visible_tip_height);
+            server_info.transparent_outpoint_spend_available = readiness
+                .transparent_outpoint_spend
+                .covers(visible_tip_height);
+        }
+        let mut wallet_info = build_wallet_server_info(&server_info);
         let Some(common) = wallet_info.common.as_mut() else {
             return Err(Status::internal(
                 "build_wallet_server_info must populate ops.ServerInfo",

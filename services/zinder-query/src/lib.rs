@@ -19,11 +19,7 @@ use zinder_core::{
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
 };
-use zinder_derive::{
-    DeriveStore, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransparentAddressTransactionHistoryConsumer,
-    TransparentAddressTransactionHistoryPageRequest, TransparentOutpointSpendConsumer,
-};
+use zinder_derive::DeriveStore;
 use zinder_proto::capabilities::{
     WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
 };
@@ -37,6 +33,7 @@ use zinder_store::{
 
 mod grpc;
 mod readiness_refresh;
+mod wallet_projection_read;
 
 pub use grpc::{
     ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
@@ -55,6 +52,11 @@ pub use grpc::{
 pub use readiness_refresh::{
     DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,
     spawn_readiness_refresh, spawn_secondary_catchup,
+};
+pub use wallet_projection_read::{
+    ProjectionRead, TransparentAddressHistoryPage, WalletProjectionPosition,
+    WalletProjectionReadApi, WalletProjectionReadError, WalletProjectionReadiness,
+    derive_store_wallet_projection_reader,
 };
 
 /// Wallet-facing read API backed by epoch-bound canonical reads.
@@ -313,7 +315,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct WalletQuery<ReadApi, Broadcaster = ()> {
     read_api: ReadApi,
-    derive_store: Option<DeriveStore>,
+    wallet_projection_reader: Option<Arc<dyn WalletProjectionReadApi>>,
     transaction_broadcaster: Broadcaster,
     options: WalletQueryOptions,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
@@ -326,7 +328,7 @@ impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalletQuery")
             .field("read_api", &self.read_api)
-            .field("derive_store", &self.derive_store)
+            .field("wallet_projection_reader", &self.wallet_projection_reader)
             .field("transaction_broadcaster", &self.transaction_broadcaster)
             .field("options", &self.options)
             .field(
@@ -419,7 +421,7 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
     ) -> Self {
         Self {
             read_api,
-            derive_store: None,
+            wallet_projection_reader: None,
             transaction_broadcaster,
             options,
             network_upgrade_activations,
@@ -430,7 +432,17 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
     /// Attaches the derive-store reader used for derive-owned wallet projections.
     #[must_use]
     pub fn with_derive_store(mut self, derive_store: DeriveStore) -> Self {
-        self.derive_store = Some(derive_store);
+        self.wallet_projection_reader = Some(derive_store_wallet_projection_reader(derive_store));
+        self
+    }
+
+    /// Attaches a typed wallet-projection reader.
+    #[must_use]
+    pub fn with_wallet_projection_reader(
+        mut self,
+        wallet_projection_reader: Arc<dyn WalletProjectionReadApi>,
+    ) -> Self {
+        self.wallet_projection_reader = Some(wallet_projection_reader);
         self
     }
 
@@ -567,10 +579,13 @@ where
             let compact_block = match reader.compact_block_at(height) {
                 Ok(Some(compact_block)) => compact_block,
                 Ok(None)
-                | Err(StoreError::ArtifactMissing {
-                    family: ArtifactFamily::CompactBlock,
-                    ..
-                }) => {
+                | Err(
+                    StoreError::ArtifactMissing {
+                        family: ArtifactFamily::CompactBlock,
+                        ..
+                    }
+                    | StoreError::CanonicalHistoryUnavailable { .. },
+                ) => {
                     return Err(block_height_artifact_unavailable(
                         ArtifactFamily::CompactBlock,
                         height,
@@ -760,7 +775,7 @@ where
     ) -> Result<TransparentSpendsByOutpointResponse, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
-        let derive_store = self.derive_store.clone();
+        let wallet_projection_reader = self.wallet_projection_reader.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
@@ -781,9 +796,9 @@ where
             }
 
             if !canonical_misses.is_empty() {
-                if let Some(derive_store) = derive_store.as_ref() {
+                if let Some(wallet_projection_reader) = wallet_projection_reader.as_deref() {
                     for entry in resolve_swept_spends_from_derive(
-                        derive_store,
+                        wallet_projection_reader,
                         &reader,
                         chain_epoch.settled_tip_height,
                         &canonical_misses,
@@ -862,7 +877,15 @@ where
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
-            let compact_blocks = reader.compact_blocks_in_range(block_range)?;
+            let compact_blocks = reader
+                .compact_blocks_in_range(block_range)
+                .map_err(|error| {
+                    map_height_artifact_store_error(
+                        error,
+                        ArtifactFamily::CompactBlock,
+                        block_range.start,
+                    )
+                })?;
             let mut available_compact_blocks = Vec::with_capacity(compact_blocks.len());
 
             for (height, compact_block) in block_range.into_iter().zip(compact_blocks) {
@@ -995,7 +1018,7 @@ where
             return outcome;
         }
 
-        let Some(derive_store) = self.derive_store.clone() else {
+        let Some(wallet_projection_reader) = self.wallet_projection_reader.clone() else {
             let outcome = Err(QueryError::DeriveUnavailable {
                 capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
             });
@@ -1013,14 +1036,12 @@ where
                 .current_chain_epoch_reader()
                 .map_err(QueryError::Store)?;
             let chain_epoch = reader.chain_epoch();
-            derive_store
-                .try_catch_up()
-                .map_err(QueryError::DeriveStore)?;
-            let derive_height = derive_store
-                .last_materialized_height_ascending(
-                    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-                )
-                .map_err(QueryError::DeriveStore)?;
+            let projection_read = wallet_projection_reader
+                .transparent_address_history_page(&request)
+                .map_err(|error| {
+                    map_wallet_projection_read_error(error, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1)
+                })?;
+            let derive_height = projection_read.materialized_height;
             if derive_height.is_none_or(|height| height < chain_epoch.visible_tip_height) {
                 return Err(QueryError::DeriveLag {
                     capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
@@ -1028,23 +1049,10 @@ where
                     derive_height,
                 });
             }
-            let page = TransparentAddressTransactionHistoryConsumer::read_page(
-                &derive_store,
-                TransparentAddressTransactionHistoryPageRequest {
-                    address_script_hash: request.address_script_hash,
-                    start_height: request.start_height,
-                    end_height: request.end_height,
-                    max_entries: request.max_entries,
-                    descending: request.descending,
-                    from_cursor: request.from_cursor.as_ref(),
-                },
-            )
-            .map_err(map_transparent_history_derive_error)?;
-
             Ok(TransparentAddressTxIds {
                 chain_epoch,
-                artifacts: page.artifacts,
-                next_cursor: page.next_cursor,
+                artifacts: projection_read.value.artifacts,
+                next_cursor: projection_read.value.next_cursor,
             })
         }))
         .await;
@@ -1157,6 +1165,13 @@ where
                     family: ArtifactFamily::TreeState,
                     ..
                 }) => None,
+                Err(error @ StoreError::CanonicalHistoryUnavailable { .. }) => {
+                    return Err(map_height_artifact_store_error(
+                        error,
+                        ArtifactFamily::TreeState,
+                        height,
+                    ));
+                }
                 Err(error) => return Err(QueryError::Store(error)),
             };
             if let Some(stored) = stored
@@ -1172,7 +1187,9 @@ where
 
             let block = reader
                 .block_header_at(height)
-                .map_err(QueryError::Store)?
+                .map_err(|error| {
+                    map_height_artifact_store_error(error, ArtifactFamily::TreeState, height)
+                })?
                 .ok_or_else(|| {
                     block_height_artifact_unavailable(ArtifactFamily::TreeState, height)
                 })?;
@@ -1390,21 +1407,21 @@ where
 /// deleted below the projection's durable height, so an empty projection on a
 /// store that never swept still returns the correct absent answer.
 fn resolve_swept_spends_from_derive(
-    derive_store: &DeriveStore,
+    wallet_projection_reader: &dyn WalletProjectionReadApi,
     reader: &zinder_store::ChainEpochReader<'_>,
     settled_tip_height: BlockHeight,
     canonical_misses: &[TransparentOutPoint],
 ) -> Result<Vec<TransparentSpendEntry>, QueryError> {
-    derive_store
-        .try_catch_up()
-        .map_err(QueryError::DeriveStore)?;
     let deleted_through = reader
         .transparent_retention_deleted_through_height()
         .map_err(QueryError::Store)?
         .map_or(0, BlockHeight::value);
-    let derive_height = derive_store
-        .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)
-        .map_err(QueryError::DeriveStore)?;
+    let projection_read = wallet_projection_reader
+        .transparent_outpoint_spenders(canonical_misses)
+        .map_err(|error| {
+            map_wallet_projection_read_error(error, WALLET_READ_TRANSPARENT_SPENDS_V1)
+        })?;
+    let derive_height = projection_read.materialized_height;
     if derive_height.map_or(0, BlockHeight::value) < deleted_through {
         return Err(QueryError::DeriveLag {
             capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
@@ -1412,9 +1429,7 @@ fn resolve_swept_spends_from_derive(
             derive_height,
         });
     }
-    let derive_hits =
-        TransparentOutpointSpendConsumer::read_spends_by_outpoints(derive_store, canonical_misses)
-            .map_err(QueryError::DeriveStore)?;
+    let derive_hits = projection_read.value;
     let mut resolved = Vec::with_capacity(canonical_misses.len().min(derive_hits.len()));
     for outpoint in canonical_misses {
         let Some(entry) = derive_hits.get(outpoint) else {
@@ -1625,7 +1640,9 @@ where
             .chain_epoch_reader_at(chain_epoch_id)
             .map_err(|error| map_epoch_pin_store_error(error, chain_epoch_id))?
             .block_blobs_in_range(sub_range)
-            .map_err(QueryError::Store)
+            .map_err(|error| {
+                map_height_artifact_store_error(error, ArtifactFamily::BlockBlob, sub_range.start)
+            })
     }))
     .await
 }
@@ -1696,28 +1713,22 @@ fn map_chain_event_store_error(error: StoreError) -> QueryError {
     }
 }
 
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "Only transparent-history cursor decode errors get a query cursor category; unknown future derive-store failures stay derive-store failures."
-)]
-fn map_transparent_history_derive_error(error: zinder_derive::DeriveStoreError) -> QueryError {
+fn map_wallet_projection_read_error(
+    error: WalletProjectionReadError,
+    capability: &'static str,
+) -> QueryError {
     match error {
-        zinder_derive::DeriveStoreError::Decode { reason, .. } if reason.contains("cursor") => {
+        WalletProjectionReadError::ProjectionUnavailable { .. } => {
+            QueryError::DeriveUnavailable { capability }
+        }
+        WalletProjectionReadError::TransparentAddressHistoryCursorInvalid => {
             QueryError::TransparentHistoryCursorInvalid {
                 reason: "cursor does not match the transparent-address transaction-history stream",
             }
         }
-        zinder_derive::DeriveStoreError::InvalidOptions { .. }
-        | zinder_derive::DeriveStoreError::Open { .. }
-        | zinder_derive::DeriveStoreError::Operation { .. }
-        | zinder_derive::DeriveStoreError::Decode { .. }
-        | zinder_derive::DeriveStoreError::SchemaMismatch { .. }
-        | zinder_derive::DeriveStoreError::ColumnFamilyMissing { .. }
-        | zinder_derive::DeriveStoreError::ConsumerColumnFamilyMissing { .. }
-        | zinder_derive::DeriveStoreError::ConsumerOperation { .. } => {
-            QueryError::DeriveStore(error)
+        WalletProjectionReadError::Storage { source } => {
+            QueryError::WalletProjectionRead { source }
         }
-        _ => QueryError::DeriveStore(error),
     }
 }
 
@@ -1805,6 +1816,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
         Some(QueryError::Store(_)) => "store",
         Some(QueryError::DeriveStore(_)) => "derive_store",
+        Some(QueryError::WalletProjectionRead { .. }) => "wallet_projection_read",
         Some(QueryError::Node(_)) => "node",
     }
 }
@@ -2291,6 +2303,14 @@ pub enum QueryError {
     #[error(transparent)]
     DeriveStore(#[from] zinder_derive::DeriveStoreError),
 
+    /// Typed wallet-projection backend returned a storage failure.
+    #[error("wallet projection read failed: {source}")]
+    WalletProjectionRead {
+        /// Backend-specific source retained without leaking its API contract.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// Upstream node operation failed.
     #[error(transparent)]
     Node(#[from] SourceError),
@@ -2336,7 +2356,9 @@ impl zinder_proto::BoundaryError for QueryError {
                 ErrorReason::NodeCapabilityMissing
             }
             Self::Node(_) => ErrorReason::NodeUnavailable,
-            Self::DeriveStore(_) | Self::Store(_) => ErrorReason::StorageUnavailable,
+            Self::DeriveStore(_) | Self::Store(_) | Self::WalletProjectionRead { .. } => {
+                ErrorReason::StorageUnavailable
+            }
         }
     }
 }
@@ -2388,6 +2410,29 @@ fn subtree_root_artifact_unavailable(
 
 fn artifact_unavailable(family: ArtifactFamily, key: ArtifactKey) -> QueryError {
     QueryError::ArtifactUnavailable { family, key }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only intentional history absence and a matching missing artifact change category; every other current and future store failure remains a storage error."
+)]
+fn map_height_artifact_store_error(
+    error: StoreError,
+    family: ArtifactFamily,
+    requested_height: BlockHeight,
+) -> QueryError {
+    match error {
+        StoreError::CanonicalHistoryUnavailable { .. } => {
+            block_height_artifact_unavailable(family, requested_height)
+        }
+        StoreError::ArtifactMissing {
+            family: missing_family,
+            ..
+        } if missing_family == family => {
+            block_height_artifact_unavailable(family, requested_height)
+        }
+        _ => QueryError::Store(error),
+    }
 }
 
 fn validate_block_range(
@@ -2501,6 +2546,9 @@ mod error_reason_tests {
             QueryError::DeriveStore(zinder_derive::DeriveStoreError::InvalidOptions {
                 reason: "probe",
             }),
+            QueryError::WalletProjectionRead {
+                source: Box::new(std::io::Error::other("probe")),
+            },
             QueryError::Node(SourceError::InvalidBlockHashHex {
                 reason: "probe".to_owned(),
             }),
@@ -2516,5 +2564,27 @@ mod error_reason_tests {
                 "QueryError variant {error:?} mapped to ERROR_REASON_UNSPECIFIED"
             );
         }
+    }
+
+    #[test]
+    fn typed_projection_errors_preserve_public_wallet_error_vocabulary() {
+        assert!(matches!(
+            map_wallet_projection_read_error(
+                WalletProjectionReadError::ProjectionUnavailable {
+                    projection: "probe",
+                },
+                "wallet.probe.v1",
+            ),
+            QueryError::DeriveUnavailable {
+                capability: "wallet.probe.v1",
+            }
+        ));
+        assert!(matches!(
+            map_wallet_projection_read_error(
+                WalletProjectionReadError::TransparentAddressHistoryCursorInvalid,
+                WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+            ),
+            QueryError::TransparentHistoryCursorInvalid { .. }
+        ));
     }
 }

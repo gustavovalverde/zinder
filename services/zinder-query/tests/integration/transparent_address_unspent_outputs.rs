@@ -109,15 +109,15 @@ async fn transparent_address_unspent_outputs_streams_past_the_old_page_cap() -> 
 async fn transparent_address_unspent_outputs_honors_start_height_floor() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let stored_utxos = commit_unspent_outputs(&store, ChainEpochId::new(1), 7, 3)?;
+    let stored_utxos = commit_unspent_outputs(&store, ChainEpochId::new(1), 1, 3)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let (_at_header, at_mined_height) = drain_unspent_outputs(&grpc_adapter, 7, None).await?;
+    let (_at_header, at_mined_height) = drain_unspent_outputs(&grpc_adapter, 1, None).await?;
     assert_eq!(at_mined_height.len(), stored_utxos.len());
 
-    let (_above_header, above_mined_height) = drain_unspent_outputs(&grpc_adapter, 8, None).await?;
+    let (_above_header, above_mined_height) = drain_unspent_outputs(&grpc_adapter, 2, None).await?;
     assert!(
         above_mined_height.is_empty(),
         "outputs mined below the wallet-birthday floor are excluded"

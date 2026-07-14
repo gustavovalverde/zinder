@@ -212,8 +212,8 @@ fn commit_two_block_fixture(
         CompactBlockArtifact, Network, UnixTimestampMillis,
     };
 
-    let first_height = BlockHeight::new(100);
-    let second_height = BlockHeight::new(101);
+    let first_height = BlockHeight::new(1);
+    let second_height = BlockHeight::new(2);
     let first_hash = BlockHash::from_bytes([0x11; 32]);
     let second_hash = BlockHash::from_bytes([0x22; 32]);
 

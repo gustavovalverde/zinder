@@ -9,11 +9,13 @@ use std::num::NonZeroU32;
 
 use tonic::{Request, Response, Status};
 use zinder_core::{
-    BlockFinalNoteCommitmentRoots, ChainEpoch, DisplacedRootArchiveCoverage,
-    FinalNoteCommitmentRoot, ShieldedProtocol as CoreProtocol,
+    BlockFinalNoteCommitmentRoots, BlockHeight, CanonicalHistoryBounds, ChainEpoch,
+    DisplacedRootArchiveCoverage, FinalNoteCommitmentRoot, NetworkUpgradeActivations,
+    ShieldedProtocol as CoreProtocol,
 };
 use zinder_derive::{
-    COMMITMENT_ROOT_SEARCH_INDEX_COLUMN_FAMILY, CommitmentRootSearchConsumer, DeriveStore,
+    COMMITMENT_ROOT_SEARCH_INDEX_COLUMN_FAMILY, CommitmentRootBackfillCoverage,
+    CommitmentRootSearchConsumer, DeriveStore,
 };
 use zinder_proto::capabilities::EXPLORER_COMMITMENT_ROOT_SEARCH_V1;
 use zinder_proto::v1::explorer::{
@@ -37,6 +39,7 @@ const MAX_RECENT_COVERAGE_ROWS: usize = 10_000;
 pub(crate) async fn handle_commitment_root_search(
     derive_store: &DeriveStore,
     canonical_store: &SecondaryChainStore,
+    activations: &NetworkUpgradeActivations,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<CommitmentRootSearchRequest>,
 ) -> Result<Response<CommitmentRootSearchResponse>, Status> {
@@ -57,9 +60,20 @@ pub(crate) async fn handle_commitment_root_search(
         .current_chain_epoch_reader()
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let chain_epoch = reader.chain_epoch();
+    let canonical_history_bounds = reader.canonical_history_bounds();
+    let sapling_activation_height = activations
+        .activation_height_by_name("Sapling")
+        .ok_or_else(|| {
+            ExplorerError::internal("network upgrade activations do not include Sapling")
+        })?;
     let matches = canonical_root_matches(derive_store, &reader, root, max_matches)?;
     let displaced_matches = displaced_root_matches(&reader, root, max_matches)?;
-    let coverage = commitment_root_search_coverage(derive_store, chain_epoch)?;
+    let coverage = commitment_root_search_coverage(
+        derive_store,
+        chain_epoch,
+        canonical_history_bounds,
+        sapling_activation_height,
+    )?;
     let displaced_coverage = displaced_root_search_coverage(
         reader
             .displaced_root_archive_coverage()
@@ -231,6 +245,8 @@ fn displaced_root_search_coverage(
 fn commitment_root_search_coverage(
     derive_store: &DeriveStore,
     chain_epoch: ChainEpoch,
+    canonical_history_bounds: CanonicalHistoryBounds,
+    sapling_activation_height: BlockHeight,
 ) -> Result<CommitmentRootSearchCoverage, Status> {
     let backfill_coverage = CommitmentRootSearchConsumer::backfill_coverage(derive_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
@@ -245,11 +261,16 @@ fn commitment_root_search_coverage(
         )?,
         None => false,
     };
-    let canonical_history_complete = backfill_coverage.is_some_and(|coverage| {
-        coverage.complete_through_height >= chain_epoch.settled_tip_height
-            && latest_indexed_height.is_some_and(|height| height >= chain_epoch.visible_tip_height)
-            && recent_index_complete
-    });
+    let canonical_history_complete = CommitmentRootCompleteness {
+        canonical_history_bounds,
+        sapling_activation_height,
+        backfill_coverage,
+        latest_indexed_height,
+        settled_tip_height: chain_epoch.settled_tip_height,
+        visible_tip_height: chain_epoch.visible_tip_height,
+        recent_index_complete,
+    }
+    .is_complete();
     Ok(CommitmentRootSearchCoverage {
         complete_from_height: backfill_coverage
             .map(|coverage| coverage.complete_from_height.value()),
@@ -258,6 +279,35 @@ fn commitment_root_search_coverage(
         latest_indexed_height: latest_indexed_height.map(zinder_core::BlockHeight::value),
         canonical_history_complete,
     })
+}
+
+struct CommitmentRootCompleteness {
+    canonical_history_bounds: CanonicalHistoryBounds,
+    sapling_activation_height: BlockHeight,
+    backfill_coverage: Option<CommitmentRootBackfillCoverage>,
+    latest_indexed_height: Option<BlockHeight>,
+    settled_tip_height: BlockHeight,
+    visible_tip_height: BlockHeight,
+    recent_index_complete: bool,
+}
+
+impl CommitmentRootCompleteness {
+    fn is_complete(&self) -> bool {
+        let expected_backfill_floor = self
+            .sapling_activation_height
+            .max(self.canonical_history_bounds.first_available_height());
+        !self
+            .canonical_history_bounds
+            .intentionally_excludes(self.sapling_activation_height)
+            && self.backfill_coverage.is_some_and(|coverage| {
+                coverage.complete_from_height == expected_backfill_floor
+                    && coverage.complete_through_height >= self.settled_tip_height
+                    && self
+                        .latest_indexed_height
+                        .is_some_and(|height| height >= self.visible_tip_height)
+                    && self.recent_index_complete
+            })
+    }
 }
 
 fn recent_index_is_contiguous(
@@ -330,4 +380,62 @@ fn wire_protocol(protocol: CoreProtocol) -> Result<ShieldedProtocol, Status> {
             .into());
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zinder_core::{BlockHash, BlockId, CanonicalHistoryBoundsError};
+
+    #[test]
+    fn checkpoint_before_sapling_preserves_complete_commitment_root_domain()
+    -> Result<(), CanonicalHistoryBoundsError> {
+        let bounds = CanonicalHistoryBounds::checkpointed(BlockId::new(
+            BlockHeight::new(99),
+            BlockHash::from_bytes([1; 32]),
+        ))?;
+
+        assert!(
+            CommitmentRootCompleteness {
+                canonical_history_bounds: bounds,
+                sapling_activation_height: BlockHeight::new(100),
+                backfill_coverage: Some(CommitmentRootBackfillCoverage::new(
+                    BlockHeight::new(100),
+                    BlockHeight::new(699),
+                )),
+                latest_indexed_height: Some(BlockHeight::new(700)),
+                settled_tip_height: BlockHeight::new(699),
+                visible_tip_height: BlockHeight::new(700),
+                recent_index_complete: true,
+            }
+            .is_complete()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_after_sapling_cannot_claim_complete_commitment_root_domain()
+    -> Result<(), CanonicalHistoryBoundsError> {
+        let bounds = CanonicalHistoryBounds::checkpointed(BlockId::new(
+            BlockHeight::new(500),
+            BlockHash::from_bytes([2; 32]),
+        ))?;
+
+        assert!(
+            !CommitmentRootCompleteness {
+                canonical_history_bounds: bounds,
+                sapling_activation_height: BlockHeight::new(100),
+                backfill_coverage: Some(CommitmentRootBackfillCoverage::new(
+                    BlockHeight::new(501),
+                    BlockHeight::new(699),
+                )),
+                latest_indexed_height: Some(BlockHeight::new(700)),
+                settled_tip_height: BlockHeight::new(699),
+                visible_tip_height: BlockHeight::new(700),
+                recent_index_complete: true,
+            }
+            .is_complete()
+        );
+        Ok(())
+    }
 }

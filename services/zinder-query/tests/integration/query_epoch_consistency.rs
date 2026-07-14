@@ -9,8 +9,8 @@ use eyre::eyre;
 use parking_lot::Mutex;
 use zinder_core::wire::encode_rpc_block_hash_hex;
 use zinder_core::{
-    BlockHeight, BlockHeightRange, ChainEpochId, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TreeStateArtifact,
+    BlockHeight, BlockHeightRange, CanonicalHistoryBounds, ChainEpochId, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange, TreeStateArtifact,
 };
 use zinder_query::{
     WalletQuery, WalletQueryApi, latest_block_response, latest_tree_state_checkpoint_response,
@@ -267,6 +267,10 @@ impl CommitAfterReaderReadApi {
 }
 
 impl ChainEpochReadApi for CommitAfterReaderReadApi {
+    fn canonical_history_bounds(&self) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+        self.store.canonical_history_bounds()
+    }
+
     fn current_chain_epoch_reader(&self) -> Result<ChainEpochReader<'_>, StoreError> {
         let reader = self.store.current_chain_epoch_reader()?;
         let pending_artifacts = self.pending_commit.lock().take();

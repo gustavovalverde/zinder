@@ -581,6 +581,12 @@ pub enum AdvertisePolicy {
     /// Explorer: advertised when the in-process payment-disclosure verifier
     /// is enabled.
     RequiresPaymentDisclosureVerifier,
+    /// Explorer: advertised when transaction history has materialized a typed
+    /// projection position and the wallet-query dependency is online.
+    RequiresTransactionHistory,
+    /// Explorer: advertised when transaction history has verified full
+    /// coverage through its typed projection position and wallet-query is online.
+    RequiresCompleteTransactionHistory,
     /// Wallet: advertised when the store retains full block blobs
     /// (ingest `raw_blob_policy = all`).
     RequiresBlockBlobs,
@@ -590,6 +596,10 @@ pub enum AdvertisePolicy {
     /// Wallet: advertised when the operator opted into the transparent
     /// UTXO-set commitment fold.
     RequiresUtxoSetCommitment,
+    /// Wallet: advertised when transparent-address history projection is available.
+    RequiresTransparentAddressHistory,
+    /// Wallet: advertised when durable transparent-spend projection is available.
+    RequiresTransparentOutpointSpend,
 }
 
 impl AdvertisePolicy {
@@ -609,6 +619,8 @@ impl AdvertisePolicy {
             Self::RequiresBlockBlobs => inputs.block_blobs_retained,
             Self::RequiresTransactionBlobs => inputs.transaction_blobs_retained,
             Self::RequiresUtxoSetCommitment => inputs.utxo_set_commitment_enabled,
+            Self::RequiresTransparentAddressHistory => inputs.transparent_address_history_available,
+            Self::RequiresTransparentOutpointSpend => inputs.transparent_outpoint_spend_available,
             Self::RequiresWalletQuery
             | Self::RequiresCanonicalStore
             | Self::RequiresDeriveStore
@@ -617,7 +629,9 @@ impl AdvertisePolicy {
             | Self::RequiresDeriveStoreAndCanonicalStore
             | Self::RequiresDeriveStoreWalletQueryAndCanonicalStore
             | Self::RequiresPrevoutResolution
-            | Self::RequiresPaymentDisclosureVerifier => false,
+            | Self::RequiresPaymentDisclosureVerifier
+            | Self::RequiresTransactionHistory
+            | Self::RequiresCompleteTransactionHistory => false,
         }
     }
 
@@ -648,12 +662,20 @@ impl AdvertisePolicy {
             }
             Self::RequiresPrevoutResolution => readiness.prevout_resolution_online,
             Self::RequiresPaymentDisclosureVerifier => readiness.payment_disclosure_verifier_online,
+            Self::RequiresTransactionHistory => {
+                readiness.transaction_history_available && readiness.wallet_query_online
+            }
+            Self::RequiresCompleteTransactionHistory => {
+                readiness.transaction_history_complete && readiness.wallet_query_online
+            }
             Self::RequiresBroadcaster
             | Self::RequiresChainEvents
             | Self::RequiresChainValuePools
             | Self::RequiresBlockBlobs
             | Self::RequiresTransactionBlobs
-            | Self::RequiresUtxoSetCommitment => false,
+            | Self::RequiresUtxoSetCommitment
+            | Self::RequiresTransparentAddressHistory
+            | Self::RequiresTransparentOutpointSpend => false,
         }
     }
 
@@ -679,7 +701,11 @@ impl AdvertisePolicy {
             | Self::RequiresPaymentDisclosureVerifier
             | Self::RequiresBlockBlobs
             | Self::RequiresTransactionBlobs
-            | Self::RequiresUtxoSetCommitment => false,
+            | Self::RequiresUtxoSetCommitment
+            | Self::RequiresTransparentAddressHistory
+            | Self::RequiresTransparentOutpointSpend
+            | Self::RequiresTransactionHistory
+            | Self::RequiresCompleteTransactionHistory => false,
         }
     }
 }
@@ -707,6 +733,10 @@ pub struct WalletAdvertiseInputs {
     pub transaction_blobs_retained: bool,
     /// The operator opted into the transparent UTXO-set commitment fold.
     pub utxo_set_commitment_enabled: bool,
+    /// Transparent-address history projection is configured and schema-compatible.
+    pub transparent_address_history_available: bool,
+    /// Durable transparent-outpoint-spend projection is configured and schema-compatible.
+    pub transparent_outpoint_spend_available: bool,
 }
 
 /// Readiness inputs the explorer plane resolves an [`AdvertisePolicy`] against.
@@ -732,6 +762,10 @@ pub struct ExplorerReadiness {
     pub prevout_resolution_online: bool,
     /// The in-process payment-disclosure verifier is enabled.
     pub payment_disclosure_verifier_online: bool,
+    /// Transaction history has a typed materialized projection position.
+    pub transaction_history_available: bool,
+    /// Transaction history has verified complete coverage through its position.
+    pub transaction_history_complete: bool,
 }
 
 /// One row binding a capability string to its surface, proto method, and
@@ -885,7 +919,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_TRANSPARENT_SPENDS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentSpendsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
+        AdvertisePolicy::RequiresTransparentOutpointSpend,
     ),
     CapabilitySpec::new(
         WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
@@ -951,7 +985,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentAddressTxIdsInRange"),
-        AdvertisePolicy::AlwaysOn,
+        AdvertisePolicy::RequiresTransparentAddressHistory,
     ),
     CapabilitySpec::new(
         WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
@@ -1203,13 +1237,13 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_TRANSACTION_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"),
-        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+        AdvertisePolicy::RequiresTransactionHistory,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_HISTORY_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"),
-        AdvertisePolicy::RequiresDeriveStoreAndWalletQuery,
+        AdvertisePolicy::RequiresCompleteTransactionHistory,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,

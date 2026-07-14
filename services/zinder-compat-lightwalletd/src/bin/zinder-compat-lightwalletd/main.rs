@@ -14,7 +14,7 @@ use zinder_runtime::{
     install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
-use zinder_store::SecondaryChainStore;
+use zinder_store::{RawBlobRetention, SecondaryChainStore};
 
 mod config;
 
@@ -139,13 +139,33 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             return Err(wrapped);
         }
     };
-    let derive_store = match DeriveStore::open_secondary(
-        DeriveStore::path_for_canonical(&lightwalletd_config.storage.path),
+    let derive_primary_path = DeriveStore::path_for_canonical(&lightwalletd_config.storage.path);
+    let projection_preset =
+        match DeriveStore::detect_projection_preset_at_path(&derive_primary_path) {
+            Ok(projection_preset) => projection_preset.unwrap_or_default(),
+            Err(error) => {
+                let wrapped = LightwalletdConfigError::DeriveStore(error);
+                open_storage_phase.fail(&wrapped);
+                start_api_phase.fail(&wrapped);
+                return Err(wrapped);
+            }
+        };
+    readiness.set_projection_workload(
+        projection_preset.as_str(),
+        projection_preset
+            .consumer_schemas()
+            .iter()
+            .map(|schema| schema.name.as_str().to_owned())
+            .collect(),
+    );
+    let derive_store = match DeriveStore::open_secondary_with_projection_preset(
+        &derive_primary_path,
         lightwalletd_config.storage.secondary_path.join("derive"),
+        projection_preset,
         DeriveStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: lightwalletd_config.storage.derive_rocksdb_budget,
+            ..DeriveStoreOptions::default()
         },
     ) {
         Ok(derive_store) => derive_store,
@@ -157,6 +177,11 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         }
     };
     open_storage_phase.complete();
+    let transparent_history_blobs_available = lightwalletd_transparent_history_blobs_available(
+        canonical_store
+            .raw_blob_retention()
+            .map_err(LightwalletdConfigError::Store)?,
+    );
     let visible_height = canonical_store
         .current_chain_epoch()
         .map_err(LightwalletdConfigError::Store)?
@@ -200,12 +225,14 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let tree_state_upstream = broadcaster
         .as_ref()
         .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
+    let wallet_projection_reader =
+        zinder_query::derive_store_wallet_projection_reader(derive_store.clone());
     let mut wallet_query = zinder_query::WalletQuery::new(
         canonical_store.clone(),
         broadcaster,
         network_upgrade_activations.clone(),
     )
-    .with_derive_store(derive_store);
+    .with_wallet_projection_reader(Arc::clone(&wallet_projection_reader));
     if let Some(tree_state_upstream) = tree_state_upstream {
         wallet_query = wallet_query.with_tree_state_upstream(tree_state_upstream);
     }
@@ -224,10 +251,13 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         lightwalletd_config.ingest_control_bearer_token.clone(),
         cancel.clone(),
     );
-    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
-        .with_transparent_address_support()
+    let mut grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
+        .with_wallet_projection_reader(wallet_projection_reader)
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);
+    if transparent_history_blobs_available {
+        grpc_adapter = grpc_adapter.with_transparent_address_support();
+    }
     let _refresh_handle = zinder_query::spawn_secondary_catchup(
         canonical_store,
         readiness.clone(),
@@ -302,6 +332,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     server_result.map_err(LightwalletdConfigError::Transport)
 }
 
+const fn lightwalletd_transparent_history_blobs_available(retention: RawBlobRetention) -> bool {
+    retention.retains_transaction_blobs()
+}
+
 fn build_broadcaster(
     broadcaster_target: Option<&NodeTarget>,
 ) -> Result<Option<ZebraJsonRpcSource>, LightwalletdConfigError> {
@@ -357,5 +391,23 @@ impl From<Cli> for LightwalletdConfigOverrides {
             ops_listen_addr: cli.ops_listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lightwalletd_transparent_history_requires_transaction_blob_retention() {
+        assert!(!lightwalletd_transparent_history_blobs_available(
+            RawBlobRetention::None
+        ));
+        assert!(lightwalletd_transparent_history_blobs_available(
+            RawBlobRetention::Transactions
+        ));
+        assert!(lightwalletd_transparent_history_blobs_available(
+            RawBlobRetention::All
+        ));
     }
 }

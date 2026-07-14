@@ -19,15 +19,13 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
-use zinder_core::{
-    BlockHeight, Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name,
-};
+use zinder_core::{Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
     CapabilitySurface, EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
     EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1, EXPLORER_PAID_FEE_DISTRIBUTION_V1,
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_HISTORY_V1, EXPLORER_TRANSACTION_HISTORY_V2,
-    EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1, EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
-    EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1, ExplorerReadiness, capabilities_for_surface,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2, EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
+    ExplorerReadiness, capabilities_for_surface,
 };
 use zinder_proto::v1::{
     explorer::{
@@ -106,7 +104,11 @@ use super::recent_transactions::{RecentTransactionsStream, handle_recent_transac
 use super::search::handle_search;
 use super::transaction_component_summary::handle_transaction_component_summary;
 use super::transaction_detail::{TransactionDetailContext, handle_transaction_detail};
-use super::transaction_history::transaction_history;
+use super::transaction_history::{
+    DeriveStoreTransactionHistoryProjectionReader, TransactionHistoryContext,
+    TransactionHistoryProjectionReadApi, TransactionHistoryProjectionReadError,
+    TransactionHistoryProjectionReadiness, transaction_history,
+};
 use super::transparent_address_activity::{
     TransparentAddressActivityContext, handle_transparent_address_activity,
 };
@@ -120,7 +122,7 @@ use super::value_pool_flow::{
     handle_value_pool_flow_summary,
 };
 use super::value_pool_summary::handle_value_pool_summary;
-use zinder_derive::{DeriveStore, TRANSACTION_HISTORY_CONSUMER_NAME};
+use zinder_derive::{DeriveStore, ProjectionPreset};
 use zinder_store::SecondaryChainStore;
 
 /// Settings the binary populates before constructing the adapter.
@@ -152,6 +154,8 @@ pub struct ExplorerQueryGrpcAdapter {
     bearer_token: Option<BearerToken>,
     canonical_store: Option<SecondaryChainStore>,
     derive_store: Option<DeriveStore>,
+    projection_preset: Option<ProjectionPreset>,
+    transaction_history_projection_reader: Option<Arc<dyn TransactionHistoryProjectionReadApi>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
     prevout_resolution_online: bool,
@@ -170,6 +174,8 @@ impl ExplorerQueryGrpcAdapter {
             bearer_token: None,
             canonical_store: None,
             derive_store: None,
+            projection_preset: None,
+            transaction_history_projection_reader: None,
             network_upgrade_activations: Arc::new(NetworkUpgradeActivations::empty(
                 settings.network,
             )),
@@ -184,6 +190,10 @@ impl ExplorerQueryGrpcAdapter {
     /// materialized `BlockSummary` records.
     #[must_use]
     pub fn with_derive_store(mut self, store: DeriveStore) -> Self {
+        self.projection_preset = Some(store.effective_projection_preset());
+        self.transaction_history_projection_reader = Some(Arc::new(
+            DeriveStoreTransactionHistoryProjectionReader::new(store.clone()),
+        ));
         self.derive_store = Some(store);
         self
     }
@@ -302,6 +312,37 @@ impl ExplorerQueryGrpcAdapter {
         InterceptedService::new(server, interceptor)
     }
 
+    fn advertised_capability_readiness(&self) -> ExplorerReadiness {
+        let wallet_query_online = self.wallet_query_endpoint.is_some();
+        let transaction_history_readiness = self
+            .transaction_history_projection_reader
+            .as_ref()
+            .and_then(|reader| reader.readiness().ok());
+        let canonical_transaction_history_position =
+            self.canonical_store.as_ref().and_then(|store| {
+                store.try_catch_up().ok()?;
+                let chain_epoch = store.current_chain_epoch().ok().flatten()?;
+                Some((
+                    chain_epoch.id,
+                    chain_epoch.visible_tip_height,
+                    chain_epoch.visible_tip_hash,
+                ))
+            });
+
+        ExplorerReadiness {
+            wallet_query_online,
+            canonical_store_online: self.canonical_store.is_some(),
+            derive_store_online: self.projection_preset == Some(ProjectionPreset::Complete),
+            prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
+            payment_disclosure_verifier_online: self.payment_disclosure_verifier_online,
+            transaction_history_available: transaction_history_readiness
+                .is_some_and(TransactionHistoryProjectionReadiness::is_available),
+            transaction_history_complete: transaction_history_readiness.is_some_and(|projection| {
+                projection.is_complete_at(canonical_transaction_history_position)
+            }),
+        }
+    }
+
     /// Returns the capability strings the adapter currently advertises.
     ///
     /// Single source of truth for capability gating: `ServerInfo`, the ops
@@ -312,14 +353,7 @@ impl ExplorerQueryGrpcAdapter {
     /// capability whose handler would return `Unavailable`.
     #[must_use]
     pub fn advertised_capabilities(&self) -> Vec<&'static str> {
-        let wallet_query_online = self.wallet_query_endpoint.is_some();
-        let readiness = ExplorerReadiness {
-            wallet_query_online,
-            canonical_store_online: self.canonical_store.is_some(),
-            derive_store_online: self.derive_store.is_some(),
-            prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
-            payment_disclosure_verifier_online: self.payment_disclosure_verifier_online,
-        };
+        let readiness = self.advertised_capability_readiness();
         let ranking_active = self.derive_store.as_ref().is_some_and(|store| {
             zinder_derive::TransparentAddressRankingConsumer::active_metadata(store)
                 .ok()
@@ -348,8 +382,6 @@ impl ExplorerQueryGrpcAdapter {
                         chain_epoch.is_some_and(intrinsic_value_balance_schema_supported)
                     })
             });
-        let (transaction_history_v1_available, transaction_history_v2_available) =
-            transaction_history_projection_capabilities(self.derive_store.as_ref());
         capabilities_for_surface(CapabilitySurface::Explorer)
             .filter(|spec| spec.policy.explorer_satisfied(readiness))
             .filter(|spec| {
@@ -364,7 +396,8 @@ impl ExplorerQueryGrpcAdapter {
                     || conventional_fee_distribution_covered
             })
             .filter(|spec| {
-                spec.string != EXPLORER_PAID_FEE_DISTRIBUTION_V1 || paid_fee_distribution_covered
+                spec.string != EXPLORER_PAID_FEE_DISTRIBUTION_V1
+                    || (paid_fee_distribution_covered && readiness.canonical_store_online)
             })
             .filter(|spec| {
                 spec.string != EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1
@@ -373,12 +406,6 @@ impl ExplorerQueryGrpcAdapter {
             .filter(|spec| {
                 spec.string != EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1
                     || transaction_intrinsic_value_balances_available
-            })
-            .filter(|spec| {
-                spec.string != EXPLORER_TRANSACTION_HISTORY_V1 || transaction_history_v1_available
-            })
-            .filter(|spec| {
-                spec.string != EXPLORER_TRANSACTION_HISTORY_V2 || transaction_history_v2_available
             })
             .map(|spec| spec.string)
             .collect()
@@ -404,24 +431,6 @@ fn block_production_time_projection_available(derive_store: Option<&DeriveStore>
             coverage.complete_from_height.value() <= 1
                 && coverage.complete_through_height >= projection_state.projection_tip_height
         })
-}
-
-fn transaction_history_projection_capabilities(derive_store: Option<&DeriveStore>) -> (bool, bool) {
-    let Some(state) = derive_store.and_then(|store| {
-        store
-            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)
-            .ok()
-            .flatten()
-    }) else {
-        return (false, false);
-    };
-
-    let v2_available = state.coverage.is_some_and(|coverage| {
-        coverage.complete_from_height == BlockHeight::new(1)
-            && coverage.complete_through_height == state.projection_tip_height
-            && coverage.complete_through_hash == state.projection_tip_hash
-    });
-    (true, v2_available)
 }
 
 fn intrinsic_value_balance_schema_supported(chain_epoch: zinder_core::ChainEpoch) -> bool {
@@ -475,6 +484,16 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                         .map(str::to_owned)
                         .collect(),
                     contract_revision: zinder_proto::CONTRACT_REVISION,
+                    projection_preset: self
+                        .projection_preset
+                        .map_or_else(String::new, |preset| preset.as_str().to_owned()),
+                    projection_identities: self.projection_preset.map_or_else(Vec::new, |preset| {
+                        preset
+                            .consumer_schemas()
+                            .iter()
+                            .map(|schema| schema.name.as_str().to_owned())
+                            .collect()
+                    }),
                 }),
                 vendor: "Zinder".to_owned(),
                 derive_status,
@@ -752,6 +771,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             handle_commitment_root_search(
                 derive_store,
                 canonical_store,
+                &self.network_upgrade_activations,
                 &self.upstream_observation_cache,
                 request,
             )
@@ -961,9 +981,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let derive_store = self.require_derive_store(OP.method)?;
+            let canonical_store = self.require_canonical_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
             handle_paid_fee_distribution(
                 derive_store,
+                canonical_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1306,17 +1328,20 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
-                ExplorerError::dependency_not_configured(
-                    "TransactionHistory requires a derive store",
-                )
-            })?;
+            let projection_reader = self.require_transaction_history_projection_reader()?;
+            projection_reader
+                .readiness()
+                .and_then(TransactionHistoryProjectionReadiness::require_available)
+                .map_err(TransactionHistoryProjectionReadError::into_status)?;
             let mut client = self.wallet_client(OP.method).await?;
             transaction_history(
-                derive_store,
-                self.canonical_store.as_ref(),
+                TransactionHistoryContext {
+                    projection_reader: Arc::clone(projection_reader),
+                    derive_store: self.derive_store.as_ref(),
+                    chain_store: self.canonical_store.as_ref(),
+                    upstream_observation_cache: &self.upstream_observation_cache,
+                },
                 &mut client,
-                &self.upstream_observation_cache,
                 request,
             )
             .await
@@ -1487,14 +1512,34 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
 }
 
 impl ExplorerQueryGrpcAdapter {
+    fn require_transaction_history_projection_reader(
+        &self,
+    ) -> Result<&Arc<dyn TransactionHistoryProjectionReadApi>, Status> {
+        self.transaction_history_projection_reader
+            .as_ref()
+            .ok_or_else(|| {
+                ExplorerError::dependency_not_configured(
+                    "TransactionHistory requires a projection reader",
+                )
+                .into()
+            })
+    }
+
     fn require_derive_store(&self, method: &'static str) -> Result<&DeriveStore, Status> {
-        self.derive_store.as_ref().ok_or_else(|| {
-            ExplorerError::dependency_not_configured(format!(
+        let derive_store = self.derive_store.as_ref().ok_or_else(|| {
+            Status::from(ExplorerError::dependency_not_configured(format!(
                 "{method} requires the BlockSummary derive view; configure \
                  --storage-path and start the explorer with the consumer wired"
+            )))
+        })?;
+        if self.projection_preset != Some(ProjectionPreset::Complete) {
+            return Err(ExplorerError::unsupported(format!(
+                "{method} is unavailable because the stored projection workload omits \
+                 explorer product views"
             ))
-            .into()
-        })
+            .into());
+        }
+        Ok(derive_store)
     }
 
     fn require_canonical_store(
@@ -1611,7 +1656,11 @@ mod tests {
     use zinder_core::{ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpochId, Network};
     use zinder_derive::{
         CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA, ConsumerProjectionCoverage, ConsumerProjectionState,
-        DeriveStoreOptions, PAID_FEE_DISTRIBUTION_SCHEMA,
+        DeriveStoreOptions, PAID_FEE_DISTRIBUTION_SCHEMA, ProjectionPreset,
+        TRANSACTION_HISTORY_CONSUMER_NAME,
+    };
+    use zinder_proto::capabilities::{
+        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_TRANSACTION_HISTORY_V1, EXPLORER_TRANSACTION_HISTORY_V2,
     };
     use zinder_store::{ChainStoreOptions, RocksDbResourceBudget, SecondaryChainStore};
     use zinder_testkit::{ChainFixture, StoreFixture};
@@ -1644,13 +1693,27 @@ mod tests {
         Ok((tempdir, adapter))
     }
 
+    fn assert_transaction_history_capabilities(
+        adapter: &ExplorerQueryGrpcAdapter,
+        v1_available: bool,
+        v2_available: bool,
+    ) {
+        let capabilities = adapter.advertised_capabilities();
+        assert_eq!(
+            capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1),
+            v1_available
+        );
+        assert_eq!(
+            capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2),
+            v2_available
+        );
+    }
+
     #[test]
     fn transaction_history_capabilities_follow_projection_state_and_dependencies()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_tempdir, adapter) = adapter_with_transaction_history_state(None, true)?;
-        let capabilities = adapter.advertised_capabilities();
-        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
-        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+        assert_transaction_history_capabilities(&adapter, false, false);
 
         let partial_state = ConsumerProjectionState {
             projection_epoch_id: ChainEpochId::new(7),
@@ -1661,26 +1724,51 @@ mod tests {
         };
         let (_tempdir, adapter) =
             adapter_with_transaction_history_state(Some(partial_state), true)?;
-        let capabilities = adapter.advertised_capabilities();
-        assert!(capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
-        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+        assert_transaction_history_capabilities(&adapter, true, false);
 
+        let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(20);
+        let store_fixture =
+            StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(7))?;
+        let chain_epoch = *store_fixture
+            .committed_chain_epoch()
+            .ok_or("fixture chain epoch missing")?;
+        let canonical_store = SecondaryChainStore::open(
+            store_fixture.tempdir_path(),
+            store_fixture
+                .tempdir_path()
+                .join("transaction-history-capability-secondary"),
+            ChainStoreOptions::for_local_tests(),
+        )?;
+        canonical_store.try_catch_up()?;
         let complete_state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(7),
-            projection_tip_height: BlockHeight::new(20),
-            projection_tip_hash: BlockHash::from_bytes([0x20; 32]),
+            projection_epoch_id: chain_epoch.id,
+            projection_tip_height: chain_epoch.visible_tip_height,
+            projection_tip_hash: chain_epoch.visible_tip_hash,
             revision: 2,
             coverage: Some(ConsumerProjectionCoverage {
                 complete_from_height: BlockHeight::new(1),
-                complete_through_height: BlockHeight::new(20),
-                complete_through_hash: BlockHash::from_bytes([0x20; 32]),
+                complete_through_height: chain_epoch.visible_tip_height,
+                complete_through_hash: chain_epoch.visible_tip_hash,
             }),
         };
         let (_tempdir, adapter) =
             adapter_with_transaction_history_state(Some(complete_state), true)?;
-        let capabilities = adapter.advertised_capabilities();
-        assert!(capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
-        assert!(capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+        let adapter = adapter.with_canonical_store(canonical_store.clone());
+        assert_transaction_history_capabilities(&adapter, true, true);
+
+        let checkpoint_state = ConsumerProjectionState {
+            revision: 3,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(8),
+                complete_through_height: chain_epoch.visible_tip_height,
+                complete_through_hash: chain_epoch.visible_tip_hash,
+            }),
+            ..complete_state
+        };
+        let (_tempdir, adapter) =
+            adapter_with_transaction_history_state(Some(checkpoint_state), true)?;
+        let adapter = adapter.with_canonical_store(canonical_store.clone());
+        assert_transaction_history_capabilities(&adapter, true, false);
 
         let mismatched_state = ConsumerProjectionState {
             projection_tip_hash: BlockHash::from_bytes([0x21; 32]),
@@ -1688,15 +1776,95 @@ mod tests {
         };
         let (_tempdir, adapter) =
             adapter_with_transaction_history_state(Some(mismatched_state), true)?;
-        let capabilities = adapter.advertised_capabilities();
-        assert!(capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
-        assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+        let adapter = adapter.with_canonical_store(canonical_store.clone());
+        assert_transaction_history_capabilities(&adapter, true, false);
+
+        let stale_state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(6),
+            projection_tip_height: BlockHeight::new(19),
+            projection_tip_hash: BlockHash::from_bytes([0x19; 32]),
+            revision: 3,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(1),
+                complete_through_height: BlockHeight::new(19),
+                complete_through_hash: BlockHash::from_bytes([0x19; 32]),
+            }),
+        };
+        let (_tempdir, adapter) = adapter_with_transaction_history_state(Some(stale_state), true)?;
+        let adapter = adapter.with_canonical_store(canonical_store);
+        assert_transaction_history_capabilities(&adapter, true, false);
 
         let (_tempdir, adapter) =
             adapter_with_transaction_history_state(Some(complete_state), false)?;
+        assert_transaction_history_capabilities(&adapter, false, false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn omitted_transaction_history_disables_capabilities_and_fails_before_wallet_connect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let derive_store = DeriveStore::open_with_projection_preset(
+            tempdir.path(),
+            ProjectionPreset::Wallet,
+            DeriveStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..DeriveStoreOptions::default()
+            },
+        )?;
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_derive_store(derive_store)
+            .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+
         let capabilities = adapter.advertised_capabilities();
+        assert!(!capabilities.contains(&EXPLORER_BLOCK_SUMMARY_V1));
         assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V1));
         assert!(!capabilities.contains(&EXPLORER_TRANSACTION_HISTORY_V2));
+        let server_info = adapter
+            .server_info(Request::new(ServerInfoRequest {}))
+            .await?
+            .into_inner();
+        let common = server_info
+            .info
+            .and_then(|info| info.common)
+            .ok_or("explorer server info missing common descriptor")?;
+        assert_eq!(common.projection_preset, "wallet");
+        assert_eq!(common.projection_identities.len(), 2);
+        let outcome = adapter
+            .transaction_history(Request::new(TransactionHistoryRequest::default()))
+            .await;
+        let Err(error) = outcome else {
+            return Err("omitted projection unexpectedly reached the wallet connection".into());
+        };
+        assert_eq!(error.code(), Code::Unimplemented);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn materializing_transaction_history_fails_before_wallet_connect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let derive_store = DeriveStore::open_with_projection_preset(
+            tempdir.path(),
+            ProjectionPreset::Complete,
+            DeriveStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..DeriveStoreOptions::default()
+            },
+        )?;
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_derive_store(derive_store)
+            .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+
+        let outcome = adapter
+            .transaction_history(Request::new(TransactionHistoryRequest::default()))
+            .await;
+        let Err(error) = outcome else {
+            return Err(
+                "materializing projection unexpectedly reached the wallet connection".into(),
+            );
+        };
+        assert_eq!(error.code(), Code::FailedPrecondition);
         Ok(())
     }
 

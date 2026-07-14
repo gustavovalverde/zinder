@@ -4,15 +4,18 @@
 //! filter-aware, bidirectional pages. The physical column-family name remains
 //! stable for the no-wipe migration; that identifier is not public vocabulary.
 
-use std::{cmp::Reverse, collections::HashMap};
+use std::{cmp::Reverse, collections::HashMap, fmt, sync::Arc};
 
 use prost::Message as _;
+use thiserror::Error;
 use tonic::{Request, Response, Status};
 use zinder_core::wire::{
     decode_height_key_descending, decode_in_block_position, decode_rpc_block_hash_hex,
     decode_rpc_transaction_id_hex, encode_internal_transaction_id, encode_rpc_block_hash_hex,
 };
-use zinder_core::{BlockHeight, PrivacyShape, TransactionId, TransactionLocation};
+use zinder_core::{
+    BlockHash, BlockHeight, ChainEpochId, PrivacyShape, TransactionId, TransactionLocation,
+};
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_HISTORY_V2;
 use zinder_proto::v1::explorer::{
     ShieldedProtocol, TransactionFeesRecord, TransactionHistoryCountScope,
@@ -32,10 +35,138 @@ use super::freshness::{
 };
 use super::intrinsic_value_balances::resolve_transaction_intrinsic_value_balances;
 use zinder_derive::{
-    ConsumerProjectionState, DeriveStore, DeriveStoreReadSnapshot, TRANSACTION_FEES_COLUMN_FAMILY,
-    TRANSACTION_HISTORY_COLUMN_FAMILY, TRANSACTION_HISTORY_CONSUMER_NAME,
-    TRANSACTION_HISTORY_KEY_LEN, TransactionFeesConsumer, TransactionHistoryConsumer,
+    ConsumerProjectionState, DeriveStore, DeriveStoreError, DeriveStoreReadSnapshot,
+    TRANSACTION_FEES_COLUMN_FAMILY, TRANSACTION_HISTORY_COLUMN_FAMILY,
+    TRANSACTION_HISTORY_CONSUMER_NAME, TRANSACTION_HISTORY_KEY_LEN, TransactionFeesConsumer,
+    TransactionHistoryConsumer,
 };
+
+/// Typed lifecycle state for the optional transaction-history projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransactionHistoryProjectionReadiness {
+    /// The selected workload deliberately omits transaction history.
+    Omitted,
+    /// The projection is selected and schema-compatible but has no durable position yet.
+    Materializing,
+    /// The projection has a durable epoch, tip, revision, and optional verified coverage.
+    Available(ConsumerProjectionState),
+}
+
+impl TransactionHistoryProjectionReadiness {
+    pub(crate) const fn is_available(self) -> bool {
+        matches!(self, Self::Available(_))
+    }
+
+    pub(crate) fn is_complete_at(
+        self,
+        canonical_position: Option<(ChainEpochId, BlockHeight, BlockHash)>,
+    ) -> bool {
+        matches!(
+            self,
+            Self::Available(state)
+                if full_history_coverage(state)
+                    && canonical_position == Some((
+                        state.projection_epoch_id,
+                        state.projection_tip_height,
+                        state.projection_tip_hash,
+                    ))
+        )
+    }
+
+    pub(crate) fn require_available(self) -> Result<(), TransactionHistoryProjectionReadError> {
+        match self {
+            Self::Available(_) => Ok(()),
+            Self::Omitted => Err(TransactionHistoryProjectionReadError::Omitted),
+            Self::Materializing => Err(TransactionHistoryProjectionReadError::Materializing),
+        }
+    }
+}
+
+/// Failures returned by the typed transaction-history projection seam.
+#[derive(Debug, Error)]
+pub(crate) enum TransactionHistoryProjectionReadError {
+    #[error("transaction-history projection is omitted by the selected workload")]
+    Omitted,
+    #[error("transaction-history projection has not materialized a durable position")]
+    Materializing,
+    #[error("transaction-history projection storage read failed: {0}")]
+    Storage(#[source] DeriveStoreError),
+    #[error("transaction-history projection request failed: {0}")]
+    Request(Status),
+}
+
+impl TransactionHistoryProjectionReadError {
+    pub(crate) fn into_status(self) -> Status {
+        match self {
+            Self::Omitted => ExplorerError::unsupported(
+                "TransactionHistory is omitted by the selected projection workload",
+            )
+            .into(),
+            Self::Materializing => ExplorerError::unsatisfied_precondition(
+                "transaction-history projection state is not available",
+            )
+            .into(),
+            Self::Storage(error) => ExplorerError::internal(error.to_string()).into(),
+            Self::Request(status) => status,
+        }
+    }
+}
+
+/// Typed read boundary for the optional transaction-history projection.
+pub(crate) trait TransactionHistoryProjectionReadApi:
+    fmt::Debug + Send + Sync + 'static
+{
+    fn readiness(
+        &self,
+    ) -> Result<TransactionHistoryProjectionReadiness, TransactionHistoryProjectionReadError>;
+
+    fn read_snapshot(
+        &self,
+        request: &TransactionHistorySnapshotRequest,
+    ) -> Result<TransactionHistorySnapshotRead, TransactionHistoryProjectionReadError>;
+}
+
+/// Current `RocksDB` implementation of the transaction-history read boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct DeriveStoreTransactionHistoryProjectionReader {
+    store: DeriveStore,
+}
+
+impl DeriveStoreTransactionHistoryProjectionReader {
+    pub(crate) const fn new(store: DeriveStore) -> Self {
+        Self { store }
+    }
+}
+
+impl TransactionHistoryProjectionReadApi for DeriveStoreTransactionHistoryProjectionReader {
+    fn readiness(
+        &self,
+    ) -> Result<TransactionHistoryProjectionReadiness, TransactionHistoryProjectionReadError> {
+        if !self.store.has_consumer(TRANSACTION_HISTORY_CONSUMER_NAME) {
+            return Ok(TransactionHistoryProjectionReadiness::Omitted);
+        }
+        self.store
+            .try_catch_up()
+            .map_err(TransactionHistoryProjectionReadError::Storage)?;
+        let state = self
+            .store
+            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)
+            .map_err(TransactionHistoryProjectionReadError::Storage)?;
+        Ok(state.map_or(
+            TransactionHistoryProjectionReadiness::Materializing,
+            TransactionHistoryProjectionReadiness::Available,
+        ))
+    }
+
+    fn read_snapshot(
+        &self,
+        request: &TransactionHistorySnapshotRequest,
+    ) -> Result<TransactionHistorySnapshotRead, TransactionHistoryProjectionReadError> {
+        self.readiness()?.require_available()?;
+        read_transaction_history_snapshot(&self.store, request)
+            .map_err(TransactionHistoryProjectionReadError::Request)
+    }
+}
 
 /// Server-side maximum entries returned in one page.
 const MAX_TRANSACTION_HISTORY_PAGE_SIZE: u32 = 256;
@@ -56,12 +187,22 @@ const CURSOR_FENCE_LEN: usize = 8 + 8 + 4 + CURSOR_BLOCK_HASH_LEN;
 const CURSOR_LEN: usize =
     CURSOR_PREFIX.len() + 4 + 4 + CURSOR_BLOCK_HASH_LEN + CURSOR_FILTER_LEN + CURSOR_FENCE_LEN;
 
+/// Dependencies for one typed transaction-history public read.
+pub(crate) struct TransactionHistoryContext<'store> {
+    pub(crate) projection_reader: Arc<dyn TransactionHistoryProjectionReadApi>,
+    pub(crate) derive_store: Option<&'store DeriveStore>,
+    pub(crate) chain_store: Option<&'store SecondaryChainStore>,
+    pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
+}
+
 /// Executes one `ExplorerQuery.TransactionHistory` request.
+#[allow(
+    clippy::too_many_lines,
+    reason = "The handler keeps one projection snapshot, canonical joins, and response fence together."
+)]
 pub(crate) async fn transaction_history(
-    derive_store: &DeriveStore,
-    chain_store: Option<&SecondaryChainStore>,
+    context: TransactionHistoryContext<'_>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<TransactionHistoryRequest>,
 ) -> Result<Response<TransactionHistoryResponse>, Status> {
     let inner = request.into_inner();
@@ -80,31 +221,35 @@ pub(crate) async fn transaction_history(
         start: inner.start,
         include_total_count: inner.include_total_count,
     };
-    let snapshot_store = derive_store.clone();
-    let snapshot_result = tokio::task::spawn_blocking(move || {
-        read_transaction_history_snapshot(&snapshot_store, &snapshot_request)
-    })
-    .await
-    .map_err(|error| {
-        ExplorerError::internal(format!("transaction-history snapshot failed: {error}"))
-    })?;
-    let snapshot_read = snapshot_result?;
+    let snapshot_reader = Arc::clone(&context.projection_reader);
+    let snapshot_result =
+        tokio::task::spawn_blocking(move || snapshot_reader.read_snapshot(&snapshot_request))
+            .await
+            .map_err(|error| {
+                ExplorerError::internal(format!("transaction-history snapshot failed: {error}"))
+            })?;
+    let snapshot_read =
+        snapshot_result.map_err(TransactionHistoryProjectionReadError::into_status)?;
 
     let chain_epoch =
         resolve_transaction_history_chain_epoch(wallet_client, snapshot_read.projection_state)
             .await?;
     let mut page = snapshot_read.page;
     resolve_missing_transparent_fees(
-        chain_store,
+        context.chain_store,
         &chain_epoch,
         &snapshot_read.projected_fee_records,
         &mut page.entries,
     )?;
-    join_transaction_intrinsic_value_balances(chain_store, &chain_epoch, &mut page.entries)?;
+    join_transaction_intrinsic_value_balances(
+        context.chain_store,
+        &chain_epoch,
+        &mut page.entries,
+    )?;
     let freshness = attach_upstream_observation(
-        upstream_observation_cache,
+        context.upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            context.derive_store,
             EXPLORER_TRANSACTION_HISTORY_V2,
             Some(chain_epoch),
             0,
@@ -172,7 +317,7 @@ async fn resolve_transaction_history_chain_epoch(
     Ok(chain_epoch)
 }
 
-struct TransactionHistorySnapshotRequest {
+pub(crate) struct TransactionHistorySnapshotRequest {
     page_size: u32,
     direction: TransactionHistoryDirection,
     filter: HistoryFilter,
@@ -181,7 +326,7 @@ struct TransactionHistorySnapshotRequest {
     include_total_count: bool,
 }
 
-struct TransactionHistorySnapshotRead {
+pub(crate) struct TransactionHistorySnapshotRead {
     page: HistoryPage,
     projected_fee_records: HashMap<TransactionId, TransactionFeesRecord>,
     projection_state: ConsumerProjectionState,
@@ -1081,7 +1226,104 @@ fn join_transaction_intrinsic_value_balances(
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+    use zinder_core::{BlockHash, ChainEpochId};
+    use zinder_derive::{ConsumerProjectionCoverage, DeriveStoreOptions, ProjectionPreset};
+    use zinder_store::RocksDbResourceBudget;
+
     use super::*;
+
+    fn test_options() -> DeriveStoreOptions {
+        DeriveStoreOptions {
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
+        }
+    }
+
+    #[test]
+    fn typed_readiness_distinguishes_omitted_materializing_and_verified_states()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let wallet_path = tempdir()?;
+        let wallet_store = DeriveStore::open_with_projection_preset(
+            wallet_path.path(),
+            ProjectionPreset::Wallet,
+            test_options(),
+        )?;
+        let wallet_reader = DeriveStoreTransactionHistoryProjectionReader::new(wallet_store);
+        assert_eq!(
+            wallet_reader.readiness()?,
+            TransactionHistoryProjectionReadiness::Omitted
+        );
+
+        let complete_path = tempdir()?;
+        let complete_store = DeriveStore::open_with_projection_preset(
+            complete_path.path(),
+            ProjectionPreset::Complete,
+            test_options(),
+        )?;
+        let complete_reader =
+            DeriveStoreTransactionHistoryProjectionReader::new(complete_store.clone());
+        assert_eq!(
+            complete_reader.readiness()?,
+            TransactionHistoryProjectionReadiness::Materializing
+        );
+
+        let partial_state = ConsumerProjectionState {
+            projection_epoch_id: ChainEpochId::new(7),
+            projection_tip_height: BlockHeight::new(20),
+            projection_tip_hash: BlockHash::from_bytes([0x20; 32]),
+            revision: 1,
+            coverage: None,
+        };
+        complete_store
+            .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, partial_state)?;
+        let readiness = complete_reader.readiness()?;
+        assert!(readiness.is_available());
+        assert!(!readiness.is_complete_at(Some((
+            partial_state.projection_epoch_id,
+            partial_state.projection_tip_height,
+            partial_state.projection_tip_hash,
+        ))));
+
+        let checkpoint_state = ConsumerProjectionState {
+            revision: 2,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(8),
+                complete_through_height: partial_state.projection_tip_height,
+                complete_through_hash: partial_state.projection_tip_hash,
+            }),
+            ..partial_state
+        };
+        complete_store
+            .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, checkpoint_state)?;
+        let readiness = complete_reader.readiness()?;
+        assert!(readiness.is_available());
+        assert!(!readiness.is_complete_at(Some((
+            checkpoint_state.projection_epoch_id,
+            checkpoint_state.projection_tip_height,
+            checkpoint_state.projection_tip_hash,
+        ))));
+
+        let complete_state = ConsumerProjectionState {
+            revision: 3,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(1),
+                complete_through_height: partial_state.projection_tip_height,
+                complete_through_hash: partial_state.projection_tip_hash,
+            }),
+            ..partial_state
+        };
+        complete_store
+            .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, complete_state)?;
+        let readiness = complete_reader.readiness()?;
+        assert!(readiness.is_available());
+        assert!(readiness.is_complete_at(Some((
+            complete_state.projection_epoch_id,
+            complete_state.projection_tip_height,
+            complete_state.projection_tip_hash,
+        ))));
+        Ok(())
+    }
 
     fn history_entry(block_height: u32, transaction_index: u32) -> TransactionHistoryEntry {
         TransactionHistoryEntry {

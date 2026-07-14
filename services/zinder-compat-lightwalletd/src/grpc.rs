@@ -90,6 +90,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     options: LightwalletdCompatibilityOptions,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
+    wallet_projection_reader: Option<Arc<dyn zinder_query::WalletProjectionReadApi>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
@@ -101,6 +102,10 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("options", &self.options)
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
+            .field(
+                "wallet_projection_reader",
+                &self.wallet_projection_reader.is_some(),
+            )
             .field(
                 "network_upgrade_activations",
                 &self.network_upgrade_activations.network(),
@@ -147,6 +152,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             options,
             mempool_surface: None,
             tip_change_watcher: None,
+            wallet_projection_reader: None,
             network_upgrade_activations,
         }
     }
@@ -167,12 +173,25 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
+    /// Supplies typed wallet-projection readiness for `GetLightdInfo`'s
+    /// transparent-address support claim.
+    #[must_use]
+    pub fn with_wallet_projection_reader(
+        mut self,
+        wallet_projection_reader: Arc<dyn zinder_query::WalletProjectionReadApi>,
+    ) -> Self {
+        self.wallet_projection_reader = Some(wallet_projection_reader);
+        self
+    }
+
     /// Advertises `LightdInfo.taddrSupport`.
     ///
     /// This is a protocol claim, not a feature flag for handlers. The
     /// transparent RPC handlers are always present on the generated
     /// `CompactTxStreamer` surface; this only changes whether `GetLightdInfo`
-    /// tells wallets they can rely on the transparent-address read set.
+    /// tells wallets they can rely on the transparent-address read set. The
+    /// caller must enable it only when transaction blobs are retained; the
+    /// adapter additionally verifies both wallet projections cover the tip.
     #[must_use]
     pub const fn with_transparent_address_support(mut self) -> Self {
         self.options.transparent_address_support = true;
@@ -777,10 +796,37 @@ where
             ));
         }
 
+        let transparent_address_support = if !self.options.transparent_address_support {
+            false
+        } else if let Some(wallet_projection_reader) = &self.wallet_projection_reader {
+            let wallet_projection_reader = Arc::clone(wallet_projection_reader);
+            let readiness =
+                tokio::task::spawn_blocking(move || wallet_projection_reader.readiness())
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "wallet projection readiness task failed: {error}"
+                        ))
+                    })?
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "wallet projection readiness read failed: {error}"
+                        ))
+                    })?;
+            readiness
+                .transparent_address_history
+                .covers(latest_block.height)
+                && readiness
+                    .transparent_outpoint_spend
+                    .covers(latest_block.height)
+        } else {
+            true
+        };
+
         Ok(Response::new(lightd_info(
             activations,
             latest_block.height,
-            self.options.transparent_address_support,
+            transparent_address_support,
         )))
     }
 

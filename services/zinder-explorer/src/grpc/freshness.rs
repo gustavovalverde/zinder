@@ -18,7 +18,9 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
-use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, DeriveStoreReadSnapshot};
+use zinder_derive::{
+    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, DeriveStore, DeriveStoreReadSnapshot,
+};
 
 use super::error::ExplorerError;
 use zinder_proto::v1::explorer::{BlockSummaryRecord, ExplorerFreshness};
@@ -106,6 +108,9 @@ pub(crate) async fn attach_upstream_observation(
 /// All chain-event derive consumers advance under one shared cursor, so the
 /// block-summary head is an accurate indexed tip for every capability.
 pub(crate) fn read_indexed_tip(derive_store: &DeriveStore) -> Result<Option<IndexedTip>, Status> {
+    if !derive_store.has_consumer(BLOCK_SUMMARY_CONSUMER_NAME) {
+        return Ok(None);
+    }
     let Some((_, payload)) = derive_store
         .last_consumer_entry(BLOCK_SUMMARY_COLUMN_FAMILY)
         .map_err(|error| ExplorerError::internal(error.to_string()))?

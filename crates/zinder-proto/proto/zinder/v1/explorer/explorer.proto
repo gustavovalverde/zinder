@@ -1690,7 +1690,9 @@ message ConventionalFeeDistributionCoverage {
   optional int64 complete_from_time_unix_seconds = 3;
   optional int64 complete_through_time_unix_seconds = 4;
 
-  // True only when projection coverage includes the full requested range.
+  // True only when contiguous projection coverage starts at height 1 and
+  // includes the full requested range. The genesis floor is required because
+  // canonical block times are non-monotonic.
   bool requested_range_complete = 5;
 }
 

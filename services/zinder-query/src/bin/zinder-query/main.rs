@@ -158,13 +158,33 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             return Err(error);
         }
     };
-    let derive_store = match DeriveStore::open_secondary(
-        DeriveStore::path_for_canonical(&query_config.storage.path),
+    let derive_primary_path = DeriveStore::path_for_canonical(&query_config.storage.path);
+    let projection_preset =
+        match DeriveStore::detect_projection_preset_at_path(&derive_primary_path) {
+            Ok(projection_preset) => projection_preset.unwrap_or_default(),
+            Err(error) => {
+                let error = QueryConfigError::DeriveStore(error);
+                open_storage_phase.fail(&error);
+                start_api_phase.fail(&error);
+                return Err(error);
+            }
+        };
+    readiness.set_projection_workload(
+        projection_preset.as_str(),
+        projection_preset
+            .consumer_schemas()
+            .iter()
+            .map(|schema| schema.name.as_str().to_owned())
+            .collect(),
+    );
+    let derive_store = match DeriveStore::open_secondary_with_projection_preset(
+        &derive_primary_path,
         query_config.storage.secondary_path.join("derive"),
+        projection_preset,
         DeriveStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: query_config.storage.derive_rocksdb_budget,
+            ..DeriveStoreOptions::default()
         },
     ) {
         Ok(derive_store) => derive_store,
@@ -231,9 +251,11 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let tree_state_upstream = broadcaster
         .as_ref()
         .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
+    let wallet_projection_reader =
+        zinder_query::derive_store_wallet_projection_reader(derive_store);
     let mut wallet_query =
         zinder_query::WalletQuery::new(store.clone(), broadcaster, network_upgrade_activations)
-            .with_derive_store(derive_store);
+            .with_wallet_projection_reader(Arc::clone(&wallet_projection_reader));
     if let Some(tree_state_upstream) = tree_state_upstream {
         wallet_query = wallet_query.with_tree_state_upstream(tree_state_upstream);
     }
@@ -253,6 +275,14 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         chain_value_pools_enabled,
         block_blobs_retained,
         transaction_blobs_retained,
+        transparent_address_history_available: false,
+        transparent_outpoint_spend_available: false,
+        projection_preset: projection_preset.as_str().to_owned(),
+        projection_identities: projection_preset
+            .consumer_schemas()
+            .iter()
+            .map(|schema| schema.name.as_str().to_owned())
+            .collect(),
         utxo_set_commitment_enabled: query_config.utxo_set_commitment_enabled,
         ..zinder_query::ServerInfoSettings::default()
     };
@@ -265,7 +295,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         if let Some(token) = query_config.ingest_control_bearer_token.clone() {
             adapter = adapter.with_ingest_control_bearer_token(token);
         }
-        adapter
+        adapter.with_wallet_projection_reader(wallet_projection_reader)
     };
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let _refresh_handle = zinder_query::spawn_secondary_catchup(

@@ -8,6 +8,7 @@ use eyre::eyre;
 use parking_lot::Mutex;
 use prost::Message;
 use std::sync::Arc;
+use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, transport::Server};
@@ -26,7 +27,13 @@ use zinder_core::{
     TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendFact,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, UnixTimestampMillis,
-    wire::encode_internal_block_hash,
+    wire::{encode_height_key_ascending, encode_internal_block_hash},
+};
+use zinder_derive::{
+    DeriveStore, DeriveStoreOptions, ProjectionPreset,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -39,15 +46,16 @@ use zinder_query::{
     SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TreeState, WalletQuery, WalletQueryApi,
+    derive_store_wallet_projection_reader,
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
-    ReorgWindowChange, StreamCursorTokenV1,
+    ReorgWindowChange, RocksDbResourceBudget, StreamCursorTokenV1,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
-    open_test_derive_store_for_canonical, sample_regtest_upgrade_activations,
-    seed_transparent_address_transaction_history, synthetic_transaction_public_facts,
+    sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
+    synthetic_transaction_public_facts,
 };
 
 const ACCEPTANCE_BLOCK_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -167,6 +175,60 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         "upgrade_height must reflect the active upgrade activation; got {}",
         lightd_info.upgrade_height
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn lightd_info_advertises_transparent_support_only_when_wallet_projections_cover_tip()
+-> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let derive_tempdir = tempdir()?;
+    let derive_store = DeriveStore::open_with_projection_preset(
+        derive_tempdir.path(),
+        ProjectionPreset::Wallet,
+        DeriveStoreOptions {
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
+        },
+    )?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_transparent_address_support()
+    .with_wallet_projection_reader(derive_store_wallet_projection_reader(derive_store.clone()));
+
+    let before_materialization = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    assert!(!before_materialization.taddr_support);
+
+    let tip_key = encode_height_key_ascending(ACCEPTANCE_BLOCK_HEIGHT);
+    for (projection, index_column_family) in [
+        (
+            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+        ),
+        (
+            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+        ),
+    ] {
+        derive_store.put_chain_event_cursor(projection, b"tip-covered")?;
+        derive_store.put_consumer(index_column_family, &tip_key, &[])?;
+    }
+
+    let after_materialization = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    assert!(after_materialization.taddr_support);
 
     Ok(())
 }
@@ -1837,7 +1899,14 @@ async fn taddress_history_honors_requested_block_range_floor() -> eyre::Result<(
             at_floor_payload.clone(),
         ));
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
+    let derive_store = DeriveStore::open_with_projection_preset(
+        DeriveStore::path_for_canonical(store_fixture.tempdir_path()),
+        ProjectionPreset::Wallet,
+        DeriveStoreOptions {
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
+        },
+    )?;
     seed_transparent_address_transaction_history(
         &derive_store,
         &[
@@ -2682,13 +2751,9 @@ fn wallet_serving_floor_store_fixture() -> eyre::Result<(StoreFixture, BlockHeig
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
 
-    store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, Vec::new(), Vec::new()).with_reorg_window_change(
-            ReorgWindowChange::AdvanceSafeTipTo {
-                height: wallet_serving_floor_height,
-            },
-        ),
-    )?;
+    store_fixture
+        .chain_store()
+        .commit_artifactless_checkpoint(chain_epoch)?;
 
     Ok((store_fixture, wallet_serving_floor_height))
 }
@@ -2730,13 +2795,9 @@ fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundary
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
-    store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(floor_epoch, Vec::new(), Vec::new()).with_reorg_window_change(
-            ReorgWindowChange::AdvanceSafeTipTo {
-                height: wallet_serving_floor_height,
-            },
-        ),
-    )?;
+    store_fixture
+        .chain_store()
+        .commit_artifactless_checkpoint(floor_epoch)?;
 
     let retained_epoch = ChainEpoch {
         id: ChainEpochId::new(2),
@@ -2917,7 +2978,14 @@ where
     }
 
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
+    let derive_store = DeriveStore::open_with_projection_preset(
+        DeriveStore::path_for_canonical(store_fixture.tempdir_path()),
+        ProjectionPreset::Wallet,
+        DeriveStoreOptions {
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
+        },
+    )?;
     seed_transparent_address_transaction_history(&derive_store, &tx_history)?;
 
     Ok((store_fixture, derive_store))

@@ -23,6 +23,8 @@ fn advertised_wallet_capabilities(
         block_blobs_retained,
         transaction_blobs_retained,
         utxo_set_commitment_enabled: false,
+        transparent_address_history_available: true,
+        transparent_outpoint_spend_available: true,
     };
     capabilities_for_surface(CapabilitySurface::Wallet)
         .filter(|spec| spec.policy.wallet_satisfied(inputs))
@@ -83,11 +85,35 @@ fn blob_policies_never_advertise_on_explorer_or_ingest() {
         derive_store_online: true,
         prevout_resolution_online: true,
         payment_disclosure_verifier_online: true,
+        ..ExplorerReadiness::default()
     };
     assert!(!AdvertisePolicy::RequiresBlockBlobs.explorer_satisfied(readiness));
     assert!(!AdvertisePolicy::RequiresTransactionBlobs.explorer_satisfied(readiness));
     assert!(!AdvertisePolicy::RequiresBlockBlobs.ingest_satisfied(true));
     assert!(!AdvertisePolicy::RequiresTransactionBlobs.ingest_satisfied(true));
+}
+
+#[test]
+fn transaction_history_policies_require_typed_projection_readiness_and_wallet_query() {
+    let available = ExplorerReadiness {
+        wallet_query_online: true,
+        transaction_history_available: true,
+        ..ExplorerReadiness::default()
+    };
+    assert!(AdvertisePolicy::RequiresTransactionHistory.explorer_satisfied(available));
+    assert!(!AdvertisePolicy::RequiresCompleteTransactionHistory.explorer_satisfied(available));
+
+    let complete = ExplorerReadiness {
+        transaction_history_complete: true,
+        ..available
+    };
+    assert!(AdvertisePolicy::RequiresCompleteTransactionHistory.explorer_satisfied(complete));
+    let disconnected = ExplorerReadiness {
+        wallet_query_online: false,
+        ..complete
+    };
+    assert!(!AdvertisePolicy::RequiresTransactionHistory.explorer_satisfied(disconnected));
+    assert!(!AdvertisePolicy::RequiresCompleteTransactionHistory.explorer_satisfied(disconnected));
 }
 
 #[test]

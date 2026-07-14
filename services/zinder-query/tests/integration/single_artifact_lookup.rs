@@ -10,7 +10,7 @@ use zinder_core::{
     TransactionId, TxStatus, UnixTimestampMillis,
 };
 use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
-use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
+use zinder_store::ChainEpochArtifacts;
 use zinder_testkit::{FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
@@ -82,16 +82,7 @@ async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            checkpoint_epoch,
-            Vec::<zinder_core::BlockHeaderArtifact>::new(),
-            Vec::new(),
-        )
-        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
-            height: checkpoint_height,
-        }),
-    )?;
+    store.commit_artifactless_checkpoint(checkpoint_epoch)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match wallet_query.compact_block_at(checkpoint_height, None).await {

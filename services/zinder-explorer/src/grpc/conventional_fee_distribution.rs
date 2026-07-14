@@ -4,6 +4,7 @@
 //! without computing paid fees, percentiles, or product-specific buckets.
 
 use tonic::{Request, Response, Status};
+use zinder_core::BlockHeight;
 use zinder_derive::{
     ConventionalFeeDistribution as DerivedConventionalFeeDistribution,
     ConventionalFeeDistributionBackfillCoverage, ConventionalFeeDistributionConsumer,
@@ -136,8 +137,8 @@ fn map_coverage(
         complete_through_height: Some(coverage.complete_through_height.value()),
         complete_from_time_unix_seconds: Some(coverage.complete_from_time_unix_seconds),
         complete_through_time_unix_seconds: Some(coverage.complete_through_time_unix_seconds),
-        requested_range_complete: requested_start_time_unix_seconds
-            >= coverage.complete_from_time_unix_seconds
+        requested_range_complete: coverage.complete_from_height == BlockHeight::new(1)
+            && requested_start_time_unix_seconds >= coverage.complete_from_time_unix_seconds
             && (requested_end_time_unix_seconds
                 <= coverage
                     .complete_through_time_unix_seconds
@@ -155,8 +156,6 @@ mod tests {
 
     use super::*;
     use tonic::Code;
-    use zinder_core::BlockHeight;
-
     #[test]
     fn rejects_empty_or_reversed_time_ranges() {
         for (start, end) in [(10, 10), (11, 10)] {
@@ -192,9 +191,22 @@ mod tests {
 
     #[test]
     fn coverage_completeness_is_specific_to_the_requested_range() {
-        let complete = map_coverage(
+        let checkpoint_bounded = map_coverage(
             ConventionalFeeDistributionBackfillCoverage::new(
                 BlockHeight::new(100),
+                BlockHeight::new(200),
+                1_699_000_000,
+                1_700_000_000,
+            ),
+            200,
+            1_699_500_000,
+            1_700_100_000,
+        );
+        assert!(!checkpoint_bounded.requested_range_complete);
+
+        let complete = map_coverage(
+            ConventionalFeeDistributionBackfillCoverage::new(
+                BlockHeight::new(1),
                 BlockHeight::new(200),
                 1_699_000_000,
                 1_700_000_000,
@@ -207,7 +219,7 @@ mod tests {
 
         let starts_before_coverage = map_coverage(
             ConventionalFeeDistributionBackfillCoverage::new(
-                BlockHeight::new(100),
+                BlockHeight::new(1),
                 BlockHeight::new(200),
                 1_699_000_000,
                 1_700_000_000,
@@ -220,7 +232,7 @@ mod tests {
 
         let ends_after_lagging_coverage = map_coverage(
             ConventionalFeeDistributionBackfillCoverage::new(
-                BlockHeight::new(100),
+                BlockHeight::new(1),
                 BlockHeight::new(199),
                 1_699_000_000,
                 1_700_000_000,

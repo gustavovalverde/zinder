@@ -968,11 +968,18 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
         service_version: "0.1.0".to_owned(),
         capabilities: vec![zinder_proto::capabilities::WALLET_EVENTS_CHAIN_V1.to_owned()],
         contract_revision: zinder_proto::CONTRACT_REVISION,
+        projection_preset: "wallet".to_owned(),
+        projection_identities: vec!["transparent_outpoint_spend".to_owned()],
     };
     let decoded = round_trip(&server_info)?;
 
     assert_eq!(decoded.contract_revision, zinder_proto::CONTRACT_REVISION);
     assert_eq!(decoded.contract_revision, 1);
+    assert_eq!(decoded.projection_preset, "wallet");
+    assert_eq!(
+        decoded.projection_identities,
+        vec!["transparent_outpoint_spend"]
+    );
     Ok(())
 }
 

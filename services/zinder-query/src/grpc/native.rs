@@ -107,6 +107,14 @@ pub struct ServerInfoSettings {
     /// Whether the operator opted into the transparent UTXO-set commitment
     /// fold on `TransparentUtxoSetSummary`.
     pub utxo_set_commitment_enabled: bool,
+    /// Whether transparent-address transaction history is available.
+    pub transparent_address_history_available: bool,
+    /// Whether durable transparent spender resolution is available.
+    pub transparent_outpoint_spend_available: bool,
+    /// Closed projection workload detected from the durable derive manifest.
+    pub projection_preset: String,
+    /// Effective stable projection identities selected by the workload.
+    pub projection_identities: Vec<String>,
 }
 
 /// Snapshot of the upstream-node capability probe used by `ServerInfo`.
@@ -144,6 +152,16 @@ impl Default for ServerInfoSettings {
             block_blobs_retained: false,
             transaction_blobs_retained: false,
             utxo_set_commitment_enabled: false,
+            transparent_address_history_available: true,
+            transparent_outpoint_spend_available: true,
+            projection_preset: zinder_derive::ProjectionPreset::Complete
+                .as_str()
+                .to_owned(),
+            projection_identities: zinder_derive::ProjectionPreset::Complete
+                .consumer_schemas()
+                .iter()
+                .map(|schema| schema.name.as_str().to_owned())
+                .collect(),
         }
     }
 }
@@ -189,10 +207,16 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
                     block_blobs_retained: settings.block_blobs_retained,
                     transaction_blobs_retained: settings.transaction_blobs_retained,
                     utxo_set_commitment_enabled: settings.utxo_set_commitment_enabled,
+                    transparent_address_history_available: settings
+                        .transparent_address_history_available,
+                    transparent_outpoint_spend_available: settings
+                        .transparent_outpoint_spend_available,
                 })
             })
             .map(|spec| spec.string.to_owned())
             .collect(),
+        projection_preset: settings.projection_preset.clone(),
+        projection_identities: settings.projection_identities.clone(),
     }
 }
 
@@ -936,8 +960,9 @@ fn native_shielded_protocol(
 #[cfg(test)]
 mod server_info_tests {
     use zinder_proto::capabilities::{
-        WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
-        WALLET_READ_TRANSACTION_BY_ID_V1, WALLET_READ_TRANSACTION_BYTES_V1,
+        WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_FULL_BLOCK_AT_V1,
+        WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V1,
+        WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
     };
 
     use super::{ServerInfoSettings, UpstreamNodeCapabilities, build_wallet_server_info};
@@ -965,6 +990,26 @@ mod server_info_tests {
         };
         assert_eq!(common.service_name, env!("CARGO_PKG_NAME"));
         assert!(!common.capabilities.is_empty());
+        assert_eq!(common.projection_preset, "complete");
+        assert!(!common.projection_identities.is_empty());
+    }
+
+    #[test]
+    fn server_info_reports_the_effective_wallet_workload() {
+        let settings = ServerInfoSettings {
+            projection_preset: "wallet".to_owned(),
+            projection_identities: vec![
+                "transparent_address_transaction_history".to_owned(),
+                "transparent_outpoint_spend".to_owned(),
+            ],
+            ..ServerInfoSettings::default()
+        };
+        let common = build_wallet_server_info(&settings)
+            .common
+            .unwrap_or_default();
+
+        assert_eq!(common.projection_preset, "wallet");
+        assert_eq!(common.projection_identities, settings.projection_identities);
     }
 
     #[test]
@@ -1024,5 +1069,25 @@ mod server_info_tests {
             );
             assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V1));
         }
+    }
+
+    #[test]
+    fn server_info_gates_wallet_projection_capabilities_on_availability() {
+        let capabilities = build_wallet_server_info(&ServerInfoSettings {
+            transparent_address_history_available: false,
+            transparent_outpoint_spend_available: false,
+            ..ServerInfoSettings::default()
+        })
+        .common
+        .map(|common| common.capabilities)
+        .unwrap_or_default();
+        assert!(!advertises(
+            &capabilities,
+            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
+        ));
+        assert!(!advertises(
+            &capabilities,
+            WALLET_READ_TRANSPARENT_SPENDS_V1
+        ));
     }
 }
