@@ -7,7 +7,8 @@ use zinder_core::{
     BlockHeight, TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentSpendEntry,
 };
 use zinder_derive::{
-    DeriveStore, DeriveStoreError, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    DeriveStore, DeriveStoreError, DeriveStoreReadSnapshot,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
     TransparentAddressTransactionHistoryConsumer, TransparentAddressTransactionHistoryPageRequest,
@@ -20,19 +21,38 @@ use crate::TransparentAddressTxIdsInRangeRequest;
 /// One typed projection value with the durable height that produced it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionRead<Value> {
+    /// Authenticated canonical chain-event position reflected by this read.
+    pub chain_event_cursor: Option<StreamCursorTokenV1>,
     /// Last block height materialized by this projection.
     pub materialized_height: Option<BlockHeight>,
     /// Typed value returned by the projection.
     pub value: Value,
 }
 
+impl<Value> ProjectionRead<Value> {
+    /// Returns whether this read reflects the required canonical position.
+    #[must_use]
+    pub fn covers(
+        &self,
+        required_height: BlockHeight,
+        required_cursor: Option<&StreamCursorTokenV1>,
+    ) -> bool {
+        projection_covers(
+            self.materialized_height,
+            self.chain_event_cursor.as_ref(),
+            required_height,
+            required_cursor,
+        )
+    }
+}
+
 /// Durable position reported by one wallet projection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalletProjectionPosition {
     /// Whether the selected workload includes the projection identity.
     pub available: bool,
-    /// Whether the projection has committed an authenticated chain-event cursor.
-    pub cursor_committed: bool,
+    /// Authenticated canonical chain-event position committed with the projection.
+    pub chain_event_cursor: Option<StreamCursorTokenV1>,
     /// Last block height materialized by the projection.
     pub materialized_height: Option<BlockHeight>,
 }
@@ -40,17 +60,23 @@ pub struct WalletProjectionPosition {
 impl WalletProjectionPosition {
     /// Returns whether this projection is complete through `required_height`.
     #[must_use]
-    pub fn covers(self, required_height: BlockHeight) -> bool {
+    pub fn covers(
+        &self,
+        required_height: BlockHeight,
+        required_cursor: Option<&StreamCursorTokenV1>,
+    ) -> bool {
         self.available
-            && self.cursor_committed
-            && self
-                .materialized_height
-                .is_some_and(|height| height >= required_height)
+            && projection_covers(
+                self.materialized_height,
+                self.chain_event_cursor.as_ref(),
+                required_height,
+                required_cursor,
+            )
     }
 }
 
 /// Independent readiness positions for the two wallet-critical projections.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalletProjectionReadiness {
     /// Transparent-address transaction-history readiness.
     pub transparent_address_history: WalletProjectionPosition,
@@ -145,12 +171,15 @@ impl DeriveStoreWalletProjectionReader {
 impl WalletProjectionReadApi for DeriveStoreWalletProjectionReader {
     fn readiness(&self) -> Result<WalletProjectionReadiness, WalletProjectionReadError> {
         self.refresh()?;
+        let snapshot = self.store.read_snapshot();
         Ok(WalletProjectionReadiness {
             transparent_address_history: self.projection_position(
+                &snapshot,
                 TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
                 TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
             )?,
             transparent_outpoint_spend: self.projection_position(
+                &snapshot,
                 TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
                 TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
             )?,
@@ -163,14 +192,18 @@ impl WalletProjectionReadApi for DeriveStoreWalletProjectionReader {
     ) -> Result<ProjectionRead<TransparentAddressHistoryPage>, WalletProjectionReadError> {
         self.require_projection(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)?;
         self.refresh()?;
-        let materialized_height = self
-            .store
+        let snapshot = self.store.read_snapshot();
+        let chain_event_cursor = snapshot
+            .get_chain_event_cursor(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)
+            .map_err(storage_error)?
+            .map(StreamCursorTokenV1::from_bytes);
+        let materialized_height = snapshot
             .last_materialized_height_ascending(
                 TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
             )
             .map_err(storage_error)?;
-        let page = TransparentAddressTransactionHistoryConsumer::read_page(
-            &self.store,
+        let page = TransparentAddressTransactionHistoryConsumer::read_page_snapshot(
+            &snapshot,
             TransparentAddressTransactionHistoryPageRequest {
                 address_script_hash: request.address_script_hash,
                 start_height: request.start_height,
@@ -181,7 +214,9 @@ impl WalletProjectionReadApi for DeriveStoreWalletProjectionReader {
             },
         )
         .map_err(history_error)?;
+        drop(snapshot);
         Ok(ProjectionRead {
+            chain_event_cursor,
             materialized_height,
             value: TransparentAddressHistoryPage {
                 artifacts: page.artifacts,
@@ -199,14 +234,21 @@ impl WalletProjectionReadApi for DeriveStoreWalletProjectionReader {
     > {
         self.require_projection(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?;
         self.refresh()?;
-        let materialized_height = self
-            .store
+        let snapshot = self.store.read_snapshot();
+        let chain_event_cursor = snapshot
+            .get_chain_event_cursor(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
+            .map_err(storage_error)?
+            .map(StreamCursorTokenV1::from_bytes);
+        let materialized_height = snapshot
             .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)
             .map_err(storage_error)?;
-        let spenders =
-            TransparentOutpointSpendConsumer::read_spends_by_outpoints(&self.store, outpoints)
-                .map_err(storage_error)?;
+        let spenders = TransparentOutpointSpendConsumer::read_spends_by_outpoints_snapshot(
+            &snapshot, outpoints,
+        )
+        .map_err(storage_error)?;
+        drop(snapshot);
         Ok(ProjectionRead {
+            chain_event_cursor,
             materialized_height,
             value: spenders,
         })
@@ -216,31 +258,40 @@ impl WalletProjectionReadApi for DeriveStoreWalletProjectionReader {
 impl DeriveStoreWalletProjectionReader {
     fn projection_position(
         &self,
+        snapshot: &DeriveStoreReadSnapshot<'_>,
         projection: zinder_derive::DeriveConsumerName,
         index_column_family: &'static str,
     ) -> Result<WalletProjectionPosition, WalletProjectionReadError> {
         if !self.store.has_consumer(projection) {
             return Ok(WalletProjectionPosition {
                 available: false,
-                cursor_committed: false,
+                chain_event_cursor: None,
                 materialized_height: None,
             });
         }
-        let cursor_committed = self
-            .store
+        let chain_event_cursor = snapshot
             .get_chain_event_cursor(projection)
             .map_err(storage_error)?
-            .is_some();
-        let materialized_height = self
-            .store
+            .map(StreamCursorTokenV1::from_bytes);
+        let materialized_height = snapshot
             .last_materialized_height_ascending(index_column_family)
             .map_err(storage_error)?;
         Ok(WalletProjectionPosition {
             available: true,
-            cursor_committed,
+            chain_event_cursor,
             materialized_height,
         })
     }
+}
+
+fn projection_covers(
+    materialized_height: Option<BlockHeight>,
+    projection_cursor: Option<&StreamCursorTokenV1>,
+    required_height: BlockHeight,
+    required_cursor: Option<&StreamCursorTokenV1>,
+) -> bool {
+    materialized_height.is_some_and(|height| height >= required_height)
+        && required_cursor.is_some_and(|cursor| projection_cursor == Some(cursor))
 }
 
 /// Builds the current `RocksDB` adapter for wallet projection reads and readiness.

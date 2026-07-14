@@ -799,6 +799,7 @@ where
                 if let Some(wallet_projection_reader) = wallet_projection_reader.as_deref() {
                     for entry in resolve_swept_spends_from_derive(
                         wallet_projection_reader,
+                        &read_api,
                         &reader,
                         chain_epoch.settled_tip_height,
                         &canonical_misses,
@@ -1036,13 +1037,14 @@ where
                 .current_chain_epoch_reader()
                 .map_err(QueryError::Store)?;
             let chain_epoch = reader.chain_epoch();
+            let required_cursor = current_tip_chain_event_cursor_for_epoch(&read_api, chain_epoch)?;
             let projection_read = wallet_projection_reader
                 .transparent_address_history_page(&request)
                 .map_err(|error| {
                     map_wallet_projection_read_error(error, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1)
                 })?;
             let derive_height = projection_read.materialized_height;
-            if derive_height.is_none_or(|height| height < chain_epoch.visible_tip_height) {
+            if !projection_read.covers(chain_epoch.visible_tip_height, required_cursor.as_ref()) {
                 return Err(QueryError::DeriveLag {
                     capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
                     chain_tip_height: chain_epoch.visible_tip_height,
@@ -1408,6 +1410,7 @@ where
 /// store that never swept still returns the correct absent answer.
 fn resolve_swept_spends_from_derive(
     wallet_projection_reader: &dyn WalletProjectionReadApi,
+    read_api: &(impl ChainEpochReadApi + ?Sized),
     reader: &zinder_store::ChainEpochReader<'_>,
     settled_tip_height: BlockHeight,
     canonical_misses: &[TransparentOutPoint],
@@ -1422,7 +1425,13 @@ fn resolve_swept_spends_from_derive(
             map_wallet_projection_read_error(error, WALLET_READ_TRANSPARENT_SPENDS_V1)
         })?;
     let derive_height = projection_read.materialized_height;
-    if derive_height.map_or(0, BlockHeight::value) < deleted_through {
+    let projection_is_current = if deleted_through == 0 {
+        true
+    } else {
+        let required_cursor = current_tip_chain_event_cursor(read_api)?;
+        projection_read.covers(BlockHeight::new(deleted_through), required_cursor.as_ref())
+    };
+    if !projection_is_current {
         return Err(QueryError::DeriveLag {
             capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
             chain_tip_height: BlockHeight::new(deleted_through),
@@ -1442,6 +1451,32 @@ fn resolve_swept_spends_from_derive(
         }
     }
     Ok(resolved)
+}
+
+fn current_tip_chain_event_cursor(
+    read_api: &(impl ChainEpochReadApi + ?Sized),
+) -> Result<Option<StreamCursorTokenV1>, QueryError> {
+    read_api
+        .resolve_chain_event_stream_start(
+            &EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Tip,
+        )
+        .map(|resume| resume.cursor)
+        .map_err(map_chain_event_store_error)
+}
+
+fn current_tip_chain_event_cursor_for_epoch(
+    read_api: &(impl ChainEpochReadApi + ?Sized),
+    expected_chain_epoch: ChainEpoch,
+) -> Result<Option<StreamCursorTokenV1>, QueryError> {
+    let cursor = current_tip_chain_event_cursor(read_api)?;
+    let current_chain_epoch = read_api
+        .current_chain_epoch_reader()
+        .map_err(QueryError::Store)?
+        .chain_epoch();
+    Ok((current_chain_epoch == expected_chain_epoch)
+        .then_some(cursor)
+        .flatten())
 }
 
 /// Refuses an ambiguous canonical miss after retention has deleted spend facts.

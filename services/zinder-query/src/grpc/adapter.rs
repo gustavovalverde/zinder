@@ -23,13 +23,14 @@ use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
-    StreamCursorTokenV1, chain_event_stream_family_from_request, event_stream_start_from_request,
+    ChainEventStreamFamily, EventStreamStartPosition, StoreError, StreamCursorTokenV1,
+    chain_event_stream_family_from_request, event_stream_start_from_request,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
 use crate::{
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
+    QueryError, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
     WalletProjectionReadApi, WalletQueryApi,
 };
 
@@ -745,32 +746,45 @@ where
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
         let mut server_info = self.server_info.clone();
         if let Some(wallet_projection_reader) = self.wallet_projection_reader.clone() {
-            let visible_tip_height = self
-                .query_api
-                .latest_block(None)
-                .await
-                .map_err(|error| status_from_query_error(&error))?
-                .chain_epoch
-                .visible_tip_height;
-            let readiness =
-                tokio::task::spawn_blocking(move || wallet_projection_reader.readiness())
+            let latest_block = match self.query_api.latest_block(None).await {
+                Ok(latest_block) => Some(latest_block),
+                Err(QueryError::Store(StoreError::NoVisibleChainEpoch)) => None,
+                Err(error) => return Err(status_from_query_error(&error)),
+            };
+            if let Some(latest_block) = latest_block {
+                let required_cursor = self
+                    .query_api
+                    .resolve_chain_events_start(
+                        EventStreamStartPosition::LiveTail,
+                        ChainEventStreamFamily::Tip,
+                    )
                     .await
-                    .map_err(|error| {
-                        Status::internal(format!(
-                            "wallet projection readiness task failed: {error}"
-                        ))
-                    })?
-                    .map_err(|error| {
-                        Status::internal(format!(
-                            "wallet projection readiness read failed: {error}"
-                        ))
-                    })?;
-            server_info.transparent_address_history_available = readiness
-                .transparent_address_history
-                .covers(visible_tip_height);
-            server_info.transparent_outpoint_spend_available = readiness
-                .transparent_outpoint_spend
-                .covers(visible_tip_height);
+                    .map_err(|error| status_from_query_error(&error))?
+                    .cursor;
+                let readiness =
+                    tokio::task::spawn_blocking(move || wallet_projection_reader.readiness())
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "wallet projection readiness task failed: {error}"
+                            ))
+                        })?
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "wallet projection readiness read failed: {error}"
+                            ))
+                        })?;
+                let visible_tip_height = latest_block.chain_epoch.visible_tip_height;
+                server_info.transparent_address_history_available = readiness
+                    .transparent_address_history
+                    .covers(visible_tip_height, required_cursor.as_ref());
+                server_info.transparent_outpoint_spend_available = readiness
+                    .transparent_outpoint_spend
+                    .covers(visible_tip_height, required_cursor.as_ref());
+            } else {
+                server_info.transparent_address_history_available = false;
+                server_info.transparent_outpoint_spend_available = false;
+            }
         }
         let mut wallet_info = build_wallet_server_info(&server_info);
         let Some(common) = wallet_info.common.as_mut() else {

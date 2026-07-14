@@ -31,7 +31,7 @@ use zinder_query::{
     address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
-use zinder_store::MempoolEvent;
+use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition, MempoolEvent};
 
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher,
@@ -799,6 +799,15 @@ where
         let transparent_address_support = if !self.options.transparent_address_support {
             false
         } else if let Some(wallet_projection_reader) = &self.wallet_projection_reader {
+            let required_cursor = self
+                .query_api
+                .resolve_chain_events_start(
+                    EventStreamStartPosition::LiveTail,
+                    ChainEventStreamFamily::Tip,
+                )
+                .await
+                .map_err(|error| status_from_query_error(&error))?
+                .cursor;
             let wallet_projection_reader = Arc::clone(wallet_projection_reader);
             let readiness =
                 tokio::task::spawn_blocking(move || wallet_projection_reader.readiness())
@@ -815,10 +824,10 @@ where
                     })?;
             readiness
                 .transparent_address_history
-                .covers(latest_block.height)
+                .covers(latest_block.height, required_cursor.as_ref())
                 && readiness
                     .transparent_outpoint_spend
-                    .covers(latest_block.height)
+                    .covers(latest_block.height, required_cursor.as_ref())
         } else {
             true
         };

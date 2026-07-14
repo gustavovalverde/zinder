@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;
-use tonic::Request;
+use tonic::{Code, Request};
 use zinder_core::wire::encode_rpc_block_hash_hex;
 use zinder_core::{
     BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
@@ -259,16 +259,67 @@ async fn transparent_address_tx_ids_clamps_oversized_page_request() -> eyre::Res
 }
 
 #[tokio::test]
-async fn transparent_address_tx_ids_returns_visible_replacement_after_reorg() -> eyre::Result<()> {
+async fn transparent_address_tx_ids_fail_closed_until_same_height_reorg_is_derived()
+-> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     let address_script_hash = TransparentAddressScriptHash::from_bytes(ADDRESS_SCRIPT_HASH_BYTES);
-    commit_reorged_tx_index_rows(&store, &derive_store, address_script_hash)?;
+    commit_initial_tx_index_row(&store, &derive_store, address_script_hash)?;
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_derive_store(derive_store);
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let projection_reader = derive_store_wallet_projection_reader(derive_store.clone());
+    let wallet_query = WalletQuery::new(
+        store.clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_wallet_projection_reader(Arc::clone(&projection_reader));
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default())
+        .with_wallet_projection_reader(projection_reader);
+
+    let (replacement_artifact, replacement_cursor) =
+        commit_same_height_replacement(&store, address_script_hash)?;
+
+    let stale_info =
+        WalletQueryService::server_info(&grpc_adapter, Request::new(wallet::ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .info
+            .ok_or_else(|| eyre::eyre!("wallet server info missing descriptor"))?;
+    assert!(
+        !has_capability(&stale_info, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1),
+        "a same-height canonical replacement must close the stale projection capability",
+    );
+
+    let stale_read = WalletQueryService::transparent_address_tx_ids_in_range(
+        &grpc_adapter,
+        Request::new(tx_history_request(10, Vec::new(), false)),
+    )
+    .await;
+    let Err(stale_status) = stale_read else {
+        return Err(eyre::eyre!("stale projection rows were served"));
+    };
+    assert_eq!(stale_status.code(), Code::Unavailable);
+
+    seed_transparent_address_transaction_history(
+        &derive_store,
+        std::slice::from_ref(&replacement_artifact),
+    )?;
+    derive_store.put_chain_event_cursor(
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+        &replacement_cursor,
+    )?;
+
+    let caught_up_info =
+        WalletQueryService::server_info(&grpc_adapter, Request::new(wallet::ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .info
+            .ok_or_else(|| eyre::eyre!("wallet server info missing descriptor"))?;
+    assert!(has_capability(
+        &caught_up_info,
+        WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
+    ));
 
     let chunks =
         collect_tx_history_chunks(&grpc_adapter, tx_history_request(10, Vec::new(), false)).await?;
@@ -280,6 +331,40 @@ async fn transparent_address_tx_ids_returns_visible_replacement_after_reorg() ->
         chunks[0].block_hash,
         encode_rpc_block_hash_hex(block_hash_from_seed(20))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_info_empty_store_disables_production_projection_reader_capabilities()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let derive_store = open_wallet_derive_store(store_fixture.tempdir_path())?;
+    let projection_reader = derive_store_wallet_projection_reader(derive_store);
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_wallet_projection_reader(Arc::clone(&projection_reader));
+    let grpc_adapter = WalletQueryGrpcAdapter::new(
+        wallet_query,
+        ServerInfoSettings {
+            transparent_address_history_available: true,
+            transparent_outpoint_spend_available: true,
+            ..ServerInfoSettings::default()
+        },
+    )
+    .with_wallet_projection_reader(projection_reader);
+
+    let info =
+        WalletQueryService::server_info(&grpc_adapter, Request::new(wallet::ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .info
+            .ok_or_else(|| eyre::eyre!("wallet server info missing descriptor"))?;
+
+    assert!(!has_capability(
+        &info,
+        WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
+    ));
+    assert!(!has_capability(&info, WALLET_READ_TRANSPARENT_SPENDS_V1));
     Ok(())
 }
 
@@ -320,7 +405,16 @@ fn tx_history_request(
     }
 }
 
-fn commit_reorged_tx_index_rows(
+fn has_capability(server_info: &wallet::WalletServerInfo, capability: &str) -> bool {
+    server_info.common.as_ref().is_some_and(|common| {
+        common
+            .capabilities
+            .iter()
+            .any(|advertised| advertised == capability)
+    })
+}
+
+fn commit_initial_tx_index_row(
     store: &PrimaryChainStore,
     derive_store: &zinder_derive::DeriveStore,
     address_script_hash: TransparentAddressScriptHash,
@@ -329,11 +423,34 @@ fn commit_reorged_tx_index_rows(
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_chain_epoch(1, 2);
     initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
     initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
         initial_epoch,
-        vec![safe_tip_block.clone(), initial_block],
+        vec![safe_tip_block, initial_block],
         vec![safe_tip_compact_block, initial_compact_block],
     ))?;
+    let initial_artifact = TransparentAddressTxIndexArtifact::new(
+        address_script_hash,
+        BlockHeight::new(2),
+        0,
+        TransactionId::from_bytes([0x11; 32]),
+        block_hash_from_seed(2),
+    );
+    seed_transparent_address_transaction_history(
+        derive_store,
+        std::slice::from_ref(&initial_artifact),
+    )?;
+    derive_store.put_chain_event_cursor(
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+        commit.event_envelope.cursor.as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn commit_same_height_replacement(
+    store: &PrimaryChainStore,
+    address_script_hash: TransparentAddressScriptHash,
+) -> eyre::Result<(TransparentAddressTxIndexArtifact, Vec<u8>)> {
+    let (safe_tip_epoch, safe_tip_block, _) = synthetic_chain_epoch(1, 1);
 
     let replacement_height = BlockHeight::new(2);
     let replacement_hash = block_hash_from_seed(20);
@@ -373,7 +490,7 @@ fn commit_reorged_tx_index_rows(
         replacement_hash,
     );
 
-    store.commit_chain_epoch(
+    let commit = store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             replacement_epoch,
             vec![replacement_block],
@@ -383,9 +500,10 @@ fn commit_reorged_tx_index_rows(
             from_height: replacement_height,
         }),
     )?;
-    seed_transparent_address_transaction_history(derive_store, &[visible_artifact])?;
-
-    Ok(())
+    Ok((
+        visible_artifact,
+        commit.event_envelope.cursor.as_bytes().to_vec(),
+    ))
 }
 
 #[derive(Clone, Copy)]

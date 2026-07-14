@@ -220,7 +220,7 @@ async fn lightd_info_advertises_transparent_support_only_when_wallet_projections
             TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
         ),
     ] {
-        derive_store.put_chain_event_cursor(projection, b"tip-covered")?;
+        set_projection_at_canonical_tip(store_fixture.chain_store(), &derive_store, projection)?;
         derive_store.put_consumer(index_column_family, &tip_key, &[])?;
     }
 
@@ -1926,6 +1926,11 @@ async fn taddress_history_honors_requested_block_range_floor() -> eyre::Result<(
             ),
         ],
     )?;
+    set_projection_at_canonical_tip(
+        store_fixture.chain_store(),
+        &derive_store,
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    )?;
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
             store_fixture.chain_store().clone(),
@@ -2987,8 +2992,29 @@ where
         },
     )?;
     seed_transparent_address_transaction_history(&derive_store, &tx_history)?;
+    set_projection_at_canonical_tip(
+        store_fixture.chain_store(),
+        &derive_store,
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    )?;
 
     Ok((store_fixture, derive_store))
+}
+
+fn set_projection_at_canonical_tip(
+    chain_store: &zinder_store::PrimaryChainStore,
+    derive_store: &DeriveStore,
+    projection: zinder_derive::DeriveConsumerName,
+) -> eyre::Result<()> {
+    let cursor = chain_store
+        .resolve_chain_event_stream_start(
+            &EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Tip,
+        )?
+        .cursor
+        .ok_or_else(|| eyre!("committed fixture must expose a live-tail cursor"))?;
+    derive_store.put_chain_event_cursor(projection, cursor.as_bytes())?;
+    Ok(())
 }
 
 fn acceptance_compact_block_payload(

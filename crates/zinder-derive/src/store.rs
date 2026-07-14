@@ -716,6 +716,28 @@ impl DeriveStoreReadSnapshot<'_> {
             .transpose()
     }
 
+    /// Reads a chain-event consumer's persisted cursor from this snapshot.
+    pub fn get_chain_event_cursor(
+        &self,
+        consumer: DeriveConsumerName,
+    ) -> Result<Option<Vec<u8>>, DeriveStoreError> {
+        let column_family = self
+            .store
+            .column_family(DeriveStoreTable::ChainEventCursor)?;
+        self.store
+            .db
+            .get_cf_opt(
+                &column_family,
+                consumer.as_str().as_bytes(),
+                &self.read_options(),
+            )
+            .map_err(|source| DeriveStoreError::Operation {
+                operation: "get",
+                column_family: DeriveStoreColumnFamily::ChainEventCursor,
+                source,
+            })
+    }
+
     /// Reads a single value from a consumer-owned column family.
     pub fn get_consumer(
         &self,
@@ -849,6 +871,25 @@ impl DeriveStoreReadSnapshot<'_> {
             source,
         })?;
         Ok(Some((key.to_vec(), payload.to_vec())))
+    }
+
+    /// Returns the highest height materialized in an ascending-height
+    /// consumer column family from this snapshot.
+    pub fn last_materialized_height_ascending(
+        &self,
+        column_family: &'static str,
+    ) -> Result<Option<BlockHeight>, DeriveStoreError> {
+        let Some(key) = self.last_consumer_key(column_family)? else {
+            return Ok(None);
+        };
+        zinder_core::wire::decode_height_key_ascending(&key)
+            .map(Some)
+            .map_err(|error| DeriveStoreError::Decode {
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                reason: format!(
+                    "consumer column family `{column_family}` last key is not a 4-byte ascending height: {error}"
+                ),
+            })
     }
 
     /// Returns the lowest height in a descending-height consumer keyspace.

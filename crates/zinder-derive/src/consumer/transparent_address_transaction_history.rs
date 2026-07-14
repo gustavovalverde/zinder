@@ -23,6 +23,7 @@ use crate::consumer::{
     DeriveConsumerName, DeriveConsumerSchema,
 };
 use crate::error::{DeriveStoreColumnFamily, DeriveStoreError};
+use crate::store::{ConsumerEntry, DeriveStore, DeriveStoreReadSnapshot};
 
 /// Ascending address transaction-history rows keyed by address, height, tx index.
 pub const TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY: &str =
@@ -94,6 +95,37 @@ pub struct TransparentAddressTransactionHistoryPage {
     pub next_cursor: Option<StreamCursorTokenV1>,
 }
 
+#[derive(Clone, Copy)]
+enum TransparentAddressTransactionHistoryRead<'store> {
+    Store(&'store DeriveStore),
+    Snapshot(&'store DeriveStoreReadSnapshot<'store>),
+}
+
+impl TransparentAddressTransactionHistoryRead<'_> {
+    fn range_iterate_consumer(
+        self,
+        column_family: &'static str,
+        start_key: &[u8],
+        end_key_inclusive: &[u8],
+        entries_cap: usize,
+    ) -> Result<Vec<ConsumerEntry>, DeriveStoreError> {
+        match self {
+            Self::Store(store) => store.range_iterate_consumer(
+                column_family,
+                start_key,
+                end_key_inclusive,
+                entries_cap,
+            ),
+            Self::Snapshot(snapshot) => snapshot.range_iterate_consumer(
+                column_family,
+                start_key,
+                end_key_inclusive,
+                entries_cap,
+            ),
+        }
+    }
+}
+
 /// Materializes confirmed transparent-address transaction-history rows.
 #[derive(Default)]
 pub struct TransparentAddressTransactionHistoryConsumer;
@@ -136,7 +168,28 @@ impl TransparentAddressTransactionHistoryConsumer {
 
     /// Reads a transparent-address transaction-history page from a derive store.
     pub fn read_page(
-        store: &crate::store::DeriveStore,
+        store: &DeriveStore,
+        request: TransparentAddressTransactionHistoryPageRequest<'_>,
+    ) -> Result<TransparentAddressTransactionHistoryPage, DeriveStoreError> {
+        Self::read_page_from(
+            TransparentAddressTransactionHistoryRead::Store(store),
+            request,
+        )
+    }
+
+    /// Reads a transparent-address transaction-history page from one snapshot.
+    pub fn read_page_snapshot(
+        snapshot: &DeriveStoreReadSnapshot<'_>,
+        request: TransparentAddressTransactionHistoryPageRequest<'_>,
+    ) -> Result<TransparentAddressTransactionHistoryPage, DeriveStoreError> {
+        Self::read_page_from(
+            TransparentAddressTransactionHistoryRead::Snapshot(snapshot),
+            request,
+        )
+    }
+
+    fn read_page_from(
+        store: TransparentAddressTransactionHistoryRead<'_>,
         request: TransparentAddressTransactionHistoryPageRequest<'_>,
     ) -> Result<TransparentAddressTransactionHistoryPage, DeriveStoreError> {
         let cursor = request

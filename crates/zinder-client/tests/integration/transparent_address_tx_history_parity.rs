@@ -17,6 +17,7 @@ use zinder_client::{
 };
 use zinder_core::TransparentAddressTxIndexArtifact;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition};
 use zinder_testkit::{
     ChainFixture, StoreFixture, open_test_derive_store_for_canonical,
     sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
@@ -199,6 +200,18 @@ async fn setup_chain_indexes(tx_count: u32) -> eyre::Result<ChainIndexFixtures> 
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
     let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     seed_transparent_address_transaction_history(&derive_store, &artifacts)?;
+    let projection_cursor = store_fixture
+        .chain_store()
+        .resolve_chain_event_stream_start(
+            &EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Tip,
+        )?
+        .cursor
+        .ok_or_else(|| eyre!("committed fixture must expose a live-tail cursor"))?;
+    derive_store.put_chain_event_cursor(
+        zinder_derive::TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+        projection_cursor.as_bytes(),
+    )?;
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
         (),

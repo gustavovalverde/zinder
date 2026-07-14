@@ -34,7 +34,7 @@ use crate::consumer::{
     advance_verified_projection_coverage,
 };
 use crate::error::{DeriveStoreColumnFamily, DeriveStoreError};
-use crate::store::ConsumerProjectionState;
+use crate::store::{ConsumerProjectionState, DeriveStore, DeriveStoreReadSnapshot};
 use zinder_store::ChainEvent;
 
 /// Primary rows keyed by spent outpoint, valued with the spender identity.
@@ -79,6 +79,28 @@ const INPUT_INDEX_RANGE: std::ops::Range<usize> =
 #[derive(Default)]
 pub struct TransparentOutpointSpendConsumer;
 
+#[derive(Clone, Copy)]
+enum TransparentOutpointSpendRead<'store> {
+    Store(&'store DeriveStore),
+    Snapshot(&'store DeriveStoreReadSnapshot<'store>),
+}
+
+impl TransparentOutpointSpendRead<'_> {
+    fn multi_get_consumer<K>(
+        self,
+        column_family: &'static str,
+        keys: &[K],
+    ) -> Result<Vec<Option<Vec<u8>>>, DeriveStoreError>
+    where
+        K: AsRef<[u8]>,
+    {
+        match self {
+            Self::Store(store) => store.multi_get_consumer(column_family, keys),
+            Self::Snapshot(snapshot) => snapshot.multi_get_consumer(column_family, keys),
+        }
+    }
+}
+
 impl TransparentOutpointSpendConsumer {
     /// Builds the consumer.
     #[must_use]
@@ -91,7 +113,25 @@ impl TransparentOutpointSpendConsumer {
     /// Outpoints with no recorded spender are absent from the returned map;
     /// absence means "no spender recorded here", never "unspent".
     pub fn read_spends_by_outpoints(
-        store: &crate::store::DeriveStore,
+        store: &DeriveStore,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<HashMap<TransparentOutPoint, TransparentSpendEntry>, DeriveStoreError> {
+        Self::read_spends_by_outpoints_from(TransparentOutpointSpendRead::Store(store), outpoints)
+    }
+
+    /// Resolves recorded spenders from one derive-store snapshot.
+    pub fn read_spends_by_outpoints_snapshot(
+        snapshot: &DeriveStoreReadSnapshot<'_>,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<HashMap<TransparentOutPoint, TransparentSpendEntry>, DeriveStoreError> {
+        Self::read_spends_by_outpoints_from(
+            TransparentOutpointSpendRead::Snapshot(snapshot),
+            outpoints,
+        )
+    }
+
+    fn read_spends_by_outpoints_from(
+        store: TransparentOutpointSpendRead<'_>,
         outpoints: &[TransparentOutPoint],
     ) -> Result<HashMap<TransparentOutPoint, TransparentSpendEntry>, DeriveStoreError> {
         if outpoints.is_empty() {
