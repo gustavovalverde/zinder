@@ -573,7 +573,6 @@ async fn run_ingest(
             source: Arc::new(source.clone()),
             chain_store: &store,
             derive_store: &derive_store,
-            startup_phase,
             historical_work_gate: &historical_work_gate,
             cancel: &cancel,
         })

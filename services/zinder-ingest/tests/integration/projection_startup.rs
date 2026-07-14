@@ -111,7 +111,6 @@ async fn wallet_startup_runs_only_wallet_projection_work() -> Result<()> {
             source: Arc::new(source.clone()),
             chain_store: &chain_store,
             derive_store: &derive_store,
-            startup_phase: IngestPhase::BulkCatchup,
             historical_work_gate: &historical_work_gate,
             cancel: &cancel,
         })
@@ -119,6 +118,53 @@ async fn wallet_startup_runs_only_wallet_projection_work() -> Result<()> {
     assert!(runtime.optional_task_names().is_empty());
     assert_eq!(source.fetch_attempts(), 0);
     cancel.cancel();
+    runtime.join().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_defers_existing_derive_replay_to_the_tailer() -> Result<()> {
+    let tempdir = tempdir()?;
+    let canonical_path = tempdir.path().join("canonical");
+    let chain_store = PrimaryChainStore::open(
+        &canonical_path,
+        ChainStoreOptions::for_network(Network::ZcashRegtest),
+    )?;
+    let artifacts = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(1)
+        .chain_epoch_artifacts(ChainEpochId::new(1))
+        .ok_or_else(|| eyre!("chain fixture unexpectedly empty"))?;
+    chain_store.commit_chain_epoch(artifacts)?;
+    let derive_store = open_primary_derive_store_for_canonical_with_projection_preset(
+        &canonical_path,
+        RocksDbResourceBudget::for_local_tests(),
+        ProjectionPreset::Wallet,
+    )?;
+    let source = MockNodeSource::from_chain(ChainFixture::new(Network::ZcashRegtest));
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let readiness = Readiness::default();
+    readiness.set_phase(IngestPhase::FollowingTip);
+    let historical_work_gate = HistoricalWorkGate::new(readiness);
+
+    let runtime = ProjectionStartupPlan::for_preset(ProjectionPreset::Wallet)
+        .start(ProjectionStartupInputs {
+            settings: enabled_settings(),
+            request_timeout: Duration::from_secs(1),
+            activations: Arc::new(sample_regtest_upgrade_activations()),
+            source: Arc::new(source),
+            chain_store: &chain_store,
+            derive_store: &derive_store,
+            historical_work_gate: &historical_work_gate,
+            cancel: &cancel,
+        })
+        .await?;
+
+    assert_eq!(
+        derive_store.get_chain_event_cursor(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?,
+        None,
+        "startup must not synchronously replay persisted derive debt"
+    );
     runtime.join().await;
     Ok(())
 }
@@ -159,7 +205,6 @@ async fn startup_rejects_a_plan_store_mismatch() -> Result<()> {
             source: Arc::new(source.clone()),
             chain_store: &chain_store,
             derive_store: &derive_store,
-            startup_phase: IngestPhase::BulkCatchup,
             historical_work_gate: &historical_work_gate,
             cancel: &cancel,
         })

@@ -1094,8 +1094,8 @@ pub async fn catch_up_derive_store_to_canonical(
 /// Drains derive debt only to the handoff boundary, then returns.
 ///
 /// Replay stops once the derive plane is within the configured handoff lag of
-/// the canonical tip or a bounded wall-clock budget elapses, so the API and ops
-/// surfaces start while the always-on tailer drains any remainder from the
+/// the canonical tip or a bounded wall-clock budget elapses. Callers that opt
+/// into this explicit handoff can then start the always-on tailer from the
 /// persisted consumer cursors. The persisted [`DeriveStatus`] is refreshed
 /// before returning so the first readiness read reflects the residual lag as
 /// catching-up rather than dark.

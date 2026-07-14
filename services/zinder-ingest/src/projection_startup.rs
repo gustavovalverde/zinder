@@ -17,7 +17,6 @@ use zinder_derive::{
     TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, VALUE_POOL_BALANCE_HISTORY_CONSUMER_NAME,
     VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
 };
-use zinder_runtime::IngestPhase;
 use zinder_source::NodeSource;
 use zinder_store::PrimaryChainStore;
 
@@ -29,13 +28,13 @@ use crate::{
     TransactionComponentBackfillContext, TransactionHistoryVerifierConfig,
     TransactionHistoryVerifierContext, ValuePoolBalanceBackfillConfig,
     ValuePoolBalanceBackfillContext, ValuePoolFlowBackfillConfig, ValuePoolFlowBackfillContext,
-    bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical_until_handoff,
-    seed_backfill_owned_consumer_cursors, seed_paid_fee_distribution_cursor_and_tail,
-    seed_value_pool_flow_cursor_and_tail, spawn_block_production_time_backfill_task,
-    spawn_commitment_root_backfill_task, spawn_conventional_fee_distribution_backfill_task,
-    spawn_derive_tailer_task, spawn_paid_fee_distribution_backfill_task,
-    spawn_transaction_component_backfill_task, spawn_transaction_history_verifier_task,
-    spawn_value_pool_balance_backfill_task, spawn_value_pool_flow_backfill_task,
+    bootstrap_transparent_address_ranking, seed_backfill_owned_consumer_cursors,
+    seed_paid_fee_distribution_cursor_and_tail, seed_value_pool_flow_cursor_and_tail,
+    spawn_block_production_time_backfill_task, spawn_commitment_root_backfill_task,
+    spawn_conventional_fee_distribution_backfill_task, spawn_derive_tailer_task,
+    spawn_paid_fee_distribution_backfill_task, spawn_transaction_component_backfill_task,
+    spawn_transaction_history_verifier_task, spawn_value_pool_balance_backfill_task,
+    spawn_value_pool_flow_backfill_task,
 };
 
 /// One ordered unit of projection-owned startup work.
@@ -328,14 +327,6 @@ impl ProjectionStartupPlan {
         if self.includes_work(ProjectionStartupWork::BackfillOwnedCursorSeed) {
             seed_backfill_owned_consumer_cursors(chain_store, derive_store)?;
         }
-        if inputs.startup_phase == IngestPhase::FollowingTip {
-            catch_up_derive_store_to_canonical_until_handoff(
-                chain_store,
-                derive_store,
-                inputs.settings.derive,
-            )
-            .await?;
-        }
         if self.includes_work(ProjectionStartupWork::RankingBootstrap) {
             let _ = bootstrap_transparent_address_ranking(chain_store, derive_store).await?;
         }
@@ -537,8 +528,6 @@ pub struct ProjectionStartupInputs<'a> {
     pub chain_store: &'a PrimaryChainStore,
     /// Selected derive store opened with the same preset as the plan.
     pub derive_store: &'a DeriveStore,
-    /// Canonical phase observed before synchronous replay handoff is considered.
-    pub startup_phase: IngestPhase,
     /// Shared exclusive-stage gate used by replay, backfills, and retention.
     pub historical_work_gate: &'a HistoricalWorkGate,
     /// Process cancellation token inherited by projection tasks.
