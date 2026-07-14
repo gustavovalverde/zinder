@@ -15,7 +15,7 @@ Zinder is one product with multiple deployable services. The boundary rule is si
 
 Zcash indexing has two distinct jobs that often get coupled: converting upstream node state into durable, queryable chain artifacts, and serving wallets and applications with stable APIs and privacy-aware behavior. The jobs have different failure modes. Ingestion needs deterministic sync, reorg handling, atomic commits, schema migration, recoverability, and source-failure handling. Query serving needs latency, compatibility, privacy boundaries, and independent scale-out.
 
-Coupling them in one runtime hides operational costs: read load can interfere with chain commits, migrations become user-visible outages, and derived explorer features can drift into the wallet path. One runtime can do both during local development. Production architecture must not let read traffic share the same ownership boundary as chain commits.
+Coupling them in one runtime hides operational costs: read load can interfere with chain commits, migrations become user-visible outages, and derived explorer features can drift into the wallet path. One runtime can do both during local development. Neither supported deployment topology may let read traffic share the same ownership boundary as chain commits.
 
 The same shape appears across the indexer ecosystem: Blockscout separates indexer, web, and API modes; Sui separates checkpoint processing from ingestion sources; Reth Execution Extensions model committed and reverted chains explicitly; Substreams treats indexing as deterministic transformations with replayable sinks.
 
@@ -38,6 +38,12 @@ The services must not share:
 
 ## Storage Ownership
 
+The current implementation is the `rocksdb-single-host` topology. The accepted
+`postgres-scale-out` migration target preserves the ownership rules below while
+replacing RocksDB primary/secondary mechanics with fenced writers and
+request-scoped Postgres read sessions. [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
+owns the two-topology contract.
+
 `zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). It also owns the derive-store primary for bundled explorer projections and runs the derive tailer over retained canonical events. The derive store remains separate from canonical storage and is rebuildable from canonical artifacts and retained events.
 
 `zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They also open the bundled derive store as a secondary when serving derive-backed wallet reads such as transparent-address transaction history. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
@@ -59,9 +65,11 @@ one process hosts multiple services locally, that process is composition glue;
 the product boundaries remain `zinder-ingest`, `zinder-query`, and
 `zinder-compat-lightwalletd`.
 
-## Production Profiles
+## Deployment Topologies
 
-Minimum production deployment (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)):
+### `rocksdb-single-host`
+
+Minimum service set (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)):
 
 ```text
 zinder-ingest              -> canonical RocksDB (primary)
@@ -77,7 +85,7 @@ zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_pat
                            -> CompactTxStreamer
 ```
 
-Extended production deployment (adds derived plane):
+Extended service set (adds the current derived plane):
 
 ```text
 zinder-ingest              -> canonical RocksDB (primary)
@@ -88,7 +96,29 @@ zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_pat
 zinder-explorer            -> derive RocksDB (secondary when available, secondary_path/derive) -> ExplorerQuery
 ```
 
-Read replicas are colocated with the writer in v1 (shared filesystem). Cross-host replicas are out of scope; see [ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).
+Read replicas are colocated with the writer on one shared-filesystem host.
+Cross-host RocksDB replicas are out of scope; see
+[ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).
+This topology is production-supported and has no Postgres dependency.
+
+### `postgres-scale-out` migration target
+
+This topology is not implemented or certified yet. Its accepted service shape
+keeps one fenced canonical writer while allowing projectors, query services,
+and Postgres replicas to deploy and scale independently:
+
+```text
+zinder-ingest       -> Postgres canonical schema (one fenced active writer)
+zinder-projector    -> Postgres wallet or explorer schema (fenced per projection)
+zinder-query        -> epoch-bound canonical + wallet read sessions -> WalletQueryApi
+zinder-explorer     -> epoch-bound canonical + wallet + explorer reads -> ExplorerQuery
+compatibility edges -> WalletQueryApi / ExplorerQuery
+```
+
+Role-scoped credentials, writer-generation fencing, replica-lag reporting,
+request-scoped epoch reads, failover, and stale-writer rejection are part of
+this topology's certification boundary. It becomes production-supported only
+after those gates and the shared lifecycle targets pass.
 
 ## Anti-Patterns
 

@@ -193,6 +193,7 @@ fn assert_projection_report(
             > 0
     );
     assert_eq!(report.storage_candidate.canonical_engine, "rocksdb");
+    assert_eq!(report.storage_candidate.topology, "rocksdb-single-host");
     assert_eq!(
         report.provenance.software_revision.as_deref(),
         Some("test-revision")

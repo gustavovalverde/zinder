@@ -616,7 +616,11 @@ the affected service's liveness or readiness endpoint.
 
 ## Deployment Guidance
 
-Minimum production deployment:
+The commands and process counts below describe the currently implemented
+`rocksdb-single-host` topology. It is production-supported and requires no
+Postgres service.
+
+Minimum service set:
 
 ```text
 1 x zinder-ingest
@@ -624,7 +628,7 @@ N x zinder-query
 0..N x zinder-compat-lightwalletd
 ```
 
-Optional derived deployment:
+Optional explorer service set:
 
 ```text
 1 x zinder-ingest
@@ -634,6 +638,13 @@ M x zinder-explorer
 ```
 
 Only one ingest writer should own a canonical storage namespace unless leader election and write fencing are explicitly designed.
+
+The accepted `postgres-scale-out` topology keeps one fenced active ingest
+writer while allowing projection workers, query replicas, and database replicas
+to scale independently. Its deployment manifest and operator runbook must not
+ship until the topology-specific lifecycle, fencing, failover, and freshness
+gates in [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
+pass.
 
 ### Native wallet clients
 

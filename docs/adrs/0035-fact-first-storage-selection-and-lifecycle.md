@@ -1,10 +1,10 @@
-# ADR-0035: Fact-first storage selection and lifecycle targets
+# ADR-0035: Fact-first storage topologies and lifecycle targets
 
 | Field | Value |
 | ----- | ----- |
 | Status | Accepted |
 | Product | Zinder |
-| Domain | Canonical storage, projection construction, production database selection, snapshot recovery, lifecycle benchmarks |
+| Domain | Canonical storage, projection construction, deployment topology support, snapshot recovery, lifecycle benchmarks |
 | Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0015](0015-unified-phase-driven-ingest.md), [ADR-0022](0022-resource-budgeted-bulk-catchup.md), [ADR-0034](0034-exclusive-index-build-stages-and-block-local-spend-replay.md), [Canonical-first indexer](../architecture/fact-first-indexer.md) |
 
 ## Context
@@ -73,37 +73,49 @@ The following lifecycles remain separate deep modules:
 - Live following commits each visible canonical epoch or projection transition
   atomically under a durable writer generation.
 
-The first production database choice is a bake-off, not a permanent adapter
-matrix. The candidates are:
+Zinder permanently supports two deployment topologies. The names describe
+operational shape, not quality or environment:
+
+- `rocksdb-single-host` keeps canonical, wallet, and explorer storage in RocksDB
+  on one host. Services may remain separate processes or containers, but they
+  share host-local storage and do not require Postgres.
+- `postgres-scale-out` keeps the three planes in Postgres with role-scoped
+  credentials and an independently deployable canonical writer, projectors,
+  query replicas, and database replicas. It may run on one host for testing,
+  but its contract permits those roles to scale across hosts.
+
+Both topologies are production-supported after passing their applicable gates.
+`rocksdb-single-host` does not mean development-only, and
+`postgres-scale-out` is not a quality tier. The term `embedded` remains
+reserved for an indexer embedded in a consumer process, such as the Zaino
+integration described by the indexer-wallet boundary; a multi-service Zinder
+deployment is not an embedded indexer.
+
+The first storage implementation is a side-by-side validation, not a
+winner-takes-all backend bake-off. The candidates are:
 
 - a fact-first RocksDB control that can build sorted external SST files; and
 - a block-granular Postgres candidate that can use binary `COPY` and deferred
   secondary-index construction while the database is not serving reads.
 
 Both candidates consume the same `CanonicalBlockFacts`, captured source corpus,
-durability contract, reference hardware, and validation digest. The selected
-runtime backend must meet every hard lifecycle gate, every universal
-correctness gate, and every gate for its advertised topology. The losing
-canonical runtime, configuration, metrics, documentation, examples, and tests
-are deleted before general availability.
+durability contract, reference hardware, and validation digest. Each topology
+must meet every hard lifecycle gate, every universal correctness gate, and its
+topology-specific gates before Zinder advertises it as ready. A failed result
+blocks that topology from release until it is corrected; it does not demote the
+other topology or create a partial hybrid.
 
-Postgres is the preferred production outcome if it passes. That topology uses
-one database per Zcash network with `canonical`, `wallet`, and `explorer`
-schemas and role-scoped credentials. It gives operators one high-availability,
-backup, replica, and observability model. If Postgres misses the canonical hard
-gate, Zinder keeps RocksDB only for canonical truth and uses Postgres for wallet
-and explorer projections. That hybrid is a measured performance compromise,
-not the default assumption. It is eligible only after the Postgres wallet and
-explorer planes independently pass their applicable construction, readiness,
-correctness, recovery, and query gates. If either projection plane misses its
-gates, the storage decision reopens rather than silently retaining an
-unmeasured topology.
+A deployment selects `rocksdb-single-host` or `postgres-scale-out` as one
+application-level contract. Per-plane mixing, such as RocksDB canonical
+storage with Postgres projections, is not a third supported topology. This
+keeps configuration, backup, recovery, readiness, and failure semantics bounded
+to two deliberate shapes.
 
-The bake-off does not introduce `DatabaseAdapter`, a generic row transaction,
-or a lowest-common-denominator key-value interface. Canonical, wallet, and
-explorer modules expose focused domain operations. Backend crates own concrete
-SQL or RocksDB mechanics. Shared backend support is extracted only after two
-retained implementations prove stable duplication.
+Supporting both topologies does not introduce `DatabaseAdapter`, a generic row
+transaction, or a lowest-common-denominator key-value interface. Canonical,
+wallet, and explorer modules expose focused domain operations. Engine-specific
+modules own concrete SQL or RocksDB mechanics. Shared implementation support is
+extracted only after the two retained implementations prove stable duplication.
 
 ## Lifecycle targets
 
@@ -147,7 +159,7 @@ receive separate measured stages when those snapshot contracts exist.
 Every threshold-bearing candidate report includes the commit, applicable
 schema revisions, fixture digest, hardware and storage class, effective
 database and durability settings, and the wall time for the boundary it
-directly drives. The complete production-selection evidence set additionally
+directly drives. The complete topology-certification evidence set additionally
 includes dense-range throughput, rows, logical bytes, WAL or SST bytes, peak
 resident memory, disk high-water mark, index construction time, validation
 digests, snapshot restore time, and representative query latency where those
@@ -156,7 +168,7 @@ or measurements it did not execute.
 
 ## Correctness gates
 
-Performance cannot select a backend unless all of these pass:
+A topology cannot be certified unless all of these pass:
 
 - Full-chain continuity and canonical digest equality against a serial
   reference.
@@ -170,13 +182,13 @@ Performance cannot select a backend unless all of these pass:
 - Native API parity, the complete lightwalletd and Zallet compatibility suite,
   and the covered Zally, Zexplorer, and Cipherscan route matrices.
 
-Postgres must additionally prove durable writer-generation fencing, automated
-failover promotion, stale-writer rejection, standby lag reporting, and
-request-scoped replica read fences. A RocksDB canonical fallback must instead
-prove exclusive primary ownership, crash-safe primary restart, and same-volume
-secondary catch-up. That fallback does not advertise cross-host writer failover
-or database-replica reads; adding those capabilities requires a new topology
-decision and its corresponding gates.
+The `postgres-scale-out` topology must additionally prove durable
+writer-generation fencing, automated failover promotion, stale-writer
+rejection, standby lag reporting, and request-scoped replica read fences. The
+`rocksdb-single-host` topology must instead prove exclusive primary ownership,
+crash-safe primary restart, same-volume secondary catch-up, and a coherent
+checkpoint bundle across its RocksDB stores. It does not advertise cross-host
+writer failover or database-replica reads.
 
 Unavailable or behind state remains explicit. A query returns a typed
 `ProjectionBehind` or `ReplicaBehind` failure rather than an empty list, zero
@@ -196,7 +208,8 @@ balance, missing row, or unqualified unavailable error.
    current store remains a temporary oracle.
 3. Implement the smallest fact-first RocksDB and Postgres vertical slices and
    run both from the same Docker Compose benchmark topology.
-4. Select one canonical runtime and delete the losing candidate.
+4. Validate `rocksdb-single-host` and `postgres-scale-out` independently,
+   retain both concrete implementations, and reject per-plane backend mixing.
 5. Cut a fresh canonical schema that removes global transparent output,
    address, spend, repair, and retention state from canonical commits.
 6. Implement the concrete wallet projection builder, ordered follower, and
@@ -225,13 +238,22 @@ projection`, `explorer projection`, `projection position`, `projection fence`,
 `snapshot manifest`. The word `derive` is reserved for protocol or
 cryptographic derivation.
 
-`zinder-store` becomes the canonical domain and its selected backend
-implementation. `zinder-derive` is deleted after wallet and explorer ownership
-lands. `zinder-ingest` remains source-to-canonical only. An independent
-`zinder-projector` process owns build, verify, catch-up, follow, and promote
-lifecycles for one selected projection. The default deployment may run these
-processes in one application group, but they retain separate credentials,
-readiness, restart, and resource ownership.
+`rocksdb-single-host` and `postgres-scale-out` are the stable serialized names
+at deployment-manifest and evidence-report boundaries. Zinder does not add a
+runtime topology selector before both composition roots exist. Once they do,
+one closed discriminant selects the complete topology, rejects configuration
+belonging to the other topology, and provides no aliases or per-plane backend
+switches.
+
+`zinder-store` becomes the canonical domain. Concrete RocksDB and Postgres
+implementations remain engine-named modules or crates selected by topology
+composition rather than hidden behind one generic database API. `zinder-derive`
+is deleted after wallet and explorer ownership lands. `zinder-ingest` remains
+source-to-canonical only. An independent `zinder-projector` process owns build,
+verify, catch-up, follow, and promote lifecycles for one selected projection.
+The `rocksdb-single-host` topology may colocate these processes in one
+application group, but they retain separate readiness, restart, and resource
+ownership.
 
 Public clients use the remote Zinder contract. `LocalChainIndex` and SDK
 storage-engine dependencies are deleted rather than carried as a second client
@@ -246,24 +268,32 @@ WalletQuery and ExplorerQuery.
   reconstruction is the hours-scale disaster and verification path.
 - Initial wallet construction can use set operations instead of replaying the
   whole chain through the live row-by-row state machine.
-- A successful Postgres candidate removes the host-local secondary-reader and
-  multi-backend operational model.
-- A failed Postgres candidate still yields a clean plane split and an explicit
-  reason for retaining RocksDB canonical storage.
-- Temporary candidate code has a deletion gate. It does not become a permanent
-  compatibility promise.
+- Operators can run a production-supported `rocksdb-single-host` deployment
+  without Postgres or choose `postgres-scale-out` when independent workers,
+  replicas, and database operations justify the additional infrastructure.
+- Both topologies preserve the same data-plane, readiness, and public API
+  contracts; only their physical persistence and topology-specific operations
+  differ.
+- Maintaining two concrete persistence implementations is an intentional
+  product cost. Temporary benchmark scaffolding and any hybrid backend path
+  still have deletion gates.
 - This decision supersedes RocksDB-specific ownership and scheduling details in
-  earlier ADRs when those details conflict with the selected fact-first
-  implementation. Historical ADRs remain records of the decisions that
-  produced the current schema.
+  earlier ADRs when those details conflict with the fact-first topology
+  contracts. Historical ADRs remain records of the decisions that produced the
+  current schema.
 
 ## Rejected alternatives
 
 - Adding Postgres behind the current `DeriveStore` preserves a RocksDB-shaped
   public batch API and mixes wallet and explorer ownership.
-- Keeping both canonical backends after the comparison doubles configuration,
-  backup, failure, replica, test, and documentation semantics without a product
-  requirement.
+- Calling the RocksDB topology `embedded` collides with the existing
+  consumer-embedded indexer vocabulary and hides that Zinder still runs as a
+  service group.
+- Calling the Postgres topology `production` falsely implies that
+  `rocksdb-single-host` deployments are unsuitable for production.
+- Allowing arbitrary per-plane backend combinations multiplies configuration,
+  backup, failure, test, and documentation semantics without adding a third
+  product topology.
 - Normalizing every canonical fact into relational rows during initial
   construction recreates index and WAL amplification before a query proves the
   rows need independent lookup.

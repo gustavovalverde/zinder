@@ -1,15 +1,15 @@
 # Resource-bounded storage-candidate environment for canonical replay measurements.
 #
 # This file intentionally stays separate from deploy/docker-compose.yml. The
-# production topology owns long-running Zinder services; this topology owns
+# application deployment owns long-running Zinder services; this topology owns
 # disposable benchmark state, fixed resource limits, and local-only database
 # credentials.
 name: ${ZINDER_BENCH_PROJECT_NAME:-zinder-storage-benchmark}
 
 services:
-  rocksdb-replay:
+  rocksdb-current-schema-oracle:
     image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
-    profiles: [rocksdb, full]
+    profiles: [rocksdb, comparison]
     restart: "no"
     init: true
     cpus: ${ZINDER_BENCH_ROCKSDB_CPUS:-8.0}
@@ -70,7 +70,7 @@ services:
 
   postgres-candidate:
     image: ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296}
-    profiles: [postgres, full]
+    profiles: [postgres, comparison]
     restart: "no"
     cpus: ${ZINDER_BENCH_POSTGRES_CPUS:-8.0}
     mem_limit: ${ZINDER_BENCH_POSTGRES_MEMORY_LIMIT_BYTES:-17179869184}

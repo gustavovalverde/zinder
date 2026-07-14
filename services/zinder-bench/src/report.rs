@@ -132,7 +132,7 @@ pub struct StorageCandidateIdentity {
 }
 
 impl StorageCandidateIdentity {
-    /// Identifies the existing embedded canonical `RocksDB` implementation.
+    /// Identifies the existing single-host canonical `RocksDB` implementation.
     #[must_use]
     pub const fn rocksdb_current_schema_oracle() -> Self {
         Self {
@@ -140,11 +140,11 @@ impl StorageCandidateIdentity {
             canonical_engine: "rocksdb",
             canonical_model: "projection-coupled-current-schema",
             diagnostic_projection_engine: None,
-            topology: "embedded",
+            topology: "rocksdb-single-host",
         }
     }
 
-    /// Identifies the embedded canonical store plus the current diagnostic
+    /// Identifies the single-host canonical store plus the current diagnostic
     /// projection store.
     #[must_use]
     pub const fn rocksdb_current_schema_with_diagnostic_projections() -> Self {
@@ -980,6 +980,7 @@ mod tests {
             "projection-coupled-current-schema"
         );
         assert_eq!(report.storage_candidate.diagnostic_projection_engine, None);
+        assert_eq!(report.storage_candidate.topology, "rocksdb-single-host");
         assert_eq!(
             report.provenance.software_revision.as_deref(),
             Some("0123456789abcdef")

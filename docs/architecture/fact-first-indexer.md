@@ -1,4 +1,4 @@
-# Canonical-First Indexer Architecture
+# Fact-First Indexer Architecture
 
 Status: Accepted migration target
 
@@ -8,21 +8,21 @@ will persist immutable, block-local facts and recovery events. It will not
 maintain address indexes, a global transparent-output lookup, spent-output
 state, rankings, distributions, or product views while catching up.
 
-This is an ownership correction and a measured storage selection, not a new
-distributed system. A default deployment remains one application group, but
-canonical ingest, projection construction, and query serving keep independent
-credentials, readiness, and restart ownership. Canonical, wallet, and explorer
-state are separate durability roles whether the selected topology maps them to
-Postgres schemas or keeps canonical truth in RocksDB. Physical paths, schemas,
-and process placement do not change the data contracts.
+This is an ownership correction and a measured storage design, not a new
+distributed system. Canonical ingest, projection construction, and query
+serving keep independent readiness and restart ownership. Canonical, wallet,
+and explorer state are separate durability roles whether the
+`rocksdb-single-host` topology stores them in RocksDB or the
+`postgres-scale-out` topology maps them to Postgres schemas. Physical paths,
+schemas, and process placement do not change the data contracts.
 
 [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) owns the
-selection gate. A fact-first RocksDB control and a block-granular Postgres
-candidate must consume the same captured facts and pass the same lifecycle and
-correctness checks. Postgres is preferred only if it meets the hard canonical
-construction gate; otherwise RocksDB remains canonical while Postgres owns the
-wallet and explorer projections. The comparison does not create a permanent
-multi-backend adapter surface.
+topology contract. A fact-first `rocksdb-single-host` implementation and a
+block-granular `postgres-scale-out` implementation consume the same captured
+facts and pass the same lifecycle and correctness checks plus their own
+topology-specific gates. Both remain supported product topologies. The design
+does not create a generic multi-backend adapter or permit per-plane backend
+mixing.
 
 ## Decision
 
@@ -118,7 +118,7 @@ The accepted tuning work remains useful:
 - canonical batches close before the next block would exceed artifact or
   estimated-write budgets;
 - canonical catchup, legacy `zinder-derive` replay, and historical backfills do
-  not compete on the default single-volume deployment;
+  not compete in the `rocksdb-single-host` topology;
 - RocksDB maintenance controls and per-column-family metrics expose flush,
   compaction, and write-stall behavior; and
 - legacy `zinder-derive` startup always hands projection replay to the
@@ -248,9 +248,9 @@ canonical catchup and wallet readiness.
 `zinder-explorer` is a reader and API service. It does not become another
 indexer. `zinder-ingest` remains source-to-canonical only. An independent
 `zinder-projector` process owns build, verify, catch-up, follow, and promotion
-for one selected projection. The default application group may colocate these
-processes, but process, credential, readiness, and restart boundaries remain
-explicit.
+for one selected projection. `rocksdb-single-host` may colocate these processes
+on one host. `postgres-scale-out` preserves independent role credentials and
+deployment boundaries. Both retain explicit readiness and restart ownership.
 
 ## Consumer and Data Matrix
 
@@ -274,13 +274,24 @@ current-height claim for missing data.
 
 ## Deployment and Scheduling
 
-The preferred production topology uses one Postgres database per Zcash network
-with `canonical`, `wallet`, and `explorer` schemas. Canonical ingest receives a
-canonical-writer role, each projector receives only its owned schema plus the
-fact-reading contract it consumes, and query services receive read-only roles.
-The measured fallback keeps only canonical truth under a RocksDB path and uses
-the same Postgres projection schemas. The losing canonical candidate is removed
-before general availability; backend choice is not a runtime product matrix.
+Zinder supports two application-level deployment topologies:
+
+| Topology | Durable storage | Scaling boundary | Operational contract |
+| --- | --- | --- | --- |
+| `rocksdb-single-host` | RocksDB stores for canonical, wallet, and explorer state | Separate services may run on one host and share host-local storage | No Postgres dependency; exclusive primary ownership, crash-safe restart, secondary catch-up, and coherent checkpoint bundles |
+| `postgres-scale-out` | One Postgres database per Zcash network with `canonical`, `wallet`, and `explorer` schemas | The canonical writer, projectors, query replicas, and database replicas deploy independently | Role-scoped credentials, durable writer fencing, failover, replica-lag reporting, and request-scoped read fences |
+
+Both are production-supported after passing their gates.
+`rocksdb-single-host` names the engine and placement constraint rather than a
+lower quality tier. `postgres-scale-out` names the engine and supported scaling
+capability and may still run on one host for testing. The term `embedded`
+remains reserved for an indexer inside a consumer process, not for Zinder's
+service deployment.
+
+A deployment selects one topology for all three durable planes. Zinder does not
+support a hybrid matrix that independently chooses RocksDB or Postgres per
+plane. That boundary retains two concrete, testable operational contracts
+without introducing a universal database adapter.
 
 Fresh construction is resource-exclusive by default:
 
@@ -389,7 +400,8 @@ Acceptance is a fresh mainnet replay, not a synthetic microbenchmark alone:
   compose the result.
 - Do not parallelize the ordered wallet state transition. Parallelize parsing,
   decoding, and independent consumers around it.
-- Do not require multiple VMs or volumes for correctness.
+- Do not make core data correctness depend on host count. Scale-out and
+  failover claims require explicit multi-host acceptance evidence.
 
 ## Related Documents
 
@@ -400,6 +412,6 @@ Acceptance is a fresh mainnet replay, not a synthetic microbenchmark alone:
 - [Protocol boundary](protocol-boundary.md)
 - [Public interfaces](public-interfaces.md)
 - [ADR-0022: resource-budgeted bulk catchup](../adrs/0022-resource-budgeted-bulk-catchup.md)
-- [ADR-0035: fact-first storage selection and lifecycle targets](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
+- [ADR-0035: fact-first storage topologies and lifecycle targets](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
 - [Integration surfaces](../reference/integration-surfaces.md)
 - [Cipherscan adapter architecture](../plans/cipherscan-adapter-architecture.md)

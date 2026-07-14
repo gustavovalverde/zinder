@@ -173,8 +173,9 @@ Omit `--report` to print the JSON to stdout (progress logs go to stderr).
 - `storage_candidate`: `rocksdb-current-schema-oracle`, explicitly identifying
   the projection-coupled current canonical model. It is not the future
   `rocksdb-fact-first` control. `diagnostic_projection_engine` is `rocksdb` only
-  when a current projection diagnostic is driven; the harness does not
-  synthesize Postgres or target wallet-plane results.
+  when a current projection diagnostic is driven. Its topology is
+  `rocksdb-single-host`; the harness does not synthesize Postgres or target
+  wallet-plane results.
 - `acceptance.canonical_fixture_replay`: `fixture-range` wall time and optional
   target/hard-limit evaluation. It is the only current acceptance boundary.
   There are no placeholder production lifecycle fields.

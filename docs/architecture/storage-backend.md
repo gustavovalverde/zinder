@@ -2,6 +2,11 @@
 
 The storage backend is the contract between chain ingestion, epoch-bound readers, migrations, and operational recovery. It is not a public table schema.
 
+This document describes the current `rocksdb-single-host` implementation.
+[ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) also
+accepts a `postgres-scale-out` topology, which remains a migration target until
+its concrete storage and lifecycle gates pass.
+
 Event and reorg semantics live in [Chain events](chain-events.md).
 
 ## Ownership

@@ -1,8 +1,8 @@
 # Storage benchmark environment
 
 `docker-compose.storage-benchmark.yml` is the disposable, resource-bounded
-environment for the fact-first storage bake-off. It keeps benchmark state and
-resource limits separate from the production topology in `docker-compose.yml`.
+environment for the fact-first storage comparison. It keeps benchmark state and
+resource limits separate from the application topology in `docker-compose.yml`.
 The exact image ID, source revision, fixture digest, resource limits, storage
 class, writer settings, and durability posture make runs comparable. The image
 build itself is not claimed to be bit-reproducible.
@@ -32,12 +32,12 @@ page writes, and synchronous commit enabled. Change resource limits and database
 memory settings together, record every override with the result, and do not
 compare runs that used different limits.
 
-The `rocksdb` and `postgres` profiles run either side in isolation. The `full`
-profile enables both sides for the eventual end-to-end comparison without
-adding dashboards, administration UIs, or unrelated services.
+The `rocksdb` and `postgres` profiles run either side in isolation. The
+`comparison` profile enables both sides for the eventual end-to-end comparison
+without adding dashboards, administration UIs, or unrelated services.
 
 Use isolated profile runs for backend throughput measurements so the engines do
-not compete for host resources. Use `full` for integration tests that
+not compete for host resources. Use `comparison` for integration tests that
 intentionally exercise both services together.
 
 ## Configure and validate
@@ -106,7 +106,7 @@ ZINDER_BENCH_STORAGE_CLASS=config-validation \
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile full \
+  --profile comparison \
   config --quiet
 
 ZINDER_BENCH_IMAGE=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
@@ -165,13 +165,13 @@ inside the existing benchmark image and fixes ownership for its UID 1000 user:
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile full down --volumes --remove-orphans
+  --profile comparison down --volumes --remove-orphans
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
   --profile rocksdb run --rm --no-deps \
-  --user 0:0 --entrypoint /bin/sh rocksdb-replay -ceu '
+  --user 0:0 --entrypoint /bin/sh rocksdb-current-schema-oracle -ceu '
     test -n "$(ls -A /benchmark/start-store)"
     test -z "$(ls -A /var/lib/zinder/benchmark-store)"
     cp -a /benchmark/start-store/. /var/lib/zinder/benchmark-store/
@@ -189,7 +189,7 @@ under `ZINDER_BENCH_RESULTS_PATH`:
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile rocksdb run --rm --no-deps rocksdb-replay
+  --profile rocksdb run --rm --no-deps rocksdb-current-schema-oracle
 ```
 
 To exercise the formal fixture-replay acceptance boundary, export the target
@@ -207,7 +207,7 @@ set +a
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile rocksdb run --rm --no-deps rocksdb-replay \
+  --profile rocksdb run --rm --no-deps rocksdb-current-schema-oracle \
   replay \
   --fixture /benchmark/fixture \
   --store /var/lib/zinder/benchmark-store \
@@ -234,7 +234,7 @@ set +a
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile rocksdb run --rm --no-deps rocksdb-replay \
+  --profile rocksdb run --rm --no-deps rocksdb-current-schema-oracle \
   replay \
   --fixture /benchmark/fixture \
   --store /var/lib/zinder/benchmark-store \
@@ -266,22 +266,22 @@ all provenance flags shown above. Production construction, restore, following,
 and wallet-readiness thresholds remain unavailable until dedicated drivers own
 those complete boundaries.
 
-## Full profile and cleanup
+## Comparison profile and cleanup
 
-The `full` profile can provision PostgreSQL before running the current-schema
-RocksDB oracle. It becomes the shared entrypoint for identical backend arms
-once the PostgreSQL replay command exists:
+The `comparison` profile can provision PostgreSQL before running the
+current-schema RocksDB oracle. It becomes the shared entrypoint for identical
+backend arms once the PostgreSQL replay command exists:
 
 ```bash
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile full up -d --wait postgres-candidate
+  --profile comparison up -d --wait postgres-candidate
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile full run --rm --no-deps rocksdb-replay
+  --profile comparison run --rm --no-deps rocksdb-current-schema-oracle
 ```
 
 Remove containers, the mutable RocksDB clone, and the PostgreSQL cluster after
@@ -291,5 +291,5 @@ capturing reports. Bind-mounted fixtures and results are not deleted:
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile full down --volumes --remove-orphans
+  --profile comparison down --volumes --remove-orphans
 ```
