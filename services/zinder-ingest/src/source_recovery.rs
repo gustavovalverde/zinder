@@ -201,6 +201,7 @@ pub(crate) fn decide_recovery(
         | IngestError::DeriveStoreMissing { .. }
         | IngestError::ProjectionStoreMissingForCanonical { .. }
         | IngestError::ProjectionStoreWithoutCanonicalHistory { .. }
+        | IngestError::ProjectionRetentionCoverageInsufficient { .. }
         | IngestError::BackupCheckpointStagingExists { .. }
         | IngestError::BackupCheckpointDestinationExists { .. }
         | IngestError::BackupCheckpointInstall { .. }

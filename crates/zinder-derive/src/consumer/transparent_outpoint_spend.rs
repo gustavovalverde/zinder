@@ -29,10 +29,13 @@ use zinder_core::wire::{
 use zinder_core::{BlockHeight, TransparentOutPoint, TransparentSpendEntry, TransparentSpendFact};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, DeriveConsumerCtx, DeriveConsumerError,
-    DeriveConsumerName, DeriveConsumerSchema,
+    BlockCommitContext, BlockKeyedConsumer, BlockProjectionCheckpoint, DeriveConsumerCtx,
+    DeriveConsumerError, DeriveConsumerName, DeriveConsumerSchema,
+    advance_verified_projection_coverage,
 };
 use crate::error::{DeriveStoreColumnFamily, DeriveStoreError};
+use crate::store::ConsumerProjectionState;
+use zinder_store::ChainEvent;
 
 /// Primary rows keyed by spent outpoint, valued with the spender identity.
 pub const TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY: &str = "transparent_outpoint_spend";
@@ -182,6 +185,61 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
         ctx.batch.delete_cf(&index_cf, index_key);
         Ok(())
     }
+
+    fn stage_chain_event_checkpoint(
+        &mut self,
+        checkpoint: BlockProjectionCheckpoint<'_>,
+        ctx: &mut DeriveConsumerCtx<'_>,
+    ) -> Result<(), DeriveConsumerError> {
+        let projection_tip_height = checkpoint
+            .projection_tip_height
+            .ok_or(TransparentOutpointSpendConsumerError::IncompleteProjectionCheckpoint)?;
+        let projection_tip_hash = checkpoint
+            .projection_tip_hash
+            .ok_or(TransparentOutpointSpendConsumerError::IncompleteProjectionCheckpoint)?;
+        let current = ctx
+            .store
+            .consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?;
+        // Re-applying an earlier committed chunk must not regress coverage a
+        // later chunk has already made durable.
+        if let Some(state) = current
+            && matches!(checkpoint.chain_event, ChainEvent::ChainCommitted { .. })
+            && projection_tip_height < state.projection_tip_height
+        {
+            return Ok(());
+        }
+        let revision = current
+            .map_or(Some(1), |state| state.revision.checked_add(1))
+            .ok_or(TransparentOutpointSpendConsumerError::ProjectionRevisionOverflow)?;
+        let initial_complete_from = match checkpoint.chain_event {
+            ChainEvent::ChainCommitted { committed }
+            | ChainEvent::ChainReorged { committed, .. }
+                if committed.block_range.start <= committed.block_range.end =>
+            {
+                Some(committed.block_range.start)
+            }
+            ChainEvent::ChainCommitted { .. } | ChainEvent::ChainReorged { .. } | _ => None,
+        };
+        let coverage = advance_verified_projection_coverage(
+            current.and_then(|state| state.coverage),
+            checkpoint,
+            projection_tip_height,
+            projection_tip_hash,
+            initial_complete_from,
+        );
+        ctx.store.stage_consumer_projection_state(
+            ctx.batch,
+            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+            ConsumerProjectionState {
+                projection_epoch_id: checkpoint.chain_epoch.id,
+                projection_tip_height,
+                projection_tip_hash,
+                revision,
+                coverage,
+            },
+        )?;
+        Ok(())
+    }
 }
 
 fn collect_spend_rows(block: &BlockCommitContext) -> Vec<TransparentSpendEntry> {
@@ -279,21 +337,22 @@ mod tests {
     use rust_rocksdb::WriteBatch;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockHash, BlockHeight, LockTime, PrivacyShape, TransactionComponentCounts,
+        ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
+        ChainTipMetadata, LockTime, Network, PrivacyShape, TransactionComponentCounts,
         TransactionFactsArtifact, TransactionId, TransactionLocation, TransactionPublicFacts,
         TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
-        TransparentOutPoint, TransparentSpendFact,
+        TransparentOutPoint, TransparentSpendFact, UnixTimestampMillis,
     };
-    use zinder_store::RocksDbResourceBudget;
+    use zinder_store::{ChainEpochCommitted, ChainEvent, RocksDbResourceBudget};
 
     use super::{
-        TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
-        TransparentOutpointSpendConsumer,
+        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+        TRANSPARENT_OUTPOINT_SPEND_SCHEMA, TransparentOutpointSpendConsumer,
     };
     use crate::consumer::block_commit_context::{
         BlockCommitContext, BlockCommitPayload, TransparentSpendFacts,
     };
-    use crate::consumer::{BlockKeyedConsumer, DeriveConsumerCtx};
+    use crate::consumer::{BlockKeyedConsumer, BlockProjectionCheckpoint, DeriveConsumerCtx};
     use crate::store::{DeriveStore, DeriveStoreOptions};
 
     const SPENT_ADDRESS: TransparentAddressScriptHash =
@@ -307,6 +366,20 @@ mod tests {
 
     fn block_hash(seed: u8) -> BlockHash {
         BlockHash::from_bytes([seed; 32])
+    }
+
+    fn chain_epoch(id: u64, tip: BlockHeight, tip_hash: BlockHash) -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(id),
+            network: Network::ZcashRegtest,
+            visible_tip_height: tip,
+            visible_tip_hash: tip_hash,
+            settled_tip_height: BlockHeight::new(1),
+            settled_tip_hash: block_hash(1),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(id),
+        }
     }
 
     fn public_facts(seed: u8) -> TransactionPublicFacts {
@@ -426,6 +499,45 @@ mod tests {
         };
         consumer.apply_block(block, &mut ctx)?;
         store.write_batch(&batch)?;
+        Ok(())
+    }
+
+    #[test]
+    fn committed_checkpoint_persists_contiguous_retention_coverage()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_tempdir, store) = open_store()?;
+        let tip = BlockHeight::new(105);
+        let tip_hash = block_hash(5);
+        let epoch = chain_epoch(1, tip, tip_hash);
+        let event = ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch: epoch,
+                block_range: BlockHeightRange::inclusive(BlockHeight::new(100), tip),
+            },
+        };
+        let mut batch = WriteBatch::default();
+        let mut ctx = DeriveConsumerCtx {
+            store: &store,
+            batch: &mut batch,
+        };
+        TransparentOutpointSpendConsumer::new().stage_chain_event_checkpoint(
+            BlockProjectionCheckpoint {
+                chain_epoch: epoch,
+                chain_event: &event,
+                projection_tip_height: Some(tip),
+                projection_tip_hash: Some(tip_hash),
+            },
+            &mut ctx,
+        )?;
+        store.write_batch(&batch)?;
+
+        let state = store
+            .consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?
+            .ok_or("projection state missing")?;
+        let coverage = state.coverage.ok_or("projection coverage missing")?;
+        assert_eq!(coverage.complete_from_height, BlockHeight::new(100));
+        assert_eq!(coverage.complete_through_height, tip);
+        assert_eq!(coverage.complete_through_hash, tip_hash);
         Ok(())
     }
 
@@ -598,4 +710,10 @@ pub enum TransparentOutpointSpendConsumerError {
         /// Byte length actually persisted.
         bytes: usize,
     },
+    /// A dispatch omitted one or more block contexts required by the projection.
+    #[error("transparent-outpoint-spend projection checkpoint is missing its indexed tip")]
+    IncompleteProjectionCheckpoint,
+    /// Projection-state revision exhausted its integer domain.
+    #[error("transparent-outpoint-spend projection revision overflowed")]
+    ProjectionRevisionOverflow,
 }

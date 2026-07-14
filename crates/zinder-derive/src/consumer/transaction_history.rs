@@ -24,11 +24,12 @@ use zinder_proto::v1::explorer::{
 };
 use zinder_proto::wire::encode_privacy_shape;
 
+use crate::ConsumerProjectionState;
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, BlockProjectionCheckpoint, DeriveConsumerCtx,
     DeriveConsumerError, DeriveConsumerName, DeriveConsumerSchema,
+    advance_verified_projection_coverage,
 };
-use crate::{ConsumerProjectionCoverage, ConsumerProjectionState};
 use zinder_store::ChainEvent;
 
 /// Stable physical column-family name owned by transaction history.
@@ -222,11 +223,12 @@ impl BlockKeyedConsumer for TransactionHistoryConsumer {
         let revision = current
             .map_or(Some(1), |state| state.revision.checked_add(1))
             .ok_or(TransactionHistoryConsumerError::ProjectionRevisionOverflow)?;
-        let coverage = advance_verified_coverage(
+        let coverage = advance_verified_projection_coverage(
             current.and_then(|state| state.coverage),
             checkpoint,
             projection_tip_height,
             projection_tip_hash,
+            None,
         );
         ctx.store.stage_consumer_projection_state(
             ctx.batch,
@@ -265,52 +267,6 @@ fn decode_persisted_entry(
         .map_err(|error| TransactionHistoryConsumerError::Decode(error.to_string()))?;
     entry.transaction_index = transaction_index;
     Ok(entry)
-}
-
-fn advance_verified_coverage(
-    coverage: Option<ConsumerProjectionCoverage>,
-    checkpoint: BlockProjectionCheckpoint<'_>,
-    projection_tip_height: BlockHeight,
-    projection_tip_hash: zinder_core::BlockHash,
-) -> Option<ConsumerProjectionCoverage> {
-    let coverage = coverage?;
-    match checkpoint.chain_event {
-        ChainEvent::ChainCommitted { committed } => {
-            let range = committed.block_range;
-            if range.start > range.end {
-                return Some(coverage);
-            }
-            if coverage.complete_through_height.next() == Some(range.start) {
-                return Some(ConsumerProjectionCoverage {
-                    complete_from_height: coverage.complete_from_height,
-                    complete_through_height: projection_tip_height,
-                    complete_through_hash: projection_tip_hash,
-                });
-            }
-            Some(coverage)
-        }
-        ChainEvent::ChainReorged {
-            reverted,
-            committed,
-        } => {
-            let replacement = committed.block_range;
-            let reverted_start = reverted.block_range.start;
-            let covers_reverted_boundary = coverage.complete_through_height >= reverted_start;
-            let replacement_starts_at_reverted_boundary = replacement.start == reverted_start;
-            if covers_reverted_boundary && replacement_starts_at_reverted_boundary {
-                return Some(ConsumerProjectionCoverage {
-                    complete_from_height: coverage.complete_from_height,
-                    complete_through_height: projection_tip_height,
-                    complete_through_hash: projection_tip_hash,
-                });
-            }
-            if coverage.complete_through_height < reverted_start {
-                return Some(coverage);
-            }
-            None
-        }
-        _ => Some(coverage),
-    }
 }
 
 /// Consumer-specific failure modes [`TransactionHistoryConsumer`] can surface.
@@ -368,11 +324,11 @@ mod tests {
     use zinder_store::{ChainEpochCommitted, ChainEvent};
 
     use super::{
-        BlockProjectionCheckpoint, ConsumerProjectionCoverage, ConsumerProjectionState,
-        TRANSACTION_HISTORY_CONSUMER_NAME, TransactionHistoryConsumer,
+        BlockProjectionCheckpoint, ConsumerProjectionState, TRANSACTION_HISTORY_CONSUMER_NAME,
+        TransactionHistoryConsumer,
     };
     use crate::consumer::{BlockKeyedConsumer, DeriveConsumerCtx};
-    use crate::store::{DeriveStore, DeriveStoreOptions};
+    use crate::store::{ConsumerProjectionCoverage, DeriveStore, DeriveStoreOptions};
 
     fn chain_epoch(id: u64, tip: u32) -> ChainEpoch {
         ChainEpoch {

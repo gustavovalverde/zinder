@@ -181,7 +181,7 @@ The derive plane fails independently. The boundary rules:
 - **A reader gateway crash does not stop `zinder-ingest`.** The derive primary is owned by ingest; readers reopen as secondaries and catch up from the primary view.
 - **A reader gateway crash does not stop `zinder-query`.** `WalletQueryApi` reads from `ChainEpochReadApi`, not from any derive consumer.
 - **A derive view becoming inconsistent does not corrupt canonical state.** Canonical artifacts are written by `zinder-ingest` in atomic batches. A derive consumer that misinterprets an event produces a wrong derived view, not a wrong canonical view.
-- **Operators can drop and rebuild a derive view.** The derive store is independent. Dropping the derive subdirectory and restarting ingest produces a full rebuild from canonical artifacts and retained events.
+- **Operators can rebuild a derive view only while its declared recovery source still covers the required history.** The derive store is physically independent, but startup rejects a missing retention-authoritative projection after canonical deletion and rejects a destructive schema rebuild unless retained events begin at the canonical history boundary.
 
 The metrics surface reflects this: ingest exposes derive-tailer health for
 writer-owned projections, and `zinder-explorer` exposes secondary-reader
@@ -201,10 +201,6 @@ This contract is what distinguishes derive from canonical. A canonical artifact,
 
 The recovery rule has a corollary for testing: an incompatible schema change must exercise full rebuild from its oldest supported recovery point, while a row-compatible change must prove that predecessor rows and cursors survive and that the new reader safely interprets them. A `cursor = None` replay over only the current retention window is not proof of complete historical recovery.
 
-This contract is what distinguishes derive from canonical. A canonical artifact, once written, is the source of truth. A derive view is one possible projection, but operators drop and rebuild it only when its declared recovery source still covers the rows being replaced.
-
-The recovery rule has a corollary for testing: an incompatible schema change must exercise full rebuild from its oldest supported recovery point, while a row-compatible change must prove that predecessor rows and cursors survive and that the new reader safely interprets them. A `cursor = None` replay over only the current retention window is not proof of complete historical recovery.
-
 ## Projection state and read snapshots
 
 Consumers that need to make completeness claims persist a
@@ -215,6 +211,12 @@ same `WriteBatch` as its projection rows and chain-event cursor, so a crash
 cannot publish a new tip, revision, or coverage boundary without the rows that
 justify it. Reorg handling may advance, retain, or clear coverage according to
 the consumer's proof; it must not infer completeness from cursor position alone.
+The retention-authoritative `transparent_outpoint_spend` projection initializes
+coverage from the first committed event it actually materializes and extends it
+only across contiguous commits or a connected replacement range. Canonical
+retention publishes only that verified range's end. A high per-height index row
+without coverage is progress evidence, not proof that deleted spender history
+survives.
 
 `DeriveStore::read_snapshot` binds projection metadata, point reads, range
 scans, joins, and exact counts to one store sequence. Primary stores use a

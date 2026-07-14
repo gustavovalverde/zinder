@@ -276,6 +276,8 @@ pub enum ProjectionPreset {
 pub struct ProjectionStoreInspection {
     has_projection_data: bool,
     transparent_outpoint_spend_height: Option<BlockHeight>,
+    transparent_outpoint_spend_coverage: Option<ConsumerProjectionCoverage>,
+    transparent_outpoint_spend_requires_rebuild: bool,
 }
 
 impl ProjectionStoreInspection {
@@ -290,6 +292,20 @@ impl ProjectionStoreInspection {
     #[must_use]
     pub const fn transparent_outpoint_spend_height(self) -> Option<BlockHeight> {
         self.transparent_outpoint_spend_height
+    }
+
+    /// Returns the verified contiguous range held by the
+    /// retention-authoritative spender projection.
+    #[must_use]
+    pub const fn transparent_outpoint_spend_coverage(self) -> Option<ConsumerProjectionCoverage> {
+        self.transparent_outpoint_spend_coverage
+    }
+
+    /// Returns whether opening this store with the running schema would clear
+    /// the retention-authoritative spender projection before replay.
+    #[must_use]
+    pub const fn transparent_outpoint_spend_requires_rebuild(self) -> bool {
+        self.transparent_outpoint_spend_requires_rebuild
     }
 }
 
@@ -413,6 +429,48 @@ fn last_height_in_column_family(
             name: column_family,
             reason: error.to_string(),
         })
+}
+
+fn transparent_outpoint_spend_state_for_inspection(
+    db: &DB,
+) -> Result<Option<ConsumerProjectionState>, DeriveStoreError> {
+    let Some(column_family) = db.cf_handle(DeriveStoreTable::ConsumerMetadata.column_family_name())
+    else {
+        return Ok(None);
+    };
+    db.get_cf(
+        &column_family,
+        consumer_projection_state_key(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str()),
+    )
+    .map_err(|source| DeriveStoreError::Operation {
+        operation: "get",
+        column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+        source,
+    })?
+    .map(|payload| {
+        decode_consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, &payload)
+    })
+    .transpose()
+}
+
+fn store_format_requires_rebuild_for_inspection(db: &DB) -> Result<bool, DeriveStoreError> {
+    let Some(column_family) = db.cf_handle(DeriveStoreTable::ConsumerMetadata.column_family_name())
+    else {
+        return Ok(false);
+    };
+    db.get_cf(&column_family, STORE_FORMAT_VERSION_KEY)
+        .map_err(|source| DeriveStoreError::Operation {
+            operation: "get",
+            column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+            source,
+        })?
+        .map(|bytes| decode_store_format_version(&bytes))
+        .transpose()
+        .map_err(|reason| DeriveStoreError::Decode {
+            column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+            reason,
+        })
+        .map(|persisted| persisted.is_some_and(|version| version < DERIVE_STORE_FORMAT_VERSION))
 }
 
 /// Rejects consumer declarations whose column families collide.
@@ -1122,9 +1180,37 @@ impl DeriveStore {
             })?;
         let transparent_outpoint_spend_height =
             last_height_in_column_family(&db, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?;
+        let transparent_outpoint_spend_state =
+            transparent_outpoint_spend_state_for_inspection(&db)?;
+        let store_format_requires_rebuild = store_format_requires_rebuild_for_inspection(&db)?;
+        let transparent_outpoint_spend_schema = requested
+            .consumer_schemas()
+            .iter()
+            .find(|schema| schema.name == TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
+            .ok_or_else(|| DeriveStoreError::ConsumerNotDeclared {
+                consumer: TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str().to_owned(),
+                persisted_schema_version: 0,
+            })?;
+        let schema_requires_rebuild = recorded_consumers
+            .get(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str())
+            .is_none_or(|recorded| {
+                recorded.schema_version <= transparent_outpoint_spend_schema.schema_version
+                    && !Self::consumer_manifest_is_exact(
+                        transparent_outpoint_spend_schema,
+                        recorded,
+                    )
+                    && !Self::consumer_manifest_is_row_compatible(
+                        transparent_outpoint_spend_schema,
+                        recorded,
+                    )
+            });
         Ok(Some(ProjectionStoreInspection {
             has_projection_data,
             transparent_outpoint_spend_height,
+            transparent_outpoint_spend_coverage: transparent_outpoint_spend_state
+                .and_then(|state| state.coverage),
+            transparent_outpoint_spend_requires_rebuild: store_format_requires_rebuild
+                || schema_requires_rebuild,
         }))
     }
 

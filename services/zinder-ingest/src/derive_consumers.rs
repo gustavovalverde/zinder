@@ -39,12 +39,12 @@ use zinder_derive::{
     PaidFeeDistributionConsumer, ProjectionPreset, ProjectionWriteMeasurement,
     RecentTransactionsConsumer, ReorgIncidentsConsumer,
     TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
-    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionComponentSummaryConsumer,
-    TransactionFeesConsumer, TransactionHistoryConsumer, TransactionIntrinsicValueBalanceFacts,
-    TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
-    TransparentAddressRankingConsumer, TransparentAddressTransactionHistoryConsumer,
-    TransparentOutpointSpendConsumer, TransparentSpendFacts, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
-    ValuePoolFlowHistoryConsumer,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+    TransactionComponentSummaryConsumer, TransactionFeesConsumer, TransactionHistoryConsumer,
+    TransactionIntrinsicValueBalanceFacts, TransparentAddressActivityConsumer,
+    TransparentAddressDeltasConsumer, TransparentAddressRankingConsumer,
+    TransparentAddressTransactionHistoryConsumer, TransparentOutpointSpendConsumer,
+    TransparentSpendFacts, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, ValuePoolFlowHistoryConsumer,
 };
 use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
 use zinder_runtime::{IngestPhase, Readiness};
@@ -1225,8 +1225,8 @@ fn maybe_publish_retention_release_floor(
     publish_retention_release_floor(chain_store, derive_store);
 }
 
-/// Publishes the durable transparent-outpoint-spend height as the canonical
-/// retention release floor.
+/// Publishes verified contiguous transparent-outpoint-spend coverage as the
+/// canonical retention release floor.
 ///
 /// The safe-tip sweep releases a spend fact only once this projection has
 /// durably recorded its spender identity, so the canonical store never deletes
@@ -1246,23 +1246,48 @@ fn publish_retention_release_floor(chain_store: &PrimaryChainStore, derive_store
         );
         return;
     }
-    let durable_height = match derive_store
-        .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)
-    {
-        Ok(durable_height) => durable_height,
+    let projection_state =
+        match derive_store.consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME) {
+            Ok(projection_state) => projection_state,
+            Err(error) => {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "retention_release_floor_read_failed",
+                    error = %error,
+                    "failed to read verified transparent-outpoint-spend coverage",
+                );
+                return;
+            }
+        };
+    let history_bounds = match chain_store.canonical_history_bounds() {
+        Ok(history_bounds) => history_bounds,
         Err(error) => {
             tracing::warn!(
                 target: "zinder::ingest",
-                event = "retention_release_floor_read_failed",
+                event = "retention_release_floor_history_bounds_failed",
                 error = %error,
-                "failed to read the durable transparent-outpoint-spend height",
+                "failed to read canonical history bounds before publishing the retention release floor",
             );
             return;
         }
     };
-    let Some(durable_height) = durable_height else {
+    let (Some(projection_state), Some(history_bounds)) = (projection_state, history_bounds) else {
         return;
     };
+    let Some(coverage) = projection_state.coverage else {
+        return;
+    };
+    if coverage.complete_from_height > history_bounds.first_available_height() {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "retention_release_floor_incomplete_coverage",
+            coverage_from_height = coverage.complete_from_height.value(),
+            required_from_height = history_bounds.first_available_height().value(),
+            "verified transparent-outpoint-spend coverage starts after canonical history; retention remains held",
+        );
+        return;
+    }
+    let durable_height = coverage.complete_through_height;
     if let Err(error) = chain_store.set_transparent_retention_release_height(durable_height) {
         tracing::warn!(
             target: "zinder::ingest",

@@ -177,6 +177,28 @@ pub enum IngestError {
         path: PathBuf,
     },
 
+    /// Canonical retention already deleted transparent spender facts that the
+    /// durable projection cannot prove it covers or safely reconstruct.
+    #[error(
+        "retention-authoritative projection at {path:?} cannot cover canonical transparent deletions {required_from}..={deleted_through}: materialized through {materialized_through:?}, verified coverage {coverage_from:?}..={coverage_through:?}, destructive rebuild required: {destructive_rebuild}; configure a new empty canonical storage path and perform a full re-ingest"
+    )]
+    ProjectionRetentionCoverageInsufficient {
+        /// Projection store whose coverage is incomplete.
+        path: PathBuf,
+        /// First canonical height the projection must cover.
+        required_from: u32,
+        /// Highest canonical height whose spender facts were deleted.
+        deleted_through: u32,
+        /// Highest materialized projection index height.
+        materialized_through: Option<u32>,
+        /// First height in verified contiguous projection coverage.
+        coverage_from: Option<u32>,
+        /// Last height in verified contiguous projection coverage.
+        coverage_through: Option<u32>,
+        /// Whether writer open would clear the existing projection.
+        destructive_rebuild: bool,
+    },
+
     /// Backup bundle staging path already exists, so the command cannot know
     /// whether replacing it would discard operator-owned data.
     #[error("backup checkpoint staging path already exists at {path:?}")]
@@ -1724,6 +1746,9 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         }
         Some(IngestError::ProjectionStoreWithoutCanonicalHistory { .. }) => {
             "projection_store_without_canonical_history"
+        }
+        Some(IngestError::ProjectionRetentionCoverageInsufficient { .. }) => {
+            "projection_retention_coverage_insufficient"
         }
         Some(IngestError::BackupCheckpointStagingExists { .. }) => {
             "backup_checkpoint_staging_exists"

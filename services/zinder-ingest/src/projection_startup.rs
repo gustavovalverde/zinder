@@ -8,7 +8,7 @@ use std::{
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zinder_core::NetworkUpgradeActivations;
+use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_derive::{
     BLOCK_PRODUCTION_TIME_CONSUMER_NAME, COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
     CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME, DeriveConsumerName, DeriveStore,
@@ -18,7 +18,7 @@ use zinder_derive::{
     VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
 };
 use zinder_source::NodeSource;
-use zinder_store::PrimaryChainStore;
+use zinder_store::{ChainEvent, ChainEventHistoryRequest, PrimaryChainStore, StoreError};
 
 use crate::{
     CommitmentRootBackfillConfig, CommitmentRootBackfillContext,
@@ -221,7 +221,49 @@ impl ProjectionStartupPlan {
         if canonical_epoch.is_none() && inspection.has_projection_data() {
             return Err(IngestError::ProjectionStoreWithoutCanonicalHistory { path: derive_path });
         }
-        Ok(())
+        let Some(deleted_through) = chain_store.transparent_retention_deleted_through_height()?
+        else {
+            return Ok(());
+        };
+        let history_bounds = chain_store
+            .canonical_history_bounds()?
+            .ok_or(StoreError::CanonicalHistoryBoundsMissing)?;
+        let required_from = history_bounds.first_available_height();
+        let coverage = inspection.transparent_outpoint_spend_coverage();
+        let destructive_rebuild = inspection.transparent_outpoint_spend_requires_rebuild();
+        let coverage_matches_canonical = if let Some(coverage) = coverage {
+            chain_store
+                .current_chain_epoch_reader()?
+                .block_header_at(coverage.complete_through_height)?
+                .is_some_and(|header| header.block_hash == coverage.complete_through_hash)
+        } else {
+            false
+        };
+        let existing_projection_covers_deletions = !destructive_rebuild
+            && coverage_matches_canonical
+            && inspection
+                .transparent_outpoint_spend_height()
+                .is_some_and(|height| height >= deleted_through)
+            && coverage.is_some_and(|coverage| {
+                coverage.complete_from_height <= required_from
+                    && coverage.complete_through_height >= deleted_through
+            });
+        let rebuild_can_replay_every_required_height =
+            destructive_rebuild && retained_chain_events_start_at(chain_store, required_from)?;
+        if existing_projection_covers_deletions || rebuild_can_replay_every_required_height {
+            return Ok(());
+        }
+        Err(IngestError::ProjectionRetentionCoverageInsufficient {
+            path: derive_path,
+            required_from: required_from.value(),
+            deleted_through: deleted_through.value(),
+            materialized_through: inspection
+                .transparent_outpoint_spend_height()
+                .map(BlockHeight::value),
+            coverage_from: coverage.map(|coverage| coverage.complete_from_height.value()),
+            coverage_through: coverage.map(|coverage| coverage.complete_through_height.value()),
+            destructive_rebuild,
+        })
     }
 
     fn includes_work(self, work: ProjectionStartupWork) -> bool {
@@ -486,6 +528,25 @@ impl ProjectionStartupPlan {
             );
         }
     }
+}
+
+fn retained_chain_events_start_at(
+    chain_store: &PrimaryChainStore,
+    required_from: BlockHeight,
+) -> Result<bool, IngestError> {
+    let events =
+        chain_store.chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
+    let first_replay_height =
+        events.iter().find_map(|envelope| {
+            let (ChainEvent::ChainCommitted { committed }
+            | ChainEvent::ChainReorged { committed, .. }) = &envelope.event
+            else {
+                return None;
+            };
+            (committed.block_range.start <= committed.block_range.end)
+                .then_some(committed.block_range.start)
+        });
+    Ok(first_replay_height == Some(required_from))
 }
 
 struct ProjectionBackfillContexts {

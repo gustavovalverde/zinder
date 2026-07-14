@@ -50,7 +50,7 @@ pub use commitment_root_search::{
     CommitmentRootSearchConsumerError,
 };
 
-use crate::store::DeriveStore;
+use crate::store::{ConsumerProjectionCoverage, DeriveStore};
 
 /// Stable name of a derive consumer used to scope cursor and metadata rows.
 ///
@@ -184,6 +184,65 @@ pub struct BlockProjectionCheckpoint<'event> {
     pub projection_tip_height: Option<BlockHeight>,
     /// Canonical hash at [`Self::projection_tip_height`].
     pub projection_tip_hash: Option<BlockHash>,
+}
+
+/// Advances one consumer's verified contiguous coverage through a checkpoint.
+///
+/// `initial_complete_from` is supplied only by projections whose event replay
+/// itself proves their first covered height. Projections that require a
+/// separate historical verifier leave it `None` until that verifier seeds the
+/// first range.
+pub(crate) fn advance_verified_projection_coverage(
+    coverage: Option<ConsumerProjectionCoverage>,
+    checkpoint: BlockProjectionCheckpoint<'_>,
+    projection_tip_height: BlockHeight,
+    projection_tip_hash: BlockHash,
+    initial_complete_from: Option<BlockHeight>,
+) -> Option<ConsumerProjectionCoverage> {
+    let Some(coverage) = coverage else {
+        return initial_complete_from.map(|complete_from_height| ConsumerProjectionCoverage {
+            complete_from_height,
+            complete_through_height: projection_tip_height,
+            complete_through_hash: projection_tip_hash,
+        });
+    };
+    match checkpoint.chain_event {
+        ChainEvent::ChainCommitted { committed } => {
+            let range = committed.block_range;
+            if range.start > range.end {
+                return Some(coverage);
+            }
+            if coverage.complete_through_height.next() == Some(range.start) {
+                return Some(ConsumerProjectionCoverage {
+                    complete_from_height: coverage.complete_from_height,
+                    complete_through_height: projection_tip_height,
+                    complete_through_hash: projection_tip_hash,
+                });
+            }
+            Some(coverage)
+        }
+        ChainEvent::ChainReorged {
+            reverted,
+            committed,
+        } => {
+            let replacement = committed.block_range;
+            let reverted_start = reverted.block_range.start;
+            let covers_reverted_boundary = coverage.complete_through_height >= reverted_start;
+            let replacement_starts_at_reverted_boundary = replacement.start == reverted_start;
+            if covers_reverted_boundary && replacement_starts_at_reverted_boundary {
+                return Some(ConsumerProjectionCoverage {
+                    complete_from_height: coverage.complete_from_height,
+                    complete_through_height: projection_tip_height,
+                    complete_through_hash: projection_tip_hash,
+                });
+            }
+            if coverage.complete_through_height < reverted_start {
+                return Some(coverage);
+            }
+            None
+        }
+        _ => Some(coverage),
+    }
 }
 
 /// Typed wrapper for a `ChainCommitted` chain event delivered to a consumer.

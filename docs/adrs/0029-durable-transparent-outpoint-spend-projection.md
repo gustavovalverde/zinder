@@ -44,6 +44,10 @@ output index) valued with the spending transaction id, spending block hash,
 spending height, and transparent input index. A per-height index column family,
 written for every applied block even when empty, drives reorg rewind and reports
 the projection's durable height through `last_materialized_height_ascending`.
+The consumer also persists `ConsumerProjectionState` in the same write batch as
+its rows and chain-event cursor. Its coverage starts at the first committed
+height actually materialized, advances only across a contiguous commit or
+connected reorg replacement, and cannot be inferred from the latest index key.
 Coinbase inputs carry no prevout and never produce a row. Parent-output
 hydration is deliberately not an input to this projection: the child input
 already identifies the spent outpoint, input index, spending transaction, and
@@ -53,9 +57,10 @@ parent facts must not cause the consumer to skip that row.
 
 Artifact schema 18 stores every observed input and the resolved spend facts in
 the canonical block-local spend index. Transparent-retention maintenance deletes the
-per-outpoint serving row but retains that block record, so a derive consumer
-schema bump can rebuild from retained canonical events like every other consumer in
-[ADR-0028](0028-per-consumer-derive-schema-versioning.md). Finalized replay
+per-outpoint serving row but retains that block record. A derive consumer schema
+bump may rebuild only when retained canonical events still begin at the durable
+canonical history boundary; a retained suffix is not proof that every historical
+row will be revisited. Finalized replay
 verifies the block record's input set and producing-block identity against the
 canonical transactions before advancing the durable projection height. Facts
 whose parents predate a configured checkpoint remain explicitly unresolved;
@@ -68,8 +73,10 @@ alongside the existing swept-through marker. A dedicated ingest maintenance
 worker runs only after canonical and derive are caught up, independently of
 chain commits, and clamps its ceiling to `min(current safe tip, release height)`, so a settled spend
 above the release height stays retained. `zinder-ingest` publishes the release
-height from the derive tailer as the durable projection advances, so canonical
-retention releases only what the projection has already recorded. A release
+height from the derive tailer's verified contiguous coverage, so canonical
+retention releases only what the projection proves it has recorded from the
+canonical history boundary. A latest index height without that coverage holds
+retention in place. A release
 height below the swept marker is ignored safely; the sweep never regresses.
 
 The release floor is a durability barrier, not just a progress signal. The
@@ -90,8 +97,11 @@ cursor, and a migration that deletes nothing, leave the marker unset.
 
 The marker still distinguishes an ambiguous canonical point miss from an
 outpoint that was never observed, which keeps union-routed serving fail-closed
-while derive lags. It no longer limits derive rebuildability: block-local spend
-records survive the deletion. Store schema 13 is a hard boundary because older
+while derive lags. It also defines the startup recovery obligation: before any
+schema reconciliation can clear rows, ingest requires preserved contiguous
+projection coverage from the canonical history boundary through the deleted
+height, or retained chain events that prove a destructive rebuild can replay
+from that same boundary. Store schema 13 remains a hard boundary because older
 stores recorded only outpoints in that index and may already have deleted the
 facts needed to fill it. Such stores are refused at primary open and require a
 genesis rebuild; there is no unsafe best-effort migration.
@@ -121,8 +131,9 @@ projection.
 - Canonical retention no longer advances on the safe tip alone; it waits for the
   durable projection, so a projection that lags (or is paused under memory
   pressure) holds canonical spend-fact storage until it catches up.
-- A derive projection can be wiped and rebuilt after point-row retention because
-  the canonical block-local replay source remains durable.
+- A derive projection can be rebuilt after point-row retention only when its
+  retained chain-event source still covers the full canonical history boundary;
+  otherwise startup fails before destructive reconciliation.
 - Deploying artifact schema 18/store schema 13 onto any older canonical volume
   fails closed and requires one genesis rebuild to establish that durable source.
 - The projection's schema can rebuild from retained transaction inputs, but a
