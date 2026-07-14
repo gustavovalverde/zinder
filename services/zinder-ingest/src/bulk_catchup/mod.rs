@@ -1565,6 +1565,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_fetch_refetches_future_ranges_after_ordered_response_split()
+    -> Result<(), Box<dyn Error>> {
+        let requested_segments = Arc::new(Mutex::new(Vec::new()));
+        let completed_segments = Arc::new(Mutex::new(Vec::new()));
+        let source = SplitHeadSegmentSource {
+            requested_segments: Arc::clone(&requested_segments),
+            completed_segments: Arc::clone(&completed_segments),
+            network: Network::ZcashRegtest,
+        };
+        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        )));
+        // Make the initial admission use the normal steady-state prefetch path.
+        // The head response below is deliberately denser and must re-plan all
+        // un-emitted ranges at one block each.
+        source_segment_sizer.lock().record_segment(
+            BlockHeight::new(1),
+            SourceChainSegmentStats::from_response_payload_bytes(4 * 1024 * 1024)
+                .with_connected_blocks(2),
+        );
+        let (_store_tempdir, store) = test_primary_chain_store("split-prefetch-replan-store")?;
+        let block_prepare_stream = build_block_prepare_stream(
+            &source,
+            BulkCatchupBlockPrepareStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(8),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(4)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                block_prepare_concurrency: 2,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
+            },
+            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+        );
+        futures_util::pin_mut!(block_prepare_stream);
+        let mut observed_heights = Vec::new();
+        while let Some(chunk_result) = block_prepare_stream.next().await {
+            for prepared in chunk_result? {
+                observed_heights.push(prepared.derived.block_header.height.value());
+            }
+        }
+
+        assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let requested_segments = requested_segments.lock().clone();
+        assert!(
+            requested_segments.contains(&(BlockHeight::new(3), 1)),
+            "expected the split feedback to re-fetch height 3 with the reduced plan; requests: {requested_segments:?}"
+        );
+        let completed_segments = completed_segments.lock().clone();
+        assert!(
+            !completed_segments.contains(&(BlockHeight::new(3), 2)),
+            "expected the stale prefetched range to be cancelled before completion; completions: {completed_segments:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn source_fetch_counts_completed_reassembly_bytes_against_watermark()
     -> Result<(), Box<dyn Error>> {
         let fetch_events = Arc::new(Mutex::new(Vec::new()));
@@ -2629,6 +2699,13 @@ mod tests {
         response_payload_bytes: u64,
     }
 
+    #[derive(Clone)]
+    struct SplitHeadSegmentSource {
+        requested_segments: Arc<Mutex<Vec<(BlockHeight, u32)>>>,
+        completed_segments: Arc<Mutex<Vec<(BlockHeight, u32)>>>,
+        network: Network,
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum SegmentFetchEvent {
         Started { start_height: BlockHeight },
@@ -2715,6 +2792,73 @@ mod tests {
             Ok(SourceChainSegment::connected_blocks_with_stats(
                 blocks,
                 SourceChainSegmentStats::from_response_payload_bytes(self.response_payload_bytes),
+            ))
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            let _ = height;
+            Err(SourceError::SourceProtocolMismatch {
+                reason: "single-block fetch should not be used by segment bulk catchup",
+            })
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            Ok(BlockId::new(BlockHeight::new(8), block_hash(8)))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NodeSource for SplitHeadSegmentSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            ZebraJsonRpcSource::baseline_capabilities()
+        }
+
+        async fn fetch_chain_segment(
+            &self,
+            limits: SourceChainSegmentLimits,
+        ) -> Result<SourceChainSegment, SourceError> {
+            let Some(start_height) = limits.cursor.next_connected_height() else {
+                return Ok(SourceChainSegment::default());
+            };
+            let max_connected_blocks = limits.max_connected_blocks.get();
+            self.requested_segments
+                .lock()
+                .push((start_height, max_connected_blocks));
+
+            if start_height != BlockHeight::new(1) && max_connected_blocks == 2 {
+                // These are the stale prefetches admitted before the split
+                // feedback from height 1. The stream must abort them before
+                // they can complete.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+
+            self.completed_segments
+                .lock()
+                .push((start_height, max_connected_blocks));
+            let end_height = BlockHeight::new(
+                start_height
+                    .value()
+                    .saturating_add(max_connected_blocks)
+                    .saturating_sub(1)
+                    .min(8),
+            );
+            let mut blocks = Vec::new();
+            let mut next_height = Some(start_height);
+            while let Some(height) = next_height {
+                if height > end_height {
+                    break;
+                }
+                blocks.push(test_source_block(self.network, height));
+                next_height = height.next();
+            }
+            let stats = if start_height == BlockHeight::new(1) {
+                SourceChainSegmentStats::from_response_payload_bytes(20 * 1024 * 1024)
+                    .with_added_splits(1)
+            } else {
+                SourceChainSegmentStats::from_response_payload_bytes(4 * 1024 * 1024)
+            };
+            Ok(SourceChainSegment::connected_blocks_with_stats(
+                blocks, stats,
             ))
         }
 

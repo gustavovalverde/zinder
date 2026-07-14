@@ -444,27 +444,50 @@ impl CanonicalBatch {
     /// moved into its matching `CanonicalBatch` vector; the running tip
     /// metadata is overwritten with the latest built value.
     pub(crate) fn absorb(&mut self, built: BuiltArtifacts) {
-        self.transactions = self
-            .transactions
-            .saturating_add(built.transaction_facts.len());
-        self.transparent_outputs = self
-            .transparent_outputs
-            .saturating_add(built.transparent_outputs_by_outpoint.len());
+        self.absorb_with_prefetched_spent_outputs(built, Vec::new());
+    }
+
+    /// Returns the resource cost contributed by one finalized block.
+    ///
+    /// This is intentionally shared by pre-admission budgeting and the
+    /// post-admission accumulator, so they cannot drift apart as canonical
+    /// artifacts gain new write paths.
+    pub(crate) fn work_cost_for_block(
+        built: &BuiltArtifacts,
+        prefetched_outputs: &[TransparentOutputArtifact],
+    ) -> CanonicalBatchCost {
         let transparent_spend_references =
             transparent_spend_reference_count_for_transactions(&built.transaction_facts);
+        CanonicalBatchCost {
+            blocks: 1,
+            transactions: built.transaction_facts.len(),
+            transparent_outputs: built.transparent_outputs_by_outpoint.len(),
+            transparent_spend_references,
+            artifact_bytes: canonical_block_artifact_bytes(built).saturating_add(
+                prefetched_spent_transparent_output_bytes(prefetched_outputs),
+            ),
+            estimated_write_bytes: canonical_block_estimated_write_bytes(
+                built,
+                transparent_spend_references,
+            ),
+        }
+    }
+
+    fn absorb_work_cost(&mut self, cost: CanonicalBatchCost) {
+        self.transactions = self.transactions.saturating_add(cost.transactions);
+        self.transparent_outputs = self
+            .transparent_outputs
+            .saturating_add(cost.transparent_outputs);
         self.transparent_spend_references = self
             .transparent_spend_references
-            .saturating_add(transparent_spend_references);
-        self.artifact_bytes = self
-            .artifact_bytes
-            .saturating_add(canonical_block_artifact_bytes(&built));
-        self.estimated_write_bytes =
-            self.estimated_write_bytes
-                .saturating_add(canonical_block_estimated_write_bytes(
-                    &built,
-                    transparent_spend_references,
-                ));
+            .saturating_add(cost.transparent_spend_references);
+        self.artifact_bytes = self.artifact_bytes.saturating_add(cost.artifact_bytes);
+        self.estimated_write_bytes = self
+            .estimated_write_bytes
+            .saturating_add(cost.estimated_write_bytes);
+    }
 
+    fn absorb_built_artifacts(&mut self, built: BuiltArtifacts) {
         self.block_headers.push(built.block_header);
         if let Some(block_blob) = built.block_blob {
             self.block_blobs.push(block_blob);
@@ -489,12 +512,9 @@ impl CanonicalBatch {
         built: BuiltArtifacts,
         prefetched_outputs: Vec<TransparentOutputArtifact>,
     ) {
-        self.absorb(built);
-        self.artifact_bytes =
-            self.artifact_bytes
-                .saturating_add(prefetched_spent_transparent_output_bytes(
-                    &prefetched_outputs,
-                ));
+        let cost = Self::work_cost_for_block(&built, &prefetched_outputs);
+        self.absorb_work_cost(cost);
+        self.absorb_built_artifacts(built);
         self.prefetched_spent_transparent_outputs
             .extend(prefetched_outputs);
     }
@@ -614,6 +634,25 @@ pub(crate) struct CanonicalBatchCost {
     pub(crate) estimated_write_bytes: usize,
 }
 
+impl CanonicalBatchCost {
+    pub(crate) fn saturating_add(self, next: Self) -> Self {
+        Self {
+            blocks: self.blocks.saturating_add(next.blocks),
+            transactions: self.transactions.saturating_add(next.transactions),
+            transparent_outputs: self
+                .transparent_outputs
+                .saturating_add(next.transparent_outputs),
+            transparent_spend_references: self
+                .transparent_spend_references
+                .saturating_add(next.transparent_spend_references),
+            artifact_bytes: self.artifact_bytes.saturating_add(next.artifact_bytes),
+            estimated_write_bytes: self
+                .estimated_write_bytes
+                .saturating_add(next.estimated_write_bytes),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalBatchBudget {
     max_blocks: NonZeroU32,
@@ -649,6 +688,36 @@ impl CanonicalBatchBudget {
         }
         if self.can_close_on_estimated_write_bytes(cost.blocks)
             && cost.estimated_write_bytes >= nonzero_u64_to_usize(self.max_estimated_write_bytes)
+        {
+            return Some(CanonicalBatchCloseTrigger::EstimatedWriteBytes);
+        }
+        None
+    }
+
+    /// Returns the close trigger for the current batch before admitting the
+    /// next finalized block.
+    ///
+    /// Exact-limit blocks still join the current batch and close it through
+    /// [`Self::commit_trigger`]. This path is only for an existing batch that
+    /// the next block would push beyond a configured bound; an oversized first
+    /// block remains valid and is committed on its own.
+    pub(crate) fn commit_trigger_before_next_block(
+        self,
+        current: CanonicalBatchCost,
+        next: CanonicalBatchCost,
+    ) -> Option<CanonicalBatchCloseTrigger> {
+        if current.blocks == 0 {
+            return None;
+        }
+        let combined = current.saturating_add(next);
+        if combined.blocks > nonzero_u32_to_usize(self.max_blocks) {
+            return Some(CanonicalBatchCloseTrigger::BlockCount);
+        }
+        if combined.artifact_bytes > nonzero_u64_to_usize(self.max_artifact_bytes) {
+            return Some(CanonicalBatchCloseTrigger::ArtifactBytes);
+        }
+        if self.can_close_on_estimated_write_bytes(combined.blocks)
+            && combined.estimated_write_bytes > nonzero_u64_to_usize(self.max_estimated_write_bytes)
         {
             return Some(CanonicalBatchCloseTrigger::EstimatedWriteBytes);
         }
@@ -1947,6 +2016,78 @@ mod tests {
                 ..CanonicalBatchCost::default()
             }),
             Some(CanonicalBatchCloseTrigger::EstimatedWriteBytes)
+        );
+    }
+
+    #[test]
+    fn ingest_batch_budget_closes_before_a_dense_block_exceeds_write_budget() {
+        let budget = canonical_batch_budget_for_tests(
+            NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN),
+            NonZeroU64::MAX,
+            NonZeroU64::new(100).unwrap_or(NonZeroU64::MIN),
+            NonZeroU32::MIN,
+        );
+
+        assert_eq!(
+            budget.commit_trigger_before_next_block(
+                CanonicalBatchCost {
+                    blocks: 2,
+                    estimated_write_bytes: 90,
+                    ..CanonicalBatchCost::default()
+                },
+                CanonicalBatchCost {
+                    blocks: 1,
+                    estimated_write_bytes: 20,
+                    ..CanonicalBatchCost::default()
+                },
+            ),
+            Some(CanonicalBatchCloseTrigger::EstimatedWriteBytes)
+        );
+    }
+
+    #[test]
+    fn ingest_batch_budget_admits_an_oversized_first_block() {
+        let budget = canonical_batch_budget_for_tests(
+            NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN),
+            NonZeroU64::MAX,
+            NonZeroU64::new(100).unwrap_or(NonZeroU64::MIN),
+            NonZeroU32::MIN,
+        );
+
+        assert_eq!(
+            budget.commit_trigger_before_next_block(
+                CanonicalBatchCost::default(),
+                CanonicalBatchCost {
+                    blocks: 1,
+                    estimated_write_bytes: 120,
+                    ..CanonicalBatchCost::default()
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ingest_batch_budget_keeps_exact_limit_block_in_current_batch() {
+        let budget = canonical_batch_budget_for_tests(
+            NonZeroU32::new(3).unwrap_or(NonZeroU32::MIN),
+            NonZeroU64::MAX,
+            NonZeroU64::MAX,
+            NonZeroU32::MIN,
+        );
+
+        assert_eq!(
+            budget.commit_trigger_before_next_block(
+                CanonicalBatchCost {
+                    blocks: 2,
+                    ..CanonicalBatchCost::default()
+                },
+                CanonicalBatchCost {
+                    blocks: 1,
+                    ..CanonicalBatchCost::default()
+                },
+            ),
+            None
         );
     }
 

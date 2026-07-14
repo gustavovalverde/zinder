@@ -18,6 +18,7 @@ use zinder_source::{
     SourceChainSegmentStats, SourceChainUpdate, SourceError,
 };
 
+use super::abort_on_drop::AbortOnDropTask;
 use super::watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer};
 use super::{
     BULK_STAGE_SOURCE_FETCH, IngestError, SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT,
@@ -113,6 +114,7 @@ where
 
         fill_source_segment_prefetch_queue(state);
         if let Some(prefetched_segment) = pop_next_completed_source_segment(state) {
+            let feedback_action = prefetched_segment.feedback_action;
             let segment = prefetched_segment.segment;
             if segment.is_empty() {
                 return None;
@@ -121,26 +123,27 @@ where
             if let Err(error) = enqueue_source_segment_max_blocks(state, segment) {
                 return Some(Err(error));
             }
+            if let Some(reason) = feedback_action {
+                restart_future_source_prefetch(state, reason);
+            }
             continue;
         }
         record_source_head_of_line_wait_started(state);
 
-        let prefetched_segment = match state.in_flight_segments.next().await {
+        let mut prefetched_segment = match state.in_flight_segments.next().await {
             Some(Ok(prefetched_segment)) => prefetched_segment,
             Some(Err(error)) => {
                 return Some(Err(error));
             }
             None => return None,
         };
-        let completed_start_height = prefetched_segment.start_height;
-        let completed_stats = prefetched_segment.segment.stats();
+        prefetched_segment.feedback_action = state.source_segment_sizer.lock().record_segment(
+            prefetched_segment.start_height,
+            prefetched_segment.segment.stats(),
+        );
         if let Err(error) = insert_completed_source_segment(state, prefetched_segment) {
             return Some(Err(error));
         }
-        state
-            .source_segment_sizer
-            .lock()
-            .record_segment(completed_start_height, completed_stats);
         record_source_fetch_queue_state(state);
     }
 }
@@ -223,6 +226,7 @@ struct PrefetchedSourceSegment {
     max_connected_blocks: NonZeroU32,
     segment: SourceChainSegment,
     queued_response_bytes: u64,
+    feedback_action: Option<SourceSegmentPrefetchRestartReason>,
     _reservation: ByteReservation,
 }
 
@@ -244,7 +248,7 @@ where
 
     // Spawned so segment fetches and block decoding progress on runtime
     // workers instead of only while the segment stream itself is polled.
-    let fetch_task = tokio::spawn(async move {
+    let fetch_task = AbortOnDropTask::spawn(async move {
         let mut retry_state = IngestRetryState::default();
         let limits = SourceChainSegmentLimits::new(
             cursor,
@@ -267,12 +271,13 @@ where
             max_connected_blocks,
             segment,
             queued_response_bytes,
+            feedback_action: None,
             _reservation: reservation,
         })
     });
 
     async move {
-        match fetch_task.await {
+        match fetch_task.join().await {
             Ok(segment_result) => segment_result,
             Err(join_error) => Err(IngestError::SourceSegmentFetchTaskStopped {
                 reason: join_error.to_string(),
@@ -332,6 +337,38 @@ fn insert_completed_source_segment<Source>(
         .completed_segment_bytes
         .saturating_add(queued_response_bytes);
     Ok(())
+}
+
+/// Discards speculative requests after ordered feedback invalidates their plan.
+///
+/// The emitted head segment has already been link-validated and queued before
+/// this runs. Every discarded range therefore starts strictly at
+/// `next_emit_height` or later and is re-fetched with the updated sizer state.
+fn restart_future_source_prefetch<Source>(
+    state: &mut SourceBlockStreamState<'_, Source>,
+    reason: SourceSegmentPrefetchRestartReason,
+) {
+    let discarded_in_flight = state.in_flight_segments.len();
+    let discarded_completed = state.completed_segments.len();
+    state.in_flight_segments = FuturesUnordered::new();
+    state.completed_segments.clear();
+    state.completed_segment_bytes = 0;
+    state.next_fetch_height = state.next_emit_height;
+    state.source_head_of_line_started_at = None;
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_restarts_total",
+        "reason" => reason.metric_label()
+    )
+    .increment(1);
+    tracing::info!(
+        event = "source_segment_prefetch_restarted",
+        reason = reason.metric_label(),
+        next_fetch_height = ?state.next_fetch_height,
+        discarded_in_flight,
+        discarded_completed,
+        "discarded stale source prefetches after ordered segment feedback"
+    );
+    record_source_fetch_queue_state(state);
 }
 
 fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, Source>) {
@@ -465,6 +502,21 @@ pub(super) enum SourceSegmentPlan {
     Complete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceSegmentPrefetchRestartReason {
+    ResponseTooLarge,
+    Density,
+}
+
+impl SourceSegmentPrefetchRestartReason {
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::ResponseTooLarge => "response_too_large",
+            Self::Density => "density",
+        }
+    }
+}
+
 pub(super) struct SourceSegmentSizer {
     max_blocks: NonZeroU32,
     target_response_payload_bytes: NonZeroU64,
@@ -578,9 +630,9 @@ impl SourceSegmentSizer {
         &mut self,
         start_height: BlockHeight,
         stats: SourceChainSegmentStats,
-    ) {
+    ) -> Option<SourceSegmentPrefetchRestartReason> {
         if self.activations.consensus_branch_id_at(start_height) != self.active_branch_id {
-            return;
+            return None;
         }
         self.initial_probe_in_flight = false;
         metrics::gauge!("zinder_ingest_source_segment_initial_probe_in_flight").set(0.0);
@@ -598,16 +650,21 @@ impl SourceSegmentSizer {
             self.max_blocks,
             self.target_response_payload_bytes,
         );
-        if previous_blocks != self.current_blocks {
-            let reason = if stats.split_count() > 0 {
-                "response_too_large"
-            } else if self.current_blocks < previous_blocks {
-                "density"
+        let feedback_action = if self.current_blocks < previous_blocks {
+            if stats.split_count() > 0 {
+                Some(SourceSegmentPrefetchRestartReason::ResponseTooLarge)
             } else {
-                "success"
-            };
+                Some(SourceSegmentPrefetchRestartReason::Density)
+            }
+        } else {
+            None
+        };
+        if previous_blocks != self.current_blocks {
+            let reason =
+                feedback_action.map_or("success", |feedback_action| feedback_action.metric_label());
             record_source_segment_sizer_adjustment(reason, previous_blocks, self.current_blocks);
         }
+        feedback_action
     }
 
     fn record_density_sample(&mut self, stats: SourceChainSegmentStats) {
