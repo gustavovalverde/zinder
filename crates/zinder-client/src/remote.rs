@@ -17,6 +17,7 @@ use tracing::warn;
 use zinder_core::wire::{
     decode_rpc_block_hash_hex, decode_rpc_merkle_root_hex, decode_rpc_transaction_id_hex,
     decode_zinder_native_chain_name, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
+    encode_zinder_native_chain_name,
 };
 use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector,
@@ -454,7 +455,7 @@ impl ChainIndex for RemoteChainIndex {
             }
             Err(status) => return Err(self.handle_status(status)),
         };
-        tx_status_from_message(response)
+        tx_status_from_message(self.network, response)
     }
 
     async fn transparent_address_unspent_outputs(
@@ -754,7 +755,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .await
             .map_err(|status| self.handle_status(status))?
             .into_inner();
-        mempool_snapshot_view_from_message(response)
+        mempool_snapshot_view_from_message(self.network, response)
     }
 
     async fn mempool_events(
@@ -771,10 +772,11 @@ impl EndpointBackedIndex for RemoteChainIndex {
             }))
             .await
             .map_err(|status| self.handle_status(status))?;
+        let expected_network = self.network;
         let recovery = self.clone();
         let stream = response.into_inner().map(move |event_result| {
             let envelope_message = event_result.map_err(|status| recovery.handle_status(status))?;
-            mempool_event_envelope_from_message(envelope_message)
+            mempool_event_envelope_from_message(expected_network, envelope_message)
         });
         Ok(Box::pin(stream))
     }
@@ -1522,6 +1524,7 @@ fn block_selector_to_message(
     reason = "TransactionLocation oneof is non-exhaustive in the protobuf-generated enum; new variants are a deliberate wire change."
 )]
 fn tx_status_from_message(
+    expected_network: Network,
     response: wallet::TransactionStatusResponse,
 ) -> Result<TxStatus, IndexerError> {
     let chain_epoch_message = response
@@ -1553,8 +1556,8 @@ fn tx_status_from_message(
             )))
         }
         wallet::transaction_location::Location::InMempool(in_mempool) => {
-            let chain_epoch = chain_epoch_from_message(chain_epoch_message)
-                .map_err(decode_error_to_indexer_error)?;
+            let chain_epoch =
+                chain_epoch_from_message_with_network(expected_network, chain_epoch_message)?;
             let entry = MempoolEntry {
                 transaction_id: TransactionId::from_bytes([0; 32]),
                 auth_digest: None,
@@ -1638,18 +1641,18 @@ fn fixed_32_bytes(field: &'static str, bytes: Vec<u8>) -> Result<[u8; 32], Index
 }
 
 fn mempool_snapshot_view_from_message(
+    expected_network: Network,
     message: wallet::MempoolSnapshotResponse,
 ) -> Result<MempoolSnapshotView, IndexerError> {
     let chain_epoch_message = message
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| IndexerError::malformed("chain_view.chain_epoch", "field is missing"))?;
-    let chain_epoch =
-        chain_epoch_from_message(chain_epoch_message).map_err(decode_error_to_indexer_error)?;
+    let chain_epoch = chain_epoch_from_message_with_network(expected_network, chain_epoch_message)?;
     let entries = message
         .entries
         .into_iter()
-        .map(|entry| mempool_entry_from_message(entry).map_err(decode_error_to_indexer_error))
+        .map(|entry| mempool_entry_from_message_with_network(expected_network, entry))
         .collect::<Result<Vec<MempoolEntry>, IndexerError>>()?;
     let next_cursor = if message.next_cursor.is_empty() {
         None
@@ -1668,6 +1671,25 @@ fn mempool_snapshot_view_from_message(
         entries,
         next_cursor,
     })
+}
+
+fn mempool_entry_from_message_with_network(
+    expected_network: Network,
+    message: wallet::MempoolEntry,
+) -> Result<MempoolEntry, IndexerError> {
+    let entry = mempool_entry_from_message(message).map_err(decode_error_to_indexer_error)?;
+    ensure_mempool_entry_network(expected_network, &entry)?;
+    Ok(entry)
+}
+
+fn ensure_mempool_entry_network(
+    expected_network: Network,
+    entry: &MempoolEntry,
+) -> Result<(), IndexerError> {
+    ensure_network_name(
+        expected_network,
+        encode_zinder_native_chain_name(entry.first_seen_chain_epoch.network),
+    )
 }
 
 /// Encodes a typed client start position into the wire `EventStreamStart`,
@@ -1697,12 +1719,16 @@ fn event_stream_start_to_message<Cursor>(
     reason = "zinder_store::MempoolEvent is non_exhaustive; the client mirrors its known variants and fails closed for any future variant."
 )]
 fn mempool_event_envelope_from_message(
+    expected_network: Network,
     message: wallet::MempoolEventEnvelope,
 ) -> Result<MempoolEventEnvelope, IndexerError> {
     let store_envelope = mempool_event_envelope_from_message_shared(message)
         .map_err(decode_error_to_indexer_error)?;
     let event = match store_envelope.event {
-        zinder_store::MempoolEvent::Added { entry } => MempoolEvent::Added { entry },
+        zinder_store::MempoolEvent::Added { entry } => {
+            ensure_mempool_entry_network(expected_network, &entry)?;
+            MempoolEvent::Added { entry }
+        }
         zinder_store::MempoolEvent::Invalidated {
             transaction_id,
             reason,
@@ -1743,6 +1769,9 @@ mod tests {
     use crate::IndexerError;
     use tonic::{Code, Status};
 
+    const EXPECTED_NETWORK: Network = Network::ZcashRegtest;
+    const MISMATCHED_NETWORK: Network = Network::ZcashMainnet;
+
     #[allow(
         clippy::expect_used,
         reason = "syntactically valid URI; connect_lazy cannot fail here"
@@ -1757,6 +1786,199 @@ mod tests {
 
     fn current_client_ptr(index: &RemoteChainIndex) -> usize {
         Arc::as_ptr(&index.client.load_full()) as usize
+    }
+
+    fn synthetic_chain_epoch(network: Network) -> wallet::ChainEpoch {
+        wallet::ChainEpoch {
+            chain_epoch_id: 7,
+            network_name: encode_zinder_native_chain_name(network).to_owned(),
+            artifact_schema_version: 1,
+            created_at_millis: 1_774_670_400_000,
+            visible_tip: Some(wallet::BlockTip {
+                height: 42,
+                hash: "11".repeat(32),
+            }),
+            settled_tip: Some(wallet::BlockTip {
+                height: 40,
+                hash: "22".repeat(32),
+            }),
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        }
+    }
+
+    fn synthetic_chain_view(network: Network) -> wallet::ChainView {
+        wallet::ChainView {
+            chain_epoch: Some(synthetic_chain_epoch(network)),
+            indexed_tip: None,
+            upstream_tip: None,
+            derive: None,
+        }
+    }
+
+    fn synthetic_mempool_entry(network: Network) -> wallet::MempoolEntry {
+        wallet::MempoolEntry {
+            transaction_id: "33".repeat(32),
+            auth_digest: String::new(),
+            raw_transaction_bytes: vec![0x01, 0x02, 0x03],
+            compact_transaction_bytes: Vec::new(),
+            first_seen_unix_millis: 1_774_670_400_000,
+            first_seen_chain_epoch: Some(synthetic_chain_epoch(network)),
+            transparent_outputs: Vec::new(),
+            transparent_spends: Vec::new(),
+        }
+    }
+
+    fn transaction_in_mempool_message(network: Network) -> wallet::TransactionStatusResponse {
+        wallet::TransactionStatusResponse {
+            chain_view: Some(synthetic_chain_view(network)),
+            location: Some(wallet::TransactionLocation {
+                location: Some(wallet::transaction_location::Location::InMempool(
+                    wallet::MempoolTransaction {
+                        payload_bytes: vec![0x01, 0x02, 0x03],
+                        first_seen_unix_seconds: 1_774_670_400,
+                    },
+                )),
+            }),
+        }
+    }
+
+    fn mempool_snapshot_message(
+        chain_view_network: Network,
+        entry_network: Network,
+    ) -> wallet::MempoolSnapshotResponse {
+        wallet::MempoolSnapshotResponse {
+            chain_view: Some(synthetic_chain_view(chain_view_network)),
+            events_resume_cursor: Vec::new(),
+            snapshot_age_millis: 0,
+            entries: vec![synthetic_mempool_entry(entry_network)],
+            next_cursor: Vec::new(),
+        }
+    }
+
+    fn mempool_added_event_message(entry_network: Network) -> wallet::MempoolEventEnvelope {
+        wallet::MempoolEventEnvelope {
+            cursor: Vec::new(),
+            event_sequence: 1,
+            source_observed_unix_millis: 1_774_670_400_000,
+            event: Some(wallet::mempool_event_envelope::Event::Added(
+                wallet::MempoolAddedEvent {
+                    entry: Some(synthetic_mempool_entry(entry_network)),
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn transaction_in_mempool_rejects_mismatched_network() {
+        let outcome = tx_status_from_message(
+            EXPECTED_NETWORK,
+            transaction_in_mempool_message(MISMATCHED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::NetworkMismatch {
+                expected: EXPECTED_NETWORK,
+                ref actual,
+            }) if actual == encode_zinder_native_chain_name(MISMATCHED_NETWORK)
+        ));
+    }
+
+    #[test]
+    fn transaction_in_mempool_accepts_matching_network() {
+        let outcome = tx_status_from_message(
+            EXPECTED_NETWORK,
+            transaction_in_mempool_message(EXPECTED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Ok(TxStatus::InMempool(entry))
+                if entry.first_seen_chain_epoch.network == EXPECTED_NETWORK
+        ));
+    }
+
+    #[test]
+    fn mempool_snapshot_rejects_mismatched_chain_view_network() {
+        let outcome = mempool_snapshot_view_from_message(
+            EXPECTED_NETWORK,
+            mempool_snapshot_message(MISMATCHED_NETWORK, EXPECTED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::NetworkMismatch {
+                expected: EXPECTED_NETWORK,
+                ref actual,
+            }) if actual == encode_zinder_native_chain_name(MISMATCHED_NETWORK)
+        ));
+    }
+
+    #[test]
+    fn mempool_snapshot_rejects_mismatched_entry_network() {
+        let mut message = mempool_snapshot_message(EXPECTED_NETWORK, MISMATCHED_NETWORK);
+        message
+            .entries
+            .insert(0, synthetic_mempool_entry(EXPECTED_NETWORK));
+        let outcome = mempool_snapshot_view_from_message(EXPECTED_NETWORK, message);
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::NetworkMismatch {
+                expected: EXPECTED_NETWORK,
+                ref actual,
+            }) if actual == encode_zinder_native_chain_name(MISMATCHED_NETWORK)
+        ));
+    }
+
+    #[test]
+    fn mempool_snapshot_accepts_matching_networks() {
+        let outcome = mempool_snapshot_view_from_message(
+            EXPECTED_NETWORK,
+            mempool_snapshot_message(EXPECTED_NETWORK, EXPECTED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Ok(snapshot)
+                if snapshot.chain_epoch.network == EXPECTED_NETWORK
+                    && snapshot.entries.len() == 1
+                    && snapshot.entries[0].first_seen_chain_epoch.network == EXPECTED_NETWORK
+        ));
+    }
+
+    #[test]
+    fn mempool_added_event_rejects_mismatched_entry_network() {
+        let outcome = mempool_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            mempool_added_event_message(MISMATCHED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::NetworkMismatch {
+                expected: EXPECTED_NETWORK,
+                ref actual,
+            }) if actual == encode_zinder_native_chain_name(MISMATCHED_NETWORK)
+        ));
+    }
+
+    #[test]
+    fn mempool_added_event_accepts_matching_entry_network() {
+        let outcome = mempool_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            mempool_added_event_message(EXPECTED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Ok(MempoolEventEnvelope {
+                event: MempoolEvent::Added { entry },
+                ..
+            }) if entry.first_seen_chain_epoch.network == EXPECTED_NETWORK
+        ));
     }
 
     #[tokio::test]
