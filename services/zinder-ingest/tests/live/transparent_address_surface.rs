@@ -35,12 +35,17 @@ use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
-    BlockHash, BlockHeight, Network, NetworkUpgradeActivations, TransactionId,
+    BlockHash, BlockHeight, Network, NetworkUpgradeActivations, SUBTREE_LEAF_COUNT, TransactionId,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
+};
+use zinder_derive::{
+    BLOCK_SUMMARY_CONSUMER_NAME, DeriveStore, DeriveStoreOptions, ProjectionPreset,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
 };
 use zinder_ingest::{
     DeriveReplayPolicy, IngestDeriveConfig, catch_up_derive_store_to_canonical,
-    open_primary_derive_store_for_canonical, run_bulk_catchup,
+    open_primary_derive_store_for_canonical_with_projection_preset, run_bulk_catchup,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_server::CompactTxStreamer as LightwalletdCompactTxStreamer,
@@ -54,6 +59,7 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 
 use crate::common::{
+    SubtreeRootStartIndices, WalletReadTestRange, assert_wallet_read_responses,
     fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
     zebra_source_from_bulk_catchup,
 };
@@ -80,16 +86,28 @@ async fn sampled_coinbase_address_round_trips_through_transparent_address_apis()
     let network = env.network();
     let (storage_path_owner, store, sample, activations) =
         bulk_catchup_and_sample_tip_coinbase(&env).await?;
+    assert_wallet_read_responses(
+        &store,
+        WalletReadTestRange {
+            network,
+            start_height: sample.bulk_catchup_from_height.value(),
+            end_height: sample.tip_height.value(),
+            subtree_root_start_indices: sample.subtree_root_start_indices,
+        },
+        Arc::clone(&activations),
+    )
+    .await?;
     let storage_path = storage_path_owner.path().join("zinder-store");
-    let derive_secondary = zinder_derive::DeriveStore::open_secondary(
-        zinder_derive::DeriveStore::path_for_canonical(&storage_path),
+    let derive_secondary = DeriveStore::open_secondary_with_projection_preset(
+        DeriveStore::path_for_canonical(&storage_path),
         storage_path_owner
             .path()
             .join("zinder-derive-secondary-history"),
-        zinder_derive::DeriveStoreOptions {
+        ProjectionPreset::Wallet,
+        DeriveStoreOptions {
             sync_writes: false,
-            consumers: zinder_derive::DeriveStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
         },
     )?;
     derive_secondary.try_catch_up()?;
@@ -134,6 +152,7 @@ struct SampledCoinbase {
     block_hash: BlockHash,
     bulk_catchup_from_height: BlockHeight,
     tip_height: BlockHeight,
+    subtree_root_start_indices: SubtreeRootStartIndices,
 }
 
 async fn bulk_catchup_and_sample_tip_coinbase(
@@ -170,20 +189,33 @@ async fn bulk_catchup_and_sample_tip_coinbase(
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
+    let subtree_root_start_indices = SubtreeRootStartIndices {
+        sapling: checkpoint.tip_metadata.sapling_commitment_tree_size / SUBTREE_LEAF_COUNT,
+        orchard: checkpoint.tip_metadata.orchard_commitment_tree_size / SUBTREE_LEAF_COUNT,
+    };
     bulk_catchup_config.checkpoint = Some(checkpoint);
     run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
         .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let block_at_tip = source.fetch_block_at(tip_height).await?;
-    let sample =
-        sample_first_coinbase_output(&block_at_tip, env.network(), from_height, tip_height)?;
+    let sample = sample_first_coinbase_output(
+        &block_at_tip,
+        env.network(),
+        from_height,
+        tip_height,
+        subtree_root_start_indices,
+    )?;
     let store =
         PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    let derive_primary = open_primary_derive_store_for_canonical(
+    let derive_primary = open_primary_derive_store_for_canonical_with_projection_preset(
         &storage_path,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
+        ProjectionPreset::Wallet,
     )?;
+    assert!(derive_primary.has_consumer(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME));
+    assert!(derive_primary.has_consumer(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME));
+    assert!(!derive_primary.has_consumer(BLOCK_SUMMARY_CONSUMER_NAME));
     catch_up_derive_store_to_canonical(&store, &derive_primary, derive_replay_config()?).await?;
     drop(derive_primary);
     Ok((tempdir, store, sample, activations))
@@ -212,6 +244,7 @@ fn sample_first_coinbase_output(
     network: Network,
     bulk_catchup_from_height: BlockHeight,
     tip_height: BlockHeight,
+    subtree_root_start_indices: SubtreeRootStartIndices,
 ) -> Result<SampledCoinbase> {
     let zebra_block: ZebraBlock = block.raw_block_bytes.as_slice().zcash_deserialize_into()?;
     let coinbase_tx = zebra_block.transactions.first().ok_or_else(|| {
@@ -245,6 +278,7 @@ fn sample_first_coinbase_output(
         block_hash: block.hash,
         bulk_catchup_from_height,
         tip_height,
+        subtree_root_start_indices,
     })
 }
 

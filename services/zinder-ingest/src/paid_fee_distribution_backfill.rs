@@ -11,9 +11,10 @@ use futures_util::{StreamExt as _, stream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHeaderArtifact, BlockHeight, NetworkUpgradeActivations, TransactionFactsArtifact,
-    TransactionId, TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
-    TransactionLocation, TransparentOutPoint, TransparentSpendFact,
+    BlockHeaderArtifact, BlockHeight, CanonicalHistoryBounds, NetworkUpgradeActivations,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
+    TransparentSpendFact,
 };
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
@@ -280,6 +281,9 @@ async fn run_paid_fee_distribution_backfill(
     if wait_until_historical_work_or_cancelled(&historical_work_gate, &cancel).await {
         return;
     }
+    if !initialize_tail_until_cancelled(config, &context, &cancel).await {
+        return;
+    }
     let Some(target_floor) = resolve_target_floor_until_cancelled(config, &context, &cancel).await
     else {
         return;
@@ -295,6 +299,47 @@ async fn run_paid_fee_distribution_backfill(
         }
         if advance_backfill_once(config, target_floor, &context, &cancel).await {
             return;
+        }
+    }
+}
+
+async fn initialize_tail_until_cancelled(
+    config: PaidFeeDistributionBackfillConfig,
+    context: &PaidFeeDistributionBackfillContext,
+    cancel: &CancellationToken,
+) -> bool {
+    loop {
+        let initialization = tokio::select! {
+            () = cancel.cancelled() => return false,
+            initialization = seed_paid_fee_distribution_cursor_and_tail(config, context) => {
+                initialization
+            }
+        };
+        match initialization.and_then(|()| {
+            PaidFeeDistributionConsumer::tail_coverage(&context.derive_store)
+                .map_err(IngestError::from)
+        }) {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "paid_fee_distribution_tail_initialization_retry",
+                    retry_delay_seconds = BACKFILL_RETRY_INTERVAL.as_secs(),
+                    "paid-fee distribution tail is not ready; retrying after canonical derive progress"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "paid_fee_distribution_tail_initialization_retry",
+                    error = %error,
+                    retry_delay_seconds = BACKFILL_RETRY_INTERVAL.as_secs(),
+                    "paid-fee distribution tail initialization failed; retrying"
+                );
+            }
+        }
+        if sleep_or_cancel(BACKFILL_RETRY_INTERVAL, cancel).await {
+            return false;
         }
     }
 }
@@ -669,7 +714,16 @@ async fn backfill_next_batch(
     target_floor: BlockHeight,
     context: &PaidFeeDistributionBackfillContext,
 ) -> Result<BackfillProgress, IngestError> {
+    let canonical_history_floor = canonical_history_floor(&context.chain_store)?;
+    if target_floor < canonical_history_floor {
+        return Err(IngestError::DeriveDispatch(format!(
+            "paid-fee distribution target floor {} precedes canonical history floor {}",
+            target_floor.value(),
+            canonical_history_floor.value()
+        )));
+    }
     let coverage = PaidFeeDistributionConsumer::backfill_coverage(&context.derive_store)?;
+    validate_backfill_coverage_floor(coverage, canonical_history_floor)?;
     let tail =
         PaidFeeDistributionConsumer::tail_coverage(&context.derive_store)?.ok_or_else(|| {
             IngestError::DeriveDispatch(
@@ -727,6 +781,7 @@ async fn resolve_target_floor(
     config: PaidFeeDistributionBackfillConfig,
     context: &PaidFeeDistributionBackfillContext,
 ) -> Result<BlockHeight, IngestError> {
+    let canonical_history_floor = canonical_history_floor(&context.chain_store)?;
     let chain_store = context.chain_store.clone();
     let requested_floor = tokio::task::spawn_blocking(move || {
         let now = SystemTime::now()
@@ -742,7 +797,7 @@ async fn resolve_target_floor(
                 )
             })?;
         let cutoff = now.saturating_sub(history_seconds);
-        select_history_floor(&chain_store, cutoff)
+        select_history_floor(&chain_store, cutoff, canonical_history_floor)
     })
     .await
     .map_err(|error| IngestError::BlockingTaskFailed {
@@ -750,7 +805,7 @@ async fn resolve_target_floor(
     })??;
 
     let persisted = read_persisted_target_floor(&context.derive_store)?;
-    let target_floor = persisted.map_or(requested_floor, |existing| existing.min(requested_floor));
+    let target_floor = durable_target_floor(persisted, requested_floor, canonical_history_floor)?;
     if persisted != Some(target_floor) {
         context.derive_store.put_consumer(
             PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY,
@@ -766,6 +821,34 @@ async fn resolve_target_floor(
         );
     }
     Ok(target_floor)
+}
+
+fn canonical_history_floor(chain_store: &PrimaryChainStore) -> Result<BlockHeight, IngestError> {
+    chain_store
+        .canonical_history_bounds()?
+        .map(zinder_core::CanonicalHistoryBounds::first_available_height)
+        .ok_or_else(|| {
+            IngestError::DeriveDispatch(
+                "canonical history bounds are unavailable during paid-fee backfill".to_owned(),
+            )
+        })
+}
+
+fn durable_target_floor(
+    persisted: Option<BlockHeight>,
+    requested: BlockHeight,
+    canonical_history_floor: BlockHeight,
+) -> Result<BlockHeight, IngestError> {
+    if let Some(persisted) = persisted
+        && persisted < canonical_history_floor
+    {
+        return Err(IngestError::DeriveDispatch(format!(
+            "paid-fee distribution persisted target floor {} precedes canonical history floor {}",
+            persisted.value(),
+            canonical_history_floor.value()
+        )));
+    }
+    Ok(persisted.map_or(requested, |existing| existing.min(requested)))
 }
 
 fn read_persisted_target_floor(store: &DeriveStore) -> Result<Option<BlockHeight>, IngestError> {
@@ -787,21 +870,26 @@ fn read_persisted_target_floor(store: &DeriveStore) -> Result<Option<BlockHeight
 fn select_history_floor(
     chain_store: &PrimaryChainStore,
     cutoff_unix_seconds: u64,
+    canonical_history_floor: BlockHeight,
 ) -> Result<BlockHeight, IngestError> {
     let reader = chain_store.current_chain_epoch_reader()?;
     let mut height = reader.chain_epoch().settled_tip_height;
+    if height < canonical_history_floor {
+        return Ok(canonical_history_floor);
+    }
     loop {
         let header = reader.block_header_at(height)?.ok_or_else(|| {
             IngestError::DeriveDispatch(format!(
-                "canonical header {} is unavailable while selecting paid-fee history floor",
-                height.value()
+                "settled canonical header {} is unavailable at or above history floor {} while selecting paid-fee history",
+                height.value(),
+                canonical_history_floor.value()
             ))
         })?;
         let block_time = u64::try_from(header.block_time).unwrap_or(0);
-        if block_time < cutoff_unix_seconds || height.value() <= 1 {
+        if block_time < cutoff_unix_seconds || height == canonical_history_floor {
             return Ok(height);
         }
-        height = BlockHeight::new(height.value() - 1);
+        height = BlockHeight::new(height.value().saturating_sub(1));
     }
 }
 
@@ -1090,7 +1178,8 @@ fn hydrate_canonical_contexts_blocking(
     let reader = chain_store.current_chain_epoch_reader()?;
     validate_hydration_boundary(&reader, &expectations, require_settled)?;
     let hydrated = load_paid_fee_transactions(&reader, &expectations, intrinsic_overlay)?;
-    let transparent_spends = resolve_transparent_spends(&reader, &hydrated)?;
+    let transparent_spends =
+        resolve_transparent_spends(&reader, &hydrated, reader.canonical_history_bounds())?;
     Ok(build_paid_fee_contexts(
         expectations,
         hydrated,
@@ -1225,16 +1314,27 @@ fn load_intrinsic_value_balances(
 fn resolve_transparent_spends(
     reader: &ChainEpochReader<'_>,
     hydrated: &HydratedPaidFeeTransactions,
+    history_bounds: CanonicalHistoryBounds,
 ) -> Result<HashMap<TransparentOutPoint, TransparentSpendFact>, IngestError> {
     let parent_ids: Vec<_> = hydrated.transparent_parent_ids.iter().copied().collect();
     let parent_facts = reader.transaction_facts_by_ids(&parent_ids)?;
     let mut transparent_spends = HashMap::new();
     for transaction in hydrated.transactions_by_block.iter().flatten() {
         for input in &transaction.transparent_inputs {
-            let parent = parent_facts
+            let Some(parent) = parent_facts
                 .get(&input.spent_outpoint.transaction_id)
                 .and_then(|facts| facts.as_ref())
-                .ok_or_else(|| missing_parent_transaction_error(input.spent_outpoint))?;
+            else {
+                if missing_parent_may_precede_history(history_bounds) {
+                    // A checkpoint-bounded store can observe a spend while its
+                    // parent transaction is intentionally outside canonical
+                    // history. Parent lookup does not yet carry height
+                    // provenance, so checkpoint stores conservatively record
+                    // the fee as unavailable instead of inventing one.
+                    continue;
+                }
+                return Err(missing_parent_transaction_error(input.spent_outpoint));
+            };
             let output = parent
                 .transparent_outputs
                 .iter()
@@ -1266,6 +1366,10 @@ fn resolve_transparent_spends(
         }
     }
     Ok(transparent_spends)
+}
+
+const fn missing_parent_may_precede_history(bounds: CanonicalHistoryBounds) -> bool {
+    bounds.preceding_checkpoint().is_some()
 }
 
 fn missing_parent_transaction_error(outpoint: TransparentOutPoint) -> IngestError {
@@ -1322,6 +1426,22 @@ fn next_prepend_end(
         }
     };
     Some(BlockHeight::new(next))
+}
+
+fn validate_backfill_coverage_floor(
+    coverage: Option<PaidFeeDistributionBackfillCoverage>,
+    canonical_history_floor: BlockHeight,
+) -> Result<(), IngestError> {
+    if let Some(coverage) = coverage
+        && coverage.complete_from_height < canonical_history_floor
+    {
+        return Err(IngestError::DeriveDispatch(format!(
+            "paid-fee distribution coverage starts at {}, before canonical history floor {}",
+            coverage.complete_from_height.value(),
+            canonical_history_floor.value()
+        )));
+    }
+    Ok(())
 }
 
 fn backward_batch_start(
@@ -1453,12 +1573,68 @@ mod tests {
     }
 
     #[test]
-    fn target_floor_expansion_is_monotonic() {
+    fn target_floor_expansion_is_monotonic() -> Result<(), IngestError> {
         let persisted = BlockHeight::new(500);
         let requested_shorter = BlockHeight::new(600);
         let requested_longer = BlockHeight::new(400);
-        assert_eq!(persisted.min(requested_shorter), persisted);
-        assert_eq!(persisted.min(requested_longer), requested_longer);
+        let canonical_history_floor = BlockHeight::new(100);
+        assert_eq!(
+            durable_target_floor(Some(persisted), requested_shorter, canonical_history_floor)?,
+            persisted
+        );
+        assert_eq!(
+            durable_target_floor(Some(persisted), requested_longer, canonical_history_floor)?,
+            requested_longer
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_floor_rejects_incompatible_persisted_target() {
+        let outcome = durable_target_floor(
+            Some(BlockHeight::new(100)),
+            BlockHeight::new(600),
+            BlockHeight::new(501),
+        );
+
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn checkpoint_floor_rejects_incompatible_backfill_coverage() {
+        let outcome = validate_backfill_coverage_floor(
+            Some(PaidFeeDistributionBackfillCoverage::new(
+                BlockHeight::new(100),
+                BlockHeight::new(700),
+                1_700_000_000,
+                1_700_001_000,
+            )),
+            BlockHeight::new(501),
+        );
+
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn checkpoint_floor_at_tail_boundary_requires_no_backfill() {
+        assert_eq!(
+            next_prepend_end(None, BlockHeight::new(501), BlockHeight::new(501)),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_parent_is_only_tolerated_for_checkpointed_history() -> Result<(), IngestError> {
+        assert!(!missing_parent_may_precede_history(
+            CanonicalHistoryBounds::complete()
+        ));
+        let checkpointed = CanonicalHistoryBounds::checkpointed(zinder_core::BlockId::new(
+            BlockHeight::new(500),
+            zinder_core::BlockHash::from_bytes([0x55; 32]),
+        ))
+        .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+        assert!(missing_parent_may_precede_history(checkpointed));
+        Ok(())
     }
 
     #[test]

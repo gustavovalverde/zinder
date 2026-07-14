@@ -12,8 +12,7 @@ use zinder_core::{
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessState};
 use zinder_source::{NodeSource, NodeTarget, SourceChainCheckpoint, SourceFailureClass};
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
-    ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, ChainStoreOptions, PrimaryChainStore,
 };
 
 use crate::artifact_builder::{RawBlobPolicy, derive_block_with_raw_blob_policy};
@@ -744,16 +743,7 @@ fn bootstrap_from_checkpoint_if_needed(
         tip_metadata: checkpoint.tip_metadata,
         created_at: current_unix_millis()?,
     };
-    let outcome = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            bootstrap_chain_epoch,
-            Vec::<zinder_core::BlockHeaderArtifact>::new(),
-            Vec::new(),
-        )
-        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
-            height: checkpoint.height,
-        }),
-    )?;
+    let outcome = store.commit_artifactless_checkpoint(bootstrap_chain_epoch)?;
     Ok(Some(outcome.chain_epoch))
 }
 
@@ -2284,6 +2274,12 @@ mod tests {
             event_history.len(),
             3,
             "checkpoint bootstrap commit plus per-block bulk catchup commits"
+        );
+        assert_eq!(
+            store.canonical_history_bounds()?,
+            Some(zinder_core::CanonicalHistoryBounds::checkpointed(
+                BlockId::new(checkpoint_height, checkpoint_hash),
+            )?)
         );
 
         Ok(())

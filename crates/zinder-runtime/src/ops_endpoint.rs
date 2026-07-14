@@ -278,6 +278,10 @@ struct ReadinessResponseBody {
     current_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_preset: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    projection_identities: Vec<String>,
 }
 
 fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseBody>) {
@@ -297,6 +301,8 @@ fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseB
         cause: report.cause,
         current_height: report.current_height,
         target_height: report.target_height,
+        projection_preset: report.projection_preset,
+        projection_identities: report.projection_identities,
     };
 
     (status_code, Json(body))
@@ -316,6 +322,25 @@ fn metrics_handler(state: &MetricsState) -> (StatusCode, String) {
 
 fn record_readiness_metrics(state: &MetricsState) {
     let report = state.readiness.report();
+    if let Some(projection_preset) = &report.projection_preset {
+        metrics::gauge!(
+            "zinder_projection_workload_info",
+            "service" => state.service_name,
+            "network" => state.network_name,
+            "preset" => projection_preset.clone(),
+        )
+        .set(1.0);
+        for projection_identity in &report.projection_identities {
+            metrics::gauge!(
+                "zinder_projection_identity_info",
+                "service" => state.service_name,
+                "network" => state.network_name,
+                "preset" => projection_preset.clone(),
+                "identity" => projection_identity.clone(),
+            )
+            .set(1.0);
+        }
+    }
     let active_cause = report.cause.metric_label();
     for cause in crate::ReadinessCause::ALL_METRIC_LABELS {
         metrics::gauge!(

@@ -6,8 +6,12 @@
 use std::{error::Error, fs, path::Path, process::Command};
 
 use tempfile::tempdir;
-use zinder_core::{ChainEpochId, Network};
-use zinder_derive::{BLOCK_SUMMARY_CONSUMER_NAME, DeriveStore, DeriveStoreOptions};
+use zinder_core::{ChainEpoch, ChainEpochId, Network, wire::encode_rpc_block_hash_hex};
+use zinder_derive::{
+    BLOCK_SUMMARY_CONSUMER_NAME, DeriveStore, DeriveStoreOptions,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::ChainFixture;
 
@@ -76,6 +80,8 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[ingest]"));
+    assert!(stdout.contains("projection_preset = \"complete\""));
+    assert!(stdout.contains("# effective_projection_identities = ["));
     assert!(stdout.contains("reorg_window_blocks = 100"));
     assert!(stdout.contains("[ingest.phases]"));
     assert!(stdout.contains("catchup_threshold_blocks ="));
@@ -111,6 +117,105 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("allow_near_tip_finalize = false"));
     assert!(stdout.contains("coverage = \"explicit\""));
 
+    Ok(())
+}
+
+#[test]
+fn wallet_projection_preset_loads_from_toml_env_and_cli() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("wallet-preset-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let base_config = ingest_config_toml(&storage_path)?;
+
+    let toml_config =
+        base_config.replace("[ingest]\n", "[ingest]\nprojection_preset = \"wallet\"\n");
+    fs::write(&config_path, toml_config)?;
+    let toml_output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+    assert_wallet_projection_config(&toml_output)?;
+
+    fs::write(&config_path, &base_config)?;
+    let env_output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_INGEST__PROJECTION_PRESET", "wallet")
+        .output()?;
+    assert_wallet_projection_config(&env_output)?;
+
+    let cli_output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--projection-preset",
+            "wallet",
+        ])
+        .output()?;
+    assert_wallet_projection_config(&cli_output)?;
+
+    Ok(())
+}
+
+#[test]
+fn print_config_output_round_trips_with_projection_identity_comment() -> Result<(), Box<dyn Error>>
+{
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("round-trip-store");
+    let source_config_path = tempdir.path().join("source.toml");
+    let rendered_config_path = tempdir.path().join("rendered.toml");
+    let config = ingest_config_toml(&storage_path)?
+        .replace("[ingest]\n", "[ingest]\nprojection_preset = \"wallet\"\n");
+    fs::write(&source_config_path, config)?;
+
+    let first_output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&source_config_path)?])
+        .output()?;
+    assert_wallet_projection_config(&first_output)?;
+    fs::write(&rendered_config_path, &first_output.stdout)?;
+
+    let second_output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&rendered_config_path)?,
+        ])
+        .output()?;
+    assert_wallet_projection_config(&second_output)?;
+
+    Ok(())
+}
+
+#[test]
+fn unsupported_projection_preset_fails_before_storage_open() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("unsupported-preset-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = ingest_config_toml(&storage_path)?
+        .replace("[ingest]\n", "[ingest]\nprojection_preset = \"custom\"\n");
+    fs::write(&config_path, config)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("ingest.projection_preset must be one of: wallet, complete"),
+        "{stderr}"
+    );
+    assert!(!storage_path.exists());
+
+    Ok(())
+}
+
+fn assert_wallet_projection_config(output: &std::process::Output) -> Result<(), Box<dyn Error>> {
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout.clone())?;
+    assert!(stdout.contains("projection_preset = \"wallet\""));
+    assert!(stdout.contains(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME.as_str()));
+    assert!(stdout.contains(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str()));
+    assert!(!stdout.contains(BLOCK_SUMMARY_CONSUMER_NAME.as_str()));
     Ok(())
 }
 
@@ -228,25 +333,57 @@ fn backup_print_config_loads_config_file() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn assert_complete_backup_manifest(
+    checkpoint_path: &Path,
+    expected_chain_epoch: ChainEpoch,
+) -> Result<(), Box<dyn Error>> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(
+        checkpoint_path.join("zinder-backup-manifest.json"),
+    )?)?;
+    assert_eq!(manifest["format_version"], 2);
+    assert_eq!(manifest["network"], "zcash-regtest");
+    assert_eq!(manifest["projection_preset"], "complete");
+    assert_eq!(
+        manifest["canonical_position"]["visible_tip_hash"],
+        encode_rpc_block_hash_hex(expected_chain_epoch.visible_tip_hash)
+    );
+    assert_eq!(
+        manifest["canonical_position"]["artifact_schema_version"],
+        expected_chain_epoch.artifact_schema_version.value()
+    );
+    let projections = manifest["projections"]
+        .as_array()
+        .ok_or("projection manifest must be an array")?;
+    assert_eq!(projections.len(), DeriveStore::bundled_consumers().len());
+    let block_summary = projections
+        .iter()
+        .find(|projection| projection["identity"] == BLOCK_SUMMARY_CONSUMER_NAME.as_str())
+        .ok_or("block-summary projection manifest missing")?;
+    assert_eq!(block_summary["state"], "exact");
+    assert!(block_summary["cursor"].is_string());
+    Ok(())
+}
+
 #[test]
 fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("backup-source-store");
     let checkpoint_path = tempdir.path().join("backup-checkpoint");
-    let derive_checkpoint_staging_path = checkpoint_path.with_extension("derive");
+    let checkpoint_staging_path = checkpoint_path.with_extension("staging");
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let artifacts = chain_fixture
         .chain_epoch_artifacts(ChainEpochId::new(1))
         .ok_or("chain fixture unexpectedly empty")?;
     let expected_chain_epoch = artifacts.chain_epoch;
-    let expected_derive_cursor = b"derive-cursor";
+    let expected_derive_cursor;
 
     {
         let store = PrimaryChainStore::open(
             &storage_path,
             ChainStoreOptions::for_network(Network::ZcashRegtest),
         )?;
-        store.commit_chain_epoch(artifacts)?;
+        let commit = store.commit_chain_epoch(artifacts)?;
+        expected_derive_cursor = commit.event_envelope.cursor.as_bytes().to_vec();
         let derive_store = DeriveStore::open(
             DeriveStore::path_for_canonical(&storage_path),
             DeriveStoreOptions {
@@ -254,7 +391,8 @@ fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> 
                 ..DeriveStoreOptions::default()
             },
         )?;
-        derive_store.put_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME, expected_derive_cursor)?;
+        derive_store
+            .put_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME, &expected_derive_cursor)?;
     }
 
     let output = zinder_ingest_command()
@@ -287,9 +425,10 @@ fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> 
     )?;
     assert_eq!(
         derive_checkpoint.get_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME)?,
-        Some(expected_derive_cursor.to_vec())
+        Some(expected_derive_cursor)
     );
-    assert!(!derive_checkpoint_staging_path.exists());
+    assert!(!checkpoint_staging_path.exists());
+    assert_complete_backup_manifest(&checkpoint_path, expected_chain_epoch)?;
 
     Ok(())
 }

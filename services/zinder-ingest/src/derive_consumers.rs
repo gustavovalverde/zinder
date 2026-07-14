@@ -34,8 +34,9 @@ use zinder_derive::{
     COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
     ChainEventDispatchInputs, CommitmentRootSearchConsumer, ConsumerProjectionState,
     ConventionalFeeDistributionConsumer, DeriveConsumerName, DeriveStore, DeriveStoreOptions,
-    IronwoodMigrationConsumer, MempoolConsumerEvent, MempoolConsumerEventVariant,
-    MempoolEventCountsConsumer, PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PaidFeeDistributionConsumer,
+    IronwoodMigrationConsumer, MEMPOOL_EVENT_COUNTS_CONSUMER_NAME, MempoolConsumerEvent,
+    MempoolConsumerEventVariant, MempoolEventCountsConsumer, PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
+    PaidFeeDistributionConsumer, ProjectionPreset, ProjectionWriteMeasurement,
     RecentTransactionsConsumer, ReorgIncidentsConsumer,
     TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionComponentSummaryConsumer,
@@ -67,6 +68,8 @@ const DERIVE_REPLAY_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
 const DERIVE_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS: &str = "build_block_contexts";
 const DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS: &str = "read_transparent_spend_facts";
 const DERIVE_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
+const PROJECTION_WRITE_SOURCE_CHAIN_EVENT: &str = "chain_event";
+const PROJECTION_WRITE_SOURCE_MEMPOOL_EVENT: &str = "mempool_event";
 static DERIVE_PROJECTION_WRITE_LOCK: Mutex<()> = parking_lot::const_mutex(());
 
 pub(crate) fn derive_projection_write_guard() -> MutexGuard<'static, ()> {
@@ -104,6 +107,19 @@ const RETENTION_RELEASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 /// multi-block event. A single dense block is still admitted because replay
 /// cannot split below the block boundary.
 const DERIVE_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK: usize = 50_000;
+
+/// Maximum blocks whose transaction facts one derive hydration read may hold.
+///
+/// The projection-row cap is evaluated only after transaction facts are
+/// decoded. Reading every configured replay block before applying that cap
+/// lets a dense historical span retain far more decoded facts than the chunk
+/// will dispatch. This independent prefetch bound limits that unavoidable
+/// look-ahead while preserving batched canonical reads.
+const DERIVE_REPLAY_FACTS_READ_MAX_BLOCKS: usize = 10;
+
+fn bounded_facts_read_groups<T>(staged_blocks: &[T]) -> std::slice::Chunks<'_, T> {
+    staged_blocks.chunks(DERIVE_REPLAY_FACTS_READ_MAX_BLOCKS)
+}
 
 /// Read-ahead keeps at most one extra hydrated batch in memory, and only when
 /// the current batch is comfortably below the projection-row cap.
@@ -216,6 +232,8 @@ struct DeriveReplayBudget {
     /// drains fully; startup returns once the derive plane reaches the handoff
     /// lag or the wall-clock budget.
     bound: DeriveCatchUpBound,
+    /// Process cancellation sampled at replay chunk boundaries.
+    cancel: Option<CancellationToken>,
 }
 
 impl DeriveReplayBudget {
@@ -226,6 +244,7 @@ impl DeriveReplayBudget {
             applied_state: DeriveReplayBudgetState::Normal,
             phase_gate: None,
             bound: DeriveCatchUpBound::Drain,
+            cancel: None,
         }
     }
 
@@ -236,7 +255,29 @@ impl DeriveReplayBudget {
             applied_state: DeriveReplayBudgetState::Normal,
             phase_gate: Some(readiness),
             bound: DeriveCatchUpBound::Drain,
+            cancel: None,
         }
+    }
+
+    fn with_phase_gate_and_cancel(
+        config: IngestDeriveConfig,
+        readiness: Readiness,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            config,
+            memory_state: DeriveReplayBudgetState::Normal,
+            applied_state: DeriveReplayBudgetState::Normal,
+            phase_gate: Some(readiness),
+            bound: DeriveCatchUpBound::Drain,
+            cancel: Some(cancel),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
     }
 
     fn evaluate_current(&mut self) -> EffectiveDeriveReplayLimits {
@@ -383,12 +424,27 @@ pub fn open_primary_derive_store_for_canonical(
     canonical_path: &Path,
     rocksdb_resource_budget: RocksDbResourceBudget,
 ) -> Result<DeriveStore, zinder_derive::DeriveStoreError> {
-    DeriveStore::open(
+    open_primary_derive_store_for_canonical_with_projection_preset(
+        canonical_path,
+        rocksdb_resource_budget,
+        ProjectionPreset::Complete,
+    )
+}
+
+/// Opens the ingest-owned derive store primary with one closed projection
+/// preset.
+pub fn open_primary_derive_store_for_canonical_with_projection_preset(
+    canonical_path: &Path,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    projection_preset: ProjectionPreset,
+) -> Result<DeriveStore, zinder_derive::DeriveStoreError> {
+    DeriveStore::open_with_projection_preset(
         DeriveStore::path_for_canonical(canonical_path),
+        projection_preset,
         DeriveStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
             rocksdb_resource_budget,
+            ..DeriveStoreOptions::default()
         },
     )
 }
@@ -421,6 +477,9 @@ pub fn seed_backfill_owned_consumer_cursors(
         return Ok(());
     };
     let missing_consumers = missing_backfill_consumer_cursors(derive_store, &cursor)?;
+    if missing_consumers.is_empty() {
+        return Ok(());
+    }
     let Some(authoritative_height) =
         derive_store.last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)?
     else {
@@ -592,14 +651,10 @@ pub(crate) fn unanimous_existing_block_consumer_cursor(
     derive_store: &DeriveStore,
 ) -> Result<Option<Vec<u8>>, IngestError> {
     let mut agreed_cursor: Option<Vec<u8>> = None;
-    for consumer_name in DeriveStore::bundled_chain_event_consumer_names()
-        .iter()
-        .copied()
-        .filter(|name| {
-            !BACKFILL_OWNED_BLOCK_CONSUMERS.contains(name)
-                && *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME
-        })
-    {
+    for consumer_name in derive_store.chain_event_consumer_names().filter(|name| {
+        !BACKFILL_OWNED_BLOCK_CONSUMERS.contains(name)
+            && *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME
+    }) {
         let Some(candidate) = derive_store.get_chain_event_cursor(consumer_name)? else {
             return Ok(None);
         };
@@ -622,7 +677,10 @@ fn missing_backfill_consumer_cursors(
     cursor: &[u8],
 ) -> Result<Vec<DeriveConsumerName>, IngestError> {
     let mut missing_consumers = Vec::new();
-    for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS {
+    for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS
+        .into_iter()
+        .filter(|consumer_name| derive_store.has_consumer(*consumer_name))
+    {
         match derive_store.get_chain_event_cursor(consumer_name)? {
             Some(existing) if existing != cursor => {
                 return Err(IngestError::DeriveDispatch(
@@ -757,8 +815,11 @@ pub fn spawn_derive_tailer_task(
             "derive chain-event tailer started"
         );
 
-        let mut replay_budget =
-            DeriveReplayBudget::with_phase_gate(derive_config, historical_work_gate.readiness());
+        let mut replay_budget = DeriveReplayBudget::with_phase_gate_and_cancel(
+            derive_config,
+            historical_work_gate.readiness(),
+            cancel.clone(),
+        );
         loop {
             refresh_historical_work_gate(&chain_store, &derive_store, &historical_work_gate);
             let effective_limits = replay_budget.evaluate_current();
@@ -832,8 +893,8 @@ fn derive_replay_caught_up(
     let canonical_tip = chain_store
         .current_chain_epoch()?
         .map(|epoch| epoch.visible_tip_height);
-    let indexed_height =
-        derive_store.last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)?;
+    let indexed_height = derive_store
+        .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?;
     Ok(canonical_tip.is_none_or(|tip| indexed_height.is_some_and(|indexed| indexed >= tip)))
 }
 
@@ -966,7 +1027,7 @@ enum DeriveCatchUpBound {
 
 impl DeriveCatchUpBound {
     /// Returns whether the catch-up has drained enough to hand off, reading the
-    /// current block-summary head from the derive store.
+    /// current wallet-correctness head shared by every supported preset.
     fn handoff_reached(self, derive_store: &DeriveStore) -> Result<bool, IngestError> {
         let Self::Handoff {
             canonical_tip_height,
@@ -979,13 +1040,14 @@ impl DeriveCatchUpBound {
         if Instant::now() >= deadline {
             return Ok(true);
         }
-        let head = derive_store.last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)?;
+        let head = derive_store
+            .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?;
         Ok(lag_within(canonical_tip_height, head, max_lag_blocks))
     }
 
     /// Returns whether the catch-up has drained enough to hand off given a
-    /// block-summary head already known from the in-flight replay, sparing a
-    /// store read.
+    /// selected projection head already known from the in-flight replay,
+    /// sparing a store read.
     fn handoff_reached_at(self, replayed_through: BlockHeight) -> bool {
         let Self::Handoff {
             canonical_tip_height,
@@ -1074,6 +1136,9 @@ async fn catch_up_derive_store_to_canonical_with_budget(
     let mut last_status_persist: Option<Instant> = None;
     let mut last_release_publish: Option<Instant> = None;
     loop {
+        if replay_budget.is_cancelled() {
+            return Ok(());
+        }
         let effective_limits = replay_budget.evaluate_current();
         record_derive_replay_budget(
             replay_budget.config.replay_policy,
@@ -1104,6 +1169,9 @@ async fn catch_up_derive_store_to_canonical_with_budget(
         }
 
         for envelope in page {
+            if replay_budget.is_cancelled() {
+                return Ok(());
+            }
             let effective_limits = replay_budget.evaluate_current();
             record_derive_replay_budget(
                 replay_budget.config.replay_policy,
@@ -1239,7 +1307,7 @@ async fn replay_chain_event_to_derive(
     let committed_range = committed_block_range_for_chain_event(&envelope)?;
     let block_count = block_height_range_len(committed_range);
     if block_count == 0 {
-        return replay_empty_committed_event(chain_store, derive_store, envelope, committed_range)
+        return replay_empty_committed_event(chain_store, derive_store, envelope)
             .map(DeriveReplayProgress::Advanced);
     }
 
@@ -1257,7 +1325,6 @@ fn replay_empty_committed_event(
     chain_store: &PrimaryChainStore,
     derive_store: &DeriveStore,
     envelope: ChainEventEnvelope,
-    committed_range: BlockHeightRange,
 ) -> Result<StreamCursorTokenV1, IngestError> {
     let contexts = HashMap::new();
     let inputs = ChainEventDispatchInputs {
@@ -1280,7 +1347,11 @@ fn replay_empty_committed_event(
     }
 
     record_derive_replay_event(0, None);
-    record_committed_replay_progress(chain_store, committed_range.end)?;
+    record_committed_replay_progress(
+        chain_store,
+        derive_store,
+        chain_event_replay_progress_height(&envelope),
+    )?;
     Ok(envelope.cursor)
 }
 
@@ -1376,10 +1447,13 @@ async fn replay_committed_event_to_derive_in_batches(
     let mut next_height = committed_range.start;
     let mut pending_replay_batch: Option<PreparedReplayBatchHandle> = None;
     while next_height <= committed_range.end {
+        if stop_replay_if(replay_budget.is_cancelled(), &mut pending_replay_batch) {
+            return Ok(DeriveReplayProgress::Yielded);
+        }
         catch_up_event_only_chain_event_consumers_to_canonical(chain_store, derive_store)?;
         let effective_limits = evaluate_and_record_replay_budget(replay_budget);
-        if effective_limits.state.is_paused() {
-            abort_pending_replay_batch(&mut pending_replay_batch);
+        let replay_paused = effective_limits.state.is_paused();
+        if stop_replay_if(replay_paused, &mut pending_replay_batch) {
             return Ok(DeriveReplayProgress::Yielded);
         }
 
@@ -1398,9 +1472,7 @@ async fn replay_committed_event_to_derive_in_batches(
         let replay_range = prepared_batch.block_range;
         let final_chunk = replay_range.end >= committed_range.end;
         let chunk_event = committed_chain_event_chunk(&envelope.event, replay_range);
-        let following_height = replay_range.end.next().ok_or_else(|| {
-            IngestError::DeriveDispatch("derive replay height overflow".to_owned())
-        })?;
+        let following_height = next_replay_height(replay_range.end)?;
         pending_replay_batch = maybe_spawn_read_ahead_replay_batch(ReadAheadReplayBatchInputs {
             chain_store,
             replay_budget,
@@ -1412,6 +1484,9 @@ async fn replay_committed_event_to_derive_in_batches(
             effective_limits,
         });
 
+        if stop_replay_if(replay_budget.is_cancelled(), &mut pending_replay_batch) {
+            return Ok(DeriveReplayProgress::Yielded);
+        }
         if let Err(error) = dispatch_replay_chunk(
             derive_store,
             &envelope,
@@ -1436,9 +1511,7 @@ async fn replay_committed_event_to_derive_in_batches(
         }
     }
 
-    record_derive_replay_event(block_count, None);
-    record_committed_replay_progress(chain_store, committed_range.end)?;
-    Ok(DeriveReplayProgress::Advanced(envelope.cursor))
+    finish_derive_replay_event(chain_store, derive_store, envelope, block_count)
 }
 
 fn dispatch_replay_chunk(
@@ -1463,6 +1536,22 @@ fn dispatch_replay_chunk(
         &dispatch_outcome,
     );
     dispatch_outcome
+}
+
+fn next_replay_height(height: BlockHeight) -> Result<BlockHeight, IngestError> {
+    height
+        .next()
+        .ok_or_else(|| IngestError::DeriveDispatch("derive replay height overflow".to_owned()))
+}
+
+fn stop_replay_if(
+    should_stop: bool,
+    pending_replay_batch: &mut Option<PreparedReplayBatchHandle>,
+) -> bool {
+    if should_stop {
+        abort_pending_replay_batch(pending_replay_batch);
+    }
+    should_stop
 }
 
 fn abort_pending_replay_batch(pending_replay_batch: &mut Option<PreparedReplayBatchHandle>) {
@@ -1568,12 +1657,28 @@ fn evaluate_and_record_replay_budget(
 
 fn record_committed_replay_progress(
     chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
     replayed_height: BlockHeight,
 ) -> Result<(), IngestError> {
     if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
-        record_derive_replay_progress(replayed_height, tip_height);
+        record_derive_replay_progress(derive_store, replayed_height, tip_height);
     }
     Ok(())
+}
+
+fn finish_derive_replay_event(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    envelope: ChainEventEnvelope,
+    block_count: usize,
+) -> Result<DeriveReplayProgress, IngestError> {
+    record_derive_replay_event(block_count, None);
+    record_committed_replay_progress(
+        chain_store,
+        derive_store,
+        chain_event_replay_progress_height(&envelope),
+    )?;
+    Ok(DeriveReplayProgress::Advanced(envelope.cursor))
 }
 
 async fn replay_reorg_event_to_derive(
@@ -1582,6 +1687,9 @@ async fn replay_reorg_event_to_derive(
     envelope: ChainEventEnvelope,
     replay_budget: &mut DeriveReplayBudget,
 ) -> Result<DeriveReplayProgress, IngestError> {
+    if replay_budget.is_cancelled() {
+        return Ok(DeriveReplayProgress::Yielded);
+    }
     let committed_range = committed_block_range_for_chain_event(&envelope)?;
     let block_count = block_height_range_len(committed_range);
     let effective_limits = replay_budget.evaluate_current();
@@ -1632,6 +1740,9 @@ async fn replay_reorg_event_to_derive(
             return Err(error);
         }
     };
+    if replay_budget.is_cancelled() {
+        return Ok(DeriveReplayProgress::Yielded);
+    }
 
     let inputs = ChainEventDispatchInputs {
         chain_epoch: envelope.chain_epoch,
@@ -1652,18 +1763,18 @@ async fn replay_reorg_event_to_derive(
         return Err(error);
     }
 
-    record_derive_replay_event(block_count, None);
-    if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
-        record_derive_replay_progress(committed_range.end, tip_height);
-    }
-    Ok(DeriveReplayProgress::Advanced(envelope.cursor))
+    finish_derive_replay_event(chain_store, derive_store, envelope, block_count)
 }
 
 fn catch_up_event_only_chain_event_consumers_to_canonical(
     chain_store: &PrimaryChainStore,
     derive_store: &DeriveStore,
 ) -> Result<(), IngestError> {
-    if DeriveStore::bundled_event_only_chain_event_consumer_names().is_empty() {
+    if derive_store
+        .event_only_chain_event_consumer_names()
+        .next()
+        .is_none()
+    {
         return Ok(());
     }
 
@@ -1687,6 +1798,7 @@ fn catch_up_event_only_chain_event_consumers_to_canonical(
 
         for envelope in page {
             cursor = Some(replay_event_only_chain_event_to_derive(
+                chain_store,
                 derive_store,
                 envelope,
             )?);
@@ -1695,6 +1807,7 @@ fn catch_up_event_only_chain_event_consumers_to_canonical(
 }
 
 fn replay_event_only_chain_event_to_derive(
+    chain_store: &PrimaryChainStore,
     derive_store: &DeriveStore,
     envelope: ChainEventEnvelope,
 ) -> Result<StreamCursorTokenV1, IngestError> {
@@ -1713,6 +1826,13 @@ fn replay_event_only_chain_event_to_derive(
         &dispatch_outcome,
     );
     dispatch_outcome?;
+    if let Some(tip_height) = record_current_derive_replay_tip(chain_store)? {
+        record_projection_replay_progress(
+            derive_store.event_only_chain_event_consumer_names(),
+            chain_event_replay_progress_height(&envelope),
+            tip_height,
+        );
+    }
     Ok(envelope.cursor)
 }
 
@@ -1720,11 +1840,14 @@ fn dispatch_event_only_chain_event(
     derive_store: &DeriveStore,
     inputs: ChainEventDispatchInputs<'_>,
 ) -> Result<(), IngestError> {
+    if !derive_store.has_consumer(zinder_derive::REORG_INCIDENTS_CONSUMER_NAME) {
+        return Ok(());
+    }
     let mut reorg_incidents = ReorgIncidentsConsumer::new();
     let mut block_consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 0] = [];
     let mut event_consumers: [&mut dyn zinder_derive::DeriveConsumer; 1] = [&mut reorg_incidents];
     let blocks = HashMap::<BlockHeight, Arc<BlockCommitContext>>::new();
-    derive_store
+    let measurements = derive_store
         .write_chain_event_chunk_with_event_consumers(
             zinder_derive::ChainEventDispatchConsumers {
                 block_consumers: &mut block_consumers,
@@ -1735,6 +1858,7 @@ fn dispatch_event_only_chain_event(
             true,
         )
         .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+    record_projection_write_measurements(&measurements, PROJECTION_WRITE_SOURCE_CHAIN_EVENT, 0);
     Ok(())
 }
 
@@ -1742,8 +1866,8 @@ fn persisted_event_only_chain_event_cursor(
     derive_store: &DeriveStore,
 ) -> Result<Option<StreamCursorTokenV1>, IngestError> {
     let mut cursor: Option<Vec<u8>> = None;
-    for consumer_name in DeriveStore::bundled_event_only_chain_event_consumer_names() {
-        let Some(candidate) = derive_store.get_chain_event_cursor(*consumer_name)? else {
+    for consumer_name in derive_store.event_only_chain_event_consumer_names() {
+        let Some(candidate) = derive_store.get_chain_event_cursor(consumer_name)? else {
             return Ok(None);
         };
         if let Some(existing) = cursor.as_ref() {
@@ -1763,13 +1887,13 @@ fn persisted_chain_event_cursor(
     derive_store: &DeriveStore,
 ) -> Result<Option<StreamCursorTokenV1>, IngestError> {
     let mut cursor: Option<Vec<u8>> = None;
-    let ranking_is_active =
-        TransparentAddressRankingConsumer::active_metadata(derive_store)?.is_some();
-    for consumer_name in DeriveStore::bundled_chain_event_consumer_names()
-        .iter()
-        .filter(|name| ranking_is_active || **name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
+    let ranking_is_active = derive_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
+        && TransparentAddressRankingConsumer::active_metadata(derive_store)?.is_some();
+    for consumer_name in derive_store
+        .chain_event_consumer_names()
+        .filter(|name| ranking_is_active || *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
     {
-        let Some(candidate) = derive_store.get_chain_event_cursor(*consumer_name)? else {
+        let Some(candidate) = derive_store.get_chain_event_cursor(consumer_name)? else {
             // A consumer without a cursor is fresh or was reset by a scoped
             // schema rebuild; it must replay from the earliest retained event
             // while the others re-apply the same deterministic rows idempotently.
@@ -1801,6 +1925,16 @@ fn committed_block_range_for_chain_event(
     Ok(committed.block_range)
 }
 
+/// Returns the canonical position authenticated by a fully consumed event.
+///
+/// A safe-tip-only commit can carry an empty committed range whose sentinel
+/// end is below the visible tip. Derive cursors still advance through the
+/// event's complete chain epoch, so replay progress follows that epoch instead
+/// of regressing to the range sentinel.
+fn chain_event_replay_progress_height(envelope: &ChainEventEnvelope) -> BlockHeight {
+    envelope.chain_epoch.visible_tip_height
+}
+
 /// One block staged for derive replay before its transaction facts are read.
 ///
 /// Phase 1 of [`hydrate_committed_block_replay_batch`] collects these so the
@@ -1813,15 +1947,14 @@ struct StagedReplayBlock {
     transaction_ids: Vec<TransactionId>,
 }
 
-/// Reads each block's header and ordered transaction ids for the replay batch,
-/// returning the staged blocks plus the flat list of every transaction id.
+/// Reads each block's header and ordered transaction ids for the replay batch.
 fn stage_committed_replay_blocks(
     reader: &zinder_store::ChainEpochReader<'_>,
     envelope: &ChainEventEnvelope,
     start_height: BlockHeight,
     end_height: BlockHeight,
     max_blocks: usize,
-) -> Result<(Vec<StagedReplayBlock>, Vec<TransactionId>), IngestError> {
+) -> Result<Vec<StagedReplayBlock>, IngestError> {
     let capacity = usize::try_from(
         end_height
             .value()
@@ -1831,7 +1964,6 @@ fn stage_committed_replay_blocks(
     .unwrap_or(usize::MAX)
     .min(max_blocks);
     let mut staged = Vec::with_capacity(capacity);
-    let mut batch_transaction_ids = Vec::with_capacity(capacity);
     let mut next_height = start_height;
     while next_height <= end_height && staged.len() < max_blocks {
         let height = next_height;
@@ -1844,7 +1976,6 @@ fn stage_committed_replay_blocks(
         };
         let transaction_ids = reader.transaction_ids_at_height(height)?;
         let final_note_commitment_roots = reader.final_note_commitment_roots_at(height)?;
-        batch_transaction_ids.extend_from_slice(&transaction_ids);
         staged.push(StagedReplayBlock {
             height,
             header,
@@ -1855,7 +1986,7 @@ fn stage_committed_replay_blocks(
             IngestError::DeriveDispatch("derive replay height overflow".to_owned())
         })?;
     }
-    Ok((staged, batch_transaction_ids))
+    Ok(staged)
 }
 
 fn hydrate_committed_block_replay_batch(
@@ -1874,54 +2005,58 @@ fn hydrate_committed_block_replay_batch(
         ));
     }
 
-    // Phase 1: read each block's header and ordered transaction ids.
-    let (staged, batch_transaction_ids) =
+    // Phase 1: read each block's header and ordered transaction ids. These
+    // artifacts are compact enough to stage up to the configured block bound.
+    let staged =
         stage_committed_replay_blocks(&reader, envelope, start_height, end_height, max_blocks)?;
-    let staged_headers_by_height: HashMap<BlockHeight, BlockHeaderArtifact> = staged
-        .iter()
-        .map(|staged_block| (staged_block.height, staged_block.header.clone()))
-        .collect();
 
-    // Phase 2: one batched facts read for the whole replay batch. Canonical
-    // transaction ids are chain-unique, so a single map distributes back to
-    // each block without collision. The reorg-safety cross-check reuses the
-    // headers staged above instead of re-reading them per unique height.
-    let mut facts_by_id = reader.transaction_facts_by_ids_with_known_headers(
-        &batch_transaction_ids,
-        &staged_headers_by_height,
-    )?;
-
-    // Phase 3: assemble each block's ordered transactions from the shared map.
+    // Phase 2: read and assemble transaction facts in bounded groups. The
+    // projection-row cap cannot be evaluated until facts are decoded, so a
+    // separate facts-read bound prevents dense history from hydrating the
+    // entire configured replay batch only to discard most of it.
     let mut replay_blocks = Vec::with_capacity(staged.len());
     let mut projection_rows = DeriveReplayProjectionRows::default();
-    for staged_block in staged {
-        let mut transactions = Vec::with_capacity(staged_block.transaction_ids.len());
-        for transaction_id in staged_block.transaction_ids {
-            let Some(transaction) = facts_by_id.remove(&transaction_id).flatten() else {
-                return Err(IngestError::DeriveDispatch(format!(
-                    "committed chain event {} references unavailable transaction facts {}",
-                    envelope.event_sequence,
-                    hex::encode(transaction_id.as_bytes())
-                )));
-            };
-            transactions.push(transaction);
+    'facts_groups: for staged_group in bounded_facts_read_groups(&staged) {
+        let transaction_ids = staged_group
+            .iter()
+            .flat_map(|staged_block| staged_block.transaction_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let headers_by_height = staged_group
+            .iter()
+            .map(|staged_block| (staged_block.height, staged_block.header.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut facts_by_id = reader
+            .transaction_facts_by_ids_with_known_headers(&transaction_ids, &headers_by_height)?;
+
+        for staged_block in staged_group {
+            let mut transactions = Vec::with_capacity(staged_block.transaction_ids.len());
+            for transaction_id in &staged_block.transaction_ids {
+                let Some(transaction) = facts_by_id.remove(transaction_id).flatten() else {
+                    return Err(IngestError::DeriveDispatch(format!(
+                        "committed chain event {} references unavailable transaction facts {}",
+                        envelope.event_sequence,
+                        hex::encode(transaction_id.as_bytes())
+                    )));
+                };
+                transactions.push(transaction);
+            }
+            let block_projection_rows = projection_rows_for_transactions(&transactions);
+            if should_start_new_projection_chunk(projection_rows, block_projection_rows) {
+                break 'facts_groups;
+            }
+            projection_rows = projection_rows.saturating_add(block_projection_rows);
+            let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
+            replay_blocks.push(CanonicalReplayBlock {
+                height: staged_block.height,
+                block_hash: staged_block.header.block_hash,
+                previous_block_hash: staged_block.header.parent_hash,
+                block_time_unix_seconds: staged_block.header.block_time,
+                block_size_bytes: staged_block.header.block_size_bytes,
+                transactions,
+                final_note_commitment_roots: staged_block.final_note_commitment_roots,
+                transparent_spends,
+            });
         }
-        let block_projection_rows = projection_rows_for_transactions(&transactions);
-        if should_start_new_projection_chunk(projection_rows, block_projection_rows) {
-            break;
-        }
-        projection_rows = projection_rows.saturating_add(block_projection_rows);
-        let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
-        replay_blocks.push(CanonicalReplayBlock {
-            height: staged_block.height,
-            block_hash: staged_block.header.block_hash,
-            previous_block_hash: staged_block.header.parent_hash,
-            block_time_unix_seconds: staged_block.header.block_time,
-            block_size_bytes: staged_block.header.block_size_bytes,
-            transactions,
-            final_note_commitment_roots: staged_block.final_note_commitment_roots,
-            transparent_spends,
-        });
     }
 
     let Some(first) = replay_blocks.first() else {
@@ -2031,7 +2166,7 @@ pub(crate) fn dispatch_chain_event(
     let mut transparent_transaction_history = TransparentAddressTransactionHistoryConsumer::new();
     let mut transparent_outpoint_spend = TransparentOutpointSpendConsumer::new();
     let mut value_pool_flow_history = ValuePoolFlowHistoryConsumer::new();
-    let mut consumers: Vec<&mut dyn zinder_derive::BlockKeyedConsumer> = vec![
+    let all_consumers: [&mut dyn zinder_derive::BlockKeyedConsumer; 15] = [
         &mut block_production_time,
         &mut block_summary,
         &mut ironwood_migration,
@@ -2048,12 +2183,23 @@ pub(crate) fn dispatch_chain_event(
         &mut transparent_outpoint_spend,
         &mut value_pool_flow_history,
     ];
-    if TransparentAddressRankingConsumer::active_metadata(derive_store)?.is_some() {
+    let mut consumers: Vec<&mut dyn zinder_derive::BlockKeyedConsumer> = all_consumers
+        .into_iter()
+        .filter(|consumer| derive_store.has_consumer(consumer.name()))
+        .collect();
+    if derive_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
+        && TransparentAddressRankingConsumer::active_metadata(derive_store)?.is_some()
+    {
         consumers.push(&mut transparent_ranking);
     }
-    derive_store
+    let measurements = derive_store
         .write_chain_event_chunk(consumers.as_mut_slice(), inputs, blocks, advance_cursor)
         .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+    record_projection_write_measurements(
+        &measurements,
+        PROJECTION_WRITE_SOURCE_CHAIN_EVENT,
+        blocks.len(),
+    );
     Ok(())
 }
 
@@ -2063,6 +2209,9 @@ pub(crate) fn dispatch_mempool_event(
     derive_store: &DeriveStore,
     envelope: &MempoolEventEnvelope,
 ) -> Result<(), IngestError> {
+    if !derive_store.has_consumer(MEMPOOL_EVENT_COUNTS_CONSUMER_NAME) {
+        return Ok(());
+    }
     match &envelope.event {
         MempoolEvent::Added { entry } => {
             let transaction_id = entry.transaction_id.as_bytes();
@@ -2128,9 +2277,14 @@ fn apply_mempool_event(
     cursor_bytes: &[u8],
 ) -> Result<(), IngestError> {
     let mut event_counts = MempoolEventCountsConsumer::new();
-    derive_store
+    let measurement = derive_store
         .write_mempool_event(&mut event_counts, event, cursor_bytes)
         .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+    record_projection_write_measurements(
+        std::slice::from_ref(&measurement),
+        PROJECTION_WRITE_SOURCE_MEMPOOL_EVENT,
+        0,
+    );
     Ok(())
 }
 
@@ -2576,11 +2730,83 @@ fn record_derive_replay_event(block_count: usize, error: Option<&IngestError>) {
     .increment(usize_to_u64_saturating(block_count));
 }
 
-fn record_derive_replay_progress(progress_height: BlockHeight, canonical_tip_height: BlockHeight) {
+fn record_projection_write_measurements(
+    measurements: &[ProjectionWriteMeasurement],
+    source: &'static str,
+    block_count: usize,
+) {
+    for measurement in measurements {
+        let projection = measurement.projection.as_str();
+        metrics::counter!(
+            "zinder_ingest_projection_write_operations_total",
+            "projection" => projection,
+            "source" => source
+        )
+        .increment(measurement.operations);
+        metrics::counter!(
+            "zinder_ingest_projection_write_bytes_total",
+            "projection" => projection,
+            "source" => source
+        )
+        .increment(measurement.logical_bytes);
+        metrics::histogram!(
+            "zinder_ingest_projection_dispatch_duration_seconds",
+            "projection" => projection,
+            "source" => source
+        )
+        .record(measurement.dispatch_duration);
+        if source == PROJECTION_WRITE_SOURCE_CHAIN_EVENT {
+            metrics::counter!(
+                "zinder_ingest_projection_replay_dispatches_total",
+                "projection" => projection
+            )
+            .increment(1);
+            metrics::counter!(
+                "zinder_ingest_projection_replay_blocks_total",
+                "projection" => projection
+            )
+            .increment(usize_to_u64_saturating(block_count));
+        }
+    }
+}
+
+fn record_derive_replay_progress(
+    derive_store: &DeriveStore,
+    progress_height: BlockHeight,
+    canonical_tip_height: BlockHeight,
+) {
     record_derive_replay_status_metrics(
         Some(progress_height.value()),
         Some(canonical_tip_height.value()),
     );
+    record_projection_replay_progress(
+        derive_store.chain_event_consumer_names(),
+        progress_height,
+        canonical_tip_height,
+    );
+}
+
+fn record_projection_replay_progress(
+    projections: impl IntoIterator<Item = DeriveConsumerName>,
+    progress_height: BlockHeight,
+    canonical_tip_height: BlockHeight,
+) {
+    let replay_lag_blocks = canonical_tip_height
+        .value()
+        .saturating_sub(progress_height.value());
+    for projection in projections {
+        let projection = projection.as_str();
+        metrics::gauge!(
+            "zinder_ingest_projection_replay_height",
+            "projection" => projection
+        )
+        .set(f64::from(progress_height.value()));
+        metrics::gauge!(
+            "zinder_ingest_projection_replay_lag_blocks",
+            "projection" => projection
+        )
+        .set(f64::from(replay_lag_blocks));
+    }
 }
 
 fn record_derive_replay_status_metrics(
@@ -2619,11 +2845,20 @@ fn persist_derive_status(
     derive_store: &DeriveStore,
     budget_state: DeriveReplayBudgetState,
 ) {
-    let indexed_height = derive_store
-        .last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)
-        .ok()
-        .flatten()
-        .map(BlockHeight::value);
+    let indexed_height = match derive_store
+        .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)
+    {
+        Ok(indexed_height) => indexed_height.map(BlockHeight::value),
+        Err(error) => {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "derive_status_projection_head_read_failed",
+                error = %error,
+                "failed to read the shared wallet-correctness projection head",
+            );
+            return;
+        }
+    };
     let canonical_tip = record_current_derive_replay_tip(chain_store)
         .ok()
         .flatten()
@@ -2794,6 +3029,10 @@ fn u64_to_f64(sample: u64) -> f64 {
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
+    use zinder_core::{
+        ArtifactSchemaVersion, ChainEpoch, ChainTipMetadata, Network, UnixTimestampMillis,
+    };
+
     use super::*;
 
     fn derive_store() -> Result<(tempfile::TempDir, DeriveStore), IngestError> {
@@ -2809,6 +3048,174 @@ mod tests {
             },
         )?;
         Ok((tempdir, store))
+    }
+
+    fn wallet_derive_store() -> Result<(tempfile::TempDir, DeriveStore), IngestError> {
+        let tempdir = tempfile::tempdir().map_err(|error| {
+            IngestError::DeriveDispatch(format!("create derive test directory: {error}"))
+        })?;
+        let store = DeriveStore::open_with_projection_preset(
+            tempdir.path(),
+            zinder_derive::ProjectionPreset::Wallet,
+            DeriveStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..DeriveStoreOptions::default()
+            },
+        )?;
+        Ok((tempdir, store))
+    }
+
+    #[test]
+    fn wallet_preset_ignores_optional_mempool_projection() -> Result<(), IngestError> {
+        let (_tempdir, store) = wallet_derive_store()?;
+        let envelope = MempoolEventEnvelope {
+            cursor: StreamCursorTokenV1::from_bytes(vec![0xA5; 64]),
+            event_sequence: 1,
+            source_observed_unix_millis: 1,
+            event: MempoolEvent::Suppressed {
+                transaction_id: TransactionId::from_bytes([0x42; 32]),
+            },
+        };
+
+        dispatch_mempool_event(&store, &envelope)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_correctness_head_can_open_the_historical_work_gate() -> Result<(), IngestError> {
+        let canonical_tempdir = tempfile::tempdir().map_err(|error| {
+            IngestError::DeriveDispatch(format!("create canonical test directory: {error}"))
+        })?;
+        let chain_store = PrimaryChainStore::open(
+            canonical_tempdir.path(),
+            zinder_store::ChainStoreOptions::for_local_tests(),
+        )?;
+        let tip_height = BlockHeight::new(10);
+        let tip_hash = BlockHash::from_bytes([0x42; 32]);
+        chain_store.commit_artifactless_checkpoint(ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: tip_height,
+            visible_tip_hash: tip_hash,
+            settled_tip_height: tip_height,
+            settled_tip_hash: tip_hash,
+            artifact_schema_version: ArtifactSchemaVersion::new(18),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1),
+        })?;
+        let (_derive_tempdir, derive_store) = wallet_derive_store()?;
+        derive_store.put_consumer(
+            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+            &zinder_core::wire::encode_height_key_ascending(tip_height),
+            &[],
+        )?;
+
+        assert!(derive_replay_caught_up(&chain_store, &derive_store)?);
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_preset_skips_optional_startup_cursor_seeding() -> Result<(), IngestError> {
+        let canonical_tempdir = tempfile::tempdir().map_err(|error| {
+            IngestError::DeriveDispatch(format!("create canonical test directory: {error}"))
+        })?;
+        let chain_store = PrimaryChainStore::open(
+            canonical_tempdir.path(),
+            zinder_store::ChainStoreOptions::for_local_tests(),
+        )?;
+        let (_derive_tempdir, derive_store) = wallet_derive_store()?;
+        let cursor = [0xA5; 64];
+        for schema in zinder_derive::ProjectionPreset::Wallet.consumer_schemas() {
+            derive_store.put_chain_event_cursor(schema.name, &cursor)?;
+        }
+
+        assert_eq!(
+            super::unanimous_existing_block_consumer_cursor(&derive_store)?,
+            Some(cursor.to_vec())
+        );
+        super::seed_backfill_owned_consumer_cursors(&chain_store, &derive_store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_preset_reports_live_from_the_shared_spend_projection_head() -> Result<(), IngestError>
+    {
+        let canonical_tempdir = tempfile::tempdir().map_err(|error| {
+            IngestError::DeriveDispatch(format!("create canonical test directory: {error}"))
+        })?;
+        let chain_store = PrimaryChainStore::open(
+            canonical_tempdir.path(),
+            zinder_store::ChainStoreOptions::for_local_tests(),
+        )?;
+        let tip_height = BlockHeight::new(10);
+        let tip_hash = BlockHash::from_bytes([0x42; 32]);
+        let chain_epoch = ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: tip_height,
+            visible_tip_hash: tip_hash,
+            settled_tip_height: tip_height,
+            settled_tip_hash: tip_hash,
+            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1),
+        };
+        chain_store.commit_artifactless_checkpoint(chain_epoch)?;
+        let (_derive_tempdir, derive_store) = wallet_derive_store()?;
+        derive_store.put_consumer(
+            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+            &zinder_core::wire::encode_height_key_ascending(tip_height),
+            &[],
+        )?;
+
+        persist_derive_status(&chain_store, &derive_store, DeriveReplayBudgetState::Normal);
+
+        let encoded = derive_store.get_derive_status()?.ok_or_else(|| {
+            IngestError::DeriveDispatch("derive status was not persisted".to_owned())
+        })?;
+        let status = DeriveStatus::decode(encoded.as_slice()).map_err(|error| {
+            IngestError::DeriveDispatch(format!("decode derive status: {error}"))
+        })?;
+        assert_eq!(status.indexed_height, tip_height.value());
+        assert_eq!(status.lag_blocks, 0);
+        assert_eq!(status.health, DeriveHealth::Live as i32);
+        Ok(())
+    }
+
+    #[test]
+    fn safe_tip_only_event_progress_uses_the_visible_tip() {
+        let visible_tip_height = BlockHeight::new(2_588);
+        let settled_tip_height = BlockHeight::new(2_488);
+        let chain_epoch = ChainEpoch {
+            id: ChainEpochId::new(2),
+            network: Network::ZcashRegtest,
+            visible_tip_height,
+            visible_tip_hash: BlockHash::from_bytes([0x42; 32]),
+            settled_tip_height,
+            settled_tip_hash: BlockHash::from_bytes([0x24; 32]),
+            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(2),
+        };
+        let empty_range = BlockHeightRange::empty_at(settled_tip_height);
+        let envelope = ChainEventEnvelope {
+            cursor: StreamCursorTokenV1::from_bytes(vec![0xA5; 64]),
+            event_sequence: 2,
+            chain_epoch,
+            safe_tip_height: settled_tip_height,
+            event: ChainEvent::ChainCommitted {
+                committed: zinder_store::ChainEpochCommitted {
+                    chain_epoch,
+                    block_range: empty_range,
+                },
+            },
+        };
+
+        assert_eq!(empty_range.end, settled_tip_height);
+        assert_eq!(
+            chain_event_replay_progress_height(&envelope),
+            visible_tip_height
+        );
     }
 
     fn seed_existing_block_consumer_cursors(
@@ -3229,6 +3636,29 @@ mod tests {
     }
 
     #[test]
+    fn replay_without_a_phase_gate_is_allowed() {
+        let mut budget = DeriveReplayBudget::new(continuous_config());
+
+        let limits = budget.evaluate_current();
+
+        assert!(!limits.phase_gate_engaged);
+        assert_eq!(limits.state, DeriveReplayBudgetState::Normal);
+        assert_eq!(limits.batch_blocks, 100);
+    }
+
+    #[test]
+    fn installed_but_unclassified_phase_gate_pauses_replay() {
+        let readiness = Readiness::default();
+        let mut budget = DeriveReplayBudget::with_phase_gate(continuous_config(), readiness);
+
+        let limits = budget.evaluate_current();
+
+        assert!(limits.phase_gate_engaged);
+        assert_eq!(limits.state, DeriveReplayBudgetState::Paused);
+        assert_eq!(limits.batch_blocks, 0);
+    }
+
+    #[test]
     fn awaiting_upstream_phase_pauses_replay() {
         let mut budget = DeriveReplayBudget::new(continuous_config());
 
@@ -3302,6 +3732,20 @@ mod tests {
     }
 
     #[test]
+    fn replay_budget_observes_process_cancellation() {
+        let cancel = CancellationToken::new();
+        let budget = DeriveReplayBudget::with_phase_gate_and_cancel(
+            replay_config(),
+            Readiness::default(),
+            cancel.clone(),
+        );
+
+        assert!(!budget.is_cancelled());
+        cancel.cancel();
+        assert!(budget.is_cancelled());
+    }
+
+    #[test]
     fn phase_gate_transition_logs_once_per_flip() {
         let mut last_engaged = None;
 
@@ -3348,6 +3792,26 @@ mod tests {
             current_rows,
             next_block_rows,
         ));
+    }
+
+    #[test]
+    fn facts_reads_never_hydrate_more_than_the_prefetch_bound() {
+        let staged_blocks = (0..DERIVE_REPLAY_FACTS_READ_MAX_BLOCKS
+            .saturating_mul(2)
+            .saturating_add(1))
+            .collect::<Vec<_>>();
+        let group_lengths = bounded_facts_read_groups(&staged_blocks)
+            .map(<[_]>::len)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            group_lengths,
+            vec![
+                DERIVE_REPLAY_FACTS_READ_MAX_BLOCKS,
+                DERIVE_REPLAY_FACTS_READ_MAX_BLOCKS,
+                1,
+            ]
+        );
     }
 
     #[test]

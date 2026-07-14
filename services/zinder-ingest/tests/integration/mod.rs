@@ -4,6 +4,7 @@ mod event_stream_start;
 mod fixture_block;
 mod ingest_loop;
 mod mempool_pipeline;
+mod projection_startup;
 mod startup_handoff;
 mod tip_follow_recovery;
 mod value_pools;

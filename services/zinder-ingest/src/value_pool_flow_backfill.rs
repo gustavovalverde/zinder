@@ -24,7 +24,6 @@ use crate::{
     },
 };
 
-const BACKFILL_START_HEIGHT: BlockHeight = BlockHeight::new(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -223,8 +222,18 @@ async fn backfill_next_batch(
     config: ValuePoolFlowBackfillConfig,
     context: &ValuePoolFlowBackfillContext,
 ) -> Result<BackfillProgress, IngestError> {
+    let canonical_history_floor = context
+        .chain_store
+        .canonical_history_bounds()?
+        .ok_or_else(|| {
+            IngestError::DeriveDispatch(
+                "canonical history bounds are unavailable during value-pool flow backfill"
+                    .to_owned(),
+            )
+        })?
+        .first_available_height();
     let coverage = ValuePoolFlowHistoryConsumer::backfill_coverage(&context.derive_store)?;
-    let next = next_backfill_height(coverage)?;
+    let next = next_backfill_height(coverage, canonical_history_floor)?;
     let Some(epoch) = context.chain_store.current_chain_epoch()? else {
         return Ok(BackfillProgress::CaughtUp);
     };
@@ -255,7 +264,7 @@ async fn backfill_next_batch(
         .ok_or_else(empty_batch_error)?
         .block_time_unix_seconds;
     let next_coverage = ValuePoolFlowBackfillCoverage::new(
-        coverage.map_or(BACKFILL_START_HEIGHT, |current| {
+        coverage.map_or(canonical_history_floor, |current| {
             current.complete_from_height
         }),
         through,
@@ -290,14 +299,17 @@ fn empty_batch_error() -> IngestError {
 
 fn next_backfill_height(
     coverage: Option<ValuePoolFlowBackfillCoverage>,
+    canonical_history_floor: BlockHeight,
 ) -> Result<BlockHeight, IngestError> {
     let Some(coverage) = coverage else {
-        return Ok(BACKFILL_START_HEIGHT);
+        return Ok(canonical_history_floor);
     };
-    if coverage.complete_from_height != BACKFILL_START_HEIGHT {
-        return Err(IngestError::DeriveDispatch(
-            "value-pool flow historical coverage does not start at height 1".to_owned(),
-        ));
+    if coverage.complete_from_height != canonical_history_floor {
+        return Err(IngestError::DeriveDispatch(format!(
+            "value-pool flow backfill coverage starts at {}, expected canonical history floor {}",
+            coverage.complete_from_height.value(),
+            canonical_history_floor.value()
+        )));
     }
     coverage.complete_through_height.next().ok_or_else(|| {
         IngestError::DeriveDispatch("value-pool flow backfill height overflow".to_owned())
@@ -383,17 +395,39 @@ mod tests {
 
     #[test]
     fn restart_resumes_after_durable_coverage() -> Result<(), IngestError> {
-        assert_eq!(next_backfill_height(None)?, BlockHeight::new(1));
+        let canonical_history_floor = BlockHeight::new(501);
         assert_eq!(
-            next_backfill_height(Some(ValuePoolFlowBackfillCoverage::new(
-                BlockHeight::new(1),
-                BlockHeight::new(256),
-                10,
-                20,
-            )))?,
-            BlockHeight::new(257)
+            next_backfill_height(None, canonical_history_floor)?,
+            canonical_history_floor
+        );
+        assert_eq!(
+            next_backfill_height(
+                Some(ValuePoolFlowBackfillCoverage::new(
+                    canonical_history_floor,
+                    BlockHeight::new(756),
+                    10,
+                    20,
+                )),
+                canonical_history_floor
+            )?,
+            BlockHeight::new(757)
         );
         Ok(())
+    }
+
+    #[test]
+    fn restart_rejects_coverage_below_checkpoint_floor() {
+        let outcome = next_backfill_height(
+            Some(ValuePoolFlowBackfillCoverage::new(
+                BlockHeight::new(1),
+                BlockHeight::new(500),
+                10,
+                20,
+            )),
+            BlockHeight::new(501),
+        );
+
+        assert!(outcome.is_err());
     }
 
     #[test]

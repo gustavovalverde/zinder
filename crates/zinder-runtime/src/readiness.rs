@@ -396,6 +396,12 @@ pub struct ReadinessReport {
     /// [ADR-0015]: ../../../docs/adrs/0015-unified-phase-driven-ingest.md
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<IngestPhase>,
+    /// Selected closed projection workload, when this service opened one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_preset: Option<String>,
+    /// Stable identities selected by [`Self::projection_preset`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub projection_identities: Vec<String>,
 }
 
 impl ReadinessReport {
@@ -408,8 +414,16 @@ impl ReadinessReport {
             current_height: None,
             target_height: None,
             phase: None,
+            projection_preset: None,
+            projection_identities: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProjectionWorkload {
+    preset: Option<String>,
+    identities: Vec<String>,
 }
 
 /// Internal readiness state guarded by an `Arc<Mutex<_>>` so HTTP handlers
@@ -417,6 +431,7 @@ impl ReadinessReport {
 #[derive(Clone, Debug)]
 pub struct Readiness {
     inner: Arc<Mutex<ReadinessState>>,
+    projection_workload: Arc<Mutex<ProjectionWorkload>>,
 }
 
 impl Default for Readiness {
@@ -431,7 +446,16 @@ impl Readiness {
     pub fn new(state: ReadinessState) -> Self {
         Self {
             inner: Arc::new(Mutex::new(state)),
+            projection_workload: Arc::new(Mutex::new(ProjectionWorkload::default())),
         }
+    }
+
+    /// Sets the closed projection workload exposed by readiness and metrics.
+    pub fn set_projection_workload(&self, preset: impl Into<String>, identities: Vec<String>) {
+        *self.projection_workload.lock() = ProjectionWorkload {
+            preset: Some(preset.into()),
+            identities,
+        };
     }
 
     /// Replaces the readiness cause and heights, preserving the ingest loop
@@ -494,12 +518,15 @@ impl Readiness {
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
         let state = self.inner.lock().clone();
+        let projection_workload = self.projection_workload.lock().clone();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
             cause: state.cause,
             current_height: state.current_height,
             target_height: state.target_height,
             phase: state.phase,
+            projection_preset: projection_workload.preset,
+            projection_identities: projection_workload.identities,
         }
     }
 }
@@ -874,6 +901,8 @@ impl From<&ReadinessReport> for ops_proto::ReadinessReport {
             current_height: report.current_height,
             target_height: report.target_height,
             detail: Option::<ops_proto::ReadinessCauseDetail>::from(&report.cause),
+            projection_preset: report.projection_preset.clone().unwrap_or_default(),
+            projection_identities: report.projection_identities.clone(),
         }
     }
 }
@@ -947,6 +976,30 @@ mod tests {
         assert!(
             rendered.get("phase").is_none(),
             "reader binaries must not surface a `phase` field; got {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn projection_workload_survives_readiness_state_changes() -> Result<(), serde_json::Error> {
+        let readiness = Readiness::default();
+        readiness.set_projection_workload(
+            "wallet",
+            vec![
+                "transparent_address_transaction_history".to_owned(),
+                "transparent_outpoint_spend".to_owned(),
+            ],
+        );
+        readiness.set(ReadinessState::ready(Some(10)));
+
+        let report = readiness.report();
+        assert_eq!(report.projection_preset.as_deref(), Some("wallet"));
+        assert_eq!(report.projection_identities.len(), 2);
+        let rendered = serde_json::to_value(report)?;
+        assert_eq!(rendered["projection_preset"], "wallet");
+        assert_eq!(
+            rendered["projection_identities"].as_array().map(Vec::len),
+            Some(2)
         );
         Ok(())
     }
@@ -1261,6 +1314,8 @@ mod tests {
             current_height: Some(100),
             target_height: None,
             phase: None,
+            projection_preset: Some("wallet".to_owned()),
+            projection_identities: vec!["transparent_outpoint_spend".to_owned()],
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1270,6 +1325,8 @@ mod tests {
         );
         assert_eq!(proto.current_height, Some(100));
         assert_eq!(proto.target_height, None);
+        assert_eq!(proto.projection_preset, "wallet");
+        assert_eq!(proto.projection_identities, ["transparent_outpoint_spend"]);
 
         let Some(detail) = proto.detail else {
             unreachable!("parametric cause must carry detail")
@@ -1293,6 +1350,8 @@ mod tests {
             current_height: None,
             target_height: None,
             phase: None,
+            projection_preset: None,
+            projection_identities: Vec::new(),
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1316,6 +1375,8 @@ mod tests {
             current_height: Some(4_013_801),
             target_height: None,
             phase: None,
+            projection_preset: None,
+            projection_identities: Vec::new(),
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);

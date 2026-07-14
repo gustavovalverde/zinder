@@ -12,6 +12,10 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockId, ChainValuePool, ChainValuePools, Network, ShieldedProtocol,
     SubtreeRootIndex,
 };
+use zinder_derive::{
+    ProjectionPreset, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+};
 use zinder_ingest::IngestControlGrpcAdapter;
 use zinder_proto::capabilities::INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_proto::v1::{
@@ -22,6 +26,32 @@ use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceSubtreeRoots,
 };
 use zinder_testkit::StoreFixture;
+
+#[tokio::test]
+async fn ingest_control_reports_the_selected_projection_workload() -> Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let adapter =
+        IngestControlGrpcAdapter::new(Network::ZcashRegtest, store_fixture.chain_store().clone())
+            .with_projection_preset(ProjectionPreset::Wallet);
+
+    let info = IngestControlService::server_info(&adapter, Request::new(ServerInfoRequest {}))
+        .await?
+        .into_inner()
+        .server_info
+        .ok_or_else(|| eyre::eyre!("server_info missing"))?;
+
+    assert_eq!(info.projection_preset, "wallet");
+    assert_eq!(
+        info.projection_identities,
+        [
+            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME
+                .as_str()
+                .to_owned(),
+            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str().to_owned(),
+        ]
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn ingest_control_advertises_value_pools_only_when_source_supports_them() -> Result<()> {

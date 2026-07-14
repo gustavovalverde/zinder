@@ -19,7 +19,6 @@ use crate::{
     ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
 };
 
-const BACKFILL_START_HEIGHT: BlockHeight = BlockHeight::new(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -181,10 +180,18 @@ async fn backfill_next_historical_batch(
     config: ValuePoolBalanceBackfillConfig,
     context: &ValuePoolBalanceBackfillContext,
 ) -> Result<HistoricalProgress, IngestError> {
+    let canonical_history_floor = context
+        .chain_store
+        .canonical_history_bounds()?
+        .ok_or_else(|| {
+            IngestError::DeriveDispatch(
+                "canonical history bounds are unavailable during value-pool balance backfill"
+                    .to_owned(),
+            )
+        })?
+        .first_available_height();
     let coverage = ValuePoolBalanceHistoryConsumer::backfill_coverage(&context.derive_store)?;
-    let next = coverage.map_or(Some(BACKFILL_START_HEIGHT), |current| {
-        current.complete_through_height.next()
-    });
+    let next = next_historical_height(coverage, canonical_history_floor)?;
     let Some(next) = next else {
         return Ok(HistoricalProgress::CaughtUp);
     };
@@ -201,7 +208,7 @@ async fn backfill_next_historical_batch(
     )?;
     let contexts = hydrate_candidates(config, context, candidates).await?;
     let next_coverage = ValuePoolBalanceBackfillCoverage::new(
-        coverage.map_or(BACKFILL_START_HEIGHT, |current| {
+        coverage.map_or(canonical_history_floor, |current| {
             current.complete_from_height
         }),
         through,
@@ -216,6 +223,23 @@ async fn backfill_next_historical_batch(
         from: next,
         through,
     })
+}
+
+fn next_historical_height(
+    coverage: Option<ValuePoolBalanceBackfillCoverage>,
+    canonical_history_floor: BlockHeight,
+) -> Result<Option<BlockHeight>, IngestError> {
+    let Some(coverage) = coverage else {
+        return Ok(Some(canonical_history_floor));
+    };
+    if coverage.complete_from_height != canonical_history_floor {
+        return Err(IngestError::DeriveDispatch(format!(
+            "value-pool balance backfill coverage starts at {}, expected canonical history floor {}",
+            coverage.complete_from_height.value(),
+            canonical_history_floor.value()
+        )));
+    }
+    Ok(coverage.complete_through_height.next())
 }
 
 fn retain_unmaterialized_candidates(
@@ -551,6 +575,44 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn historical_backfill_starts_at_checkpoint_floor() -> Result<(), IngestError> {
+        let checkpoint_floor = BlockHeight::new(501);
+        assert_eq!(
+            next_historical_height(None, checkpoint_floor)?,
+            Some(checkpoint_floor)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn historical_backfill_resumes_checkpoint_coverage() -> Result<(), IngestError> {
+        assert_eq!(
+            next_historical_height(
+                Some(ValuePoolBalanceBackfillCoverage::new(
+                    BlockHeight::new(501),
+                    BlockHeight::new(700),
+                )),
+                BlockHeight::new(501),
+            )?,
+            Some(BlockHeight::new(701))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn historical_backfill_rejects_coverage_below_checkpoint_floor() {
+        let outcome = next_historical_height(
+            Some(ValuePoolBalanceBackfillCoverage::new(
+                BlockHeight::new(1),
+                BlockHeight::new(500),
+            )),
+            BlockHeight::new(501),
+        );
+
+        assert!(outcome.is_err());
+    }
 
     struct BalanceSource {
         capabilities: NodeCapabilities,

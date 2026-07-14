@@ -16,12 +16,11 @@ use crate::{
     IngestError,
     derive_consumers::derive_projection_write_guard,
     ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
-    transaction_component_backfill::read_canonical_context_batch,
+    transaction_component_backfill::{canonical_history_bounds, read_canonical_context_batch},
 };
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const BACKFILL_CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
-const BACKFILL_START_HEIGHT: BlockHeight = BlockHeight::new(1);
 
 pub(crate) fn seed_conventional_fee_distribution_visible_tail(
     chain_store: &PrimaryChainStore,
@@ -123,7 +122,6 @@ async fn run_conventional_fee_distribution_backfill(
     tracing::info!(
         target: "zinder::ingest",
         event = "conventional_fee_distribution_backfill_started",
-        from_height = BACKFILL_START_HEIGHT.value(),
         batch_blocks = config.batch_blocks.get(),
         "conventional-fee distribution historical backfill started"
     );
@@ -215,12 +213,14 @@ fn backfill_next_batch_blocking(
     context: &ConventionalFeeDistributionBackfillContext,
 ) -> Result<BackfillProgress, IngestError> {
     let coverage = ConventionalFeeDistributionConsumer::backfill_coverage(&context.derive_store)?;
-    let next_height = next_backfill_height(coverage)?;
     let Some(chain_epoch) = context.chain_store.current_chain_epoch()? else {
         return Ok(BackfillProgress::CaughtUp {
             through_height: coverage.map(|coverage| coverage.complete_through_height),
         });
     };
+    let history_bounds = canonical_history_bounds(&context.chain_store)?;
+    let first_available_height = history_bounds.first_available_height();
+    let next_height = next_backfill_height(coverage, first_available_height)?;
     let Some(target_height) = historical_backfill_target(
         chain_epoch.settled_tip_height,
         ConventionalFeeDistributionConsumer::tail_coverage(&context.derive_store)?,
@@ -260,7 +260,7 @@ fn backfill_next_batch_blocking(
         })?
         .block_time_unix_seconds;
     let next_coverage = ConventionalFeeDistributionBackfillCoverage::new(
-        coverage.map_or(BACKFILL_START_HEIGHT, |coverage| {
+        coverage.map_or(first_available_height, |coverage| {
             coverage.complete_from_height
         }),
         batch_end,
@@ -296,15 +296,16 @@ fn historical_backfill_target(
 
 fn next_backfill_height(
     coverage: Option<ConventionalFeeDistributionBackfillCoverage>,
+    first_available_height: BlockHeight,
 ) -> Result<BlockHeight, IngestError> {
     let Some(coverage) = coverage else {
-        return Ok(BACKFILL_START_HEIGHT);
+        return Ok(first_available_height);
     };
-    if coverage.complete_from_height != BACKFILL_START_HEIGHT {
+    if coverage.complete_from_height != first_available_height {
         return Err(IngestError::DeriveDispatch(format!(
             "conventional-fee distribution backfill coverage starts at {}, expected {}",
             coverage.complete_from_height.value(),
-            BACKFILL_START_HEIGHT.value()
+            first_available_height.value()
         )));
     }
     coverage.complete_through_height.next().ok_or_else(|| {
@@ -327,14 +328,21 @@ mod tests {
 
     #[test]
     fn backfill_resumes_after_contiguous_coverage() -> Result<(), IngestError> {
-        assert_eq!(next_backfill_height(None)?, BlockHeight::new(1));
+        let first_available_height = BlockHeight::new(101);
         assert_eq!(
-            next_backfill_height(Some(ConventionalFeeDistributionBackfillCoverage::new(
-                BlockHeight::new(1),
-                BlockHeight::new(256),
-                1_600_000_000,
-                1_600_000_001,
-            )))?,
+            next_backfill_height(None, first_available_height)?,
+            first_available_height
+        );
+        assert_eq!(
+            next_backfill_height(
+                Some(ConventionalFeeDistributionBackfillCoverage::new(
+                    first_available_height,
+                    BlockHeight::new(256),
+                    1_600_000_000,
+                    1_600_000_001,
+                )),
+                first_available_height
+            )?,
             BlockHeight::new(257)
         );
         Ok(())
@@ -342,12 +350,15 @@ mod tests {
 
     #[test]
     fn backfill_rejects_wrong_coverage_floor() {
-        let result = next_backfill_height(Some(ConventionalFeeDistributionBackfillCoverage::new(
-            BlockHeight::new(2),
-            BlockHeight::new(256),
-            1_600_000_000,
-            1_600_000_001,
-        )));
+        let result = next_backfill_height(
+            Some(ConventionalFeeDistributionBackfillCoverage::new(
+                BlockHeight::new(100),
+                BlockHeight::new(256),
+                1_600_000_000,
+                1_600_000_001,
+            )),
+            BlockHeight::new(101),
+        );
         assert!(matches!(result, Err(IngestError::DeriveDispatch(_))));
     }
 

@@ -40,4 +40,12 @@ message ServerInfo {
   // an existing wire surface are revised in place. Consumers assert a
   // minimum.
   uint32 contract_revision = 5;
+
+  // Closed projection workload detected from the durable derive manifest.
+  // Empty only when this process has no projection store attached.
+  string projection_preset = 6;
+
+  // Stable projection identities selected by projection_preset. Order is not
+  // significant; consumers compare these as a set.
+  repeated string projection_identities = 7;
 }

@@ -189,8 +189,19 @@ async fn backfill_next_batch(
     sapling_activation_height: BlockHeight,
     context: &CommitmentRootBackfillContext,
 ) -> Result<BackfillProgress, IngestError> {
+    let canonical_history_floor = context
+        .chain_store
+        .canonical_history_bounds()?
+        .ok_or_else(|| {
+            IngestError::DeriveDispatch(
+                "canonical history bounds are unavailable during commitment-root backfill"
+                    .to_owned(),
+            )
+        })?
+        .first_available_height();
+    let backfill_floor = sapling_activation_height.max(canonical_history_floor);
     let coverage = CommitmentRootSearchConsumer::backfill_coverage(&context.derive_store)?;
-    let next_height = next_backfill_height(coverage, sapling_activation_height)?;
+    let next_height = next_backfill_height(coverage, backfill_floor)?;
     let Some(chain_epoch) = context.chain_store.current_chain_epoch()? else {
         return Ok(BackfillProgress::CaughtUp {
             through_height: coverage.map(|coverage| coverage.complete_through_height),
@@ -223,9 +234,7 @@ async fn backfill_next_batch(
 
     let contexts = read_enriched_contexts(&context.chain_store, next_height, batch_end)?;
     let next_coverage = CommitmentRootBackfillCoverage::new(
-        coverage.map_or(sapling_activation_height, |coverage| {
-            coverage.complete_from_height
-        }),
+        coverage.map_or(backfill_floor, |coverage| coverage.complete_from_height),
         batch_end,
     );
     write_root_search_batch(context.derive_store.clone(), contexts, next_coverage).await?;
@@ -238,16 +247,16 @@ async fn backfill_next_batch(
 
 fn next_backfill_height(
     coverage: Option<CommitmentRootBackfillCoverage>,
-    sapling_activation_height: BlockHeight,
+    backfill_floor: BlockHeight,
 ) -> Result<BlockHeight, IngestError> {
     let Some(coverage) = coverage else {
-        return Ok(sapling_activation_height);
+        return Ok(backfill_floor);
     };
-    if coverage.complete_from_height != sapling_activation_height {
+    if coverage.complete_from_height != backfill_floor {
         return Err(IngestError::DeriveDispatch(format!(
-            "commitment-root backfill coverage starts at {}, expected Sapling activation {}",
+            "commitment-root backfill coverage starts at {}, expected canonical backfill floor {}",
             coverage.complete_from_height.value(),
-            sapling_activation_height.value()
+            backfill_floor.value()
         )));
     }
     coverage.complete_through_height.next().ok_or_else(|| {
@@ -518,19 +527,42 @@ mod tests {
 
     #[test]
     fn backfill_resumes_after_contiguous_coverage() -> Result<(), IngestError> {
-        let activation = BlockHeight::new(100);
-        assert_eq!(next_backfill_height(None, activation)?, activation);
+        let backfill_floor = BlockHeight::new(100);
+        assert_eq!(next_backfill_height(None, backfill_floor)?, backfill_floor);
         assert_eq!(
             next_backfill_height(
                 Some(CommitmentRootBackfillCoverage::new(
-                    activation,
+                    backfill_floor,
                     BlockHeight::new(149),
                 )),
-                activation,
+                backfill_floor,
             )?,
             BlockHeight::new(150)
         );
         Ok(())
+    }
+
+    #[test]
+    fn checkpoint_floor_replaces_earlier_sapling_activation() -> Result<(), IngestError> {
+        let checkpoint_floor = BlockHeight::new(501);
+        assert_eq!(
+            next_backfill_height(None, checkpoint_floor)?,
+            checkpoint_floor
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_floor_rejects_coverage_from_an_incompatible_store() {
+        let outcome = next_backfill_height(
+            Some(CommitmentRootBackfillCoverage::new(
+                BlockHeight::new(100),
+                BlockHeight::new(500),
+            )),
+            BlockHeight::new(501),
+        );
+
+        assert!(outcome.is_err());
     }
 
     #[test]

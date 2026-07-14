@@ -17,10 +17,9 @@ use crate::{
     IngestError,
     derive_consumers::derive_projection_write_guard,
     ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
-    transaction_component_backfill::read_canonical_context_batch,
+    transaction_component_backfill::{canonical_history_bounds, read_canonical_context_batch},
 };
 
-const VERIFICATION_START_HEIGHT: BlockHeight = BlockHeight::new(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -84,7 +83,6 @@ async fn run_verifier(
     tracing::info!(
         target: "zinder::ingest",
         event = "transaction_history_verifier_started",
-        from_height = VERIFICATION_START_HEIGHT.value(),
         batch_blocks = config.batch_blocks.get(),
         "transaction-history verification started"
     );
@@ -193,7 +191,6 @@ fn verify_next_batch_blocking(
     let state_before = context
         .derive_store
         .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)?;
-    let next_height = next_verification_height(state_before)?;
     let Some(chain_epoch_before) = context.chain_store.current_chain_epoch()? else {
         return Ok(VerificationProgress::CaughtUp {
             through_height: state_before.and_then(|state| {
@@ -203,6 +200,9 @@ fn verify_next_batch_blocking(
             }),
         });
     };
+    let history_bounds = canonical_history_bounds(&context.chain_store)?;
+    let first_available_height = history_bounds.first_available_height();
+    let next_height = next_verification_height(state_before, first_available_height)?;
     let projection_head = transaction_history_projection_head(&context.derive_store)?;
     let Some((projection_height, projection_hash)) = projection_head else {
         return Ok(VerificationProgress::ProjectionBehind {
@@ -256,6 +256,7 @@ fn verify_next_batch_blocking(
             state_before,
             chain_epoch_before,
             projection_head,
+            first_available_height,
             through_height,
             through_hash,
         },
@@ -273,6 +274,7 @@ struct VerifiedBatchPublication {
     state_before: Option<ConsumerProjectionState>,
     chain_epoch_before: ChainEpoch,
     projection_head: Option<(BlockHeight, BlockHash)>,
+    first_available_height: BlockHeight,
     through_height: BlockHeight,
     through_hash: BlockHash,
 }
@@ -285,6 +287,7 @@ fn publish_verified_coverage(
         state_before,
         chain_epoch_before,
         projection_head,
+        first_available_height,
         through_height,
         through_hash,
     } = *publication;
@@ -332,7 +335,7 @@ fn publish_verified_coverage(
             projection_tip_hash: projection_hash,
             revision,
             coverage: Some(ConsumerProjectionCoverage {
-                complete_from_height: VERIFICATION_START_HEIGHT,
+                complete_from_height: first_available_height,
                 complete_through_height: through_height,
                 complete_through_hash: through_hash,
             }),
@@ -377,15 +380,16 @@ fn transaction_history_projection_head(
 
 fn next_verification_height(
     state: Option<ConsumerProjectionState>,
+    first_available_height: BlockHeight,
 ) -> Result<BlockHeight, IngestError> {
     let Some(coverage) = state.and_then(|state| state.coverage) else {
-        return Ok(VERIFICATION_START_HEIGHT);
+        return Ok(first_available_height);
     };
-    if coverage.complete_from_height != VERIFICATION_START_HEIGHT {
+    if coverage.complete_from_height != first_available_height {
         return Err(IngestError::DeriveDispatch(format!(
             "transaction-history coverage starts at {}, expected {}",
             coverage.complete_from_height.value(),
-            VERIFICATION_START_HEIGHT.value()
+            first_available_height.value()
         )));
     }
     coverage.complete_through_height.next().ok_or_else(|| {
@@ -525,20 +529,48 @@ mod tests {
 
     #[test]
     fn verification_resumes_after_the_verified_height() -> TestResult {
+        let first_available_height = BlockHeight::new(8);
         let state = ConsumerProjectionState {
             projection_epoch_id: zinder_core::ChainEpochId::new(7),
             projection_tip_height: BlockHeight::new(20),
             projection_tip_hash: BlockHash::from_bytes([0x33; 32]),
             revision: 2,
             coverage: Some(ConsumerProjectionCoverage {
-                complete_from_height: BlockHeight::new(1),
+                complete_from_height: first_available_height,
                 complete_through_height: BlockHeight::new(10),
                 complete_through_hash: BlockHash::from_bytes([0x44; 32]),
             }),
         };
 
-        assert_eq!(next_verification_height(Some(state))?, BlockHeight::new(11));
+        assert_eq!(
+            next_verification_height(Some(state), first_available_height)?,
+            BlockHeight::new(11)
+        );
+        assert_eq!(
+            next_verification_height(None, first_available_height)?,
+            first_available_height
+        );
         Ok(())
+    }
+
+    #[test]
+    fn verification_rejects_coverage_from_a_different_floor() {
+        let state = ConsumerProjectionState {
+            projection_epoch_id: zinder_core::ChainEpochId::new(7),
+            projection_tip_height: BlockHeight::new(20),
+            projection_tip_hash: BlockHash::from_bytes([0x33; 32]),
+            revision: 2,
+            coverage: Some(ConsumerProjectionCoverage {
+                complete_from_height: BlockHeight::new(7),
+                complete_through_height: BlockHeight::new(10),
+                complete_through_hash: BlockHash::from_bytes([0x44; 32]),
+            }),
+        };
+
+        assert!(matches!(
+            next_verification_height(Some(state), BlockHeight::new(8)),
+            Err(IngestError::DeriveDispatch(_))
+        ));
     }
 
     #[tokio::test]

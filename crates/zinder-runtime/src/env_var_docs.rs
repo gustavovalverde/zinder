@@ -626,6 +626,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       lightwalletd transaction and transparent-history methods require retained bytes.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__PROJECTION_PRESET",
+        toml_path: "ingest.projection_preset",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Closed derive workload: `\"wallet\"` or `\"complete\"`. Defaults to \
+                      `\"complete\"`. Selection is supported only when creating a fresh \
+                      canonical-plus-projection store.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__REORG_WINDOW_BLOCKS",
         toml_path: "ingest.reorg_window_blocks",
         used_by: &["zinder-ingest"],

@@ -157,22 +157,90 @@ pub enum IngestError {
         path: PathBuf,
     },
 
-    /// Backup staging path already exists, so the command cannot know whether
-    /// replacing it would discard operator-owned data.
-    #[error("derive checkpoint staging path already exists at {path:?}")]
-    BackupDeriveCheckpointStagingExists {
+    /// Canonical history exists without the projection store that previously
+    /// consumed it, so a derive-only rebuild cannot be proven safe.
+    #[error(
+        "canonical history exists but its projection store is missing at {path:?}; configure a new empty canonical storage path and perform a full re-ingest because derive-only rebuilds are unsupported"
+    )]
+    ProjectionStoreMissingForCanonical {
+        /// Expected projection store path.
+        path: PathBuf,
+    },
+
+    /// Projection rows or cursors exist beside an empty canonical store, so
+    /// the two stores cannot be proven to describe one chain history.
+    #[error(
+        "projection data exists at {path:?} without matching canonical history; configure a new empty canonical storage path and perform a full re-ingest because mixed storage pairs are unsupported"
+    )]
+    ProjectionStoreWithoutCanonicalHistory {
+        /// Projection store whose data has no matching canonical epoch.
+        path: PathBuf,
+    },
+
+    /// Backup bundle staging path already exists, so the command cannot know
+    /// whether replacing it would discard operator-owned data.
+    #[error("backup checkpoint staging path already exists at {path:?}")]
+    BackupCheckpointStagingExists {
         /// Existing staging path.
         path: PathBuf,
     },
 
-    /// Backup could not move the staged derive checkpoint under the canonical
-    /// checkpoint directory.
-    #[error("failed to install derive checkpoint from {from_path:?} to {to_path:?}: {source}")]
-    BackupDeriveCheckpointInstall {
-        /// Temporary derive checkpoint path.
+    /// Backup destination already exists and is never replaced implicitly.
+    #[error("backup checkpoint destination already exists at {path:?}")]
+    BackupCheckpointDestinationExists {
+        /// Existing destination path.
+        path: PathBuf,
+    },
+
+    /// Backup could not atomically publish the staged canonical, projection,
+    /// and manifest bundle.
+    #[error("failed to install backup checkpoint from {from_path:?} to {to_path:?}: {source}")]
+    BackupCheckpointInstall {
+        /// Temporary bundle path.
         from_path: PathBuf,
-        /// Final derive checkpoint path under the canonical checkpoint.
+        /// Final checkpoint bundle path.
         to_path: PathBuf,
+        /// Filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Backup manifest could not be encoded.
+    #[error("failed to encode backup manifest: {source}")]
+    BackupManifestEncode {
+        /// JSON encoding failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A backup or restore manifest could not be decoded into the supported
+    /// structural contract.
+    #[error("failed to decode backup or restore manifest at {path:?}: {source}")]
+    BackupManifestDecode {
+        /// Manifest path being validated.
+        path: PathBuf,
+        /// JSON decoding or structural-shape failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A backup or restore manifest disagrees with the checkpoint bundle it
+    /// describes.
+    #[error("backup or restore checkpoint validation failed at {path:?}: {reason}")]
+    BackupCheckpointValidation {
+        /// Staged bundle path being validated.
+        path: PathBuf,
+        /// Stable human-readable validation failure.
+        reason: String,
+    },
+
+    /// Backup or restore manifest filesystem operation failed.
+    #[error("backup or restore manifest {operation} failed at {path:?}: {source}")]
+    BackupManifestIo {
+        /// Filesystem operation being attempted.
+        operation: &'static str,
+        /// Path the operation targeted.
+        path: PathBuf,
         /// Filesystem failure.
         #[source]
         source: std::io::Error,
@@ -1582,12 +1650,23 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",
         Some(IngestError::DeriveStore(_)) => "derive_store",
         Some(IngestError::DeriveStoreMissing { .. }) => "derive_store_missing",
-        Some(IngestError::BackupDeriveCheckpointStagingExists { .. }) => {
-            "backup_derive_checkpoint_staging_exists"
+        Some(IngestError::ProjectionStoreMissingForCanonical { .. }) => {
+            "projection_store_missing_for_canonical"
         }
-        Some(IngestError::BackupDeriveCheckpointInstall { .. }) => {
-            "backup_derive_checkpoint_install"
+        Some(IngestError::ProjectionStoreWithoutCanonicalHistory { .. }) => {
+            "projection_store_without_canonical_history"
         }
+        Some(IngestError::BackupCheckpointStagingExists { .. }) => {
+            "backup_checkpoint_staging_exists"
+        }
+        Some(IngestError::BackupCheckpointDestinationExists { .. }) => {
+            "backup_checkpoint_destination_exists"
+        }
+        Some(IngestError::BackupCheckpointInstall { .. }) => "backup_checkpoint_install",
+        Some(IngestError::BackupManifestEncode { .. }) => "backup_manifest_encode",
+        Some(IngestError::BackupManifestDecode { .. }) => "backup_manifest_decode",
+        Some(IngestError::BackupManifestIo { .. }) => "backup_manifest_io",
+        Some(IngestError::BackupCheckpointValidation { .. }) => "backup_checkpoint_validation",
     }
 }
 

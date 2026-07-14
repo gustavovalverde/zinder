@@ -11,6 +11,7 @@ use zinder_core::{
     ChainEpoch, ChainValuePools, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
 };
+use zinder_derive::ProjectionPreset;
 use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
 use zinder_proto::v1::{
     ingest::{
@@ -57,6 +58,7 @@ pub struct IngestControlGrpcAdapter {
     mempool_index: Option<MempoolIndex>,
     node_source: Option<Arc<dyn NodeSource>>,
     bearer_token: Option<BearerToken>,
+    projection_preset: ProjectionPreset,
 }
 
 impl IngestControlGrpcAdapter {
@@ -74,7 +76,15 @@ impl IngestControlGrpcAdapter {
             mempool_index: None,
             node_source: None,
             bearer_token: None,
+            projection_preset: ProjectionPreset::Complete,
         }
+    }
+
+    /// Selects the closed projection workload advertised by `ServerInfo`.
+    #[must_use]
+    pub const fn with_projection_preset(mut self, projection_preset: ProjectionPreset) -> Self {
+        self.projection_preset = projection_preset;
+        self
     }
 
     /// Wires the live mempool surfaces into the ingest-control adapter.
@@ -152,6 +162,13 @@ impl IngestControl for IngestControlGrpcAdapter {
             service_version: env!("CARGO_PKG_VERSION").to_owned(),
             capabilities: self.advertised_capabilities(),
             contract_revision: zinder_proto::CONTRACT_REVISION,
+            projection_preset: self.projection_preset.as_str().to_owned(),
+            projection_identities: self
+                .projection_preset
+                .consumer_schemas()
+                .iter()
+                .map(|schema| schema.name.as_str().to_owned())
+                .collect(),
         };
         Ok(Response::new(ServerInfoResponse {
             server_info: Some(server_info),

@@ -199,8 +199,15 @@ pub(crate) fn decide_recovery(
         | IngestError::DeriveDispatch(_)
         | IngestError::DeriveStore(_)
         | IngestError::DeriveStoreMissing { .. }
-        | IngestError::BackupDeriveCheckpointStagingExists { .. }
-        | IngestError::BackupDeriveCheckpointInstall { .. } => SourceRecoveryDecision::Exit,
+        | IngestError::ProjectionStoreMissingForCanonical { .. }
+        | IngestError::ProjectionStoreWithoutCanonicalHistory { .. }
+        | IngestError::BackupCheckpointStagingExists { .. }
+        | IngestError::BackupCheckpointDestinationExists { .. }
+        | IngestError::BackupCheckpointInstall { .. }
+        | IngestError::BackupManifestEncode { .. }
+        | IngestError::BackupManifestDecode { .. }
+        | IngestError::BackupManifestIo { .. }
+        | IngestError::BackupCheckpointValidation { .. } => SourceRecoveryDecision::Exit,
     }
 }
 

@@ -18,7 +18,10 @@ use tempfile::tempdir;
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, Network, ShieldedProtocol, SubtreeRootIndex,
 };
-use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, decode_stored_record};
+use zinder_derive::{
+    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, DeriveStoreError, ProjectionPreset,
+    decode_stored_record,
+};
 use zinder_ingest::{
     BulkCatchupRunConfig, DeriveReplayPolicy, IngestDeriveConfig, NodeSourceKind,
     catch_up_derive_store_to_canonical, run_bulk_catchup, run_bulk_catchup_until_complete,
@@ -267,27 +270,47 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
     );
 
     let derive_store = bundled_derive_store(&storage_path)?;
-    catch_up_derive_store_to_canonical(
-        &store,
-        &derive_store,
-        IngestDeriveConfig {
-            replay_batch_blocks: NonZeroU32::new(1)
-                .ok_or_else(|| eyre!("invalid replay batch blocks"))?,
-            replay_policy: DeriveReplayPolicy::DEFAULT,
-            memory_budget_bytes: None,
-            memory_degrade_ratio: 0.85,
-            memory_pause_ratio: 0.95,
-            memory_resume_ratio: 0.75,
-            min_replay_batch_blocks: NonZeroU32::new(1)
-                .ok_or_else(|| eyre!("invalid minimum replay batch blocks"))?,
-            startup_handoff_lag_blocks: 1_000,
-        },
-    )
-    .await?;
+    let derive_config = IngestDeriveConfig {
+        replay_batch_blocks: NonZeroU32::new(1)
+            .ok_or_else(|| eyre!("invalid replay batch blocks"))?,
+        replay_policy: DeriveReplayPolicy::DEFAULT,
+        memory_budget_bytes: None,
+        memory_degrade_ratio: 0.85,
+        memory_pause_ratio: 0.95,
+        memory_resume_ratio: 0.75,
+        min_replay_batch_blocks: NonZeroU32::new(1)
+            .ok_or_else(|| eyre!("invalid minimum replay batch blocks"))?,
+        startup_handoff_lag_blocks: 1_000,
+    };
+    catch_up_derive_store_to_canonical(&store, &derive_store, derive_config).await?;
 
     assert_chain_event_cursors_advanced(&derive_store)?;
     assert_block_summary_materialized(&derive_store, source_block.height)?;
     assert_paid_fee_live_tail_seeded(&derive_store, source_block.height)?;
+
+    let wallet_derive_store = zinder_derive::DeriveStore::open_with_projection_preset(
+        storage_path.join("wallet-derive"),
+        ProjectionPreset::Wallet,
+        zinder_derive::DeriveStoreOptions {
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            ..zinder_derive::DeriveStoreOptions::default()
+        },
+    )?;
+    catch_up_derive_store_to_canonical(&store, &wallet_derive_store, derive_config).await?;
+    for schema in ProjectionPreset::Wallet.consumer_schemas() {
+        assert!(
+            wallet_derive_store
+                .get_chain_event_cursor(schema.name)?
+                .is_some(),
+            "wallet projection {} must advance through retained canonical events",
+            schema.name.as_str()
+        );
+    }
+    assert!(matches!(
+        wallet_derive_store.consumer_column_family(BLOCK_SUMMARY_COLUMN_FAMILY),
+        Err(DeriveStoreError::ConsumerColumnFamilyMissing { name })
+            if name == BLOCK_SUMMARY_COLUMN_FAMILY
+    ));
 
     Ok(())
 }

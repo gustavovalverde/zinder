@@ -73,6 +73,10 @@ message ReadinessReport {
   // Operator-actionable detail tied to the active cause. Unset when the
   // cause carries no auxiliary detail.
   optional ReadinessCauseDetail detail = 4;
+  // Selected closed projection workload, or empty when no projection store is open.
+  string projection_preset = 5;
+  // Stable identities selected by projection_preset.
+  repeated string projection_identities = 6;
 }
 
 // Operator-actionable detail tied to a parametric readiness cause. The

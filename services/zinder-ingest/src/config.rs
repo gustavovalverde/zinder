@@ -18,6 +18,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::BlockHeight;
+use zinder_derive::ProjectionPreset;
 use zinder_ingest::{
     BulkCatchupConfig, ChainEventRetentionConfig, CommitmentRootBackfillConfig,
     ConventionalFeeDistributionBackfillConfig, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
@@ -129,12 +130,14 @@ const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_BATCH_BLOCKS: u32 = 10_000;
 const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
 const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
+const DEFAULT_PROJECTION_PRESET: ProjectionPreset = ProjectionPreset::Complete;
 
 /// Fully loaded command configuration for the unified `zinder-ingest`
 /// run (no subcommand and the `probe` subcommand both consume this).
 #[derive(Debug)]
 pub(crate) struct IngestCommandConfig {
     pub(crate) loop_config: IngestLoopConfig,
+    pub(crate) projection_preset: ProjectionPreset,
     pub(crate) conventional_fee_distribution_backfill: ConventionalFeeDistributionBackfillConfig,
     pub(crate) paid_fee_distribution_backfill: PaidFeeDistributionBackfillConfig,
     pub(crate) transaction_component_backfill: TransactionComponentBackfillConfig,
@@ -218,6 +221,7 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) node_auth_username: Option<String>,
     pub(crate) node_auth_path: Option<PathBuf>,
     pub(crate) storage_path: Option<PathBuf>,
+    pub(crate) projection_preset: Option<String>,
     pub(crate) request_timeout_secs: Option<u64>,
     pub(crate) max_response_bytes: Option<u64>,
     pub(crate) reorg_window_blocks: Option<u32>,
@@ -291,6 +295,10 @@ pub(crate) fn load_ingest_config(
         // non-PaaS hosts override via `ZINDER_STORAGE__PATH` env var or the
         // `--storage-path` CLI flag.
         .with_default("storage.path", "/var/lib/zinder/store")?
+        .with_default(
+            "ingest.projection_preset",
+            DEFAULT_PROJECTION_PRESET.as_str(),
+        )?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
             "ingest.bulk_catchup.canonical_batch_max_blocks",
@@ -475,6 +483,7 @@ pub(crate) fn load_ingest_config(
         .with_override_if("node.auth.username", overrides.node_auth_username)?
         .with_override_path_if("node.auth.path", overrides.node_auth_path)?
         .with_override_path_if("storage.path", overrides.storage_path)?
+        .with_override_if("ingest.projection_preset", overrides.projection_preset)?
         .with_override_if("node.request_timeout_secs", overrides.request_timeout_secs)?
         .with_override_if("node.max_response_bytes", overrides.max_response_bytes)?
         .with_override_if("ingest.reorg_window_blocks", overrides.reorg_window_blocks)?
@@ -582,7 +591,16 @@ pub(crate) fn redacted_ingest_config_toml(
 ) -> Result<String, IngestConfigError> {
     let rendered = toml::to_string(&RedactedIngestConfigToml::from_ingest_config(config))
         .map_err(|source| ConfigError::Render { source })?;
-    Ok(rendered)
+    let effective_projection_identities = config
+        .projection_preset
+        .consumer_schemas()
+        .iter()
+        .map(|schema| format!("\"{}\"", schema.name.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "# effective_projection_identities = [{effective_projection_identities}]\n{rendered}"
+    ))
 }
 
 /// Renders the effective backup configuration in the accepted TOML
@@ -635,6 +653,8 @@ struct IngestSection {
     /// implemented; [ADR-0016](../../../docs/adrs/0016-source-streaming-pipeline.md)
     /// reserves `auto`, `zebra-indexer-grpc`, and `zebra-in-process`.
     source: Option<String>,
+    /// Closed derive workload. Existing configuration defaults to `complete`.
+    projection_preset: Option<String>,
     /// Chain-truth invariant: how deep into the upstream tip the
     /// safe-tip cliff sits. Defaults to `100`.
     reorg_window_blocks: Option<u32>,
@@ -795,6 +815,16 @@ fn parse_derive_replay_policy(policy_text: &str) -> Result<DeriveReplayPolicy, C
     }
 }
 
+fn parse_projection_preset(preset_text: &str) -> Result<ProjectionPreset, ConfigError> {
+    match preset_text {
+        "wallet" => Ok(ProjectionPreset::Wallet),
+        "complete" => Ok(ProjectionPreset::Complete),
+        _ => Err(ConfigError::invalid(
+            "ingest.projection_preset must be one of: wallet, complete",
+        )),
+    }
+}
+
 fn nonzero_u32_config(amount: Option<u32>, path: &'static str) -> Result<NonZeroU32, ConfigError> {
     let amount = require_field(amount, path)?;
     NonZeroU32::new(amount)
@@ -835,6 +865,11 @@ fn ratio_config(amount: Option<f64>, path: &'static str) -> Result<f64, ConfigEr
 )]
 fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
+    let projection_preset_text = require_field(
+        config.ingest.projection_preset.clone(),
+        "ingest.projection_preset",
+    )?;
+    let projection_preset = parse_projection_preset(&projection_preset_text)?;
     let node_source_text = config
         .ingest
         .source
@@ -1238,6 +1273,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
 
     Ok(IngestCommandConfig {
         loop_config,
+        projection_preset,
         conventional_fee_distribution_backfill,
         paid_fee_distribution_backfill,
         transaction_component_backfill,
@@ -1314,6 +1350,7 @@ impl RedactedIngestConfigToml {
             },
             ingest: IngestToml {
                 source: node_source_name(loop_config.node_source),
+                projection_preset: config.projection_preset.as_str(),
                 reorg_window_blocks: loop_config.reorg_window_blocks,
                 phases: IngestPhasesToml {
                     catchup_threshold_blocks: loop_config.phases.catchup_threshold_blocks,
@@ -1463,6 +1500,7 @@ impl RedactedBackupConfigToml {
 #[derive(Serialize)]
 struct IngestToml {
     source: &'static str,
+    projection_preset: &'static str,
     reorg_window_blocks: u32,
     phases: IngestPhasesToml,
     derive: IngestDeriveToml,

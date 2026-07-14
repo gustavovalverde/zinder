@@ -5,7 +5,7 @@ use std::{collections::HashSet, num::NonZeroU32, time::Duration};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zinder_core::{BlockHeaderArtifact, BlockHeight, TransactionId};
+use zinder_core::{BlockHeaderArtifact, BlockHeight, CanonicalHistoryBounds, TransactionId};
 use zinder_derive::{
     BlockCommitContext, BlockCommitPayload, DeriveStore, TransactionComponentBackfillCoverage,
     TransactionComponentSummaryConsumer, TransactionIntrinsicValueBalanceFacts,
@@ -21,7 +21,6 @@ use crate::{
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const BACKFILL_CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
-const BACKFILL_START_HEIGHT: BlockHeight = BlockHeight::new(1);
 
 /// Seeds the canonical visible range already covered by the event cursor that
 /// a newly added transaction-component consumer inherits at startup.
@@ -129,7 +128,6 @@ async fn run_transaction_component_backfill(
     tracing::info!(
         target: "zinder::ingest",
         event = "transaction_component_backfill_started",
-        from_height = BACKFILL_START_HEIGHT.value(),
         batch_blocks = config.batch_blocks.get(),
         "transaction-component historical backfill started"
     );
@@ -221,12 +219,14 @@ fn backfill_next_batch_blocking(
     context: &TransactionComponentBackfillContext,
 ) -> Result<BackfillProgress, IngestError> {
     let coverage = TransactionComponentSummaryConsumer::backfill_coverage(&context.derive_store)?;
-    let next_height = next_backfill_height(coverage)?;
     let Some(chain_epoch) = context.chain_store.current_chain_epoch()? else {
         return Ok(BackfillProgress::CaughtUp {
             through_height: coverage.map(|coverage| coverage.complete_through_height),
         });
     };
+    let history_bounds = canonical_history_bounds(&context.chain_store)?;
+    let first_available_height = history_bounds.first_available_height();
+    let next_height = next_backfill_height(coverage, first_available_height)?;
     let Some(target_height) = historical_backfill_target(
         chain_epoch.settled_tip_height,
         TransactionComponentSummaryConsumer::tail_coverage(&context.derive_store)?,
@@ -266,7 +266,7 @@ fn backfill_next_batch_blocking(
         })?
         .block_time_unix_seconds;
     let next_coverage = TransactionComponentBackfillCoverage::new(
-        coverage.map_or(BACKFILL_START_HEIGHT, |coverage| {
+        coverage.map_or(first_available_height, |coverage| {
             coverage.complete_from_height
         }),
         batch_end,
@@ -302,15 +302,16 @@ fn historical_backfill_target(
 
 fn next_backfill_height(
     coverage: Option<TransactionComponentBackfillCoverage>,
+    first_available_height: BlockHeight,
 ) -> Result<BlockHeight, IngestError> {
     let Some(coverage) = coverage else {
-        return Ok(BACKFILL_START_HEIGHT);
+        return Ok(first_available_height);
     };
-    if coverage.complete_from_height != BACKFILL_START_HEIGHT {
+    if coverage.complete_from_height != first_available_height {
         return Err(IngestError::DeriveDispatch(format!(
             "transaction-component backfill coverage starts at {}, expected {}",
             coverage.complete_from_height.value(),
-            BACKFILL_START_HEIGHT.value()
+            first_available_height.value()
         )));
     }
     coverage.complete_through_height.next().ok_or_else(|| {
@@ -330,13 +331,23 @@ pub(crate) fn read_canonical_context_batch(
 ) -> Result<Vec<BlockCommitContext>, IngestError> {
     let reader = chain_store.current_chain_epoch_reader()?;
     validate_visible_boundary(reader.chain_epoch().visible_tip_height, through_height)?;
+    let history_bounds = reader.canonical_history_bounds();
     let (staged_blocks, batch_transaction_ids) =
-        stage_canonical_blocks(&reader, from_height, through_height)?;
+        stage_canonical_blocks(&reader, &history_bounds, from_height, through_height)?;
     hydrate_staged_blocks(&reader, staged_blocks, &batch_transaction_ids)
+}
+
+pub(crate) fn canonical_history_bounds(
+    chain_store: &PrimaryChainStore,
+) -> Result<CanonicalHistoryBounds, IngestError> {
+    chain_store.canonical_history_bounds()?.ok_or_else(|| {
+        IngestError::DeriveDispatch("canonical history bounds are unavailable".to_owned())
+    })
 }
 
 fn stage_canonical_blocks(
     reader: &zinder_store::ChainEpochReader<'_>,
+    history_bounds: &CanonicalHistoryBounds,
     from_height: BlockHeight,
     through_height: BlockHeight,
 ) -> Result<(Vec<StagedBlock>, Vec<TransactionId>), IngestError> {
@@ -344,7 +355,7 @@ fn stage_canonical_blocks(
     let mut staged_blocks = Vec::with_capacity(height_count(from_height, through_height));
     let mut batch_transaction_ids = Vec::new();
     let mut unique_transaction_ids = HashSet::new();
-    let mut expected_parent_hash = read_predecessor_hash(reader, from_height)?;
+    let mut expected_parent_hash = read_predecessor_hash(reader, history_bounds, from_height)?;
     for height in inclusive_heights(from_height, through_height) {
         let header = reader.block_header_at(height)?.ok_or_else(|| {
             IngestError::DeriveDispatch(format!(
@@ -409,10 +420,21 @@ fn stage_canonical_blocks(
 
 fn read_predecessor_hash(
     reader: &zinder_store::ChainEpochReader<'_>,
+    history_bounds: &CanonicalHistoryBounds,
     from_height: BlockHeight,
 ) -> Result<Option<zinder_core::BlockHash>, IngestError> {
-    if from_height == BACKFILL_START_HEIGHT {
-        return Ok(None);
+    let first_available_height = history_bounds.first_available_height();
+    if from_height == first_available_height {
+        return Ok(history_bounds
+            .preceding_checkpoint()
+            .map(|checkpoint| checkpoint.hash));
+    }
+    if from_height < first_available_height {
+        return Err(IngestError::DeriveDispatch(format!(
+            "canonical batch starts at {}, before the first available height {}",
+            from_height.value(),
+            first_available_height.value()
+        )));
     }
     let predecessor_height =
         BlockHeight::new(from_height.value().checked_sub(1).ok_or_else(|| {
@@ -562,18 +584,29 @@ async fn sleep_or_cancel(duration: Duration, cancel: &CancellationToken) -> bool
 
 #[cfg(test)]
 mod tests {
+    use zinder_core::{BlockHeightRange, ChainEpochId, Network, TransactionId};
+    use zinder_store::{ChainEpochArtifacts, ChainStoreOptions, ReorgWindowChange};
+    use zinder_testkit::{ChainFixture, FixtureTransactionRows};
+
     use super::*;
 
     #[test]
     fn backfill_resumes_after_contiguous_coverage() -> Result<(), IngestError> {
-        assert_eq!(next_backfill_height(None)?, BlockHeight::new(1));
+        let first_available_height = BlockHeight::new(101);
         assert_eq!(
-            next_backfill_height(Some(TransactionComponentBackfillCoverage::new(
-                BlockHeight::new(1),
-                BlockHeight::new(256),
-                1_600_000_000,
-                1_600_000_001,
-            )))?,
+            next_backfill_height(None, first_available_height)?,
+            first_available_height
+        );
+        assert_eq!(
+            next_backfill_height(
+                Some(TransactionComponentBackfillCoverage::new(
+                    first_available_height,
+                    BlockHeight::new(256),
+                    1_600_000_000,
+                    1_600_000_001,
+                )),
+                first_available_height
+            )?,
             BlockHeight::new(257)
         );
         Ok(())
@@ -581,13 +614,77 @@ mod tests {
 
     #[test]
     fn backfill_rejects_wrong_coverage_floor() {
-        let result = next_backfill_height(Some(TransactionComponentBackfillCoverage::new(
-            BlockHeight::new(2),
-            BlockHeight::new(256),
-            1_600_000_000,
-            1_600_000_001,
-        )));
+        let result = next_backfill_height(
+            Some(TransactionComponentBackfillCoverage::new(
+                BlockHeight::new(100),
+                BlockHeight::new(256),
+                1_600_000_000,
+                1_600_000_001,
+            )),
+            BlockHeight::new(101),
+        );
         assert!(matches!(result, Err(IngestError::DeriveDispatch(_))));
+    }
+
+    #[test]
+    fn canonical_batch_starts_after_an_artifactless_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(21);
+        let checkpoint_block = chain
+            .block_at(BlockHeight::new(20))
+            .ok_or("checkpoint fixture block missing")?;
+        let first_available_block = chain
+            .block_at(BlockHeight::new(21))
+            .ok_or("first available fixture block missing")?;
+        let directory = tempfile::tempdir()?;
+        let store =
+            PrimaryChainStore::open(directory.path(), ChainStoreOptions::for_local_tests())?;
+        let mut checkpoint_epoch = chain
+            .chain_epoch(ChainEpochId::new(1))
+            .ok_or("checkpoint fixture epoch missing")?;
+        checkpoint_epoch.visible_tip_height = checkpoint_block.height;
+        checkpoint_epoch.visible_tip_hash = checkpoint_block.hash;
+        checkpoint_epoch.settled_tip_height = checkpoint_block.height;
+        checkpoint_epoch.settled_tip_hash = checkpoint_block.hash;
+        store.commit_artifactless_checkpoint(checkpoint_epoch)?;
+
+        let transaction_rows = FixtureTransactionRows::from_raw_transaction(
+            TransactionId::from_bytes([0x42; 32]),
+            first_available_block.height,
+            first_available_block.hash,
+            0,
+            [0x01],
+        );
+        let first_available_epoch = chain
+            .chain_epoch(ChainEpochId::new(2))
+            .ok_or("first available fixture epoch missing")?;
+        store.commit_chain_epoch(
+            ChainEpochArtifacts::new(
+                first_available_epoch,
+                vec![first_available_block.block_header_artifact()],
+                vec![first_available_block.compact_block_artifact()],
+            )
+            .with_block_transaction_index(vec![transaction_rows.block_transaction_index])
+            .with_transaction_locations(vec![transaction_rows.location])
+            .with_transaction_facts(vec![transaction_rows.facts])
+            .with_reorg_window_change(ReorgWindowChange::Extend {
+                block_range: BlockHeightRange::inclusive(
+                    first_available_block.height,
+                    first_available_block.height,
+                ),
+            }),
+        )?;
+
+        let contexts = read_canonical_context_batch(
+            &store,
+            first_available_block.height,
+            first_available_block.height,
+        )?;
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].height, first_available_block.height);
+        assert_eq!(contexts[0].block_hash, first_available_block.hash);
+        Ok(())
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod memory_pressure;
 mod mempool;
 mod paid_fee_distribution_backfill;
 mod phase;
+mod projection_startup;
 mod retention;
 mod source_recovery;
 mod tip_follow;
@@ -52,6 +53,7 @@ pub use conventional_fee_distribution_backfill::{
 pub use derive_consumers::{
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, catch_up_derive_store_to_canonical,
     catch_up_derive_store_to_canonical_until_handoff, open_primary_derive_store_for_canonical,
+    open_primary_derive_store_for_canonical_with_projection_preset,
     seed_backfill_owned_consumer_cursors, seed_commitment_root_search_cursor_for_backfill,
     spawn_derive_replay_budget_metrics_task, spawn_derive_tailer_task,
 };
@@ -74,6 +76,10 @@ pub use paid_fee_distribution_backfill::{
     seed_paid_fee_distribution_cursor_and_tail, spawn_paid_fee_distribution_backfill_task,
 };
 pub use phase::{classify_phase, current_chain_height};
+pub use projection_startup::{
+    ProjectionRuntime, ProjectionStartupInputs, ProjectionStartupPlan, ProjectionStartupSettings,
+    ProjectionStartupWork,
+};
 pub use retention::{
     ChainEventRetentionConfig, MempoolEventRetentionWorkerConfig, spawn_chain_event_retention_task,
     spawn_mempool_event_retention_task, spawn_transparent_retention_task,
