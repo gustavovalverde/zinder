@@ -27,7 +27,7 @@ use zinder_source::{
 use crate::error::BenchError;
 
 /// Version stamped into every manifest this crate writes.
-pub const FIXTURE_FORMAT_VERSION: u32 = 1;
+pub const FIXTURE_FORMAT_VERSION: u32 = 2;
 
 /// Manifest and segment file base names.
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -84,6 +84,71 @@ pub struct SegmentDescriptor {
     pub sha256: String,
 }
 
+/// Source-workload density measured from the captured consensus bytes.
+///
+/// Totals show the amount of work in the fixture, while per-block maxima and
+/// populated-block counts make burst-dominated ranges visible.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkloadDensity {
+    /// Number of measured blocks.
+    pub block_count: u32,
+    /// Total raw serialized block bytes.
+    pub raw_block_bytes: u64,
+    /// Total transactions, including coinbase transactions.
+    pub transaction_count: u64,
+    /// Total non-coinbase transparent inputs.
+    pub transparent_input_count: u64,
+    /// Total transparent outputs, including coinbase outputs.
+    pub transparent_output_count: u64,
+    /// Blocks containing at least one non-coinbase transparent input.
+    pub blocks_with_transparent_inputs: u32,
+    /// Blocks containing at least one transparent output.
+    pub blocks_with_transparent_outputs: u32,
+    /// Largest raw serialized block in bytes.
+    pub max_raw_block_bytes_per_block: u64,
+    /// Largest transaction count observed in one block.
+    pub max_transactions_per_block: u32,
+    /// Largest non-coinbase transparent-input count observed in one block.
+    pub max_transparent_inputs_per_block: u32,
+    /// Largest transparent-output count observed in one block.
+    pub max_transparent_outputs_per_block: u32,
+}
+
+impl WorkloadDensity {
+    /// Adds another independently measured segment into this summary.
+    pub fn merge(&mut self, segment: Self) {
+        self.block_count = self.block_count.saturating_add(segment.block_count);
+        self.raw_block_bytes = self.raw_block_bytes.saturating_add(segment.raw_block_bytes);
+        self.transaction_count = self
+            .transaction_count
+            .saturating_add(segment.transaction_count);
+        self.transparent_input_count = self
+            .transparent_input_count
+            .saturating_add(segment.transparent_input_count);
+        self.transparent_output_count = self
+            .transparent_output_count
+            .saturating_add(segment.transparent_output_count);
+        self.blocks_with_transparent_inputs = self
+            .blocks_with_transparent_inputs
+            .saturating_add(segment.blocks_with_transparent_inputs);
+        self.blocks_with_transparent_outputs = self
+            .blocks_with_transparent_outputs
+            .saturating_add(segment.blocks_with_transparent_outputs);
+        self.max_raw_block_bytes_per_block = self
+            .max_raw_block_bytes_per_block
+            .max(segment.max_raw_block_bytes_per_block);
+        self.max_transactions_per_block = self
+            .max_transactions_per_block
+            .max(segment.max_transactions_per_block);
+        self.max_transparent_inputs_per_block = self
+            .max_transparent_inputs_per_block
+            .max(segment.max_transparent_inputs_per_block);
+        self.max_transparent_outputs_per_block = self
+            .max_transparent_outputs_per_block
+            .max(segment.max_transparent_outputs_per_block);
+    }
+}
+
 /// The full fixed-range fixture manifest.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FixtureManifest {
@@ -97,6 +162,8 @@ pub struct FixtureManifest {
     pub to_height: u32,
     /// Total captured block count.
     pub block_count: u32,
+    /// Consensus-byte workload density for the complete captured range.
+    pub workload_density: WorkloadDensity,
     /// Canonical artifact schema version at capture time.
     pub artifact_schema_version: u16,
     /// Hash of the block at `to_height`, hex-encoded, used as the replay tip.
@@ -120,6 +187,12 @@ impl FixtureManifest {
             return Err(BenchError::fixture_format(format!(
                 "unsupported fixture format version {} (expected {FIXTURE_FORMAT_VERSION})",
                 manifest.fixture_format_version
+            )));
+        }
+        if manifest.workload_density.block_count != manifest.block_count {
+            return Err(BenchError::fixture_format(format!(
+                "density block count {} does not match fixture block count {}",
+                manifest.workload_density.block_count, manifest.block_count
             )));
         }
         Ok(manifest)

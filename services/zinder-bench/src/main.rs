@@ -7,15 +7,16 @@ use std::{
     time::Duration,
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use zinder_bench::{
     BenchError,
     capture::{CaptureConfig, capture_fixed_range},
     recorder::install_recorder,
-    replay::{ReplayConfig, replay_fixture},
+    replay::{ProjectionReplayScope, ReplayConfig, replay_fixture},
     report::Report,
 };
 use zinder_core::{BlockHeight, Network, wire::decode_zinder_native_chain_name};
+use zinder_derive::ProjectionPreset;
 use zinder_source::{CookieSource, NodeAuth};
 
 const DEFAULT_FROM_HEIGHT: u32 = 150_000;
@@ -90,12 +91,53 @@ struct ReplayArgs {
     /// Optional canonical block-cache override in bytes.
     #[arg(long = "block-cache-bytes")]
     block_cache_bytes: Option<u64>,
-    /// Drive derive replay in the same run.
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    derive: bool,
+    /// Projection preset to replay after canonical ingest. Omit for a
+    /// canonical-only run.
+    #[arg(long = "projection-preset")]
+    projection_preset: Option<CliProjectionPreset>,
+    /// Projection history to replay. Fixed-range seeds fresh projection
+    /// cursors at the cloned canonical tip; retained-history rebuilds all
+    /// retained events.
+    #[arg(
+        long = "projection-replay-scope",
+        value_enum,
+        default_value_t = CliProjectionReplayScope::FixedRange
+    )]
+    projection_replay_scope: CliProjectionReplayScope,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliProjectionPreset {
+    Wallet,
+    Complete,
+}
+
+impl From<CliProjectionPreset> for ProjectionPreset {
+    fn from(preset: CliProjectionPreset) -> Self {
+        match preset {
+            CliProjectionPreset::Wallet => Self::Wallet,
+            CliProjectionPreset::Complete => Self::Complete,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum CliProjectionReplayScope {
+    #[default]
+    FixedRange,
+    RetainedHistory,
+}
+
+impl From<CliProjectionReplayScope> for ProjectionReplayScope {
+    fn from(scope: CliProjectionReplayScope) -> Self {
+        match scope {
+            CliProjectionReplayScope::FixedRange => Self::FixedRange,
+            CliProjectionReplayScope::RetainedHistory => Self::RetainedHistory,
+        }
+    }
 }
 
 #[tokio::main]
@@ -149,6 +191,9 @@ async fn run_capture(args: CaptureArgs) -> Result<(), BenchError> {
         from_height = manifest.from_height,
         to_height = manifest.to_height,
         block_count = manifest.block_count,
+        transaction_count = manifest.workload_density.transaction_count,
+        transparent_input_count = manifest.workload_density.transparent_input_count,
+        transparent_output_count = manifest.workload_density.transparent_output_count,
         segment_count = manifest.segments.len(),
         "capture complete"
     );
@@ -165,7 +210,8 @@ async fn run_replay(args: ReplayArgs) -> Result<(), BenchError> {
             "block-prepare-concurrency",
         )?,
         canonical_block_cache_bytes: args.block_cache_bytes,
-        run_derive: args.derive,
+        projection_preset: args.projection_preset.map(ProjectionPreset::from),
+        projection_replay_scope: args.projection_replay_scope.into(),
     };
     let report = replay_fixture(config, Some(metrics_handle)).await?;
     emit_report(&report, args.report.as_deref())?;

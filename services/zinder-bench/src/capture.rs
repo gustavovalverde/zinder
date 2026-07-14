@@ -9,8 +9,10 @@ use std::{
 
 use futures_util::StreamExt as _;
 use zinder_core::{
-    BlockHeight, Network, ShieldedProtocol, SubtreeRootIndex, wire::encode_zinder_native_chain_name,
+    BlockHeight, Network, NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootIndex,
+    wire::encode_zinder_native_chain_name,
 };
+use zinder_ingest::derive_block;
 use zinder_source::{
     NodeAuth, NodeSource, SourceBlock, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
@@ -20,7 +22,7 @@ use crate::{
     error::BenchError,
     fixture::{
         ActivationRecord, FIXTURE_FORMAT_VERSION, FixtureManifest, SegmentDescriptor,
-        SubtreeRootRecord, SubtreeRootSet, write_segment,
+        SubtreeRootRecord, SubtreeRootSet, WorkloadDensity, write_segment,
     },
 };
 
@@ -89,7 +91,8 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
     let CapturedSegments {
         segments,
         tip_hash_hex,
-    } = capture_segments(&source, &config).await?;
+        workload_density,
+    } = capture_segments(&source, &config, &activations).await?;
 
     let subtree_roots = SubtreeRootSet {
         sapling: capture_subtree_roots(&source, ShieldedProtocol::Sapling, config.to_height)
@@ -111,6 +114,7 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
         from_height: config.from_height.value(),
         to_height: config.to_height.value(),
         block_count,
+        workload_density,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         tip_hash_hex,
         network_upgrade_activations: activation_records,
@@ -124,21 +128,25 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
 struct CapturedSegments {
     segments: Vec<SegmentDescriptor>,
     tip_hash_hex: String,
+    workload_density: WorkloadDensity,
 }
 
 async fn capture_segments(
     source: &ZebraJsonRpcSource,
     config: &CaptureConfig,
+    activations: &NetworkUpgradeActivations,
 ) -> Result<CapturedSegments, BenchError> {
     let mut segments = Vec::new();
     let mut tip_hash_hex = String::new();
     let mut segment_index = 0_u32;
     let mut segment_from = config.from_height.value();
+    let mut workload_density = WorkloadDensity::default();
     while segment_from <= config.to_height.value() {
         let segment_to = segment_end_height(segment_from, config.segment_blocks, config.to_height);
         let blocks =
             fetch_segment_blocks(source, segment_from, segment_to, config.fetch_concurrency)
                 .await?;
+        workload_density.merge(measure_workload_density(&blocks, activations)?);
         if let Some(last) = blocks.last()
             && last.height.value() == config.to_height.value()
         {
@@ -161,7 +169,67 @@ async fn capture_segments(
     Ok(CapturedSegments {
         segments,
         tip_hash_hex,
+        workload_density,
     })
+}
+
+/// Measures workload density from the same deterministic artifact parser used
+/// by canonical ingest.
+pub fn measure_workload_density(
+    blocks: &[SourceBlock],
+    activations: &NetworkUpgradeActivations,
+) -> Result<WorkloadDensity, BenchError> {
+    let mut density = WorkloadDensity::default();
+    for block in blocks {
+        let derived = derive_block(block, activations)?;
+        let transaction_count = u32::try_from(derived.transaction_facts.len()).map_err(|_| {
+            BenchError::fixture_format("block transaction count exceeds u32".to_owned())
+        })?;
+        let transparent_input_count = derived
+            .transaction_facts
+            .iter()
+            .map(|transaction| transaction.transparent_inputs.len())
+            .sum::<usize>();
+        let transparent_input_count = u32::try_from(transparent_input_count).map_err(|_| {
+            BenchError::fixture_format("block transparent input count exceeds u32".to_owned())
+        })?;
+        let transparent_output_count = u32::try_from(derived.transparent_outputs_by_outpoint.len())
+            .map_err(|_| {
+                BenchError::fixture_format("block transparent output count exceeds u32".to_owned())
+            })?;
+        let raw_block_bytes = u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX);
+
+        density.block_count = density.block_count.saturating_add(1);
+        density.raw_block_bytes = density.raw_block_bytes.saturating_add(raw_block_bytes);
+        density.transaction_count = density
+            .transaction_count
+            .saturating_add(u64::from(transaction_count));
+        density.transparent_input_count = density
+            .transparent_input_count
+            .saturating_add(u64::from(transparent_input_count));
+        density.transparent_output_count = density
+            .transparent_output_count
+            .saturating_add(u64::from(transparent_output_count));
+        if transparent_input_count > 0 {
+            density.blocks_with_transparent_inputs =
+                density.blocks_with_transparent_inputs.saturating_add(1);
+        }
+        if transparent_output_count > 0 {
+            density.blocks_with_transparent_outputs =
+                density.blocks_with_transparent_outputs.saturating_add(1);
+        }
+        density.max_raw_block_bytes_per_block =
+            density.max_raw_block_bytes_per_block.max(raw_block_bytes);
+        density.max_transactions_per_block =
+            density.max_transactions_per_block.max(transaction_count);
+        density.max_transparent_inputs_per_block = density
+            .max_transparent_inputs_per_block
+            .max(transparent_input_count);
+        density.max_transparent_outputs_per_block = density
+            .max_transparent_outputs_per_block
+            .max(transparent_output_count);
+    }
+    Ok(density)
 }
 
 const fn segment_end_height(

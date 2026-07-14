@@ -908,6 +908,8 @@ const EXPORTED_TICKERS: &[Ticker] = &[
     Ticker::NumberMultigetBytesRead,
     Ticker::BytesRead,
     Ticker::BytesWritten,
+    Ticker::WalFileBytes,
+    Ticker::FlushWriteBytes,
     Ticker::StallMicros,
     Ticker::FlushWriteBytes,
     Ticker::MemtablePayloadBytesAtFlush,

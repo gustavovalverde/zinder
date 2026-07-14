@@ -8,6 +8,7 @@
 #     docker build -f deploy/Dockerfile --target zinder-query -t zinder-query .
 #     docker build -f deploy/Dockerfile --target zinder-explorer -t zinder-explorer .
 #     docker build -f deploy/Dockerfile --target zinder-compat-lightwalletd -t zinder-compat-lightwalletd .
+#     docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench .
 #     docker build -f deploy/Dockerfile --target zinder-single-container -t zinder .
 #
 # Every runtime target depends on the same `zinder-binaries` stage. That stage
@@ -70,11 +71,13 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
         --bin zinder-query \
         --bin zinder-explorer \
         --bin zinder-compat-lightwalletd \
+        --bin zinder-bench \
     && mkdir -p /zinder-binaries \
     && cp /workspace/target/release/zinder-ingest /zinder-binaries/zinder-ingest \
     && cp /workspace/target/release/zinder-query /zinder-binaries/zinder-query \
     && cp /workspace/target/release/zinder-explorer /zinder-binaries/zinder-explorer \
-    && cp /workspace/target/release/zinder-compat-lightwalletd /zinder-binaries/zinder-compat-lightwalletd
+    && cp /workspace/target/release/zinder-compat-lightwalletd /zinder-binaries/zinder-compat-lightwalletd \
+    && cp /workspace/target/release/zinder-bench /zinder-binaries/zinder-bench
 
 FROM debian:${DEBIAN_RELEASE}-slim AS zinder-runtime-base
 
@@ -158,6 +161,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9107/readyz || exit 1
 
 ENTRYPOINT ["zinder-compat-lightwalletd"]
+
+FROM zinder-runtime-base AS zinder-bench
+
+COPY --from=zinder-binaries /zinder-binaries/zinder-bench /usr/local/bin/zinder-bench
+
+USER zinder:zinder
+WORKDIR /var/lib/zinder
+
+ENTRYPOINT ["zinder-bench"]
 
 FROM zinder-runtime-base AS zinder-single-container
 

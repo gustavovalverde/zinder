@@ -6,6 +6,7 @@
 use eyre::{Result, eyre};
 use serde_json::Value;
 use tempfile::tempdir;
+use zinder_bench::capture::measure_workload_density;
 use zinder_bench::fixture::{
     ActivationRecord, FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource, SubtreeRootSet,
     read_segment_blocks, write_segment,
@@ -58,6 +59,8 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
 
     let fixture_dir = tempdir()?;
     let descriptor = write_segment(fixture_dir.path(), 0, &blocks)?;
+    let workload_density =
+        measure_workload_density(&blocks, &sample_regtest_upgrade_activations())?;
     assert_eq!(descriptor.block_count, 2);
     assert_eq!(descriptor.from_height, 1);
     assert_eq!(descriptor.to_height, 603);
@@ -72,6 +75,7 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
         from_height: 1,
         to_height: 603,
         block_count: 2,
+        workload_density,
         artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         tip_hash_hex: hex::encode(block_six_hundred_three.hash.as_bytes()),
         network_upgrade_activations: regtest_activation_records(),
@@ -83,6 +87,9 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
     let reloaded = FixtureManifest::read(fixture_dir.path())?;
     assert_eq!(reloaded.network_typed()?, Network::ZcashRegtest);
     assert_eq!(reloaded.to_height, 603);
+    assert_eq!(reloaded.workload_density.block_count, 2);
+    assert_eq!(reloaded.workload_density.transaction_count, 3);
+    assert!(reloaded.workload_density.raw_block_bytes > 0);
     assert_eq!(
         reloaded.activations_typed()?.activations().len(),
         sample_regtest_upgrade_activations().activations().len()
@@ -92,6 +99,14 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
     let fetched = source.fetch_block_at(BlockHeight::new(1)).await?;
     assert_eq!(fetched, block_one);
     assert_eq!(source.tip_id().await?, reloaded.tip_id()?);
+
+    let mut inconsistent = reloaded;
+    inconsistent.workload_density.block_count = 1;
+    inconsistent.write(fixture_dir.path())?;
+    let Err(error) = FixtureManifest::read(fixture_dir.path()) else {
+        return Err(eyre!("density block count must match the fixture range"));
+    };
+    assert!(error.to_string().contains("density block count"));
 
     Ok(())
 }

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::{
+    fixture::WorkloadDensity,
     metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name},
     rss::PeakRss,
 };
@@ -14,6 +15,9 @@ const READ_DURATION_SUM: &str = "zinder_store_read_duration_seconds_sum";
 const MULTI_GET_KEYS_TOTAL: &str = "zinder_store_multi_get_keys_total";
 const MULTI_GET_RESOLVED_TOTAL: &str = "zinder_store_multi_get_resolved_total";
 const ROCKSDB_TICKER: &str = "zinder_store_rocksdb_ticker";
+const ROCKSDB_COMPACT_READ_BYTES: &str = "rocksdb.compact.read.bytes";
+const ROCKSDB_COMPACT_WRITE_BYTES: &str = "rocksdb.compact.write.bytes";
+const DERIVE_PRIMARY_STORE_ROLE: &str = "derive_primary";
 const COMMIT_DURATION_COUNT: &str = "zinder_ingest_commit_duration_seconds_count";
 const COMMIT_FALLBACK_CALLER: &str = "commit_fallback";
 const HEAD_OF_LINE_WAIT_SUM: &str = "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum";
@@ -38,6 +42,8 @@ pub struct FixtureSummary {
     pub to_height: u32,
     /// Captured block count.
     pub block_count: u32,
+    /// Consensus-byte workload density for the replayed fixture.
+    pub workload_density: WorkloadDensity,
     /// Number of segment files.
     pub segment_count: usize,
 }
@@ -47,8 +53,11 @@ pub struct FixtureSummary {
 pub struct ReplayMeasurements {
     /// Prepare concurrency the run used.
     pub block_prepare_concurrency: u32,
-    /// Whether derive replay was driven in the same run.
-    pub derive_enabled: bool,
+    /// Projection preset replayed after canonical ingest, or `None` for a
+    /// canonical-only run.
+    pub projection_preset: Option<&'static str>,
+    /// Projection history scope, or `None` for a canonical-only run.
+    pub projection_replay_scope: Option<&'static str>,
     /// Wall-clock seconds spent in the canonical replay call.
     pub wall_clock_seconds: f64,
     /// Store tip height before replay.
@@ -57,6 +66,16 @@ pub struct ReplayMeasurements {
     pub tip_height_after: Option<u32>,
     /// Wall-clock seconds spent in derive catch-up, when driven.
     pub derive_wall_clock_seconds: Option<f64>,
+    /// Total rows across the selected consumers' owned column families.
+    pub projection_row_count: Option<u64>,
+    /// Selected projection lag behind the canonical tip after replay.
+    pub projection_lag_blocks: Option<u64>,
+    /// Final on-disk bytes under the derive-store directory.
+    pub derive_store_bytes: Option<u64>,
+    /// Seconds required to close and reopen the populated derive store.
+    pub derive_reopen_seconds: Option<f64>,
+    /// Serialized bytes submitted in successful derive write batches.
+    pub derive_bytes_written: Option<u64>,
     /// Peak resident-set-size reading.
     pub peak_rss: PeakRss,
 }
@@ -134,8 +153,11 @@ pub struct TickerStat {
 pub struct ReplaySummary {
     /// Prepare concurrency the run used.
     pub block_prepare_concurrency: u32,
-    /// Whether derive replay was driven in the same run.
-    pub derive_enabled: bool,
+    /// Projection preset replayed after canonical ingest, or `None` for a
+    /// canonical-only run.
+    pub projection_preset: Option<&'static str>,
+    /// Projection history scope, or `None` for a canonical-only run.
+    pub projection_replay_scope: Option<&'static str>,
     /// Wall-clock seconds spent in the canonical replay call.
     pub wall_clock_seconds: f64,
     /// Store tip height before replay.
@@ -152,6 +174,18 @@ pub struct ReplaySummary {
     pub commit_fallback_reads: u64,
     /// Wall-clock seconds spent in derive catch-up, when driven.
     pub derive_wall_clock_seconds: Option<f64>,
+    /// Total rows across the selected consumers' owned column families.
+    pub projection_row_count: Option<u64>,
+    /// Selected projection lag behind the canonical tip after replay.
+    pub projection_lag_blocks: Option<u64>,
+    /// Final on-disk bytes under the derive-store directory.
+    pub derive_store_bytes: Option<u64>,
+    /// Bytes written to the derive `RocksDB` write-ahead log during the process.
+    pub derive_bytes_written: Option<u64>,
+    /// Bytes read plus written by derive-store compactions.
+    pub derive_compaction_bytes: Option<u64>,
+    /// Seconds required to close and reopen the populated derive store.
+    pub derive_reopen_seconds: Option<f64>,
     /// Peak resident-set-size reading.
     pub peak_rss: PeakRss,
 }
@@ -188,6 +222,18 @@ pub fn build_report(
     let head_of_line_wait = aggregate_head_of_line_wait(&samples);
     let stage_durations = aggregate_stage_durations(&samples);
     let rocksdb_tickers = aggregate_tickers(&samples);
+    let derive_compaction_bytes = measurements.projection_preset.map(|_| {
+        ticker_reading(
+            &rocksdb_tickers,
+            ROCKSDB_COMPACT_READ_BYTES,
+            DERIVE_PRIMARY_STORE_ROLE,
+        )
+        .saturating_add(ticker_reading(
+            &rocksdb_tickers,
+            ROCKSDB_COMPACT_WRITE_BYTES,
+            DERIVE_PRIMARY_STORE_ROLE,
+        ))
+    });
     let epochs_committed = round_to_u64(sum_by_name(&samples, COMMIT_DURATION_COUNT));
     let commit_fallback_reads = store_reads
         .iter()
@@ -205,7 +251,8 @@ pub fn build_report(
     };
     let replay = ReplaySummary {
         block_prepare_concurrency: measurements.block_prepare_concurrency,
-        derive_enabled: measurements.derive_enabled,
+        projection_preset: measurements.projection_preset,
+        projection_replay_scope: measurements.projection_replay_scope,
         wall_clock_seconds: measurements.wall_clock_seconds,
         tip_height_before: measurements.tip_height_before,
         tip_height_after: measurements.tip_height_after,
@@ -214,6 +261,12 @@ pub fn build_report(
         blocks_per_second,
         commit_fallback_reads,
         derive_wall_clock_seconds: measurements.derive_wall_clock_seconds,
+        projection_row_count: measurements.projection_row_count,
+        projection_lag_blocks: measurements.projection_lag_blocks,
+        derive_store_bytes: measurements.derive_store_bytes,
+        derive_bytes_written: measurements.derive_bytes_written,
+        derive_compaction_bytes,
+        derive_reopen_seconds: measurements.derive_reopen_seconds,
         peak_rss: measurements.peak_rss,
     };
     Report {
@@ -225,6 +278,13 @@ pub fn build_report(
         stage_durations,
         rocksdb_tickers,
     }
+}
+
+fn ticker_reading(tickers: &[TickerStat], ticker: &str, store_role: &str) -> u64 {
+    tickers
+        .iter()
+        .find(|stat| stat.ticker == ticker && stat.store_role == store_role)
+        .map_or(0, |stat| round_to_u64(stat.reading))
 }
 
 fn blocks_committed(before: Option<u32>, after: Option<u32>) -> u64 {

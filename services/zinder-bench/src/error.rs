@@ -37,6 +37,13 @@ pub enum BenchError {
         #[source]
         source: zinder_source::SourceError,
     },
+    /// Canonical artifact derivation failed while measuring fixture density.
+    #[error("artifact derivation error: {source}")]
+    ArtifactDerive {
+        /// Underlying deterministic block-derivation failure.
+        #[source]
+        source: Box<zinder_ingest::ArtifactDeriveError>,
+    },
     /// The bulk-catchup pipeline returned an error during replay.
     #[error("ingest error: {source}")]
     Ingest {
@@ -81,6 +88,14 @@ impl From<serde_json::Error> for BenchError {
 impl From<zinder_source::SourceError> for BenchError {
     fn from(source: zinder_source::SourceError) -> Self {
         Self::Source { source }
+    }
+}
+
+impl From<zinder_ingest::ArtifactDeriveError> for BenchError {
+    fn from(source: zinder_ingest::ArtifactDeriveError) -> Self {
+        Self::ArtifactDerive {
+            source: Box::new(source),
+        }
     }
 }
 

@@ -35,7 +35,9 @@ Optional flags: `--node-auth-cookie <path>` for cookie auth, `--segment-blocks`
 The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
 `manifest.json` recording the network, range, consensus activations, artifact
 schema version, replay tip hash, per-segment SHA-256, and any shielded subtree
-roots that complete inside the range.
+roots that complete inside the range. It also records transaction, transparent
+input/output, and raw-byte density totals, populated-block counts, and
+per-block maxima so a benchmark range can be reviewed for burst dominance.
 
 ## 2. Snapshot the starting store
 
@@ -63,6 +65,8 @@ zinder-ingest backup \
 The clone's canonical tip must equal `from_height - 1`. Replay writes into the
 clone, so use a throwaway copy per run (or per configuration in a sweep).
 
+When the harness runs inside Docker Desktop, place RocksDB stores on named Linux volumes rather than host bind mounts. The macOS virtiofs path can report direct-I/O support while producing padded SST file sizes that fail RocksDB manifest validation on reopen. Bind mounts remain appropriate for immutable fixture inputs and JSON reports; the writable canonical and derive stores must use the container VM's ext4-backed named volumes.
+
 ## 3. Replay and read the report
 
 ```bash
@@ -78,14 +82,32 @@ identical runs (each against a fresh store clone):
 
 - `--block-prepare-concurrency 4|8|12|24` for the prepare-concurrency sweep.
 - `--block-cache-bytes <N>` for the canonical block-cache-size sweep.
-- `--derive` to also drive derive replay over the committed range.
+- `--projection-preset wallet|complete` to drive one explicit projection
+  workload over the committed range. Omit it for a canonical-only control.
+- `--projection-replay-scope fixed-range|retained-history` to compare only the
+  captured range (the default) or a full rebuild from retained canonical event
+  history. Fixed-range replay requires a fresh derive store in the clone.
 
 Omit `--report` to print the JSON to stdout (progress logs go to stderr).
 
 ## Report fields
 
+- `fixture.workload_density`: the immutable workload totals and per-block
+  maxima copied from the captured fixture manifest.
 - `replay.wall_clock_seconds`, `replay.blocks_committed`,
   `replay.blocks_per_second`: throughput over the range.
+- `replay.projection_preset`: the derive workload replayed after canonical
+  ingest, or `null` for a canonical-only run.
+- `replay.projection_replay_scope`: whether the projection arm measured only
+  the fixed range or rebuilt all retained history.
+- `replay.projection_row_count`, `replay.derive_store_bytes`: selected
+  projection rows and final derive-store disk use.
+- `replay.derive_bytes_written`, `replay.derive_compaction_bytes`: derive-store
+  serialized write-batch bytes and compaction I/O for the run.
+- `replay.projection_lag_blocks`: selected projection lag after the fixed event
+  history is exhausted.
+- `replay.derive_wall_clock_seconds`, `replay.derive_reopen_seconds`: projection
+  replay and populated-store reopen time.
 - `replay.epochs_committed`: committed chain epochs.
 - `replay.commit_fallback_reads`: commit-fallback read calls; near zero confirms
   ordered prevout resolution covered the range.
