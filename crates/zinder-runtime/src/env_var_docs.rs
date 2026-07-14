@@ -459,8 +459,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Canonical-store aggregate RocksDB background job cap shared by flush and \
-                      compaction work. Defaults to 2.",
+        description: "Canonical-store primary-writer RocksDB background job cap shared by flush \
+                      and compaction work. Defaults to 2 and is not applied to secondary opens.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MEMTABLE_BUDGET_BYTES",
@@ -571,8 +571,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store aggregate RocksDB background job cap shared by flush and \
-                      compaction work. Defaults to 2.",
+        description: "Derive-store primary-writer RocksDB background job cap shared by flush and \
+                      compaction work. Defaults to 2 and is not applied to secondary opens.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MEMTABLE_BUDGET_BYTES",
@@ -1061,6 +1061,24 @@ mod tests {
                     && line.contains("When `ZINDER_NODE__AUTH__METHOD=basic`")),
             "conditional rows must render their precondition:\n{rendered}",
         );
+    }
+
+    #[test]
+    fn background_job_variables_mark_secondary_inapplicability() {
+        let background_job_variables = ENVIRONMENT_VARIABLES
+            .iter()
+            .filter(|env_var| env_var.name.ends_with("__ROCKSDB__MAX_BACKGROUND_JOBS"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(background_job_variables.len(), 2);
+        for env_var in background_job_variables {
+            assert!(env_var.description.contains("primary-writer"));
+            assert!(
+                env_var
+                    .description
+                    .contains("not applied to secondary opens")
+            );
+        }
     }
 
     #[test]

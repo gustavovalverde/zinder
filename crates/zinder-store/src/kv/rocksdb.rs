@@ -81,6 +81,24 @@ impl StoreReadCaller {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RocksDbOpenPosture {
+    Primary,
+    Secondary,
+}
+
+impl RocksDbOpenPosture {
+    const fn effective_max_background_jobs(
+        self,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Option<i32> {
+        match self {
+            Self::Primary => Some(resource_budget.max_background_jobs),
+            Self::Secondary => None,
+        }
+    }
+}
+
 /// Store domain and open posture used to label `RocksDB` resource gauges.
 ///
 /// The canonical chain store and the derive store share one process, so the
@@ -107,6 +125,13 @@ impl StoreRole {
             Self::CanonicalSecondary => "canonical_secondary",
             Self::DerivePrimary => "derive_primary",
             Self::DeriveSecondary => "derive_secondary",
+        }
+    }
+
+    const fn open_posture(self) -> RocksDbOpenPosture {
+        match self {
+            Self::CanonicalPrimary | Self::DerivePrimary => RocksDbOpenPosture::Primary,
+            Self::CanonicalSecondary | Self::DeriveSecondary => RocksDbOpenPosture::Secondary,
         }
     }
 }
@@ -146,6 +171,13 @@ impl<'path> RocksDbOpenRole<'path> {
 
     const fn is_primary(self) -> bool {
         matches!(self, Self::Primary { .. })
+    }
+
+    const fn open_posture(self) -> RocksDbOpenPosture {
+        match self {
+            Self::Primary { .. } => RocksDbOpenPosture::Primary,
+            Self::Secondary { .. } => RocksDbOpenPosture::Secondary,
+        }
     }
 }
 
@@ -248,6 +280,13 @@ where
             open_attempt.block_cache,
         ),
     };
+    if let Some(max_background_jobs) = open_attempt
+        .role
+        .open_posture()
+        .effective_max_background_jobs(open_attempt.rocksdb_resource_budget)
+    {
+        db_options.set_max_background_jobs(max_background_jobs);
+    }
     db_options.set_write_buffer_manager(open_attempt.write_buffer_manager);
     if io_mode == RocksDbIoMode::Direct {
         db_options.set_use_direct_reads(true);
@@ -825,7 +864,7 @@ fn wal_size_bytes(db: &DB) -> Option<u64> {
 /// Shared by the canonical chain store and the derive store so both instances
 /// contribute distinguishable cache, memtable, WAL, and per-CF footprints to
 /// the same series. `store_role` keeps the aggregate resident set attributable
-/// to each instance.
+/// to each instance. Primary-only controls are omitted for secondary roles.
 pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
     let store_role = inputs.store_role.as_str();
     for cf_name in inputs.column_family_names {
@@ -865,8 +904,14 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
     }
     metrics::gauge!("zinder_store_wal_bytes_limit", "store_role" => store_role)
         .set(u64_to_f64(inputs.resource_budget.max_wal_bytes));
-    metrics::gauge!("zinder_store_max_background_jobs", "store_role" => store_role)
-        .set(f64::from(inputs.resource_budget.max_background_jobs));
+    if let Some(max_background_jobs) = inputs
+        .store_role
+        .open_posture()
+        .effective_max_background_jobs(inputs.resource_budget)
+    {
+        metrics::gauge!("zinder_store_max_background_jobs", "store_role" => store_role)
+            .set(f64::from(max_background_jobs));
+    }
     metrics::gauge!("zinder_store_block_cache_capacity_bytes", "store_role" => store_role)
         .set(u64_to_f64(inputs.resource_budget.block_cache_bytes));
     metrics::gauge!("zinder_store_block_cache_usage_bytes", "store_role" => store_role)
@@ -1020,20 +1065,19 @@ fn build_primary_db_options(
     apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_total_wal_size(rocksdb_resource_budget.max_wal_bytes);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
-    db_options.set_max_background_jobs(rocksdb_resource_budget.max_background_jobs);
     db_options.set_atomic_flush(true);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
 }
 
-/// Builds `RocksDB` options for a secondary replica with the same
-/// bounded resource budget as the primary.
+/// Builds `RocksDB` options for a secondary replica from the uniform bounded
+/// resource-budget type.
 ///
 /// Secondaries replay the writer's WAL but do not generate one, so the WAL
-/// ceiling and atomic-flush flag are not applied here. Per-DB resource caps
-/// (block cache, open file handles, and background jobs) apply identically
-/// because the secondary's open-time RAM peak grows with store size the same
-/// way the primary's does.
+/// ceiling and atomic-flush flag are not applied here. `OpenAsSecondary` also
+/// disables automatic flushes and compactions, so the primary-only background
+/// job limit is not applied. The block-cache and open-file caps still bound the
+/// secondary's open-time RAM peak as the store grows.
 #[must_use]
 fn build_secondary_db_options(
     rocksdb_resource_budget: RocksDbResourceBudget,
@@ -1044,7 +1088,6 @@ fn build_secondary_db_options(
     db_options.create_missing_column_families(false);
     apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
-    db_options.set_max_background_jobs(rocksdb_resource_budget.max_background_jobs);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
 }
@@ -1889,6 +1932,45 @@ mod tests {
             "rocksdb.base-level",
         ] {
             assert!(PER_CF_INT_PROPERTIES.contains(&property));
+        }
+    }
+
+    #[test]
+    fn background_job_limit_is_effective_only_for_primary_posture() {
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.max_background_jobs = 6;
+
+        let primary_open = RocksDbOpenRole::Primary {
+            path: Path::new("primary"),
+        };
+        let secondary_open = RocksDbOpenRole::Secondary {
+            primary_path: Path::new("primary"),
+            secondary_path: Path::new("secondary"),
+        };
+        assert_eq!(
+            primary_open
+                .open_posture()
+                .effective_max_background_jobs(budget),
+            Some(6)
+        );
+        assert_eq!(
+            secondary_open
+                .open_posture()
+                .effective_max_background_jobs(budget),
+            None
+        );
+
+        for role in [StoreRole::CanonicalPrimary, StoreRole::DerivePrimary] {
+            assert_eq!(
+                role.open_posture().effective_max_background_jobs(budget),
+                Some(6)
+            );
+        }
+        for role in [StoreRole::CanonicalSecondary, StoreRole::DeriveSecondary] {
+            assert_eq!(
+                role.open_posture().effective_max_background_jobs(budget),
+                None
+            );
         }
     }
 

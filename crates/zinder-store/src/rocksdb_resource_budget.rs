@@ -9,10 +9,10 @@
 //!   `RocksDB` open path. They are not tunable; touching them breaks the
 //!   per-epoch commit contract.
 //! - **Bounded resource budget** lives here. The numbers below cap the
-//!   block-cache, table-cache, WAL, background jobs, per-column-family write
-//!   buffers, and total memtable memory surfaces so a crash-replay open or bulk
-//!   write does not OOM the host. The defaults target a mainnet-sized store and
-//!   are documented in
+//!   block-cache, table-cache, WAL, primary-writer background jobs,
+//!   per-column-family write buffers, and total memtable memory surfaces so a
+//!   crash-replay open or bulk write does not OOM the host. The defaults target
+//!   a mainnet-sized store and are documented in
 //!   [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
 //!
 //! Construct one with writer defaults for primary stores and reader defaults
@@ -41,10 +41,10 @@
 ///   rotates to an immutable memtable and flushes to an `SST`.
 /// - `max_write_buffer_count` caps how many mutable plus immutable memtables a
 ///   column family may hold before writes stall.
-/// - `max_background_jobs` caps the shared `RocksDB` background job pool used
-///   for flushes and compactions. Keeping this in the role budget lets an
-///   operator match storage maintenance concurrency to the available I/O and
-///   CPU without changing storage semantics.
+/// - `max_background_jobs` caps the primary writer's shared `RocksDB`
+///   background job pool used for flushes and compactions. `OpenAsSecondary`
+///   disables automatic flushes and compactions, so secondary opens retain the
+///   field in this uniform budget type but do not apply it.
 /// - `memtable_budget_bytes` caps total memtable memory across column
 ///   families via `RocksDB`'s write-buffer manager.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,7 +60,7 @@ pub struct RocksDbResourceBudget {
     pub write_buffer_bytes: u64,
     /// Per-column-family mutable plus immutable memtable count.
     pub max_write_buffer_count: i32,
-    /// Shared background flush and compaction job limit.
+    /// Primary-writer background flush and compaction job limit.
     pub max_background_jobs: i32,
     /// Total mutable and immutable memtable memory budget across column families.
     pub memtable_budget_bytes: u64,
@@ -94,9 +94,10 @@ impl RocksDbResourceBudget {
     /// absorb writes while another buffer flushes.
     pub const MIN_MAX_WRITE_BUFFER_COUNT: i32 = 2;
 
-    /// Smallest accepted [`Self::max_background_jobs`]. One background job
-    /// cannot flush and compact concurrently when both kinds of maintenance
-    /// are pending.
+    /// Smallest accepted [`Self::max_background_jobs`] for primary writers.
+    /// One background job cannot flush and compact concurrently when both
+    /// kinds of maintenance are pending. The uniform budget keeps this valid
+    /// value for secondary profiles even though secondary opens do not apply it.
     pub const MIN_MAX_BACKGROUND_JOBS: i32 = 2;
 
     /// Smallest accepted [`Self::memtable_budget_bytes`]. Smaller values
@@ -149,10 +150,11 @@ impl RocksDbResourceBudget {
     /// Canonical-store reader defaults for secondary processes.
     ///
     /// `128 MiB` block cache, `32 MiB` WAL ceiling, `128` open file handles,
-    /// `8 MiB x 2` write buffers per column family, `2` background jobs, and
-    /// `16 MiB` total memtable budget. Secondary readers replay the writer's
-    /// manifest and serve public traffic; their memory posture must stay below
-    /// the writer so readers cannot starve clean sync.
+    /// `8 MiB x 2` write buffers per column family, and `16 MiB` total memtable
+    /// budget. The uniform budget retains the primary-only background-job value
+    /// at `2`, but secondary opens do not apply it. Secondary readers replay the
+    /// writer's manifest and serve public traffic; their memory posture must
+    /// stay below the writer so readers cannot starve clean sync.
     #[must_use]
     pub const fn canonical_reader_defaults() -> Self {
         Self {
@@ -170,9 +172,10 @@ impl RocksDbResourceBudget {
     /// Derive-store reader defaults for secondary processes.
     ///
     /// `64 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
-    /// `4 MiB x 2` write buffers per column family, `2` background jobs, and
-    /// `16 MiB` total memtable budget. Derive reader stores are rebuildable and
-    /// subordinate to the canonical reader path.
+    /// `4 MiB x 2` write buffers per column family, and `16 MiB` total memtable
+    /// budget. The uniform budget retains the primary-only background-job value
+    /// at `2`, but secondary opens do not apply it. Derive reader stores are
+    /// rebuildable and subordinate to the canonical reader path.
     #[must_use]
     pub const fn derive_reader_defaults() -> Self {
         Self {
@@ -190,8 +193,8 @@ impl RocksDbResourceBudget {
     /// Defaults for throwaway local test stores.
     ///
     /// `32 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
-    /// `4 MiB x 2` write buffers per column family, `2` background jobs, and
-    /// `8 MiB` total memtable budget. Keeps unit-test memory footprint
+    /// `4 MiB x 2` write buffers per column family, a `2`-job primary limit,
+    /// and an `8 MiB` total memtable budget. Keeps unit-test memory footprint
     /// negligible while still exercising the bounded code path.
     #[must_use]
     pub const fn for_local_tests() -> Self {

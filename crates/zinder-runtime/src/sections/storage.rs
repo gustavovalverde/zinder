@@ -43,7 +43,9 @@ pub struct RocksDbResourceBudgetSection {
     pub write_buffer_bytes: Option<u64>,
     /// Override [`RocksDbResourceBudget::max_write_buffer_count`].
     pub max_write_buffer_count: Option<i32>,
-    /// Override [`RocksDbResourceBudget::max_background_jobs`].
+    /// Override the primary-writer
+    /// [`RocksDbResourceBudget::max_background_jobs`] limit. Secondary opens
+    /// retain this field in their uniform budget but do not apply it.
     pub max_background_jobs: Option<i32>,
     /// Override [`RocksDbResourceBudget::memtable_budget_bytes`].
     pub memtable_budget_bytes: Option<u64>,
@@ -393,7 +395,8 @@ pub struct RocksDbResourceBudgetToml {
     pub write_buffer_bytes: u64,
     /// Resolved [`RocksDbResourceBudget::max_write_buffer_count`].
     pub max_write_buffer_count: i32,
-    /// Resolved [`RocksDbResourceBudget::max_background_jobs`].
+    /// Resolved primary-writer [`RocksDbResourceBudget::max_background_jobs`]
+    /// limit. Secondary opens do not apply it.
     pub max_background_jobs: i32,
     /// Resolved [`RocksDbResourceBudget::memtable_budget_bytes`].
     pub memtable_budget_bytes: u64,
