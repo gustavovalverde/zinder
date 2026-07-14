@@ -9,9 +9,10 @@
 //!   `RocksDB` open path. They are not tunable; touching them breaks the
 //!   per-epoch commit contract.
 //! - **Bounded resource budget** lives here. The numbers below cap the
-//!   block-cache, table-cache, WAL, per-column-family write buffers, and total
-//!   memtable memory surfaces so a crash-replay open or bulk write does not
-//!   OOM the host. The defaults target a mainnet-sized store and are documented in
+//!   block-cache, table-cache, WAL, background jobs, per-column-family write
+//!   buffers, and total memtable memory surfaces so a crash-replay open or bulk
+//!   write does not OOM the host. The defaults target a mainnet-sized store and
+//!   are documented in
 //!   [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
 //!
 //! Construct one with writer defaults for primary stores and reader defaults
@@ -40,6 +41,10 @@
 ///   rotates to an immutable memtable and flushes to an `SST`.
 /// - `max_write_buffer_count` caps how many mutable plus immutable memtables a
 ///   column family may hold before writes stall.
+/// - `max_background_jobs` caps the shared `RocksDB` background job pool used
+///   for flushes and compactions. Keeping this in the role budget lets an
+///   operator match storage maintenance concurrency to the available I/O and
+///   CPU without changing storage semantics.
 /// - `memtable_budget_bytes` caps total memtable memory across column
 ///   families via `RocksDB`'s write-buffer manager.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +60,8 @@ pub struct RocksDbResourceBudget {
     pub write_buffer_bytes: u64,
     /// Per-column-family mutable plus immutable memtable count.
     pub max_write_buffer_count: i32,
+    /// Shared background flush and compaction job limit.
+    pub max_background_jobs: i32,
     /// Total mutable and immutable memtable memory budget across column families.
     pub memtable_budget_bytes: u64,
     /// `RocksDB` statistics collection gate.
@@ -87,6 +94,11 @@ impl RocksDbResourceBudget {
     /// absorb writes while another buffer flushes.
     pub const MIN_MAX_WRITE_BUFFER_COUNT: i32 = 2;
 
+    /// Smallest accepted [`Self::max_background_jobs`]. One background job
+    /// cannot flush and compact concurrently when both kinds of maintenance
+    /// are pending.
+    pub const MIN_MAX_BACKGROUND_JOBS: i32 = 2;
+
     /// Smallest accepted [`Self::memtable_budget_bytes`]. Smaller values
     /// force constant flush churn and do not leave enough room for one
     /// bounded column-family memtable to rotate cleanly.
@@ -95,8 +107,8 @@ impl RocksDbResourceBudget {
     /// Canonical-store writer defaults sized for a mainnet-shaped deployment.
     ///
     /// `512 MiB` block cache, `256 MiB` WAL ceiling, `512` open file handles,
-    /// `16 MiB x 2` write buffers per column family, and `256 MiB` total
-    /// memtable budget. See ADR-0020 for the budget derivation.
+    /// `16 MiB x 2` write buffers per column family, `2` background jobs, and
+    /// `256 MiB` total memtable budget. See ADR-0020 for the budget derivation.
     #[must_use]
     pub const fn canonical_writer_defaults() -> Self {
         Self {
@@ -105,6 +117,7 @@ impl RocksDbResourceBudget {
             max_open_files: 512,
             write_buffer_bytes: 16 * MIB,
             max_write_buffer_count: 2,
+            max_background_jobs: 2,
             memtable_budget_bytes: 256 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
@@ -113,11 +126,12 @@ impl RocksDbResourceBudget {
     /// Derive-store writer defaults sized for sustained multi-CF replay.
     ///
     /// `256 MiB` block cache, `256 MiB` WAL ceiling, `512` open file handles,
-    /// `16 MiB x 4` write buffers per column family, and `512 MiB` total
-    /// memtable budget. Replay writes many consumer families in every ordered
-    /// dispatch; the larger shared memtable envelope lets hot families rotate
-    /// while compaction catches up instead of turning flush churn into write
-    /// stalls. The write-buffer manager remains the hard aggregate bound.
+    /// `16 MiB x 4` write buffers per column family, `2` background jobs, and
+    /// `512 MiB` total memtable budget. Replay writes many consumer families in
+    /// every ordered dispatch; the larger shared memtable envelope lets hot
+    /// families rotate while compaction catches up instead of turning flush
+    /// churn into write stalls. The write-buffer manager remains the hard
+    /// aggregate bound.
     #[must_use]
     pub const fn derive_writer_defaults() -> Self {
         Self {
@@ -126,6 +140,7 @@ impl RocksDbResourceBudget {
             max_open_files: 512,
             write_buffer_bytes: 16 * MIB,
             max_write_buffer_count: 4,
+            max_background_jobs: 2,
             memtable_budget_bytes: 512 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
@@ -134,10 +149,10 @@ impl RocksDbResourceBudget {
     /// Canonical-store reader defaults for secondary processes.
     ///
     /// `128 MiB` block cache, `32 MiB` WAL ceiling, `128` open file handles,
-    /// `8 MiB x 2` write buffers per column family, and `16 MiB` total
-    /// memtable budget. Secondary readers replay the writer's manifest and
-    /// serve public traffic; their memory posture must stay below the writer
-    /// so readers cannot starve clean sync.
+    /// `8 MiB x 2` write buffers per column family, `2` background jobs, and
+    /// `16 MiB` total memtable budget. Secondary readers replay the writer's
+    /// manifest and serve public traffic; their memory posture must stay below
+    /// the writer so readers cannot starve clean sync.
     #[must_use]
     pub const fn canonical_reader_defaults() -> Self {
         Self {
@@ -146,6 +161,7 @@ impl RocksDbResourceBudget {
             max_open_files: 128,
             write_buffer_bytes: 8 * MIB,
             max_write_buffer_count: 2,
+            max_background_jobs: 2,
             memtable_budget_bytes: 16 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
@@ -154,9 +170,9 @@ impl RocksDbResourceBudget {
     /// Derive-store reader defaults for secondary processes.
     ///
     /// `64 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
-    /// `4 MiB x 2` write buffers per column family, and `16 MiB` total
-    /// memtable budget. Derive reader stores are rebuildable and subordinate
-    /// to the canonical reader path.
+    /// `4 MiB x 2` write buffers per column family, `2` background jobs, and
+    /// `16 MiB` total memtable budget. Derive reader stores are rebuildable and
+    /// subordinate to the canonical reader path.
     #[must_use]
     pub const fn derive_reader_defaults() -> Self {
         Self {
@@ -165,6 +181,7 @@ impl RocksDbResourceBudget {
             max_open_files: 64,
             write_buffer_bytes: 4 * MIB,
             max_write_buffer_count: 2,
+            max_background_jobs: 2,
             memtable_budget_bytes: 16 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
@@ -173,9 +190,9 @@ impl RocksDbResourceBudget {
     /// Defaults for throwaway local test stores.
     ///
     /// `32 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
-    /// `4 MiB x 2` write buffers per column family, and `8 MiB` total
-    /// memtable budget. Keeps unit-test memory footprint negligible while
-    /// still exercising the bounded code path.
+    /// `4 MiB x 2` write buffers per column family, `2` background jobs, and
+    /// `8 MiB` total memtable budget. Keeps unit-test memory footprint
+    /// negligible while still exercising the bounded code path.
     #[must_use]
     pub const fn for_local_tests() -> Self {
         Self {
@@ -184,6 +201,7 @@ impl RocksDbResourceBudget {
             max_open_files: 64,
             write_buffer_bytes: 4 * MIB,
             max_write_buffer_count: 2,
+            max_background_jobs: 2,
             memtable_budget_bytes: 8 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
@@ -210,6 +228,9 @@ impl RocksDbResourceBudget {
         }
         if self.max_write_buffer_count < Self::MIN_MAX_WRITE_BUFFER_COUNT {
             return Err("rocksdb_resource_budget.max_write_buffer_count must be at least 2");
+        }
+        if self.max_background_jobs < Self::MIN_MAX_BACKGROUND_JOBS {
+            return Err("rocksdb_resource_budget.max_background_jobs must be at least 2");
         }
         if self.memtable_budget_bytes < Self::MIN_MEMTABLE_BUDGET_BYTES {
             return Err("rocksdb_resource_budget.memtable_budget_bytes must be at least 4 MiB");
@@ -278,6 +299,7 @@ mod tests {
         assert_eq!(budget.max_open_files, 512);
         assert_eq!(budget.write_buffer_bytes, 16 * MIB);
         assert_eq!(budget.max_write_buffer_count, 2);
+        assert_eq!(budget.max_background_jobs, 2);
         assert_eq!(budget.memtable_budget_bytes, 256 * MIB);
     }
 
@@ -290,6 +312,7 @@ mod tests {
         assert_eq!(derive.max_open_files, canonical.max_open_files);
         assert_eq!(derive.write_buffer_bytes, canonical.write_buffer_bytes);
         assert_eq!(derive.max_write_buffer_count, 4);
+        assert_eq!(derive.max_background_jobs, canonical.max_background_jobs);
         assert_eq!(
             derive.memtable_budget_bytes,
             canonical.memtable_budget_bytes * 2
@@ -346,6 +369,29 @@ mod tests {
         assert!(
             matches!(budget.validate(), Err(reason) if reason.contains("max_write_buffer_count"))
         );
+    }
+
+    #[test]
+    fn single_background_job_is_rejected() {
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.max_background_jobs = 1;
+        assert!(matches!(
+            budget.validate(),
+            Err(reason) if reason.contains("max_background_jobs")
+        ));
+    }
+
+    #[test]
+    fn every_default_budget_preserves_two_background_jobs() {
+        for budget in [
+            RocksDbResourceBudget::canonical_writer_defaults(),
+            RocksDbResourceBudget::derive_writer_defaults(),
+            RocksDbResourceBudget::canonical_reader_defaults(),
+            RocksDbResourceBudget::derive_reader_defaults(),
+            RocksDbResourceBudget::for_local_tests(),
+        ] {
+            assert_eq!(budget.max_background_jobs, 2);
+        }
     }
 
     #[test]

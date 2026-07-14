@@ -70,6 +70,7 @@ stores. It carries:
 | `max_open_files` | 512 | 512 | 128 | 64 | Open SST handle cap so RocksDB does not pin metadata for every file. |
 | `write_buffer_bytes` | 16 MiB | 16 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. |
 | `max_write_buffer_count` | 2 | 4 | 2 | 2 | Per-column-family mutable plus immutable memtable count. |
+| `max_background_jobs` | 2 | 2 | 2 | 2 | Aggregate flush and compaction job cap owned by RocksDB. |
 | `memtable_budget_bytes` | 256 MiB | 512 MiB | 16 MiB | 16 MiB | Total memtable memory budget across column families via `WriteBufferManager`. |
 
 The derive writer deliberately reserves more aggregate memtable headroom than
@@ -80,7 +81,7 @@ compaction turnover.
 
 Local tests use the same bounded path with a smaller profile: 32 MiB block
 cache, 16 MiB WAL ceiling, 64 open files, 4 MiB write buffers, two write
-buffers, and an 8 MiB total memtable budget.
+buffers, two background jobs, and an 8 MiB total memtable budget.
 
 The validation gate rejects values below the minimums:
 
@@ -89,10 +90,17 @@ The validation gate rejects values below the minimums:
 - `MIN_MAX_OPEN_FILES = 32`
 - `MIN_WRITE_BUFFER_BYTES = 4 MiB`
 - `MIN_MAX_WRITE_BUFFER_COUNT = 2`
+- `MIN_MAX_BACKGROUND_JOBS = 2`
 - `MIN_MEMTABLE_BUDGET_BYTES = 4 MiB`
 
 `max_wal_bytes = 0` remains invalid because it disables RocksDB's WAL-size
 flush trigger.
+
+The background-job value is a resource limit, not a flush-policy switch.
+RocksDB dynamically schedules flush and compaction work within the configured
+cap. All role defaults remain at RocksDB's existing two-job posture; operators
+can raise a specific role only after the per-column-family pressure and byte
+ticker metrics demonstrate a maintenance backlog.
 
 ### Locked RocksDB Invariants
 

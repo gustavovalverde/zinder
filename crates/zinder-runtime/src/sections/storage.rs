@@ -43,6 +43,8 @@ pub struct RocksDbResourceBudgetSection {
     pub write_buffer_bytes: Option<u64>,
     /// Override [`RocksDbResourceBudget::max_write_buffer_count`].
     pub max_write_buffer_count: Option<i32>,
+    /// Override [`RocksDbResourceBudget::max_background_jobs`].
+    pub max_background_jobs: Option<i32>,
     /// Override [`RocksDbResourceBudget::memtable_budget_bytes`].
     pub memtable_budget_bytes: Option<u64>,
     /// Override [`RocksDbResourceBudget::statistics_level`]: `off`,
@@ -77,6 +79,9 @@ impl RocksDbResourceBudgetSection {
         }
         if let Some(count) = self.max_write_buffer_count {
             defaults.max_write_buffer_count = count;
+        }
+        if let Some(jobs) = self.max_background_jobs {
+            defaults.max_background_jobs = jobs;
         }
         if let Some(bytes) = self.memtable_budget_bytes {
             defaults.memtable_budget_bytes = bytes;
@@ -388,6 +393,8 @@ pub struct RocksDbResourceBudgetToml {
     pub write_buffer_bytes: u64,
     /// Resolved [`RocksDbResourceBudget::max_write_buffer_count`].
     pub max_write_buffer_count: i32,
+    /// Resolved [`RocksDbResourceBudget::max_background_jobs`].
+    pub max_background_jobs: i32,
     /// Resolved [`RocksDbResourceBudget::memtable_budget_bytes`].
     pub memtable_budget_bytes: u64,
     /// Resolved [`RocksDbResourceBudget::statistics_level`]: `off`,
@@ -405,6 +412,7 @@ impl RocksDbResourceBudgetToml {
             max_open_files: budget.max_open_files,
             write_buffer_bytes: budget.write_buffer_bytes,
             max_write_buffer_count: budget.max_write_buffer_count,
+            max_background_jobs: budget.max_background_jobs,
             memtable_budget_bytes: budget.memtable_budget_bytes,
             statistics_level: budget.statistics_level.as_str(),
         }
@@ -728,6 +736,7 @@ mod tests {
             max_open_files: Some(256),
             write_buffer_bytes: Some(8 * 1024 * 1024),
             max_write_buffer_count: Some(3),
+            max_background_jobs: Some(6),
             memtable_budget_bytes: Some(16 * 1024 * 1024),
             statistics_level: Some("off".to_owned()),
         })?;
@@ -737,9 +746,19 @@ mod tests {
         assert_eq!(resolved.max_open_files, 256);
         assert_eq!(resolved.write_buffer_bytes, 8 * 1024 * 1024);
         assert_eq!(resolved.max_write_buffer_count, 3);
+        assert_eq!(resolved.max_background_jobs, 6);
         assert_eq!(resolved.memtable_budget_bytes, 16 * 1024 * 1024);
         assert_eq!(resolved.statistics_level, RocksDbStatisticsLevel::Off);
         Ok(())
+    }
+
+    #[test]
+    fn background_job_budget_rejects_single_job() {
+        let outcome = resolve_canonical_writer_rocksdb_budget(RocksDbResourceBudgetSection {
+            max_background_jobs: Some(1),
+            ..RocksDbResourceBudgetSection::default()
+        });
+        assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
     }
 
     #[test]

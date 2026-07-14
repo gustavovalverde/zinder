@@ -865,6 +865,8 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
     }
     metrics::gauge!("zinder_store_wal_bytes_limit", "store_role" => store_role)
         .set(u64_to_f64(inputs.resource_budget.max_wal_bytes));
+    metrics::gauge!("zinder_store_max_background_jobs", "store_role" => store_role)
+        .set(f64::from(inputs.resource_budget.max_background_jobs));
     metrics::gauge!("zinder_store_block_cache_capacity_bytes", "store_role" => store_role)
         .set(u64_to_f64(inputs.resource_budget.block_cache_bytes));
     metrics::gauge!("zinder_store_block_cache_usage_bytes", "store_role" => store_role)
@@ -907,6 +909,9 @@ const EXPORTED_TICKERS: &[Ticker] = &[
     Ticker::BytesRead,
     Ticker::BytesWritten,
     Ticker::StallMicros,
+    Ticker::FlushWriteBytes,
+    Ticker::MemtablePayloadBytesAtFlush,
+    Ticker::MemtableGarbageBytesAtFlush,
     Ticker::CompactReadBytes,
     Ticker::CompactWriteBytes,
 ];
@@ -1013,6 +1018,7 @@ fn build_primary_db_options(
     apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_total_wal_size(rocksdb_resource_budget.max_wal_bytes);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
+    db_options.set_max_background_jobs(rocksdb_resource_budget.max_background_jobs);
     db_options.set_atomic_flush(true);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
@@ -1023,8 +1029,9 @@ fn build_primary_db_options(
 ///
 /// Secondaries replay the writer's WAL but do not generate one, so the WAL
 /// ceiling and atomic-flush flag are not applied here. Per-DB resource caps
-/// (block cache, open file handles) apply identically because the secondary's
-/// open-time RAM peak grows with store size the same way the primary's does.
+/// (block cache, open file handles, and background jobs) apply identically
+/// because the secondary's open-time RAM peak grows with store size the same
+/// way the primary's does.
 #[must_use]
 fn build_secondary_db_options(
     rocksdb_resource_budget: RocksDbResourceBudget,
@@ -1035,6 +1042,7 @@ fn build_secondary_db_options(
     db_options.create_missing_column_families(false);
     apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
+    db_options.set_max_background_jobs(rocksdb_resource_budget.max_background_jobs);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
 }
@@ -1553,7 +1561,7 @@ fn exclusive_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(upper_bound)
 }
 
-const PER_CF_INT_PROPERTIES: [&str; 7] = [
+const PER_CF_INT_PROPERTIES: [&str; 13] = [
     "rocksdb.estimate-live-data-size",
     "rocksdb.total-sst-files-size",
     "rocksdb.size-all-mem-tables",
@@ -1561,6 +1569,12 @@ const PER_CF_INT_PROPERTIES: [&str; 7] = [
     "rocksdb.estimate-table-readers-mem",
     "rocksdb.estimate-pending-compaction-bytes",
     "rocksdb.num-running-compactions",
+    "rocksdb.num-files-at-level0",
+    "rocksdb.num-immutable-mem-table",
+    "rocksdb.mem-table-flush-pending",
+    "rocksdb.num-running-flushes",
+    "rocksdb.compaction-pending",
+    "rocksdb.base-level",
 ];
 
 /// Write-controller properties reported by the whole database instance rather
@@ -1847,6 +1861,33 @@ mod tests {
         let throttle = ResourceGaugeThrottle::new(Duration::ZERO);
         assert!(throttle.should_sample());
         assert!(throttle.should_sample());
+    }
+
+    #[test]
+    fn ticker_export_covers_flush_efficiency() {
+        for ticker in [
+            Ticker::FlushWriteBytes,
+            Ticker::MemtablePayloadBytesAtFlush,
+            Ticker::MemtableGarbageBytesAtFlush,
+        ] {
+            assert!(EXPORTED_TICKERS.contains(&ticker));
+        }
+    }
+
+    #[test]
+    fn property_export_covers_flush_and_compaction_pressure() {
+        for property in [
+            "rocksdb.num-files-at-level0",
+            "rocksdb.num-immutable-mem-table",
+            "rocksdb.mem-table-flush-pending",
+            "rocksdb.num-running-flushes",
+            "rocksdb.compaction-pending",
+            "rocksdb.estimate-pending-compaction-bytes",
+            "rocksdb.num-running-compactions",
+            "rocksdb.base-level",
+        ] {
+            assert!(PER_CF_INT_PROPERTIES.contains(&property));
+        }
     }
 
     #[test]

@@ -449,6 +449,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       buffer count. Defaults to 2.",
     },
     EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_BACKGROUND_JOBS",
+        toml_path: "storage.canonical.rocksdb.max_background_jobs",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical-store aggregate RocksDB background job cap shared by flush and \
+                      compaction work. Defaults to 2.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MEMTABLE_BUDGET_BYTES",
         toml_path: "storage.canonical.rocksdb.memtable_budget_bytes",
         used_by: &[
@@ -487,7 +501,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB block cache budget in bytes. Defaults to 134217728 for \
+        description: "Derive-store RocksDB block cache budget in bytes. Defaults to 268435456 for \
                       writers and 67108864 for readers.",
     },
     EnvVarDoc {
@@ -501,7 +515,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB live WAL ceiling in bytes. Defaults to 67108864 for \
+        description: "Derive-store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for \
                       writers and 16777216 for readers.",
     },
     EnvVarDoc {
@@ -515,7 +529,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB open SST file cap. Defaults to 256 for writers and 64 \
+        description: "Derive-store RocksDB open SST file cap. Defaults to 512 for writers and 64 \
                       for readers.",
     },
     EnvVarDoc {
@@ -530,7 +544,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Derive-store per-column-family RocksDB write buffer size. Defaults to \
-                      8388608 for writers and 4194304 for readers.",
+                      16777216 for writers and 4194304 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
@@ -544,7 +558,21 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Derive-store per-column-family mutable plus immutable RocksDB write buffer \
-                      count. Defaults to 2.",
+                      count. Defaults to 4 for writers and 2 for readers.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_BACKGROUND_JOBS",
+        toml_path: "storage.derive.rocksdb.max_background_jobs",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Derive-store aggregate RocksDB background job cap shared by flush and \
+                      compaction work. Defaults to 2.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MEMTABLE_BUDGET_BYTES",
@@ -558,7 +586,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Derive-store total RocksDB memtable budget across column families. Defaults \
-                      to 67108864 for writers and 16777216 for readers.",
+                      to 536870912 for writers and 16777216 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__DERIVE__ROCKSDB__STATISTICS_LEVEL",

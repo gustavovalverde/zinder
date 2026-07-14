@@ -119,6 +119,7 @@ max_wal_bytes = 268435456       # 256 MiB
 max_open_files = 512
 write_buffer_bytes = 16777216   # 16 MiB per column family
 max_write_buffer_count = 2
+max_background_jobs = 2         # aggregate flush + compaction jobs
 ```
 
 And a multi-column-family replay profile for the writer-owned derive store:
@@ -130,6 +131,7 @@ max_wal_bytes = 268435456       # 256 MiB
 max_open_files = 512
 write_buffer_bytes = 16777216   # 16 MiB per column family
 max_write_buffer_count = 4
+max_background_jobs = 2         # raise only with pressure-metric evidence
 memtable_budget_bytes = 536870912 # 512 MiB aggregate hard bound
 ```
 
@@ -146,6 +148,7 @@ max_wal_bytes = 33554432        # 32 MiB
 max_open_files = 128
 write_buffer_bytes = 8388608    # 8 MiB per column family
 max_write_buffer_count = 2
+max_background_jobs = 2
 
 [storage.derive.rocksdb]
 block_cache_bytes = 67108864    # 64 MiB
@@ -153,6 +156,7 @@ max_wal_bytes = 16777216        # 16 MiB
 max_open_files = 64
 write_buffer_bytes = 4194304    # 4 MiB per column family
 max_write_buffer_count = 2
+max_background_jobs = 2
 ```
 
 Plus the derive and bulk-catchup ingest knobs:
@@ -219,7 +223,9 @@ The metric set shipped alongside the bounded resource budget catches the trap be
 - `zinder_store_wal_bytes` — sum of `*.log` file sizes inside the store path. Scraped at every commit.
 - `zinder_store_wal_bytes_limit` — the configured `max_wal_bytes`. The alert `ZinderStoreWalGrowth` fires when the ratio exceeds 75% for five minutes, evaluated per `store_role`.
 - `zinder_store_block_cache_capacity_bytes` and `zinder_store_block_cache_usage_bytes` — block cache size and current usage. These are the canonical signals for cache pressure; the same numbers are not republished as `zinder_store_rocksdb_property` labels.
-- `zinder_store_rocksdb_property` (gauge, labels `property`, `cf`, `store_role`) gained `rocksdb.cur-size-active-mem-table` so an oversized memtable shows up alongside the WAL gauge, plus the DB-level write-controller properties `rocksdb.actual-delayed-write-rate` and `rocksdb.is-write-stopped` (reported under `cf="__db__"`) that name a write stall directly. Every resource gauge above carries a `store_role` label (`canonical_primary`, `canonical_secondary`, `derive_primary`, `derive_secondary`); the canonical and derive stores share the process, so sum across `store_role` for total footprint and split by it to attribute pressure.
+- `zinder_store_max_background_jobs` — the configured aggregate flush-and-compaction job cap. The default remains two for every role; compare the gauge with the per-column-family queue properties before raising it.
+- `zinder_store_rocksdb_property` (gauge, labels `property`, `cf`, `store_role`) includes the active and immutable memtable state, level-zero file count, flush pending/running state, compaction pending/running state, base level, and pending-compaction bytes, plus the DB-level write-controller properties `rocksdb.actual-delayed-write-rate` and `rocksdb.is-write-stopped` (reported under `cf="__db__"`) that name a write stall directly. Every resource gauge above carries a `store_role` label (`canonical_primary`, `canonical_secondary`, `derive_primary`, `derive_secondary`); the canonical and derive stores share the process, so sum across `store_role` for total footprint and split by it to attribute pressure.
+- `zinder_store_rocksdb_ticker` — use `rocksdb.stall.micros` with flush, memtable payload/garbage-at-flush, and compaction byte counters to distinguish foreground stalls, flush amplification, and compaction debt.
 - `zinder_startup_phase_duration_seconds` (histogram, labels `phase`, `outcome`, `service`) — the alert `ZinderStartupOpenStorageSlow` fires when `open_storage` p95 exceeds 60 seconds, the shape this trap takes during the restart loop.
 - `zinder_ingest_bulk_pipeline_queue_bytes{stage}` and `zinder_ingest_bulk_pipeline_reorder_buffer_bytes{stage}` distinguish active source/fact reservations from completed out-of-order backlog.
 - `zinder_ingest_derive_replay_budget_state{state}` and `zinder_ingest_derive_replay_effective_batch_blocks` show whether derive replay is normal, degraded, or paused under memory pressure.
