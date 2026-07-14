@@ -111,6 +111,22 @@ pub enum DeriveStoreError {
         /// Store-format version the running binary expects.
         running: u16,
     },
+    /// The requested preset conflicts with the store's durable projection
+    /// identities.
+    #[error(
+        "derive store projection identities are incompatible with requested preset {requested}; configure a new empty canonical storage path and re-ingest from upstream because in-place preset changes are unsupported"
+    )]
+    ProjectionPresetRequiresFreshStore {
+        /// Non-default preset requested by the opening process.
+        requested: &'static str,
+    },
+    /// A projection-owned write targeted an identity omitted by the opened
+    /// workload.
+    #[error("derive store projection `{projection}` is not selected by the opened workload")]
+    ProjectionNotSelected {
+        /// Stable projection identity rejected by the store.
+        projection: &'static str,
+    },
     /// A declared consumer's persisted schema contract cannot be read safely
     /// by the running binary. Secondary readers reject this rather than decode
     /// incompatible rows. A primary rebuilds older incompatible versions but
@@ -176,6 +192,15 @@ pub enum DeriveStoreError {
     ConsumerColumnFamilyMissing {
         /// Column family name the consumer asked for.
         name: &'static str,
+    },
+    /// A projection-specific cursor could not be decoded or did not match its
+    /// read request.
+    #[error("derive projection {projection} cursor is invalid: {reason}")]
+    ProjectionCursorInvalid {
+        /// Stable projection identity that owns the cursor.
+        projection: &'static str,
+        /// Specific validation failure.
+        reason: &'static str,
     },
     /// Operation on a consumer-owned column family failed.
     #[error("derive store {operation} failed for consumer column family {name}: {source}")]

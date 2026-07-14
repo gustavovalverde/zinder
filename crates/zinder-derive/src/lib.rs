@@ -21,6 +21,7 @@
 
 pub mod consumer;
 pub mod error;
+mod projection_catalog;
 pub mod store;
 pub mod value_pool_change;
 
@@ -168,9 +169,14 @@ pub use consumer::{
     apply_chain_committed_in_memory, apply_chain_reorged_in_memory,
 };
 pub use error::{DeriveError, DeriveStoreColumnFamily, DeriveStoreError};
+pub use projection_catalog::{
+    CanonicalRetentionAuthority, ProjectionDefinition, ProjectionPresetMembership,
+    ProjectionRecoverySource, ProjectionRole, bundled_projection_definitions,
+};
 pub use store::{
     ChainEventDispatchConsumers, ChainEventDispatchInputs, ConsumerEntry,
     ConsumerProjectionCoverage, ConsumerProjectionState, DERIVE_STORE_FORMAT_VERSION,
     DERIVE_STORE_SUBDIR, DeriveCursorEntry, DeriveStore, DeriveStoreOptions,
-    DeriveStoreReadSnapshot, DeriveStoreTable,
+    DeriveStoreReadSnapshot, DeriveStoreTable, ProjectionPreset, ProjectionStoreInspection,
+    ProjectionWriteMeasurement,
 };

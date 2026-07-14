@@ -16,7 +16,11 @@ use std::{
     fmt,
     hash::BuildHasher,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use parking_lot::{RwLock, RwLockReadGuard};
@@ -44,7 +48,9 @@ use crate::{
     },
     consumer::ironwood_migration::{IRONWOOD_MIGRATION_CONSUMER_NAME, IRONWOOD_MIGRATION_SCHEMA},
     consumer::mempool_event_counts::MEMPOOL_EVENT_COUNTS_SCHEMA,
-    consumer::paid_fee_distribution::PAID_FEE_DISTRIBUTION_SCHEMA,
+    consumer::paid_fee_distribution::{
+        PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PAID_FEE_DISTRIBUTION_SCHEMA,
+    },
     consumer::recent_transactions::{
         RECENT_TRANSACTIONS_CONSUMER_NAME, RECENT_TRANSACTIONS_SCHEMA,
     },
@@ -70,7 +76,8 @@ use crate::{
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
     },
     consumer::transparent_outpoint_spend::{
-        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
+        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+        TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
     },
     consumer::value_pool_balance_history::VALUE_POOL_BALANCE_HISTORY_SCHEMA,
     consumer::value_pool_flow_history::{
@@ -119,6 +126,76 @@ const CONSUMER_SCHEMA_KEY_PREFIX: &[u8] = b"\x00\x03consumer_schema:";
 const CONSUMER_PROJECTION_STATE_KEY_PREFIX: &[u8] = b"\x00\x04consumer_projection_state:";
 const CONSUMER_PROJECTION_STATE_VERSION: u8 = 1;
 const CONSUMER_PROJECTION_STATE_LEN: usize = 94;
+const PROJECTION_ROCKSDB_PROPERTIES: [&str; 7] = [
+    "rocksdb.estimate-live-data-size",
+    "rocksdb.total-sst-files-size",
+    "rocksdb.size-all-mem-tables",
+    "rocksdb.cur-size-active-mem-table",
+    "rocksdb.estimate-table-readers-mem",
+    "rocksdb.estimate-pending-compaction-bytes",
+    "rocksdb.num-running-compactions",
+];
+
+/// Per-projection work staged into one successful atomic derive-store commit.
+///
+/// Measurements use the stable projection identity rather than its owned
+/// column-family names. The ingest scheduler turns these values into replay
+/// and write metrics only after the shared batch commits successfully.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionWriteMeasurement {
+    /// Stable projection identity that staged the writes.
+    pub projection: DeriveConsumerName,
+    /// Number of puts, deletes, and merges staged by this projection.
+    pub operations: u64,
+    /// Serialized write-batch bytes attributable to this projection.
+    pub logical_bytes: u64,
+    /// Time spent applying the event and staging projection-owned rows.
+    pub dispatch_duration: Duration,
+}
+
+impl ProjectionWriteMeasurement {
+    fn from_batch_delta(
+        projection: DeriveConsumerName,
+        before: WriteBatchSize,
+        batch: &WriteBatch,
+        dispatch_duration: Duration,
+    ) -> Self {
+        let after = WriteBatchSize::capture(batch);
+        Self {
+            projection,
+            operations: usize_to_u64_saturating(after.operations.saturating_sub(before.operations)),
+            logical_bytes: usize_to_u64_saturating(
+                after.logical_bytes.saturating_sub(before.logical_bytes),
+            ),
+            dispatch_duration,
+        }
+    }
+
+    fn add_batch_delta(&mut self, before: WriteBatchSize, batch: &WriteBatch) {
+        let after = WriteBatchSize::capture(batch);
+        self.operations = self.operations.saturating_add(usize_to_u64_saturating(
+            after.operations.saturating_sub(before.operations),
+        ));
+        self.logical_bytes = self.logical_bytes.saturating_add(usize_to_u64_saturating(
+            after.logical_bytes.saturating_sub(before.logical_bytes),
+        ));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WriteBatchSize {
+    operations: usize,
+    logical_bytes: usize,
+}
+
+impl WriteBatchSize {
+    fn capture(batch: &WriteBatch) -> Self {
+        Self {
+            operations: batch.len(),
+            logical_bytes: batch.size_in_bytes(),
+        }
+    }
+}
 const ROCKSDB_DEFAULT_COLUMN_FAMILY: &str = "default";
 
 /// Inclusive lower bound for a full column-family clear: the empty key sorts
@@ -152,12 +229,17 @@ const BUNDLED_CONSUMERS: &[DeriveConsumerSchema] = &[
     VALUE_POOL_BALANCE_HISTORY_SCHEMA,
     VALUE_POOL_FLOW_HISTORY_SCHEMA,
 ];
+const WALLET_PROJECTION_CONSUMERS: &[DeriveConsumerSchema] = &[
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
+    TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
+];
 const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
     BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
     BLOCK_SUMMARY_CONSUMER_NAME,
     IRONWOOD_MIGRATION_CONSUMER_NAME,
     COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
     CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+    PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
     RECENT_TRANSACTIONS_CONSUMER_NAME,
     TRANSACTION_FEES_CONSUMER_NAME,
     TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
@@ -171,6 +253,65 @@ const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] = &[
 ];
 const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES: &[DeriveConsumerName] =
     &[REORG_INCIDENTS_CONSUMER_NAME];
+
+/// Closed product workload that selects durable derive projection identities.
+///
+/// Presets choose which read models the derive store materializes. They do not
+/// change canonical facts, historical coverage, raw payload retention, or the
+/// process that executes a projection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProjectionPreset {
+    /// Wallet-serving projections required for transparent history and durable
+    /// spender resolution.
+    Wallet,
+    /// Every projection bundled with this Zinder release.
+    #[default]
+    Complete,
+}
+
+/// Read-only facts discovered from an existing projection store before a
+/// writer opens it for schema reconciliation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionStoreInspection {
+    has_projection_data: bool,
+    transparent_outpoint_spend_height: Option<BlockHeight>,
+}
+
+impl ProjectionStoreInspection {
+    /// Returns whether any selected projection row or event cursor exists.
+    #[must_use]
+    pub const fn has_projection_data(self) -> bool {
+        self.has_projection_data
+    }
+
+    /// Returns the durable height of the retention-authoritative spender
+    /// projection, if that projection has materialized any block.
+    #[must_use]
+    pub const fn transparent_outpoint_spend_height(self) -> Option<BlockHeight> {
+        self.transparent_outpoint_spend_height
+    }
+}
+
+impl ProjectionPreset {
+    /// Returns the stable configuration and storage name for this preset.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wallet => "wallet",
+            Self::Complete => "complete",
+        }
+    }
+
+    /// Returns the durable consumer schemas selected by this preset.
+    #[must_use]
+    pub const fn consumer_schemas(self) -> &'static [DeriveConsumerSchema] {
+        match self {
+            Self::Wallet => WALLET_PROJECTION_CONSUMERS,
+            Self::Complete => BUNDLED_CONSUMERS,
+        }
+    }
+}
 
 /// Per-column-family options the derive plane tunes at open time.
 ///
@@ -230,6 +371,48 @@ fn column_family_descriptors(
 /// the path is not yet a `RocksDB` store.
 fn existing_column_family_names(path: &Path) -> Vec<String> {
     DB::list_cf(&Options::default(), path).unwrap_or_default()
+}
+
+fn column_family_has_any_row(
+    db: &DB,
+    column_family: &'static str,
+) -> Result<bool, DeriveStoreError> {
+    let Some(handle) = db.cf_handle(column_family) else {
+        return Ok(false);
+    };
+    let Some(entry) = db.iterator_cf(&handle, IteratorMode::Start).next() else {
+        return Ok(false);
+    };
+    entry
+        .map(|_| true)
+        .map_err(|source| DeriveStoreError::ConsumerOperation {
+            operation: "inspect_first_row",
+            name: column_family,
+            source,
+        })
+}
+
+fn last_height_in_column_family(
+    db: &DB,
+    column_family: &'static str,
+) -> Result<Option<BlockHeight>, DeriveStoreError> {
+    let Some(handle) = db.cf_handle(column_family) else {
+        return Ok(None);
+    };
+    let Some(entry) = db.iterator_cf(&handle, IteratorMode::End).next() else {
+        return Ok(None);
+    };
+    let (key, _) = entry.map_err(|source| DeriveStoreError::ConsumerOperation {
+        operation: "inspect_last_row",
+        name: column_family,
+        source,
+    })?;
+    zinder_core::wire::decode_height_key_ascending(&key)
+        .map(Some)
+        .map_err(|error| DeriveStoreError::ConsumerPayloadDecode {
+            name: column_family,
+            reason: error.to_string(),
+        })
 }
 
 /// Rejects consumer declarations whose column families collide.
@@ -425,6 +608,7 @@ pub struct DeriveStore {
     statistics: Arc<Options>,
     io_mode: RocksDbIoMode,
     resource_gauge_throttle: Arc<ResourceGaugeThrottle>,
+    logical_write_bytes: Arc<AtomicU64>,
 }
 
 /// Consistent read view over one `DeriveStore` sequence.
@@ -735,6 +919,10 @@ impl fmt::Debug for DeriveStore {
             .field("consumers", &self.consumers)
             .field("rocksdb_resource_budget", &self.rocksdb_resource_budget)
             .field("is_secondary", &self.is_secondary)
+            .field(
+                "logical_write_bytes",
+                &self.logical_write_bytes.load(Ordering::Relaxed),
+            )
             .field("catch_up_barrier", &self.catch_up_barrier)
             .field("io_mode", &self.io_mode)
             .field("block_cache_usage_bytes", &self.block_cache.get_usage())
@@ -803,6 +991,51 @@ impl DeriveStore {
         BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES
     }
 
+    /// Returns whether this store declared the durable consumer identity at
+    /// open time.
+    #[must_use]
+    pub fn has_consumer(&self, consumer_name: DeriveConsumerName) -> bool {
+        self.consumers
+            .iter()
+            .any(|schema| schema.name == consumer_name)
+    }
+
+    /// Returns the closed product workload represented by this store's
+    /// selected consumer identities.
+    ///
+    /// Generic test stores and legacy bundled stores classify as complete;
+    /// only the exact wallet identity set classifies as wallet.
+    #[must_use]
+    pub fn effective_projection_preset(&self) -> ProjectionPreset {
+        let is_wallet = self.consumers.len() == WALLET_PROJECTION_CONSUMERS.len()
+            && WALLET_PROJECTION_CONSUMERS
+                .iter()
+                .all(|schema| self.has_consumer(schema.name));
+        if is_wallet {
+            ProjectionPreset::Wallet
+        } else {
+            ProjectionPreset::Complete
+        }
+    }
+
+    /// Iterates the selected block-keyed chain-event consumer identities.
+    pub fn chain_event_consumer_names(&self) -> impl Iterator<Item = DeriveConsumerName> + '_ {
+        BUNDLED_CHAIN_EVENT_CONSUMER_NAMES
+            .iter()
+            .copied()
+            .filter(|consumer_name| self.has_consumer(*consumer_name))
+    }
+
+    /// Iterates the selected event-only chain-event consumer identities.
+    pub fn event_only_chain_event_consumer_names(
+        &self,
+    ) -> impl Iterator<Item = DeriveConsumerName> + '_ {
+        BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES
+            .iter()
+            .copied()
+            .filter(|consumer_name| self.has_consumer(*consumer_name))
+    }
+
     /// Opens or creates a derive store at `path`.
     ///
     /// Rejects with [`DeriveStoreError::ConsumerColumnFamilyConflict`] when the
@@ -821,13 +1054,112 @@ impl DeriveStore {
         path: impl AsRef<Path>,
         options: DeriveStoreOptions,
     ) -> Result<Self, DeriveStoreError> {
+        Self::open_primary(path.as_ref(), options, None)
+    }
+
+    /// Opens or creates a derive store for one closed projection preset.
+    ///
+    /// The durable per-consumer manifest is preflighted before consumer schemas
+    /// are reconciled. Reopening a wallet store as complete, or a complete
+    /// store as wallet, fails before that manifest can be expanded or reduced.
+    /// A legacy bundled store remains compatible with
+    /// [`ProjectionPreset::Complete`]; a wallet preset requires a fresh store.
+    pub fn open_with_projection_preset(
+        path: impl AsRef<Path>,
+        projection_preset: ProjectionPreset,
+        mut options: DeriveStoreOptions,
+    ) -> Result<Self, DeriveStoreError> {
+        options.consumers = projection_preset.consumer_schemas();
+        Self::open_primary(path.as_ref(), options, Some(projection_preset))
+    }
+
+    /// Inspects an existing projection store without opening it for writes.
+    ///
+    /// The requested preset is validated against the recorded consumer
+    /// identities before any primary open can create column families,
+    /// reconcile schemas, or rewrite the manifest. `None` means `path` is not
+    /// currently a `RocksDB` derive store.
+    pub fn inspect_projection_store_at_path(
+        path: impl AsRef<Path>,
+        requested: ProjectionPreset,
+    ) -> Result<Option<ProjectionStoreInspection>, DeriveStoreError> {
         let path = path.as_ref();
+        let existing_column_families = existing_column_family_names(path);
+        if existing_column_families.is_empty() {
+            return Ok(None);
+        }
+        let db =
+            DB::open_cf_for_read_only(&Options::default(), path, &existing_column_families, false)
+                .map_err(|source| DeriveStoreError::Open {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let recorded_consumers = if let Some(column_family) =
+            db.cf_handle(DeriveStoreTable::ConsumerMetadata.column_family_name())
+        {
+            decode_consumer_manifest_entries(db.iterator_cf(
+                &column_family,
+                IteratorMode::From(CONSUMER_SCHEMA_KEY_PREFIX, rust_rocksdb::Direction::Forward),
+            ))?
+        } else {
+            BTreeMap::new()
+        };
+        Self::validate_recorded_projection_identities(requested, &recorded_consumers, false)?;
+
+        let has_projection_data = requested
+            .consumer_schemas()
+            .iter()
+            .flat_map(|schema| schema.column_families.iter().copied())
+            .chain([
+                DeriveStoreTable::ChainEventCursor.column_family_name(),
+                DeriveStoreTable::MempoolEventCursor.column_family_name(),
+            ])
+            .try_fold(false, |found, column_family| {
+                if found {
+                    return Ok(true);
+                }
+                column_family_has_any_row(&db, column_family)
+            })?;
+        let transparent_outpoint_spend_height =
+            last_height_in_column_family(&db, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?;
+        Ok(Some(ProjectionStoreInspection {
+            has_projection_data,
+            transparent_outpoint_spend_height,
+        }))
+    }
+
+    /// Detects the closed projection preset recorded by an existing derive
+    /// store without opening it for writes or reconciling schemas.
+    ///
+    /// Returns `None` when the path is not a derive `RocksDB` store. Legacy
+    /// bundled manifests are classified as [`ProjectionPreset::Complete`];
+    /// only the exact two-identity wallet manifest is classified as wallet.
+    pub fn detect_projection_preset_at_path(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<ProjectionPreset>, DeriveStoreError> {
+        let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path.as_ref())? else {
+            return Ok(None);
+        };
+        Self::reject_unknown_projection_identities(&recorded_consumers)?;
+        Ok(Some(Self::preset_for_recorded_consumers(
+            &recorded_consumers,
+        )))
+    }
+
+    fn open_primary(
+        path: &Path,
+        options: DeriveStoreOptions,
+        projection_preset: Option<ProjectionPreset>,
+    ) -> Result<Self, DeriveStoreError> {
         options
             .rocksdb_resource_budget
             .validate()
             .map_err(|reason| DeriveStoreError::InvalidOptions { reason })?;
         validate_consumer_declarations(options.consumers)?;
-        Self::wipe_derive_directory_if_store_format_superseded(path, &options)?;
+        if let Some(projection_preset) = projection_preset {
+            Self::preflight_projection_preset_at_path(path, projection_preset)?;
+        }
+        Self::wipe_derive_directory_if_store_format_superseded(path)?;
         let existing_column_families = existing_column_family_names(path);
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary { path },
@@ -858,8 +1190,12 @@ impl DeriveStore {
             statistics: bounded_open.statistics,
             io_mode: bounded_open.io_mode,
             resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
+            logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
         store.validate_or_initialize_store_format_version()?;
+        if let Some(projection_preset) = projection_preset {
+            store.preflight_projection_preset(projection_preset, true)?;
+        }
         store.reconcile_consumer_schemas()?;
         store.record_rocksdb_properties();
         Ok(store)
@@ -890,8 +1226,38 @@ impl DeriveStore {
         secondary_path: impl AsRef<Path>,
         options: DeriveStoreOptions,
     ) -> Result<Self, DeriveStoreError> {
-        let primary_path = primary_path.as_ref();
-        let secondary_path = secondary_path.as_ref();
+        Self::open_secondary_store(
+            primary_path.as_ref(),
+            secondary_path.as_ref(),
+            options,
+            None,
+        )
+    }
+
+    /// Opens a secondary reader for one closed projection preset.
+    ///
+    /// The primary must already have initialized the same durable preset.
+    pub fn open_secondary_with_projection_preset(
+        primary_path: impl AsRef<Path>,
+        secondary_path: impl AsRef<Path>,
+        projection_preset: ProjectionPreset,
+        mut options: DeriveStoreOptions,
+    ) -> Result<Self, DeriveStoreError> {
+        options.consumers = projection_preset.consumer_schemas();
+        Self::open_secondary_store(
+            primary_path.as_ref(),
+            secondary_path.as_ref(),
+            options,
+            Some(projection_preset),
+        )
+    }
+
+    fn open_secondary_store(
+        primary_path: &Path,
+        secondary_path: &Path,
+        options: DeriveStoreOptions,
+        projection_preset: Option<ProjectionPreset>,
+    ) -> Result<Self, DeriveStoreError> {
         options
             .rocksdb_resource_budget
             .validate()
@@ -930,8 +1296,12 @@ impl DeriveStore {
             statistics: bounded_open.statistics,
             io_mode: bounded_open.io_mode,
             resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
+            logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
         store.require_matching_store_format_version()?;
+        if let Some(projection_preset) = projection_preset {
+            store.preflight_projection_preset(projection_preset, false)?;
+        }
         store.validate_secondary_consumer_schemas()?;
         store.record_rocksdb_properties();
         Ok(store)
@@ -1085,7 +1455,7 @@ impl DeriveStore {
         consumers: &mut [&mut dyn BlockKeyedConsumer],
         inputs: ChainEventDispatchInputs<'_>,
         blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
-    ) -> Result<(), DeriveError>
+    ) -> Result<Vec<ProjectionWriteMeasurement>, DeriveError>
     where
         S: BuildHasher,
     {
@@ -1116,7 +1486,7 @@ impl DeriveStore {
         inputs: ChainEventDispatchInputs<'_>,
         blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
         advance_cursor: bool,
-    ) -> Result<(), DeriveError>
+    ) -> Result<Vec<ProjectionWriteMeasurement>, DeriveError>
     where
         S: BuildHasher,
     {
@@ -1145,7 +1515,7 @@ impl DeriveStore {
         inputs: ChainEventDispatchInputs<'_>,
         blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
         advance_cursor: bool,
-    ) -> Result<(), DeriveError>
+    ) -> Result<Vec<ProjectionWriteMeasurement>, DeriveError>
     where
         S: BuildHasher,
     {
@@ -1159,8 +1529,13 @@ impl DeriveStore {
             batch: &mut batch,
         };
         let projection_checkpoint = block_projection_checkpoint(inputs, blocks);
+        let mut measurements =
+            Vec::with_capacity(block_consumers.len().saturating_add(event_consumers.len()));
 
         for consumer in block_consumers.iter_mut() {
+            let projection = consumer.name();
+            let before = WriteBatchSize::capture(ctx.batch);
+            let started_at = Instant::now();
             consumer
                 .begin_batch(&mut ctx)
                 .map_err(DeriveError::Consumer)?;
@@ -1171,25 +1546,50 @@ impl DeriveStore {
             consumer
                 .stage_chain_event_checkpoint(projection_checkpoint, &mut ctx)
                 .map_err(DeriveError::Consumer)?;
+            measurements.push(ProjectionWriteMeasurement::from_batch_delta(
+                projection,
+                before,
+                ctx.batch,
+                started_at.elapsed(),
+            ));
         }
         for consumer in event_consumers.iter_mut() {
+            let projection = consumer.name();
+            let before = WriteBatchSize::capture(ctx.batch);
+            let started_at = Instant::now();
             dispatch_chain_event_to_consumer(&mut **consumer, inputs, &mut ctx)?;
+            measurements.push(ProjectionWriteMeasurement::from_batch_delta(
+                projection,
+                before,
+                ctx.batch,
+                started_at.elapsed(),
+            ));
         }
 
         if advance_cursor {
-            self.stage_chain_event_cursor_advances(
-                &mut batch,
-                block_consumers,
-                inputs.chain_cursor,
-            )?;
-            self.stage_event_chain_event_cursor_advances(
-                &mut batch,
-                event_consumers,
-                inputs.chain_cursor,
-            )?;
+            let cursor_column_family = self.column_family(DeriveStoreTable::ChainEventCursor)?;
+            for consumer in block_consumers.iter() {
+                stage_projection_cursor_and_measure(
+                    &mut batch,
+                    &cursor_column_family,
+                    consumer.name(),
+                    inputs.chain_cursor,
+                    &mut measurements,
+                );
+            }
+            for consumer in event_consumers.iter() {
+                stage_projection_cursor_and_measure(
+                    &mut batch,
+                    &cursor_column_family,
+                    consumer.name(),
+                    inputs.chain_cursor,
+                    &mut measurements,
+                );
+            }
         }
         self.write_batch(&batch)?;
-        Ok(())
+        record_projection_write_measurements(&measurements);
+        Ok(measurements)
     }
 
     /// Dispatches one mempool consumer and atomically writes its rows plus
@@ -1199,18 +1599,30 @@ impl DeriveStore {
         consumer: &mut dyn DeriveMempoolConsumer,
         event: &crate::consumer::MempoolConsumerEvent<'_>,
         cursor_bytes: &[u8],
-    ) -> Result<(), DeriveError> {
+    ) -> Result<ProjectionWriteMeasurement, DeriveError> {
         let mut batch = WriteBatch::default();
         let mut ctx = DeriveConsumerCtx {
             store: self,
             batch: &mut batch,
         };
+        let projection = consumer.name();
+        let before = WriteBatchSize::capture(ctx.batch);
+        let started_at = Instant::now();
         consumer
             .apply_mempool_event(event, &mut ctx)
             .map_err(DeriveError::Consumer)?;
-        self.stage_mempool_event_cursor_advance(&mut batch, consumer.name(), cursor_bytes)?;
+        let mut measurement = ProjectionWriteMeasurement::from_batch_delta(
+            projection,
+            before,
+            ctx.batch,
+            started_at.elapsed(),
+        );
+        let cursor_before = WriteBatchSize::capture(&batch);
+        self.stage_mempool_event_cursor_advance(&mut batch, projection, cursor_bytes)?;
+        measurement.add_batch_delta(cursor_before, &batch);
         self.write_batch(&batch)?;
-        Ok(())
+        record_projection_write_measurements(std::slice::from_ref(&measurement));
+        Ok(measurement)
     }
 
     /// Reads a chain-event consumer's persisted cursor bytes, when present.
@@ -1241,7 +1653,25 @@ impl DeriveStore {
                 operation: "put_chain_event_cursor",
                 column_family: DeriveStoreColumnFamily::ChainEventCursor,
                 source,
-            })
+            })?;
+        self.record_projection_batch_if_selected(consumer, &batch);
+        Ok(())
+    }
+
+    /// Refreshes exported `RocksDB` resource and I/O metrics immediately.
+    ///
+    /// Normal writes sample these metrics through a one-second throttle. A
+    /// bounded benchmark or an operator snapshot can call this after a short
+    /// write burst so the exported ticker gauges include the completed work.
+    pub fn refresh_rocksdb_resource_metrics(&self) {
+        self.record_rocksdb_properties();
+    }
+
+    /// Returns serialized bytes submitted in successful write batches since
+    /// this process opened the store.
+    #[must_use]
+    pub fn logical_write_bytes(&self) -> u64 {
+        self.logical_write_bytes.load(Ordering::Relaxed)
     }
 
     /// Stages one chain-event cursor in a caller-owned atomic write batch.
@@ -1304,6 +1734,43 @@ impl DeriveStore {
                 column_family: DeriveStoreColumnFamily::ConsumerMetadata,
                 source,
             })
+    }
+
+    /// Commits a batch owned by one stable projection identity and attributes
+    /// its successful writes to that projection's operational counters.
+    ///
+    /// Callers use this for backfill, seed, and repair batches that do not pass
+    /// through chain-event dispatch. The batch must contain only rows and
+    /// metadata owned by `projection`.
+    pub fn write_projection_batch(
+        &self,
+        projection: DeriveConsumerName,
+        batch: &WriteBatch,
+    ) -> Result<(), DeriveStoreError> {
+        if !self.has_consumer(projection) {
+            return Err(DeriveStoreError::ProjectionNotSelected {
+                projection: projection.as_str(),
+            });
+        }
+        self.write_batch(batch)?;
+        self.record_projection_batch_if_selected(projection, batch);
+        Ok(())
+    }
+
+    fn record_projection_batch_if_selected(
+        &self,
+        projection: DeriveConsumerName,
+        batch: &WriteBatch,
+    ) {
+        if !self.has_consumer(projection) {
+            return;
+        }
+        record_projection_write_measurements(std::slice::from_ref(&ProjectionWriteMeasurement {
+            projection,
+            operations: usize_to_u64_saturating(batch.len()),
+            logical_bytes: usize_to_u64_saturating(batch.size_in_bytes()),
+            dispatch_duration: Duration::ZERO,
+        }));
     }
 
     /// Returns a column-family handle the caller can use when staging puts
@@ -1372,7 +1839,16 @@ impl DeriveStore {
                 operation: "put",
                 name: column_family,
                 source,
-            })
+            })?;
+        if let Some(projection) = self
+            .consumers
+            .iter()
+            .find(|schema| schema.column_families.contains(&column_family))
+            .map(|schema| schema.name)
+        {
+            self.record_projection_batch_if_selected(projection, &batch);
+        }
+        Ok(())
     }
 
     /// Persists the ingest plane's derive-status record so the explorer plane
@@ -1425,7 +1901,9 @@ impl DeriveStore {
     ) -> Result<(), DeriveStoreError> {
         let mut batch = WriteBatch::default();
         self.stage_consumer_projection_state(&mut batch, consumer, state)?;
-        self.write_batch(&batch)
+        self.write_batch(&batch)?;
+        self.record_projection_batch_if_selected(consumer, &batch);
+        Ok(())
     }
 
     /// Batch-reads multiple keys from a consumer-owned column family.
@@ -1767,32 +2245,6 @@ impl DeriveStore {
             })
     }
 
-    fn stage_chain_event_cursor_advances(
-        &self,
-        batch: &mut WriteBatch,
-        consumers: &[&mut dyn BlockKeyedConsumer],
-        cursor_bytes: &[u8],
-    ) -> Result<(), DeriveStoreError> {
-        let cf = self.column_family(DeriveStoreTable::ChainEventCursor)?;
-        for consumer in consumers {
-            batch.put_cf(&cf, consumer.name().as_str().as_bytes(), cursor_bytes);
-        }
-        Ok(())
-    }
-
-    fn stage_event_chain_event_cursor_advances(
-        &self,
-        batch: &mut WriteBatch,
-        consumers: &[&mut dyn DeriveConsumer],
-        cursor_bytes: &[u8],
-    ) -> Result<(), DeriveStoreError> {
-        let cf = self.column_family(DeriveStoreTable::ChainEventCursor)?;
-        for consumer in consumers {
-            batch.put_cf(&cf, consumer.name().as_str().as_bytes(), cursor_bytes);
-        }
-        Ok(())
-    }
-
     fn stage_mempool_event_cursor_advance(
         &self,
         batch: &mut WriteBatch,
@@ -1860,9 +2312,8 @@ impl DeriveStore {
     /// destroys a store it cannot read.
     fn wipe_derive_directory_if_store_format_superseded(
         path: &Path,
-        options: &DeriveStoreOptions,
     ) -> Result<(), DeriveStoreError> {
-        let Some(persisted) = Self::peek_store_format_version(path, options)? else {
+        let Some(persisted) = Self::peek_store_format_version(path)? else {
             return Ok(());
         };
         if persisted >= DERIVE_STORE_FORMAT_VERSION {
@@ -1886,38 +2337,23 @@ impl DeriveStore {
     /// Returns `None` when `path` holds no derive store yet. The store is
     /// opened as a primary, read, and closed before the caller decides whether
     /// to wipe or open it for real.
-    fn peek_store_format_version(
-        path: &Path,
-        options: &DeriveStoreOptions,
-    ) -> Result<Option<u16>, DeriveStoreError> {
+    fn peek_store_format_version(path: &Path) -> Result<Option<u16>, DeriveStoreError> {
         let existing_column_families = existing_column_family_names(path);
         if existing_column_families.is_empty() {
             return Ok(None);
         }
-        let bounded_open = open_bounded_rocksdb(
-            RocksDbOpenRole::Primary { path },
-            options.rocksdb_resource_budget,
-            |cache, rocksdb_resource_budget| {
-                column_family_descriptors(
-                    cache,
-                    rocksdb_resource_budget,
-                    options.consumers,
-                    &existing_column_families,
-                )
-            },
-        )
-        .map_err(|source| DeriveStoreError::Open {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let column_family = bounded_open
-            .db
+        let db =
+            DB::open_cf_for_read_only(&Options::default(), path, &existing_column_families, false)
+                .map_err(|source| DeriveStoreError::Open {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let column_family = db
             .cf_handle(DeriveStoreTable::ConsumerMetadata.column_family_name())
             .ok_or(DeriveStoreError::ColumnFamilyMissing {
                 column_family: DeriveStoreColumnFamily::ConsumerMetadata,
             })?;
-        let persisted = bounded_open
-            .db
+        let persisted = db
             .get_cf(&column_family, STORE_FORMAT_VERSION_KEY)
             .map_err(|source| DeriveStoreError::Operation {
                 operation: "get",
@@ -1930,9 +2366,45 @@ impl DeriveStore {
                 column_family: DeriveStoreColumnFamily::ConsumerMetadata,
                 reason,
             })?;
-        drop(column_family);
-        drop(bounded_open);
         Ok(persisted)
+    }
+
+    /// Reads the existing per-consumer manifest without opening the store for
+    /// writes, creating column families, or reconciling schemas.
+    fn preflight_projection_preset_at_path(
+        path: &Path,
+        requested: ProjectionPreset,
+    ) -> Result<(), DeriveStoreError> {
+        let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path)? else {
+            return Ok(());
+        };
+        Self::validate_recorded_projection_identities(requested, &recorded_consumers, false)
+    }
+
+    fn read_consumer_manifest_at_path(
+        path: &Path,
+    ) -> Result<Option<BTreeMap<String, ConsumerManifestEntry>>, DeriveStoreError> {
+        let existing_column_families = existing_column_family_names(path);
+        if existing_column_families.is_empty() {
+            return Ok(None);
+        }
+        let db =
+            DB::open_cf_for_read_only(&Options::default(), path, &existing_column_families, false)
+                .map_err(|source| DeriveStoreError::Open {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let Some(column_family) =
+            db.cf_handle(DeriveStoreTable::ConsumerMetadata.column_family_name())
+        else {
+            return Ok(Some(BTreeMap::new()));
+        };
+        let iterator = db.iterator_cf(
+            &column_family,
+            IteratorMode::From(CONSUMER_SCHEMA_KEY_PREFIX, rust_rocksdb::Direction::Forward),
+        );
+        let recorded_consumers = decode_consumer_manifest_entries(iterator)?;
+        Ok(Some(recorded_consumers))
     }
 
     fn validate_or_initialize_store_format_version(&self) -> Result<(), DeriveStoreError> {
@@ -1956,6 +2428,75 @@ impl DeriveStore {
                 persisted,
                 running: DERIVE_STORE_FORMAT_VERSION,
             })
+        }
+    }
+
+    fn preflight_projection_preset(
+        &self,
+        requested: ProjectionPreset,
+        allow_fresh_store: bool,
+    ) -> Result<(), DeriveStoreError> {
+        let recorded_consumers = self.read_consumer_manifest()?;
+        Self::validate_recorded_projection_identities(
+            requested,
+            &recorded_consumers,
+            allow_fresh_store,
+        )
+    }
+
+    fn validate_recorded_projection_identities(
+        requested: ProjectionPreset,
+        recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
+        allow_fresh_store: bool,
+    ) -> Result<(), DeriveStoreError> {
+        if recorded_consumers.is_empty() && allow_fresh_store {
+            return Ok(());
+        }
+        Self::reject_unknown_projection_identities(recorded_consumers)?;
+        let recorded_preset = Self::preset_for_recorded_consumers(recorded_consumers);
+        let compatible = match requested {
+            ProjectionPreset::Wallet => recorded_preset == ProjectionPreset::Wallet,
+            // Complete preserves the legacy behavior of adding newly bundled
+            // consumers during a release upgrade. A store whose durable
+            // identity set is exactly wallet is the one forbidden expansion.
+            ProjectionPreset::Complete => recorded_preset == ProjectionPreset::Complete,
+        };
+        if compatible {
+            return Ok(());
+        }
+        Err(DeriveStoreError::ProjectionPresetRequiresFreshStore {
+            requested: requested.as_str(),
+        })
+    }
+
+    fn reject_unknown_projection_identities(
+        recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
+    ) -> Result<(), DeriveStoreError> {
+        for (name, entry) in recorded_consumers {
+            if BUNDLED_CONSUMERS
+                .iter()
+                .all(|consumer| consumer.name.as_str() != name)
+            {
+                return Err(DeriveStoreError::ConsumerNotDeclared {
+                    consumer: name.clone(),
+                    persisted_schema_version: entry.schema_version,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn preset_for_recorded_consumers(
+        recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
+    ) -> ProjectionPreset {
+        let recorded_is_wallet = recorded_consumers.len() == WALLET_PROJECTION_CONSUMERS.len()
+            && WALLET_PROJECTION_CONSUMERS
+                .iter()
+                .all(|schema| recorded_consumers.contains_key(schema.name.as_str()));
+        if recorded_is_wallet {
+            ProjectionPreset::Wallet
+        } else {
+            ProjectionPreset::Complete
         }
     }
 
@@ -2149,31 +2690,7 @@ impl DeriveStore {
             &column_family,
             IteratorMode::From(CONSUMER_SCHEMA_KEY_PREFIX, rust_rocksdb::Direction::Forward),
         );
-        let mut manifest = BTreeMap::new();
-        for entry in iterator {
-            let (key, payload) = entry.map_err(|source| DeriveStoreError::Operation {
-                operation: "read_manifest",
-                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
-                source,
-            })?;
-            let Some(name_bytes) = key.strip_prefix(CONSUMER_SCHEMA_KEY_PREFIX) else {
-                break;
-            };
-            let name = String::from_utf8(name_bytes.to_vec()).map_err(|error| {
-                DeriveStoreError::SchemaReconcile {
-                    operation: "decode_manifest_name",
-                    reason: error.to_string(),
-                }
-            })?;
-            let decoded = decode_manifest_entry(&payload).map_err(|reason| {
-                DeriveStoreError::SchemaReconcile {
-                    operation: "decode_manifest_entry",
-                    reason,
-                }
-            })?;
-            manifest.insert(name, decoded);
-        }
-        Ok(manifest)
+        decode_consumer_manifest_entries(iterator)
     }
 
     /// Clears every row in a consumer-owned column family without dropping the
@@ -2278,9 +2795,12 @@ impl DeriveStore {
     }
 
     fn write(&self, batch: &WriteBatch) -> Result<(), rust_rocksdb::Error> {
+        let batch_bytes = u64::try_from(batch.size_in_bytes()).unwrap_or(u64::MAX);
         let mut write_options = WriteOptions::default();
         write_options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &write_options)?;
+        self.logical_write_bytes
+            .fetch_add(batch_bytes, Ordering::Relaxed);
         if self.resource_gauge_throttle.should_sample() {
             self.record_rocksdb_properties();
         }
@@ -2310,7 +2830,87 @@ impl DeriveStore {
             io_mode: self.io_mode,
             resource_budget: self.rocksdb_resource_budget,
         });
+        self.record_projection_rocksdb_properties(store_role);
     }
+
+    fn record_projection_rocksdb_properties(&self, store_role: StoreRole) {
+        for consumer in self.consumers {
+            for property in PROJECTION_ROCKSDB_PROPERTIES {
+                let mut aggregate = 0_u64;
+                let mut sampled = false;
+                for column_family_name in consumer.column_families {
+                    let Some(column_family) = self.db.cf_handle(column_family_name) else {
+                        continue;
+                    };
+                    let Ok(Some(property_sample)) =
+                        self.db.property_int_value_cf(&column_family, property)
+                    else {
+                        continue;
+                    };
+                    aggregate = aggregate.saturating_add(property_sample);
+                    sampled = true;
+                }
+                if sampled {
+                    metrics::gauge!(
+                        "zinder_projection_rocksdb_property",
+                        "projection" => consumer.name.as_str(),
+                        "property" => property,
+                        "store_role" => store_role.as_str()
+                    )
+                    .set(u64_to_f64(aggregate));
+                }
+            }
+        }
+    }
+}
+
+fn stage_projection_cursor_and_measure(
+    batch: &mut WriteBatch,
+    cursor_column_family: &Arc<rust_rocksdb::BoundColumnFamily<'_>>,
+    projection: DeriveConsumerName,
+    cursor_bytes: &[u8],
+    measurements: &mut [ProjectionWriteMeasurement],
+) {
+    let before = WriteBatchSize::capture(batch);
+    batch.put_cf(
+        cursor_column_family,
+        projection.as_str().as_bytes(),
+        cursor_bytes,
+    );
+    if let Some(measurement) = measurements
+        .iter_mut()
+        .find(|measurement| measurement.projection == projection)
+    {
+        measurement.add_batch_delta(before, batch);
+    }
+}
+
+fn record_projection_write_measurements(measurements: &[ProjectionWriteMeasurement]) {
+    for measurement in measurements {
+        let projection = measurement.projection.as_str();
+        metrics::counter!(
+            "zinder_projection_write_operations_total",
+            "projection" => projection
+        )
+        .increment(measurement.operations);
+        metrics::counter!(
+            "zinder_projection_write_bytes_total",
+            "projection" => projection
+        )
+        .increment(measurement.logical_bytes);
+    }
+}
+
+fn usize_to_u64_saturating(amount: usize) -> u64 {
+    u64::try_from(amount).unwrap_or(u64::MAX)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges are f64 and approximate very large byte counters"
+)]
+fn u64_to_f64(sample: u64) -> f64 {
+    sample as f64
 }
 
 fn dispatch_chain_event_to_block_consumer<C, S>(
@@ -2449,6 +3049,35 @@ fn decode_store_format_version(bytes: &[u8]) -> Result<u16, String> {
         .try_into()
         .map_err(|_| format!("store format version requires 2 bytes; got {}", bytes.len()))?;
     Ok(u16::from_be_bytes(array))
+}
+
+fn decode_consumer_manifest_entries(
+    iterator: impl Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), rust_rocksdb::Error>>,
+) -> Result<BTreeMap<String, ConsumerManifestEntry>, DeriveStoreError> {
+    let mut manifest = BTreeMap::new();
+    for entry in iterator {
+        let (key, payload) = entry.map_err(|source| DeriveStoreError::SchemaReconcile {
+            operation: "read_manifest",
+            reason: source.to_string(),
+        })?;
+        let Some(name_bytes) = key.strip_prefix(CONSUMER_SCHEMA_KEY_PREFIX) else {
+            break;
+        };
+        let name = String::from_utf8(name_bytes.to_vec()).map_err(|error| {
+            DeriveStoreError::SchemaReconcile {
+                operation: "decode_manifest_name",
+                reason: error.to_string(),
+            }
+        })?;
+        let decoded = decode_manifest_entry(&payload).map_err(|reason| {
+            DeriveStoreError::SchemaReconcile {
+                operation: "decode_manifest_entry",
+                reason,
+            }
+        })?;
+        manifest.insert(name, decoded);
+    }
+    Ok(manifest)
 }
 
 /// One consumer's persisted schema manifest row: its declared version and the
@@ -2776,10 +3405,10 @@ mod tests {
     }
 
     #[test]
-    fn paid_fee_schema_is_bundled_before_ingest_dispatch_is_wired() {
+    fn paid_fee_schema_and_cursor_participate_in_bundled_dispatch() {
         assert!(DeriveStore::bundled_consumers().contains(&PAID_FEE_DISTRIBUTION_SCHEMA));
         assert!(
-            !DeriveStore::bundled_chain_event_consumer_names()
+            DeriveStore::bundled_chain_event_consumer_names()
                 .contains(&PAID_FEE_DISTRIBUTION_SCHEMA.name)
         );
     }
@@ -2806,6 +3435,64 @@ mod tests {
         assert_eq!(
             store.get_chain_event_cursor(TEST_CONSUMER)?,
             Some(vec![4, 5])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn projection_write_measurement_attributes_rows_and_cursor_to_stable_identity() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = DeriveStore::open(
+            tempdir.path(),
+            DeriveStoreOptions {
+                consumers: &[TEST_CONSUMER_SCHEMA],
+                ..DeriveStoreOptions::default()
+            },
+        )?;
+        let projection = TEST_CONSUMER_SCHEMA.name;
+        let consumer_column_family = store.consumer_column_family(TEST_CONSUMER_CF)?;
+        let mut batch = WriteBatch::default();
+        let before = WriteBatchSize::capture(&batch);
+        batch.put_cf(&consumer_column_family, b"row-key", b"row-payload");
+        let mut measurements = vec![ProjectionWriteMeasurement::from_batch_delta(
+            projection,
+            before,
+            &batch,
+            Duration::ZERO,
+        )];
+        let cursor_column_family = store.column_family(DeriveStoreTable::ChainEventCursor)?;
+        stage_projection_cursor_and_measure(
+            &mut batch,
+            &cursor_column_family,
+            projection,
+            b"cursor",
+            &mut measurements,
+        );
+
+        assert_eq!(measurements[0].projection, projection);
+        assert_eq!(measurements[0].operations, 2);
+        assert!(measurements[0].logical_bytes > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn projection_owned_batch_rejects_an_unselected_identity_before_write() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = DeriveStore::open(tempdir.path(), DeriveStoreOptions::default())?;
+        let metadata = store.column_family(DeriveStoreTable::ConsumerMetadata)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&metadata, b"must-not-commit", b"row");
+
+        let outcome = store.write_projection_batch(TEST_CONSUMER, &batch);
+
+        assert!(matches!(
+            outcome,
+            Err(DeriveStoreError::ProjectionNotSelected { projection })
+                if projection == TEST_CONSUMER.as_str()
+        ));
+        assert_eq!(
+            store.get(DeriveStoreTable::ConsumerMetadata, b"must-not-commit")?,
+            None
         );
         Ok(())
     }

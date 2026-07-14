@@ -171,7 +171,7 @@ impl CommitmentRootSearchConsumer {
             store.consumer_column_family(COMMITMENT_ROOT_SEARCH_COVERAGE_COLUMN_FAMILY)?;
         ctx.batch
             .put_cf(&coverage_cf, COVERAGE_KEY, encode_coverage(next_coverage));
-        store.write_batch(ctx.batch)?;
+        store.write_projection_batch(COMMITMENT_ROOT_SEARCH_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 }

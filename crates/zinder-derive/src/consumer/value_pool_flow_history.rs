@@ -297,7 +297,7 @@ impl ValuePoolFlowHistoryConsumer {
         let cf = store.consumer_column_family(VALUE_POOL_FLOW_HISTORY_COVERAGE_COLUMN_FAMILY)?;
         ctx.batch
             .put_cf(&cf, COVERAGE_KEY, encode_coverage(next_coverage));
-        store.write_batch(ctx.batch)?;
+        store.write_projection_batch(VALUE_POOL_FLOW_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -318,7 +318,7 @@ impl ValuePoolFlowHistoryConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_batch(ctx.batch)?;
+        store.write_projection_batch(VALUE_POOL_FLOW_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 

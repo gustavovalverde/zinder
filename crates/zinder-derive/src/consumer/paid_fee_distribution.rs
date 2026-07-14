@@ -588,7 +588,7 @@ impl PaidFeeDistributionConsumer {
             store.consumer_column_family(PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY)?;
         ctx.batch
             .put_cf(&coverage_cf, COVERAGE_KEY, encode_coverage(next_coverage));
-        store.write_batch(ctx.batch)?;
+        store.write_projection_batch(PAID_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -609,7 +609,7 @@ impl PaidFeeDistributionConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_batch(ctx.batch)?;
+        store.write_projection_batch(PAID_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 

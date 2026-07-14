@@ -379,13 +379,13 @@ fn validate_cursor_matches_request(
 ) -> Result<(), DeriveStoreError> {
     let address = decode_address_from_key(key)?;
     if address != request.address_script_hash {
-        return Err(decode_error(
+        return Err(cursor_error(
             "cursor address does not match request address",
         ));
     }
     let height = decode_height_from_key(key, request.descending)?;
     if height < request.start_height || height > request.end_height {
-        return Err(decode_error("cursor height is outside request range"));
+        return Err(cursor_error("cursor height is outside request range"));
     }
     Ok(())
 }
@@ -476,19 +476,21 @@ fn history_cursor_from_token(
 ) -> Result<HistoryCursor, DeriveStoreError> {
     let bytes = cursor.as_bytes();
     if bytes.len() != CURSOR_LEN {
-        return Err(decode_error("history cursor length is invalid"));
+        return Err(cursor_error("history cursor length is invalid"));
     }
     if bytes.get(..CURSOR_PREFIX.len()) != Some(CURSOR_PREFIX) {
-        return Err(decode_error("history cursor prefix is invalid"));
+        return Err(cursor_error("history cursor prefix is invalid"));
     }
     let descending = match bytes[CURSOR_DIRECTION_OFFSET] {
         0 => false,
         1 => true,
-        _ => return Err(decode_error("history cursor direction is invalid")),
+        _ => return Err(cursor_error("history cursor direction is invalid")),
     };
     Ok(HistoryCursor {
         descending,
-        key: history_key_from_bytes(&bytes[CURSOR_KEY_OFFSET..])?,
+        key: bytes[CURSOR_KEY_OFFSET..]
+            .try_into()
+            .map_err(|_| cursor_error("history cursor length is invalid"))?,
     })
 }
 
@@ -531,6 +533,13 @@ fn decode_error(reason: impl Into<String>) -> DeriveStoreError {
     DeriveStoreError::Decode {
         column_family: DeriveStoreColumnFamily::ConsumerMetadata,
         reason: reason.into(),
+    }
+}
+
+fn cursor_error(reason: &'static str) -> DeriveStoreError {
+    DeriveStoreError::ProjectionCursorInvalid {
+        projection: TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME.as_str(),
+        reason,
     }
 }
 

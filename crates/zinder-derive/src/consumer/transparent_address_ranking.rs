@@ -334,7 +334,7 @@ impl TransparentAddressRankingConsumer {
             BUILD_MANIFEST_KEY,
             encode_snapshot_build_manifest(requested),
         );
-        store.write_batch(&batch)?;
+        store.write_projection_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(())
     }
 
@@ -415,7 +415,7 @@ impl TransparentAddressRankingConsumer {
             BUILD_MANIFEST_KEY,
             encode_snapshot_build_manifest(manifest),
         );
-        store.write_batch(&batch)?;
+        store.write_projection_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(())
     }
 
@@ -489,7 +489,7 @@ impl TransparentAddressRankingConsumer {
         let metadata_cf =
             store.consumer_column_family(TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY)?;
         batch.put_cf(&metadata_cf, BUILD_METADATA_KEY, encode_metadata(updated));
-        store.write_batch(&batch)?;
+        store.write_projection_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(())
     }
 
@@ -545,7 +545,7 @@ impl TransparentAddressRankingConsumer {
             TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
             cursor_bytes,
         )?;
-        store.write_batch(&batch)?;
+        store.write_projection_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(metadata)
     }
 

@@ -251,7 +251,7 @@ impl ValuePoolBalanceHistoryConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_batch(ctx.batch)?;
+        store.write_projection_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -286,7 +286,7 @@ impl ValuePoolBalanceHistoryConsumer {
             BACKFILL_COVERAGE_KEY,
             encode_backfill_coverage(next_coverage),
         );
-        store.write_batch(ctx.batch)?;
+        store.write_projection_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -307,7 +307,7 @@ impl ValuePoolBalanceHistoryConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_batch(ctx.batch)?;
+        store.write_projection_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 

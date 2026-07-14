@@ -12,12 +12,12 @@
 //! projection answers only *who* spent an outpoint, never *whether* it is
 //! spent. A missing row means "no spender recorded", never "unspent".
 //!
-//! Schema cost: the canonical retention sweep releases only up to this
-//! projection's durable height, and swept facts can never be re-derived (their
-//! source rows are gone). Bumping [`TRANSPARENT_OUTPOINT_SPEND_SCHEMA`]'s
-//! version wipes and rebuilds this projection from retained canonical events;
-//! if the rebuild floor sits above already-swept heights the only remedy is a
-//! full canonical re-ingest. Keep the row format conservative.
+//! The consumer derives spender identity from the child transaction's intrinsic
+//! input and mined location, not from the parent output or the short-lived
+//! canonical spend-fact row. This keeps checkpoint-crossing spends observable
+//! and lets a scoped schema rebuild replay durable transaction facts. The
+//! retention sweep still releases canonical spend facts only after this
+//! projection durably materializes the corresponding height.
 
 use std::collections::HashMap;
 
@@ -121,17 +121,10 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
         block: &BlockCommitContext,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        // This projection gates irreversible canonical deletion through its
-        // durable height, so it must never advance that height for a block
-        // whose spenders it could not observe.
-        let Some(spends_by_outpoint) = block.transparent_spends()? else {
-            return Err(Box::new(
-                TransparentOutpointSpendConsumerError::OfflineSpendFacts {
-                    height: block.height.value(),
-                },
-            ));
-        };
-        let rows = collect_spend_rows(block, &spends_by_outpoint);
+        // Spender identity is intrinsic to the child transaction input and its
+        // mined location. Parent-output hydration supplies value and script
+        // facts to other consumers, but must not gate this retention authority.
+        let rows = collect_spend_rows(block);
         let spend_cf = ctx
             .store
             .consumer_column_family(TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY)?;
@@ -140,12 +133,12 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
             .consumer_column_family(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?;
 
         let mut index_payload = Vec::with_capacity(rows.len() * OUTPOINT_KEY_LEN);
-        for (outpoint, spend) in rows {
-            let key = encode_outpoint_key(outpoint);
+        for spend in rows {
+            let key = encode_outpoint_key(spend.spent_outpoint);
             ctx.batch.put_cf(
                 &spend_cf,
                 key,
-                encode_transparent_spend_row_value(&spend).as_slice(),
+                encode_transparent_spend_entry_row_value(&spend).as_slice(),
             );
             index_payload.extend_from_slice(&key);
         }
@@ -191,15 +184,18 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
     }
 }
 
-fn collect_spend_rows(
-    block: &BlockCommitContext,
-    spends_by_outpoint: &HashMap<TransparentOutPoint, TransparentSpendFact>,
-) -> Vec<(TransparentOutPoint, TransparentSpendFact)> {
+fn collect_spend_rows(block: &BlockCommitContext) -> Vec<TransparentSpendEntry> {
     let mut rows = Vec::new();
     for transaction in &block.transactions {
         for input in &transaction.transparent_inputs {
-            if let Some(spend) = spends_by_outpoint.get(&input.spent_outpoint) {
-                rows.push((input.spent_outpoint, spend.clone()));
+            if input.spent_outpoint != TransparentOutPoint::COINBASE_SENTINEL {
+                rows.push(TransparentSpendEntry {
+                    spent_outpoint: input.spent_outpoint,
+                    spending_transaction_id: transaction.location.transaction_id,
+                    input_index: input.input_index,
+                    spending_block_height: transaction.location.block_height,
+                    spending_block_hash: transaction.location.block_hash,
+                });
             }
         }
     }
@@ -213,14 +209,26 @@ fn collect_spend_rows(
 /// test seeders reuse it instead of hand-writing the same offsets.
 #[must_use]
 pub fn encode_transparent_spend_row_value(spend: &TransparentSpendFact) -> [u8; SPEND_VALUE_LEN] {
+    encode_transparent_spend_entry_row_value(&TransparentSpendEntry {
+        spent_outpoint: spend.spent_outpoint,
+        spending_transaction_id: spend.spending_transaction_id,
+        input_index: spend.input_index,
+        spending_block_height: spend.block_height,
+        spending_block_hash: spend.block_hash,
+    })
+}
+
+fn encode_transparent_spend_entry_row_value(
+    spend: &TransparentSpendEntry,
+) -> [u8; SPEND_VALUE_LEN] {
     let mut encoded = [0u8; SPEND_VALUE_LEN];
     encoded[SPENDING_TRANSACTION_ID_RANGE].copy_from_slice(&encode_internal_transaction_id(
         spend.spending_transaction_id,
     ));
     encoded[SPENDING_BLOCK_HASH_RANGE]
-        .copy_from_slice(&encode_internal_block_hash(spend.block_hash));
+        .copy_from_slice(&encode_internal_block_hash(spend.spending_block_hash));
     encoded[SPENDING_HEIGHT_RANGE]
-        .copy_from_slice(&encode_height_key_ascending(spend.block_height));
+        .copy_from_slice(&encode_height_key_ascending(spend.spending_block_height));
     encoded[INPUT_INDEX_RANGE].copy_from_slice(&spend.input_index.to_be_bytes());
     encoded
 }
@@ -280,7 +288,7 @@ mod tests {
 
     use super::{
         TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
-        TransparentOutpointSpendConsumer, TransparentOutpointSpendConsumerError,
+        TransparentOutpointSpendConsumer,
     };
     use crate::consumer::block_commit_context::{
         BlockCommitContext, BlockCommitPayload, TransparentSpendFacts,
@@ -341,14 +349,18 @@ mod tests {
     }
 
     fn spend_block() -> BlockCommitContext {
+        let mut spends = HashMap::new();
+        spends.insert(received_outpoint(), spend_fact());
+        spend_block_with_facts(TransparentSpendFacts::Static(Arc::new(spends)))
+    }
+
+    fn spend_block_with_facts(spend_facts: TransparentSpendFacts) -> BlockCommitContext {
         let location = TransactionLocation::new(transaction_id(20), SPEND_HEIGHT, block_hash(5), 0);
         let transaction = TransactionFactsArtifact::new(location, public_facts(20))
             .with_transparent_facts(
                 vec![TransparentInputFact::new(2, received_outpoint())],
                 Vec::new(),
             );
-        let mut spends = HashMap::new();
-        spends.insert(received_outpoint(), spend_fact());
         BlockCommitContext::new(
             BlockCommitPayload {
                 height: SPEND_HEIGHT,
@@ -359,7 +371,7 @@ mod tests {
                 transactions: vec![transaction],
                 final_note_commitment_roots: None,
             },
-            TransparentSpendFacts::Static(Arc::new(spends)),
+            spend_facts,
         )
     }
 
@@ -462,6 +474,29 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_parent_still_records_spender_from_child_transaction()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = TransparentOutpointSpendConsumer::new();
+        let block = spend_block_with_facts(TransparentSpendFacts::Static(Arc::new(HashMap::new())));
+
+        apply_block(&store, &mut consumer, &block)?;
+
+        let spends = TransparentOutpointSpendConsumer::read_spends_by_outpoints(
+            &store,
+            &[received_outpoint()],
+        )?;
+        let entry = spends
+            .get(&received_outpoint())
+            .expect("child transaction input must identify its spender without parent facts");
+        assert_eq!(entry.spending_transaction_id, transaction_id(20));
+        assert_eq!(entry.spending_block_hash, block_hash(5));
+        assert_eq!(entry.spending_block_height, SPEND_HEIGHT);
+        assert_eq!(entry.input_index, 2);
+        Ok(())
+    }
+
+    #[test]
     fn coinbase_input_records_no_spend_row() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     {
         let (_tempdir, store) = open_store()?;
@@ -485,35 +520,19 @@ mod tests {
     }
 
     #[test]
-    fn offline_spend_facts_are_a_hard_error() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    {
+    fn offline_parent_facts_still_record_spender()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (_tempdir, store) = open_store()?;
         let mut consumer = TransparentOutpointSpendConsumer::new();
-        let block = BlockCommitContext::new(
-            BlockCommitPayload {
-                height: SPEND_HEIGHT,
-                block_hash: block_hash(5),
-                previous_block_hash: block_hash(4),
-                block_time_unix_seconds: 1_700_000_500,
-                block_size_bytes: 0,
-                transactions: Vec::new(),
-                final_note_commitment_roots: None,
-            },
-            TransparentSpendFacts::Offline,
-        );
+        let block = spend_block_with_facts(TransparentSpendFacts::Offline);
 
-        let mut batch = WriteBatch::default();
-        let mut ctx = DeriveConsumerCtx {
-            store: &store,
-            batch: &mut batch,
-        };
-        let error = consumer
-            .apply_block(&block, &mut ctx)
-            .expect_err("offline spend facts must fail instead of advancing the durable height");
-        assert!(matches!(
-            error.downcast_ref::<TransparentOutpointSpendConsumerError>(),
-            Some(TransparentOutpointSpendConsumerError::OfflineSpendFacts { height }) if *height == SPEND_HEIGHT.value()
-        ));
+        apply_block(&store, &mut consumer, &block)?;
+
+        let spends = TransparentOutpointSpendConsumer::read_spends_by_outpoints(
+            &store,
+            &[received_outpoint()],
+        )?;
+        assert!(spends.contains_key(&received_outpoint()));
         Ok(())
     }
 
@@ -578,17 +597,5 @@ pub enum TransparentOutpointSpendConsumerError {
         height: u32,
         /// Byte length actually persisted.
         bytes: usize,
-    },
-
-    /// The block context supplied no transparent spend facts, so the projection
-    /// cannot record the block's spenders. Advancing its durable height here
-    /// would unlock irreversible canonical deletion for a height it never
-    /// covered.
-    #[error(
-        "transparent_outpoint_spend cannot consume block {height} with transparent spend facts offline"
-    )]
-    OfflineSpendFacts {
-        /// Height whose spend facts were unavailable.
-        height: u32,
     },
 }
