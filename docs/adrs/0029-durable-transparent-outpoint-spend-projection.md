@@ -9,7 +9,7 @@
 
 ## Context
 
-The canonical safe-tip retention sweep deletes a transparent spend fact and its
+Canonical transparent-retention maintenance deletes a transparent spend fact and its
 spent-output rows once the spend settles below the safe tip. `WalletQuery.TransparentSpendsByOutpoint`
 then cannot resolve the spender of anything spent longer ago than the reorg
 window, which breaks wallet offline-recovery: a wallet backend maps that RPC to
@@ -21,8 +21,8 @@ stay ignorant of the derive plane ([ADR-0003](0003-canonical-storage-access-boun
 
 ## Decision
 
-A bundled derive consumer records durable spender identity, and the canonical
-retention sweep is clamped so it never deletes a fact the consumer has not yet
+A bundled derive consumer records durable spender identity, and canonical
+retention maintenance is clamped so it never deletes a fact the consumer has not yet
 recorded.
 
 ### Authority split
@@ -48,21 +48,22 @@ facts are unavailable at replay time is a hard error, never a skip: the durable
 height gates irreversible canonical deletion, so it must not advance past a
 block whose spenders the consumer could not observe.
 
-The projection sources its facts from the same canonical spend facts the sweep
-deletes, so a schema-version bump that rebuilds it replays from retained
-canonical events; a rebuild floor above already-swept heights forces a full
-canonical re-ingest. This is the one exception to the per-consumer rebuild
-economics of [ADR-0028](0028-per-consumer-derive-schema-versioning.md): every
-other consumer's schema bump costs a scoped wipe plus a replay from retained
-events, while this consumer's bump can escalate to a from-genesis canonical
-re-ingest because the sweep destroyed its source rows. The row format is
-deliberately conservative to keep the version stable.
+Artifact schema 18 stores every observed input and the resolved spend facts in
+the canonical block-local spend index. Transparent-retention maintenance deletes the
+per-outpoint serving row but retains that block record, so a derive consumer
+schema bump can rebuild from retained canonical events like every other consumer in
+[ADR-0028](0028-per-consumer-derive-schema-versioning.md). Finalized replay
+verifies the block record's input set and producing-block identity against the
+canonical transactions before advancing the durable projection height. Facts
+whose parents predate a configured checkpoint remain explicitly unresolved;
+they do not make the whole replay context unavailable.
 
 ### Retention release floor
 
 The canonical store persists a `transparent_retention_release_height` marker
-alongside the existing swept-through marker. The safe-tip sweep clamps its
-ceiling to `min(new safe tip, previous tip, release height)`, so a settled spend
+alongside the existing swept-through marker. A dedicated ingest maintenance
+worker runs only after canonical and derive are caught up, independently of
+chain commits, and clamps its ceiling to `min(current safe tip, release height)`, so a settled spend
 above the release height stays retained. `zinder-ingest` publishes the release
 height from the derive tailer as the durable projection advances, so canonical
 retention releases only what the projection has already recorded. A release
@@ -76,22 +77,21 @@ delete, stranding spender identities the guard cannot recover. Publication is
 throttled: each floor advance costs one derive fsync plus one synced canonical
 write, and a floor that lags by the throttle interval only defers a sweep.
 
-### Deleted-through marker and startup guard
+### Deleted-through marker and replay source
 
 Deletion provenance is recorded, not inferred. Every batch that deletes a spend
-fact (the safe-tip sweep, and the in-place address-projection migration) writes
+fact (transparent-retention maintenance, and the in-place address-projection migration) writes
 the highest deleted height into a `transparent_retention_deleted_through_height`
 marker in the same batch. A checkpoint bootstrap that only advances the swept
 cursor, and a migration that deletes nothing, leave the marker unset.
 
-`zinder-ingest` refuses to start when the projection's durable height falls below
-that marker: those spender identities can never be re-derived, and the only
-remedy is a full canonical re-ingest, so the process crashes with a typed error
-naming exactly that. A fresh store and a checkpoint-bootstrap store both pass
-because the marker stays unset until a real deletion runs. A store that migrated
-its address projection in place and deleted finalized-spent facts seeds the
-marker at its safe tip, so it fails the guard rather than serving absent spenders
-for genuinely spent outpoints.
+The marker still distinguishes an ambiguous canonical point miss from an
+outpoint that was never observed, which keeps union-routed serving fail-closed
+while derive lags. It no longer limits derive rebuildability: block-local spend
+records survive the deletion. Store schema 13 is a hard boundary because older
+stores recorded only outpoints in that index and may already have deleted the
+facts needed to fill it. Such stores are refused at primary open and require a
+genesis rebuild; there is no unsafe best-effort migration.
 
 ### Serving
 
@@ -118,7 +118,7 @@ projection.
 - Canonical retention no longer advances on the safe tip alone; it waits for the
   durable projection, so a projection that lags (or is paused under memory
   pressure) holds canonical spend-fact storage until it catches up.
-- Deploying onto a store that already swept past an absent projection crashes on
-  purpose and requires a canonical re-ingest.
-- The projection's schema version is expensive to move; a bump rebuilds from
-  retained events and can escalate to a canonical re-ingest.
+- A derive projection can be wiped and rebuilt after point-row retention because
+  the canonical block-local replay source remains durable.
+- Deploying artifact schema 18/store schema 13 onto any older canonical volume
+  fails closed and requires one genesis rebuild to establish that durable source.

@@ -255,6 +255,17 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         .await?
         .ok_or_else(|| eyre!("expected bulk catchup to commit"))?;
 
+    let replay = store
+        .current_chain_epoch_reader()?
+        .current_transparent_spend_replay_at_height(source_block.height)?
+        .ok_or_else(|| eyre!("checkpoint block did not persist its transparent input set"))?;
+    assert_eq!(replay.block_hash, source_block.hash);
+    assert!(!replay.input_outpoints.is_empty());
+    assert!(
+        replay.spend_facts.is_empty(),
+        "parents older than the checkpoint must remain explicitly unresolved"
+    );
+
     let derive_store = bundled_derive_store(&storage_path)?;
     catch_up_derive_store_to_canonical(
         &store,

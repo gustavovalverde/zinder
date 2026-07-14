@@ -277,6 +277,6 @@ fn epoch_artifacts(
 }
 
 #[test]
-fn current_schema_is_seventeen() {
-    assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 17);
+fn current_schema_is_eighteen() {
+    assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 18);
 }

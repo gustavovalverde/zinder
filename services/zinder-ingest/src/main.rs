@@ -19,26 +19,26 @@ use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
     CommitmentRootBackfillContext, ConventionalFeeDistributionBackfillContext,
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    IngestControlGrpcAdapter, IngestError, IngestModifiers, MempoolIndex,
+    HistoricalWorkGate, IngestControlGrpcAdapter, IngestError, IngestModifiers, MempoolIndex,
     MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind,
     PaidFeeDistributionBackfillContext, TipFollowSubsystems, TipFollowSubsystemsLauncher,
     TransactionComponentBackfillContext, TransactionHistoryVerifierContext,
     ValuePoolBalanceBackfillContext, ValuePoolFlowBackfillContext,
     bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical_until_handoff,
-    classify_phase, current_chain_height, ensure_spend_projection_not_behind_retention_sweep,
-    mempool_ready_channel, open_primary_derive_store_for_canonical, run_ingest_loop,
-    run_mempool_orchestrator, seed_backfill_owned_consumer_cursors,
-    seed_paid_fee_distribution_cursor_and_tail, seed_value_pool_flow_cursor_and_tail,
-    spawn_block_production_time_backfill_task, spawn_chain_event_retention_task,
-    spawn_commitment_root_backfill_task, spawn_conventional_fee_distribution_backfill_task,
-    spawn_derive_replay_budget_metrics_task, spawn_derive_tailer_task,
-    spawn_mempool_event_retention_task, spawn_paid_fee_distribution_backfill_task,
-    spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
-    spawn_transaction_history_verifier_task, spawn_upstream_health_probe_task,
+    classify_phase, current_chain_height, mempool_ready_channel,
+    open_primary_derive_store_for_canonical, run_ingest_loop, run_mempool_orchestrator,
+    seed_backfill_owned_consumer_cursors, seed_paid_fee_distribution_cursor_and_tail,
+    seed_value_pool_flow_cursor_and_tail, spawn_block_production_time_backfill_task,
+    spawn_chain_event_retention_task, spawn_commitment_root_backfill_task,
+    spawn_conventional_fee_distribution_backfill_task, spawn_derive_replay_budget_metrics_task,
+    spawn_derive_tailer_task, spawn_mempool_event_retention_task,
+    spawn_paid_fee_distribution_backfill_task, spawn_runtime_memory_metrics_task,
+    spawn_transaction_component_backfill_task, spawn_transaction_history_verifier_task,
+    spawn_transparent_retention_task, spawn_upstream_health_probe_task,
     spawn_value_pool_balance_backfill_task, spawn_value_pool_flow_backfill_task,
 };
 use zinder_runtime::{
-    Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase,
+    IngestPhase, Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
     spawn_ops_endpoint_for,
 };
@@ -478,12 +478,29 @@ async fn run_ingest(
             return Err(wrapped);
         }
     };
-    if let Err(error) = ensure_spend_projection_not_behind_retention_sweep(&store, &derive_store) {
-        let wrapped: IngestConfigError = error.into();
-        open_storage_phase.fail(&wrapped);
-        start_api_phase.fail(&wrapped);
-        return Err(wrapped);
-    }
+    let startup_phase = match source.tip_id().await {
+        Ok(upstream_tip) => classify_phase(
+            current_chain_height(&store),
+            upstream_tip.height.value(),
+            command_config.loop_config.phases.catchup_threshold_blocks,
+        ),
+        Err(error) => {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "startup_ingest_phase_observation_failed",
+                error = %error,
+                "startup could not classify canonical lag; derive replay remains fail-closed until the unified loop retries"
+            );
+            IngestPhase::BulkCatchup
+        }
+    };
+    readiness.set_phase(startup_phase);
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "startup_ingest_phase_classified",
+        phase = ?startup_phase,
+        "classified ingest phase before admitting startup derive work"
+    );
     let paid_fee_distribution_backfill_context = PaidFeeDistributionBackfillContext::new(
         command_config.loop_config.node.request_timeout,
         Arc::clone(&network_upgrade_activations),
@@ -524,12 +541,13 @@ async fn run_ingest(
         start_api_phase.fail(&wrapped);
         return Err(wrapped);
     }
-    if let Err(error) = catch_up_derive_store_to_canonical_until_handoff(
-        &store,
-        &derive_store,
-        command_config.loop_config.derive,
-    )
-    .await
+    if startup_phase_allows_derive_handoff(startup_phase)
+        && let Err(error) = catch_up_derive_store_to_canonical_until_handoff(
+            &store,
+            &derive_store,
+            command_config.loop_config.derive,
+        )
+        .await
     {
         let wrapped: IngestConfigError = error.into();
         open_storage_phase.fail(&wrapped);
@@ -542,12 +560,13 @@ async fn run_ingest(
         start_api_phase.fail(&wrapped);
         return Err(wrapped);
     }
+    let historical_work_gate = HistoricalWorkGate::new(readiness.clone());
     let derive_tailer_handle = spawn_derive_tailer_task(
         store.clone(),
         derive_store.clone(),
         command_config.loop_config.derive,
         DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
-        readiness.clone(),
+        historical_work_gate.clone(),
         cancel.clone(),
     );
     let memory_metrics_handle =
@@ -559,6 +578,11 @@ async fn run_ingest(
         readiness.clone(),
         cancel.clone(),
     );
+    let transparent_retention_handle = spawn_transparent_retention_task(
+        store.clone(),
+        historical_work_gate.clone(),
+        cancel.clone(),
+    );
     let commitment_root_backfill_handle = spawn_commitment_root_backfill_task(
         command_config.loop_config.commitment_root_backfill,
         CommitmentRootBackfillContext::new(
@@ -568,43 +592,43 @@ async fn run_ingest(
             store.clone(),
             derive_store.clone(),
         ),
-        readiness.clone(),
+        historical_work_gate.clone(),
         cancel.clone(),
     );
     let block_production_time_backfill_handle = spawn_block_production_time_backfill_task(
         derive_store.clone(),
-        readiness.clone(),
+        historical_work_gate.clone(),
         cancel.clone(),
     );
     let transaction_component_backfill_handle = spawn_transaction_component_backfill_task(
         command_config.transaction_component_backfill,
         TransactionComponentBackfillContext::new(store.clone(), derive_store.clone()),
-        readiness.clone(),
+        historical_work_gate.clone(),
         cancel.clone(),
     );
     let transaction_history_verifier_handle = spawn_transaction_history_verifier_task(
         command_config.transaction_history_verifier,
         TransactionHistoryVerifierContext::new(store.clone(), derive_store.clone()),
-        readiness.clone(),
+        historical_work_gate.clone(),
         cancel.clone(),
     );
     let conventional_fee_distribution_backfill_handle =
         spawn_conventional_fee_distribution_backfill_task(
             command_config.conventional_fee_distribution_backfill,
             ConventionalFeeDistributionBackfillContext::new(store.clone(), derive_store.clone()),
-            readiness.clone(),
+            historical_work_gate.clone(),
             cancel.clone(),
         );
     let paid_fee_distribution_backfill_handle = spawn_paid_fee_distribution_backfill_task(
         command_config.paid_fee_distribution_backfill,
         paid_fee_distribution_backfill_context,
-        readiness.clone(),
+        historical_work_gate.clone(),
         cancel.clone(),
     );
     let value_pool_flow_backfill_handle = spawn_value_pool_flow_backfill_task(
         command_config.value_pool_flow_backfill,
         value_pool_flow_backfill_context,
-        readiness.clone(),
+        historical_work_gate.clone(),
         cancel.clone(),
     );
     let value_pool_balance_backfill_handle = spawn_value_pool_balance_backfill_task(
@@ -615,7 +639,7 @@ async fn run_ingest(
             store.clone(),
             derive_store.clone(),
         ),
-        readiness.clone(),
+        historical_work_gate.clone(),
         cancel.clone(),
     );
     open_storage_phase.complete();
@@ -755,6 +779,14 @@ async fn run_ingest(
             "derive replay budget metrics task failed during shutdown"
         );
     }
+    if let Err(join_error) = transparent_retention_handle.await {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "transparent_retention_join_failed",
+            error = %join_error,
+            "transparent retention task failed during shutdown"
+        );
+    }
     if let Some(handle) = commitment_root_backfill_handle
         && let Err(join_error) = handle.await
     {
@@ -848,6 +880,10 @@ async fn run_ingest(
     }
 
     final_result
+}
+
+const fn startup_phase_allows_derive_handoff(phase: IngestPhase) -> bool {
+    matches!(phase, IngestPhase::FollowingTip)
 }
 
 async fn handle_loop_outcome(
@@ -1498,8 +1534,22 @@ impl From<BackupArgs> for BackupConfigOverrides {
 #[cfg(test)]
 mod tests {
     use super::{
-        NodeCapabilities, NodeCapability, ZebraJsonRpcSource, require_ingest_node_capabilities,
+        IngestPhase, NodeCapabilities, NodeCapability, ZebraJsonRpcSource,
+        require_ingest_node_capabilities, startup_phase_allows_derive_handoff,
     };
+
+    #[test]
+    fn startup_derive_handoff_runs_only_while_following_tip() {
+        assert!(startup_phase_allows_derive_handoff(
+            IngestPhase::FollowingTip
+        ));
+        assert!(!startup_phase_allows_derive_handoff(
+            IngestPhase::BulkCatchup
+        ));
+        assert!(!startup_phase_allows_derive_handoff(
+            IngestPhase::AwaitingUpstream
+        ));
+    }
 
     #[test]
     fn ingest_capability_validation_accepts_zebra_baseline()

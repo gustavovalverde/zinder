@@ -296,7 +296,7 @@ pub(crate) struct TransparentUtxoSetAggregate {
 /// settled tip.
 ///
 /// Rows at heights at or below `settled_tip_height` are the irreversible
-/// unspent set: reorgs cannot reach them, and the safe-tip retention sweep has
+/// unspent set: reorgs cannot reach them, and transparent-retention maintenance has
 /// already deleted finalized spends and reverted creations. The scan therefore
 /// needs neither a producing-block visibility check nor a spend re-check. Rows
 /// above the settled tip live inside the reorg window and are excluded so the

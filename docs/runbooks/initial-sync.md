@@ -70,12 +70,13 @@ Steady-state operation emits `chain_committed` events with `phase=following_tip`
 
 Canonical readiness does not imply that every historical projection is complete. Use this table as the operator checklist; each worker persists progress and resumes after restart.
 
-During `BulkCatchup`, canonical ingest has priority over all rebuildable
-projection work. Derive replay reports a paused budget state, and the historical
-enrichment and verification workers wait before starting each bounded batch.
-They resume automatically in `FollowingTip`; no operator sequencing is needed.
-An in-flight enrichment batch may complete after a bounce back to bulk catch-up,
-but the worker cannot start another batch until tip follow resumes.
+Initial indexing has strict priority: canonical owns `BulkCatchup`, derive replay
+owns the post-canonical drain, and historical enrichment or verification starts
+only when canonical is `FollowingTip` and derive covers its visible tip. The
+workers resume automatically when `zinder_ingest_historical_work_gate_open` is
+`1`; no operator sequencing is needed. An in-flight historical batch may finish
+after the gate closes, but the worker cannot start another batch until both
+canonical and derive are current again.
 
 | Worker | Canonical boundary | Readiness effect | Capability and completion evidence | Restart behavior |
 | --- | --- | --- | --- | --- |
@@ -173,8 +174,11 @@ enabled = true
 batch_blocks = 256
 ```
 
-This worker does not gate canonical readiness. Consumers must inspect the RPC
-coverage envelope until historical and live-tail ranges are contiguous.
+This worker does not gate canonical readiness. It remains deferred while
+canonical bulk catchup or readiness-critical derive replay owns the storage
+budget, then advances after `zinder_ingest_historical_work_gate_open` becomes
+`1`. Consumers must inspect the RPC coverage envelope until historical and
+live-tail ranges are contiguous.
 
 ## Conventional-fee distribution history
 

@@ -57,7 +57,7 @@ getblockhash       8.58 ms   (serial; blocks the parallel triple)
 
 Dropping the serial call leaves just the parallel source reads and raises the
 theoretical ceiling while the response-size regime is light. In dense eras,
-`ingest.bulk_catchup.source_segment_max_blocks = 16` is only a hard ceiling: bulk
+`ingest.bulk_catchup.source_segment_max_blocks = 64` is only a hard ceiling: bulk
 catch-up adapts the actual request size from observed source response bytes and
 resets its density estimate at consensus-branch changes.
 

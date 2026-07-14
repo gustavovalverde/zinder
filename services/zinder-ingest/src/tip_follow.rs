@@ -73,6 +73,12 @@ pub struct TipFollowConfig {
     /// service is ready as soon as the store is at most one block behind the
     /// observed node tip.
     pub lag_threshold_blocks: u64,
+    /// Optional lag boundary that returns control to the unified phase
+    /// classifier so bulk catchup can replace serial tip-follow immediately.
+    /// Standalone tip-follow callers leave this unset.
+    pub phase_exit_lag_blocks: Option<u32>,
+    /// Optional terminal height for bounded indexing runs.
+    pub target_height: Option<BlockHeight>,
     /// Optional raw-byte blob write policy.
     pub raw_blob_policy: RawBlobPolicy,
     /// Node-discovered consensus upgrade activations used for transaction facts.
@@ -261,6 +267,32 @@ where
             Err(error) => break Err(error),
         };
         set_tip_follow_readiness(readiness, lag_state, mempool_ready_gate);
+
+        let store_tip = current_chain_height(&store);
+        if reached_target_height(config.target_height, store_tip) {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "ingest_loop_following_tip_target_reached",
+                target_height = config.target_height.map(BlockHeight::value),
+                "target height reached inside FollowingTip; returning to the phase classifier"
+            );
+            break Ok(());
+        }
+        if exceeds_phase_exit_lag(
+            config.phase_exit_lag_blocks,
+            iteration.observed_tip_id.height,
+            store_tip,
+        ) {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "ingest_loop_phase_bounce_back",
+                new_phase = "bulk_catchup",
+                store_tip,
+                upstream_tip = iteration.observed_tip_id.height.value(),
+                "tip-follow observed bulk-catchup lag; returning to the phase classifier"
+            );
+            break Ok(());
+        }
     };
 
     chain_tip_task_cancel.cancel();
@@ -269,6 +301,20 @@ where
     }
 
     tip_follow_outcome
+}
+
+fn reached_target_height(target: Option<BlockHeight>, store_tip: Option<u32>) -> bool {
+    target.is_some_and(|target| store_tip.is_some_and(|height| height >= target.value()))
+}
+
+fn exceeds_phase_exit_lag(
+    threshold: Option<u32>,
+    upstream_tip: BlockHeight,
+    store_tip: Option<u32>,
+) -> bool {
+    threshold.is_some_and(|threshold| {
+        upstream_tip.value().saturating_sub(store_tip.unwrap_or(0)) > threshold
+    })
 }
 
 /// Per-outage running state for the tip-follow recovery loop.
@@ -1033,6 +1079,32 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn phase_exit_lag_uses_the_bulk_catchup_boundary_without_a_polling_delay() {
+        assert!(!exceeds_phase_exit_lag(
+            Some(100),
+            BlockHeight::new(1_100),
+            Some(1_000)
+        ));
+        assert!(exceeds_phase_exit_lag(
+            Some(100),
+            BlockHeight::new(1_101),
+            Some(1_000)
+        ));
+        assert!(!exceeds_phase_exit_lag(
+            None,
+            BlockHeight::new(1_101),
+            Some(1_000)
+        ));
+    }
+
+    #[test]
+    fn target_height_exit_requires_a_visible_store_tip_at_or_above_target() {
+        assert!(!reached_target_height(Some(BlockHeight::new(10)), None));
+        assert!(!reached_target_height(Some(BlockHeight::new(10)), Some(9)));
+        assert!(reached_target_height(Some(BlockHeight::new(10)), Some(10)));
+    }
+
     #[tokio::test]
     async fn tip_follow_commits_first_available_height() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
@@ -1448,6 +1520,8 @@ mod tests {
             reorg_window_blocks,
             poll_interval: Duration::from_millis(1),
             lag_threshold_blocks: super::DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
+            phase_exit_lag_blocks: None,
+            target_height: None,
         }
     }
 

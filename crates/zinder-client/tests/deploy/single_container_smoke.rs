@@ -326,7 +326,7 @@ reorg_window_blocks = 100
 [ingest.bulk_catchup]
 canonical_batch_max_blocks = 100
 canonical_batch_max_artifact_bytes = 536870912
-source_segment_max_blocks = 16
+source_segment_max_blocks = 64
 source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 12
 source_fetch_max_in_flight_bytes = 402653184

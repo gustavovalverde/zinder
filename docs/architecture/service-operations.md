@@ -119,9 +119,19 @@ Implemented baseline metrics:
 | `zinder_ingest_source_segment_reassembly_segments` | gauge | `zinder-ingest` | Completed source segments waiting for earlier heights before ordered bulk-catchup emission. |
 | `zinder_ingest_source_segment_reassembly_bytes` | gauge | `zinder-ingest` | Estimated response bytes held by completed source segments waiting in ordered reassembly. |
 | `zinder_ingest_source_segment_initial_probe_in_flight` | gauge | `zinder-ingest` | Set to `1` while the adaptive source scheduler waits for the first measured response in a consensus branch before filling the concurrent request queue. |
-| `zinder_ingest_block_prepare_duration_seconds` | histogram | `zinder-ingest` | Per-block block-prepare latency by status and error class. Bulk catchup includes derivation plus spent-transparent-output prefetch; tip follow records sequential derivation plus finalization. |
+| `zinder_ingest_source_fetch_request_reservation_bytes` | gauge | `zinder-ingest` | Predicted response bytes reserved for the most recently admitted source request. |
+| `zinder_ingest_source_segment_reserved_response_bytes` | histogram | `zinder-ingest` | Distribution of predicted response-byte reservations used for source admission. |
+| `zinder_ingest_source_segment_reservation_undersized_total` | counter | `zinder-ingest` | Source segments whose measured response bytes exceeded their admission reservation. |
+| `zinder_ingest_block_prepare_duration_seconds` | histogram | `zinder-ingest` | Per-block artifact-prepare latency by status and error class. Ordered bulk-catchup prevout resolution is reported separately; tip follow records sequential derivation plus finalization. |
 | `zinder_ingest_block_prepare_total` | counter | `zinder-ingest` | Per-block block-prepare count by status and error class. |
-| `zinder_ingest_block_prepare_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk block-prepare task time split between `artifact_derive` and `transparent_prevout_prefetch`, labeled by status. |
+| `zinder_ingest_block_prepare_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk prepare time split between per-block `artifact_derive` and per-window `transparent_prevout_resolve`, labeled by status. |
+| `zinder_ingest_prevout_resolver_window_blocks` | histogram | `zinder-ingest` | Contiguous blocks coalesced into one ordered prevout-resolution window. |
+| `zinder_ingest_prevout_resolver_outpoints_total` | counter | `zinder-ingest` | Prevout resolution counts by bounded `source`: `same_block`, `same_window`, `recent_cache`, `store_requested`, `store_resolved`, or `store_missing`. |
+| `zinder_ingest_prevout_resolver_store_lookups_total` | counter | `zinder-ingest` | Deduplicated RocksDB multi-get calls issued by ordered prevout resolution. |
+| `zinder_ingest_prevout_resolver_recent_outputs` | gauge | `zinder-ingest` | Outputs retained in the byte-budgeted recent-output cache. |
+| `zinder_ingest_prevout_resolver_recent_output_bytes` | gauge | `zinder-ingest` | Estimated resident bytes held by the recent-output cache. |
+| `zinder_ingest_prevout_resolver_cache_admission_total` | counter | `zinder-ingest` | Recent-output cache admissions by `cached` or `no_headroom`. |
+| `zinder_ingest_prevout_resolver_cache_evictions_total` | counter | `zinder-ingest` | Oldest recent outputs evicted to stay inside the shared block-prepare watermark. |
 | `zinder_ingest_block_derive_stage_duration_seconds` | histogram | `zinder-ingest` | Canonical artifact CPU time split between `block_parse`, `identity_validation`, `compact_artifacts`, `transparent_output_artifacts`, `transaction_artifacts`, `block_header_artifact`, and `block_blob_artifact`, labeled by status. |
 | `zinder_ingest_block_prepare_reassembly_blocks` | gauge | `zinder-ingest` | Completed prepared blocks waiting for earlier heights before the serial finalization fold. |
 | `zinder_ingest_derive_tailer_tick_duration_seconds` | histogram | `zinder-ingest` | Derive tailer catch-up pass latency by status and error class. |
@@ -138,6 +148,8 @@ Implemented baseline metrics:
 | `zinder_ingest_derive_replay_memory_budget_bytes` | gauge | `zinder-ingest` | Memory budget used for derive replay pressure decisions. |
 | `zinder_ingest_derive_replay_paused` | gauge | `zinder-ingest` | Compatibility operational gauge set to `1` only when derive replay is paused. |
 | `zinder_ingest_derive_replay_phase_gate` | gauge | `zinder-ingest` | Set to `1` while the canonical-phase gate pauses derive replay during `BulkCatchup`, `0` otherwise. |
+| `zinder_ingest_derive_replay_caught_up` | gauge | `zinder-ingest` | Set to `1` when the derive materialized block-summary height covers the canonical visible tip. |
+| `zinder_ingest_historical_work_gate_open` | gauge | `zinder-ingest` | Set to `1` only when canonical is following tip and derive is caught up; historical backfills and verifiers wait while it is `0`. |
 | `zinder_ingest_memory_pressure_ratio` | gauge | `zinder-ingest` | Scheduler pressure ratio. Uses cgroup working set (`memory.current - inactive_file`) over `memory.high` or `memory.max` when available, falling back to current cgroup pressure. |
 | `zinder_ingest_memory_current_pressure_ratio` | gauge | `zinder-ingest` | Raw cgroup `memory.current` pressure ratio over `memory.high` or `memory.max`. |
 | `zinder_ingest_memory_working_set_bytes` | gauge | `zinder-ingest` | Cgroup working set bytes after subtracting inactive file cache. |
@@ -193,6 +205,11 @@ Implemented baseline metrics:
 | `zinder_store_write_batch_duration_seconds` | histogram | `zinder-store` | RocksDB write-batch latency by status. |
 | `zinder_store_write_batch_rows_total` | counter | `zinder-store` | Write-batch row count by put/delete kind and column family. |
 | `zinder_store_write_batch_bytes_total` | counter | `zinder-store` | Write-batch payload bytes by put/delete kind and column family. |
+| `zinder_store_retention_sweep_duration_seconds` | histogram | `zinder-store` | Wall time for one bounded transparent-retention maintenance pass by status. |
+| `zinder_store_retention_swept_outpoints_total` | counter | `zinder-store` | Finalized spent outpoints removed by transparent-retention maintenance. |
+| `zinder_store_retention_backlog_heights` | gauge | `zinder-store` | Complete finalized heights remaining below the current derive-released retention ceiling. |
+| `zinder_derive_secondary_catchup_retries_total` | counter | `zinder-derive` | Internal retries that crossed a narrowly classified missing-SST primary-compaction race during secondary catchup. |
+| `zinder_store_secondary_catchup_retries_total` | counter | `zinder-store` | Canonical-secondary retries that crossed the same narrowly classified missing-SST primary-compaction race. |
 | `zinder_store_visibility_seek_total` | counter | `zinder-store` | Visibility-index reverse seeks by artifact family. |
 | `zinder_store_rocksdb_property` | gauge | `zinder-store` | Curated RocksDB integer properties by column family, property name, and store role. The `store_role` label separates the canonical and derive stores that share the process (`canonical_primary`, `canonical_secondary`, `derive_primary`, `derive_secondary`). DB-level write-controller properties (`rocksdb.actual-delayed-write-rate`, `rocksdb.is-write-stopped`) carry `cf="__db__"`. |
 | `zinder_store_wal_bytes`, `zinder_store_wal_bytes_limit`, `zinder_store_block_cache_capacity_bytes`, `zinder_store_block_cache_usage_bytes`, `zinder_store_block_cache_pinned_usage_bytes`, `zinder_store_memtable_budget_bytes`, `zinder_store_memtable_budget_usage_bytes`, `zinder_store_rocksdb_io_mode` | gauge | `zinder-store` | Bounded-RocksDB resource footprints, each labeled by `store_role` so the canonical and derive stores are attributable within one process. |
@@ -483,7 +500,7 @@ canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
 canonical_batch_max_estimated_write_bytes = 536870912
 canonical_batch_min_blocks_before_estimated_write_close = 100
-source_segment_max_blocks = 16
+source_segment_max_blocks = 64
 source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 20
 source_fetch_max_in_flight_bytes = 671088640

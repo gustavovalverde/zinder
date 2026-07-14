@@ -254,8 +254,8 @@ async fn transparent_spends_by_outpoint_ignores_derive_spend_above_settled_tip()
     Ok(())
 }
 
-/// Commits an output, a settled spend of it, and an `AdvanceSafeTipTo` that
-/// deletes the spend, so the canonical deleted-through marker reaches height 2.
+/// Commits an output, settles its spend, advances the safe tip, and explicitly
+/// runs retention maintenance so the deleted-through marker reaches height 2.
 fn commit_real_sweep_to_deleted_through_two(
     store: &zinder_store::PrimaryChainStore,
 ) -> eyre::Result<()> {
@@ -298,6 +298,9 @@ fn commit_real_sweep_to_deleted_through_two(
             },
         ),
     )?;
+    let sweep = store.sweep_transparent_retention_once()?;
+    assert_eq!(sweep.swept_heights(), 2);
+    assert_eq!(sweep.swept_outpoints(), 1);
     Ok(())
 }
 

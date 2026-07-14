@@ -36,8 +36,9 @@ block bytes, transaction bytes, or compact-block payloads.
 | `transaction_location` | `(network, txid)` | height, tx index, block hash | Direct transaction lookup without compact-block decoding |
 | `transaction_facts` | `(network, txid)` | public transaction facts, component counts, size, auth digest, privacy shape, fee inputs that do not require private data | Transaction detail, search, recent transactions, fee summaries |
 | `transparent_output` | `(network, outpoint)` | value, script pubkey, address script hash, produced height, produced block hash | Single canonical transparent output fact |
-| `address_output_index` | `(network, address_script_hash, height, outpoint)` | address output row | Current unspent-output projection per address; finalized-spent rows are deleted by the safe-tip retention sweep |
-| `transparent_spend_fact` | `(network, spent_outpoint)` | spending txid, input index, spending block, spent value, spent address script hash, spent block | Spend lookup, derive replay, and reorg repair |
+| `address_output_index` | `(network, address_script_hash, height, outpoint)` | address output row | Current unspent-output projection per address; finalized-spent rows are deleted by gated transparent-retention maintenance |
+| `transparent_spend_fact` | `(network, spent_outpoint)` | spending txid, input index, spending block, spent value, spent address script hash, spent block | Spend lookup and reorg repair; finalized rows may be retained only in the durable block-local replay index |
+| `transparent_spend_fact_block_index` | `(network, spending_height, source_epoch)` | producing block hash, complete observed input set, and ordered resolved spend facts | Sequential finalized derive replay, retention enumeration, and bounded reorg repair |
 | `compact_block` | `(network, height)` | encoded lightwalletd compact block | Wallet sync cache |
 | `tree_state` | `(network, height)` | source tree-state payload or typed tree state | Wallet scan boundary |
 | `subtree_root` | `(network, pool, start_index)` | completed subtree root | Wallet scan acceleration |

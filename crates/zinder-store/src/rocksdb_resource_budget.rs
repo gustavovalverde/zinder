@@ -110,21 +110,23 @@ impl RocksDbResourceBudget {
         }
     }
 
-    /// Derive-store writer defaults sized for smaller rebuildable artifacts.
+    /// Derive-store writer defaults sized for sustained multi-CF replay.
     ///
-    /// `128 MiB` block cache, `64 MiB` WAL ceiling, `256` open file handles,
-    /// `8 MiB x 2` write buffers per column family, and `64 MiB` total
-    /// memtable budget. Derive stores hold smaller working sets than the
-    /// canonical chain store and are rebuildable from retained chain events.
+    /// `256 MiB` block cache, `256 MiB` WAL ceiling, `512` open file handles,
+    /// `16 MiB x 4` write buffers per column family, and `512 MiB` total
+    /// memtable budget. Replay writes many consumer families in every ordered
+    /// dispatch; the larger shared memtable envelope lets hot families rotate
+    /// while compaction catches up instead of turning flush churn into write
+    /// stalls. The write-buffer manager remains the hard aggregate bound.
     #[must_use]
     pub const fn derive_writer_defaults() -> Self {
         Self {
-            block_cache_bytes: 128 * MIB,
-            max_wal_bytes: 64 * MIB,
-            max_open_files: 256,
-            write_buffer_bytes: 8 * MIB,
-            max_write_buffer_count: 2,
-            memtable_budget_bytes: 64 * MIB,
+            block_cache_bytes: 256 * MIB,
+            max_wal_bytes: 256 * MIB,
+            max_open_files: 512,
+            write_buffer_bytes: 16 * MIB,
+            max_write_buffer_count: 4,
+            memtable_budget_bytes: 512 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
     }
@@ -280,15 +282,17 @@ mod tests {
     }
 
     #[test]
-    fn derive_writer_defaults_are_smaller_than_canonical_writer_budget() {
+    fn derive_writer_defaults_reserve_multi_family_compaction_headroom() {
         let canonical = RocksDbResourceBudget::canonical_writer_defaults();
         let derive = RocksDbResourceBudget::derive_writer_defaults();
-        assert_eq!(derive.block_cache_bytes * 4, canonical.block_cache_bytes);
-        assert_eq!(derive.max_wal_bytes * 4, canonical.max_wal_bytes);
-        assert_eq!(derive.write_buffer_bytes * 2, canonical.write_buffer_bytes);
+        assert_eq!(derive.block_cache_bytes * 2, canonical.block_cache_bytes);
+        assert_eq!(derive.max_wal_bytes, canonical.max_wal_bytes);
+        assert_eq!(derive.max_open_files, canonical.max_open_files);
+        assert_eq!(derive.write_buffer_bytes, canonical.write_buffer_bytes);
+        assert_eq!(derive.max_write_buffer_count, 4);
         assert_eq!(
-            derive.memtable_budget_bytes * 4,
-            canonical.memtable_budget_bytes
+            derive.memtable_budget_bytes,
+            canonical.memtable_budget_bytes * 2
         );
     }
 

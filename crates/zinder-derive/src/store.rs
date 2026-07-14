@@ -109,6 +109,10 @@ pub const DERIVE_STORE_SUBDIR: &str = "derive";
 /// first open and validated on subsequent opens.
 pub const DERIVE_STORE_FORMAT_VERSION: u16 = 7;
 
+/// Total attempts used to cross a primary-compaction race while a secondary
+/// catches up and validates its newly replayed manifest.
+const SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS: u32 = 3;
+
 const STORE_FORMAT_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const DERIVE_STATUS_KEY: &[u8] = b"\x00\x02derive_status";
 const CONSUMER_SCHEMA_KEY_PREFIX: &[u8] = b"\x00\x03consumer_schema:";
@@ -943,6 +947,31 @@ impl DeriveStore {
             return Ok(());
         }
         let _catch_up_guard = self.catch_up_barrier.write();
+        let mut attempt = 1;
+        loop {
+            let outcome = self.try_catch_up_once();
+            if outcome
+                .as_ref()
+                .is_err_and(is_transient_secondary_missing_sst)
+                && attempt < SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS
+            {
+                metrics::counter!("zinder_derive_secondary_catchup_retries_total").increment(1);
+                tracing::debug!(
+                    target: "zinder::derive",
+                    event = "secondary_catchup_missing_sst_retry",
+                    attempt,
+                    max_attempts = SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS,
+                    "derive secondary crossed a primary-compaction file race; retrying catchup"
+                );
+                std::thread::yield_now();
+                attempt += 1;
+                continue;
+            }
+            return outcome;
+        }
+    }
+
+    fn try_catch_up_once(&self) -> Result<(), DeriveStoreError> {
         self.db
             .try_catch_up_with_primary()
             .map_err(|source| DeriveStoreError::Operation {
@@ -2122,9 +2151,10 @@ impl DeriveStore {
         );
         let mut manifest = BTreeMap::new();
         for entry in iterator {
-            let (key, payload) = entry.map_err(|source| DeriveStoreError::SchemaReconcile {
+            let (key, payload) = entry.map_err(|source| DeriveStoreError::Operation {
                 operation: "read_manifest",
-                reason: source.to_string(),
+                column_family: DeriveStoreColumnFamily::ConsumerMetadata,
+                source,
             })?;
             let Some(name_bytes) = key.strip_prefix(CONSUMER_SCHEMA_KEY_PREFIX) else {
                 break;
@@ -2683,6 +2713,23 @@ fn read_manifest_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
     Ok(u16::from_be_bytes(array))
 }
 
+fn is_transient_secondary_missing_sst(error: &DeriveStoreError) -> bool {
+    let Some(source) = std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<rust_rocksdb::Error>())
+    else {
+        return false;
+    };
+    is_missing_sst_error(&source.kind(), source.as_ref())
+}
+
+fn is_missing_sst_error(kind: &rust_rocksdb::ErrorKind, message: &str) -> bool {
+    matches!(
+        kind,
+        rust_rocksdb::ErrorKind::IOError | rust_rocksdb::ErrorKind::NotFound
+    ) && message.contains("No such file or directory")
+        && message.contains(".sst")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::mpsc, thread, time::Duration};
@@ -2699,6 +2746,22 @@ mod tests {
         1,
         &[TEST_CONSUMER_CF],
     );
+
+    #[test]
+    fn secondary_catchup_retries_only_missing_sst_file_races() {
+        assert!(is_missing_sst_error(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: /derive/199308.sst"
+        ));
+        assert!(!is_missing_sst_error(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: /derive/MANIFEST-000123"
+        ));
+        assert!(!is_missing_sst_error(
+            &rust_rocksdb::ErrorKind::Corruption,
+            "Corruption: No such file or directory: /derive/199308.sst"
+        ));
+    }
 
     #[test]
     fn reorg_incidents_cursor_is_event_only() {

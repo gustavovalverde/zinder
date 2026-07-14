@@ -51,7 +51,7 @@ rest are plan-scoped and end at merge.
    `TransparentSpendsByOutpoint` handler: canonical epoch-pinned read first,
    derive lookups accepted only at or below the pinned epoch's settled tip,
    `DeriveLag` when the derive head trails the canonical swept-through marker.
-   The safe-tip retention sweep is clamped by a `retention_release_height` so
+   Transparent-retention maintenance is clamped by a `retention_release_height` so
    canonical never deletes spend facts a durable consumer has not consumed,
    and ingest startup refuses a derive store whose cursor is behind the swept
    marker. No new RPC, message, capability string, or config knob;
@@ -262,7 +262,7 @@ Files:
 - `crates/zinder-derive/src/consumer/transparent_outpoint_spend.rs` (new
   consumer: outpoint-keyed rows plus per-height rewind index).
 - `crates/zinder-store/src/chain_store.rs`: `retention_release_height` clamp
-  in `build_safe_tip_retention_sweep`; swept-through marker exposure.
+  in `build_transparent_retention_sweep`; swept-through marker exposure.
 - `services/zinder-ingest`: startup guard refusing a derive store behind the
   swept marker; release-height feed from the derive cursor.
 - `services/zinder-query/src/lib.rs`: union-routed read inside the

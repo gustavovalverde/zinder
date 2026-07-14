@@ -69,8 +69,7 @@ use crate::{
     },
     transparent_output::read_current_transparent_outputs_by_outpoints,
     transparent_spend_fact::{
-        read_current_transparent_spend_fact_block_outpoints,
-        read_current_transparent_spend_facts_by_outpoints,
+        read_current_transparent_spend_fact_block_facts,
         read_visible_transparent_spend_fact_block_outpoints,
     },
 };
@@ -134,23 +133,24 @@ pub struct ChainStoreOptions {
     pub rocksdb_resource_budget: RocksDbResourceBudget,
     /// Raw-blob retention the primary writer persists on open.
     pub raw_blob_retention: RawBlobRetention,
-    /// Maximum heights one commit sweeps when the safe-tip retention floor
+    /// Maximum heights one maintenance pass sweeps when the safe-tip retention floor
     /// jumps far ahead of the swept marker. Bounds the scan through sparse
     /// eras where few outpoints ever meet the outpoint budget.
-    pub retention_sweep_max_heights_per_commit: u32,
-    /// Maximum outpoints one commit sweeps. Bounds the delete batch held in
+    pub retention_sweep_max_heights_per_pass: u32,
+    /// Maximum outpoints one maintenance pass sweeps. Bounds the delete batch held in
     /// memory through transaction-dense eras where a few heights carry
     /// millions of spent outpoints. A single height is never split across
-    /// commits, so one commit may exceed the budget by at most the densest
+    /// passes, so one pass may exceed the budget by at most the densest
     /// height in its range.
-    pub retention_sweep_max_outpoints_per_commit: u64,
+    pub retention_sweep_max_outpoints_per_pass: u64,
 }
 
-/// Default per-commit ceiling on safe-tip retention sweep heights.
-const DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_COMMIT: u32 = 25_000;
+/// Default per-pass ceiling on transparent retention sweep heights.
+const DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_PASS: u32 = 1_000;
 
-/// Default per-commit ceiling on safe-tip retention sweep outpoints.
-const DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_COMMIT: u64 = 500_000;
+/// Default per-pass ceiling on transparent retention sweep outpoints.
+const DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_PASS: u64 = 10_000;
+const SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS: u32 = 3;
 
 impl ChainStoreOptions {
     /// Returns durable production options anchored to `network` with fsync writes.
@@ -162,9 +162,8 @@ impl ChainStoreOptions {
             network: Some(network),
             rocksdb_resource_budget: RocksDbResourceBudget::canonical_writer_defaults(),
             raw_blob_retention: RawBlobRetention::None,
-            retention_sweep_max_heights_per_commit: DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_COMMIT,
-            retention_sweep_max_outpoints_per_commit:
-                DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_COMMIT,
+            retention_sweep_max_heights_per_pass: DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_PASS,
+            retention_sweep_max_outpoints_per_pass: DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_PASS,
         }
     }
 
@@ -181,20 +180,13 @@ impl ChainStoreOptions {
             network: Some(Network::ZcashRegtest),
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
             raw_blob_retention: RawBlobRetention::None,
-            retention_sweep_max_heights_per_commit: DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_COMMIT,
-            retention_sweep_max_outpoints_per_commit:
-                DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_COMMIT,
+            retention_sweep_max_heights_per_pass: DEFAULT_RETENTION_SWEEP_MAX_HEIGHTS_PER_PASS,
+            retention_sweep_max_outpoints_per_pass: DEFAULT_RETENTION_SWEEP_MAX_OUTPOINTS_PER_PASS,
         }
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 12;
-/// Store schema version that the address-output startup rebuild accepts and
-/// migrates in place. See [`schema_migration`].
-const ADDRESS_OUTPUT_REBUILD_STORE_SCHEMA_VERSION: u16 = 10;
-/// Store schema version that still carried the canonical transparent-address
-/// tx-history column family now owned by the derive plane.
-const TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION: u16 = 11;
+const STORE_SCHEMA_VERSION: u16 = 13;
 /// Durable artifact schema version written by this binary.
 ///
 /// Version 10 carried the fact-first layout with every hash-shaped proto
@@ -229,6 +221,10 @@ const TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION: u16 = 11;
 /// `TransparentAddressTxIndexArtifact` remains the wallet/query response row,
 /// but materialization belongs to the derive plane.
 ///
+/// Store schema version 13 replaces the outpoint-only transparent spend block
+/// index with complete retained spend facts. Older stores may have swept the
+/// point facts needed to construct those records and are refused at open.
+///
 /// Version 14 adds per-block Sapling, Orchard, and Ironwood final
 /// note-commitment roots.
 ///
@@ -244,24 +240,20 @@ const TRANSPARENT_HISTORY_STORAGE_STORE_SCHEMA_VERSION: u16 = 11;
 /// coverage record's activation decode with unknown roots and are excluded
 /// from displaced-root coverage counters. The next canonical commit stamps
 /// version 17.
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(17);
+///
+/// Version 18 stores every observed transparent input and its resolved spend
+/// facts in each block-local spend replay index. Point rows may still be
+/// deleted after safe-tip retention, while derive rebuilds remain possible
+/// from the durable block records. Store schema 13 introduces this
+/// non-migratable payload.
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(18);
 /// Oldest durable artifact schema version this binary can read.
 ///
-/// Version 17 first writes transaction-intrinsic value balances for every
-/// retained transparent-participating transaction, which the value-pool
-/// flow-history consumer reads during replay; a store below it is refused at
-/// open and rebuilt from genesis.
-pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 17;
+/// Version 18 is the first schema whose canonical history can rebuild the
+/// transparent spend projection after point-row retention.
+pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 18;
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
-/// Artifact schema the store-schema-10-to-11 rebuild produces.
-///
-/// The rebuild reshapes the transparent projection only and derives no
-/// Ironwood action data, so it stamps this pre-Ironwood version rather than the
-/// current one; an Ironwood-capable binary then rejects the store at open and
-/// rebuilds from genesis instead of serving absent Ironwood artifacts.
-const REBUILT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(11);
-
 /// Default maximum chain events returned by one history read.
 pub const DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
@@ -408,6 +400,48 @@ pub struct SecondaryCatchupOutcome {
 impl SecondaryCatchupOutcome {
     const fn new(before: Option<ChainEpochId>, after: Option<ChainEpochId>) -> Self {
         Self { before, after }
+    }
+}
+
+/// Result of one bounded transparent-projection retention maintenance pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransparentRetentionSweepOutcome {
+    swept_heights: u32,
+    swept_outpoints: u64,
+    backlog_heights: u32,
+}
+
+impl TransparentRetentionSweepOutcome {
+    const fn new(swept_heights: u32, swept_outpoints: u64, backlog_heights: u32) -> Self {
+        Self {
+            swept_heights,
+            swept_outpoints,
+            backlog_heights,
+        }
+    }
+
+    /// Number of complete block heights advanced by this pass.
+    #[must_use]
+    pub const fn swept_heights(self) -> u32 {
+        self.swept_heights
+    }
+
+    /// Number of finalized spent outpoints deleted by this pass.
+    #[must_use]
+    pub const fn swept_outpoints(self) -> u64 {
+        self.swept_outpoints
+    }
+
+    /// Remaining complete block heights below the current safe release ceiling.
+    #[must_use]
+    pub const fn backlog_heights(self) -> u32 {
+        self.backlog_heights
+    }
+
+    /// Whether this pass advanced the durable retention cursor.
+    #[must_use]
+    pub const fn made_progress(self) -> bool {
+        self.swept_heights > 0
     }
 }
 
@@ -571,7 +605,7 @@ impl PrimaryChainStore {
         read_raw_blob_retention_signal(self.store.inner.as_ref())
     }
 
-    /// Reads the height through which the safe-tip retention sweep has deleted
+    /// Reads the height through which transparent-retention maintenance has deleted
     /// transparent spend facts and their spent-output rows, or `None` before
     /// the first sweep.
     ///
@@ -608,6 +642,19 @@ impl PrimaryChainStore {
         self.store
             .inner
             .write(vec![transparent_retention_release_height_put(height)])
+    }
+
+    /// Runs one bounded transparent-projection retention maintenance pass.
+    ///
+    /// The pass deletes only finalized spends already released by the durable
+    /// derive projection. It is deliberately separate from
+    /// [`Self::commit_chain_epoch`] so a large historical retention backlog
+    /// cannot delay canonical chain advancement. The ingest scheduler calls
+    /// this only after canonical ingest and derive replay have both caught up.
+    pub fn sweep_transparent_retention_once(
+        &self,
+    ) -> Result<TransparentRetentionSweepOutcome, StoreError> {
+        self.store.sweep_transparent_retention_once()
     }
 
     /// Reads the currently visible chain epoch.
@@ -978,6 +1025,31 @@ impl SecondaryChainStore {
 
     /// Replays available WAL and manifest state from the primary store.
     pub fn try_catch_up(&self) -> Result<SecondaryCatchupOutcome, StoreError> {
+        let mut attempt = 1;
+        loop {
+            let outcome = self.try_catch_up_once();
+            if outcome
+                .as_ref()
+                .is_err_and(is_transient_secondary_missing_sst)
+                && attempt < SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS
+            {
+                metrics::counter!("zinder_store_secondary_catchup_retries_total").increment(1);
+                tracing::debug!(
+                    target: "zinder::store",
+                    event = "secondary_catchup_missing_sst_retry",
+                    attempt,
+                    max_attempts = SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS,
+                    "canonical secondary crossed a primary-compaction file race; retrying catchup"
+                );
+                std::thread::yield_now();
+                attempt += 1;
+                continue;
+            }
+            return outcome;
+        }
+    }
+
+    fn try_catch_up_once(&self) -> Result<SecondaryCatchupOutcome, StoreError> {
         let before = self.store.current_chain_epoch_id()?;
         self.store.inner.try_catch_up_with_primary()?;
         let after = self.store.current_chain_epoch_id()?;
@@ -987,6 +1059,23 @@ impl SecondaryChainStore {
 
         Ok(SecondaryCatchupOutcome::new(before, after))
     }
+}
+
+fn is_transient_secondary_missing_sst(error: &StoreError) -> bool {
+    let Some(source) = std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<rust_rocksdb::Error>())
+    else {
+        return false;
+    };
+    is_missing_sst_error(&source.kind(), source.as_ref())
+}
+
+fn is_missing_sst_error(kind: &rust_rocksdb::ErrorKind, message: &str) -> bool {
+    matches!(
+        kind,
+        rust_rocksdb::ErrorKind::IOError | rust_rocksdb::ErrorKind::NotFound
+    ) && message.contains("No such file or directory")
+        && message.contains(".sst")
 }
 
 impl ChainStoreInner {
@@ -1086,8 +1175,6 @@ impl ChainStoreInner {
         &self,
         artifacts: ChainEpochArtifacts,
     ) -> Result<ChainEpochCommitOutcome, StoreError> {
-        let precomputed_retention_sweep = self.precompute_retention_sweep(&artifacts)?;
-
         let _control_guard = self.inner.lock_control();
         let commit_read_view = self
             .inner
@@ -1106,14 +1193,14 @@ impl ChainStoreInner {
         let chain_epoch = artifacts.chain_epoch;
         let block_range = committed_block_range(&artifacts, current_chain_epoch)?;
         let reorg_window_change = artifacts.reorg_window_change.clone();
+        let initializes_retention_cursor = current_chain_epoch.is_none()
+            && artifacts.block_headers.is_empty()
+            && matches!(
+                &reorg_window_change,
+                ReorgWindowChange::AdvanceSafeTipTo { .. }
+            );
         let (current_projection_protected_outpoints, current_spend_projection_protected_outpoints) =
             protected_transparent_outpoints(&artifacts);
-        let retention_sweep =
-            if precomputed_retention_sweep.swept_marker_unchanged(&commit_read_view)? {
-                precomputed_retention_sweep
-            } else {
-                SafeTipRetentionSweep::empty()
-            };
         let committed = ChainEpochCommitted::new(chain_epoch, block_range);
         let event_envelope = build_chain_event_envelope(&ChainEventEnvelopeInputs {
             inner: &commit_read_view,
@@ -1134,6 +1221,15 @@ impl ChainStoreInner {
         if let Some(store_metadata_put) = store_metadata_put {
             puts.push(store_metadata_put);
         }
+        if initializes_retention_cursor {
+            // A checkpoint bootstrap stores no canonical rows below the
+            // supplied settled tip. Start maintenance at that boundary so a
+            // later worker does not scan millions of intentionally absent
+            // heights.
+            puts.push(transparent_retention_swept_height_put(
+                chain_epoch.settled_tip_height,
+            ));
+        }
         let projection_repairs = build_reorg_window_projection_repairs(
             &commit_read_view,
             TransparentOutputProjectionRepairInputs {
@@ -1152,16 +1248,10 @@ impl ChainStoreInner {
                 protected_outpoints: &current_spend_projection_protected_outpoints,
             },
         )?;
-        let swept_outpoints = retention_sweep.swept_outpoints;
-        let retention_sweep_advance = retention_sweep.advance;
-        puts.extend(retention_sweep.puts);
         let mut deletes = projection_repairs.deletes;
         deletes.extend(spend_projection_repairs.deletes);
-        deletes.extend(retention_sweep.deletes);
 
         self.inner.write_batch(puts, deletes)?;
-        record_safe_tip_retention_sweep(swept_outpoints);
-        log_safe_tip_retention_sweep(retention_sweep_advance.as_ref());
 
         Ok(ChainEpochCommitOutcome::new(committed, event_envelope))
     }
@@ -2255,32 +2345,49 @@ impl ChainStoreInner {
         }
     }
 
-    /// Computes the retention sweep for a commit before the control lock is
-    /// taken.
-    ///
-    /// The scan is the dominant read cost of an `AdvanceSafeTipTo` commit;
-    /// running it unlocked keeps readiness and event-history reads responsive
-    /// through a full sweep chunk. See [`build_safe_tip_retention_sweep`] for
-    /// the soundness argument and the locked marker re-check that guards the
-    /// write.
-    fn precompute_retention_sweep(
+    /// Runs one bounded transparent retention pass independently of canonical
+    /// chain advancement.
+    fn sweep_transparent_retention_once(
         &self,
-        artifacts: &ChainEpochArtifacts,
-    ) -> Result<SafeTipRetentionSweep, StoreError> {
-        let sweep_read_view = self
-            .inner
-            .direct_read_view_for(StoreReadCaller::RetentionSweep);
-        let scanned_chain_epoch = match self.current_chain_epoch_id()? {
-            Some(chain_epoch_id) => Some(read_chain_epoch(&sweep_read_view, chain_epoch_id)?),
-            None => None,
-        };
-        build_safe_tip_retention_sweep(
-            &sweep_read_view,
-            artifacts,
-            scanned_chain_epoch,
-            self.options.retention_sweep_max_heights_per_commit,
-            self.options.retention_sweep_max_outpoints_per_commit,
-        )
+    ) -> Result<TransparentRetentionSweepOutcome, StoreError> {
+        let started_at = Instant::now();
+        let sweep_outcome = (|| {
+            let sweep_read_view = self
+                .inner
+                .direct_read_view_for(StoreReadCaller::RetentionSweep);
+            let Some(chain_epoch_id) = self.current_chain_epoch_id()? else {
+                return Ok(TransparentRetentionSweepOutcome::default());
+            };
+            let chain_epoch = read_chain_epoch(&sweep_read_view, chain_epoch_id)?;
+            let retention_sweep = build_transparent_retention_sweep(
+                &sweep_read_view,
+                chain_epoch,
+                self.options.retention_sweep_max_heights_per_pass,
+                self.options.retention_sweep_max_outpoints_per_pass,
+            )?;
+            let outcome = retention_sweep.outcome();
+            if retention_sweep.puts.is_empty() && retention_sweep.deletes.is_empty() {
+                return Ok(outcome);
+            }
+
+            let _control_guard = self.inner.lock_control();
+            let commit_read_view = self
+                .inner
+                .direct_read_view_for(StoreReadCaller::CommitFallback);
+            if !retention_sweep.swept_marker_unchanged(&commit_read_view)? {
+                return Ok(TransparentRetentionSweepOutcome::default());
+            }
+
+            let swept_outpoints = retention_sweep.swept_outpoints;
+            let retention_sweep_advance = retention_sweep.advance;
+            self.inner
+                .write_batch(retention_sweep.puts, retention_sweep.deletes)?;
+            record_transparent_retention_sweep(swept_outpoints);
+            log_transparent_retention_sweep(retention_sweep_advance.as_ref());
+            Ok(outcome)
+        })();
+        record_transparent_retention_sweep_outcome(started_at, &sweep_outcome);
+        sweep_outcome
     }
 
     fn validate_commit_order(
@@ -3141,6 +3248,7 @@ fn build_chain_epoch_puts(
         transparent_spend_facts,
         reorg_window_change: _,
     } = artifacts;
+    let transparent_spend_inputs = transparent_spend_inputs_by_block(&transaction_facts);
 
     let mut puts = Vec::new();
     puts.push(StoragePut {
@@ -3165,7 +3273,12 @@ fn build_chain_epoch_puts(
     push_block_value_pool_balance_puts(&mut puts, chain_epoch, block_value_pool_balances)?;
     push_subtree_root_artifact_puts(&mut puts, chain_epoch, subtree_roots)?;
     push_transparent_output_artifact_puts(&mut puts, chain_epoch, transparent_outputs_by_outpoint)?;
-    push_transparent_spend_fact_puts(&mut puts, chain_epoch, transparent_spend_facts)?;
+    push_transparent_spend_fact_puts(
+        &mut puts,
+        chain_epoch,
+        transparent_spend_inputs,
+        transparent_spend_facts,
+    )?;
     push_commit_control_puts(&mut puts, chain_epoch, event_envelope);
 
     Ok(puts)
@@ -3289,17 +3402,17 @@ fn build_reorg_window_spend_fact_projection_repairs(
     Ok(TransparentSpendFactProjectionRepairs { deletes })
 }
 
-struct SafeTipRetentionSweep {
+struct TransparentRetentionSweep {
     puts: Vec<StoragePut>,
     deletes: Vec<StorageDelete>,
     swept_outpoints: u64,
     advance: Option<RetentionSweepAdvance>,
-    /// Swept marker the scan started from (0 when absent). The locked commit
+    /// Swept marker the scan started from (0 when absent). The locked writer
     /// re-reads the marker and discards the sweep when they differ.
     observed_swept_height: BlockHeight,
 }
 
-impl SafeTipRetentionSweep {
+impl TransparentRetentionSweep {
     const fn empty() -> Self {
         Self {
             puts: Vec::new(),
@@ -3322,6 +3435,22 @@ impl SafeTipRetentionSweep {
             read_transparent_retention_swept_height(inner)?.unwrap_or(BlockHeight::new(0));
         Ok(swept_height == self.observed_swept_height)
     }
+
+    fn outcome(&self) -> TransparentRetentionSweepOutcome {
+        self.advance
+            .as_ref()
+            .map_or_else(TransparentRetentionSweepOutcome::default, |advance| {
+                TransparentRetentionSweepOutcome::new(
+                    advance
+                        .swept_through
+                        .value()
+                        .saturating_sub(advance.swept_from.value())
+                        .saturating_add(1),
+                    advance.swept_outpoints,
+                    advance.backlog_heights,
+                )
+            })
+    }
 }
 
 struct RetentionSweepAdvance {
@@ -3332,95 +3461,63 @@ struct RetentionSweepAdvance {
     backlog_heights: u32,
 }
 
-/// Builds the safe-tip retention sweep for an `AdvanceSafeTipTo` commit.
+/// Builds one transparent-projection retention maintenance pass.
 ///
 /// A projection row may be physically deleted only when no commit the store
 /// will ever accept can make it live again. `validate_reorg_window_change`
 /// floors every `Replace` at `safe_tip + 1`, so a spend at or below
 /// `safe_tip_height` is irreversible: the spent output's rows are deleted
 /// from `address_output_index`, `transparent_output`, and
-/// `transparent_spend_fact` in the same commit batch.
+/// `transparent_spend_fact` in one maintenance batch.
 ///
 /// The sweep covers heights from the persisted swept-through marker up to
-/// `min(new safe tip, previous tip, retention release height)`. The retention
+/// `min(current safe tip, retention release height)`. The retention
 /// release height is the durable-consumer floor: `zinder-ingest` publishes it
 /// through [`PrimaryChainStore::set_transparent_retention_release_height`] as the
 /// durable transparent-outpoint-spend projection advances, so a spend fact is
-/// deleted only once that projection has recorded its spender identity. Spend
-/// facts committed by this same batch are not durable yet when the sweep reads,
-/// so bulk catchup (which advances the safe tip to the batch tip) sweeps each
-/// batch one commit later. A non-monotonic `AdvanceSafeTipTo` target, or a
-/// release height below the swept marker, leaves the marker and the projections
-/// untouched. A sweep that deletes at least one fact also advances the
+/// deleted only once that projection has recorded its spender identity. A
+/// release height below the swept marker leaves the marker and the projections
+/// untouched. A pass that deletes at least one fact also advances the
 /// `transparent_retention_deleted_through_height` marker to the same ceiling, so
 /// the startup guard can tell a real deletion apart from a checkpoint-bootstrap
 /// swept marker that deleted nothing.
 ///
-/// A single commit sweeps at most `max_heights_per_commit` heights and stops
+/// A single pass sweeps at most `max_heights_per_pass` heights and stops
 /// after the first fully-swept height that reaches
-/// `max_outpoints_per_commit`, whichever budget hits first. When the release
+/// `max_outpoints_per_pass`, whichever budget hits first. When the release
 /// floor jumps far ahead of the swept marker (a store rebuilt with derive
 /// paused, then un-paused at tip), the marker advances only to the last
-/// fully-swept height and the remaining backlog drains across later commits;
+/// fully-swept height and the remaining backlog drains across later passes;
 /// the outpoint budget bounds the delete batch through transaction-dense
 /// eras, and the height cap bounds the scan through sparse ones.
 ///
 /// The scan runs outside the control lock so readiness and event-history
-/// reads stay responsive through a multi-minute chunk. This is sound because
-/// every row it reads is finalized: the range ends at or below the previous
+/// reads stay responsive through a bounded chunk. This is sound because
+/// every row it reads is finalized: the range ends at or below the current
 /// safe tip, `validate_reorg_window_change` floors every `Replace` at
 /// `safe_tip + 1`, and the swept marker is written only by this sweep inside
-/// serialized commits. The locked commit still re-checks the marker via
-/// [`SafeTipRetentionSweep::swept_marker_unchanged`] and discards the sweep on
+/// the serialized writer. The locked write still re-checks the marker via
+/// [`TransparentRetentionSweep::swept_marker_unchanged`] and discards the sweep on
 /// skew rather than writing markers derived from stale state.
-fn build_safe_tip_retention_sweep(
+fn build_transparent_retention_sweep(
     inner: &impl RocksChainStoreRead,
-    artifacts: &ChainEpochArtifacts,
-    previous_chain_epoch: Option<ChainEpoch>,
-    max_heights_per_commit: u32,
-    max_outpoints_per_commit: u64,
-) -> Result<SafeTipRetentionSweep, StoreError> {
-    if !matches!(
-        artifacts.reorg_window_change,
-        ReorgWindowChange::AdvanceSafeTipTo { .. }
-    ) {
-        return Ok(SafeTipRetentionSweep::empty());
-    }
-    let chain_epoch = artifacts.chain_epoch;
-    let Some(previous_chain_epoch) = previous_chain_epoch else {
-        // Checkpoint bootstrap: nothing below the operator-supplied safe tip
-        // is stored, so the marker starts at that boundary instead of
-        // walking millions of empty heights on the first follow-up sweep.
-        if artifacts.block_headers.is_empty() {
-            return Ok(SafeTipRetentionSweep {
-                puts: vec![transparent_retention_swept_height_put(
-                    chain_epoch.settled_tip_height,
-                )],
-                deletes: Vec::new(),
-                swept_outpoints: 0,
-                advance: None,
-                observed_swept_height: BlockHeight::new(0),
-            });
-        }
-        return Ok(SafeTipRetentionSweep::empty());
-    };
-
+    chain_epoch: ChainEpoch,
+    max_heights_per_pass: u32,
+    max_outpoints_per_pass: u64,
+) -> Result<TransparentRetentionSweep, StoreError> {
     let swept_through =
         read_transparent_retention_swept_height(inner)?.unwrap_or(BlockHeight::new(0));
     let retention_release_height =
         read_transparent_retention_release_height(inner)?.unwrap_or(BlockHeight::new(0));
-    let sweep_ceiling = chain_epoch
-        .settled_tip_height
-        .min(previous_chain_epoch.visible_tip_height)
-        .min(retention_release_height);
+    let sweep_ceiling = chain_epoch.settled_tip_height.min(retention_release_height);
     if sweep_ceiling <= swept_through {
-        return Ok(SafeTipRetentionSweep::empty());
+        return Ok(TransparentRetentionSweep::empty());
     }
 
     let capped_ceiling = BlockHeight::new(
         swept_through
             .value()
-            .saturating_add(max_heights_per_commit)
+            .saturating_add(max_heights_per_pass)
             .min(sweep_ceiling.value()),
     );
     let swept_from = BlockHeight::new(swept_through.value().saturating_add(1));
@@ -3428,9 +3525,8 @@ fn build_safe_tip_retention_sweep(
     let settled_sweep = collect_settled_spend_sweep_deletes(
         inner,
         chain_epoch,
-        previous_chain_epoch,
         sweep_range,
-        max_outpoints_per_commit,
+        max_outpoints_per_pass,
     )?;
     let swept_outpoints = settled_sweep.swept_outpoints;
 
@@ -3445,7 +3541,7 @@ fn build_safe_tip_retention_sweep(
     let backlog_heights = sweep_ceiling
         .value()
         .saturating_sub(settled_sweep.swept_through.value());
-    Ok(SafeTipRetentionSweep {
+    Ok(TransparentRetentionSweep {
         puts,
         deletes: settled_sweep.deletes,
         swept_outpoints,
@@ -3471,13 +3567,12 @@ struct SettledSpendSweepDeletes {
 /// `sweep_range`, stopping after the first fully-swept height that reaches
 /// `max_outpoints`.
 ///
-/// A height is never split across commits: the budget is checked only after
+/// A height is never split across passes: the budget is checked only after
 /// every spend at a height is collected, so `swept_through` always names a
 /// height whose deletes are complete and the marker may safely advance to it.
 fn collect_settled_spend_sweep_deletes(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
-    previous_chain_epoch: ChainEpoch,
     sweep_range: BlockHeightRange,
     max_outpoints: u64,
 ) -> Result<SettledSpendSweepDeletes, StoreError> {
@@ -3486,26 +3581,12 @@ fn collect_settled_spend_sweep_deletes(
     let mut swept_through = sweep_range.start;
     for height in sweep_range {
         swept_through = height;
-        let outpoints = read_current_transparent_spend_fact_block_outpoints(
-            inner,
-            previous_chain_epoch,
-            height,
-        )?;
-        if outpoints.is_empty() {
-            continue;
-        }
-        let spends = read_current_transparent_spend_facts_by_outpoints(
-            inner,
-            previous_chain_epoch,
-            &outpoints,
-        )?;
-        for outpoint in outpoints {
-            let Some(spend) = spends.get(&outpoint) else {
-                continue;
-            };
+        let spends = read_current_transparent_spend_fact_block_facts(inner, chain_epoch, height)?;
+        for spend in spends {
             if spend.block_height != height {
                 continue;
             }
+            let outpoint = spend.spent_outpoint;
             deletes.push(StorageDelete {
                 table: StorageTable::AddressOutputIndex,
                 key: StoreKey::address_output_index(
@@ -3657,14 +3738,29 @@ fn read_storage_control_height(
     Ok(Some(BlockHeight::new(u32::from_be_bytes(height_bytes))))
 }
 
-fn record_safe_tip_retention_sweep(swept_outpoints: u64) {
+fn record_transparent_retention_sweep(swept_outpoints: u64) {
     if swept_outpoints == 0 {
         return;
     }
     metrics::counter!("zinder_store_retention_swept_outpoints_total").increment(swept_outpoints);
 }
 
-fn log_safe_tip_retention_sweep(advance: Option<&RetentionSweepAdvance>) {
+fn record_transparent_retention_sweep_outcome(
+    started_at: Instant,
+    outcome: &Result<TransparentRetentionSweepOutcome, StoreError>,
+) {
+    metrics::histogram!(
+        "zinder_store_retention_sweep_duration_seconds",
+        "status" => outcome_status(outcome)
+    )
+    .record(started_at.elapsed());
+    if let Ok(outcome) = outcome {
+        metrics::gauge!("zinder_store_retention_backlog_heights")
+            .set(f64::from(outcome.backlog_heights()));
+    }
+}
+
+fn log_transparent_retention_sweep(advance: Option<&RetentionSweepAdvance>) {
     let Some(advance) = advance else {
         return;
     };
@@ -3679,7 +3775,7 @@ fn log_safe_tip_retention_sweep(advance: Option<&RetentionSweepAdvance>) {
         sweep_ceiling = advance.sweep_ceiling.value(),
         swept_outpoints = advance.swept_outpoints,
         backlog_heights = advance.backlog_heights,
-        "advanced the safe-tip retention sweep"
+        "advanced transparent retention maintenance"
     );
 }
 
@@ -4144,36 +4240,56 @@ fn push_transparent_output_artifact_puts(
 fn push_transparent_spend_fact_puts(
     puts: &mut Vec<StoragePut>,
     chain_epoch: ChainEpoch,
+    mut block_spend_inputs: HashMap<(BlockHeight, BlockHash), Vec<TransparentOutPoint>>,
     transparent_spend_facts: Vec<TransparentSpendFact>,
 ) -> Result<(), StoreError> {
-    let mut block_spent_outpoints =
-        HashMap::<(BlockHeight, BlockHash), Vec<TransparentOutPoint>>::new();
+    let mut block_spend_facts =
+        HashMap::<(BlockHeight, BlockHash), Vec<TransparentSpendFact>>::new();
     for spend in transparent_spend_facts {
         let current_key =
             StoreKey::transparent_spend_fact(chain_epoch.network, spend.spent_outpoint);
-        block_spent_outpoints
-            .entry((spend.block_height, spend.block_hash))
-            .or_default()
-            .push(spend.spent_outpoint);
         let encoded_spend = encode_transparent_spend_fact(&spend)?;
         puts.push(StoragePut {
             table: StorageTable::TransparentSpendFact,
             key: current_key,
             value: encoded_spend,
         });
+        block_spend_facts
+            .entry((spend.block_height, spend.block_hash))
+            .or_default()
+            .push(spend.clone());
+        block_spend_inputs
+            .entry((spend.block_height, spend.block_hash))
+            .or_default()
+            .push(spend.spent_outpoint);
     }
 
-    let mut block_spent_outpoints = block_spent_outpoints.into_iter().collect::<Vec<_>>();
-    block_spent_outpoints.sort_by(
+    let mut block_spend_inputs = block_spend_inputs.into_iter().collect::<Vec<_>>();
+    block_spend_inputs.sort_by(
         |((left_height, left_hash), _), ((right_height, right_hash), _)| {
             left_height
                 .cmp(right_height)
                 .then(left_hash.as_bytes().cmp(&right_hash.as_bytes()))
         },
     );
-    for ((block_height, block_hash), mut spent_outpoints) in block_spent_outpoints {
-        sort_transparent_outpoints(&mut spent_outpoints);
-        spent_outpoints.dedup();
+    for ((block_height, block_hash), mut input_outpoints) in block_spend_inputs {
+        sort_transparent_outpoints(&mut input_outpoints);
+        input_outpoints.dedup();
+        let mut spend_facts = block_spend_facts
+            .remove(&(block_height, block_hash))
+            .unwrap_or_default();
+        spend_facts.sort_by(|left, right| {
+            left.spent_outpoint
+                .transaction_id
+                .as_bytes()
+                .cmp(&right.spent_outpoint.transaction_id.as_bytes())
+                .then(
+                    left.spent_outpoint
+                        .output_index
+                        .cmp(&right.spent_outpoint.output_index),
+                )
+        });
+        spend_facts.dedup_by_key(|spend| spend.spent_outpoint);
         puts.push(StoragePut {
             table: StorageTable::TransparentSpendFactBlockIndex,
             key: StoreKey::transparent_spend_fact_block_index(
@@ -4181,11 +4297,36 @@ fn push_transparent_spend_fact_puts(
                 block_height,
                 chain_epoch.id,
             ),
-            value: encode_transparent_spend_fact_block_index(block_hash, &spent_outpoints)?,
+            value: encode_transparent_spend_fact_block_index(
+                block_hash,
+                &input_outpoints,
+                &spend_facts,
+            )?,
         });
     }
 
     Ok(())
+}
+
+fn transparent_spend_inputs_by_block(
+    transaction_facts: &[TransactionFactsArtifact],
+) -> HashMap<(BlockHeight, BlockHash), Vec<TransparentOutPoint>> {
+    let mut inputs_by_block = HashMap::new();
+    for transaction in transaction_facts {
+        for input in &transaction.transparent_inputs {
+            if input.spent_outpoint.is_coinbase_sentinel() {
+                continue;
+            }
+            inputs_by_block
+                .entry((
+                    transaction.location.block_height,
+                    transaction.location.block_hash,
+                ))
+                .or_insert_with(Vec::new)
+                .push(input.spent_outpoint);
+        }
+    }
+    inputs_by_block
 }
 
 fn visibility_value(chain_epoch: ChainEpoch) -> Vec<u8> {
@@ -4693,12 +4834,28 @@ mod tests {
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 17);
-        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 17);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 18);
+        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 18);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()
         );
+    }
+
+    #[test]
+    fn canonical_secondary_retries_only_missing_sst_file_races() {
+        assert!(is_missing_sst_error(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: /canonical/123456.sst"
+        ));
+        assert!(!is_missing_sst_error(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: /canonical/CURRENT"
+        ));
+        assert!(!is_missing_sst_error(
+            &rust_rocksdb::ErrorKind::Corruption,
+            "Corruption: No such file or directory: /canonical/123456.sst"
+        ));
     }
 
     #[test]
@@ -4897,7 +5054,7 @@ mod tests {
             let store =
                 PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())?;
             let mut metadata_bytes = Vec::with_capacity(6);
-            metadata_bytes.extend_from_slice(&u16::MAX.to_be_bytes());
+            metadata_bytes.extend_from_slice(&12_u16.to_be_bytes());
             metadata_bytes.extend_from_slice(&Network::ZcashRegtest.id().to_be_bytes());
             store.store.inner.write(vec![StoragePut {
                 table: StorageTable::StorageControl,
@@ -4918,7 +5075,7 @@ mod tests {
                 StoreError::SchemaMismatch {
                     persisted_version,
                     expected_version: STORE_SCHEMA_VERSION,
-                } if persisted_version == u16::MAX
+                } if persisted_version == 12
             ),
             "unexpected error: {error:?}"
         );

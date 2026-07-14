@@ -20,14 +20,14 @@ pub(super) fn validate_chain_store_options(options: ChainStoreOptions) -> Result
             reason: "reorg window blocks must be greater than zero",
         });
     }
-    if options.retention_sweep_max_heights_per_commit == 0 {
+    if options.retention_sweep_max_heights_per_pass == 0 {
         return Err(StoreError::InvalidChainStoreOptions {
-            reason: "retention sweep max heights per commit must be greater than zero",
+            reason: "retention sweep max heights per pass must be greater than zero",
         });
     }
-    if options.retention_sweep_max_outpoints_per_commit == 0 {
+    if options.retention_sweep_max_outpoints_per_pass == 0 {
         return Err(StoreError::InvalidChainStoreOptions {
-            reason: "retention sweep max outpoints per commit must be greater than zero",
+            reason: "retention sweep max outpoints per pass must be greater than zero",
         });
     }
     options

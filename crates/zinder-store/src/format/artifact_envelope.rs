@@ -48,6 +48,8 @@ pub(crate) enum PayloadFormat {
     ZinderBlockValuePoolBalancesV1 = 19,
     /// Zinder protobuf payload for a displaced block.
     ZinderDisplacedBlockV1 = 20,
+    /// Zinder protobuf payload for block-local transparent spend replay facts.
+    ZinderTransparentSpendFactBlockIndexV2 = 21,
 }
 
 impl PayloadFormat {
@@ -71,6 +73,7 @@ impl PayloadFormat {
             18 => Some(Self::ZinderTransactionIntrinsicValueBalancesV1),
             19 => Some(Self::ZinderBlockValuePoolBalancesV1),
             20 => Some(Self::ZinderDisplacedBlockV1),
+            21 => Some(Self::ZinderTransparentSpendFactBlockIndexV2),
             _ => None,
         }
     }

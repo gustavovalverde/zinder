@@ -9,7 +9,6 @@ use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
     ValuePoolFlowBackfillCoverage, ValuePoolFlowHistoryConsumer, ValuePoolFlowTailCoverage,
 };
-use zinder_runtime::Readiness;
 use zinder_store::PrimaryChainStore;
 
 use crate::{
@@ -18,7 +17,7 @@ use crate::{
         backfill_consumer_tail_boundary, derive_projection_write_guard,
         unanimous_existing_block_consumer_cursor,
     },
-    ingest_loop::wait_until_tip_follow_or_cancelled,
+    ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
     paid_fee_distribution_backfill::{
         PaidFeeDistributionBackfillConfig, PaidFeeDistributionBackfillContext,
         hydrate_range_with_source,
@@ -171,7 +170,7 @@ async fn seed_visible_tail_from_source(
 pub fn spawn_value_pool_flow_backfill_task(
     config: ValuePoolFlowBackfillConfig,
     context: ValuePoolFlowBackfillContext,
-    readiness: Readiness,
+    historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -179,7 +178,7 @@ pub fn spawn_value_pool_flow_backfill_task(
     }
     Some(tokio::spawn(async move {
         loop {
-            if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+            if wait_until_historical_work_or_cancelled(&historical_work_gate, &cancel).await {
                 return;
             }
             let progress = backfill_next_batch(config, &context).await;

@@ -24,7 +24,10 @@
 use std::{
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -54,15 +57,83 @@ use crate::{
 /// failures while it is between handlers.
 const TIP_OBSERVATION_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
 
-/// Cadence at which the bounce-back watcher re-evaluates the classifier
-/// while the `FollowingTip` handler runs.
-///
-/// Short enough to catch an upstream burst within a minute; long enough
-/// to keep watcher load negligible against the upstream node. Operators
-/// rarely need to tune this; the value is intentionally a private
-/// constant rather than a configuration knob.
-const PHASE_BOUNCE_BACK_WATCH_INTERVAL: Duration = Duration::from_mins(1);
 const BACKGROUND_WORK_PHASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Process-local admission gate for rebuildable historical work.
+///
+/// Canonical bulk catch-up owns the storage budget first. Once canonical is
+/// following tip, derive replay owns it until every canonical block is
+/// materialized. Historical backfills and verifiers may run only after both
+/// conditions hold. Keeping this state out of [`Readiness`] avoids exposing an
+/// internal scheduler concern as part of the service's public health contract.
+#[derive(Clone, Debug)]
+pub struct HistoricalWorkGate {
+    readiness: Readiness,
+    derive_caught_up: Arc<AtomicBool>,
+}
+
+impl HistoricalWorkGate {
+    /// Creates a closed historical-work gate tied to canonical phase state.
+    #[must_use]
+    pub fn new(readiness: Readiness) -> Self {
+        metrics::gauge!("zinder_ingest_historical_work_gate_open").set(0.0);
+        metrics::gauge!("zinder_ingest_derive_replay_caught_up").set(0.0);
+        Self {
+            readiness,
+            derive_caught_up: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Returns the shared canonical readiness handle used by derive replay's
+    /// bulk-catchup phase gate.
+    #[must_use]
+    pub fn readiness(&self) -> Readiness {
+        self.readiness.clone()
+    }
+
+    /// Publishes whether derive replay has materialized the canonical tip.
+    pub fn set_derive_caught_up(&self, caught_up: bool) {
+        let was_caught_up = self.derive_caught_up.swap(caught_up, Ordering::AcqRel);
+        metrics::gauge!("zinder_ingest_derive_replay_caught_up").set(if caught_up {
+            1.0
+        } else {
+            0.0
+        });
+        self.record_open_metric();
+        if was_caught_up == caught_up {
+            return;
+        }
+
+        if caught_up {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "derive_replay_caught_up",
+                "derive replay reached the canonical tip; historical work may run during tip follow"
+            );
+        } else {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "derive_replay_fell_behind",
+                "derive replay no longer covers the canonical tip; historical work is deferred"
+            );
+        }
+    }
+
+    /// Returns whether historical work currently owns any storage budget.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        matches!(self.readiness.phase(), Some(IngestPhase::FollowingTip))
+            && self.derive_caught_up.load(Ordering::Acquire)
+    }
+
+    fn record_open_metric(&self) {
+        metrics::gauge!("zinder_ingest_historical_work_gate_open").set(if self.is_open() {
+            1.0
+        } else {
+            0.0
+        });
+    }
+}
 
 /// Resolved configuration consumed by [`run_ingest_loop`].
 ///
@@ -276,16 +347,17 @@ pub struct TipFollowSubsystems {
 /// the loop holds for the life of the process.
 pub type TipFollowSubsystemsLauncher = Box<dyn FnOnce() -> TipFollowSubsystems + Send>;
 
-/// Waits until canonical ingest reaches tip follow, where rebuildable
-/// enrichment work may run without competing with bulk catch-up.
+/// Waits until canonical ingest and derive replay release the storage budget
+/// to rebuildable historical work.
 ///
 /// Returns `true` when cancellation wins and the caller should exit.
-pub(crate) async fn wait_until_tip_follow_or_cancelled(
-    readiness: &Readiness,
+pub(crate) async fn wait_until_historical_work_or_cancelled(
+    gate: &HistoricalWorkGate,
     cancel: &CancellationToken,
 ) -> bool {
     loop {
-        if matches!(readiness.phase(), Some(IngestPhase::FollowingTip)) {
+        gate.record_open_metric();
+        if gate.is_open() {
             return false;
         }
         tokio::select! {
@@ -318,10 +390,9 @@ pub(crate) async fn wait_until_tip_follow_or_cancelled(
 ///   yield a flush-and-reclaim window once memory pressure reaches the
 ///   configured derive-replay degrade/pause ratios.
 /// - [`IngestPhase::FollowingTip`] calls
-///   [`tip_follow_with_primary_store`] with a child cancel token; a
-///   parallel watcher task fires the child token if re-classification
-///   would yield a different phase, so an upstream burst bounces the
-///   loop back into bulk catch-up without a manual restart.
+///   [`tip_follow_with_primary_store`], which reuses each iteration's observed
+///   upstream tip and returns as soon as lag crosses the bulk-catchup boundary.
+///   The unified loop then re-classifies without a separate polling delay.
 ///
 /// On first entry to `FollowingTip` the loop invokes
 /// `tip_follow_subsystems` to spawn the mempool orchestrator, retention
@@ -353,7 +424,7 @@ where
             flush_pending_bulk_catchup_writes(&store, &mut bulk_flush_state).await?;
             return Ok(());
         }
-        if reached_target_height(config.modifiers.target_height, &store) {
+        if store_reached_target_height(config.modifiers.target_height, &store) {
             tracing::info!(
                 target: "zinder::ingest",
                 event = "ingest_loop_target_reached",
@@ -477,14 +548,6 @@ where
 
                 let tip_follow_config =
                     build_tip_follow_config(config, Arc::clone(&network_upgrade_activations));
-                let phase_cancel = cancel.child_token();
-                let watcher_handle = spawn_following_tip_exit_watcher(
-                    Arc::clone(&source),
-                    store.clone(),
-                    config.phases.catchup_threshold_blocks,
-                    config.modifiers.target_height,
-                    phase_cancel.clone(),
-                );
                 let tip_follow_outcome = tip_follow_with_primary_store(
                     &tip_follow_config,
                     source.as_ref(),
@@ -496,17 +559,14 @@ where
                     tip_subsystems
                         .as_ref()
                         .and_then(|subsystems| subsystems.chain_tip_source.clone()),
-                    phase_cancel,
+                    cancel.clone(),
                 )
                 .await;
-                watcher_handle.abort();
                 tip_follow_outcome?;
-                // tip_follow_with_primary_store returns either when the
-                // top-level cancel fired (operator shutdown) or when the
-                // bounce-back watcher cancelled the child token (upstream
-                // burst pushed the classifier out of FollowingTip). The
-                // top-of-loop `cancel.is_cancelled()` guard distinguishes
-                // the two and re-dispatches in the burst case.
+                // Tip-follow returns on operator cancellation, target height,
+                // or as soon as its own observed lag crosses the bulk-catchup
+                // boundary. The top-of-loop guard distinguishes shutdown from
+                // a normal phase re-dispatch.
             }
             _ => {
                 if sleep_or_cancel(config.tip_follow.poll_interval, &cancel)
@@ -518,62 +578,6 @@ where
             }
         }
     }
-}
-
-/// Spawns the watcher that fires `cancel` when `FollowingTip` should return
-/// control to the unified loop.
-///
-/// Runs alongside `tip_follow_with_primary_store`; the parent loop
-/// aborts the watcher's join handle as soon as the tip-follow handler returns.
-/// The watcher does not own readiness updates: it only signals the
-/// cancellation that lets the unified loop re-classify or honor
-/// `--target-height`.
-fn spawn_following_tip_exit_watcher<Source>(
-    source: Arc<Source>,
-    store: PrimaryChainStore,
-    catchup_threshold_blocks: u32,
-    target_height: Option<BlockHeight>,
-    cancel: CancellationToken,
-) -> JoinHandle<()>
-where
-    Source: NodeSource + Clone,
-{
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => return,
-                () = tokio::time::sleep(PHASE_BOUNCE_BACK_WATCH_INTERVAL) => {}
-            }
-            if reached_target_height(target_height, &store) {
-                tracing::info!(
-                    target: "zinder::ingest",
-                    event = "ingest_loop_following_tip_target_reached",
-                    target_height = target_height.as_ref().map(|height| height.value()),
-                    "target height reached inside FollowingTip; cancelling inner loop"
-                );
-                cancel.cancel();
-                return;
-            }
-            let Ok(tip_id) = source.tip_id().await else {
-                continue;
-            };
-            let store_tip = current_chain_height(&store);
-            record_canonical_lag_blocks(tip_id.height.value(), store_tip);
-            let phase = classify_phase(store_tip, tip_id.height.value(), catchup_threshold_blocks);
-            if !matches!(phase, IngestPhase::FollowingTip) {
-                tracing::info!(
-                    target: "zinder::ingest",
-                    event = "ingest_loop_phase_bounce_back",
-                    new_phase = phase.wire_label(),
-                    store_tip = store_tip,
-                    upstream_tip = tip_id.height.value(),
-                    "phase classifier requests bounce-back from FollowingTip; cancelling inner loop"
-                );
-                cancel.cancel();
-                return;
-            }
-        }
-    })
 }
 
 /// Computes the per-batch finalization target for the `BulkCatchup` phase.
@@ -683,17 +687,15 @@ fn build_tip_follow_config(
         reorg_window_blocks: config.reorg_window_blocks,
         poll_interval: config.tip_follow.poll_interval,
         lag_threshold_blocks: config.tip_follow.lag_threshold_blocks,
+        phase_exit_lag_blocks: Some(config.phases.catchup_threshold_blocks),
+        target_height: config.modifiers.target_height,
     }
 }
 
-fn reached_target_height(target: Option<BlockHeight>, store: &PrimaryChainStore) -> bool {
-    let Some(target) = target else {
-        return false;
-    };
-    let Some(current) = current_chain_height(store) else {
-        return false;
-    };
-    current >= target.value()
+fn store_reached_target_height(target: Option<BlockHeight>, store: &PrimaryChainStore) -> bool {
+    target.is_some_and(|target| {
+        current_chain_height(store).is_some_and(|height| height >= target.value())
+    })
 }
 
 /// Records how many blocks the canonical writer trails the upstream tip by,
@@ -807,23 +809,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_work_gate_opens_only_during_tip_follow() {
+    async fn background_work_gate_requires_derive_to_cover_tip() {
         let readiness = Readiness::default();
         readiness.set_phase(IngestPhase::FollowingTip);
+        let gate = HistoricalWorkGate::new(readiness);
         let cancel = CancellationToken::new();
+        let gate_for_waiter = gate.clone();
+        let cancel_for_waiter = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            wait_until_historical_work_or_cancelled(&gate_for_waiter, &cancel_for_waiter).await
+        });
 
-        assert!(!wait_until_tip_follow_or_cancelled(&readiness, &cancel).await);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        gate.set_derive_caught_up(true);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+        assert!(matches!(outcome, Ok(Ok(false))));
     }
 
     #[tokio::test]
-    async fn background_work_gate_resumes_after_bulk_catchup() {
+    async fn background_work_gate_resumes_after_bulk_catchup_and_derive_catchup() {
         let readiness = Readiness::default();
         readiness.set_phase(IngestPhase::BulkCatchup);
+        let gate = HistoricalWorkGate::new(readiness.clone());
+        gate.set_derive_caught_up(true);
         let cancel = CancellationToken::new();
-        let gate_readiness = readiness.clone();
+        let waiter_gate = gate.clone();
         let gate_cancel = cancel.clone();
         let waiter = tokio::spawn(async move {
-            wait_until_tip_follow_or_cancelled(&gate_readiness, &gate_cancel).await
+            wait_until_historical_work_or_cancelled(&waiter_gate, &gate_cancel).await
         });
 
         tokio::task::yield_now().await;
@@ -838,10 +853,11 @@ mod tests {
     async fn background_work_gate_exits_when_cancelled_before_tip_follow() {
         let readiness = Readiness::default();
         readiness.set_phase(IngestPhase::BulkCatchup);
+        let gate = HistoricalWorkGate::new(readiness);
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        assert!(wait_until_tip_follow_or_cancelled(&readiness, &cancel).await);
+        assert!(wait_until_historical_work_or_cancelled(&gate, &cancel).await);
     }
 
     #[test]

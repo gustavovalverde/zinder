@@ -48,6 +48,7 @@ const SOURCE_SEGMENT_GROW_DENOMINATOR: u32 = 4;
 
 const BULK_STAGE_SOURCE_FETCH: &str = "source_fetch";
 const BULK_STAGE_CANONICAL_BLOCK_PREPARE: &str = "canonical_block_prepare";
+const BULK_STAGE_CANONICAL_PREVOUT_RESOLVE: &str = "canonical_prevout_resolve";
 const BULK_STAGE_CANONICAL_FINALIZE: &str = "canonical_finalize";
 const BULK_STAGE_SUBTREE_ROOT_ATTACHMENT: &str = "subtree_root_attachment";
 const BULK_STAGE_CHECKPOINT_TREE_STATE: &str = "checkpoint_tree_state";
@@ -1048,12 +1049,24 @@ mod tests {
         );
 
         assert_eq!(
-            sizer.plan_segment(BlockHeight::new(1), BlockHeight::new(100)),
-            SourceSegmentPlan::Ready(NonZeroU32::new(32).ok_or("invalid planned blocks")?)
+            sizer.plan_segment(
+                BlockHeight::new(1),
+                BlockHeight::new(100),
+                NonZeroU64::new(16 * 1024 * 1024).ok_or("invalid max response bytes")?,
+            ),
+            SourceSegmentPlan::Ready {
+                max_blocks: NonZeroU32::new(32).ok_or("invalid planned blocks")?,
+                reserved_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid reserved response bytes")?,
+            }
         );
         sizer.record_segment_scheduled(BlockHeight::new(1));
         assert_eq!(
-            sizer.plan_segment(BlockHeight::new(33), BlockHeight::new(100)),
+            sizer.plan_segment(
+                BlockHeight::new(33),
+                BlockHeight::new(100),
+                NonZeroU64::new(16 * 1024 * 1024).ok_or("invalid max response bytes")?,
+            ),
             SourceSegmentPlan::AwaitingFeedback
         );
 
@@ -1063,8 +1076,16 @@ mod tests {
                 .with_connected_blocks(12),
         );
         assert_eq!(
-            sizer.plan_segment(BlockHeight::new(33), BlockHeight::new(100)),
-            SourceSegmentPlan::Ready(NonZeroU32::new(12).ok_or("invalid adapted blocks")?)
+            sizer.plan_segment(
+                BlockHeight::new(33),
+                BlockHeight::new(100),
+                NonZeroU64::new(16 * 1024 * 1024).ok_or("invalid max response bytes")?,
+            ),
+            SourceSegmentPlan::Ready {
+                max_blocks: NonZeroU32::new(12).ok_or("invalid adapted blocks")?,
+                reserved_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid reserved response bytes")?,
+            }
         );
         Ok(())
     }
@@ -1231,6 +1252,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_prepare_resolution_windows_respect_prepare_concurrency()
+    -> Result<(), Box<dyn Error>> {
+        let requested_segments = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingSegmentSource {
+            requested_segments: Arc::clone(&requested_segments),
+            network: Network::ZcashRegtest,
+        };
+        let source_segment_sizer = test_source_segment_sizer(BlockHeight::new(1), 32)?;
+        let (_store_tempdir, store) = test_primary_chain_store("bounded-prevout-window-store")?;
+        let block_prepare_stream = build_block_prepare_stream(
+            &source,
+            BulkCatchupBlockPrepareStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(32),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(1)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                block_prepare_concurrency: 4,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
+            },
+            |source_block| async move {
+                if source_block.height == BlockHeight::new(1) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(test_derived_block(&source_block, 0, 0))
+            },
+        );
+        futures_util::pin_mut!(block_prepare_stream);
+
+        let mut window_sizes = Vec::new();
+        while let Some(chunk_result) = block_prepare_stream.next().await {
+            window_sizes.push(chunk_result?.len());
+        }
+
+        assert_eq!(window_sizes.iter().sum::<usize>(), 32);
+        assert!(window_sizes.iter().all(|size| *size <= 4));
+        assert!(
+            window_sizes.len() <= 10,
+            "full prepare concurrency must not flush each completed block: {window_sizes:?}"
+        );
+        assert_eq!(*requested_segments.lock(), vec![(1, 32)]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn block_prepare_stream_prefetches_spent_transparent_outputs()
     -> Result<(), Box<dyn Error>> {
         let (_store_tempdir, store) = test_primary_chain_store("prefetched-prevout-store")?;
@@ -1301,11 +1377,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_prepare_stream_resolves_outputs_created_in_ordered_windows()
+    -> Result<(), Box<dyn Error>> {
+        for block_prepare_concurrency in [1, 2] {
+            let (_store_tempdir, store) = test_primary_chain_store("windowed-prevout-store")?;
+            let requested_segments = Arc::new(Mutex::new(Vec::new()));
+            let source = RecordingSegmentSource {
+                requested_segments: Arc::clone(&requested_segments),
+                network: Network::ZcashRegtest,
+            };
+            let source_segment_sizer = test_source_segment_sizer(BlockHeight::new(1), 2)?;
+            let funding_transaction_id = TransactionId::from_bytes([0x31; 32]);
+            let spent_outpoint = TransparentOutPoint::new(funding_transaction_id, 0);
+            let spending_transaction_id = TransactionId::from_bytes([0x32; 32]);
+            let block_prepare_stream = build_block_prepare_stream(
+                &source,
+                BulkCatchupBlockPrepareStreamConfig {
+                    request_timeout: Duration::from_secs(30),
+                    from_height: BlockHeight::new(1),
+                    to_height: BlockHeight::new(2),
+                    max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                        .ok_or("invalid max response bytes")?,
+                    target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                        .ok_or("invalid target response bytes")?,
+                    source_fetch_max_in_flight_requests: NonZeroU32::new(1)
+                        .ok_or("invalid source fetch requests")?,
+                    source_fetch_max_in_flight_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                        .ok_or("invalid source fetch bytes")?,
+                    source_segment_sizer,
+                    block_prepare_concurrency,
+                    block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                        .ok_or(
+                        "invalid block prepare artifact bytes",
+                    )?,
+                    store,
+                },
+                move |source_block| async move {
+                    match source_block.height.value() {
+                        1 => Ok(test_output_creating_block(&source_block, spent_outpoint)),
+                        2 => Ok(test_transparent_spend_block(
+                            &source_block,
+                            spending_transaction_id,
+                            spent_outpoint,
+                        )),
+                        _ => Ok(test_derived_block(&source_block, 0, 0)),
+                    }
+                },
+            );
+            futures_util::pin_mut!(block_prepare_stream);
+
+            let mut prepared_blocks = Vec::new();
+            while let Some(chunk_result) = block_prepare_stream.next().await {
+                prepared_blocks.extend(chunk_result?);
+            }
+            assert_eq!(prepared_blocks.len(), 2);
+            assert_eq!(
+                prepared_blocks[1]
+                    .prefetched_spent_transparent_outputs
+                    .iter()
+                    .map(|output| output.outpoint)
+                    .collect::<Vec<_>>(),
+                vec![spent_outpoint]
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn source_fetch_schedules_past_slow_earlier_segment() -> Result<(), Box<dyn Error>> {
         let fetch_events = Arc::new(Mutex::new(Vec::new()));
         let source = DelayedSegmentSource {
             fetch_events: Arc::clone(&fetch_events),
             network: Network::ZcashRegtest,
+            response_payload_bytes: 12 * 1024 * 1024,
         };
         let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
             NonZeroU32::new(2).ok_or("invalid segment blocks")?,
@@ -1367,12 +1512,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_fetch_admission_uses_observed_response_budget() -> Result<(), Box<dyn Error>> {
+        let fetch_events = Arc::new(Mutex::new(Vec::new()));
+        let source = DelayedSegmentSource {
+            fetch_events: Arc::clone(&fetch_events),
+            network: Network::ZcashRegtest,
+            response_payload_bytes: 8 * 1024 * 1024,
+        };
+        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
+            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
+            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        )));
+        let (_store_tempdir, store) = test_primary_chain_store("adaptive-source-budget-store")?;
+        let block_prepare_stream = build_block_prepare_stream(
+            &source,
+            BulkCatchupBlockPrepareStreamConfig {
+                request_timeout: Duration::from_secs(30),
+                from_height: BlockHeight::new(1),
+                to_height: BlockHeight::new(8),
+                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
+                    .ok_or("invalid max response bytes")?,
+                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid target response bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(36 * 1024 * 1024)
+                    .ok_or("invalid source fetch bytes")?,
+                source_segment_sizer,
+                block_prepare_concurrency: 2,
+                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or("invalid block prepare artifact bytes")?,
+                store,
+            },
+            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+        );
+        futures_util::pin_mut!(block_prepare_stream);
+        while let Some(chunk_result) = block_prepare_stream.next().await {
+            let _ = chunk_result?;
+        }
+
+        let fetch_events = fetch_events.lock().clone();
+        let start_fourth_segment = fetch_event_index(
+            &fetch_events,
+            SegmentFetchEvent::Started {
+                start_height: BlockHeight::new(7),
+            },
+        )?;
+        let finish_second_segment = fetch_event_index(
+            &fetch_events,
+            SegmentFetchEvent::Finished {
+                start_height: BlockHeight::new(3),
+            },
+        )?;
+        assert!(
+            start_fourth_segment < finish_second_segment,
+            "expected observed sparse responses to admit all three later requests; events: {fetch_events:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn source_fetch_counts_completed_reassembly_bytes_against_watermark()
     -> Result<(), Box<dyn Error>> {
         let fetch_events = Arc::new(Mutex::new(Vec::new()));
         let source = DelayedSegmentSource {
             fetch_events: Arc::clone(&fetch_events),
             network: Network::ZcashRegtest,
+            response_payload_bytes: 12 * 1024 * 1024,
         };
         let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
             NonZeroU32::new(2).ok_or("invalid segment blocks")?,
@@ -1440,6 +1649,7 @@ mod tests {
         let source = DelayedSegmentSource {
             fetch_events: Arc::clone(&fetch_events),
             network: Network::ZcashRegtest,
+            response_payload_bytes: 12 * 1024 * 1024,
         };
         let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
             NonZeroU32::new(2).ok_or("invalid segment blocks")?,
@@ -1717,11 +1927,9 @@ mod tests {
     /// Batch {1,2} funds an output that block 3 (batch {3,4}) spends.
     ///
     /// The first commit is held at its tree-state fetch until block 4's
-    /// derive releases it; with `block_prepare_concurrency = 1`, block 4's
-    /// derive starts only after block 3's whole prepare (including its
-    /// spent-output prefetch) finished, so the prefetch provably ran against
-    /// a store that did not yet contain epoch 1 and the spend fact can only
-    /// come from the commit-time store re-read.
+    /// derive releases it. With `block_prepare_concurrency = 1`, the ordered
+    /// prevout resolver must carry block 1's output across emitted windows;
+    /// the store does not yet contain epoch 1 when block 3 resolves its spend.
     #[tokio::test]
     async fn bulk_catchup_resolves_cross_batch_transparent_spend() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
@@ -2422,6 +2630,7 @@ mod tests {
     struct DelayedSegmentSource {
         fetch_events: Arc<Mutex<Vec<SegmentFetchEvent>>>,
         network: Network,
+        response_payload_bytes: u64,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2495,7 +2704,7 @@ mod tests {
                     .value()
                     .saturating_add(limits.max_connected_blocks.get())
                     .saturating_sub(1)
-                    .min(6),
+                    .min(8),
             );
             let mut blocks = Vec::new();
             let mut next_height = Some(start_height);
@@ -2509,7 +2718,7 @@ mod tests {
 
             Ok(SourceChainSegment::connected_blocks_with_stats(
                 blocks,
-                SourceChainSegmentStats::from_response_payload_bytes(12 * 1024 * 1024),
+                SourceChainSegmentStats::from_response_payload_bytes(self.response_payload_bytes),
             ))
         }
 
@@ -2521,7 +2730,7 @@ mod tests {
         }
 
         async fn tip_id(&self) -> Result<BlockId, SourceError> {
-            Ok(BlockId::new(BlockHeight::new(6), block_hash(6)))
+            Ok(BlockId::new(BlockHeight::new(8), block_hash(8)))
         }
     }
 
@@ -2538,7 +2747,7 @@ mod tests {
             let Some(start_height) = limits.cursor.next_connected_height() else {
                 return Ok(SourceChainSegment::default());
             };
-            if start_height > BlockHeight::new(6) {
+            if start_height > BlockHeight::new(32) {
                 return Ok(SourceChainSegment::default());
             }
 
@@ -2550,7 +2759,7 @@ mod tests {
                     .value()
                     .saturating_add(limits.max_connected_blocks.get())
                     .saturating_sub(1)
-                    .min(6),
+                    .min(32),
             );
             let mut blocks = Vec::new();
             let mut next_height = Some(start_height);
@@ -2573,7 +2782,7 @@ mod tests {
         }
 
         async fn tip_id(&self) -> Result<BlockId, SourceError> {
-            Ok(BlockId::new(BlockHeight::new(6), block_hash(6)))
+            Ok(BlockId::new(BlockHeight::new(32), block_hash(32)))
         }
     }
 

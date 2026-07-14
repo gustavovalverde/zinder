@@ -50,12 +50,14 @@ use zinder_runtime::{IngestPhase, Readiness};
 use zinder_store::{
     ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent, MempoolEventEnvelope,
     PrimaryChainStore, RocksDbResourceBudget, StoreReadCaller, StreamCursorTokenV1,
+    TransparentSpendReplayBlock,
 };
 
 use crate::{
     DeriveReplayPolicy, IngestDeriveConfig, IngestError,
     chain_ingest::{ingest_error_class, outcome_status},
     conventional_fee_distribution_backfill::seed_conventional_fee_distribution_visible_tail,
+    ingest_loop::HistoricalWorkGate,
     memory_pressure::RuntimeMemorySnapshot,
     transaction_component_backfill::seed_transaction_component_visible_tail,
 };
@@ -142,11 +144,11 @@ struct EffectiveDeriveReplayLimits {
 /// Returns whether the current ingest phase gives the storage budget
 /// exclusively to canonical work by pausing derive replay.
 ///
-/// [`IngestPhase::BulkCatchup`] is entered precisely when the canonical gap
-/// exceeds `ingest.phases.catchup_threshold_blocks`, so it is the
-/// canonical-lag-exceeds-threshold signal the gate needs.
+/// Replay fails closed until the unified loop has positively classified
+/// [`IngestPhase::FollowingTip`]. This prevents startup and upstream-wait
+/// windows from admitting derive work before canonical ownership is known.
 const fn phase_engages_replay_gate(phase: Option<IngestPhase>) -> bool {
-    matches!(phase, Some(IngestPhase::BulkCatchup))
+    !matches!(phase, Some(IngestPhase::FollowingTip))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -238,7 +240,10 @@ impl DeriveReplayBudget {
     }
 
     fn evaluate_current(&mut self) -> EffectiveDeriveReplayLimits {
-        let phase = self.phase_gate.as_ref().and_then(Readiness::phase);
+        let phase = self
+            .phase_gate
+            .as_ref()
+            .map_or(Some(IngestPhase::FollowingTip), Readiness::phase);
         self.evaluate(RuntimeMemorySnapshot::sample(), phase)
     }
 
@@ -712,37 +717,6 @@ pub fn seed_commitment_root_search_cursor_for_backfill(
     seed_backfill_owned_consumer_cursors(chain_store, derive_store)
 }
 
-/// Refuses to run when the durable transparent-outpoint-spend projection is
-/// behind the canonical retention sweep.
-///
-/// The projection sources its spender identities from canonical spend-fact
-/// rows, which the safe-tip sweep deletes. Every batch that deletes a fact
-/// records the highest deleted height in the canonical deleted-through marker
-/// (a checkpoint bootstrap that only advanced the swept cursor leaves it
-/// unset). If the projection's durable height fell below that marker (a
-/// derive-schema rebuild or wipe after the canonical already swept), those
-/// spender identities can never be re-derived: the only remedy is a full
-/// canonical re-ingest. Crash loudly rather than serve a silently incomplete
-/// projection.
-pub fn ensure_spend_projection_not_behind_retention_sweep(
-    chain_store: &PrimaryChainStore,
-    derive_store: &DeriveStore,
-) -> Result<(), IngestError> {
-    let deleted_through = chain_store
-        .transparent_retention_deleted_through_height()?
-        .map_or(0, BlockHeight::value);
-    let projection_height = derive_store
-        .last_materialized_height_ascending(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?
-        .map_or(0, BlockHeight::value);
-    if projection_height < deleted_through {
-        return Err(IngestError::SpendProjectionBehindRetentionSweep {
-            projection_height,
-            deleted_through,
-        });
-    }
-    Ok(())
-}
-
 /// Spawns the ingest-owned chain-event tailer for derive consumers.
 ///
 /// The task is intentionally best-effort from the canonical ingest point of
@@ -751,7 +725,7 @@ pub fn ensure_spend_projection_not_behind_retention_sweep(
 /// without blocking new chain facts from being indexed.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the tailer binds two stores, the derive config, the poll cadence, the shared readiness handle for the canonical-phase gate, and the cancel token; a spec struct would only relay bindings the binary already holds"
+    reason = "the tailer binds two stores, replay policy, poll cadence, the shared work scheduler, and cancellation; a spec struct would only relay bindings the binary already holds"
 )]
 #[must_use = "drop the handle to detach the derive tailer or await it for symmetric shutdown"]
 pub fn spawn_derive_tailer_task(
@@ -759,11 +733,12 @@ pub fn spawn_derive_tailer_task(
     derive_store: DeriveStore,
     derive_config: IngestDeriveConfig,
     poll_interval: Duration,
-    readiness: Readiness,
+    historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if !derive_store.has_consumer_column_families() {
+            historical_work_gate.set_derive_caught_up(true);
             tracing::info!(
                 target: "zinder::ingest",
                 event = "derive_tailer_disabled",
@@ -782,8 +757,10 @@ pub fn spawn_derive_tailer_task(
             "derive chain-event tailer started"
         );
 
-        let mut replay_budget = DeriveReplayBudget::with_phase_gate(derive_config, readiness);
+        let mut replay_budget =
+            DeriveReplayBudget::with_phase_gate(derive_config, historical_work_gate.readiness());
         loop {
+            refresh_historical_work_gate(&chain_store, &derive_store, &historical_work_gate);
             let effective_limits = replay_budget.evaluate_current();
             record_derive_replay_budget(
                 derive_config.replay_policy,
@@ -813,6 +790,7 @@ pub fn spawn_derive_tailer_task(
                 &mut replay_budget,
             )
             .await;
+            refresh_historical_work_gate(&chain_store, &derive_store, &historical_work_gate);
             record_derive_tailer_tick(started_at, &outcome);
             if let Err(error) = outcome {
                 tracing::warn!(
@@ -828,6 +806,35 @@ pub fn spawn_derive_tailer_task(
             }
         }
     })
+}
+
+fn refresh_historical_work_gate(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+    historical_work_gate: &HistoricalWorkGate,
+) {
+    let caught_up = derive_replay_caught_up(chain_store, derive_store).unwrap_or_else(|error| {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "derive_replay_gate_refresh_failed",
+            error = %error,
+            "failed to compare derive replay with the canonical tip; historical work remains deferred"
+        );
+        false
+    });
+    historical_work_gate.set_derive_caught_up(caught_up);
+}
+
+fn derive_replay_caught_up(
+    chain_store: &PrimaryChainStore,
+    derive_store: &DeriveStore,
+) -> Result<bool, IngestError> {
+    let canonical_tip = chain_store
+        .current_chain_epoch()?
+        .map(|epoch| epoch.visible_tip_height);
+    let indexed_height =
+        derive_store.last_materialized_height_ascending(BLOCK_SUMMARY_COLUMN_FAMILY)?;
+    Ok(canonical_tip.is_none_or(|tip| indexed_height.is_some_and(|indexed| indexed >= tip)))
 }
 
 /// Sleeps for `poll_interval` or returns early on cancellation.
@@ -1314,6 +1321,42 @@ async fn await_hydrated_replay_batch(
         })?
 }
 
+type PreparedReplayBatchHandle = JoinHandle<Result<PreparedReplayBatch, IngestError>>;
+
+fn spawn_prepare_committed_block_replay_batch(
+    chain_store: &PrimaryChainStore,
+    envelope: &ChainEventEnvelope,
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+    effective_limits: EffectiveDeriveReplayLimits,
+) -> PreparedReplayBatchHandle {
+    let chain_store = chain_store.clone();
+    let envelope = envelope.clone();
+    tokio::spawn(async move {
+        let replay_batch = await_hydrated_replay_batch(spawn_hydrate_committed_block_replay_batch(
+            &chain_store,
+            &envelope,
+            start_height,
+            end_height,
+            effective_limits,
+        ))
+        .await?;
+        let finalized = replay_batch.block_range.end <= envelope.safe_tip_height;
+        let contexts = build_contexts_for_replay_batch(
+            &chain_store,
+            &envelope,
+            replay_batch.blocks,
+            finalized,
+        )
+        .await?;
+        Ok(PreparedReplayBatch {
+            block_range: replay_batch.block_range,
+            projection_rows: replay_batch.projection_rows,
+            contexts,
+        })
+    })
+}
+
 fn should_read_ahead_derive_replay(
     effective_limits: EffectiveDeriveReplayLimits,
     projection_rows: DeriveReplayProjectionRows,
@@ -1331,8 +1374,7 @@ async fn replay_committed_event_to_derive_in_batches(
 ) -> Result<DeriveReplayProgress, IngestError> {
     let block_count = block_height_range_len(committed_range);
     let mut next_height = committed_range.start;
-    let mut pending_replay_batch: Option<JoinHandle<Result<CanonicalReplayBatch, IngestError>>> =
-        None;
+    let mut pending_replay_batch: Option<PreparedReplayBatchHandle> = None;
     while next_height <= committed_range.end {
         catch_up_event_only_chain_event_consumers_to_canonical(chain_store, derive_store)?;
         let effective_limits = evaluate_and_record_replay_budget(replay_budget);
@@ -1342,7 +1384,7 @@ async fn replay_committed_event_to_derive_in_batches(
         }
 
         let replay_batch_handle = pending_replay_batch.take().unwrap_or_else(|| {
-            spawn_hydrate_committed_block_replay_batch(
+            spawn_prepare_committed_block_replay_batch(
                 chain_store,
                 &envelope,
                 next_height,
@@ -1350,12 +1392,11 @@ async fn replay_committed_event_to_derive_in_batches(
                 effective_limits,
             )
         });
-        let replay_batch =
+        let prepared_batch =
             await_expected_replay_batch(replay_batch_handle, next_height, block_count).await?;
 
-        let replay_range = replay_batch.block_range;
+        let replay_range = prepared_batch.block_range;
         let final_chunk = replay_range.end >= committed_range.end;
-        let finalized = replay_range.end <= envelope.safe_tip_height;
         let chunk_event = committed_chain_event_chunk(&envelope.event, replay_range);
         let following_height = replay_range.end.next().ok_or_else(|| {
             IngestError::DeriveDispatch("derive replay height overflow".to_owned())
@@ -1364,30 +1405,18 @@ async fn replay_committed_event_to_derive_in_batches(
             chain_store,
             replay_budget,
             envelope: &envelope,
-            projection_rows: replay_batch.projection_rows,
+            projection_rows: prepared_batch.projection_rows,
             following_height,
             committed_end: committed_range.end,
             final_chunk,
             effective_limits,
         });
 
-        let contexts_outcome =
-            build_contexts_for_replay_batch(chain_store, &envelope, replay_batch.blocks, finalized)
-                .await;
-        let contexts = match contexts_outcome {
-            Ok(contexts) => contexts,
-            Err(error) => {
-                abort_pending_replay_batch(&mut pending_replay_batch);
-                record_derive_replay_event(block_count, Some(&error));
-                return Err(error);
-            }
-        };
-
         if let Err(error) = dispatch_replay_chunk(
             derive_store,
             &envelope,
             &chunk_event,
-            &contexts,
+            &prepared_batch.contexts,
             final_chunk,
         ) {
             abort_pending_replay_batch(&mut pending_replay_batch);
@@ -1436,20 +1465,24 @@ fn dispatch_replay_chunk(
     dispatch_outcome
 }
 
-fn abort_pending_replay_batch(
-    pending_replay_batch: &mut Option<JoinHandle<Result<CanonicalReplayBatch, IngestError>>>,
-) {
+fn abort_pending_replay_batch(pending_replay_batch: &mut Option<PreparedReplayBatchHandle>) {
     if let Some(handle) = pending_replay_batch.take() {
         handle.abort();
     }
 }
 
 async fn await_expected_replay_batch(
-    replay_batch_handle: JoinHandle<Result<CanonicalReplayBatch, IngestError>>,
+    replay_batch_handle: PreparedReplayBatchHandle,
     expected_start: BlockHeight,
     block_count: usize,
-) -> Result<CanonicalReplayBatch, IngestError> {
-    let replay_batch = match await_hydrated_replay_batch(replay_batch_handle).await {
+) -> Result<PreparedReplayBatch, IngestError> {
+    let replay_batch_outcome = match replay_batch_handle.await {
+        Ok(outcome) => outcome,
+        Err(join_error) => Err(IngestError::BlockingTaskFailed {
+            reason: join_error.to_string(),
+        }),
+    };
+    let replay_batch = match replay_batch_outcome {
         Ok(replay_batch) => replay_batch,
         Err(error) => {
             record_derive_replay_event(block_count, Some(&error));
@@ -1472,7 +1505,7 @@ async fn await_expected_replay_batch(
 
 fn maybe_spawn_read_ahead_replay_batch(
     inputs: ReadAheadReplayBatchInputs<'_>,
-) -> Option<JoinHandle<Result<CanonicalReplayBatch, IngestError>>> {
+) -> Option<PreparedReplayBatchHandle> {
     let ReadAheadReplayBatchInputs {
         chain_store,
         replay_budget,
@@ -1490,7 +1523,7 @@ fn maybe_spawn_read_ahead_replay_batch(
     if read_ahead_limits.state.is_paused() {
         return None;
     }
-    Some(spawn_hydrate_committed_block_replay_batch(
+    Some(spawn_prepare_committed_block_replay_batch(
         chain_store,
         envelope,
         following_height,
@@ -2270,6 +2303,12 @@ struct CanonicalReplayBatch {
     projection_rows: DeriveReplayProjectionRows,
 }
 
+struct PreparedReplayBatch {
+    block_range: BlockHeightRange,
+    projection_rows: DeriveReplayProjectionRows,
+    contexts: HashMap<BlockHeight, Arc<BlockCommitContext>>,
+}
+
 struct ReadAheadReplayBatchInputs<'event> {
     chain_store: &'event PrimaryChainStore,
     replay_budget: &'event mut DeriveReplayBudget,
@@ -2303,17 +2342,16 @@ fn transparent_spent_outpoints_for_transactions(
 /// on a multi-core host with idle IO bandwidth.
 const SPEND_FACT_RESOLVE_CONCURRENCY: usize = 16;
 
-/// Resolves a batch's transparent spend facts across several blocking readers.
+/// Resolves a non-finalized batch's transparent spend facts across several
+/// blocking readers.
 ///
 /// Outpoints are chain-unique, so chunk result maps have disjoint keys and
-/// merge without collision. `finalized` selects the visibility-skipping
-/// current-projection read; see
-/// [`read_transparent_spend_facts_for_committed_blocks`].
+/// merge without collision. Reorg-window replay still needs point-row
+/// visibility checks; finalized replay uses the block-local record below.
 async fn resolve_spend_facts_concurrently(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
     outpoints: Vec<TransparentOutPoint>,
-    finalized: bool,
 ) -> Result<HashMap<TransparentOutPoint, TransparentSpendFact>, IngestError> {
     if outpoints.is_empty() {
         return Ok(HashMap::new());
@@ -2329,11 +2367,7 @@ async fn resolve_spend_facts_concurrently(
         handles.push(tokio::task::spawn_blocking(move || {
             let reader = store
                 .chain_epoch_reader_at_for(StoreReadCaller::DeriveHydration, chain_epoch_id)?;
-            if finalized {
-                reader.current_transparent_spend_facts_by_outpoints(&chunk)
-            } else {
-                reader.transparent_spend_facts_by_outpoints(&chunk)
-            }
+            reader.transparent_spend_facts_by_outpoints(&chunk)
         }));
     }
     let mut resolved = HashMap::with_capacity(outpoints.len());
@@ -2347,6 +2381,118 @@ async fn resolve_spend_facts_concurrently(
         resolved.extend(chunk_map);
     }
     Ok(resolved)
+}
+
+async fn resolve_finalized_spend_facts_by_block(
+    chain_store: &PrimaryChainStore,
+    chain_epoch_id: ChainEpochId,
+    replay_blocks: &[CanonicalReplayBlock],
+) -> Result<HashMap<TransparentOutPoint, TransparentSpendFact>, IngestError> {
+    let requested_by_block = replay_blocks
+        .iter()
+        .map(|block| {
+            (
+                block.height,
+                block.block_hash,
+                block
+                    .transparent_spends
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let chain_store = chain_store.clone();
+    tokio::task::spawn_blocking(move || {
+        let reader = chain_store
+            .chain_epoch_reader_at_for(StoreReadCaller::DeriveHydration, chain_epoch_id)?;
+        let total_spends = requested_by_block
+            .iter()
+            .map(|(_, _, outpoints)| outpoints.len())
+            .sum();
+        let mut resolved = HashMap::with_capacity(total_spends);
+        for (height, expected_block_hash, requested_outpoints) in requested_by_block {
+            let replay = reader.current_transparent_spend_replay_at_height(height)?;
+            for spend in validate_transparent_spend_replay_block(
+                height,
+                expected_block_hash,
+                &requested_outpoints,
+                replay,
+            )? {
+                if spend.block_height != height || spend.block_hash != expected_block_hash {
+                    return Err(IngestError::DeriveDispatch(format!(
+                        "block-local transparent spend replay fact has the wrong producing block at height {}",
+                        height.value(),
+                    )));
+                }
+                if resolved.insert(spend.spent_outpoint, spend).is_some() {
+                    return Err(IngestError::DeriveDispatch(format!(
+                        "block-local transparent spend replay fact is duplicated at height {}",
+                        height.value(),
+                    )));
+                }
+            }
+        }
+        Ok(resolved)
+    })
+    .await
+    .map_err(|join_error| IngestError::BlockingTaskFailed {
+        reason: join_error.to_string(),
+    })?
+}
+
+fn validate_transparent_spend_replay_block(
+    height: BlockHeight,
+    expected_block_hash: BlockHash,
+    requested_outpoints: &HashSet<TransparentOutPoint>,
+    replay: Option<TransparentSpendReplayBlock>,
+) -> Result<Vec<TransparentSpendFact>, IngestError> {
+    let Some(replay) = replay else {
+        if requested_outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(IngestError::DeriveDispatch(format!(
+            "block-local transparent spend replay record is missing at height {}",
+            height.value(),
+        )));
+    };
+    if replay.block_hash != expected_block_hash {
+        return Err(IngestError::DeriveDispatch(format!(
+            "block-local transparent spend replay record has the wrong block hash at height {}",
+            height.value(),
+        )));
+    }
+    let recorded_input_outpoints = replay
+        .input_outpoints
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if recorded_input_outpoints.len() != replay.input_outpoints.len()
+        || &recorded_input_outpoints != requested_outpoints
+    {
+        return Err(IngestError::DeriveDispatch(format!(
+            "block-local transparent spend replay inputs disagree with canonical transactions at height {} (requested {}, recorded {})",
+            height.value(),
+            requested_outpoints.len(),
+            replay.input_outpoints.len(),
+        )));
+    }
+    let resolved_outpoints = replay
+        .spend_facts
+        .iter()
+        .map(|spend| spend.spent_outpoint)
+        .collect::<HashSet<_>>();
+    if resolved_outpoints.len() != replay.spend_facts.len()
+        || !resolved_outpoints.is_subset(requested_outpoints)
+    {
+        return Err(IngestError::DeriveDispatch(format!(
+            "block-local transparent spend replay facts contain duplicate or unknown inputs at height {} (requested {}, resolved {})",
+            height.value(),
+            requested_outpoints.len(),
+            resolved_outpoints.len(),
+        )));
+    }
+    Ok(replay.spend_facts)
 }
 
 async fn read_transparent_spend_facts_for_committed_blocks(
@@ -2364,8 +2510,11 @@ async fn read_transparent_spend_facts_for_committed_blocks(
     record_transparent_spend_fact_requested_outpoints(unique_spent_outpoint_count);
     let outpoints = requested_outpoints.into_iter().collect::<Vec<_>>();
     let read_started_at = Instant::now();
-    let read_outcome =
-        resolve_spend_facts_concurrently(chain_store, chain_epoch_id, outpoints, finalized).await;
+    let read_outcome = if finalized {
+        resolve_finalized_spend_facts_by_block(chain_store, chain_epoch_id, replay_blocks).await
+    } else {
+        resolve_spend_facts_concurrently(chain_store, chain_epoch_id, outpoints).await
+    };
     record_derive_replay_stage(
         DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS,
         read_started_at,
@@ -2924,19 +3073,19 @@ mod tests {
     fn replay_budget_degrades_batch_before_pause() {
         let mut budget = DeriveReplayBudget::new(replay_config());
 
-        let normal = budget.evaluate(memory_snapshot(800), None);
+        let normal = budget.evaluate(memory_snapshot(800), Some(IngestPhase::FollowingTip));
         assert_eq!(normal.state, DeriveReplayBudgetState::Normal);
         assert_eq!(normal.batch_blocks, 100);
 
-        let degraded = budget.evaluate(memory_snapshot(875), None);
+        let degraded = budget.evaluate(memory_snapshot(875), Some(IngestPhase::FollowingTip));
         assert_eq!(degraded.state, DeriveReplayBudgetState::Degraded);
         assert_eq!(degraded.batch_blocks, 50);
 
-        let minimum = budget.evaluate(memory_snapshot(925), None);
+        let minimum = budget.evaluate(memory_snapshot(925), Some(IngestPhase::FollowingTip));
         assert_eq!(minimum.state, DeriveReplayBudgetState::Degraded);
         assert_eq!(minimum.batch_blocks, 10);
 
-        let paused = budget.evaluate(memory_snapshot(950), None);
+        let paused = budget.evaluate(memory_snapshot(950), Some(IngestPhase::FollowingTip));
         assert_eq!(paused.state, DeriveReplayBudgetState::Paused);
         assert_eq!(paused.batch_blocks, 0);
     }
@@ -2946,19 +3095,27 @@ mod tests {
         let mut budget = DeriveReplayBudget::new(replay_config());
 
         assert_eq!(
-            budget.evaluate(memory_snapshot(960), None).state,
+            budget
+                .evaluate(memory_snapshot(960), Some(IngestPhase::FollowingTip))
+                .state,
             DeriveReplayBudgetState::Paused
         );
         assert_eq!(
-            budget.evaluate(memory_snapshot(900), None).state,
+            budget
+                .evaluate(memory_snapshot(900), Some(IngestPhase::FollowingTip))
+                .state,
             DeriveReplayBudgetState::Degraded
         );
         assert_eq!(
-            budget.evaluate(memory_snapshot(800), None).state,
+            budget
+                .evaluate(memory_snapshot(800), Some(IngestPhase::FollowingTip))
+                .state,
             DeriveReplayBudgetState::Degraded
         );
         assert_eq!(
-            budget.evaluate(memory_snapshot(700), None).state,
+            budget
+                .evaluate(memory_snapshot(700), Some(IngestPhase::FollowingTip))
+                .state,
             DeriveReplayBudgetState::Normal
         );
     }
@@ -2975,7 +3132,7 @@ mod tests {
             ..RuntimeMemorySnapshot::default()
         };
 
-        let limits = budget.evaluate(snapshot, None);
+        let limits = budget.evaluate(snapshot, Some(IngestPhase::FollowingTip));
 
         assert_eq!(limits.memory_pressure_ratio, Some(0.2));
         assert_eq!(limits.state, DeriveReplayBudgetState::Normal);
@@ -2995,7 +3152,7 @@ mod tests {
             ..RuntimeMemorySnapshot::default()
         };
 
-        let limits = budget.evaluate(snapshot, None);
+        let limits = budget.evaluate(snapshot, Some(IngestPhase::FollowingTip));
 
         assert_eq!(limits.memory_pressure_ratio, Some(0.875));
         assert_eq!(limits.state, DeriveReplayBudgetState::Degraded);
@@ -3054,6 +3211,28 @@ mod tests {
         let mut budget = DeriveReplayBudget::new(continuous_config());
 
         let limits = budget.evaluate(memory_snapshot(800), Some(IngestPhase::BulkCatchup));
+
+        assert!(limits.phase_gate_engaged);
+        assert_eq!(limits.state, DeriveReplayBudgetState::Paused);
+        assert_eq!(limits.batch_blocks, 0);
+    }
+
+    #[test]
+    fn unclassified_startup_phase_pauses_replay() {
+        let mut budget = DeriveReplayBudget::new(continuous_config());
+
+        let limits = budget.evaluate(memory_snapshot(800), None);
+
+        assert!(limits.phase_gate_engaged);
+        assert_eq!(limits.state, DeriveReplayBudgetState::Paused);
+        assert_eq!(limits.batch_blocks, 0);
+    }
+
+    #[test]
+    fn awaiting_upstream_phase_pauses_replay() {
+        let mut budget = DeriveReplayBudget::new(continuous_config());
+
+        let limits = budget.evaluate(memory_snapshot(800), Some(IngestPhase::AwaitingUpstream));
 
         assert!(limits.phase_gate_engaged);
         assert_eq!(limits.state, DeriveReplayBudgetState::Paused);
@@ -3199,5 +3378,50 @@ mod tests {
             degraded_limits,
             small_rows
         ));
+    }
+
+    #[test]
+    fn finalized_spend_replay_accepts_explicit_unresolved_checkpoint_parent()
+    -> Result<(), IngestError> {
+        let height = BlockHeight::new(100);
+        let block_hash = BlockHash::from_bytes([10; 32]);
+        let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([11; 32]), 1);
+        let requested = HashSet::from([outpoint]);
+        let replay = TransparentSpendReplayBlock {
+            block_hash,
+            input_outpoints: vec![outpoint],
+            spend_facts: Vec::new(),
+        };
+
+        let facts =
+            validate_transparent_spend_replay_block(height, block_hash, &requested, Some(replay))?;
+
+        assert!(facts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_spend_replay_rejects_a_missing_canonical_input() -> Result<(), IngestError> {
+        let height = BlockHeight::new(100);
+        let block_hash = BlockHash::from_bytes([10; 32]);
+        let first = TransparentOutPoint::new(TransactionId::from_bytes([11; 32]), 1);
+        let second = TransparentOutPoint::new(TransactionId::from_bytes([12; 32]), 2);
+        let requested = HashSet::from([first, second]);
+        let replay = TransparentSpendReplayBlock {
+            block_hash,
+            input_outpoints: vec![first],
+            spend_facts: Vec::new(),
+        };
+
+        let Err(error) =
+            validate_transparent_spend_replay_block(height, block_hash, &requested, Some(replay))
+        else {
+            return Err(IngestError::DeriveDispatch(
+                "truncated input set unexpectedly passed validation".to_owned(),
+            ));
+        };
+
+        assert!(error.to_string().contains("inputs disagree"));
+        Ok(())
     }
 }

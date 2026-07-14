@@ -33,7 +33,6 @@ fn chain_epoch_reader_stays_pinned_after_a_new_epoch_is_committed() -> eyre::Res
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
     let (epoch_2, block_2, compact_block_2) = synthetic_epoch(2, 2);
-
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         epoch_1,
         vec![block_1.clone()],
@@ -466,6 +465,7 @@ fn current_transparent_spend_facts_match_visible_for_finalized_outpoints() -> ey
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
     let (epoch_2, block_2, compact_block_2) = synthetic_epoch(2, 2);
+    let spend_height = block_2.height;
     let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([51; 32]), 0);
     let output = TransparentUnspentOutput::new(
         TransparentAddressScriptHash::from_bytes([52; 32]),
@@ -500,9 +500,17 @@ fn current_transparent_spend_facts_match_visible_for_finalized_outpoints() -> ey
     let epoch_2_reader = store.chain_epoch_reader_at(ChainEpochId::new(2))?;
     let visible = epoch_2_reader.transparent_spend_facts_by_outpoints(&[spent_outpoint])?;
     let current = epoch_2_reader.current_transparent_spend_facts_by_outpoints(&[spent_outpoint])?;
+    let block_local = epoch_2_reader.current_transparent_spend_facts_at_height(spend_height)?;
+    let replay = epoch_2_reader
+        .current_transparent_spend_replay_at_height(spend_height)?
+        .ok_or_else(|| eyre::eyre!("missing block-local spend replay record"))?;
 
     assert_eq!(visible.get(&spent_outpoint), Some(&spend));
     assert_eq!(current, visible);
+    assert_eq!(block_local, vec![spend.clone()]);
+    assert_eq!(replay.block_hash, spend.block_hash);
+    assert_eq!(replay.input_outpoints, vec![spent_outpoint]);
+    assert_eq!(replay.spend_facts, vec![spend]);
 
     Ok(())
 }

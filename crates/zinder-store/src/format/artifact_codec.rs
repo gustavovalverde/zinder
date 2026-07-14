@@ -1569,19 +1569,7 @@ pub(crate) fn encode_transparent_spend_fact(
 ) -> Result<Vec<u8>, StoreError> {
     encode_artifact_record(
         PayloadFormat::ZinderTransparentSpendFactV2,
-        &TransparentSpendFactRecord {
-            transaction_id: spend.spent_outpoint.transaction_id.as_bytes().to_vec(),
-            output_index: spend.spent_outpoint.output_index,
-            input_index: spend.input_index,
-            spending_transaction_id: spend.spending_transaction_id.as_bytes().to_vec(),
-            tx_index_in_block: spend.tx_index_in_block,
-            block_height: spend.block_height.value(),
-            block_hash: spend.block_hash.as_bytes().to_vec(),
-            spent_value_zat: spend.spent_value_zat,
-            spent_address_script_hash: spend.spent_address_script_hash.as_bytes().to_vec(),
-            spent_block_height: spend.spent_block_height.value(),
-            spent_block_hash: spend.spent_block_hash.as_bytes().to_vec(),
-        },
+        &transparent_spend_fact_record(spend),
     )
 }
 
@@ -1604,7 +1592,31 @@ pub(crate) fn decode_transparent_spend_fact(
         }
     })?;
 
-    let decoded_outpoint = TransparentOutPoint::new(
+    decode_transparent_spend_fact_record(key, &record, Some(outpoint))
+}
+
+fn transparent_spend_fact_record(spend: &TransparentSpendFact) -> TransparentSpendFactRecord {
+    TransparentSpendFactRecord {
+        transaction_id: spend.spent_outpoint.transaction_id.as_bytes().to_vec(),
+        output_index: spend.spent_outpoint.output_index,
+        input_index: spend.input_index,
+        spending_transaction_id: spend.spending_transaction_id.as_bytes().to_vec(),
+        tx_index_in_block: spend.tx_index_in_block,
+        block_height: spend.block_height.value(),
+        block_hash: spend.block_hash.as_bytes().to_vec(),
+        spent_value_zat: spend.spent_value_zat,
+        spent_address_script_hash: spend.spent_address_script_hash.as_bytes().to_vec(),
+        spent_block_height: spend.spent_block_height.value(),
+        spent_block_hash: spend.spent_block_hash.as_bytes().to_vec(),
+    }
+}
+
+fn decode_transparent_spend_fact_record(
+    key: &StoreKey,
+    record: &TransparentSpendFactRecord,
+    expected_outpoint: Option<TransparentOutPoint>,
+) -> Result<TransparentSpendFact, StoreError> {
+    let outpoint = TransparentOutPoint::new(
         decode_transaction_id_for_family(
             ArtifactFamily::TransparentSpendFact,
             key,
@@ -1612,7 +1624,7 @@ pub(crate) fn decode_transparent_spend_fact(
         )?,
         record.output_index,
     );
-    if decoded_outpoint != outpoint {
+    if expected_outpoint.is_some_and(|expected| outpoint != expected) {
         return Err(StoreError::ArtifactCorrupt {
             family: ArtifactFamily::TransparentSpendFact,
             key: key.clone().into(),
@@ -1651,13 +1663,18 @@ pub(crate) fn decode_transparent_spend_fact(
 
 pub(crate) fn encode_transparent_spend_fact_block_index(
     block_hash: BlockHash,
-    spent_outpoints: &[TransparentOutPoint],
+    input_outpoints: &[TransparentOutPoint],
+    spend_facts: &[TransparentSpendFact],
 ) -> Result<Vec<u8>, StoreError> {
     encode_artifact_record(
-        PayloadFormat::ZinderTransparentSpendFactBlockIndexV1,
-        &TransparentOutputBlockIndexRecord {
+        PayloadFormat::ZinderTransparentSpendFactBlockIndexV2,
+        &TransparentSpendFactBlockIndexRecord {
             block_hash: block_hash.as_bytes().to_vec(),
-            outpoints: spent_outpoints
+            spend_facts: spend_facts
+                .iter()
+                .map(transparent_spend_replay_fact_record)
+                .collect(),
+            input_outpoints: input_outpoints
                 .iter()
                 .map(|outpoint| TransparentOutPointRecord {
                     transaction_id: outpoint.transaction_id.as_bytes().to_vec(),
@@ -1671,14 +1688,21 @@ pub(crate) fn encode_transparent_spend_fact_block_index(
 pub(crate) fn decode_transparent_spend_fact_block_index(
     key: &StoreKey,
     envelope_bytes: &[u8],
-) -> Result<(BlockHash, Vec<TransparentOutPoint>), StoreError> {
+) -> Result<
+    (
+        BlockHash,
+        Vec<TransparentOutPoint>,
+        Vec<TransparentSpendFact>,
+    ),
+    StoreError,
+> {
     let payload_bytes = decode_artifact_payload(
         ArtifactFamily::TransparentSpendFact,
         key,
         envelope_bytes,
-        PayloadFormat::ZinderTransparentSpendFactBlockIndexV1,
+        PayloadFormat::ZinderTransparentSpendFactBlockIndexV2,
     )?;
-    let record = TransparentOutputBlockIndexRecord::decode(payload_bytes).map_err(|_| {
+    let record = TransparentSpendFactBlockIndexRecord::decode(payload_bytes).map_err(|_| {
         StoreError::ArtifactCorrupt {
             family: ArtifactFamily::TransparentSpendFact,
             key: key.clone().into(),
@@ -1690,9 +1714,17 @@ pub(crate) fn decode_transparent_spend_fact_block_index(
         key,
         &record.block_hash,
     )?;
-    let mut outpoints = Vec::with_capacity(record.outpoints.len());
-    for outpoint in record.outpoints {
-        outpoints.push(TransparentOutPoint::new(
+    let block_height =
+        StoreKey::transparent_artifact_block_height(key.as_bytes()).ok_or_else(|| {
+            StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::TransparentSpendFact,
+                key: key.clone().into(),
+                reason: "transparent spend fact block index key is malformed",
+            }
+        })?;
+    let mut input_outpoints = Vec::with_capacity(record.input_outpoints.len());
+    for outpoint in record.input_outpoints {
+        input_outpoints.push(TransparentOutPoint::new(
             decode_transaction_id_for_family(
                 ArtifactFamily::TransparentSpendFact,
                 key,
@@ -1701,7 +1733,41 @@ pub(crate) fn decode_transparent_spend_fact_block_index(
             outpoint.output_index,
         ));
     }
-    Ok((block_hash, outpoints))
+    let mut spend_facts = Vec::with_capacity(record.spend_facts.len());
+    for spend_fact in record.spend_facts {
+        let full_spend_fact = TransparentSpendFactRecord {
+            transaction_id: spend_fact.transaction_id,
+            output_index: spend_fact.output_index,
+            input_index: spend_fact.input_index,
+            spending_transaction_id: spend_fact.spending_transaction_id,
+            tx_index_in_block: spend_fact.tx_index_in_block,
+            block_height: block_height.value(),
+            block_hash: block_hash.as_bytes().to_vec(),
+            spent_value_zat: spend_fact.spent_value_zat,
+            spent_address_script_hash: spend_fact.spent_address_script_hash,
+            spent_block_height: spend_fact.spent_block_height,
+            spent_block_hash: spend_fact.spent_block_hash,
+        };
+        let spend = decode_transparent_spend_fact_record(key, &full_spend_fact, None)?;
+        spend_facts.push(spend);
+    }
+    Ok((block_hash, input_outpoints, spend_facts))
+}
+
+fn transparent_spend_replay_fact_record(
+    spend: &TransparentSpendFact,
+) -> TransparentSpendReplayFactRecord {
+    TransparentSpendReplayFactRecord {
+        transaction_id: spend.spent_outpoint.transaction_id.as_bytes().to_vec(),
+        output_index: spend.spent_outpoint.output_index,
+        input_index: spend.input_index,
+        spending_transaction_id: spend.spending_transaction_id.as_bytes().to_vec(),
+        tx_index_in_block: spend.tx_index_in_block,
+        spent_value_zat: spend.spent_value_zat,
+        spent_address_script_hash: spend.spent_address_script_hash.as_bytes().to_vec(),
+        spent_block_height: spend.spent_block_height.value(),
+        spent_block_hash: spend.spent_block_hash.as_bytes().to_vec(),
+    }
 }
 
 fn transaction_facts_artifact_record(
@@ -2345,7 +2411,8 @@ const fn artifact_family_for_payload_format(payload_format: PayloadFormat) -> Ar
         PayloadFormat::ZinderSubtreeRootArtifactV1 => ArtifactFamily::SubtreeRoot,
         PayloadFormat::ZinderTransparentUnspentOutputV1 => ArtifactFamily::AddressOutputIndex,
         PayloadFormat::ZinderTransparentSpendFactV2
-        | PayloadFormat::ZinderTransparentSpendFactBlockIndexV1 => {
+        | PayloadFormat::ZinderTransparentSpendFactBlockIndexV1
+        | PayloadFormat::ZinderTransparentSpendFactBlockIndexV2 => {
             ArtifactFamily::TransparentSpendFact
         }
         PayloadFormat::ZinderTransparentOutputArtifactV1
@@ -2900,6 +2967,38 @@ struct TransparentSpendFactRecord {
     #[prost(uint32, tag = "10")]
     spent_block_height: u32,
     #[prost(bytes, tag = "11")]
+    spent_block_hash: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TransparentSpendFactBlockIndexRecord {
+    #[prost(bytes, tag = "1")]
+    block_hash: Vec<u8>,
+    #[prost(message, repeated, tag = "2")]
+    spend_facts: Vec<TransparentSpendReplayFactRecord>,
+    #[prost(message, repeated, tag = "3")]
+    input_outpoints: Vec<TransparentOutPointRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TransparentSpendReplayFactRecord {
+    #[prost(bytes, tag = "1")]
+    transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    output_index: u32,
+    #[prost(uint32, tag = "3")]
+    input_index: u32,
+    #[prost(bytes, tag = "4")]
+    spending_transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "5")]
+    tx_index_in_block: u32,
+    #[prost(uint64, tag = "6")]
+    spent_value_zat: u64,
+    #[prost(bytes, tag = "7")]
+    spent_address_script_hash: Vec<u8>,
+    #[prost(uint32, tag = "8")]
+    spent_block_height: u32,
+    #[prost(bytes, tag = "9")]
     spent_block_hash: Vec<u8>,
 }
 

@@ -58,7 +58,9 @@ use crate::{
         read_visible_transparent_outputs_by_outpoints,
     },
     transparent_spend_fact::{
+        read_current_transparent_spend_fact_block_facts,
         read_current_transparent_spend_facts_by_outpoints,
+        read_current_transparent_spend_replay_block,
         read_visible_transparent_spend_facts_by_outpoints,
     },
     tree_state::{TreeStateStore, read_tree_state_checkpoint_at_or_before},
@@ -566,7 +568,28 @@ impl<'store> ChainEpochReader<'store> {
         )
     }
 
-    /// Reads the height through which the safe-tip retention sweep has actually
+    /// Reads the complete transparent spend facts produced by one finalized
+    /// block from its durable block-local replay record.
+    ///
+    /// This path remains available after point-row retention and performs one
+    /// ordered index seek instead of one random lookup per spent outpoint.
+    pub fn current_transparent_spend_facts_at_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Vec<TransparentSpendFact>, StoreError> {
+        read_current_transparent_spend_fact_block_facts(&self.read_view, self.chain_epoch, height)
+    }
+
+    /// Reads the complete transparent input set and resolved spend facts for
+    /// one finalized block.
+    pub fn current_transparent_spend_replay_at_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<crate::TransparentSpendReplayBlock>, StoreError> {
+        read_current_transparent_spend_replay_block(&self.read_view, self.chain_epoch, height)
+    }
+
+    /// Reads the height through which transparent-retention maintenance has actually
     /// deleted transparent spend facts, or `None` before any real deletion.
     ///
     /// A canonical spend-fact miss for an outpoint spent at or below this

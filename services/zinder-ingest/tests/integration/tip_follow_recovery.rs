@@ -185,6 +185,8 @@ fn sample_tip_follow_config(storage_path: &std::path::Path) -> TipFollowConfig {
         reorg_window_blocks: 100,
         poll_interval: Duration::from_millis(10),
         lag_threshold_blocks: 1,
+        phase_exit_lag_blocks: None,
+        target_height: None,
     }
 }
 

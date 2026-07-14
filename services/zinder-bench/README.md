@@ -40,9 +40,9 @@ roots that complete inside the range.
 ## 2. Snapshot the starting store
 
 The replay needs a canonical store already populated up to `from_height - 1`, so
-the prefetch stage can resolve prevouts spent inside the range that were created
-before it. The operator supplies this clone; the harness does not snapshot a live
-store for you.
+the ordered prevout resolver can resolve spends of outputs created before the
+captured range against the cold store. The operator supplies this clone; the
+harness does not snapshot a live store for you.
 
 Either copy a stopped store directory:
 
@@ -88,7 +88,7 @@ Omit `--report` to print the JSON to stdout (progress logs go to stderr).
   `replay.blocks_per_second`: throughput over the range.
 - `replay.epochs_committed`: committed chain epochs.
 - `replay.commit_fallback_reads`: commit-fallback read calls; near zero confirms
-  the prefetch stage resolved the range's prevouts.
+  ordered prevout resolution covered the range.
 - `replay.peak_rss`: peak resident bytes (Linux `/proc/self/status` `VmHWM`;
   reported as unavailable off Linux).
 - `store_reads`: per-caller canonical-store read call counts and cumulative
@@ -96,7 +96,7 @@ Omit `--report` to print the JSON to stdout (progress logs go to stderr).
   `derive_hydration`, `retention_sweep`, `query`), table, and operation.
 - `multi_get`: per-caller requested and resolved key totals.
 - `stage_durations`: cumulative task seconds and call counts for block-prepare
-  stages (`artifact_derive`, `transparent_prevout_prefetch`) and block-derive
+  stages (`artifact_derive`, `transparent_prevout_resolve`) and block-derive
   stages (`block_parse`, `identity_validation`, `compact_artifacts`,
   `transparent_output_artifacts`, `transaction_artifacts`,
   `block_header_artifact`, and `block_blob_artifact`).

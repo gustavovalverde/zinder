@@ -682,37 +682,6 @@ impl StoreKey {
         (key_bytes.len() >= prefix_len).then_some(prefix_len)
     }
 
-    /// Extracts the outpoint from a raw `transparent_output` or
-    /// `transparent_spend_fact` column-family key. Returns `None` when the
-    /// key has the wrong length, version prefix, or kind byte.
-    pub(crate) fn transparent_outpoint_from_key(key_bytes: &[u8]) -> Option<TransparentOutPoint> {
-        const OUTPUT_INDEX_LEN: usize = 4;
-        let expected_len =
-            STORE_KEY_HEADER_LEN + NETWORK_ID_LEN + TRANSACTION_ID_LEN + OUTPUT_INDEX_LEN;
-        if key_bytes.len() != expected_len
-            || key_bytes[0] != KEY_VERSION
-            || !matches!(
-                key_bytes[1],
-                TRANSPARENT_OUTPUT_KEY_KIND | TRANSPARENT_SPEND_FACT_KEY_KIND
-            )
-        {
-            return None;
-        }
-        let transaction_id_start = STORE_KEY_HEADER_LEN + NETWORK_ID_LEN;
-        let output_index_start = transaction_id_start + TRANSACTION_ID_LEN;
-        let transaction_id_bytes = <[u8; TRANSACTION_ID_LEN]>::try_from(
-            &key_bytes[transaction_id_start..output_index_start],
-        )
-        .ok()?;
-        let output_index_bytes =
-            <[u8; OUTPUT_INDEX_LEN]>::try_from(&key_bytes[output_index_start..]).ok()?;
-
-        Some(TransparentOutPoint::new(
-            TransactionId::from_bytes(transaction_id_bytes),
-            u32::from_be_bytes(output_index_bytes),
-        ))
-    }
-
     pub(crate) fn transparent_artifact_chain_epoch_id(key_bytes: &[u8]) -> Option<ChainEpochId> {
         if key_bytes.len() < STORE_KEY_HEADER_LEN || key_bytes[0] != KEY_VERSION {
             return None;
@@ -728,6 +697,27 @@ impl StoreKey {
             <[u8; CHAIN_EPOCH_ID_LEN]>::try_from(&key_bytes[epoch_start..]).ok()?;
 
         Some(ChainEpochId::new(u64::from_be_bytes(chain_epoch_bytes)))
+    }
+
+    /// Extracts the block height from a transparent block-index key.
+    pub(crate) fn transparent_artifact_block_height(key_bytes: &[u8]) -> Option<BlockHeight> {
+        let expected_len =
+            STORE_KEY_HEADER_LEN + NETWORK_ID_LEN + BLOCK_HEIGHT_LEN + CHAIN_EPOCH_ID_LEN;
+        if key_bytes.len() != expected_len
+            || key_bytes[0] != KEY_VERSION
+            || !matches!(
+                key_bytes[1],
+                TRANSPARENT_SPEND_FACT_BLOCK_INDEX_KEY_KIND
+                    | TRANSPARENT_OUTPUT_BLOCK_INDEX_KEY_KIND
+            )
+        {
+            return None;
+        }
+        let height_start = STORE_KEY_HEADER_LEN + NETWORK_ID_LEN;
+        let height_end = height_start + BLOCK_HEIGHT_LEN;
+        let height_bytes =
+            <[u8; BLOCK_HEIGHT_LEN]>::try_from(&key_bytes[height_start..height_end]).ok()?;
+        Some(BlockHeight::new(u32::from_be_bytes(height_bytes)))
     }
 }
 

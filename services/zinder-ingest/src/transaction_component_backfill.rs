@@ -11,12 +11,12 @@ use zinder_derive::{
     TransactionComponentSummaryConsumer, TransactionIntrinsicValueBalanceFacts,
     TransparentSpendFacts,
 };
-use zinder_runtime::Readiness;
 use zinder_store::PrimaryChainStore;
 
 use crate::{
-    IngestError, derive_consumers::derive_projection_write_guard,
-    ingest_loop::wait_until_tip_follow_or_cancelled,
+    IngestError,
+    derive_consumers::derive_projection_write_guard,
+    ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
 };
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -100,7 +100,7 @@ impl TransactionComponentBackfillContext {
 pub fn spawn_transaction_component_backfill_task(
     config: TransactionComponentBackfillConfig,
     context: TransactionComponentBackfillContext,
-    readiness: Readiness,
+    historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -113,14 +113,17 @@ pub fn spawn_transaction_component_backfill_task(
     }
 
     Some(tokio::spawn(run_transaction_component_backfill(
-        config, context, readiness, cancel,
+        config,
+        context,
+        historical_work_gate,
+        cancel,
     )))
 }
 
 async fn run_transaction_component_backfill(
     config: TransactionComponentBackfillConfig,
     context: TransactionComponentBackfillContext,
-    readiness: Readiness,
+    historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) {
     tracing::info!(
@@ -132,7 +135,7 @@ async fn run_transaction_component_backfill(
     );
 
     loop {
-        if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+        if wait_until_historical_work_or_cancelled(&historical_work_gate, &cancel).await {
             return;
         }
         let backfill = backfill_next_batch(config, context.clone());

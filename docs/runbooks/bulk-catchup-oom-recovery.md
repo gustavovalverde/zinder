@@ -121,15 +121,16 @@ write_buffer_bytes = 16777216   # 16 MiB per column family
 max_write_buffer_count = 2
 ```
 
-And a smaller writer-owned derive store:
+And a multi-column-family replay profile for the writer-owned derive store:
 
 ```toml
 [storage.derive.rocksdb]
-block_cache_bytes = 134217728   # 128 MiB
-max_wal_bytes = 67108864        # 64 MiB
-max_open_files = 256
-write_buffer_bytes = 8388608    # 8 MiB per column family
-max_write_buffer_count = 2
+block_cache_bytes = 268435456   # 256 MiB
+max_wal_bytes = 268435456       # 256 MiB
+max_open_files = 512
+write_buffer_bytes = 16777216   # 16 MiB per column family
+max_write_buffer_count = 4
+memtable_budget_bytes = 536870912 # 512 MiB aggregate hard bound
 ```
 
 Reader secondaries default lower so query, explorer, and compat services do not
@@ -169,7 +170,7 @@ canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
 canonical_batch_max_estimated_write_bytes = 536870912
 canonical_batch_min_blocks_before_estimated_write_close = 100
-source_segment_max_blocks = 16      # hard ceiling; runtime size adapts by response bytes
+source_segment_max_blocks = 64      # hard ceiling; runtime size adapts by response bytes
 source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 20
 source_fetch_max_in_flight_bytes = 671088640
@@ -192,7 +193,7 @@ large JSON payloads. If split bursts repeat immediately after every
 
 With `canonical_batch_max_blocks = 1000` and `flush_interval_epochs = 5`, the writer truncates the WAL every 5,000 committed blocks. `canonical_batch_max_artifact_bytes` is a hard raw-artifact memory limit. `canonical_batch_max_estimated_write_bytes` closes dense canonical-write batches only after `canonical_batch_min_blocks_before_estimated_write_close`, except for a single oversized block. Crash-recovery RAM is bounded above by `block_cache_bytes + max_wal_bytes + active_memtables`, roughly 1 GiB total for the canonical-store defaults.
 
-`ingest.bulk_catchup.source_fetch_max_in_flight_bytes` reserves `node.max_response_bytes` before each source request and then shrinks to the measured response bytes after decode. Keep it at least as large as `node.max_response_bytes`; otherwise startup rejects the config because a single active source response would not fit the declared watermark.
+`ingest.bulk_catchup.source_fetch_max_in_flight_bytes` is the source admission watermark. The first density probe reserves `node.max_response_bytes`; later requests reserve at least the configured response target with 50% prediction headroom, capped at `node.max_response_bytes`, and then resize to measured bytes after decode. Keep the watermark at least as large as `node.max_response_bytes`; otherwise startup rejects the config because the initial probe would not fit. A response above its prediction can temporarily exceed the admission watermark, but the request-count ceiling and `node.max_response_bytes` retain an absolute bound and the scheduler admits no more work until the watermark recovers. Track `zinder_ingest_source_segment_reservation_undersized_total` when tuning this budget.
 
 `ingest.bulk_catchup.block_prepare_concurrency` controls CPU workers; `block_prepare_max_in_flight_artifact_bytes` controls the active plus completed derived-artifact backlog. The source and commit-reassembly byte limits bound different memory pools and should be tuned separately. Startup derive replay is bounded by `ingest.derive.replay_batch_blocks` and the derive memory watermarks, so replay shrinks its effective batch before pausing. See [ADR-0021](../adrs/0021-parallel-block-derivation.md).
 
@@ -222,7 +223,8 @@ The metric set shipped alongside the bounded resource budget catches the trap be
 - `zinder_startup_phase_duration_seconds` (histogram, labels `phase`, `outcome`, `service`) — the alert `ZinderStartupOpenStorageSlow` fires when `open_storage` p95 exceeds 60 seconds, the shape this trap takes during the restart loop.
 - `zinder_ingest_bulk_pipeline_queue_bytes{stage}` and `zinder_ingest_bulk_pipeline_reorder_buffer_bytes{stage}` distinguish active source/fact reservations from completed out-of-order backlog.
 - `zinder_ingest_derive_replay_budget_state{state}` and `zinder_ingest_derive_replay_effective_batch_blocks` show whether derive replay is normal, degraded, or paused under memory pressure.
-- `zinder_ingest_derive_replay_phase_gate` is `1` while the canonical-phase gate pauses derive replay so canonical bulk catch-up owns the storage budget exclusively; it drops to `0` when the writer reaches tip. During a from-genesis rebuild this gauge is expected to sit at `1`.
+- `zinder_ingest_derive_replay_phase_gate` is `1` until the canonical phase is positively classified as `FollowingTip`. It therefore remains engaged during unclassified startup, `AwaitingUpstream`, and `BulkCatchup`, then drops to `0` when the writer reaches tip. During a from-genesis rebuild and after any mid-rebuild restart this gauge is expected to sit at `1`.
+- `zinder_ingest_derive_replay_caught_up` and `zinder_ingest_historical_work_gate_open` distinguish the post-canonical derive drain from optional history. After canonical reaches tip, the first remains `0` until derive covers that tip, and the second must remain `0`; historical workers may advance only after both become `1`.
 
 These signals appear on the relevant service `/metrics` endpoints and feed the existing Grafana dashboards under `observability/grafana/`.
 

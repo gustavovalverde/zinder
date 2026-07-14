@@ -8,8 +8,8 @@ use std::{
 
 use parking_lot::{Mutex, MutexGuard};
 use rust_rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, FlushOptions, Options, SliceTransform,
-    Snapshot, WriteBatch, WriteBufferManager, WriteOptions,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, FlushOptions, Options, ReadOptions,
+    SliceTransform, Snapshot, WriteBatch, WriteBufferManager, WriteOptions,
     checkpoint::Checkpoint,
     statistics::{StatsLevel, Ticker},
 };
@@ -710,107 +710,6 @@ impl RocksChainStore {
             .map_err(StoreError::secondary_catchup_failed)
     }
 
-    /// Drops `table`'s column family and recreates it empty with the same
-    /// bounded options, reclaiming its disk space immediately.
-    ///
-    /// Primary-only schema-migration primitive: a secondary cannot replay a
-    /// column-family drop and must reopen after the primary migrates.
-    pub(crate) fn recreate_column_family(&self, table: StorageTable) -> Result<(), StoreError> {
-        let name = table.column_family_name();
-        if self.db.cf_handle(name).is_some() {
-            self.db
-                .drop_cf(name)
-                .map_err(StoreError::storage_unavailable)?;
-        }
-        let options = column_family_options(table, &self.block_cache, self.resource_budget);
-        self.db
-            .create_cf(name, &options)
-            .map_err(StoreError::storage_unavailable)
-    }
-
-    /// Drops an extra column family opened only for schema migration.
-    pub(crate) fn drop_column_family(&self, name: &'static str) -> Result<(), StoreError> {
-        if self.db.cf_handle(name).is_some() {
-            self.db
-                .drop_cf(name)
-                .map_err(StoreError::storage_unavailable)?;
-        }
-        Ok(())
-    }
-
-    /// Walks two column families in one ordered pass, pairing rows whose
-    /// keys are identical after the two-byte `StoreKey` header.
-    ///
-    /// Both families must share the same post-header key layout. Writes
-    /// issued from inside the visitor are safe: each raw iterator pins its
-    /// own consistent view at creation.
-    pub(crate) fn scan_tables_merged_by_key_suffix(
-        &self,
-        left_table: StorageTable,
-        right_table: StorageTable,
-        visit: &mut dyn FnMut(MergedTableRow<'_>) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        let left_column_family = self.column_family(left_table)?;
-        let right_column_family = self.column_family(right_table)?;
-        let mut left = self.db.raw_iterator_cf(&left_column_family);
-        let mut right = self.db.raw_iterator_cf(&right_column_family);
-        left.seek_to_first();
-        right.seek_to_first();
-
-        loop {
-            let left_item = if left.valid() { left.item() } else { None };
-            let right_item = if right.valid() { right.item() } else { None };
-            match (left_item, right_item) {
-                (None, None) => break,
-                (Some((left_key, left_value)), None) => {
-                    visit(MergedTableRow::LeftOnly {
-                        key: left_key,
-                        value: left_value,
-                    })?;
-                    left.next();
-                }
-                (None, Some((right_key, right_value))) => {
-                    visit(MergedTableRow::RightOnly {
-                        key: right_key,
-                        value: right_value,
-                    })?;
-                    right.next();
-                }
-                (Some((left_key, left_value)), Some((right_key, right_value))) => {
-                    match key_suffix(left_key).cmp(key_suffix(right_key)) {
-                        std::cmp::Ordering::Less => {
-                            visit(MergedTableRow::LeftOnly {
-                                key: left_key,
-                                value: left_value,
-                            })?;
-                            left.next();
-                        }
-                        std::cmp::Ordering::Greater => {
-                            visit(MergedTableRow::RightOnly {
-                                key: right_key,
-                                value: right_value,
-                            })?;
-                            right.next();
-                        }
-                        std::cmp::Ordering::Equal => {
-                            visit(MergedTableRow::Matched {
-                                left_key,
-                                left_value,
-                                right_value,
-                            })?;
-                            left.next();
-                            right.next();
-                        }
-                    }
-                }
-            }
-        }
-        left.status().map_err(StoreError::storage_unavailable)?;
-        right.status().map_err(StoreError::storage_unavailable)?;
-
-        Ok(())
-    }
-
     /// Forces every column family's active memtable to flush to `SST`
     /// and truncates the WAL.
     ///
@@ -990,8 +889,8 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
 /// DB-wide `RocksDB` statistics tickers exported as monotonic gauges.
 ///
 /// Every ticker is aggregated across all column families of one store; the
-/// bloom entries reflect only `transparent_output` because it is the sole
-/// column family with a filter policy.
+/// bloom entries reflect the transparent point-lookup families, which share
+/// the filter policy used by batched outpoint reads.
 const EXPORTED_TICKERS: &[Ticker] = &[
     Ticker::BloomFilterUseful,
     Ticker::BloomFilterFullPositive,
@@ -1232,25 +1131,6 @@ pub(crate) enum PrefixScanControl {
     Stop,
 }
 
-/// One step of a two-table ordered merge over a shared post-header key layout.
-#[derive(Clone, Copy)]
-pub(crate) enum MergedTableRow<'row> {
-    /// Key present only in the left table.
-    LeftOnly { key: &'row [u8], value: &'row [u8] },
-    /// Key present only in the right table.
-    RightOnly { key: &'row [u8], value: &'row [u8] },
-    /// Key present in both tables.
-    Matched {
-        left_key: &'row [u8],
-        left_value: &'row [u8],
-        right_value: &'row [u8],
-    },
-}
-
-fn key_suffix(key: &[u8]) -> &[u8] {
-    key.get(2..).unwrap_or(key)
-}
-
 impl RocksChainStoreRead for RocksChainStore {
     fn get(&self, table: StorageTable, key: &StoreKey) -> Result<Option<Vec<u8>>, StoreError> {
         Self::get(self, StoreReadCaller::Query, table, key)
@@ -1458,6 +1338,36 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             .multi_get_cf(keys.iter().map(|key| (&column_family, key.as_bytes())))
             .into_iter()
             .map(|rocksdb_result| rocksdb_result.map_err(StoreError::storage_unavailable))
+            .collect();
+        record_store_multi_get_outcome(self.caller, table, started_at, keys.len(), &read_outcome);
+
+        read_outcome
+    }
+
+    fn sorted_multi_get(
+        &self,
+        table: StorageTable,
+        keys: &[StoreKey],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        let column_family = self.store.column_family(table)?;
+        let mut read_options = ReadOptions::default();
+        read_options.set_snapshot(&self.snapshot);
+        let started_at = Instant::now();
+        let read_outcome = self
+            .store
+            .db
+            .batched_multi_get_cf_slice_opt(
+                &column_family,
+                keys.iter().map(StoreKey::as_bytes),
+                true,
+                &read_options,
+            )
+            .into_iter()
+            .map(|rocksdb_result| {
+                rocksdb_result
+                    .map(|maybe_slice| maybe_slice.map(|slice| slice.to_vec()))
+                    .map_err(StoreError::storage_unavailable)
+            })
             .collect();
         record_store_multi_get_outcome(self.caller, table, started_at, keys.len(), &read_outcome);
 
@@ -1850,7 +1760,10 @@ fn column_family_options(
     let mut options = Options::default();
     let mut table_factory = build_block_based_table_factory(cache);
 
-    if table == StorageTable::TransparentOutput {
+    if matches!(
+        table,
+        StorageTable::TransparentOutput | StorageTable::TransparentSpendFact
+    ) {
         table_factory.set_bloom_filter(10.0, false);
         options.set_memtable_batch_lookup_optimization(true);
     }
@@ -1937,16 +1850,22 @@ mod tests {
     }
 
     #[test]
-    fn transparent_output_cf_enables_memtable_batch_lookup() {
+    fn transparent_point_lookup_cfs_enable_memtable_batch_lookup() {
         let budget = RocksDbResourceBudget::for_local_tests();
         let cache = build_block_cache(budget.block_cache_bytes);
 
         let transparent_output_options =
             column_family_options(StorageTable::TransparentOutput, &cache, budget);
         assert!(transparent_output_options.get_memtable_batch_lookup_optimization());
+        let transparent_spend_options =
+            column_family_options(StorageTable::TransparentSpendFact, &cache, budget);
+        assert!(transparent_spend_options.get_memtable_batch_lookup_optimization());
 
         for table in StorageTable::all() {
-            if table == StorageTable::TransparentOutput {
+            if matches!(
+                table,
+                StorageTable::TransparentOutput | StorageTable::TransparentSpendFact
+            ) {
                 continue;
             }
             let options = column_family_options(table, &cache, budget);

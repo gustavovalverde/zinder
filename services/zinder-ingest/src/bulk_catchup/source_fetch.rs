@@ -28,6 +28,9 @@ use super::{
 };
 use crate::chain_ingest::{IngestRetryState, fetch_chain_segment_with_retry};
 
+const SOURCE_RESPONSE_RESERVATION_HEADROOM_NUMERATOR: u64 = 3;
+const SOURCE_RESPONSE_RESERVATION_HEADROOM_DENOMINATOR: u64 = 2;
+
 pub(super) struct BulkCatchupSourceFetchStreamConfig {
     pub(super) request_timeout: Duration,
     pub(super) from_height: BlockHeight,
@@ -152,12 +155,16 @@ where
         let Some(next_height) = state.next_fetch_height else {
             break;
         };
-        let segment_plan = state
-            .source_segment_sizer
-            .lock()
-            .plan_segment(next_height, state.to_height);
-        let source_segment_max_blocks = match segment_plan {
-            SourceSegmentPlan::Ready(max_blocks) => max_blocks,
+        let segment_plan = state.source_segment_sizer.lock().plan_segment(
+            next_height,
+            state.to_height,
+            state.max_response_bytes,
+        );
+        let (source_segment_max_blocks, reserved_response_bytes) = match segment_plan {
+            SourceSegmentPlan::Ready {
+                max_blocks,
+                reserved_response_bytes,
+            } => (max_blocks, reserved_response_bytes),
             SourceSegmentPlan::AwaitingFeedback => break,
             SourceSegmentPlan::Complete => {
                 state.next_fetch_height = None;
@@ -166,13 +173,16 @@ where
         };
 
         let cursor = SourceChainCursor::before_height(next_height);
-        let reserved_response_bytes = state.max_response_bytes.get();
         let Some(reservation) = state
             .source_fetch_watermark
-            .try_reserve(reserved_response_bytes)
+            .try_reserve(reserved_response_bytes.get())
         else {
             break;
         };
+        metrics::gauge!("zinder_ingest_source_fetch_request_reservation_bytes")
+            .set(u64_to_f64(reserved_response_bytes.get()));
+        metrics::histogram!("zinder_ingest_source_segment_reserved_response_bytes")
+            .record(u64_to_f64(reserved_response_bytes.get()));
         state
             .source_segment_sizer
             .lock()
@@ -187,7 +197,7 @@ where
                 max_connected_blocks: source_segment_max_blocks,
                 target_response_bytes: state.target_response_payload_bytes,
                 max_response_bytes: state.max_response_bytes,
-                reserved_response_bytes,
+                reserved_response_bytes: reserved_response_bytes.get(),
                 reservation,
             }));
         record_source_fetch_queue_state(state);
@@ -246,6 +256,10 @@ where
             fetch_chain_segment_with_retry(request_timeout, &source, limits, &mut retry_state)
                 .await?;
         let queued_response_bytes = queued_source_segment_bytes(&segment, reserved_response_bytes);
+        if queued_response_bytes > reserved_response_bytes {
+            metrics::counter!("zinder_ingest_source_segment_reservation_undersized_total")
+                .increment(1);
+        }
         let mut reservation = reservation;
         reservation.resize(queued_response_bytes);
         Ok(PrefetchedSourceSegment {
@@ -443,7 +457,10 @@ struct SourceSegmentDensitySample {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceSegmentPlan {
-    Ready(NonZeroU32),
+    Ready {
+        max_blocks: NonZeroU32,
+        reserved_response_bytes: NonZeroU64,
+    },
     AwaitingFeedback,
     Complete,
 }
@@ -509,6 +526,7 @@ impl SourceSegmentSizer {
         &mut self,
         next_height: BlockHeight,
         to_height: BlockHeight,
+        max_response_bytes: NonZeroU64,
     ) -> SourceSegmentPlan {
         let Some(max_blocks) = self.blocks_for_remaining_range(next_height, to_height) else {
             return SourceSegmentPlan::Complete;
@@ -516,7 +534,29 @@ impl SourceSegmentSizer {
         if self.density_samples.is_empty() && self.initial_probe_in_flight {
             return SourceSegmentPlan::AwaitingFeedback;
         }
-        SourceSegmentPlan::Ready(max_blocks)
+        SourceSegmentPlan::Ready {
+            max_blocks,
+            reserved_response_bytes: self.reserved_response_bytes(max_blocks, max_response_bytes),
+        }
+    }
+
+    fn reserved_response_bytes(
+        &self,
+        max_blocks: NonZeroU32,
+        max_response_bytes: NonZeroU64,
+    ) -> NonZeroU64 {
+        let Some(bytes_per_block) = self.estimated_response_payload_bytes_per_block() else {
+            return max_response_bytes;
+        };
+        let estimated_response_bytes = bytes_per_block.saturating_mul(u64::from(max_blocks.get()));
+        let response_bytes_with_headroom = estimated_response_bytes
+            .saturating_mul(SOURCE_RESPONSE_RESERVATION_HEADROOM_NUMERATOR)
+            .saturating_add(SOURCE_RESPONSE_RESERVATION_HEADROOM_DENOMINATOR - 1)
+            .saturating_div(SOURCE_RESPONSE_RESERVATION_HEADROOM_DENOMINATOR);
+        let reserved_response_bytes = response_bytes_with_headroom
+            .max(self.target_response_payload_bytes.get())
+            .min(max_response_bytes.get());
+        NonZeroU64::new(reserved_response_bytes).unwrap_or(max_response_bytes)
     }
 
     pub(super) fn record_segment_scheduled(&mut self, start_height: BlockHeight) {

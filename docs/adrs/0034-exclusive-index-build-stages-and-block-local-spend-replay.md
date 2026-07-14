@@ -1,0 +1,66 @@
+# ADR-0034: Exclusive index-build stages and block-local spend replay
+
+| Field | Value |
+| ----- | ----- |
+| Status | Accepted |
+| Product | Zinder |
+| Domain | Initial sync scheduling, derive replay, canonical retention, RocksDB resource ownership |
+| Related | [ADR-0015](0015-unified-phase-driven-ingest.md), [ADR-0017](0017-derive-consumer-template-and-key-codec-convention.md), [ADR-0020](0020-bounded-rocksdb-resource-budget.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md) |
+
+## Context
+
+Mainnet canary measurements showed that canonical bulk catchup completed quickly, but derive replay then projected a multi-day drain. The process was not CPU- or memory-pressure-bound. In transparent-input-dense history, almost all context-build time was spent resolving hundreds of spend facts per block through random point reads. The variable-row limit correctly kept writes bounded, but it shortened nominal 1,000-block batches to tens of blocks without reducing the random-read cost per spend.
+
+At the same time, historical backfills began as soon as canonical entered `FollowingTip`. They serialized their derive writes through the same process lock and generated their own compaction work while the readiness-critical derive replay was still millions of blocks behind. RocksDB reported substantial compaction amplification and write stalls despite low process memory pressure.
+
+The canonical safe-tip sweep also deleted the point rows used by replay after the durable spend projection advanced. That made a later derive-store rebuild depend on source rows that canonical retention had already destroyed.
+
+Canary traces exposed two further canonical-path delays. A 500,000-outpoint transparent-retention chunk ran synchronously before every safe-tip commit and took minutes, repeatedly pushing canonical lag above the bulk threshold. Tip-follow then waited for a separate one-minute watcher to notice that threshold. Separately, the adaptive source controller was hard-capped at 16 blocks even while measured responses averaged far below its byte target; the fixed control's proven 64-block ceiling sustained higher throughput without splits.
+
+## Decision
+
+Initial indexing has three exclusive storage-budget owners, in priority order:
+
+1. Canonical bulk catchup runs while the unified ingest phase is `BulkCatchup`; derive replay and rebuildable historical work are paused.
+2. Derive replay runs after canonical enters `FollowingTip` and until its materialized block-summary height covers the canonical visible tip; historical backfills and verifiers remain closed.
+3. Historical backfills, verifiers, and transparent-retention maintenance may start bounded batches only while canonical is following tip and derive is caught up. If derive falls behind again, the gate closes before another historical batch begins.
+
+Startup observes and publishes the canonical phase before it admits synchronous derive handoff work. Only a positively classified `FollowingTip` phase may replay; `BulkCatchup`, `AwaitingUpstream`, a failed tip observation, and the unclassified state fail closed. A restart during initial sync therefore resumes canonical work without first spending the bounded startup replay window on derive debt.
+
+This is an internal scheduling contract, not public readiness state. `HistoricalWorkGate` combines the canonical phase with the derive tailer's caught-up signal. Metrics expose the two inputs and the resulting gate state.
+
+Canonical artifact schema 18 and store schema 13 replace the transparent-spend block-index payload with version 2. The record contains every non-coinbase transparent input observed in the block plus the complete ordered `TransparentSpendFact` values whose parent outputs canonical ingest could resolve. Keeping both sets makes checkpoint-parent misses explicit instead of making them indistinguishable from a truncated record. Per-outpoint rows remain the serving and reorg-repair projection and may still be removed by safe-tip retention; the block-local replay record is retained.
+
+Finalized derive replay reads one block-local record per block and verifies that the recorded input set and producing block identity exactly match the canonical transactions. Resolved facts must be a unique subset of those inputs; unresolved inputs are legitimate when their parents predate a configured checkpoint. Any other mismatch is corruption and stops replay. Non-finalized reorg replay continues to use epoch-visible point rows; its sorted keys use RocksDB's batched multi-get path.
+
+Replay keeps one fully prepared batch ahead of ordered dispatch. Preparation includes canonical hydration and context construction, so reads for batch N+1 overlap the atomic consumer write for batch N. Admission remains subject to the existing memory state and variable-projection-row bound, and cursor advancement remains serial.
+
+Transparent retention is removed from `commit_chain_epoch`. A separate worker reads the retained block-local spend record once per height, writes no chain event, and advances its cursor in passes capped at 1,000 heights or 10,000 outpoints by default. Safe-tip commits therefore stay independent of historical backlog. Tip-follow reuses its existing upstream-tip observation to return to the phase classifier immediately when lag exceeds the bulk threshold; there is no independent minute-scale watcher.
+
+The default source-segment hard ceiling is 64 blocks, matching the measured fixed control. The response-byte target, p95 density estimate, network-upgrade reset, and split feedback remain the actual dense-era safeguards, so the controller may shrink below 64 but can now exploit lighter eras.
+
+Canonical and derive secondary catchup retry a narrowly classified missing-`.sst` I/O race up to three total attempts while holding their catchup barrier. This covers a primary compaction replacing a file between manifest replay and the next secondary read or schema validation; schema mismatches, corruption, and other I/O failures still surface immediately.
+
+The derive writer defaults reserve a 512 MiB aggregate memtable budget, four 16 MiB buffers per hot column family, a 256 MiB WAL ceiling, and a 256 MiB block cache. The shared write-buffer manager remains the hard memory bound. Existing RocksDB ticker and property metrics measure compaction bytes, stalls, cache use, WAL size, and memtable use.
+
+Store schema 13 has no in-place migration. Earlier stores may have already deleted facts needed to construct the new block-local records, so primary open fails with `SchemaMismatch`. Deployment requires a fresh canonical and derive volume rebuilt from genesis.
+
+## Consequences
+
+- End-to-end readiness work no longer competes with optional historical backfills.
+- Canonical chain advancement no longer performs historical retention reads or million-row delete batches.
+- Upstream bursts switch from serial tip-follow to bulk catchup after the current iteration instead of after a minute-scale poll.
+- Light eras can use the fixed control's proven 64-block request ceiling; dense eras remain byte-adaptive.
+- Transient derive-secondary compaction races recover inside one catchup operation without masking persistent failures.
+- Transparent-input density increases sequential block-local payload size, not random lookup count.
+- A derive-store rebuild remains possible after canonical point-row retention.
+- Prepared replay is bounded to the current batch plus one admitted following batch, and writes remain ordered.
+- The larger derive write envelope trades bounded resident memory for fewer flushes and write stalls; operators validate it through existing memory and RocksDB metrics.
+- Schema-12 volumes cannot be reused by this binary. Rollback to a schema-12 binary likewise requires the prior checkpoint or a separate volume.
+
+## Rejected alternatives
+
+- Raising replay block count does not remove the per-outpoint random-read cost and violates the variable-row memory bound in dense history.
+- Increasing point-read concurrency further multiplies random I/O and leaves retained-data rebuilds impossible.
+- Starting backfills at `FollowingTip` treats canonical freshness as derive readiness and repeats the measured compaction contention.
+- Lazily synthesizing version-2 block records from version-1 indexes is unsafe because retention may already have deleted some or all referenced facts.

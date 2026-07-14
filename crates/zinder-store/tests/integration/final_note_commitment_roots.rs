@@ -146,20 +146,21 @@ fn historical_enrichment_is_idempotent_rejects_stale_hashes_and_survives_commit(
 }
 
 #[test]
-fn only_artifact_schema_17_is_readable_older_and_newer_are_rejected_and_17_commits()
+fn only_artifact_schema_18_is_readable_older_and_newer_are_rejected_and_18_commits()
 -> eyre::Result<()> {
-    assert_schema_reopen(17, true)?;
+    assert_schema_reopen(18, true)?;
     assert_schema_reopen(11, false)?;
     assert_schema_reopen(12, false)?;
     assert_schema_reopen(13, false)?;
     assert_schema_reopen(14, false)?;
     assert_schema_reopen(15, false)?;
     assert_schema_reopen(16, false)?;
-    assert_schema_reopen(18, false)?;
+    assert_schema_reopen(17, false)?;
+    assert_schema_reopen(19, false)?;
 
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch, block, compact) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 17);
+    let (epoch, block, compact) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 18);
     store.commit_chain_epoch(ChainEpochArtifacts::new(epoch, vec![block], vec![compact]))?;
     assert_eq!(
         store
@@ -187,8 +188,8 @@ fn assert_schema_reopen(version: u16, should_open: bool) -> eyre::Result<()> {
     );
     if let Err(error) = reopened {
         match version {
-            11..=16 => assert!(matches!(error, StoreError::SchemaTooOld { .. })),
-            18 => assert!(matches!(error, StoreError::SchemaTooNew { .. })),
+            11..=17 => assert!(matches!(error, StoreError::SchemaTooOld { .. })),
+            19 => assert!(matches!(error, StoreError::SchemaTooNew { .. })),
             _ => return Err(eyre::eyre!("unexpected schema reopen error: {error}")),
         }
     }

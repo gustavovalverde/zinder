@@ -109,14 +109,15 @@ The expected readiness sequence is `phase=awaiting_upstream cause=starting` → 
 
 ### Artifact schema upgrades
 
-Every store persisted below artifact schema 17 is refused at open. The
-value-pool flow-history projection replays one transaction-intrinsic
-value-balance row per retained transparent-participating transaction, and
-stores written before schema 17 never wrote them, so there is no in-place
-upgrade path across the floor. Deploy the schema-17 service set against a fresh
-volume and resync from genesis; ingest opens the primary and stamps schema 17
-on its first canonical commit, and the query and explorer readers open once
-ingest is healthy.
+Every store persisted below artifact schema 18 or canonical store schema 13 is
+refused at open. Schema 18 stores block-local transparent input sets and
+resolved spend replay facts that remain after per-outpoint retention; older volumes may have already
+deleted the source facts and cannot be upgraded safely in place. Deploy this
+service set against a fresh canonical and derive volume and resync from genesis;
+ingest opens the primary and stamps artifact schema 18/store schema 13 on its
+first canonical commit, and query and explorer readers open once ingest is
+healthy. Keep the schema-12 checkpoint if rollback is required; binaries on the
+two sides of this boundary must not share a volume.
 
 Schema 17 also introduces the writer-owned displaced-block archive with a
 permanent retention policy, so include its monotonic growth in capacity

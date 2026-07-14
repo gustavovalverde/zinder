@@ -24,6 +24,7 @@ Bulk catchup is a resource-budgeted staged pipeline:
 ```text
 SourceFetchStage
   -> CanonicalBlockPrepareStage
+  -> CanonicalPrevoutResolveStage
   -> CanonicalFinalizeStage
   -> SubtreeRootAttachmentStage
   -> CanonicalCommitStage
@@ -39,7 +40,7 @@ requested block.
 
 Bulk catchup uses byte-watermarked source fetch config:
 
-- `source_segment_max_blocks = 16`
+- `source_segment_max_blocks = 64`
 - `source_segment_target_response_bytes = 33554432`
 - `source_fetch_max_in_flight_requests = 12`
 - `source_fetch_max_in_flight_bytes = 402653184`
@@ -56,16 +57,24 @@ The segment sizer uses observed response bytes per block, p95 density, overshoot
 memory after split attempts, and network-upgrade resets. The JSON-RPC response
 default is 64 MiB, so the default segment target is 32 MiB. Source fetch and
 block prepare may complete out of order, but ordered reassembly is the only
-place that releases blocks to the serial finalization boundary. Block prepare
-derives canonical artifacts and prefetches already-visible spent transparent
-outputs; canonical commit still performs the fallback lookup for same-batch
-outputs and outputs made visible by an overlapped previous commit. Completed
-out-of-order source segments keep their byte reservation until emitted. Each
-request reserves `node.max_response_bytes` before it is sent, then shrinks to
-the measured response size after the segment is decoded.
-`source_fetch_max_in_flight_bytes` therefore bounds both worst-case active
-responses and completed reassembly bytes; config validation requires it to be at
-least `node.max_response_bytes`.
+place that releases blocks to the prevout and serial finalization boundaries.
+Block prepare derives canonical artifacts. The ordered prevout resolver uses
+same-window outputs and a recent-output cache before issuing one deduplicated
+multi-get for the window's remaining cold outpoints; canonical commit still
+performs the authoritative fallback lookup. The cache shares
+`block_prepare_max_in_flight_artifact_bytes`, so cache entries yield to new
+prepare work instead of creating another independent memory ceiling. Completed
+out-of-order source segments keep their measured-byte reservation until emitted.
+The first density probe reserves `node.max_response_bytes`. Later requests
+reserve the larger of the response target or 1.5 times the density prediction,
+capped at `node.max_response_bytes`, then resize to the measured response after
+decode. `source_fetch_max_in_flight_bytes` is therefore an admission watermark
+over conservative predictions plus completed reassembly bytes, while
+`source_fetch_max_in_flight_requests * node.max_response_bytes` remains the
+absolute active-response bound. A larger-than-predicted response can
+temporarily take the watermark over its admission limit; no more work is
+admitted until retained bytes fall below the limit. Config validation still
+requires enough room for the initial maximum-sized probe.
 
 The durable writer remains serial, but subtree-root attachment, checkpoint
 tree-state fetch, canonical commit, and flush run as one in-flight commit
@@ -107,7 +116,7 @@ The canonical ingest vocabulary is `CanonicalBatch`, `CanonicalBatchBudget`,
 derive replay plane.
 
 Bulk-catchup observability uses stage labels from this ADR:
-`source_fetch`, `canonical_block_prepare`, `canonical_finalize`,
+`source_fetch`, `canonical_block_prepare`, `canonical_prevout_resolve`, `canonical_finalize`,
 `subtree_root_attachment`, `checkpoint_tree_state`, `commit_reassembly`,
 `canonical_commit`, and `canonical_flush`.
 

@@ -659,8 +659,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum connected blocks requested from the source in one bulk-catchup \
-                      segment. Defaults to 16.",
+        description: "Hard ceiling on connected blocks requested from the source in one \
+                      bulk-catchup segment. The byte-density controller may request fewer. \
+                      Defaults to 64.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES",
@@ -685,9 +686,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum reserved source response bytes across active fetches and completed \
-                      source reassembly. Must be greater than or equal to \
-                      node.max_response_bytes. Defaults to 402653184.",
+        description: "Admission watermark for predicted active source responses plus measured \
+                      completed reassembly. Measured responses can temporarily exceed it; the \
+                      absolute active bound is request concurrency times node.max_response_bytes. \
+                      Must be greater than or equal to node.max_response_bytes. Defaults to \
+                      402653184.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY",
@@ -791,11 +794,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Residual derive lag in blocks at which the startup catch-up stops replaying \
-                      synchronously and hands the remainder to the always-on tailer, so the API \
-                      and ops surfaces come up while the tailer drains the rest. A bounded \
-                      wall-clock budget caps the startup catch-up regardless of this value. \
-                      Defaults to 1000.",
+        description: "Residual derive lag in blocks at which a FollowingTip startup stops \
+                      replaying synchronously and hands the remainder to the always-on tailer. \
+                      BulkCatchup, AwaitingUpstream, failed observation, and unclassified startup \
+                      states skip synchronous replay. A bounded wall-clock budget caps an \
+                      admitted startup catch-up regardless of this value. Defaults to 1000.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS",

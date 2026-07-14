@@ -134,6 +134,8 @@ pub(crate) fn live_tip_follow_config(
         reorg_window_blocks,
         poll_interval,
         lag_threshold_blocks: DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
+        phase_exit_lag_blocks: None,
+        target_height: None,
     }
 }
 

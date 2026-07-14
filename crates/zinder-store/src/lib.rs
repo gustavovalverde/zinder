@@ -52,7 +52,7 @@ pub use chain_store::{
     MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH,
     MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, RawBlobRetention,
     SecondaryCatchupOutcome, SecondaryChainStore,
-    TransactionIntrinsicValueBalanceEnrichmentOutcome,
+    TransactionIntrinsicValueBalanceEnrichmentOutcome, TransparentRetentionSweepOutcome,
 };
 pub use displaced_block::{DisplacedBlockCursor, DisplacedBlockPage, DisplacedBlockStore};
 pub use event_stream::{
@@ -98,4 +98,5 @@ pub use transaction_artifact::{
     TransactionBlobStore, TransactionFactsStore, TransactionIntrinsicValueBalancesStore,
     TransactionLocationStore,
 };
+pub use transparent_spend_fact::TransparentSpendReplayBlock;
 pub use tree_state::TreeStateStore;

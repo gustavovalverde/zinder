@@ -10,12 +10,12 @@ use zinder_derive::{
     ConventionalFeeDistributionBackfillCoverage, ConventionalFeeDistributionConsumer,
     ConventionalFeeDistributionTailCoverage, DeriveStore,
 };
-use zinder_runtime::Readiness;
 use zinder_store::PrimaryChainStore;
 
 use crate::{
-    IngestError, derive_consumers::derive_projection_write_guard,
-    ingest_loop::wait_until_tip_follow_or_cancelled,
+    IngestError,
+    derive_consumers::derive_projection_write_guard,
+    ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
     transaction_component_backfill::read_canonical_context_batch,
 };
 
@@ -94,7 +94,7 @@ impl ConventionalFeeDistributionBackfillContext {
 pub fn spawn_conventional_fee_distribution_backfill_task(
     config: ConventionalFeeDistributionBackfillConfig,
     context: ConventionalFeeDistributionBackfillContext,
-    readiness: Readiness,
+    historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -107,14 +107,17 @@ pub fn spawn_conventional_fee_distribution_backfill_task(
     }
 
     Some(tokio::spawn(run_conventional_fee_distribution_backfill(
-        config, context, readiness, cancel,
+        config,
+        context,
+        historical_work_gate,
+        cancel,
     )))
 }
 
 async fn run_conventional_fee_distribution_backfill(
     config: ConventionalFeeDistributionBackfillConfig,
     context: ConventionalFeeDistributionBackfillContext,
-    readiness: Readiness,
+    historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) {
     tracing::info!(
@@ -126,7 +129,7 @@ async fn run_conventional_fee_distribution_backfill(
     );
 
     loop {
-        if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+        if wait_until_historical_work_or_cancelled(&historical_work_gate, &cancel).await {
             return;
         }
         let backfill = backfill_next_batch(config, context.clone());

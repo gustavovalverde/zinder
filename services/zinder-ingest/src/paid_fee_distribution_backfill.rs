@@ -20,7 +20,6 @@ use zinder_derive::{
     PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY, PaidFeeDistributionBackfillCoverage,
     PaidFeeDistributionConsumer, TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
 };
-use zinder_runtime::Readiness;
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{
     ChainEpochReader, MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH, PrimaryChainStore,
@@ -32,7 +31,7 @@ use crate::{
         backfill_consumer_tail_boundary, derive_projection_write_guard,
         unanimous_existing_block_consumer_cursor,
     },
-    ingest_loop::wait_until_tip_follow_or_cancelled,
+    ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
 };
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -253,7 +252,7 @@ async fn seed_visible_tail(
 pub fn spawn_paid_fee_distribution_backfill_task(
     config: PaidFeeDistributionBackfillConfig,
     context: PaidFeeDistributionBackfillContext,
-    readiness: Readiness,
+    historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -265,17 +264,20 @@ pub fn spawn_paid_fee_distribution_backfill_task(
         return None;
     }
     Some(tokio::spawn(run_paid_fee_distribution_backfill(
-        config, context, readiness, cancel,
+        config,
+        context,
+        historical_work_gate,
+        cancel,
     )))
 }
 
 async fn run_paid_fee_distribution_backfill(
     config: PaidFeeDistributionBackfillConfig,
     context: PaidFeeDistributionBackfillContext,
-    readiness: Readiness,
+    historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) {
-    if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+    if wait_until_historical_work_or_cancelled(&historical_work_gate, &cancel).await {
         return;
     }
     let Some(target_floor) = resolve_target_floor_until_cancelled(config, &context, &cancel).await
@@ -285,7 +287,7 @@ async fn run_paid_fee_distribution_backfill(
     record_backfill_started(config, target_floor);
 
     loop {
-        if wait_until_tip_follow_or_cancelled(&readiness, &cancel).await {
+        if wait_until_historical_work_or_cancelled(&historical_work_gate, &cancel).await {
             return;
         }
         if reconcile_settled_tail_or_retry(config, &context, &cancel).await {

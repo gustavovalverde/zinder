@@ -97,7 +97,7 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("canonical_batch_max_artifact_bytes = 536870912"));
     assert!(stdout.contains("canonical_batch_max_estimated_write_bytes = 536870912"));
     assert!(stdout.contains("canonical_batch_min_blocks_before_estimated_write_close = 100"));
-    assert!(stdout.contains("source_segment_max_blocks = 16"));
+    assert!(stdout.contains("source_segment_max_blocks = 64"));
     assert!(stdout.contains("source_segment_target_response_bytes = 33554432"));
     assert!(stdout.contains("source_fetch_max_in_flight_requests = 12"));
     assert!(stdout.contains("source_fetch_max_in_flight_bytes = 402653184"));

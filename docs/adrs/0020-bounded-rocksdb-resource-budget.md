@@ -65,12 +65,18 @@ stores. It carries:
 
 | Knob | Writer canonical | Writer derive | Reader canonical | Reader derive | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `block_cache_bytes` | 512 MiB | 128 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data, index, and bloom blocks. |
-| `max_wal_bytes` | 256 MiB | 64 MiB | 32 MiB | 16 MiB | Live WAL ceiling. Writer stores flush once the WAL crosses this limit. |
-| `max_open_files` | 512 | 256 | 128 | 64 | Open SST handle cap so RocksDB does not pin metadata for every file. |
-| `write_buffer_bytes` | 16 MiB | 8 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. |
-| `max_write_buffer_count` | 2 | 2 | 2 | 2 | Per-column-family mutable plus immutable memtable count. |
-| `memtable_budget_bytes` | 256 MiB | 64 MiB | 16 MiB | 16 MiB | Total memtable memory budget across column families via `WriteBufferManager`. |
+| `block_cache_bytes` | 512 MiB | 256 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data, index, and bloom blocks. |
+| `max_wal_bytes` | 256 MiB | 256 MiB | 32 MiB | 16 MiB | Live WAL ceiling. Writer stores flush once the WAL crosses this limit. |
+| `max_open_files` | 512 | 512 | 128 | 64 | Open SST handle cap so RocksDB does not pin metadata for every file. |
+| `write_buffer_bytes` | 16 MiB | 16 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. |
+| `max_write_buffer_count` | 2 | 4 | 2 | 2 | Per-column-family mutable plus immutable memtable count. |
+| `memtable_budget_bytes` | 256 MiB | 512 MiB | 16 MiB | 16 MiB | Total memtable memory budget across column families via `WriteBufferManager`. |
+
+The derive writer deliberately reserves more aggregate memtable headroom than
+canonical because one ordered replay dispatch writes many consumer column
+families. The shared manager still enforces the 512 MiB hard bound; the larger
+envelope prevents hot families from stalling behind constant flush and
+compaction turnover.
 
 Local tests use the same bounded path with a smaller profile: 32 MiB block
 cache, 16 MiB WAL ceiling, 64 open files, 4 MiB write buffers, two write

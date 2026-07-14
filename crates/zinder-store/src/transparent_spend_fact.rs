@@ -11,6 +11,17 @@ use crate::{
     kv::{PrefixScanControl, RocksChainStoreRead, StorageTable},
 };
 
+/// Durable transparent spend replay data for one finalized block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentSpendReplayBlock {
+    /// Canonical hash of the block that produced these spends.
+    pub block_hash: BlockHash,
+    /// Every non-coinbase transparent input observed in the block.
+    pub input_outpoints: Vec<TransparentOutPoint>,
+    /// Inputs whose parent outputs were available to canonical ingest.
+    pub spend_facts: Vec<TransparentSpendFact>,
+}
+
 pub(crate) fn read_current_transparent_spend_facts_by_outpoints(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
@@ -22,7 +33,7 @@ pub(crate) fn read_current_transparent_spend_facts_by_outpoints(
         .copied()
         .map(|outpoint| StoreKey::transparent_spend_fact(chain_epoch.network, outpoint))
         .collect::<Vec<_>>();
-    let rows = inner.multi_get(StorageTable::TransparentSpendFact, &keys)?;
+    let rows = inner.sorted_multi_get(StorageTable::TransparentSpendFact, &keys)?;
     let mut resolved = HashMap::with_capacity(outpoints.len());
 
     for ((outpoint, key), row) in outpoints.into_iter().zip(keys).zip(rows) {
@@ -92,8 +103,13 @@ pub(crate) fn read_visible_transparent_spend_fact_block_outpoints(
 
             let key = StoreKey::from_raw_bytes(key_bytes);
             match decode_transparent_spend_fact_block_index(&key, envelope_bytes) {
-                Ok((block_hash, block_outpoints)) if block_hash == block.block_hash => {
-                    outpoints = Some(block_outpoints);
+                Ok((block_hash, _, block_spend_facts)) if block_hash == block.block_hash => {
+                    outpoints = Some(
+                        block_spend_facts
+                            .into_iter()
+                            .map(|spend| spend.spent_outpoint)
+                            .collect(),
+                    );
                     Ok(PrefixScanControl::Stop)
                 }
                 Ok(_) => Ok(PrefixScanControl::Continue),
@@ -112,22 +128,29 @@ pub(crate) fn read_visible_transparent_spend_fact_block_outpoints(
     Ok(outpoints.unwrap_or_default())
 }
 
-/// Reads the spent outpoints recorded for `height` from the current projection,
-/// skipping the visible-header seek [`read_visible_transparent_spend_fact_block_outpoints`]
-/// performs.
+/// Reads complete block-local spend replay facts from the current projection.
 ///
-/// Correct only for finalized heights (at or below `settled_tip_height`): such
-/// blocks are immutable, so the highest-epoch block-index entry at or below the
-/// pinned epoch is the canonical one and no orphaned entry can outrank it. The
-/// reverse scan returns that entry directly, turning a block-header read plus a
-/// hash match into a single index seek.
-pub(crate) fn read_current_transparent_spend_fact_block_outpoints(
+/// Correct only for finalized heights. Unlike the point rows used by serving
+/// queries, this replay record is durable across transparent spend retention.
+pub(crate) fn read_current_transparent_spend_fact_block_facts(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     height: BlockHeight,
-) -> Result<Vec<TransparentOutPoint>, StoreError> {
+) -> Result<Vec<TransparentSpendFact>, StoreError> {
+    Ok(
+        read_current_transparent_spend_replay_block(inner, chain_epoch, height)?
+            .map_or_else(Vec::new, |replay| replay.spend_facts),
+    )
+}
+
+/// Reads the complete block-local spend replay record from the current projection.
+pub(crate) fn read_current_transparent_spend_replay_block(
+    inner: &impl RocksChainStoreRead,
+    chain_epoch: ChainEpoch,
+    height: BlockHeight,
+) -> Result<Option<TransparentSpendReplayBlock>, StoreError> {
     let prefix = StoreKey::transparent_spend_fact_block_index_prefix(chain_epoch.network, height);
-    let mut outpoints = None;
+    let mut replay = None;
     let mut scan_error = None;
     inner.scan_prefix_reverse(
         StorageTable::TransparentSpendFactBlockIndex,
@@ -148,8 +171,12 @@ pub(crate) fn read_current_transparent_spend_fact_block_outpoints(
 
             let key = StoreKey::from_raw_bytes(key_bytes);
             match decode_transparent_spend_fact_block_index(&key, envelope_bytes) {
-                Ok((_, block_outpoints)) => {
-                    outpoints = Some(block_outpoints);
+                Ok((block_hash, input_outpoints, spend_facts)) => {
+                    replay = Some(TransparentSpendReplayBlock {
+                        block_hash,
+                        input_outpoints,
+                        spend_facts,
+                    });
                     Ok(PrefixScanControl::Stop)
                 }
                 Err(error) => {
@@ -164,7 +191,7 @@ pub(crate) fn read_current_transparent_spend_fact_block_outpoints(
         return Err(error);
     }
 
-    Ok(outpoints.unwrap_or_default())
+    Ok(replay)
 }
 
 fn block_is_visible(

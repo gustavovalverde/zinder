@@ -12,6 +12,12 @@ use zinder_store::{
     PrimaryChainStore, StoreError,
 };
 
+use crate::ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled};
+
+const TRANSPARENT_RETENTION_BACKLOG_YIELD: Duration = Duration::from_millis(250);
+const TRANSPARENT_RETENTION_CAUGHT_UP_INTERVAL: Duration = Duration::from_secs(30);
+const TRANSPARENT_RETENTION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Runtime configuration for chain-event retention pruning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChainEventRetentionConfig {
@@ -32,6 +38,61 @@ pub struct MempoolEventRetentionWorkerConfig {
     pub check_interval: Duration,
     /// Warning window before retention expiry.
     pub cursor_at_risk_warning: Duration,
+}
+
+/// Spawns bounded transparent-projection retention maintenance.
+///
+/// The historical-work gate keeps this task idle until canonical ingest and
+/// derive replay are both caught up. Each blocking store pass has its own
+/// height and outpoint limits, then yields before draining more backlog so a
+/// newly-arrived canonical block can close the gate between passes.
+#[must_use = "await the handle during shutdown"]
+pub fn spawn_transparent_retention_task(
+    store: PrimaryChainStore,
+    historical_work_gate: HistoricalWorkGate,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if wait_until_historical_work_or_cancelled(&historical_work_gate, &cancel).await {
+                return;
+            }
+
+            let store_for_pass = store.clone();
+            let pass = tokio::task::spawn_blocking(move || {
+                store_for_pass.sweep_transparent_retention_once()
+            });
+            let delay = match pass.await {
+                Ok(Ok(outcome)) if outcome.backlog_heights() > 0 => {
+                    TRANSPARENT_RETENTION_BACKLOG_YIELD
+                }
+                Ok(Ok(_)) => TRANSPARENT_RETENTION_CAUGHT_UP_INTERVAL,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        target: "zinder::ingest",
+                        event = "transparent_retention_sweep_failed",
+                        error = %error,
+                        "transparent retention maintenance pass failed; retrying"
+                    );
+                    TRANSPARENT_RETENTION_RETRY_INTERVAL
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "zinder::ingest",
+                        event = "transparent_retention_task_failed",
+                        error = %error,
+                        "transparent retention maintenance task stopped; retrying"
+                    );
+                    TRANSPARENT_RETENTION_RETRY_INTERVAL
+                }
+            };
+
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(delay) => {}
+            }
+        }
+    })
 }
 
 /// Spawns the ingest-owned chain-event retention task.
