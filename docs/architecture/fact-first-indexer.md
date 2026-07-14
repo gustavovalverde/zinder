@@ -1,283 +1,370 @@
-# Fact-First Indexer
+# Canonical-First Indexer Architecture
 
-Status: Current architecture
+Status: Accepted migration target
 
-Zinder is a fact-first Zcash indexer. The canonical store keeps typed public
-facts in hot tables, keeps raw payloads only as optional blob artifacts, and
-feeds selected, rebuildable projections through durable event streams.
+Zinder will make the canonical chain available first, build the wallet serving
+model second, and build optional explorer analytics last. The canonical writer
+will persist immutable, block-local facts and recovery events. It will not
+maintain address indexes, a global transparent-output lookup, spent-output
+state, rankings, distributions, or product views while catching up.
 
-This document owns the storage vocabulary, ingest shape, derive-tailer
-boundary, source-boundary expectations, and public naming rules for that model.
+This is an ownership correction, not a new distributed system. A default
+deployment remains one process group on one VM and one volume. Canonical,
+wallet, and explorer state use separate RocksDB paths and independent readiness
+positions. Operators may place those paths on separate volumes without changing
+the data contracts.
 
-## Boundary Model
+## Decision
 
-Zinder indexes the chain once and serves one shared chain view through native,
-lightwalletd-compatible, and explorer APIs. Canonical facts remain the source
-of truth, while selected projections provide rebuildable views for specific
-query workloads.
+The architecture has three durable stores and two protocol edges:
 
 ```mermaid
 flowchart LR
-    Zebra["Zebra node"] --> Ingest["zinder-ingest<br/>indexes the chain once"]
-    Ingest --> Canonical[("Canonical chain view<br/>shared source of truth")]
-    Canonical --> APIs["Zinder APIs<br/>WalletQuery · lightwalletd · ExplorerQuery"]
-    Canonical -->|"rebuildable events"| Projections[("Selected derived views<br/>wallet or complete")]
-    Projections --> APIs
-    APIs --> Consumers["Wallets · applications · explorers"]
+    Zebra["Zebra node"] --> Ingest["Canonical ingest"]
+    Ingest --> Canonical[("Canonical facts<br/>ordered and replayable")]
+    Canonical --> WalletReplay["Wallet replay"]
+    Canonical --> ExplorerReplay["Explorer replay"]
+    WalletReplay --> WalletStore[("Wallet projections")]
+    ExplorerReplay --> ExplorerStore[("Explorer projections")]
+    Canonical --> WalletQuery["WalletQuery"]
+    WalletStore --> WalletQuery
+    Canonical --> ExplorerQuery["ExplorerQuery"]
+    WalletQuery --> ExplorerQuery
+    ExplorerStore --> ExplorerQuery
+    WalletQuery --> Lightwalletd["lightwalletd compatibility"]
+    WalletQuery --> Zally["Zally"]
+    WalletQuery --> Zexplorer["Zexplorer"]
+    ExplorerQuery --> Zexplorer
+    WalletQuery --> Cipherscan["Cipherscan compatibility"]
+    ExplorerQuery --> Cipherscan
 ```
 
-Three independent configuration choices shape the indexed workload without
-changing this architecture:
+The stores have distinct responsibilities:
 
-| Configuration | Values | Question it answers |
+| Store | Owns | Does not own |
 | --- | --- | --- |
-| `ingest.modifiers.coverage` | `explicit`, `wallet-serving` | How far back should canonical indexing begin? |
-| `storage.raw_blob_policy` | `none`, `transactions`, `all` | Which original raw payloads should the canonical store retain? |
-| `ingest.projection_preset` | `wallet`, `complete` | Which derived views should Zinder build? |
+| Canonical | Chain epochs, block identity, transaction order and location, immutable transaction facts, compact blocks, tree state, subtree roots, chain and mempool events, optional raw blobs, and sequential replay rows | Global transparent-output state, address indexes, spent-output lookup, wallet balances, explorer summaries, rankings, distributions, or product data |
+| Wallet projection | Live transparent outputs, address-to-live-output index, address balance, durable spent-outpoint lookup, address transaction history, bounded reorg undo, projection cursor, and coverage fence | Canonical truth, explorer analytics, source-node RPCs, or per-wallet private state |
+| Explorer projection | Block and transaction summaries, recent activity, fee and value-pool series, rankings, mining and migration views, reorg history, and other rebuildable public analytics | Canonical truth, wallet-private state, Cipherscan labels and names, market prices, or source-node RPCs |
 
-These choices are orthogonal. Coverage selects the canonical history floor,
-raw-blob policy selects retained source bytes, and the projection preset selects
-derived views.
+`WalletQuery` and `ExplorerQuery` remain the stable product contracts. Storage
+paths, RocksDB column families, and projection scheduling are implementation
+details. Compatibility services translate protocols at the edge and never open
+primary stores.
 
-The implementation is split into three durable planes.
+## Current State and Failure Mode
 
-| Plane | Owns | Must not own |
+The current implementation is only partly fact-first. It correctly separates
+many explorer projections from canonical ingest, but the canonical writer still
+owns a global `transparent_output` table, `address_output_index`,
+`transparent_spend_fact`, and block-local spend repair rows. Preparing a block
+therefore requires resolving historical input outpoints before the chain epoch
+can commit.
+
+That coupling creates the dominant bottleneck:
+
+1. A source block supplies input outpoints but not the values and scripts of the
+   outputs they consume.
+2. Canonical preparation looks up old outputs in an ever-growing RocksDB key
+   space so it can materialize wallet-shaped spend facts and address indexes.
+3. Dense transparent workloads turn one sequential chain scan into thousands
+   of random positive reads per second.
+4. Those reads compete with canonical write, WAL, flush, and compaction I/O.
+5. Increasing source concurrency, batch size, memtables, or compaction jobs can
+   move the limit but cannot remove the read amplification.
+
+The canary data separates this from source, CPU, and memory limits. During a
+dense historical interval around height `1869296`, canonical throughput fell to
+about `10.5` blocks per second while transparent prevout resolution averaged
+about `0.73` seconds per preparation window and requested about `3,273`
+store-backed outpoints per second. Canonical transparent-output prefetch reads
+were active for about `0.93` seconds per wall-clock second. There were no
+missing outputs, sustained memory pressure, or swap. After the dense workload,
+around height `2199296`, throughput recovered to about `182.5` blocks per
+second and prevout resolution fell to about `0.04` seconds without an
+architectural or resource change.
+
+The wallet-only trial reached the same conclusion from a different range. It
+disabled unrelated explorer projections, kept derive and historical work gated
+during bulk catchup, and still became commit-bound with low CPU usage. The
+projection preset reduced future derive work, but it could not remove the
+transparent read model embedded in canonical ingest.
+
+The broad post-NU5 sandblasting workload band is approximately
+`1702296..2175692`. It contains several transaction shapes, and earlier history
+also contains transparent-input stress. Runtime code must not branch on these
+height labels. The benchmark anchors and the distinction between consensus
+epochs and workload bands are owned by
+[Zcash chain workload eras](zcash-chain-workload-eras.md).
+
+## Why Tuning Alone Is Insufficient
+
+The accepted tuning work remains useful:
+
+- adaptive source segments and byte-based admission avoid oversized responses;
+- stale speculative fetches are cancelled only after ordered shrinking
+  feedback invalidates their plan;
+- canonical batches close before the next block would exceed artifact or
+  estimated-write budgets;
+- canonical catchup, derive replay, and historical backfills do not compete on
+  the default single-volume deployment;
+- RocksDB maintenance controls and per-column-family metrics expose flush,
+  compaction, and write-stall behavior; and
+- derive startup always hands replay to the asynchronous tailer.
+
+These controls bound work and make failures observable. They do not change the
+fact that the canonical writer performs wallet projection work. Treating a
+larger cache, more background jobs, a different batch size, or a second volume
+as the final solution would preserve the same amplification and make capacity
+the correctness boundary.
+
+The abandoned topology rewrite is also the wrong solution. Zinder does not need
+a generic database adapter, a new store service, or one deployable per consumer.
+The domain has three concrete durability roles. Making those roles explicit is
+smaller and easier to operate than abstracting every database operation.
+
+## Canonical Fact Contract
+
+Canonical ingest parses a block once and emits immutable rows that can be read
+in block order. The target hot schema is:
+
+| Fact | Key | Purpose |
 | --- | --- | --- |
-| Canonical index plane | Epoch-consistent block identity, transaction location, transaction facts, transparent output facts, compact wallet artifacts, tree state, subtree roots, mempool events, chain events | Explorer summaries, analytics views, per-consumer state |
-| Derive plane | Selected, rebuildable wallet-serving, explorer, and analytics projections fed by canonical events | Canonical truth, source-node RPCs, per-wallet state |
-| Query planes | Wallet-shaped and explorer-shaped gRPC surfaces over canonical and derived facts | Storage migrations, background projection, chain ingestion |
+| `block_header` | `(network, height)` | Block identity, parent, time, header fields, and size |
+| `block_transaction_index` | `(network, height, transaction_index)` | Canonical transaction order |
+| `transaction_location` | `(network, transaction_id)` | Direct transaction location |
+| `transaction_facts` | `(network, transaction_id)` | Public transaction shape, input outpoints, created transparent outputs, shielded component counts, and intrinsic value data |
+| `block_replay_facts` | `(network, height)` | Compact ordered envelope of transaction facts needed by projection replay |
+| `compact_block` | `(network, height)` | Encoded lightwalletd compact block |
+| `tree_state` | `(network, height)` | Wallet scan checkpoint |
+| `subtree_root` | `(network, pool, start_index)` | Completed subtree root |
+| `chain_event` | `(network, event_sequence)` | Durable commit or reorg transition and replay cursor source |
+| `mempool_event` | `(network, event_sequence)` | Durable live-mempool transition |
+| `block_blob` | `(network, height)` | Optional compressed consensus block bytes |
+| `transaction_blob` | `(network, transaction_id)` | Optional raw transaction bytes |
 
-The canonical plane may duplicate raw payloads as cold blobs for explicit raw
-export. Raw blobs are not the source of block headers, transaction locations,
-transaction detail, fee facts, transparent address activity, or derive
-projections.
+`block_replay_facts` is not a second truth model. It is a block-local physical
+layout of the same typed facts, optimized for sequential replay. It contains no
+address balance, spend status, or cross-block lookup result. If benchmarks show
+that a structure-of-arrays representation improves decoding and cache locality,
+that representation belongs inside this replay envelope or an in-memory replay
+window. It does not justify a new public abstraction or storage plane.
 
-## Canonical Store
+Canonical ingest follows one ordered contract:
 
-Canonical storage is fact-first. Hot reads use typed rows instead of reparsing
-block bytes, transaction bytes, or compact-block payloads.
+```text
+source segment
+  -> parse each block once
+  -> build immutable canonical and replay facts
+  -> atomically commit ChainEpoch plus ChainEvent
+```
 
-| Table | Hot key | Value | Purpose |
+The canonical commit must not read a projection database. It may resolve facts
+created earlier in the same block or preparation window from memory only when
+that resolution is part of parsing the immutable block envelope. Any
+cross-block state transition belongs to projection replay.
+
+## Wallet Projection Contract
+
+Wallet replay is one ordered transparent-state machine over canonical replay
+facts. For each bounded block window it:
+
+1. resolves same-block and same-window outputs in memory;
+2. performs one sorted, deduplicated `MultiGet` for remaining inputs against the
+   live-output set, which contains only currently unspent outputs;
+3. deletes consumed live outputs and their address index entries;
+4. inserts created live outputs and updates address balances;
+5. appends durable spent-outpoint and address-history rows;
+6. records the inverse delta needed for reorgs inside the supported window; and
+7. commits all rows, the authenticated chain-event cursor, the projection tip,
+   and coverage in one write batch.
+
+This changes the asymptotic storage problem. Historical input resolution no
+longer searches every output ever created. It searches the smaller live UTXO
+set, and each spent output leaves that hot set. A durable spend row retains the
+output value, script, producing location, and spender, so historical wallet and
+explorer reads do not need the deleted live row.
+
+Pure replay preparation may run in parallel across decoded blocks. The state
+transition and cursor commit remain ordered. Batches close by measured input,
+output, row, and estimated-write cost rather than by a hard-coded historical
+height. A single unusually dense block is allowed to form a batch by itself.
+
+Wallet reads fail closed when the projection cursor does not cover the pinned
+canonical epoch. A matching height alone is insufficient because a same-height
+reorg can replace every relevant row. Capabilities advertise only when the
+projection identity, authenticated event cursor, and required coverage match.
+
+## Explorer Projection Contract
+
+Explorer replay consumes the same canonical fact stream after the wallet model
+is available. Independent explorer consumers may replay in parallel when they
+do not share state. Each consumer still owns an atomic cursor and coverage
+fence. The explorer database can be deleted and rebuilt without affecting
+canonical or wallet readiness.
+
+Explorer transaction detail composes immutable transaction facts with the
+wallet spent-output projection for transparent input values and addresses.
+Block summaries, recent transactions, fee distributions, value-pool series,
+rankings, mining statistics, migration views, and historical aggregates belong
+to explorer projections. This keeps expensive scans and compactions out of both
+canonical catchup and wallet readiness.
+
+`zinder-explorer` is a reader and API service. It does not become another
+indexer. `zinder-ingest` may host the projection runners initially because it
+already owns durable cursor advancement. Splitting the runner into another
+process is justified only if measured resource isolation requires it later.
+
+## Consumer and Data Matrix
+
+| Consumer | Canonical or live data | Wallet projection data | Explorer projection or external data |
 | --- | --- | --- | --- |
-| `block_header` | `(network, height)` | block hash, parent hash, time, header commitment fields, size bytes | Header and block identity reads without raw block parsing |
-| `block_transaction_index` | `(network, height, tx_index)` | transaction id | Canonical transaction order |
-| `transaction_location` | `(network, txid)` | height, tx index, block hash | Direct transaction lookup without compact-block decoding |
-| `transaction_facts` | `(network, txid)` | public transaction facts, component counts, size, auth digest, privacy shape, fee inputs that do not require private data | Transaction detail, search, recent transactions, fee summaries |
-| `transparent_output` | `(network, outpoint)` | value, script pubkey, address script hash, produced height, produced block hash | Single canonical transparent output fact |
-| `address_output_index` | `(network, address_script_hash, height, outpoint)` | address output row | Current unspent-output projection per address; finalized-spent rows are deleted by gated transparent-retention maintenance |
-| `transparent_spend_fact` | `(network, spent_outpoint)` | spending txid, input index, spending block, spent value, spent address script hash, spent block | Spend lookup and reorg repair; finalized rows may be retained only in the durable block-local replay index |
-| `transparent_spend_fact_block_index` | `(network, spending_height, source_epoch)` | producing block hash, complete observed input set, and ordered resolved spend facts | Sequential finalized derive replay, retention enumeration, and bounded reorg repair |
-| `compact_block` | `(network, height)` | encoded lightwalletd compact block | Wallet sync cache |
-| `tree_state` | `(network, height)` | source tree-state payload or typed tree state | Wallet scan boundary |
-| `subtree_root` | `(network, pool, start_index)` | completed subtree root | Wallet scan acceleration |
-| `chain_event` | `(network, event_sequence)` | committed, reverted, safe-tip event envelope | Source of truth for derive tailers and chain subscriptions |
-| `mempool_event` | `(network, event_sequence)` | mempool change envelope | Source of truth for mempool readers and mempool-derived projections |
-| `block_blob` | `(network, height)` | compressed raw block bytes | Explicit raw block export and rebuild aid |
-| `transaction_blob` | `(network, txid)` | raw transaction bytes | Explicit raw transaction export |
+| Zally native adapter | visible and safe tips, compact blocks, tree state, subtree roots, transaction status, chain events, mempool, and broadcast | transparent unspent outputs | none |
+| lightwalletd compatibility | latest block, compact block ranges, transaction bytes and status, tree state, subtree roots, mempool, server info, and broadcast | transparent address transaction ids, balances, and UTXOs | none |
+| Zexplorer | chain freshness, block identity, transaction facts, raw blobs when enabled, chain and mempool events | transparent balance, UTXOs, spent-output enrichment, and address activity | summaries, recent history, search indexes, fees, value pools, rankings, production, migration, reorg, and other analytics |
+| Cipherscan compatibility | chain info, blocks, transactions, raw bytes when enabled, mempool, broadcast, and freshness | address detail and transparent enrichment | rankings, mining and pool analytics, privacy and cross-chain aggregates; market prices, labels, names, and product formulas remain adapter or Cipherscan-owned |
 
-Transparent-output naming describes the row at creation time. A spend is one
-consumer of that row, not the row identity. Public APIs may use `prevout` only
-for transaction-input-facing request fields. Storage, core types, and canonical
-code use `transparent_output`.
+The lightwalletd and Cipherscan compatibility services are stateless protocol
+edges. They translate `WalletQuery` and `ExplorerQuery`; they do not get direct
+database access. Zally and Zexplorer use the same native APIs, so the storage
+migration does not require consumer-specific forks.
 
-`compact_block` is never used to infer transaction order. Transaction-at-location
-reads use `block_transaction_index` and `transaction_location`.
+Some capabilities are conditional. Full blocks, raw transactions, and the
+Cipherscan raw routes require the corresponding raw-blob policy. A projection
+that has not reached the requested fence returns an explicit unavailable or
+coverage error. The system never substitutes an empty list, zero balance, or
+current-height claim for missing data.
 
-Transparent-address transaction history is a derive-plane projection over
-`transaction_facts`, `transparent_output`, and `transparent_spend_fact`.
-Keeping that projection off the canonical writer prevents explorer views from
-throttling wallet sync and canonical catchup.
+## Deployment and Scheduling
 
-`block_blob` and `transaction_blob` are optional cold paths. Wallet sync,
-explorer transaction detail, search, address history, and derive projections
-must not depend on raw blob presence.
-
-## Ingest Pipeline
-
-Canonical ingest turns ordered source updates into atomic `ChainEpoch` commits.
-It does not run product projections.
+The default layout is intentionally simple:
 
 ```text
-SourceChainUpdate stream
-  -> build canonical facts
-  -> commit ChainEpoch
-  -> append ChainEvent
-  -> notify derive tailer
+/var/lib/zinder/canonical
+/var/lib/zinder/projections/wallet
+/var/lib/zinder/projections/explorer   # complete preset only
 ```
 
-Implementation rules:
+All three paths may live on one volume. Operators may mount the projection root
+or each projection group on another volume. Path placement must not alter
+schema identity, cursors, backup manifests, or API behavior.
 
-- `build_canonical_facts` parses each block once and emits the canonical rows
-  listed above.
-- `commit_chain_epoch` writes canonical rows and the chain event in one
-  visible epoch transition.
-- Batch limits are based on durable pressure units: block count, raw source
-  bytes, transaction count, logical actions, transparent outputs, transparent
-  inputs, compact outputs/actions, and write-batch bytes.
-- Explicit RocksDB flush is a storage-pressure control. Metrics report it as
-  storage work.
+The default single-volume schedule is exclusive:
 
-Bulk catchup uses the resource-budgeted staged pipeline in
-[ADR-0022](../adrs/0022-resource-budgeted-bulk-catchup.md). Tip-follow uses the
-same canonical block-preparation path and commits one live-edge transition at a time.
+1. canonical `BulkCatchup` owns the ingest budget;
+2. after canonical reaches `FollowingTip`, wallet replay drains;
+3. after wallet coverage is current, wallet APIs become ready;
+4. complete deployments then drain explorer replay; and
+5. low-priority historical backfills run only after their owning projection is
+   current.
 
-## Derive Tailer
+Separate volumes permit bounded overlap only after measurements prove that
+canonical latency and memory remain unaffected. A projection handoff may use a
+bounded in-memory notification for low latency, but the durable chain-event
+cursor is always the recovery contract. A slow or failed projection can never
+backpressure or roll back a committed canonical epoch.
 
-The derive plane is an asynchronous tailer over canonical events.
+Backups record canonical, wallet, and explorer checkpoints independently. A
+restore is admitted only when each included projection proves its schema,
+identity, cursor, and coverage. Missing projection checkpoints cause replay,
+not fabricated readiness.
 
-```text
-chain_event cursor
-  -> hydrate canonical facts for the event range
-  -> apply derive consumers
-  -> write derive rows and cursor atomically
-```
+## Repository Reconciliation
 
-Implementation rules:
+The current branch set is consolidated by behavior, not by branch name:
 
-- `zinder-ingest` hosts the derive tailer because it owns the primary derive
-  store handle.
-- The tailer runs independently from canonical commit.
-- Startup replay and steady-state projection use the same chain-event cursor
-  contract.
-- Each derive consumer reads typed canonical facts, not raw block bytes.
-- Per-consumer projection may parallelize block work inside one event range,
-  but cursor advancement stays serial and atomic.
-- Replay may hydrate one following committed range while dispatching the
-  current range, but cursor writes remain serial and atomic. The hydrate
-  read-ahead is bounded to one pending batch and is disabled under derive
-  memory pressure or dense projected fan-out.
-- A derive failure leaves canonical ingest healthy. Readiness and server-info
-  surfaces report derive lag and capability freshness.
-- `zinder-explorer` is a stateless secondary reader. It does not run derive
-  consumers and does not open primary stores.
+| Disposition | Work |
+| --- | --- |
+| Keep | Projection workload presets, canonical history bounds, projection-aware capabilities, replay benchmarks, RocksDB maintenance controls and metrics, adaptive source admission, bounded canonical batches, asynchronous derive startup, authenticated projection read fences, recovery checks, and client network validation |
+| Redesign | Canonical transparent-output, address-output, and spend-fact ownership; one combined derive database for wallet and explorer workloads; direct query assumptions that these canonical indexes are always present |
+| Drop | The large generic storage/topology rewrite, duplicate rescue and salvage branches after their accepted commits are represented on `main`, stale detached worktrees, and height-specific incident modes |
+| Reconcile separately | Portable Cipherscan operator documentation that is newer than the already-merged compatibility implementation |
 
-The derive cursor is the recovery contract. If canonical event `N` committed
-and the derive cursor is still at `N - 1`, the tailer replays event `N`. If the
-derive store is deleted, the tailer rebuilds from retained canonical events or
-operator-provided canonical snapshots.
+No branch or worktree with uncommitted unique changes is removed before those
+changes pass focused tests and are committed or explicitly rejected. The final
+integration line is fast-forwarded onto `main` so the retained history stays
+linear. Obsolete local branches and worktrees are deleted only after their tips
+are ancestors of `main` or their rejected status is recorded here.
 
-## Source Boundary
+## Migration Plan
 
-`NodeSource` is the only upstream-node boundary. The current catchup path uses
-`fetch_chain_segment` with `SourceChainSegmentLimits` so the writer can size
-source work by connected block count and response bytes.
+### 1. Consolidate and lock contracts
 
-Source adapters emit Zinder source values, not store rows. Zebra-specific JSON,
-gRPC, and parser details stay inside `zinder-source`; canonical ingest receives
-ordered source updates and maps them into the fact-first store.
+- merge the accepted preset, RocksDB, catchup, query-fence, recovery, benchmark,
+  and client correctness work;
+- retain the native `WalletQuery` and `ExplorerQuery` method contracts;
+- preserve the lightwalletd and Cipherscan compatibility boundaries; and
+- add benchmark fixtures for the transparent-input stress anchors, NU5
+  boundary, heavy Sapling and Orchard anchors, and sandblasting end boundary.
 
-Streaming source adapters must emit the same internal `SourceChainUpdate` shape
-as the JSON-RPC adapter. That keeps the canonical store, query APIs, derive
-tailer, and metrics independent of the transport used to observe the chain.
+### 2. Introduce canonical schema vNext
 
-## Public APIs
+- add `block_replay_facts` and make its encoding versioned;
+- stop writing canonical address, live-output, and spent-output read models;
+- remove cross-block prevout reads from canonical preparation;
+- keep the existing canonical schema readable only for controlled export or
+  rebuild tooling; and
+- validate the new schema from a fresh volume rather than attempting an
+  in-place mainnet rewrite.
 
-The public API is split by user job, not by storage layout.
+### 3. Build the wallet state machine
 
-Wallet-facing APIs:
+- create the live-output, address, spent-output, history, undo, cursor, and
+  coverage tables in the wallet projection database;
+- replay ordered block facts in cost-bounded batches;
+- use one deduplicated lookup against the live set per replay window;
+- prove same-height reorg fencing, restart recovery, and bounded rollback; and
+- move transparent `WalletQuery` reads behind the projection readiness fence.
 
-- compact block by height and compact block ranges
-- tree-state checkpoints and latest tree state
-- subtree roots
-- chain events and mempool events
-- transparent outputs by outpoint
-- transparent address outputs
-- transparent address transaction ids
-- transaction status without raw bytes by default
-- explicit raw transaction read when `transaction_blob` is enabled
-- broadcast transaction
+### 4. Separate explorer projections
 
-Explorer-facing APIs:
+- move complete-only consumers into the explorer projection database;
+- compose explorer transaction and address views through the wallet contract
+  instead of duplicating wallet state;
+- keep each explorer consumer independently rebuildable and capability-gated;
+  and
+- preserve Cipherscan-owned market, label, name, and product concerns at the
+  compatibility edge.
 
-- block summary and block detail from `block_header`, `block_transaction_index`,
-  and `transaction_facts`
-- transaction detail from `transaction_facts`, `transaction_location`,
-  `transparent_output`, and optional `transaction_blob`
-- transparent address activity from derive rows over canonical facts
-- recent transactions from derive rows or direct fact indexes
-- explicit raw block and raw transaction reads only when blob capabilities are
-  enabled
+### 5. Validate the complete lifecycle
 
-## Naming Rules
+Acceptance is a fresh mainnet replay, not a synthetic microbenchmark alone:
 
-- Use `transparent_output` for storage, core types, and canonical code.
-- Use `prevout` only in transaction-input-facing request names.
-- Use `transaction_facts` for durable parsed public facts.
-- Use `transaction_blob` and `block_blob` for raw bytes.
-- Use `derive_tailer` for the asynchronous event consumer. Do not call it a
-  dispatcher, manager, worker, or replay service.
-- Use `canonical_lag_blocks` and `derive_lag_blocks` in readiness surfaces.
+- canonical catchup crosses every workload anchor with derive and historical
+  work closed;
+- canonical throughput no longer correlates with store-backed historical
+  prevout requests because that metric is zero in canonical ingest;
+- wallet replay crosses the transparent-input and sandblasting ranges without
+  unbounded pending compaction, write stops, memory pressure, or swap;
+- the wallet projection reaches tip and serves Zally plus the complete
+  lightwalletd compatibility suite;
+- explorer replay reaches tip and serves Zexplorer plus the covered Cipherscan
+  route matrix; and
+- restart, same-height reorg, backup, restore, missing-capability, and separate
+  volume-path cases fail closed and recover from durable cursors.
 
-Capability rules:
+## Guardrails
 
-- Wallet capability names stay under `wallet.read.*`, `wallet.mempool.*`, and
-  `wallet.write.*`.
-- Explorer capability names use `explorer.<domain>.<view>_vN`, for example
-  `explorer.transaction.detail_v3` and `explorer.block.summary_v1`.
-- Raw bytes are explicit capabilities, not fields quietly attached to typed
-  reads.
+- Do not add a sandblasting runtime mode or height-specific storage semantics.
+- Do not introduce a generic database adapter before a second concrete backend
+  exists with a proven contract.
+- Do not let projection lag delay canonical commit.
+- Do not advertise projection-backed capabilities from height alone.
+- Do not let compatibility JSON or protobuf shapes become canonical tables.
+- Do not duplicate wallet state in explorer projections when `WalletQuery` can
+  compose the result.
+- Do not parallelize the ordered wallet state transition. Parallelize parsing,
+  decoding, and independent consumers around it.
+- Do not require multiple VMs or volumes for correctness.
 
-## Metrics
+## Related Documents
 
-Canonical ingest metrics:
-
-- committed height, target height, and `canonical_lag_blocks`
-- source fetch duration and bytes by source method
-- block, transaction, logical-action, compact-output, compact-action, nullifier,
-  transparent-input, and transparent-output counts per batch
-- canonical write duration and write bytes by table
-- RocksDB flush duration and flushed bytes by store
-- batch close trigger by pressure unit
-
-Derive tailer metrics:
-
-- derive cursor height and `derive_lag_blocks`
-- event hydration duration by source table
-- per-consumer apply duration
-- per-consumer rows staged and bytes staged
-- derive-store write duration and write bytes
-- event replay count and failure reason
-
-Query metrics:
-
-- request duration by service, method, status, and response item count
-- raw blob reads separated from typed fact reads
-- secondary catch-up duration and lag by store
-
-## Validation Gates
-
-Local validation:
-
-```bash
-cargo fmt --all --check
-cargo check --workspace --all-targets --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --profile=ci
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
-```
-
-Storage validation:
-
-- fresh stores start with the schema version for this architecture
-- mismatched stores fail closed with a schema mismatch
-- reorg replacement repairs `transparent_output` visibility and secondary
-  indexes atomically
-- pinned epoch reads never see rows from a later epoch
-- raw blob absence disables only raw capabilities
-
-Performance validation:
-
-- canonical height advances while derive lag can trail
-- typed transaction detail does not parse raw transaction bytes
-- block header reads do not parse raw block bytes
-- transaction-at-location reads do not decode compact block bytes
-- write bytes by table show raw blobs separated from hot fact rows
-- catchup reports pressure by bytes, actions, and rows, not only blocks
-
-## External References
-
-- [ECC sandblasting retrospective](https://electriccoin.co/blog/a-look-back-nu5-and-network-sandblasting/)
-- [ZIP-307: Light Client Protocol for Payment Detection](https://zips.z.cash/zip-0307)
-- [ZIP-317: Proportional Transfer Fee Mechanism](https://zips.z.cash/zip-0317)
-- [ZIP-401: Addressing Mempool Denial-of-Service](https://zips.z.cash/zip-0401)
-- [Zebra mempool specification](https://zebra.zfnd.org/dev/mempool-specification.html)
+- [Zcash chain workload eras](zcash-chain-workload-eras.md)
+- [Derive plane](derive-plane.md)
+- [Wallet data plane](wallet-data-plane.md)
+- [Explorer plane](explorer-plane.md)
+- [Protocol boundary](protocol-boundary.md)
+- [Public interfaces](public-interfaces.md)
+- [ADR-0022: resource-budgeted bulk catchup](../adrs/0022-resource-budgeted-bulk-catchup.md)
+- [Integration surfaces](../reference/integration-surfaces.md)
+- [Cipherscan adapter architecture](../plans/cipherscan-adapter-architecture.md)
