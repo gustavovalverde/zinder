@@ -132,6 +132,10 @@ impl StoreKey {
         Self(vec![KEY_VERSION, 21])
     }
 
+    pub(crate) fn canonical_history_bounds() -> Self {
+        Self(vec![KEY_VERSION, 22])
+    }
+
     pub(crate) fn chain_epoch(chain_epoch: ChainEpochId) -> Self {
         let mut key = vec![KEY_VERSION];
         key.extend_from_slice(&chain_epoch.value().to_be_bytes());
@@ -858,12 +862,13 @@ mod tests {
             StoreKey::displaced_block_archive_coverage(),
             StoreKey::displaced_block_count(),
             StoreKey::displaced_root_archive_coverage(),
+            StoreKey::canonical_history_bounds(),
         ]
         .map(StoreKey::into_bytes)
         .into_iter()
         .collect::<HashSet<_>>();
 
-        assert_eq!(storage_control_keys.len(), 14);
+        assert_eq!(storage_control_keys.len(), 15);
         for chain_epoch in [
             ChainEpochId::new(0),
             ChainEpochId::new(1),

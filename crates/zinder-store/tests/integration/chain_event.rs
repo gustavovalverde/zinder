@@ -73,12 +73,7 @@ fn checkpoint_bootstrap_cursor_resumes_after_artifactless_anchor() -> eyre::Resu
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_200_010),
     };
-    let checkpoint_commit = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(checkpoint_epoch, Vec::new(), Vec::new())
-            .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
-                height: checkpoint_height,
-            }),
-    )?;
+    let checkpoint_commit = store.commit_artifactless_checkpoint(checkpoint_epoch)?;
     let (next_epoch, next_block, next_compact_block) = synthetic_epoch(2, 11);
     let next_commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
         next_epoch,

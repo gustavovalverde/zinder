@@ -11,12 +11,12 @@ use std::{
 
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockValuePoolBalances, ChainEpoch, ChainEpochId, CompactBlockArtifact,
-    DisplacedRootArchiveCoverage, DisplacedRootCandidate, FinalNoteCommitmentRoot,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
-    TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentOutputEntry, TransparentSpendFact,
+    BlockHeightRange, BlockValuePoolBalances, CanonicalHistoryBounds, ChainEpoch, ChainEpochId,
+    CompactBlockArtifact, DisplacedRootArchiveCoverage, DisplacedRootCandidate,
+    FinalNoteCommitmentRoot, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentOutputEntry, TransparentSpendFact,
     TransparentUnspentOutput, TransparentUtxoSetSummary, TreeStateArtifact,
 };
 
@@ -69,6 +69,7 @@ use crate::{
 /// In-process read view pinned to one [`ChainEpoch`].
 pub struct ChainEpochReader<'store> {
     chain_epoch: ChainEpoch,
+    canonical_history_bounds: CanonicalHistoryBounds,
     read_view: RocksChainStoreReadView<'store>,
     is_current: bool,
     secondary_visible_epoch: Option<Arc<AtomicU64>>,
@@ -77,11 +78,13 @@ pub struct ChainEpochReader<'store> {
 impl<'store> ChainEpochReader<'store> {
     pub(crate) fn current(
         chain_epoch: ChainEpoch,
+        canonical_history_bounds: CanonicalHistoryBounds,
         read_view: RocksChainStoreReadView<'store>,
         secondary_visible_epoch: Option<Arc<AtomicU64>>,
     ) -> Self {
         Self {
             chain_epoch,
+            canonical_history_bounds,
             read_view,
             is_current: true,
             secondary_visible_epoch,
@@ -90,11 +93,13 @@ impl<'store> ChainEpochReader<'store> {
 
     pub(crate) fn at_epoch(
         chain_epoch: ChainEpoch,
+        canonical_history_bounds: CanonicalHistoryBounds,
         read_view: RocksChainStoreReadView<'store>,
         secondary_visible_epoch: Option<Arc<AtomicU64>>,
     ) -> Self {
         Self {
             chain_epoch,
+            canonical_history_bounds,
             read_view,
             is_current: false,
             secondary_visible_epoch,
@@ -131,11 +136,33 @@ impl<'store> ChainEpochReader<'store> {
         self.chain_epoch
     }
 
+    /// Returns the durable canonical-history bounds for this read session.
+    #[must_use]
+    pub const fn canonical_history_bounds(&self) -> CanonicalHistoryBounds {
+        self.canonical_history_bounds
+    }
+
+    fn ensure_history_height_available(&self, height: BlockHeight) -> Result<(), StoreError> {
+        if !self.canonical_history_bounds.intentionally_excludes(height) {
+            return Ok(());
+        }
+        let checkpoint = self
+            .canonical_history_bounds
+            .preceding_checkpoint()
+            .ok_or(StoreError::CanonicalHistoryBoundsMissing)?;
+        Err(StoreError::CanonicalHistoryUnavailable {
+            requested_height: height,
+            first_available_height: self.canonical_history_bounds.first_available_height(),
+            checkpoint,
+        })
+    }
+
     /// Reads block-header facts by height.
     pub fn block_header_at(
         &self,
         height: BlockHeight,
     ) -> Result<Option<BlockHeaderArtifact>, StoreError> {
+        self.ensure_history_height_available(height)?;
         self.read_at_pinned_secondary_epoch(|| {
             read_block_header_artifact(&self.read_view, self.chain_epoch, height)
         })
@@ -146,6 +173,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         block_range: BlockHeightRange,
     ) -> Result<Vec<Option<BlockHeaderArtifact>>, StoreError> {
+        self.ensure_history_height_available(block_range.start)?;
         read_block_header_artifacts(&self.read_view, self.chain_epoch, block_range)
     }
 
@@ -154,6 +182,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         height: BlockHeight,
     ) -> Result<Option<BlockBlobArtifact>, StoreError> {
+        self.ensure_history_height_available(height)?;
         read_block_blob_artifact(&self.read_view, self.chain_epoch, height)
     }
 
@@ -162,6 +191,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         block_range: BlockHeightRange,
     ) -> Result<Vec<Option<BlockBlobArtifact>>, StoreError> {
+        self.ensure_history_height_available(block_range.start)?;
         read_block_blob_artifacts(&self.read_view, self.chain_epoch, block_range)
     }
 
@@ -171,6 +201,7 @@ impl<'store> ChainEpochReader<'store> {
         height: BlockHeight,
         tx_index_in_block: u32,
     ) -> Result<Option<TransactionId>, StoreError> {
+        self.ensure_history_height_available(height)?;
         Ok(read_block_transaction_index_artifact(
             &self.read_view,
             self.chain_epoch,
@@ -185,6 +216,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         height: BlockHeight,
     ) -> Result<Vec<TransactionId>, StoreError> {
+        self.ensure_history_height_available(height)?;
         read_block_transaction_index_artifacts_at_height(&self.read_view, self.chain_epoch, height)
             .map(|artifacts| {
                 artifacts
@@ -199,6 +231,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         height: BlockHeight,
     ) -> Result<Option<CompactBlockArtifact>, StoreError> {
+        self.ensure_history_height_available(height)?;
         read_compact_block_artifact(&self.read_view, self.chain_epoch, height)
     }
 
@@ -207,6 +240,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         block_range: BlockHeightRange,
     ) -> Result<Vec<Option<CompactBlockArtifact>>, StoreError> {
+        self.ensure_history_height_available(block_range.start)?;
         read_compact_block_artifacts(&self.read_view, self.chain_epoch, block_range)
     }
 
@@ -284,6 +318,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         max_height: BlockHeight,
     ) -> Result<Option<TreeStateArtifact>, StoreError> {
+        self.ensure_history_height_available(max_height)?;
         read_tree_state_checkpoint_at_or_before(&self.read_view, self.chain_epoch, max_height)
     }
 
@@ -297,6 +332,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         height: BlockHeight,
     ) -> Result<Option<BlockFinalNoteCommitmentRoots>, StoreError> {
+        self.ensure_history_height_available(height)?;
         self.read_at_pinned_secondary_epoch(|| {
             read_final_note_commitment_roots(&self.read_view, self.chain_epoch, height)
         })
@@ -307,6 +343,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         block_range: BlockHeightRange,
     ) -> Result<Vec<Option<BlockFinalNoteCommitmentRoots>>, StoreError> {
+        self.ensure_history_height_available(block_range.start)?;
         read_final_note_commitment_roots_in_range(&self.read_view, self.chain_epoch, block_range)
     }
 
@@ -360,6 +397,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         height: BlockHeight,
     ) -> Result<Option<BlockValuePoolBalances>, StoreError> {
+        self.ensure_history_height_available(height)?;
         read_block_value_pool_balances(&self.read_view, self.chain_epoch, height)
     }
 
@@ -368,6 +406,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         block_range: BlockHeightRange,
     ) -> Result<Vec<Option<BlockValuePoolBalances>>, StoreError> {
+        self.ensure_history_height_available(block_range.start)?;
         read_block_value_pool_balances_in_range(&self.read_view, self.chain_epoch, block_range)
     }
 
@@ -386,6 +425,7 @@ impl<'store> ChainEpochReader<'store> {
         start_height: BlockHeight,
         max_entries: NonZeroU32,
     ) -> Result<Vec<TransparentUnspentOutput>, StoreError> {
+        self.ensure_history_height_available(start_height)?;
         read_address_output_index(
             &self.read_view,
             self.chain_epoch,
@@ -408,6 +448,7 @@ impl<'store> ChainEpochReader<'store> {
                 feature: "transparent address balance snapshots on historical chain epochs",
             });
         }
+        self.ensure_history_height_available(self.chain_epoch.visible_tip_height)?;
         read_transparent_address_balance_snapshot(
             &self.read_view,
             self.chain_epoch,
@@ -424,6 +465,7 @@ impl<'store> ChainEpochReader<'store> {
                 feature: "settled transparent address balance snapshots on historical chain epochs",
             });
         }
+        self.ensure_history_height_available(self.chain_epoch.settled_tip_height)?;
         read_transparent_address_balance_snapshot(
             &self.read_view,
             self.chain_epoch,
@@ -445,6 +487,7 @@ impl<'store> ChainEpochReader<'store> {
         &self,
         commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, StoreError> {
+        self.ensure_history_height_available(self.chain_epoch.settled_tip_height)?;
         let aggregate = read_transparent_utxo_set_aggregate(
             &self.read_view,
             self.chain_epoch,

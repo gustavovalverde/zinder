@@ -9,7 +9,7 @@ use std::{
 use thiserror::Error;
 
 use crate::format::StoreKey;
-use zinder_core::{BlockHeight, ChainEpochId, Network};
+use zinder_core::{BlockHeight, BlockId, ChainEpochId, Network};
 
 /// Stable storage-engine failure category for operator diagnostics.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -163,6 +163,30 @@ pub enum StoreError {
     /// No visible chain epoch has been committed yet.
     #[error("no visible chain epoch has been committed")]
     NoVisibleChainEpoch,
+
+    /// A non-empty store has no trustworthy canonical-history bounds.
+    #[error("canonical history bounds are missing from a non-empty store")]
+    CanonicalHistoryBoundsMissing,
+
+    /// Legacy canonical-history metadata could not be reconciled safely.
+    #[error("canonical history bounds reconciliation failed: {reason}")]
+    CanonicalHistoryBoundsReconciliation {
+        /// Stable reason the legacy store could not be classified.
+        reason: &'static str,
+    },
+
+    /// Requested history was intentionally omitted by checkpoint bootstrap.
+    #[error(
+        "canonical history at height {requested_height:?} is unavailable before retained height {first_available_height:?}"
+    )]
+    CanonicalHistoryUnavailable {
+        /// Requested canonical block height.
+        requested_height: BlockHeight,
+        /// First height at which canonical artifacts are retained.
+        first_available_height: BlockHeight,
+        /// Checkpoint immediately preceding retained history.
+        checkpoint: BlockId,
+    },
 
     /// Attempted chain epoch conflicts with the current visible epoch.
     #[error("chain epoch conflict: current {current:?}, attempted {attempted:?}")]

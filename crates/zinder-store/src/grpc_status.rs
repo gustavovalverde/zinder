@@ -135,7 +135,9 @@ impl BoundaryError for StoreError {
             Self::ReorgWindowExceeded { .. } => ErrorReason::ReorgWindowExceeded,
             Self::ChainEpochConflict { .. } => ErrorReason::ChainEpochConflict,
             Self::ChainEpochNetworkMismatch { .. } => ErrorReason::ChainEpochNetworkMismatch,
-            Self::ArtifactMissing { .. } => ErrorReason::ArtifactUnavailable,
+            Self::ArtifactMissing { .. } | Self::CanonicalHistoryUnavailable { .. } => {
+                ErrorReason::ArtifactUnavailable
+            }
             Self::ChainEpochMissing { .. } => ErrorReason::ChainEpochMissing,
             Self::NoVisibleChainEpoch => ErrorReason::NoVisibleChainEpoch,
             Self::EntropyUnavailable { .. } => ErrorReason::EntropyUnavailable,
@@ -152,7 +154,7 @@ impl BoundaryError for StoreError {
 mod tests {
     use std::io;
 
-    use zinder_core::{BlockHeight, ChainEpochId, Network};
+    use zinder_core::{BlockHash, BlockHeight, BlockId, ChainEpochId, Network};
 
     use super::*;
     use crate::ArtifactFamily;
@@ -184,6 +186,13 @@ mod tests {
                 chain_epoch: ChainEpochId::new(1),
             },
             StoreError::NoVisibleChainEpoch,
+            StoreError::CanonicalHistoryBoundsMissing,
+            StoreError::CanonicalHistoryBoundsReconciliation { reason: "probe" },
+            StoreError::CanonicalHistoryUnavailable {
+                requested_height: BlockHeight::new(1),
+                first_available_height: BlockHeight::new(2),
+                checkpoint: BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            },
             StoreError::ChainEpochConflict {
                 current: ChainEpochId::new(1),
                 attempted: ChainEpochId::new(2),

@@ -13,8 +13,8 @@ use std::{
 use eyre::eyre;
 use tempfile::{TempDir, tempdir};
 use zinder_core::{
-    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
-    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
+    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
     TransparentSpendFact, TransparentUnspentOutput, UnixTimestampMillis,
 };
@@ -922,10 +922,26 @@ fn process_crash_with_sync_writes_recovers_complete_epoch() -> eyre::Result<()> 
 }
 
 #[test]
-fn initial_commit_uses_artifact_set_as_lower_bound() -> eyre::Result<()> {
+fn checkpoint_commit_establishes_artifact_lower_bound() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let checkpoint_epoch = ChainEpoch {
+        id: ChainEpochId::new(1),
+        network: Network::ZcashRegtest,
+        visible_tip_height: BlockHeight::new(1),
+        visible_tip_hash: block_hash(1),
+        settled_tip_height: BlockHeight::new(1),
+        settled_tip_hash: block_hash(1),
+        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1),
+    };
+    store.commit_artifactless_checkpoint(checkpoint_epoch)?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 2);
+    let chain_epoch = ChainEpoch {
+        id: ChainEpochId::new(2),
+        ..chain_epoch
+    };
 
     let outcome = store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
@@ -945,7 +961,7 @@ fn initial_commit_uses_artifact_set_as_lower_bound() -> eyre::Result<()> {
     assert_eq!(outcome.chain_epoch, chain_epoch);
     assert!(matches!(
         below_lower_bound,
-        zinder_store::StoreError::ArtifactMissing { .. }
+        zinder_store::StoreError::CanonicalHistoryUnavailable { .. }
     ));
     assert_eq!(reader.block_header_at(BlockHeight::new(2))?, Some(block));
     assert_eq!(

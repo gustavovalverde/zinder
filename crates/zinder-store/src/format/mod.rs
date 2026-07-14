@@ -1,5 +1,6 @@
 mod artifact_codec;
 mod artifact_envelope;
+mod canonical_history_bounds;
 mod store_key;
 mod stream_cursor;
 
@@ -27,6 +28,9 @@ pub(crate) use artifact_codec::{
 };
 pub(crate) use artifact_envelope::{
     ArtifactEnvelopeError, ArtifactEnvelopeHeaderV1, PayloadFormat,
+};
+pub(crate) use canonical_history_bounds::{
+    decode_canonical_history_bounds, encode_canonical_history_bounds,
 };
 pub(crate) use store_key::StoreKey;
 pub use stream_cursor::{

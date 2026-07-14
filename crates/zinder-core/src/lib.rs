@@ -11,6 +11,7 @@ pub mod artifact_family;
 mod block_artifact;
 mod block_header;
 mod block_id;
+mod canonical_history;
 mod chain_epoch;
 mod chain_value_pools;
 mod displaced_block;
@@ -39,6 +40,7 @@ pub use block_artifact::{
 };
 pub use block_header::BlockHeaderInfo;
 pub use block_id::{BlockId, BlockSelector};
+pub use canonical_history::{CanonicalHistoryBounds, CanonicalHistoryBoundsError};
 pub use chain_epoch::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter,
     ChainEpoch, ChainEpochId, ChainTipMetadata, Network, UnixTimestampMillis,

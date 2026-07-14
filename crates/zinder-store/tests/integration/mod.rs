@@ -7,6 +7,7 @@ use zinder_core::{
 
 mod address_output_projection;
 mod block_value_pool_balances;
+mod canonical_history;
 mod chain_epoch_reader;
 mod chain_event;
 mod commit_chain_epoch;

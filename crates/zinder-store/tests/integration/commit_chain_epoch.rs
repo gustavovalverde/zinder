@@ -422,16 +422,7 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
 
-    let committed = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            bootstrap_chain_epoch,
-            Vec::<zinder_core::BlockHeaderArtifact>::new(),
-            Vec::new(),
-        )
-        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
-            height: bootstrap_height,
-        }),
-    )?;
+    let committed = store.commit_artifactless_checkpoint(bootstrap_chain_epoch)?;
     assert_eq!(committed.chain_epoch, bootstrap_chain_epoch);
     assert_eq!(
         committed.block_range,
@@ -442,16 +433,15 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
     assert_eq!(reader.chain_epoch(), bootstrap_chain_epoch);
     // Heights at or above the bootstrap tip return Ok(None) because the
     // chain has no artifacts beyond the checkpoint; heights below surface a
-    // typed `ArtifactMissing` error which the wallet layer already maps to
-    // `QueryError::ArtifactUnavailable`.
+    // typed canonical-history error.
     assert_eq!(reader.block_header_at(BlockHeight::new(2_000))?, None);
     assert!(matches!(
         reader.block_header_at(BlockHeight::new(1)),
-        Err(StoreError::ArtifactMissing { .. })
+        Err(StoreError::CanonicalHistoryUnavailable { .. })
     ));
     assert!(matches!(
         reader.compact_block_at(BlockHeight::new(1)),
-        Err(StoreError::ArtifactMissing { .. })
+        Err(StoreError::CanonicalHistoryUnavailable { .. })
     ));
     Ok(())
 }
@@ -479,16 +469,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         tip_metadata: ChainTipMetadata::new(130_002, 39_758, 0),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            bootstrap_chain_epoch,
-            Vec::<zinder_core::BlockHeaderArtifact>::new(),
-            Vec::new(),
-        )
-        .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
-            height: checkpoint_height,
-        }),
-    )?;
+    store.commit_artifactless_checkpoint(bootstrap_chain_epoch)?;
 
     // Attempt a reorg whose `from_height` rewinds onto the checkpoint height
     // itself. `minimum_reorg_height = safe_tip_height + 1 = 1001`, so 1000 is

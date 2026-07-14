@@ -17,13 +17,13 @@ use std::{
 use parking_lot::RwLock;
 use zinder_core::{
     ArtifactSchemaVersion, BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash,
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockTransactionIndexArtifact,
-    BlockValuePoolBalances, ChainEpoch, ChainEpochId, CompactBlockArtifact, DisplacedBlock,
-    DisplacedBlockArchiveCoverage, Network, SubtreeRootArtifact, TransactionBlobArtifact,
-    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
-    TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact,
-    UnixTimestampMillis,
+    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, BlockTransactionIndexArtifact,
+    BlockValuePoolBalances, CanonicalHistoryBounds, ChainEpoch, ChainEpochId, CompactBlockArtifact,
+    DisplacedBlock, DisplacedBlockArchiveCoverage, Network, SubtreeRootArtifact,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 
 use crate::displaced_block::{
@@ -44,13 +44,14 @@ use crate::{
         CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
         MempoolEventKind, MempoolEventStreamFamily, SnapshotPageCursorAnchor,
         SnapshotPageCursorPayload, SnapshotPageStreamFamily, StoreKey,
-        decode_block_value_pool_balances, decode_chain_epoch, decode_chain_event_envelope,
-        decode_final_note_commitment_roots, decode_mempool_event_envelope,
-        decode_mempool_event_kind, decode_mempool_event_observed_at, decode_mempool_event_position,
-        decode_transaction_intrinsic_value_balances, decode_transparent_output_block_index,
-        encode_address_output_index_artifact, encode_block_blob_artifact,
-        encode_block_header_artifact, encode_block_transaction_index_artifact,
-        encode_block_value_pool_balances, encode_chain_epoch, encode_chain_event_envelope,
+        decode_block_value_pool_balances, decode_canonical_history_bounds, decode_chain_epoch,
+        decode_chain_event_envelope, decode_final_note_commitment_roots,
+        decode_mempool_event_envelope, decode_mempool_event_kind, decode_mempool_event_observed_at,
+        decode_mempool_event_position, decode_transaction_intrinsic_value_balances,
+        decode_transparent_output_block_index, encode_address_output_index_artifact,
+        encode_block_blob_artifact, encode_block_header_artifact,
+        encode_block_transaction_index_artifact, encode_block_value_pool_balances,
+        encode_canonical_history_bounds, encode_chain_epoch, encode_chain_event_envelope,
         encode_compact_block_artifact, encode_final_note_commitment_roots,
         encode_mempool_event_envelope, encode_subtree_root_artifact,
         encode_transaction_blob_artifact, encode_transaction_facts_artifact,
@@ -533,6 +534,9 @@ struct ReorgedCursorResume {
 
 /// Public Rust API used by `zinder-query` to read epoch-bound canonical data.
 pub trait ChainEpochReadApi {
+    /// Reads the durable boundary of intentionally retained canonical history.
+    fn canonical_history_bounds(&self) -> Result<Option<CanonicalHistoryBounds>, StoreError>;
+
     /// Opens a reader pinned to the currently visible chain epoch.
     fn current_chain_epoch_reader(&self) -> Result<ChainEpochReader<'_>, StoreError>;
 
@@ -603,6 +607,25 @@ impl PrimaryChainStore {
     /// Returns [`RawBlobRetention::None`] when the store predates the signal.
     pub fn raw_blob_retention(&self) -> Result<RawBlobRetention, StoreError> {
         read_raw_blob_retention_signal(self.store.inner.as_ref())
+    }
+
+    /// Reads the durable boundary of intentionally retained canonical history.
+    pub fn canonical_history_bounds(&self) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+        read_canonical_history_bounds(self.store.inner.as_ref())
+    }
+
+    /// Reconciles durable history bounds for a legacy store created before the bounds marker.
+    ///
+    /// Existing durable bounds are authoritative. An empty store remains unbounded until its
+    /// first commit. A non-empty store is classified as complete only when height 1 is readable;
+    /// otherwise a supplied checkpoint must match the artifactless first epoch and retained
+    /// boundary before checkpointed bounds are persisted.
+    pub fn reconcile_canonical_history_bounds(
+        &self,
+        configured_checkpoint: Option<BlockId>,
+    ) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+        self.store
+            .reconcile_canonical_history_bounds(configured_checkpoint)
     }
 
     /// Reads the height through which transparent-retention maintenance has deleted
@@ -717,6 +740,16 @@ impl PrimaryChainStore {
         artifacts: ChainEpochArtifacts,
     ) -> Result<ChainEpochCommitOutcome, StoreError> {
         let outcome = self.store.commit_chain_epoch(artifacts)?;
+        *self.cached_visible_chain_epoch.write() = Some(outcome.chain_epoch);
+        Ok(outcome)
+    }
+
+    /// Atomically bootstraps an empty store from an artifactless checkpoint epoch.
+    pub fn commit_artifactless_checkpoint(
+        &self,
+        chain_epoch: ChainEpoch,
+    ) -> Result<ChainEpochCommitOutcome, StoreError> {
+        let outcome = self.store.commit_artifactless_checkpoint(chain_epoch)?;
         *self.cached_visible_chain_epoch.write() = Some(outcome.chain_epoch);
         Ok(outcome)
     }
@@ -958,6 +991,11 @@ impl SecondaryChainStore {
         read_raw_blob_retention_signal(self.store.inner.as_ref())
     }
 
+    /// Reads the durable boundary of intentionally retained canonical history.
+    pub fn canonical_history_bounds(&self) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+        read_canonical_history_bounds(self.store.inner.as_ref())
+    }
+
     /// Reads the currently visible chain epoch.
     pub fn current_chain_epoch(&self) -> Result<Option<ChainEpoch>, StoreError> {
         self.store.current_chain_epoch()
@@ -1135,12 +1173,95 @@ impl ChainStoreInner {
             .transpose()
     }
 
+    fn reconcile_canonical_history_bounds(
+        &self,
+        configured_checkpoint: Option<BlockId>,
+    ) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+        let _control_guard = self.inner.lock_control();
+        if let Some(bounds) = read_persisted_canonical_history_bounds(self.inner.as_ref())? {
+            return Ok(Some(bounds));
+        }
+        let Some(current_epoch_id) = read_current_chain_epoch_id(self.inner.as_ref())? else {
+            return Ok(None);
+        };
+        let current_epoch = read_chain_epoch(self.inner.as_ref(), current_epoch_id)?;
+
+        match read_block_header_artifact(self.inner.as_ref(), current_epoch, BlockHeight::new(1)) {
+            Ok(Some(_)) => {
+                let bounds = CanonicalHistoryBounds::complete();
+                self.inner
+                    .write(vec![canonical_history_bounds_put(bounds)])?;
+                return Ok(Some(bounds));
+            }
+            Ok(None) | Err(StoreError::ArtifactMissing { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        let checkpoint = configured_checkpoint.ok_or(StoreError::CanonicalHistoryBoundsMissing)?;
+        let first_epoch = read_chain_epoch(self.inner.as_ref(), ChainEpochId::new(1))?;
+        if first_epoch.visible_tip_height != checkpoint.height
+            || first_epoch.visible_tip_hash != checkpoint.hash
+            || first_epoch.settled_tip_height != checkpoint.height
+            || first_epoch.settled_tip_hash != checkpoint.hash
+        {
+            return Err(StoreError::CanonicalHistoryBoundsReconciliation {
+                reason: "configured checkpoint does not match the first canonical epoch",
+            });
+        }
+        if current_epoch.visible_tip_height < checkpoint.height {
+            return Err(StoreError::CanonicalHistoryBoundsReconciliation {
+                reason: "current canonical tip is below the configured checkpoint",
+            });
+        }
+        match read_block_header_artifact(self.inner.as_ref(), first_epoch, checkpoint.height) {
+            Err(StoreError::ArtifactMissing { .. }) => {}
+            Ok(None) => {
+                return Err(StoreError::CanonicalHistoryBoundsReconciliation {
+                    reason: "checkpoint height is outside its first canonical epoch",
+                });
+            }
+            Ok(Some(_)) => {
+                return Err(StoreError::CanonicalHistoryBoundsReconciliation {
+                    reason: "configured checkpoint has a canonical block artifact",
+                });
+            }
+            Err(error) => return Err(error),
+        }
+
+        let bounds = CanonicalHistoryBounds::checkpointed(checkpoint).map_err(|_| {
+            StoreError::CanonicalHistoryBoundsReconciliation {
+                reason: "configured checkpoint height has no successor",
+            }
+        })?;
+        if current_epoch.visible_tip_height >= bounds.first_available_height() {
+            let boundary = read_block_header_artifact(
+                self.inner.as_ref(),
+                current_epoch,
+                bounds.first_available_height(),
+            )?
+            .ok_or(StoreError::CanonicalHistoryBoundsReconciliation {
+                reason: "first retained canonical block is unavailable",
+            })?;
+            if boundary.parent_hash != checkpoint.hash {
+                return Err(StoreError::CanonicalHistoryBoundsReconciliation {
+                    reason: "first retained canonical block does not connect to the checkpoint",
+                });
+            }
+        }
+
+        self.inner
+            .write(vec![canonical_history_bounds_put(bounds)])?;
+        Ok(Some(bounds))
+    }
+
     /// Opens a reader pinned to the currently visible chain epoch.
     fn current_chain_epoch_reader(&self) -> Result<ChainEpochReader<'_>, StoreError> {
         let read_view = self.read_view();
         let chain_epoch = require_current_chain_epoch(&read_view)?;
+        let canonical_history_bounds = require_canonical_history_bounds(&read_view)?;
         Ok(ChainEpochReader::current(
             chain_epoch,
+            canonical_history_bounds,
             read_view,
             self.secondary_visible_epoch.clone(),
         ))
@@ -1163,8 +1284,10 @@ impl ChainStoreInner {
     ) -> Result<ChainEpochReader<'_>, StoreError> {
         let read_view = self.read_view_for(caller);
         let chain_epoch = read_chain_epoch(&read_view, chain_epoch)?;
+        let canonical_history_bounds = require_canonical_history_bounds(&read_view)?;
         Ok(ChainEpochReader::at_epoch(
             chain_epoch,
+            canonical_history_bounds,
             read_view,
             self.secondary_visible_epoch.clone(),
         ))
@@ -1175,6 +1298,39 @@ impl ChainStoreInner {
         &self,
         artifacts: ChainEpochArtifacts,
     ) -> Result<ChainEpochCommitOutcome, StoreError> {
+        self.commit_chain_epoch_with_initial_bounds(artifacts, None)
+    }
+
+    fn commit_artifactless_checkpoint(
+        &self,
+        chain_epoch: ChainEpoch,
+    ) -> Result<ChainEpochCommitOutcome, StoreError> {
+        if chain_epoch.visible_tip_height != chain_epoch.settled_tip_height
+            || chain_epoch.visible_tip_hash != chain_epoch.settled_tip_hash
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "artifactless checkpoint visible and settled tips must match",
+            });
+        }
+        let checkpoint = BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+        let bounds = CanonicalHistoryBounds::checkpointed(checkpoint).map_err(|_| {
+            StoreError::InvalidChainEpochArtifacts {
+                reason: "artifactless checkpoint height must have a successor",
+            }
+        })?;
+        let checkpoint_height = chain_epoch.visible_tip_height;
+        let artifacts = ChainEpochArtifacts::new(chain_epoch, Vec::new(), Vec::new())
+            .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
+                height: checkpoint_height,
+            });
+        self.commit_chain_epoch_with_initial_bounds(artifacts, Some(bounds))
+    }
+
+    fn commit_chain_epoch_with_initial_bounds(
+        &self,
+        artifacts: ChainEpochArtifacts,
+        initial_bounds: Option<CanonicalHistoryBounds>,
+    ) -> Result<ChainEpochCommitOutcome, StoreError> {
         let _control_guard = self.inner.lock_control();
         let commit_read_view = self
             .inner
@@ -1183,6 +1339,7 @@ impl ChainStoreInner {
         let store_metadata_put =
             validate_store_metadata_for_commit(&self.inner, artifacts.chain_epoch.network)?;
         let current_chain_epoch = self.validate_commit_order(&artifacts.chain_epoch)?;
+        validate_initial_canonical_history_commit(&artifacts, current_chain_epoch, initial_bounds)?;
         validate_reorg_window_change(&artifacts, current_chain_epoch, self.options)?;
         validate_visible_chain_commit(&self.inner, &artifacts, current_chain_epoch)?;
         let event_sequence = self
@@ -1211,6 +1368,11 @@ impl ChainStoreInner {
             cursor_auth_key: self.cursor_auth_key,
         })?;
         let mut puts = build_chain_epoch_puts(artifacts, &event_envelope)?;
+        if let Some(bounds_put) =
+            initial_canonical_history_bounds_put(current_chain_epoch, initial_bounds)?
+        {
+            puts.push(bounds_put);
+        }
         puts.extend(build_displaced_block_archive_puts_for_change(
             self.inner.as_ref(),
             current_chain_epoch,
@@ -2467,6 +2629,10 @@ fn validate_stored_block_value_pool_balances(
 }
 
 impl ChainEpochReadApi for PrimaryChainStore {
+    fn canonical_history_bounds(&self) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+        self.canonical_history_bounds()
+    }
+
     fn current_chain_epoch_reader(&self) -> Result<ChainEpochReader<'_>, StoreError> {
         self.current_chain_epoch_reader()
     }
@@ -2502,6 +2668,10 @@ impl ChainEpochReadApi for PrimaryChainStore {
 }
 
 impl ChainEpochReadApi for SecondaryChainStore {
+    fn canonical_history_bounds(&self) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+        self.canonical_history_bounds()
+    }
+
     fn current_chain_epoch_reader(&self) -> Result<ChainEpochReader<'_>, StoreError> {
         self.current_chain_epoch_reader()
     }
@@ -3615,6 +3785,90 @@ fn collect_settled_spend_sweep_deletes(
         swept_outpoints,
         swept_through,
     })
+}
+
+fn canonical_history_bounds_put(bounds: CanonicalHistoryBounds) -> StoragePut {
+    StoragePut {
+        table: StorageTable::StorageControl,
+        key: StoreKey::canonical_history_bounds(),
+        value: encode_canonical_history_bounds(bounds),
+    }
+}
+
+fn initial_canonical_history_bounds_put(
+    current_chain_epoch: Option<ChainEpoch>,
+    initial_bounds: Option<CanonicalHistoryBounds>,
+) -> Result<Option<StoragePut>, StoreError> {
+    if current_chain_epoch.is_none() {
+        let bounds = initial_bounds.unwrap_or_else(CanonicalHistoryBounds::complete);
+        return Ok(Some(canonical_history_bounds_put(bounds)));
+    }
+    if initial_bounds.is_some() {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "artifactless checkpoint requires an empty canonical store",
+        });
+    }
+    Ok(None)
+}
+
+fn validate_initial_canonical_history_commit(
+    artifacts: &ChainEpochArtifacts,
+    current_chain_epoch: Option<ChainEpoch>,
+    initial_bounds: Option<CanonicalHistoryBounds>,
+) -> Result<(), StoreError> {
+    if current_chain_epoch.is_some() || initial_bounds.is_some() {
+        return Ok(());
+    }
+    let first_required_height = if artifacts.chain_epoch.visible_tip_height == BlockHeight::new(0) {
+        BlockHeight::new(0)
+    } else {
+        BlockHeight::new(1)
+    };
+    if artifacts
+        .block_headers
+        .iter()
+        .any(|header| header.height == first_required_height)
+    {
+        return Ok(());
+    }
+    Err(StoreError::InvalidChainEpochArtifacts {
+        reason: "first complete-history commit must include the first canonical block header",
+    })
+}
+
+fn read_persisted_canonical_history_bounds(
+    inner: &impl RocksChainStoreRead,
+) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+    let key = StoreKey::canonical_history_bounds();
+    inner
+        .get(StorageTable::StorageControl, &key)?
+        .map(|bytes| decode_canonical_history_bounds(&bytes))
+        .transpose()
+}
+
+pub(crate) fn read_canonical_history_bounds(
+    inner: &impl RocksChainStoreRead,
+) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
+    if let Some(bounds) = read_persisted_canonical_history_bounds(inner)? {
+        return Ok(Some(bounds));
+    }
+    let Some(current_epoch_id) = read_current_chain_epoch_id(inner)? else {
+        return Ok(None);
+    };
+    let current_epoch = read_chain_epoch(inner, current_epoch_id)?;
+    match read_block_header_artifact(inner, current_epoch, BlockHeight::new(1)) {
+        Ok(Some(_)) => Ok(Some(CanonicalHistoryBounds::complete())),
+        Ok(None) | Err(StoreError::ArtifactMissing { .. }) => {
+            Err(StoreError::CanonicalHistoryBoundsMissing)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn require_canonical_history_bounds(
+    inner: &impl RocksChainStoreRead,
+) -> Result<CanonicalHistoryBounds, StoreError> {
+    read_canonical_history_bounds(inner)?.ok_or(StoreError::CanonicalHistoryBoundsMissing)
 }
 
 fn encode_raw_blob_retention_signal(retention: RawBlobRetention) -> Vec<u8> {
@@ -4880,6 +5134,159 @@ mod tests {
                 Err(StoreError::ArtifactCorrupt { .. })
             ));
         }
+    }
+
+    #[test]
+    fn reconciliation_persists_complete_bounds_for_a_legacy_full_store()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+        let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+        store.commit_chain_epoch(ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block],
+            vec![compact_block],
+        ))?;
+        store.store.inner.delete(
+            StorageTable::StorageControl,
+            &StoreKey::canonical_history_bounds(),
+        )?;
+
+        assert_eq!(
+            store.canonical_history_bounds()?,
+            Some(CanonicalHistoryBounds::complete())
+        );
+        assert_eq!(
+            store.reconcile_canonical_history_bounds(None)?,
+            Some(CanonicalHistoryBounds::complete())
+        );
+        assert_eq!(
+            read_persisted_canonical_history_bounds(store.store.inner.as_ref())?,
+            Some(CanonicalHistoryBounds::complete())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_requires_explicit_matching_checkpoint_for_a_legacy_checkpoint_store()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+        let checkpoint_epoch = ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(20),
+            visible_tip_hash: block_hash(20),
+            settled_tip_height: BlockHeight::new(20),
+            settled_tip_hash: block_hash(20),
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1),
+        };
+        store.commit_artifactless_checkpoint(checkpoint_epoch)?;
+        let (next_epoch, next_block, next_compact_block) =
+            synthetic_epoch_with_hash_seed(2, 21, 21, 20);
+        store.commit_chain_epoch(ChainEpochArtifacts::new(
+            next_epoch,
+            vec![next_block],
+            vec![next_compact_block],
+        ))?;
+        store.store.inner.delete(
+            StorageTable::StorageControl,
+            &StoreKey::canonical_history_bounds(),
+        )?;
+
+        assert!(matches!(
+            store.canonical_history_bounds(),
+            Err(StoreError::CanonicalHistoryBoundsMissing)
+        ));
+        assert!(matches!(
+            store.reconcile_canonical_history_bounds(None),
+            Err(StoreError::CanonicalHistoryBoundsMissing)
+        ));
+
+        let checkpoint = BlockId::new(BlockHeight::new(20), block_hash(20));
+        let expected = CanonicalHistoryBounds::checkpointed(checkpoint)?;
+        assert_eq!(
+            store.reconcile_canonical_history_bounds(Some(checkpoint))?,
+            Some(expected)
+        );
+        assert_eq!(
+            read_persisted_canonical_history_bounds(store.store.inner.as_ref())?,
+            Some(expected)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_mismatched_legacy_checkpoint_without_persisting()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+        let checkpoint_epoch = ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(20),
+            visible_tip_hash: block_hash(20),
+            settled_tip_height: BlockHeight::new(20),
+            settled_tip_hash: block_hash(20),
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1),
+        };
+        store.commit_artifactless_checkpoint(checkpoint_epoch)?;
+        store.store.inner.delete(
+            StorageTable::StorageControl,
+            &StoreKey::canonical_history_bounds(),
+        )?;
+
+        assert!(matches!(
+            store.reconcile_canonical_history_bounds(Some(BlockId::new(
+                BlockHeight::new(20),
+                block_hash(99),
+            ))),
+            Err(StoreError::CanonicalHistoryBoundsReconciliation { .. })
+        ));
+        assert_eq!(
+            read_persisted_canonical_history_bounds(store.store.inner.as_ref())?,
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn missing_retained_full_history_row_is_not_treated_as_intentional_truncation()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+        let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+        store.commit_chain_epoch(ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block],
+            vec![compact_block],
+        ))?;
+        store.store.inner.delete(
+            StorageTable::BlockHeader,
+            &StoreKey::block_header(
+                Network::ZcashRegtest,
+                ChainEpochId::new(1),
+                BlockHeight::new(1),
+            ),
+        )?;
+
+        let reader = store.current_chain_epoch_reader()?;
+        assert!(matches!(
+            reader.block_header_at(BlockHeight::new(1)),
+            Err(StoreError::ArtifactMissing {
+                family: ArtifactFamily::BlockHeader,
+                ..
+            })
+        ));
+
+        Ok(())
     }
 
     #[test]
