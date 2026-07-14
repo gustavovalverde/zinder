@@ -22,9 +22,9 @@ ordered finalize/commit stage.
 
 ```text
 ordered source segment
-  -> parallel derive_block / block prepare on the blocking pool
+  -> parallel prepare_canonical_block on the blocking pool
   -> ordered windowed transparent-prevout resolution
-  -> ordered finalize_derived_block fold
+  -> ordered finalize_canonical_block fold
   -> canonical commit
 ```
 

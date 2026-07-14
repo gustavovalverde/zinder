@@ -8,15 +8,25 @@ will persist immutable, block-local facts and recovery events. It will not
 maintain address indexes, a global transparent-output lookup, spent-output
 state, rankings, distributions, or product views while catching up.
 
-This is an ownership correction, not a new distributed system. A default
-deployment remains one process group on one VM and one volume. Canonical,
-wallet, and explorer state use separate RocksDB paths and independent readiness
-positions. Operators may place those paths on separate volumes without changing
-the data contracts.
+This is an ownership correction and a measured storage selection, not a new
+distributed system. A default deployment remains one application group, but
+canonical ingest, projection construction, and query serving keep independent
+credentials, readiness, and restart ownership. Canonical, wallet, and explorer
+state are separate durability roles whether the selected topology maps them to
+Postgres schemas or keeps canonical truth in RocksDB. Physical paths, schemas,
+and process placement do not change the data contracts.
+
+[ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) owns the
+selection gate. A fact-first RocksDB control and a block-granular Postgres
+candidate must consume the same captured facts and pass the same lifecycle and
+correctness checks. Postgres is preferred only if it meets the hard canonical
+construction gate; otherwise RocksDB remains canonical while Postgres owns the
+wallet and explorer projections. The comparison does not create a permanent
+multi-backend adapter surface.
 
 ## Decision
 
-The architecture has three durable stores and two protocol edges:
+The architecture has three durable data planes and two protocol edges:
 
 ```mermaid
 flowchart LR
@@ -39,9 +49,9 @@ flowchart LR
     ExplorerQuery --> Cipherscan
 ```
 
-The stores have distinct responsibilities:
+The data planes have distinct responsibilities:
 
-| Store | Owns | Does not own |
+| Data plane | Owns | Does not own |
 | --- | --- | --- |
 | Canonical | Chain epochs, block identity, transaction order and location, immutable transaction facts, compact blocks, tree state, subtree roots, chain and mempool events, optional raw blobs, and sequential replay rows | Global transparent-output state, address indexes, spent-output lookup, wallet balances, explorer summaries, rankings, distributions, or product data |
 | Wallet projection | Live transparent outputs, address-to-live-output index, address balance, durable spent-outpoint lookup, address transaction history, bounded reorg undo, projection cursor, and coverage fence | Canonical truth, explorer analytics, source-node RPCs, or per-wallet private state |
@@ -85,10 +95,11 @@ second and prevout resolution fell to about `0.04` seconds without an
 architectural or resource change.
 
 The wallet-only trial reached the same conclusion from a different range. It
-disabled unrelated explorer projections, kept derive and historical work gated
-during bulk catchup, and still became commit-bound with low CPU usage. The
-projection preset reduced future derive work, but it could not remove the
-transparent read model embedded in canonical ingest.
+disabled unrelated explorer projections, kept the legacy `zinder-derive`
+replay and historical work gated during bulk catchup, and still became
+commit-bound with low CPU usage. The projection preset reduced future legacy
+projection work, but it could not remove the transparent read model embedded
+in canonical ingest.
 
 The broad post-NU5 sandblasting workload band is approximately
 `1702296..2175692`. It contains several transaction shapes, and earlier history
@@ -106,11 +117,12 @@ The accepted tuning work remains useful:
   feedback invalidates their plan;
 - canonical batches close before the next block would exceed artifact or
   estimated-write budgets;
-- canonical catchup, derive replay, and historical backfills do not compete on
-  the default single-volume deployment;
+- canonical catchup, legacy `zinder-derive` replay, and historical backfills do
+  not compete on the default single-volume deployment;
 - RocksDB maintenance controls and per-column-family metrics expose flush,
   compaction, and write-stall behavior; and
-- derive startup always hands replay to the asynchronous tailer.
+- legacy `zinder-derive` startup always hands projection replay to the
+  asynchronous tailer.
 
 These controls bound work and make failures observable. They do not change the
 fact that the canonical writer performs wallet projection work. Treating a
@@ -126,7 +138,15 @@ smaller and easier to operate than abstracting every database operation.
 ## Canonical Fact Contract
 
 Canonical ingest parses a block once and emits immutable rows that can be read
-in block order. The target hot schema is:
+in block order. The first implementation seam is the in-memory
+`CanonicalBlockFacts` value. Its explicitly tagged, versioned reference digest
+defines the shared correctness oracle for the future RocksDB and Postgres
+candidate drivers without imposing either engine's physical encoding. The
+current RocksDB writer still expands that value into the existing schema;
+removing its cross-block reads and projection-owned writes is the next schema
+slice, not a performance claim for this seam alone.
+
+The target hot schema is:
 
 | Fact | Key | Purpose |
 | --- | --- | --- |
@@ -150,6 +170,19 @@ that a structure-of-arrays representation improves decoding and cache locality,
 that representation belongs inside this replay envelope or an in-memory replay
 window. It does not justify a new public abstraction or storage plane.
 
+`CanonicalBlockFacts` is the backend-neutral Rust aggregate, not a physical
+schema version. `CanonicalBlockFactsDigestVersion` versions only its
+deterministic reference-digest encoding. Version 1 commits every current field
+through explicit numeric tags, length prefixes, option-presence bytes, ordered
+vector boundaries, and fixed little-endian integers. The aggregate owns one
+block header, optional raw block bytes, and ordered `CanonicalTransactionFacts`;
+each transaction owns its public facts, intrinsic balances, transparent inputs
+and outputs, and optional raw bytes. Candidate drivers will compare both
+per-block digests and the ordered full-sequence digest; that path is not yet
+wired into `zinder-bench`. Once wired, changing a fact, its order, or
+the digest contract will change the evidence independently of the RocksDB or
+Postgres schema revision.
+
 Canonical ingest follows one ordered contract:
 
 ```text
@@ -170,14 +203,16 @@ Wallet replay is one ordered transparent-state machine over canonical replay
 facts. For each bounded block window it:
 
 1. resolves same-block and same-window outputs in memory;
-2. performs one sorted, deduplicated `MultiGet` for remaining inputs against the
-   live-output set, which contains only currently unspent outputs;
+2. performs one sorted, deduplicated set-oriented lookup for remaining inputs
+   against the live-output set, which contains only currently unspent outputs;
+   a RocksDB implementation uses `MultiGet`, while Postgres uses a set-valued
+   query or temporary input relation;
 3. deletes consumed live outputs and their address index entries;
 4. inserts created live outputs and updates address balances;
 5. appends durable spent-outpoint and address-history rows;
 6. records the inverse delta needed for reorgs inside the supported window; and
 7. commits all rows, the authenticated chain-event cursor, the projection tip,
-   and coverage in one write batch.
+   and coverage in one storage transaction.
 
 This changes the asymptotic storage problem. Historical input resolution no
 longer searches every output ever created. It searches the smaller live UTXO
@@ -211,9 +246,11 @@ to explorer projections. This keeps expensive scans and compactions out of both
 canonical catchup and wallet readiness.
 
 `zinder-explorer` is a reader and API service. It does not become another
-indexer. `zinder-ingest` may host the projection runners initially because it
-already owns durable cursor advancement. Splitting the runner into another
-process is justified only if measured resource isolation requires it later.
+indexer. `zinder-ingest` remains source-to-canonical only. An independent
+`zinder-projector` process owns build, verify, catch-up, follow, and promotion
+for one selected projection. The default application group may colocate these
+processes, but process, credential, readiness, and restart boundaries remain
+explicit.
 
 ## Consumer and Data Matrix
 
@@ -237,19 +274,15 @@ current-height claim for missing data.
 
 ## Deployment and Scheduling
 
-The default layout is intentionally simple:
+The preferred production topology uses one Postgres database per Zcash network
+with `canonical`, `wallet`, and `explorer` schemas. Canonical ingest receives a
+canonical-writer role, each projector receives only its owned schema plus the
+fact-reading contract it consumes, and query services receive read-only roles.
+The measured fallback keeps only canonical truth under a RocksDB path and uses
+the same Postgres projection schemas. The losing canonical candidate is removed
+before general availability; backend choice is not a runtime product matrix.
 
-```text
-/var/lib/zinder/canonical
-/var/lib/zinder/projections/wallet
-/var/lib/zinder/projections/explorer   # complete preset only
-```
-
-All three paths may live on one volume. Operators may mount the projection root
-or each projection group on another volume. Path placement must not alter
-schema identity, cursors, backup manifests, or API behavior.
-
-The default single-volume schedule is exclusive:
+Fresh construction is resource-exclusive by default:
 
 1. canonical `BulkCatchup` owns the ingest budget;
 2. after canonical reaches `FollowingTip`, wallet replay drains;
@@ -258,10 +291,10 @@ The default single-volume schedule is exclusive:
 5. low-priority historical backfills run only after their owning projection is
    current.
 
-Separate volumes permit bounded overlap only after measurements prove that
-canonical latency and memory remain unaffected. A projection handoff may use a
-bounded in-memory notification for low latency, but the durable chain-event
-cursor is always the recovery contract. A slow or failed projection can never
+Bounded overlap is permitted only after measurements prove that canonical
+latency and memory remain unaffected. A projection handoff may use a bounded
+in-memory notification for low latency, but the durable chain-event cursor is
+always the recovery contract. A slow or failed projection can never
 backpressure or roll back a committed canonical epoch.
 
 Backups record canonical, wallet, and explorer checkpoints independently. A
@@ -275,9 +308,9 @@ The current branch set is consolidated by behavior, not by branch name:
 
 | Disposition | Work |
 | --- | --- |
-| Keep | Projection workload presets, canonical history bounds, projection-aware capabilities, replay benchmarks, RocksDB maintenance controls and metrics, adaptive source admission, bounded canonical batches, asynchronous derive startup, authenticated projection read fences, recovery checks, and client network validation |
-| Redesign | Canonical transparent-output, address-output, and spend-fact ownership; one combined derive database for wallet and explorer workloads; direct query assumptions that these canonical indexes are always present |
-| Drop | The large generic storage/topology rewrite, duplicate rescue and salvage branches after their accepted commits are represented on `main`, stale detached worktrees, and height-specific incident modes |
+| Keep | Canonical history bounds, projection-aware capabilities, replay benchmarks, engine-specific maintenance controls and metrics, adaptive source admission, bounded canonical batches, authenticated projection read fences, recovery checks, and client network validation |
+| Redesign | Canonical transparent-output, address-output, and spend-fact ownership; the legacy combined `zinder-derive` database for wallet and explorer workloads; direct query assumptions that these canonical indexes are always present |
+| Drop | Projection presets as a persistent storage API, the large generic storage/topology rewrite, duplicate rescue and salvage branches after their accepted commits are represented on `main`, stale detached worktrees, and height-specific incident modes |
 | Reconcile separately | Portable Cipherscan operator documentation that is newer than the already-merged compatibility implementation |
 
 No branch or worktree with uncommitted unique changes is removed before those
@@ -290,8 +323,8 @@ are ancestors of `main` or their rejected status is recorded here.
 
 ### 1. Consolidate and lock contracts
 
-- merge the accepted preset, RocksDB, catchup, query-fence, recovery, benchmark,
-  and client correctness work;
+- merge the accepted catchup, query-fence, recovery, benchmark, and client
+  correctness work;
 - retain the native `WalletQuery` and `ExplorerQuery` method contracts;
 - preserve the lightwalletd and Cipherscan compatibility boundaries; and
 - add benchmark fixtures for the transparent-input stress anchors, NU5
@@ -299,7 +332,8 @@ are ancestors of `main` or their rejected status is recorded here.
 
 ### 2. Introduce canonical schema vNext
 
-- add `block_replay_facts` and make its encoding versioned;
+- persist the `CanonicalBlockFacts` replay envelope and make its storage
+  encoding versioned;
 - stop writing canonical address, live-output, and spent-output read models;
 - remove cross-block prevout reads from canonical preparation;
 - keep the existing canonical schema readable only for controlled export or
@@ -330,8 +364,8 @@ are ancestors of `main` or their rejected status is recorded here.
 
 Acceptance is a fresh mainnet replay, not a synthetic microbenchmark alone:
 
-- canonical catchup crosses every workload anchor with derive and historical
-  work closed;
+- canonical catchup crosses every workload anchor with legacy `zinder-derive`
+  replay and historical work closed;
 - canonical throughput no longer correlates with store-backed historical
   prevout requests because that metric is zero in canonical ingest;
 - wallet replay crosses the transparent-input and sandblasting ranges without
@@ -346,8 +380,8 @@ Acceptance is a fresh mainnet replay, not a synthetic microbenchmark alone:
 ## Guardrails
 
 - Do not add a sandblasting runtime mode or height-specific storage semantics.
-- Do not introduce a generic database adapter before a second concrete backend
-  exists with a proven contract.
+- Do not introduce a generic database adapter. Compare concrete canonical and
+  projection implementations through domain contracts.
 - Do not let projection lag delay canonical commit.
 - Do not advertise projection-backed capabilities from height alone.
 - Do not let compatibility JSON or protobuf shapes become canonical tables.
@@ -360,11 +394,12 @@ Acceptance is a fresh mainnet replay, not a synthetic microbenchmark alone:
 ## Related Documents
 
 - [Zcash chain workload eras](zcash-chain-workload-eras.md)
-- [Derive plane](derive-plane.md)
+- [Legacy derive plane](derive-plane.md)
 - [Wallet data plane](wallet-data-plane.md)
 - [Explorer plane](explorer-plane.md)
 - [Protocol boundary](protocol-boundary.md)
 - [Public interfaces](public-interfaces.md)
 - [ADR-0022: resource-budgeted bulk catchup](../adrs/0022-resource-budgeted-bulk-catchup.md)
+- [ADR-0035: fact-first storage selection and lifecycle targets](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
 - [Integration surfaces](../reference/integration-surfaces.md)
 - [Cipherscan adapter architecture](../plans/cipherscan-adapter-architecture.md)

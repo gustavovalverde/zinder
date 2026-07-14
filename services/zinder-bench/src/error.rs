@@ -37,12 +37,12 @@ pub enum BenchError {
         #[source]
         source: zinder_source::SourceError,
     },
-    /// Canonical artifact derivation failed while measuring fixture density.
-    #[error("artifact derivation error: {source}")]
-    ArtifactDerive {
-        /// Underlying deterministic block-derivation failure.
+    /// Canonical block construction failed while measuring fixture density.
+    #[error("canonical block construction error: {source}")]
+    CanonicalBlockConstruction {
+        /// Underlying deterministic block-construction failure.
         #[source]
-        source: Box<zinder_ingest::ArtifactDeriveError>,
+        source: Box<zinder_ingest::CanonicalBlockConstructionError>,
     },
     /// The bulk-catchup pipeline returned an error during replay.
     #[error("ingest error: {source}")]
@@ -58,12 +58,24 @@ pub enum BenchError {
         #[source]
         source: zinder_store::StoreError,
     },
-    /// A derive-store operation failed while driving derive replay.
-    #[error("derive store error: {source}")]
-    Derive {
-        /// Underlying derive-store failure.
+    /// A projection-store operation failed while constructing projections.
+    #[error("projection store error: {source}")]
+    Projection {
+        /// Underlying projection-store failure.
         #[source]
         source: zinder_derive::DeriveStoreError,
+    },
+    /// Projection construction returned without reaching the canonical event tip.
+    #[error("projection build incomplete: {reason}")]
+    ProjectionBuildIncomplete {
+        /// Consumer cursor mismatch that prevents a completed build claim.
+        reason: String,
+    },
+    /// The starting checkpoint manifest was missing, malformed, or inconsistent.
+    #[error("starting checkpoint manifest error: {reason}")]
+    StartingCheckpointManifest {
+        /// Manifest requirement or logical-position mismatch.
+        reason: String,
     },
     /// The Prometheus recorder could not be installed.
     #[error("metrics recorder error: {reason}")]
@@ -75,6 +87,24 @@ pub enum BenchError {
     #[error("invalid argument: {reason}")]
     InvalidArgument {
         /// Human-readable description of the rejection.
+        reason: String,
+    },
+    /// One or more configured acceptance hard limits were missed.
+    #[error("acceptance hard limit missed for measured boundary: {boundary}")]
+    AcceptanceHardLimitMissed {
+        /// Stable report field name for the boundary that missed its limit.
+        boundary: String,
+    },
+    /// A thresholded acceptance report lacks required telemetry coverage.
+    #[error("acceptance telemetry missing for: {families}")]
+    AcceptanceTelemetryMissing {
+        /// Stable names for the absent report evidence.
+        families: String,
+    },
+    /// A thresholded replay did not prove the requested fixture range completed.
+    #[error("acceptance completion evidence mismatch: {reason}")]
+    AcceptanceCompletionMismatch {
+        /// Human-readable mismatch between fixture and final canonical state.
         reason: String,
     },
 }
@@ -91,9 +121,9 @@ impl From<zinder_source::SourceError> for BenchError {
     }
 }
 
-impl From<zinder_ingest::ArtifactDeriveError> for BenchError {
-    fn from(source: zinder_ingest::ArtifactDeriveError) -> Self {
-        Self::ArtifactDerive {
+impl From<zinder_ingest::CanonicalBlockConstructionError> for BenchError {
+    fn from(source: zinder_ingest::CanonicalBlockConstructionError) -> Self {
+        Self::CanonicalBlockConstruction {
             source: Box::new(source),
         }
     }
@@ -113,7 +143,7 @@ impl From<zinder_store::StoreError> for BenchError {
 
 impl From<zinder_derive::DeriveStoreError> for BenchError {
     fn from(source: zinder_derive::DeriveStoreError) -> Self {
-        Self::Derive { source }
+        Self::Projection { source }
     }
 }
 
@@ -139,6 +169,46 @@ impl BenchError {
     #[must_use]
     pub fn invalid_argument(reason: impl Into<String>) -> Self {
         Self::InvalidArgument {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a hard-limit error for one measured acceptance boundary.
+    #[must_use]
+    pub fn acceptance_hard_limit_missed(boundary: impl Into<String>) -> Self {
+        Self::AcceptanceHardLimitMissed {
+            boundary: boundary.into(),
+        }
+    }
+
+    /// Builds an error for missing thresholded-acceptance telemetry.
+    #[must_use]
+    pub fn acceptance_telemetry_missing(families: impl Into<String>) -> Self {
+        Self::AcceptanceTelemetryMissing {
+            families: families.into(),
+        }
+    }
+
+    /// Builds an error for incomplete or mismatched fixture replay evidence.
+    #[must_use]
+    pub fn acceptance_completion_mismatch(reason: impl Into<String>) -> Self {
+        Self::AcceptanceCompletionMismatch {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds an incomplete-projection error from a cursor mismatch.
+    #[must_use]
+    pub fn projection_build_incomplete(reason: impl Into<String>) -> Self {
+        Self::ProjectionBuildIncomplete {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a starting-checkpoint manifest error.
+    #[must_use]
+    pub fn starting_checkpoint_manifest(reason: impl Into<String>) -> Self {
+        Self::StartingCheckpointManifest {
             reason: reason.into(),
         }
     }

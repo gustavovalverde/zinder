@@ -363,7 +363,7 @@ mod tests {
     use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
     use super::*;
-    use crate::{CommitmentTreeSizes, derive_block, finalize_derived_block};
+    use crate::{CommitmentTreeSizes, finalize_canonical_block, prepare_canonical_block};
 
     struct FixtureSource {
         block: SourceBlock,
@@ -451,10 +451,17 @@ mod tests {
     async fn preserved_store_startup_hydrates_missing_intrinsic_facts_from_source()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         let source_block = regtest_fixture_block()?;
-        let derived = derive_block(&source_block, &sample_regtest_upgrade_activations())?;
+        let prepared =
+            prepare_canonical_block(&source_block, &sample_regtest_upgrade_activations())?;
         let mut tree_sizes = CommitmentTreeSizes::default();
-        let built = finalize_derived_block(derived, &mut tree_sizes)?;
-        assert!(!built.transaction_intrinsic_value_balances.is_empty());
+        let block = finalize_canonical_block(prepared, &mut tree_sizes)?;
+        let current_schema_artifacts =
+            crate::artifact_builder::expand_current_schema_block_artifacts(block.facts)?;
+        assert!(
+            !current_schema_artifacts
+                .transaction_intrinsic_value_balances
+                .is_empty()
+        );
 
         let fixture = StoreFixture::open()?;
         let chain_store = fixture.chain_store().clone();
@@ -466,19 +473,19 @@ mod tests {
             settled_tip_height: BlockHeight::new(0),
             settled_tip_hash: source_block.parent_hash,
             artifact_schema_version: ArtifactSchemaVersion::new(12),
-            tip_metadata: built.tip_metadata,
+            tip_metadata: block.tip_metadata,
             created_at: UnixTimestampMillis::new(1_774_669_000_000),
         };
         chain_store.commit_chain_epoch(
             ChainEpochArtifacts::new(
                 chain_epoch,
-                vec![built.block_header],
-                vec![built.compact_block],
+                vec![current_schema_artifacts.block_header],
+                vec![block.compact_block],
             )
-            .with_block_transaction_index(built.block_transaction_index)
-            .with_transaction_locations(built.transaction_locations)
-            .with_transaction_facts(built.transaction_facts)
-            .with_transaction_blobs(built.transaction_blobs),
+            .with_block_transaction_index(current_schema_artifacts.block_transaction_index)
+            .with_transaction_locations(current_schema_artifacts.transaction_locations)
+            .with_transaction_facts(current_schema_artifacts.transaction_facts)
+            .with_transaction_blobs(current_schema_artifacts.transaction_blobs),
         )?;
         let transaction_id = chain_store
             .current_chain_epoch_reader()?

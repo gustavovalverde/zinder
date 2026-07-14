@@ -15,7 +15,7 @@ use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, ChainStoreOptions, PrimaryChainStore,
 };
 
-use crate::artifact_builder::{RawBlobPolicy, derive_block_with_raw_blob_policy};
+use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block_with_raw_blob_policy};
 use crate::chain_ingest::{IngestError, NodeSourceKind, current_unix_millis};
 use crate::phase::current_chain_height;
 use crate::source_recovery::{
@@ -31,7 +31,7 @@ use source_fetch::SourceSegmentSizer;
 use watermark::record_stage_duration;
 
 #[cfg(test)]
-use crate::artifact_builder::{CommitmentTreeSizes, DerivedBlockArtifacts};
+use crate::artifact_builder::{CommitmentTreeSizes, PreparedCanonicalBlock};
 
 mod abort_on_drop;
 mod block_prepare;
@@ -94,15 +94,15 @@ pub struct BulkCatchupRunConfig {
     pub source_fetch_max_in_flight_requests: NonZeroU32,
     /// Maximum reserved response bytes across source segment requests.
     pub source_fetch_max_in_flight_bytes: NonZeroU64,
-    /// Number of parallel `derive_block` invocations kept in flight on the
-    /// Tokio blocking pool. Per-block derivation is CPU-bound (block
+    /// Number of parallel `prepare_canonical_block` invocations kept in flight on the
+    /// Tokio blocking pool. Per-block construction is CPU-bound (block
     /// deserialization, per-tx canonical re-serialization, compact-block
     /// proto encoding, per-output `SHA256(script_pub_key)`); parallelism
     /// scales nearly linearly with cores up to the commit-batch boundary.
     /// Operator-tunable via `ingest.bulk_catchup.block_prepare_concurrency`.
     /// See [ADR-0021](../../../../docs/adrs/0021-parallel-block-derivation.md).
     pub block_prepare_concurrency: NonZeroU32,
-    /// Maximum reserved derived artifact bytes across active and completed
+    /// Maximum reserved prepared block bytes across active and completed
     /// block-prepare work.
     pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
     /// Maximum safe-tip artifact bytes that can accumulate while the previous
@@ -513,8 +513,12 @@ where
             let activations = Arc::clone(&network_upgrade_activations);
             async move {
                 tokio::task::spawn_blocking(move || {
-                    derive_block_with_raw_blob_policy(&source_block, &activations, raw_blob_policy)
-                        .map_err(IngestError::from)
+                    prepare_canonical_block_with_raw_blob_policy(
+                        &source_block,
+                        &activations,
+                        raw_blob_policy,
+                    )
+                    .map_err(IngestError::from)
                 })
                 .await
                 .map_err(|join_error| IngestError::BlockingTaskFailed {
@@ -598,14 +602,16 @@ fn record_bulk_pipeline_stage_duration(
 }
 
 #[cfg(test)]
-async fn bulk_catchup_from_source_with_mock_derive<Source, F>(
+async fn bulk_catchup_from_source_with_mock_prepare<Source, F>(
     config: &BulkCatchupRunConfig,
     source: &Source,
-    derive_fn: F,
+    prepare_fn: F,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
     Source: NodeSource + Clone,
-    F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
+    F: Fn(
+            &zinder_source::SourceBlock,
+        ) -> Result<PreparedCanonicalBlock, crate::CanonicalBlockConstructionError>
         + Clone
         + Send
         + Sync
@@ -623,11 +629,11 @@ where
     )?;
 
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
-    bulk_catchup_from_source_with_store_using_derive_fn(
+    bulk_catchup_from_source_with_store_using_prepare_fn(
         config,
         source,
         &store,
-        derive_fn,
+        prepare_fn,
         BulkCatchupStart {
             from_height: config.from_height,
             initial_tip_metadata: ChainTipMetadata::empty(),
@@ -639,18 +645,20 @@ where
 #[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
-    reason = "test seam mirrors the production bulk-catchup path plus an injected derive function"
+    reason = "test seam mirrors the production bulk-catchup path plus injected canonical preparation"
 )]
-async fn bulk_catchup_from_source_with_store_using_derive_fn<Source, F>(
+async fn bulk_catchup_from_source_with_store_using_prepare_fn<Source, F>(
     config: &BulkCatchupRunConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    derive_fn: F,
+    prepare_fn: F,
     bulk_catchup_start: BulkCatchupStart,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
     Source: NodeSource + Clone,
-    F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
+    F: Fn(
+            &zinder_source::SourceBlock,
+        ) -> Result<PreparedCanonicalBlock, crate::CanonicalBlockConstructionError>
         + Clone
         + Send
         + Sync
@@ -681,8 +689,8 @@ where
             store: store.clone(),
         },
         move |source_block| {
-            let derive_fn = derive_fn.clone();
-            async move { derive_fn(&source_block).map_err(IngestError::from) }
+            let prepare_fn = prepare_fn.clone();
+            async move { prepare_fn(&source_block).map_err(IngestError::from) }
         },
     );
 
@@ -703,7 +711,7 @@ struct BulkCatchupStart {
     initial_tip_metadata: ChainTipMetadata,
 }
 
-/// Seeds an empty store with a stub chain epoch derived from the operator's
+/// Seeds an empty store with a stub chain epoch built from the operator's
 /// checkpoint, so bulk catchup can start at `checkpoint.height + 1` without
 /// replaying every block from genesis.
 ///
@@ -862,11 +870,11 @@ mod tests {
     use parking_lot::Mutex;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockHash, BlockId, ConsensusBranchId, NetworkUpgradeActivation, SUBTREE_LEAF_COUNT,
-        ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, TransactionFactsArtifact,
-        TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
-        TransparentOutPoint, TransparentOutputArtifact, TransparentUnspentOutput,
-        UnixTimestampMillis, wire::encode_internal_block_hash,
+        BlockHash, BlockId, CanonicalTransactionFacts, ConsensusBranchId, NetworkUpgradeActivation,
+        SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, TransactionId,
+        TransactionIntrinsicValueBalances, TransparentAddressScriptHash, TransparentInputFact,
+        TransparentOutPoint, TransparentOutputFact, TransparentUnspentOutput, UnixTimestampMillis,
+        wire::encode_internal_block_hash,
     };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{
@@ -876,7 +884,7 @@ mod tests {
     };
     use zinder_store::{ChainEventHistoryRequest, StoreReadCaller};
 
-    use crate::ArtifactDeriveError;
+    use crate::CanonicalBlockConstructionError;
 
     use super::*;
 
@@ -1128,8 +1136,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 101, 150, 50, false)?;
 
-        let error = match bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let error = match bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await
         {
@@ -1166,8 +1174,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 10, 5, false)?;
 
-        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let commit_outcome = bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await?;
 
@@ -1225,13 +1233,13 @@ mod tests {
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1275,7 +1283,7 @@ mod tests {
                 if source_block.height == BlockHeight::new(1) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                Ok(test_derived_block(&source_block, 0, 0))
+                Ok(test_prepared_block(&source_block, 0, 0))
             },
         );
         futures_util::pin_mut!(block_prepare_stream);
@@ -1347,7 +1355,10 @@ mod tests {
             .ok_or("missing prepared chunk")??;
         assert_eq!(prepared_chunk.len(), 1);
         let prepared = prepared_chunk.remove(0);
-        assert_eq!(prepared.derived.block_header.height, BlockHeight::new(2));
+        assert_eq!(
+            prepared.prepared.facts.block_header.height,
+            BlockHeight::new(2)
+        );
         assert_eq!(
             prepared.prefetched_spent_transparent_outputs,
             store
@@ -1410,7 +1421,7 @@ mod tests {
                             spending_transaction_id,
                             spent_outpoint,
                         )),
-                        _ => Ok(test_derived_block(&source_block, 0, 0)),
+                        _ => Ok(test_prepared_block(&source_block, 0, 0)),
                     }
                 },
             );
@@ -1469,13 +1480,13 @@ mod tests {
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1536,7 +1547,7 @@ mod tests {
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         while let Some(chunk_result) = block_prepare_stream.next().await {
@@ -1609,13 +1620,13 @@ mod tests {
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1670,13 +1681,13 @@ mod tests {
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1738,13 +1749,13 @@ mod tests {
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1772,7 +1783,7 @@ mod tests {
 
     #[tokio::test]
     async fn block_prepare_schedules_past_slow_earlier_block() -> Result<(), Box<dyn Error>> {
-        let derive_events = Arc::new(Mutex::new(Vec::new()));
+        let prepare_events = Arc::new(Mutex::new(Vec::new()));
         let source = RecordingSegmentSource {
             requested_segments: Arc::new(Mutex::new(Vec::new())),
             network: Network::ZcashRegtest,
@@ -1783,7 +1794,7 @@ mod tests {
             Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
             BlockHeight::new(1),
         )));
-        let derive_events_for_stream = Arc::clone(&derive_events);
+        let prepare_events_for_stream = Arc::clone(&prepare_events);
         let (_store_tempdir, store) =
             test_primary_chain_store("slow-block-prepare-prefetch-store")?;
         let block_prepare_stream = build_block_prepare_stream(
@@ -1807,10 +1818,10 @@ mod tests {
                 store,
             },
             move |source_block| {
-                let derive_events = Arc::clone(&derive_events_for_stream);
+                let prepare_events = Arc::clone(&prepare_events_for_stream);
                 async move {
                     let height = source_block.height;
-                    derive_events
+                    prepare_events
                         .lock()
                         .push(BlockPrepareEvent::Started { height });
                     match height.value() {
@@ -1818,10 +1829,10 @@ mod tests {
                         2 => tokio::time::sleep(Duration::from_millis(10)).await,
                         _ => {}
                     }
-                    derive_events
+                    prepare_events
                         .lock()
                         .push(BlockPrepareEvent::Finished { height });
-                    Ok(test_derived_block(&source_block, 0, 0))
+                    Ok(test_prepared_block(&source_block, 0, 0))
                 }
             },
         );
@@ -1829,35 +1840,34 @@ mod tests {
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
-        let derive_events = derive_events.lock().clone();
+        let prepare_events = prepare_events.lock().clone();
         let start_third_block = block_prepare_event_index(
-            &derive_events,
+            &prepare_events,
             BlockPrepareEvent::Started {
                 height: BlockHeight::new(3),
             },
         )?;
         let finish_first_block = block_prepare_event_index(
-            &derive_events,
+            &prepare_events,
             BlockPrepareEvent::Finished {
                 height: BlockHeight::new(1),
             },
         )?;
         assert!(
             start_third_block < finish_first_block,
-            "expected later block prepare to start before the slow first block finished; events: {derive_events:?}"
+            "expected later block prepare to start before the slow first block finished; events: {prepare_events:?}"
         );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn block_prepare_derive_futures_progress_without_stream_polling()
-    -> Result<(), Box<dyn Error>> {
+    async fn block_prepare_futures_progress_without_stream_polling() -> Result<(), Box<dyn Error>> {
         let source = RecordingSegmentSource {
             requested_segments: Arc::new(Mutex::new(Vec::new())),
             network: Network::ZcashRegtest,
@@ -1913,7 +1923,7 @@ mod tests {
                         }
                         _ => {}
                     }
-                    Ok(test_derived_block(&source_block, 0, 0))
+                    Ok(test_prepared_block(&source_block, 0, 0))
                 }
             },
         );
@@ -1924,7 +1934,10 @@ mod tests {
             .await
             .ok_or("missing first prepared chunk")??;
         let first_block = first_chunk.first().ok_or("empty prepared chunk")?;
-        assert_eq!(first_block.derived.block_header.height, BlockHeight::new(1));
+        assert_eq!(
+            first_block.prepared.facts.block_header.height,
+            BlockHeight::new(1)
+        );
 
         second_block_release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), second_block_completed.notified())
@@ -1950,8 +1963,8 @@ mod tests {
         // successful sequential epochs prove the overlap kept commits ordered.
         let config = test_bulk_catchup_run_config(&storage_path, 1, 8, 1, false)?;
 
-        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let commit_outcome = bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await?;
 
@@ -1987,7 +2000,7 @@ mod tests {
     /// Batch {1,2} funds an output that block 3 (batch {3,4}) spends.
     ///
     /// The first commit is held at its tree-state fetch until block 4's
-    /// derive releases it. With `block_prepare_concurrency = 1`, the ordered
+    /// preparation releases it. With `block_prepare_concurrency = 1`, the ordered
     /// prevout resolver must carry block 1's output across emitted windows;
     /// the store does not yet contain epoch 1 when block 3 resolves its spend.
     #[tokio::test]
@@ -2011,16 +2024,16 @@ mod tests {
         let funding_transaction_id = TransactionId::from_bytes([0x51; 32]);
         let spent_outpoint = TransparentOutPoint::new(funding_transaction_id, 0);
         let spending_transaction_id = TransactionId::from_bytes([0x52; 32]);
-        let derive_events = Arc::clone(&recorded_events);
+        let prepare_events = Arc::clone(&recorded_events);
         let release_gate = Arc::clone(&commit_gate);
 
         let commit_outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            bulk_catchup_from_source_with_mock_derive(&config, &source, move |source_block| {
+            bulk_catchup_from_source_with_mock_prepare(&config, &source, move |source_block| {
                 match source_block.height.value() {
                     1 => Ok(test_output_creating_block(source_block, spent_outpoint)),
                     3 => {
-                        derive_events.lock().push("spending_block_derived");
+                        prepare_events.lock().push("spending_block_prepared");
                         Ok(test_transparent_spend_block(
                             source_block,
                             spending_transaction_id,
@@ -2028,11 +2041,11 @@ mod tests {
                         ))
                     }
                     4 => {
-                        derive_events.lock().push("release_block_derived");
+                        prepare_events.lock().push("release_block_prepared");
                         release_gate.notify_one();
-                        Ok(test_derived_block(source_block, 0, 0))
+                        Ok(test_prepared_block(source_block, 0, 0))
                     }
-                    _ => Ok(test_derived_block(source_block, 0, 0)),
+                    _ => Ok(test_prepared_block(source_block, 0, 0)),
                 }
             }),
         )
@@ -2044,12 +2057,12 @@ mod tests {
             BlockHeight::new(4)
         );
         let observed = recorded_events.lock().clone();
-        let spend_derived = recorded_event_index(&observed, "spending_block_derived")?;
-        let release_derived = recorded_event_index(&observed, "release_block_derived")?;
+        let spend_prepared = recorded_event_index(&observed, "spending_block_prepared")?;
+        let release_prepared = recorded_event_index(&observed, "release_block_prepared")?;
         let commit_held = recorded_event_index(&observed, "first_commit_holding")?;
         let commit_released = recorded_event_index(&observed, "first_commit_released")?;
         assert!(
-            spend_derived < release_derived && release_derived < commit_released,
+            spend_prepared < release_prepared && release_prepared < commit_released,
             "spending block must be prepared before the first commit resumes; events: {observed:?}"
         );
         assert!(commit_held < commit_released);
@@ -2085,8 +2098,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, false)?;
 
-        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let commit_outcome = bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await?;
 
@@ -2125,8 +2138,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, false)?;
 
-        let error = match bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let error = match bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await
         {
@@ -2182,8 +2195,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, false)?;
 
-        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, SUBTREE_LEAF_COUNT, 0))
+        let commit_outcome = bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, SUBTREE_LEAF_COUNT, 0))
         })
         .await?;
 
@@ -2322,8 +2335,8 @@ mod tests {
         };
 
         let commit_outcome =
-            bulk_catchup_with_bootstrap_using_mock_derive(&config, &source, |sb| {
-                Ok(test_derived_block(sb, 0, 0))
+            bulk_catchup_with_bootstrap_using_mock_prepare(&config, &source, |sb| {
+                Ok(test_prepared_block(sb, 0, 0))
             })
             .await?;
 
@@ -2385,8 +2398,8 @@ mod tests {
         // under test is that the writer does not re-fetch the
         // already-recorded subtree root for the checkpoint range.
         let commit_outcome =
-            bulk_catchup_with_bootstrap_using_mock_derive(&config, &source, |sb| {
-                Ok(test_derived_block(sb, 0, 0))
+            bulk_catchup_with_bootstrap_using_mock_prepare(&config, &source, |sb| {
+                Ok(test_prepared_block(sb, 0, 0))
             })
             .await?;
 
@@ -2468,19 +2481,19 @@ mod tests {
         Ok(())
     }
 
-    /// Test helper that runs the checkpoint bootstrap and then the
-    /// commit loop with `derive_fn` substituted for `derive_block`, so
-    /// unit tests can exercise both phases without parsing real Zcash
-    /// block bytes.
+    /// Runs checkpoint bootstrap and the commit loop for tests.
+    ///
+    /// A preparation function replaces [`prepare_canonical_block`], so tests
+    /// exercise both phases without parsing real Zcash block bytes.
     #[cfg(test)]
-    async fn bulk_catchup_with_bootstrap_using_mock_derive<Source, F>(
+    async fn bulk_catchup_with_bootstrap_using_mock_prepare<Source, F>(
         config: &BulkCatchupRunConfig,
         source: &Source,
-        derive_fn: F,
+        prepare_fn: F,
     ) -> Result<ChainEpochCommitOutcome, IngestError>
     where
         Source: NodeSource + Clone,
-        F: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, ArtifactDeriveError>
+        F: Fn(&SourceBlock) -> Result<PreparedCanonicalBlock, CanonicalBlockConstructionError>
             + Clone
             + Send
             + Sync
@@ -2503,11 +2516,11 @@ mod tests {
             .map_or_else(ChainTipMetadata::empty, |chain_epoch| {
                 chain_epoch.tip_metadata
             });
-        bulk_catchup_from_source_with_store_using_derive_fn(
+        bulk_catchup_from_source_with_store_using_prepare_fn(
             config,
             source,
             &store,
-            derive_fn,
+            prepare_fn,
             BulkCatchupStart {
                 from_height: config.from_height,
                 initial_tip_metadata,
@@ -2561,7 +2574,7 @@ mod tests {
             source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
                 .ok_or("invalid test source fetch bytes")?,
             block_prepare_concurrency: NonZeroU32::new(4)
-                .ok_or("invalid test derive concurrency")?,
+                .ok_or("invalid test prepare concurrency")?,
             block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or("invalid test block prepare artifact bytes")?,
             commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
@@ -2629,44 +2642,44 @@ mod tests {
         source_block: &SourceBlock,
         spending_transaction_id: TransactionId,
         spent_outpoint: TransparentOutPoint,
-    ) -> DerivedBlockArtifacts {
-        let mut derived = test_derived_block(source_block, 0, 0);
-        let location = TransactionLocation::new(
-            spending_transaction_id,
-            source_block.height,
-            source_block.hash,
-            0,
-        );
-        let transaction_facts = TransactionFactsArtifact::new(
-            location,
-            zinder_testkit::synthetic_transaction_public_facts(spending_transaction_id, 64),
-        )
-        .with_transparent_facts(
-            vec![TransparentInputFact::new(0, spent_outpoint)],
-            Vec::new(),
-        );
-        derived.transaction_facts.push(transaction_facts);
-        derived
+    ) -> PreparedCanonicalBlock {
+        let mut prepared = test_prepared_block(source_block, 0, 0);
+        prepared.facts.transactions.push(CanonicalTransactionFacts {
+            public_facts: zinder_testkit::synthetic_transaction_public_facts(
+                spending_transaction_id,
+                64,
+            ),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: vec![TransparentInputFact::new(0, spent_outpoint)],
+            transparent_outputs: Vec::new(),
+            raw_transaction_bytes: None,
+        });
+        prepared
     }
 
     fn test_output_creating_block(
         source_block: &SourceBlock,
         outpoint: TransparentOutPoint,
-    ) -> DerivedBlockArtifacts {
-        let mut derived = test_derived_block(source_block, 0, 0);
+    ) -> PreparedCanonicalBlock {
+        let mut prepared = test_prepared_block(source_block, 0, 0);
         let script_pub_key = vec![0x76, 0xa9, 0x14, 0x77];
         let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
-        derived
-            .transparent_outputs_by_outpoint
-            .push(TransparentOutputArtifact::new(
-                outpoint,
+        prepared.facts.transactions.push(CanonicalTransactionFacts {
+            public_facts: zinder_testkit::synthetic_transaction_public_facts(
+                outpoint.transaction_id,
+                64,
+            ),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: vec![TransparentOutputFact::new(
+                outpoint.output_index,
                 21,
                 script_pub_key,
                 address_script_hash,
-                source_block.height,
-                source_block.hash,
-            ));
-        derived
+            )],
+            raw_transaction_bytes: None,
+        });
+        prepared
     }
 
     #[derive(Clone)]
@@ -3160,37 +3173,35 @@ mod tests {
         }
     }
 
-    /// Constructs a synthetic [`DerivedBlockArtifacts`] for tests that
+    /// Constructs a synthetic [`PreparedCanonicalBlock`] for tests that
     /// drive the commit loop without parsing real Zcash bytes.
     ///
     /// The mock partial compact block carries the same identifiers the
-    /// production derive would emit; `finalize_derived_block` then folds
+    /// production preparation would emit; `finalize_canonical_block` then folds
     /// the supplied tree-size additions and stamps the final
     /// `chain_metadata` before encoding the proto.
-    fn test_derived_block(
+    fn test_prepared_block(
         source_block: &SourceBlock,
         sapling_tree_size_addition: u32,
         orchard_tree_size_addition: u32,
-    ) -> DerivedBlockArtifacts {
-        DerivedBlockArtifacts {
-            block_header: zinder_core::BlockHeaderArtifact::new(
-                source_block.height,
-                source_block.hash,
-                source_block.parent_hash,
-                [0; 32],
-                [0; 32],
-                i64::from(source_block.block_time_seconds),
-                0,
-                [0; 32],
-                0,
-                u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
-            ),
-            block_blob: Some(zinder_core::BlockBlobArtifact::new(
-                source_block.height,
-                source_block.hash,
-                source_block.parent_hash,
-                source_block.raw_block_bytes.clone(),
-            )),
+    ) -> PreparedCanonicalBlock {
+        PreparedCanonicalBlock {
+            facts: zinder_core::CanonicalBlockFacts {
+                block_header: zinder_core::BlockHeaderArtifact::new(
+                    source_block.height,
+                    source_block.hash,
+                    source_block.parent_hash,
+                    [0; 32],
+                    [0; 32],
+                    i64::from(source_block.block_time_seconds),
+                    0,
+                    [0; 32],
+                    0,
+                    u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+                ),
+                raw_block_bytes: Some(source_block.raw_block_bytes.clone()),
+                transactions: Vec::new(),
+            },
             partial_compact_block: LightwalletdCompactBlock {
                 height: u64::from(source_block.height.value()),
                 hash: encode_internal_block_hash(source_block.hash).to_vec(),
@@ -3205,12 +3216,6 @@ mod tests {
                 orchard: orchard_tree_size_addition,
                 ironwood: 0,
             },
-            block_transaction_index: Vec::new(),
-            transaction_locations: Vec::new(),
-            transaction_facts: Vec::new(),
-            transaction_intrinsic_value_balances: Vec::new(),
-            transaction_blobs: Vec::new(),
-            transparent_outputs_by_outpoint: Vec::new(),
         }
     }
 }

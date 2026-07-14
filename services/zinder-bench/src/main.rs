@@ -1,6 +1,8 @@
 //! Command-line entry point for the fixed-range benchmark harness.
 
 use std::{
+    fs::OpenOptions,
+    io::Write,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     process::ExitCode,
@@ -13,7 +15,7 @@ use zinder_bench::{
     capture::{CaptureConfig, capture_fixed_range},
     recorder::install_recorder,
     replay::{ProjectionReplayScope, ReplayConfig, replay_fixture},
-    report::Report,
+    report::{AcceptanceThresholds, Report},
 };
 use zinder_core::{BlockHeight, Network, wire::decode_zinder_native_chain_name};
 use zinder_derive::ProjectionPreset;
@@ -91,7 +93,8 @@ struct ReplayArgs {
     /// Optional canonical block-cache override in bytes.
     #[arg(long = "block-cache-bytes")]
     block_cache_bytes: Option<u64>,
-    /// Projection preset to replay after canonical ingest. Omit for a
+    /// Projection preset to replay after canonical ingest. `complete` is a
+    /// diagnostic replay, not projection-readiness certification. Omit for a
     /// canonical-only run.
     #[arg(long = "projection-preset")]
     projection_preset: Option<CliProjectionPreset>,
@@ -107,6 +110,30 @@ struct ReplayArgs {
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Source revision of the measured binary (commit SHA or image digest).
+    #[arg(long = "software-revision")]
+    software_revision: Option<String>,
+    /// Stable operator label for the runner; resource facts are separate flags.
+    #[arg(long = "runner-id")]
+    runner_id: Option<String>,
+    /// CPU limit applied to the benchmark container, in logical cores.
+    #[arg(long = "cpu-limit-cores")]
+    cpu_limit_cores: Option<f64>,
+    /// Memory limit applied to the benchmark container, in bytes.
+    #[arg(long = "memory-limit-bytes")]
+    memory_limit_bytes: Option<u64>,
+    /// Stable operator-defined storage performance class.
+    #[arg(long = "storage-class")]
+    storage_class: Option<String>,
+    /// Immutable container image reference for the measured binary.
+    #[arg(long = "image-reference")]
+    image_reference: Option<String>,
+    /// Desired canonical fixture replay time, in seconds.
+    #[arg(long = "canonical-fixture-replay-target-secs")]
+    canonical_fixture_replay_target_secs: Option<f64>,
+    /// Maximum accepted canonical fixture replay time, in seconds.
+    #[arg(long = "canonical-fixture-replay-hard-limit-secs")]
+    canonical_fixture_replay_hard_limit_secs: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -201,6 +228,7 @@ async fn run_capture(args: CaptureArgs) -> Result<(), BenchError> {
 }
 
 async fn run_replay(args: ReplayArgs) -> Result<(), BenchError> {
+    let canonical_fixture_replay_thresholds = canonical_fixture_replay_thresholds(&args)?;
     let metrics_handle = install_recorder()?;
     let config = ReplayConfig {
         fixture_directory: args.fixture,
@@ -212,20 +240,60 @@ async fn run_replay(args: ReplayArgs) -> Result<(), BenchError> {
         canonical_block_cache_bytes: args.block_cache_bytes,
         projection_preset: args.projection_preset.map(ProjectionPreset::from),
         projection_replay_scope: args.projection_replay_scope.into(),
+        software_revision: args.software_revision,
+        runner_id: args.runner_id,
+        cpu_limit_cores: args.cpu_limit_cores,
+        memory_limit_bytes: args.memory_limit_bytes,
+        storage_class: args.storage_class,
+        image_reference: args.image_reference,
+        canonical_fixture_replay_thresholds,
     };
     let report = replay_fixture(config, Some(metrics_handle)).await?;
     emit_report(&report, args.report.as_deref())?;
+    report.validate_acceptance()?;
     Ok(())
+}
+
+fn canonical_fixture_replay_thresholds(
+    args: &ReplayArgs,
+) -> Result<Option<AcceptanceThresholds>, BenchError> {
+    let thresholds = match (
+        args.canonical_fixture_replay_target_secs,
+        args.canonical_fixture_replay_hard_limit_secs,
+    ) {
+        (None, None) => Ok(None),
+        (Some(target_seconds), Some(hard_limit_seconds)) => {
+            AcceptanceThresholds::try_from_seconds(target_seconds, hard_limit_seconds).map(Some)
+        }
+        _ => Err(BenchError::invalid_argument(
+            "--canonical-fixture-replay-target-secs and --canonical-fixture-replay-hard-limit-secs must be supplied together",
+        )),
+    }?;
+    Ok(thresholds)
 }
 
 fn emit_report(report: &Report, report_path: Option<&std::path::Path>) -> Result<(), BenchError> {
     let encoded = serde_json::to_vec_pretty(report)?;
     if let Some(path) = report_path {
-        std::fs::write(path, encoded).map_err(|source| BenchError::io(path, source))?;
+        create_report_file(path, &encoded)?;
     } else {
         write_report_to_stdout(&encoded);
     }
     Ok(())
+}
+
+fn create_report_file(path: &std::path::Path, encoded: &[u8]) -> Result<(), BenchError> {
+    let mut report_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| BenchError::io(path, source))?;
+    report_file
+        .write_all(encoded)
+        .map_err(|source| BenchError::io(path, source))?;
+    report_file
+        .sync_all()
+        .map_err(|source| BenchError::io(path, source))
 }
 
 #[allow(
@@ -250,4 +318,100 @@ fn require_nonzero_u32(candidate: u32, flag: &str) -> Result<NonZeroU32, BenchEr
 fn require_nonzero_u64(candidate: u64, flag: &str) -> Result<NonZeroU64, BenchError> {
     NonZeroU64::new(candidate)
         .ok_or_else(|| BenchError::invalid_argument(format!("--{flag} must be greater than zero")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use clap::Parser;
+    use tempfile::tempdir;
+
+    use super::{Cli, Command, canonical_fixture_replay_thresholds, create_report_file};
+
+    fn replay_args(extra: &[&str]) -> Vec<String> {
+        [
+            "zinder-bench",
+            "replay",
+            "--fixture",
+            "fixture",
+            "--store",
+            "store",
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn removed_target_plane_and_old_canonical_flags_are_rejected() {
+        for removed_flag in [
+            "--canonical-build-target-secs",
+            "--canonical-build-hard-limit-secs",
+            "--wallet-build-target-secs",
+            "--wallet-build-hard-limit-secs",
+            "--wallet-build-lifecycle-target-secs",
+            "--wallet-build-lifecycle-hard-limit-secs",
+        ] {
+            assert!(Cli::try_parse_from(replay_args(&[removed_flag, "10"])).is_err());
+        }
+    }
+
+    #[test]
+    fn acceptance_threshold_flags_must_be_supplied_as_a_pair() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from(replay_args(&[
+            "--canonical-fixture-replay-target-secs",
+            "10",
+        ]))?;
+        let Command::Replay(args) = cli.command else {
+            return Err("expected replay command".into());
+        };
+
+        let Some(error) = canonical_fixture_replay_thresholds(&args).err() else {
+            return Err("unpaired acceptance threshold must be rejected".into());
+        };
+        assert!(error.to_string().contains(
+            "--canonical-fixture-replay-target-secs and --canonical-fixture-replay-hard-limit-secs must be supplied together"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn acceptance_threshold_pair_parses() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from(replay_args(&[
+            "--canonical-fixture-replay-target-secs",
+            "10",
+            "--canonical-fixture-replay-hard-limit-secs",
+            "20",
+        ]))?;
+        let Command::Replay(args) = cli.command else {
+            return Err("expected replay command".into());
+        };
+
+        assert!(canonical_fixture_replay_thresholds(&args)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn unthresholded_replay_allows_omitted_provenance() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from(replay_args(&[]))?;
+        let Command::Replay(args) = cli.command else {
+            return Err("expected replay command".into());
+        };
+
+        assert!(canonical_fixture_replay_thresholds(&args)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn report_file_creation_refuses_to_replace_existing_evidence() -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        let report_path = directory.path().join("report.json");
+        create_report_file(&report_path, b"first")?;
+
+        assert!(create_report_file(&report_path, b"second").is_err());
+        assert_eq!(std::fs::read(&report_path)?, b"first");
+        Ok(())
+    }
 }

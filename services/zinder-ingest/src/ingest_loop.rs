@@ -265,7 +265,7 @@ pub struct BulkCatchupConfig {
     pub source_fetch_max_in_flight_bytes: NonZeroU64,
     /// Parallel canonical block-prepare slots.
     pub block_prepare_concurrency: NonZeroU32,
-    /// Maximum reserved derived artifact bytes across active and completed
+    /// Maximum reserved prepared block bytes across active and completed
     /// canonical block prepares.
     pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
     /// Maximum safe-tip artifact bytes allowed to queue while the previous

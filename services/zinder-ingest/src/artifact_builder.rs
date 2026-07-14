@@ -13,14 +13,12 @@ use zebra_chain::{
 };
 use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockTransactionIndexArtifact,
-    ChainTipMetadata, CompactBlockArtifact, NetworkUpgradeActivations, ShieldedProtocol,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
-    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentAddressScriptHash,
+    CanonicalBlockFacts, CanonicalTransactionFacts, ChainTipMetadata, CompactBlockArtifact,
+    NetworkUpgradeActivations, PositionedCanonicalBlock, ShieldedProtocol, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionIntrinsicValueBalancesArtifact, TransactionLocation,
     TransparentOutPoint, TransparentOutputArtifact,
     wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
-
-use crate::chain_ingest::BuiltArtifacts;
 use zinder_proto::compat::lightwalletd::{
     ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
     CompactTx, CompactTxIn, TxOut as CompactTxOut,
@@ -75,10 +73,10 @@ impl RawBlobPolicy {
     }
 }
 
-/// Error returned while deriving canonical artifacts from source blocks.
+/// Error returned while constructing canonical blocks from source blocks.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum ArtifactDeriveError {
+pub enum CanonicalBlockConstructionError {
     /// Source block payload is empty.
     #[error("source block payload is empty")]
     EmptySourcePayload,
@@ -132,23 +130,12 @@ pub enum ArtifactDeriveError {
     #[error("compact note ciphertext is shorter than {COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN} bytes")]
     CompactCiphertextTooShort,
 
-    /// Compact transaction id has the wrong length.
-    #[error("compact transaction id is {byte_count} bytes, expected 32")]
-    CompactTransactionIdMalformed {
-        /// Observed byte count.
-        byte_count: usize,
-    },
-
     /// Transparent input previous transaction id has the wrong length.
     #[error("transparent input prevout transaction id is {byte_count} bytes, expected 32")]
     TransparentOutputTransactionIdMalformed {
         /// Observed byte count.
         byte_count: usize,
     },
-
-    /// Transparent output index cannot be represented as `u32`.
-    #[error("transparent output index does not fit u32")]
-    TransparentOutputIndexOverflow,
 
     /// Transaction index cannot be represented as `u32`.
     #[error("transaction index does not fit u32")]
@@ -210,9 +197,9 @@ impl fmt::Display for BlockMismatchField {
     }
 }
 
-/// Commitment-tree position (Sapling and Orchard output counts) at one block boundary.
+/// Shielded commitment-tree positions at one block boundary.
 ///
-/// `derive_block` returns a per-block delta; `finalize_derived_block` folds
+/// `prepare_canonical_block` returns a per-block delta; `finalize_canonical_block` folds
 /// those deltas into the running position. The same type expresses both
 /// shapes, so callers can carry one running offset through a serial loop
 /// or seed it from a `ChainTipMetadata` recovered from the store.
@@ -239,20 +226,20 @@ impl CommitmentTreeSizes {
     }
 
     /// Sums two positions; errors if any pool overflows `u32`.
-    pub fn checked_add(self, additions: Self) -> Result<Self, ArtifactDeriveError> {
+    pub fn checked_add(self, additions: Self) -> Result<Self, CanonicalBlockConstructionError> {
         let sapling = self.sapling.checked_add(additions.sapling).ok_or(
-            ArtifactDeriveError::CommitmentTreeOverflow {
+            CanonicalBlockConstructionError::CommitmentTreeOverflow {
                 protocol: ShieldedProtocol::Sapling,
             },
         )?;
         let orchard = self.orchard.checked_add(additions.orchard).ok_or(
-            ArtifactDeriveError::CommitmentTreeOverflow {
+            CanonicalBlockConstructionError::CommitmentTreeOverflow {
                 protocol: ShieldedProtocol::Orchard,
             },
         )?;
         let ironwood = self.ironwood.checked_add(additions.ironwood).ok_or(
-            ArtifactDeriveError::CountOverflow {
-                field: "Ironwood commitment tree size",
+            CanonicalBlockConstructionError::CommitmentTreeOverflow {
+                protocol: ShieldedProtocol::Ironwood,
             },
         )?;
 
@@ -281,75 +268,62 @@ impl CommitmentTreeSizes {
     }
 }
 
-/// Parallel-safe derivation output for one source block.
+/// Parallel-safe preparation output for one source block.
 ///
-/// `derive_block` populates every field that depends only on the block
-/// content. `finalize_derived_block` stamps the position-dependent fields
+/// [`prepare_canonical_block`] populates every field that depends only on the
+/// block content. [`finalize_canonical_block`] stamps the position-dependent fields
 /// (the `chain_metadata` inside `partial_compact_block` and the
-/// `tip_metadata` in the returned `BuiltArtifacts`) after folding
+/// `tip_metadata` in the returned [`PositionedCanonicalBlock`]) after folding
 /// `tree_size_additions` into the running commitment-tree position.
 #[derive(Debug)]
-pub struct DerivedBlockArtifacts {
-    /// Canonical block-header facts.
-    pub block_header: BlockHeaderArtifact,
-    /// Optional raw block blob.
-    pub block_blob: Option<BlockBlobArtifact>,
+pub struct PreparedCanonicalBlock {
+    /// Immutable facts computed from this source block alone.
+    pub facts: CanonicalBlockFacts,
     /// Lightwalletd compact block with `chain_metadata = None`; the
     /// serial folder stamps the final tree-size position before encoding.
     pub partial_compact_block: CompactBlock,
     /// Commitment-tree-size delta this block contributes.
     pub tree_size_additions: CommitmentTreeSizes,
-    /// Block-local transaction id index rows.
-    pub block_transaction_index: Vec<BlockTransactionIndexArtifact>,
-    /// Transaction location rows.
-    pub transaction_locations: Vec<TransactionLocation>,
-    /// Per-transaction public facts.
-    pub transaction_facts: Vec<TransactionFactsArtifact>,
-    /// Per-transaction signed shielded-pool balances.
-    pub transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
-    /// Optional raw transaction blobs.
-    pub transaction_blobs: Vec<TransactionBlobArtifact>,
-    /// Transparent-output artifacts for this block. One per transparent
-    /// output; writer, derive, and query paths resolve spent outputs from
-    /// these rows without re-fetching the producing transaction, and the
-    /// store derives the address-output projection rows from them.
-    pub transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
 }
 
-/// Parallel-safe derivation: parse the source block and build every artifact
-/// that does not depend on the block's position in the running chain state.
+/// Parses one source block and prepares its block-local canonical facts.
+///
+/// Preparation is parallel-safe because the returned value does not depend on
+/// the block's position in the running chain state.
 ///
 /// The output's `partial_compact_block.chain_metadata` is left `None`;
-/// [`finalize_derived_block`] stamps the final commitment-tree position
+/// [`finalize_canonical_block`] stamps the final commitment-tree position
 /// before encoding the proto and validating against any source-supplied
 /// observation.
-pub fn derive_block(
+pub fn prepare_canonical_block(
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
-) -> Result<DerivedBlockArtifacts, ArtifactDeriveError> {
-    derive_block_with_raw_blob_policy(source_block, activations, RawBlobPolicy::None)
+) -> Result<PreparedCanonicalBlock, CanonicalBlockConstructionError> {
+    prepare_canonical_block_with_raw_blob_policy(source_block, activations, RawBlobPolicy::None)
 }
 
-/// Parallel-safe derivation with an explicit optional raw-blob policy.
-pub fn derive_block_with_raw_blob_policy(
+/// Prepares block-local canonical facts with an explicit raw-blob policy.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one parse-and-construct pipeline keeps stage timing and field ownership auditable"
+)]
+pub fn prepare_canonical_block_with_raw_blob_policy(
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
     raw_blob_policy: RawBlobPolicy,
-) -> Result<DerivedBlockArtifacts, ArtifactDeriveError> {
+) -> Result<PreparedCanonicalBlock, CanonicalBlockConstructionError> {
     validate_source_block_payload(source_block)?;
     let parsed_block =
-        measure_block_derive_stage("block_parse", || parse_source_block(source_block))?;
-    measure_block_derive_stage("identity_validation", || {
+        measure_canonical_construction_stage("block_parse", || parse_source_block(source_block))?;
+    measure_canonical_construction_stage("identity_validation", || {
         validate_parsed_block_identity(&parsed_block, source_block)
     })?;
     let (compact_transactions, tree_size_additions) =
-        measure_block_derive_stage("compact_artifacts", || compact_transactions(&parsed_block))?;
-    let transparent_outputs_by_outpoint =
-        measure_block_derive_stage("transparent_output_artifacts", || {
-            transparent_output_artifacts(source_block, &compact_transactions)
+        measure_canonical_construction_stage("compact_artifacts", || {
+            compact_transactions(&parsed_block)
         })?;
-    let transaction_artifacts = measure_block_derive_stage("transaction_artifacts", || {
-        derive_transaction_artifacts_from_parsed(
+    let transactions = measure_canonical_construction_stage("transaction_facts", || {
+        prepare_canonical_transactions_from_parsed(
             &parsed_block,
             source_block,
             activations,
@@ -357,31 +331,31 @@ pub fn derive_block_with_raw_blob_policy(
         )
     })?;
     let (block_header_bytes, block_header) =
-        measure_block_derive_stage("block_header_artifact", || {
-            let block_header_bytes = parsed_block
-                .header
-                .zcash_serialize_to_vec()
-                .map_err(|source| ArtifactDeriveError::BlockHeaderSerializationFailed { source })?;
+        measure_canonical_construction_stage("block_header_artifact", || {
+            let block_header_bytes =
+                parsed_block
+                    .header
+                    .zcash_serialize_to_vec()
+                    .map_err(|source| {
+                        CanonicalBlockConstructionError::BlockHeaderSerializationFailed { source }
+                    })?;
             let block_header = BlockHeaderArtifact::from_header_info_with_block_size(
                 block_header_info_from_raw_block_bytes(
                     source_block.height,
                     &source_block.raw_block_bytes,
                 )
-                .map_err(|source| ArtifactDeriveError::BlockHeaderParseFailed {
-                    reason: source.to_string(),
+                .map_err(|source| {
+                    CanonicalBlockConstructionError::BlockHeaderParseFailed {
+                        reason: source.to_string(),
+                    }
                 })?,
                 usize_to_u64_saturating(source_block.raw_block_bytes.len()),
             );
             Ok((block_header_bytes, block_header))
         })?;
-    let block_blob = measure_block_derive_stage("block_blob_artifact", || {
+    let raw_block_bytes = measure_canonical_construction_stage("raw_block_bytes", || {
         Ok(if raw_blob_policy.writes_block_blobs() {
-            Some(BlockBlobArtifact::new(
-                source_block.height,
-                source_block.hash,
-                source_block.parent_hash,
-                source_block.raw_block_bytes.clone(),
-            ))
+            Some(source_block.raw_block_bytes.clone())
         } else {
             record_raw_blob_disabled("block_blob", 1);
             None
@@ -397,143 +371,208 @@ pub fn derive_block_with_raw_blob_policy(
         chain_metadata: None,
     };
 
-    Ok(DerivedBlockArtifacts {
-        block_header,
-        block_blob,
+    Ok(PreparedCanonicalBlock {
+        facts: CanonicalBlockFacts {
+            block_header,
+            raw_block_bytes,
+            transactions,
+        },
         partial_compact_block,
         tree_size_additions,
-        block_transaction_index: transaction_artifacts.block_transaction_index,
-        transaction_locations: transaction_artifacts.transaction_locations,
-        transaction_facts: transaction_artifacts.transaction_facts,
-        transaction_intrinsic_value_balances: transaction_artifacts
-            .transaction_intrinsic_value_balances,
-        transaction_blobs: transaction_artifacts.transaction_blobs,
-        transparent_outputs_by_outpoint,
     })
 }
 
-/// Serial fold over a single block's derived artifacts.
+/// Finalizes one prepared block at its ordered commitment-tree position.
 ///
-/// Applies `derived.tree_size_additions` to `running_tree_sizes`, stamps
+/// Applies `prepared.tree_size_additions` to `running_tree_sizes`, stamps
 /// the final `chain_metadata` into the compact block, and returns the
-/// built [`BuiltArtifacts`].
+/// finalized [`PositionedCanonicalBlock`].
 /// Mutates `running_tree_sizes` in place so a sequential loop can carry
 /// it forward across blocks.
-pub fn finalize_derived_block(
-    derived: DerivedBlockArtifacts,
+pub fn finalize_canonical_block(
+    prepared: PreparedCanonicalBlock,
     running_tree_sizes: &mut CommitmentTreeSizes,
-) -> Result<BuiltArtifacts, ArtifactDeriveError> {
-    let DerivedBlockArtifacts {
-        block_header,
-        block_blob,
+) -> Result<PositionedCanonicalBlock, CanonicalBlockConstructionError> {
+    let PreparedCanonicalBlock {
+        facts,
         mut partial_compact_block,
         tree_size_additions,
-        block_transaction_index,
-        transaction_locations,
-        transaction_facts,
-        transaction_intrinsic_value_balances,
-        transaction_blobs,
-        transparent_outputs_by_outpoint,
-    } = derived;
+    } = prepared;
 
     let final_tree_sizes = running_tree_sizes.checked_add(tree_size_additions)?;
 
     partial_compact_block.chain_metadata = Some(final_tree_sizes.chain_metadata());
     let compact_block = CompactBlockArtifact::new(
-        block_header.height,
-        block_header.block_hash,
+        facts.block_header.height,
+        facts.block_header.block_hash,
         partial_compact_block.encode_to_vec(),
     );
 
     *running_tree_sizes = final_tree_sizes;
 
-    Ok(BuiltArtifacts {
+    Ok(PositionedCanonicalBlock {
+        facts,
+        compact_block,
+        tip_metadata: final_tree_sizes.tip_metadata(),
+    })
+}
+
+/// Physical rows required by the current `RocksDB` writer.
+///
+/// These redundant index shapes are deliberately private to the current-schema
+/// writer boundary and are not part of the backend-neutral fact contract.
+pub(crate) struct CurrentSchemaBlockArtifacts {
+    pub(crate) block_header: BlockHeaderArtifact,
+    pub(crate) block_blob: Option<BlockBlobArtifact>,
+    pub(crate) block_transaction_index: Vec<BlockTransactionIndexArtifact>,
+    pub(crate) transaction_locations: Vec<TransactionLocation>,
+    pub(crate) transaction_facts: Vec<TransactionFactsArtifact>,
+    pub(crate) transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
+    pub(crate) transaction_blobs: Vec<TransactionBlobArtifact>,
+    pub(crate) transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
+}
+
+/// Expands the minimal fact envelope into the redundant rows the current
+/// `RocksDB` schema still commits.
+pub(crate) fn expand_current_schema_block_artifacts(
+    facts: CanonicalBlockFacts,
+) -> Result<CurrentSchemaBlockArtifacts, CanonicalBlockConstructionError> {
+    let transparent_outputs_by_outpoint = current_schema_transparent_outputs(&facts);
+    let CanonicalBlockFacts {
+        block_header,
+        raw_block_bytes,
+        transactions,
+    } = facts;
+    let block_height = block_header.height;
+    let block_hash = block_header.block_hash;
+    let block_blob = raw_block_bytes.map(|raw_block_bytes| {
+        BlockBlobArtifact::new(
+            block_height,
+            block_hash,
+            block_header.parent_hash,
+            raw_block_bytes,
+        )
+    });
+    let mut block_transaction_index = Vec::with_capacity(transactions.len());
+    let mut transaction_locations = Vec::with_capacity(transactions.len());
+    let mut transaction_facts = Vec::with_capacity(transactions.len());
+    let mut transaction_intrinsic_value_balances = Vec::with_capacity(transactions.len());
+    let mut transaction_blobs = Vec::new();
+
+    for (tx_index_in_block, transaction) in transactions.into_iter().enumerate() {
+        let tx_index_in_block = u32::try_from(tx_index_in_block)
+            .map_err(|_| CanonicalBlockConstructionError::TransactionIndexOverflow)?;
+        let CanonicalTransactionFacts {
+            public_facts,
+            intrinsic_value_balances,
+            transparent_inputs,
+            transparent_outputs,
+            raw_transaction_bytes,
+        } = transaction;
+        let transaction_id = public_facts.transaction_id;
+        let location =
+            TransactionLocation::new(transaction_id, block_height, block_hash, tx_index_in_block);
+        block_transaction_index.push(BlockTransactionIndexArtifact::new(
+            block_height,
+            tx_index_in_block,
+            transaction_id,
+            block_hash,
+        ));
+        transaction_locations.push(location);
+        transaction_facts.push(
+            TransactionFactsArtifact::new(location, public_facts)
+                .with_transparent_facts(transparent_inputs, transparent_outputs),
+        );
+        transaction_intrinsic_value_balances.push(TransactionIntrinsicValueBalancesArtifact::new(
+            location,
+            intrinsic_value_balances,
+        ));
+        if let Some(raw_transaction_bytes) = raw_transaction_bytes {
+            transaction_blobs.push(TransactionBlobArtifact::new(
+                location,
+                raw_transaction_bytes,
+            ));
+        }
+    }
+
+    Ok(CurrentSchemaBlockArtifacts {
         block_header,
         block_blob,
-        compact_block,
         block_transaction_index,
         transaction_locations,
         transaction_facts,
         transaction_intrinsic_value_balances,
         transaction_blobs,
         transparent_outputs_by_outpoint,
-        tip_metadata: final_tree_sizes.tip_metadata(),
     })
 }
 
-struct DerivedTransactionArtifacts {
-    block_transaction_index: Vec<BlockTransactionIndexArtifact>,
-    transaction_locations: Vec<TransactionLocation>,
-    transaction_facts: Vec<TransactionFactsArtifact>,
-    transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
-    transaction_blobs: Vec<TransactionBlobArtifact>,
+/// Expands block-local transparent outputs into current-schema outpoint rows.
+pub(crate) fn current_schema_transparent_outputs(
+    facts: &CanonicalBlockFacts,
+) -> Vec<TransparentOutputArtifact> {
+    let block_height = facts.block_header.height;
+    let block_hash = facts.block_header.block_hash;
+    facts
+        .transactions
+        .iter()
+        .flat_map(|transaction| {
+            let transaction_id = transaction.public_facts.transaction_id;
+            transaction.transparent_outputs.iter().map(move |output| {
+                TransparentOutputArtifact::new(
+                    TransparentOutPoint::new(transaction_id, output.output_index),
+                    output.value_zat,
+                    output.script_pub_key.clone(),
+                    output.address_script_hash,
+                    block_height,
+                    block_hash,
+                )
+            })
+        })
+        .collect()
 }
 
-fn derive_transaction_artifacts_from_parsed(
+fn prepare_canonical_transactions_from_parsed(
     parsed_block: &ZebraBlock,
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
     raw_blob_policy: RawBlobPolicy,
-) -> Result<DerivedTransactionArtifacts, ArtifactDeriveError> {
-    let mut block_transaction_index = Vec::with_capacity(parsed_block.transactions.len());
-    let mut transaction_locations = Vec::with_capacity(parsed_block.transactions.len());
-    let mut transaction_facts = Vec::with_capacity(parsed_block.transactions.len());
-    let mut transaction_intrinsic_value_balances =
-        Vec::with_capacity(parsed_block.transactions.len());
-    let mut transaction_blobs = Vec::with_capacity(parsed_block.transactions.len());
+) -> Result<Vec<CanonicalTransactionFacts>, CanonicalBlockConstructionError> {
+    let mut transactions = Vec::with_capacity(parsed_block.transactions.len());
 
     for (tx_index_in_block, transaction) in parsed_block.transactions.iter().enumerate() {
-        let tx_index_in_block = u32::try_from(tx_index_in_block)
-            .map_err(|_| ArtifactDeriveError::TransactionIndexOverflow)?;
+        let _tx_index_in_block = u32::try_from(tx_index_in_block)
+            .map_err(|_| CanonicalBlockConstructionError::TransactionIndexOverflow)?;
         let serialized_size = transaction.zcash_serialized_size();
-        let transaction_id = TransactionId::from_bytes(transaction.hash().0);
-        let location = TransactionLocation::new(
-            transaction_id,
-            source_block.height,
-            source_block.hash,
-            tx_index_in_block,
-        );
         let fact_set = transaction_public_fact_set_from_parsed(
             transaction,
             serialized_size,
             Some(source_block.height),
             activations,
         )
-        .map_err(|source| ArtifactDeriveError::TransactionFactsParseFailed {
-            reason: source.to_string(),
+        .map_err(|source| {
+            CanonicalBlockConstructionError::TransactionFactsParseFailed {
+                reason: source.to_string(),
+            }
         })?;
-        block_transaction_index.push(BlockTransactionIndexArtifact::new(
-            source_block.height,
-            tx_index_in_block,
-            transaction_id,
-            source_block.hash,
-        ));
-        transaction_locations.push(location);
-        transaction_facts.push(
-            TransactionFactsArtifact::new(location, fact_set.public_facts)
-                .with_transparent_facts(fact_set.transparent_inputs, fact_set.transparent_outputs),
-        );
-        transaction_intrinsic_value_balances.push(TransactionIntrinsicValueBalancesArtifact::new(
-            location,
-            fact_set.intrinsic_value_balances,
-        ));
-        if raw_blob_policy.writes_transaction_blobs() {
-            let payload_bytes = transaction
-                .zcash_serialize_to_vec()
-                .map_err(|source| ArtifactDeriveError::TransactionSerializationFailed { source })?;
-            transaction_blobs.push(TransactionBlobArtifact::new(location, payload_bytes));
+        let raw_transaction_bytes = if raw_blob_policy.writes_transaction_blobs() {
+            Some(transaction.zcash_serialize_to_vec().map_err(|source| {
+                CanonicalBlockConstructionError::TransactionSerializationFailed { source }
+            })?)
         } else {
             record_raw_blob_disabled("transaction_blob", 1);
-        }
+            None
+        };
+        transactions.push(CanonicalTransactionFacts {
+            public_facts: fact_set.public_facts,
+            intrinsic_value_balances: fact_set.intrinsic_value_balances,
+            transparent_inputs: fact_set.transparent_inputs,
+            transparent_outputs: fact_set.transparent_outputs,
+            raw_transaction_bytes,
+        });
     }
 
-    Ok(DerivedTransactionArtifacts {
-        block_transaction_index,
-        transaction_locations,
-        transaction_facts,
-        transaction_intrinsic_value_balances,
-        transaction_blobs,
-    })
+    Ok(transactions)
 }
 
 fn record_raw_blob_disabled(table: &'static str, row_count: u64) {
@@ -541,26 +580,26 @@ fn record_raw_blob_disabled(table: &'static str, row_count: u64) {
         .increment(row_count);
 }
 
-fn record_block_derive_stage<T>(
+fn record_canonical_construction_stage<T>(
     stage: &'static str,
     started_at: Instant,
-    outcome: &Result<T, ArtifactDeriveError>,
+    outcome: &Result<T, CanonicalBlockConstructionError>,
 ) {
     metrics::histogram!(
-        "zinder_ingest_block_derive_stage_duration_seconds",
+        "zinder_ingest_canonical_block_construction_stage_duration_seconds",
         "stage" => stage,
         "status" => if outcome.is_ok() { "ok" } else { "error" }
     )
     .record(started_at.elapsed());
 }
 
-fn measure_block_derive_stage<T>(
+fn measure_canonical_construction_stage<T>(
     stage: &'static str,
-    operation: impl FnOnce() -> Result<T, ArtifactDeriveError>,
-) -> Result<T, ArtifactDeriveError> {
+    operation: impl FnOnce() -> Result<T, CanonicalBlockConstructionError>,
+) -> Result<T, CanonicalBlockConstructionError> {
     let started_at = Instant::now();
     let outcome = operation();
-    record_block_derive_stage(stage, started_at, &outcome);
+    record_canonical_construction_stage(stage, started_at, &outcome);
     outcome
 }
 
@@ -568,32 +607,36 @@ fn usize_to_u64_saturating(amount: usize) -> u64 {
     u64::try_from(amount).unwrap_or(u64::MAX)
 }
 
-fn validate_source_block_payload(source_block: &SourceBlock) -> Result<(), ArtifactDeriveError> {
+fn validate_source_block_payload(
+    source_block: &SourceBlock,
+) -> Result<(), CanonicalBlockConstructionError> {
     if source_block.raw_block_bytes.is_empty() {
-        return Err(ArtifactDeriveError::EmptySourcePayload);
+        return Err(CanonicalBlockConstructionError::EmptySourcePayload);
     }
 
     Ok(())
 }
 
-fn parse_source_block(source_block: &SourceBlock) -> Result<ZebraBlock, ArtifactDeriveError> {
+fn parse_source_block(
+    source_block: &SourceBlock,
+) -> Result<ZebraBlock, CanonicalBlockConstructionError> {
     source_block
         .raw_block_bytes
         .as_slice()
         .zcash_deserialize_into::<ZebraBlock>()
-        .map_err(|source| ArtifactDeriveError::BlockParseFailed { source })
+        .map_err(|source| CanonicalBlockConstructionError::BlockParseFailed { source })
 }
 
 fn validate_parsed_block_identity(
     parsed_block: &ZebraBlock,
     source_block: &SourceBlock,
-) -> Result<(), ArtifactDeriveError> {
+) -> Result<(), CanonicalBlockConstructionError> {
     let parsed_height = parsed_block
         .coinbase_height()
-        .ok_or(ArtifactDeriveError::ParsedBlockMissingCoinbaseHeight)?
+        .ok_or(CanonicalBlockConstructionError::ParsedBlockMissingCoinbaseHeight)?
         .0;
     if parsed_height != source_block.height.value() {
-        return Err(ArtifactDeriveError::SourceBlockMismatch {
+        return Err(CanonicalBlockConstructionError::SourceBlockMismatch {
             field: BlockMismatchField::Height,
             expected: source_block.height.value().to_string(),
             actual: parsed_height.to_string(),
@@ -602,7 +645,7 @@ fn validate_parsed_block_identity(
 
     let parsed_hash = parsed_block.hash().0;
     if parsed_hash != source_block.hash.as_bytes() {
-        return Err(ArtifactDeriveError::SourceBlockMismatch {
+        return Err(CanonicalBlockConstructionError::SourceBlockMismatch {
             field: BlockMismatchField::Hash,
             expected: format_block_hash(source_block.hash.as_bytes()),
             actual: format_block_hash(parsed_hash),
@@ -611,7 +654,7 @@ fn validate_parsed_block_identity(
 
     let parsed_parent_hash = parsed_block.header.previous_block_hash.0;
     if parsed_parent_hash != source_block.parent_hash.as_bytes() {
-        return Err(ArtifactDeriveError::SourceBlockMismatch {
+        return Err(CanonicalBlockConstructionError::SourceBlockMismatch {
             field: BlockMismatchField::ParentHash,
             expected: format_block_hash(source_block.parent_hash.as_bytes()),
             actual: format_block_hash(parsed_parent_hash),
@@ -619,12 +662,12 @@ fn validate_parsed_block_identity(
     }
 
     let parsed_time = u32::try_from(parsed_block.header.time.timestamp()).map_err(|_| {
-        ArtifactDeriveError::CountOverflow {
+        CanonicalBlockConstructionError::CountOverflow {
             field: "parsed block time",
         }
     })?;
     if parsed_time != source_block.block_time_seconds {
-        return Err(ArtifactDeriveError::SourceBlockMismatch {
+        return Err(CanonicalBlockConstructionError::SourceBlockMismatch {
             field: BlockMismatchField::Time,
             expected: source_block.block_time_seconds.to_string(),
             actual: parsed_time.to_string(),
@@ -636,14 +679,16 @@ fn validate_parsed_block_identity(
 
 fn compact_transactions(
     parsed_block: &ZebraBlock,
-) -> Result<(Vec<CompactTx>, CommitmentTreeSizes), ArtifactDeriveError> {
+) -> Result<(Vec<CompactTx>, CommitmentTreeSizes), CanonicalBlockConstructionError> {
     let mut compact_transactions = Vec::new();
     let mut tree_size_additions = CommitmentTreeSizes::default();
 
     for (transaction_index, transaction) in parsed_block.transactions.iter().enumerate() {
         let compact_transaction = compact_transaction(
-            u64::try_from(transaction_index).map_err(|_| ArtifactDeriveError::CountOverflow {
-                field: "transaction index",
+            u64::try_from(transaction_index).map_err(|_| {
+                CanonicalBlockConstructionError::CountOverflow {
+                    field: "transaction index",
+                }
             })?,
             transaction.as_ref(),
         )?;
@@ -672,7 +717,7 @@ fn compact_transactions(
 pub(crate) fn compact_transaction(
     index: u64,
     transaction: &ZebraTransaction,
-) -> Result<CompactTx, ArtifactDeriveError> {
+) -> Result<CompactTx, CanonicalBlockConstructionError> {
     Ok(CompactTx {
         index,
         txid: transaction.hash().0.to_vec(),
@@ -697,7 +742,7 @@ fn compact_sapling_spends(transaction: &ZebraTransaction) -> Vec<CompactSaplingS
 
 fn compact_sapling_outputs(
     transaction: &ZebraTransaction,
-) -> Result<Vec<CompactSaplingOutput>, ArtifactDeriveError> {
+) -> Result<Vec<CompactSaplingOutput>, CanonicalBlockConstructionError> {
     transaction
         .sapling_outputs()
         .map(|output| {
@@ -713,7 +758,7 @@ fn compact_sapling_outputs(
 
 fn compact_orchard_actions(
     transaction: &ZebraTransaction,
-) -> Result<Vec<CompactOrchardAction>, ArtifactDeriveError> {
+) -> Result<Vec<CompactOrchardAction>, CanonicalBlockConstructionError> {
     transaction
         .orchard_actions()
         .map(|action| {
@@ -730,7 +775,7 @@ fn compact_orchard_actions(
 
 fn compact_ironwood_actions(
     transaction: &ZebraTransaction,
-) -> Result<Vec<CompactOrchardAction>, ArtifactDeriveError> {
+) -> Result<Vec<CompactOrchardAction>, CanonicalBlockConstructionError> {
     transaction
         .ironwood_actions()
         .map(|action| {
@@ -745,11 +790,13 @@ fn compact_ironwood_actions(
         .collect()
 }
 
-fn compact_note_ciphertext_prefix(ciphertext: &[u8]) -> Result<Vec<u8>, ArtifactDeriveError> {
+fn compact_note_ciphertext_prefix(
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CanonicalBlockConstructionError> {
     ciphertext
         .get(..COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN)
         .map(<[u8]>::to_vec)
-        .ok_or(ArtifactDeriveError::CompactCiphertextTooShort)
+        .ok_or(CanonicalBlockConstructionError::CompactCiphertextTooShort)
 }
 
 fn compact_transparent_inputs(transaction: &ZebraTransaction) -> Vec<CompactTxIn> {
@@ -777,45 +824,6 @@ fn compact_transparent_outputs(transaction: &ZebraTransaction) -> Vec<CompactTxO
         .collect()
 }
 
-fn transparent_output_artifacts(
-    source_block: &SourceBlock,
-    compact_transactions: &[CompactTx],
-) -> Result<Vec<TransparentOutputArtifact>, ArtifactDeriveError> {
-    let mut transparent_outputs_by_outpoint = Vec::new();
-
-    for transaction in compact_transactions {
-        let transaction_id = transaction_id_from_compact_tx(transaction)?;
-        for (output_index, output) in transaction.vout.iter().enumerate() {
-            let output_index = u32::try_from(output_index)
-                .map_err(|_| ArtifactDeriveError::TransparentOutputIndexOverflow)?;
-            let address_script_hash =
-                TransparentAddressScriptHash::of_script_pub_key(&output.script_pub_key);
-            let outpoint = TransparentOutPoint::new(transaction_id, output_index);
-            transparent_outputs_by_outpoint.push(TransparentOutputArtifact::new(
-                outpoint,
-                output.value,
-                output.script_pub_key.clone(),
-                address_script_hash,
-                source_block.height,
-                source_block.hash,
-            ));
-        }
-    }
-
-    Ok(transparent_outputs_by_outpoint)
-}
-
-fn transaction_id_from_compact_tx(
-    transaction: &CompactTx,
-) -> Result<TransactionId, ArtifactDeriveError> {
-    let txid_bytes = <[u8; 32]>::try_from(transaction.txid.as_slice()).map_err(|_| {
-        ArtifactDeriveError::CompactTransactionIdMalformed {
-            byte_count: transaction.txid.len(),
-        }
-    })?;
-    Ok(TransactionId::from_bytes(txid_bytes))
-}
-
 fn compact_transaction_has_payload(transaction: &CompactTx) -> bool {
     !transaction.spends.is_empty()
         || !transaction.outputs.is_empty()
@@ -825,8 +833,8 @@ fn compact_transaction_has_payload(transaction: &CompactTx) -> bool {
         || !transaction.vout.is_empty()
 }
 
-fn count_to_u32(count: usize, field: &'static str) -> Result<u32, ArtifactDeriveError> {
-    u32::try_from(count).map_err(|_| ArtifactDeriveError::CountOverflow { field })
+fn count_to_u32(count: usize, field: &'static str) -> Result<u32, CanonicalBlockConstructionError> {
+    u32::try_from(count).map_err(|_| CanonicalBlockConstructionError::CountOverflow { field })
 }
 
 fn format_block_hash(bytes: [u8; 32]) -> String {
@@ -837,10 +845,159 @@ fn format_block_hash(bytes: [u8; 32]) -> String {
 mod tests {
     use std::error::Error;
 
-    use super::{
-        ArtifactDeriveError, COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CompactOrchardAction, CompactTx,
-        compact_note_ciphertext_prefix, compact_transaction_has_payload,
+    use serde_json::Value;
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockHeight, ChainEpoch, ChainEpochId, Network, UnixTimestampMillis,
     };
+    use zinder_source::SourceBlock;
+    use zinder_store::ChainEpochArtifacts;
+    use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+
+    use super::{
+        COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CanonicalBlockConstructionError, CommitmentTreeSizes,
+        CompactOrchardAction, CompactTx, RawBlobPolicy, ShieldedProtocol,
+        compact_note_ciphertext_prefix, compact_transaction_has_payload,
+        expand_current_schema_block_artifacts, finalize_canonical_block,
+        prepare_canonical_block_with_raw_blob_policy,
+    };
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the boundary test keeps real-fixture expansion, commit, and row reads together"
+    )]
+    fn current_schema_expansion_round_trips_real_fixture_rows() -> Result<(), Box<dyn Error>> {
+        let source_block = regtest_fixture_block()?;
+        let prepared = prepare_canonical_block_with_raw_blob_policy(
+            &source_block,
+            &sample_regtest_upgrade_activations(),
+            RawBlobPolicy::All,
+        )?;
+        let mut tree_sizes = CommitmentTreeSizes::default();
+        let positioned = finalize_canonical_block(prepared, &mut tree_sizes)?;
+        let compact_block = positioned.compact_block;
+        let tip_metadata = positioned.tip_metadata;
+        let current_schema = expand_current_schema_block_artifacts(positioned.facts)?;
+        let location = *current_schema
+            .transaction_locations
+            .first()
+            .ok_or("fixture transaction location is missing")?;
+        let transaction_facts = current_schema
+            .transaction_facts
+            .first()
+            .cloned()
+            .ok_or("fixture transaction facts are missing")?;
+        let transaction_blob = current_schema
+            .transaction_blobs
+            .first()
+            .cloned()
+            .ok_or("fixture transaction blob is missing")?;
+        let transparent_output = current_schema
+            .transparent_outputs_by_outpoint
+            .first()
+            .cloned()
+            .ok_or("fixture transparent output is missing")?;
+        let fixture = StoreFixture::open()?;
+        let chain_epoch = ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: source_block.height,
+            visible_tip_hash: source_block.hash,
+            settled_tip_height: source_block.height,
+            settled_tip_hash: source_block.hash,
+            artifact_schema_version: ArtifactSchemaVersion::new(18),
+            tip_metadata,
+            created_at: UnixTimestampMillis::new(1_774_669_000_000),
+        };
+        let block_blobs = current_schema.block_blob.into_iter().collect();
+        fixture.chain_store().commit_chain_epoch(
+            ChainEpochArtifacts::new(
+                chain_epoch,
+                vec![current_schema.block_header],
+                vec![compact_block],
+            )
+            .with_block_blobs(block_blobs)
+            .with_block_transaction_index(current_schema.block_transaction_index)
+            .with_transaction_locations(current_schema.transaction_locations)
+            .with_transaction_facts(current_schema.transaction_facts)
+            .with_transaction_intrinsic_value_balances(
+                current_schema.transaction_intrinsic_value_balances,
+            )
+            .with_transaction_blobs(current_schema.transaction_blobs)
+            .with_transparent_outputs_by_outpoint(current_schema.transparent_outputs_by_outpoint),
+        )?;
+
+        let reader = fixture.chain_store().current_chain_epoch_reader()?;
+        assert_eq!(
+            reader.transaction_id_at_block_index(source_block.height, 0)?,
+            Some(location.transaction_id)
+        );
+        assert_eq!(
+            reader.transaction_location_by_id(location.transaction_id)?,
+            Some(location)
+        );
+        assert_eq!(
+            reader.transaction_facts_by_id(location.transaction_id)?,
+            Some(transaction_facts)
+        );
+        assert_eq!(
+            reader.transaction_blob_by_id(location.transaction_id)?,
+            Some(transaction_blob)
+        );
+        assert_eq!(
+            reader
+                .transparent_outputs_by_outpoints(&[transparent_output.outpoint])?
+                .get(&transparent_output.outpoint),
+            Some(&transparent_output)
+        );
+        Ok(())
+    }
+
+    fn regtest_fixture_block() -> Result<SourceBlock, Box<dyn Error>> {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/z3-regtest-block-1.json"))?;
+        let raw_block_hex = fixture
+            .get("raw_block_hex")
+            .and_then(Value::as_str)
+            .ok_or("fixture raw_block_hex is missing")?;
+        let raw_block_bytes = hex::decode(raw_block_hex)?;
+        let height = fixture
+            .get("height")
+            .and_then(Value::as_u64)
+            .and_then(|height| u32::try_from(height).ok())
+            .ok_or("fixture height is missing")?;
+        Ok(SourceBlock::from_raw_block_bytes(
+            Network::ZcashRegtest,
+            BlockHeight::new(height),
+            raw_block_bytes,
+        )?)
+    }
+
+    #[test]
+    fn commitment_tree_size_overflow_identifies_ironwood() -> Result<(), Box<dyn Error>> {
+        let running_sizes = CommitmentTreeSizes {
+            ironwood: u32::MAX,
+            ..CommitmentTreeSizes::default()
+        };
+        let additions = CommitmentTreeSizes {
+            ironwood: 1,
+            ..CommitmentTreeSizes::default()
+        };
+        let error = match running_sizes.checked_add(additions) {
+            Ok(sizes) => {
+                return Err(format!("expected Ironwood overflow, got {sizes:?}").into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            CanonicalBlockConstructionError::CommitmentTreeOverflow {
+                protocol: ShieldedProtocol::Ironwood
+            }
+        ));
+        Ok(())
+    }
 
     #[test]
     fn compact_note_ciphertext_prefix_rejects_short_buffers() -> Result<(), Box<dyn Error>> {
@@ -858,7 +1015,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ArtifactDeriveError::CompactCiphertextTooShort
+            CanonicalBlockConstructionError::CompactCiphertextTooShort
         ));
         Ok(())
     }

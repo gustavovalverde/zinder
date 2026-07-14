@@ -3,6 +3,8 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
+use std::{fs::OpenOptions, io::Write};
+
 use eyre::{Result, eyre};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -55,14 +57,20 @@ fn regtest_activation_records() -> Vec<ActivationRecord> {
 async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
     let block_one = load_regtest_block(REGTEST_BLOCK_1)?;
     let block_six_hundred_three = load_regtest_block(REGTEST_BLOCK_603)?;
-    let blocks = vec![block_one.clone(), block_six_hundred_three.clone()];
 
     let fixture_dir = tempdir()?;
+    let noncontiguous = write_segment(
+        fixture_dir.path(),
+        99,
+        &[block_one, block_six_hundred_three.clone()],
+    );
+    assert!(noncontiguous.is_err());
+    let blocks = vec![block_six_hundred_three.clone()];
     let descriptor = write_segment(fixture_dir.path(), 0, &blocks)?;
     let workload_density =
         measure_workload_density(&blocks, &sample_regtest_upgrade_activations())?;
-    assert_eq!(descriptor.block_count, 2);
-    assert_eq!(descriptor.from_height, 1);
+    assert_eq!(descriptor.block_count, 1);
+    assert_eq!(descriptor.from_height, 603);
     assert_eq!(descriptor.to_height, 603);
     assert_eq!(descriptor.sha256.len(), 64);
 
@@ -72,9 +80,9 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
     let manifest = FixtureManifest {
         fixture_format_version: FIXTURE_FORMAT_VERSION,
         network: encode_zinder_native_chain_name(Network::ZcashRegtest).to_owned(),
-        from_height: 1,
+        from_height: 603,
         to_height: 603,
-        block_count: 2,
+        block_count: 1,
         workload_density,
         artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         tip_hash_hex: hex::encode(block_six_hundred_three.hash.as_bytes()),
@@ -85,10 +93,11 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
     manifest.write(fixture_dir.path())?;
 
     let reloaded = FixtureManifest::read(fixture_dir.path())?;
+    assert_eq!(reloaded.digest_sha256()?.len(), 64);
     assert_eq!(reloaded.network_typed()?, Network::ZcashRegtest);
     assert_eq!(reloaded.to_height, 603);
-    assert_eq!(reloaded.workload_density.block_count, 2);
-    assert_eq!(reloaded.workload_density.transaction_count, 3);
+    assert_eq!(reloaded.workload_density.block_count, 1);
+    assert_eq!(reloaded.workload_density.transaction_count, 2);
     assert!(reloaded.workload_density.raw_block_bytes > 0);
     assert_eq!(
         reloaded.activations_typed()?.activations().len(),
@@ -96,13 +105,26 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
     );
 
     let source = FixtureNodeSource::open(fixture_dir.path(), &reloaded)?;
-    let fetched = source.fetch_block_at(BlockHeight::new(1)).await?;
-    assert_eq!(fetched, block_one);
+    let fetched = source.fetch_block_at(BlockHeight::new(603)).await?;
+    assert_eq!(fetched, block_six_hundred_three);
     assert_eq!(source.tip_id().await?, reloaded.tip_id()?);
 
+    let segment_path = fixture_dir.path().join(&descriptor.file);
+    OpenOptions::new()
+        .append(true)
+        .open(&segment_path)?
+        .write_all(b"corruption")?;
+    let Err(error) = FixtureNodeSource::open(fixture_dir.path(), &reloaded) else {
+        return Err(eyre!("fixture open must verify each segment digest"));
+    };
+    assert!(error.to_string().contains("SHA-256"));
+
     let mut inconsistent = reloaded;
-    inconsistent.workload_density.block_count = 1;
-    inconsistent.write(fixture_dir.path())?;
+    inconsistent.workload_density.block_count = 0;
+    std::fs::write(
+        fixture_dir.path().join("manifest.json"),
+        serde_json::to_vec_pretty(&inconsistent)?,
+    )?;
     let Err(error) = FixtureManifest::read(fixture_dir.path()) else {
         return Err(eyre!("density block count must match the fixture range"));
     };

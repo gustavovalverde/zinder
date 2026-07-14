@@ -131,7 +131,7 @@ struct Cli {
     /// Maximum reserved response bytes across source segment fetches.
     #[arg(long = "source-fetch-max-in-flight-bytes", global = true)]
     source_fetch_max_in_flight_bytes: Option<u64>,
-    /// Number of parallel `derive_block` invocations on the blocking pool.
+    /// Number of parallel `prepare_canonical_block` invocations on the blocking pool.
     #[arg(long = "block-prepare-concurrency", global = true)]
     block_prepare_concurrency: Option<u32>,
     /// Delay between upstream node tip polls, in milliseconds.

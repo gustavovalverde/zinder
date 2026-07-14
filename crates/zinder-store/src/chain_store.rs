@@ -187,7 +187,8 @@ impl ChainStoreOptions {
     }
 }
 
-const STORE_SCHEMA_VERSION: u16 = 13;
+/// Durable canonical store schema version written by this binary.
+pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 13;
 /// Durable artifact schema version written by this binary.
 ///
 /// Version 10 carried the fact-first layout with every hash-shaped proto
@@ -2945,7 +2946,7 @@ struct StoreMetadata {
 
 fn encode_store_metadata(network: Network) -> Vec<u8> {
     let mut metadata = Vec::with_capacity(6);
-    metadata.extend_from_slice(&STORE_SCHEMA_VERSION.to_be_bytes());
+    metadata.extend_from_slice(&CURRENT_STORE_SCHEMA_VERSION.to_be_bytes());
     metadata.extend_from_slice(&network.id().to_be_bytes());
     metadata
 }
@@ -2955,10 +2956,10 @@ fn decode_current_store_metadata(
     metadata_bytes: &[u8],
 ) -> Result<StoreMetadata, StoreError> {
     let store_metadata = decode_store_metadata(key, metadata_bytes)?;
-    if store_metadata.schema_version != STORE_SCHEMA_VERSION {
+    if store_metadata.schema_version != CURRENT_STORE_SCHEMA_VERSION {
         return Err(StoreError::SchemaMismatch {
             persisted_version: store_metadata.schema_version,
-            expected_version: STORE_SCHEMA_VERSION,
+            expected_version: CURRENT_STORE_SCHEMA_VERSION,
         });
     }
 
@@ -5481,7 +5482,7 @@ mod tests {
                 error,
                 StoreError::SchemaMismatch {
                     persisted_version,
-                    expected_version: STORE_SCHEMA_VERSION,
+                    expected_version: CURRENT_STORE_SCHEMA_VERSION,
                 } if persisted_version == 12
             ),
             "unexpected error: {error:?}"

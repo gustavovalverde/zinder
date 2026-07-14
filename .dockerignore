@@ -9,6 +9,12 @@ mutants.out.old/
 coverage/
 lcov.info
 
+# Storage-benchmark corpora and reports are bind-mounted runtime data. Keeping
+# the repository-root paths out of the build context prevents multi-gigabyte
+# fixtures and checkpoints from being uploaded to BuildKit.
+/fixtures/
+/benchmark-results/
+
 # Local IDE and shell state.
 .git/
 .gitignore

@@ -30,8 +30,9 @@ mod value_pool_balance_backfill;
 mod value_pool_flow_backfill;
 
 pub use artifact_builder::{
-    ArtifactDeriveError, BlockMismatchField, CommitmentTreeSizes, DerivedBlockArtifacts,
-    RawBlobPolicy, derive_block, derive_block_with_raw_blob_policy, finalize_derived_block,
+    BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
+    PreparedCanonicalBlock, RawBlobPolicy, finalize_canonical_block, prepare_canonical_block,
+    prepare_canonical_block_with_raw_blob_policy,
 };
 pub use block_production_time_backfill::spawn_block_production_time_backfill_task;
 pub use bulk_catchup::{
@@ -39,7 +40,7 @@ pub use bulk_catchup::{
     run_bulk_catchup_with_store,
 };
 pub use chain_ingest::{
-    BuiltArtifacts, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, IngestError, NodeSourceKind,
 };
 pub use commitment_root_backfill::{

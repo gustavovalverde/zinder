@@ -12,7 +12,7 @@ use zinder_core::{
     BlockHeight, Network, NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootIndex,
     wire::encode_zinder_native_chain_name,
 };
-use zinder_ingest::derive_block;
+use zinder_ingest::prepare_canonical_block;
 use zinder_source::{
     NodeAuth, NodeSource, SourceBlock, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
@@ -181,22 +181,30 @@ pub fn measure_workload_density(
 ) -> Result<WorkloadDensity, BenchError> {
     let mut density = WorkloadDensity::default();
     for block in blocks {
-        let derived = derive_block(block, activations)?;
-        let transaction_count = u32::try_from(derived.transaction_facts.len()).map_err(|_| {
+        let prepared = prepare_canonical_block(block, activations)?;
+        let transaction_count = u32::try_from(prepared.facts.transactions.len()).map_err(|_| {
             BenchError::fixture_format("block transaction count exceeds u32".to_owned())
         })?;
-        let transparent_input_count = derived
-            .transaction_facts
+        let transparent_input_count = prepared
+            .facts
+            .transactions
             .iter()
             .map(|transaction| transaction.transparent_inputs.len())
             .sum::<usize>();
         let transparent_input_count = u32::try_from(transparent_input_count).map_err(|_| {
             BenchError::fixture_format("block transparent input count exceeds u32".to_owned())
         })?;
-        let transparent_output_count = u32::try_from(derived.transparent_outputs_by_outpoint.len())
-            .map_err(|_| {
-                BenchError::fixture_format("block transparent output count exceeds u32".to_owned())
-            })?;
+        let transparent_output_count = u32::try_from(
+            prepared
+                .facts
+                .transactions
+                .iter()
+                .map(|transaction| transaction.transparent_outputs.len())
+                .sum::<usize>(),
+        )
+        .map_err(|_| {
+            BenchError::fixture_format("block transparent output count exceeds u32".to_owned())
+        })?;
         let raw_block_bytes = u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX);
 
         density.block_count = density.block_count.saturating_add(1);

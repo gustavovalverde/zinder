@@ -12,7 +12,7 @@ use crate::{
     kv::{RocksChainStore, StorageTable, StoreReadCaller},
 };
 
-use super::{STORE_SCHEMA_VERSION, decode_store_metadata};
+use super::{CURRENT_STORE_SCHEMA_VERSION, decode_store_metadata};
 
 pub(super) fn migrate_primary_store_schema(inner: &RocksChainStore) -> Result<(), StoreError> {
     let key = StoreKey::store_metadata();
@@ -22,12 +22,12 @@ pub(super) fn migrate_primary_store_schema(inner: &RocksChainStore) -> Result<()
         return Ok(());
     };
     let metadata = decode_store_metadata(&key, &metadata_bytes)?;
-    if metadata.schema_version == STORE_SCHEMA_VERSION {
+    if metadata.schema_version == CURRENT_STORE_SCHEMA_VERSION {
         return Ok(());
     }
 
     Err(StoreError::SchemaMismatch {
         persisted_version: metadata.schema_version,
-        expected_version: STORE_SCHEMA_VERSION,
+        expected_version: CURRENT_STORE_SCHEMA_VERSION,
     })
 }

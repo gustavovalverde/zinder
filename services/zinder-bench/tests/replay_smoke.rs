@@ -13,10 +13,12 @@ use zinder_bench::{
     fixture::{
         ActivationRecord, FIXTURE_FORMAT_VERSION, FixtureManifest, SubtreeRootSet, write_segment,
     },
+    recorder::install_recorder,
     replay::{
         ProjectionReplayScope, ReplayConfig, replay_fixture,
         seed_projection_replay_at_canonical_tip,
     },
+    report::{AcceptanceThresholds, StartingCanonicalStateKind},
 };
 use zinder_core::{BlockHeight, Network, wire::encode_zinder_native_chain_name};
 use zinder_derive::{
@@ -25,11 +27,15 @@ use zinder_derive::{
 };
 use zinder_ingest::open_primary_derive_store_for_canonical_with_projection_preset;
 use zinder_source::SourceBlock;
-use zinder_store::RocksDbResourceBudget;
+use zinder_store::{
+    ChainEventStreamFamily, EventStreamStartPosition, PrimaryChainStore, RocksDbResourceBudget,
+};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 const REGTEST_BLOCK_1: &str =
     include_str!("../../zinder-ingest/tests/fixtures/z3-regtest-block-1.json");
+const REGTEST_BLOCK_603: &str =
+    include_str!("../../zinder-ingest/tests/fixtures/z3-regtest-ironwood-block-603.json");
 
 fn regtest_activation_records() -> Vec<ActivationRecord> {
     sample_regtest_upgrade_activations()
@@ -44,14 +50,27 @@ fn regtest_activation_records() -> Vec<ActivationRecord> {
 }
 
 fn write_regtest_fixture() -> Result<TempDir> {
-    let fixture: Value = serde_json::from_str(REGTEST_BLOCK_1)?;
+    write_regtest_fixture_from_json(REGTEST_BLOCK_1)
+}
+
+fn write_non_genesis_manifest_fixture() -> Result<TempDir> {
+    write_regtest_fixture_from_json(REGTEST_BLOCK_603)
+}
+
+fn write_regtest_fixture_from_json(fixture_json: &str) -> Result<TempDir> {
+    let fixture: Value = serde_json::from_str(fixture_json)?;
+    let height = fixture
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|height| u32::try_from(height).ok())
+        .ok_or_else(|| eyre!("fixture height must fit in u32"))?;
     let raw_block_hex = fixture
         .get("raw_block_hex")
         .and_then(Value::as_str)
         .ok_or_else(|| eyre!("fixture raw_block_hex must be a string"))?;
     let block = SourceBlock::from_raw_block_bytes(
         Network::ZcashRegtest,
-        BlockHeight::new(1),
+        BlockHeight::new(height),
         hex::decode(raw_block_hex)?,
     )?;
     let fixture_directory = tempdir()?;
@@ -63,8 +82,8 @@ fn write_regtest_fixture() -> Result<TempDir> {
     FixtureManifest {
         fixture_format_version: FIXTURE_FORMAT_VERSION,
         network: encode_zinder_native_chain_name(Network::ZcashRegtest).to_owned(),
-        from_height: 1,
-        to_height: 1,
+        from_height: height,
+        to_height: height,
         block_count: 1,
         workload_density,
         artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
@@ -89,7 +108,33 @@ fn replay_config(
         canonical_block_cache_bytes: None,
         projection_preset,
         projection_replay_scope: ProjectionReplayScope::FixedRange,
+        software_revision: Some("test-revision".to_owned()),
+        runner_id: Some("test-runner".to_owned()),
+        cpu_limit_cores: Some(2.0),
+        memory_limit_bytes: Some(1024 * 1024 * 1024),
+        storage_class: Some("test-tmpfs".to_owned()),
+        image_reference: Some(format!("sha256:{}", "a".repeat(64))),
+        canonical_fixture_replay_thresholds: None,
     })
+}
+
+fn write_starting_checkpoint_manifest(
+    store_path: &std::path::Path,
+    canonical_position: &serde_json::Value,
+) -> Result<()> {
+    std::fs::create_dir_all(store_path)?;
+    let manifest = serde_json::json!({
+        "format_version": 2,
+        "network": "zcash-regtest",
+        "projection_preset": "wallet",
+        "canonical_position": canonical_position,
+        "projections": []
+    });
+    std::fs::write(
+        store_path.join("zinder-backup-manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    Ok(())
 }
 
 fn assert_projection_report(
@@ -99,29 +144,128 @@ fn assert_projection_report(
     assert_eq!(report.fixture.workload_density.block_count, 1);
     assert_eq!(report.fixture.workload_density.transaction_count, 1);
     assert_eq!(report.replay.tip_height_after, Some(1));
+    assert_eq!(report.replay.starting_canonical_state.tip_height, None);
+    assert_eq!(
+        report.replay.starting_canonical_state.tip_hash_rpc_hex,
+        None
+    );
+    assert_eq!(report.replay.starting_canonical_state.chain_epoch_id, None);
+    assert_eq!(
+        report
+            .replay
+            .starting_canonical_state
+            .artifact_schema_version,
+        None
+    );
+    assert_eq!(
+        report
+            .replay
+            .starting_canonical_state
+            .checkpoint_manifest_sha256,
+        None
+    );
     assert_eq!(report.replay.blocks_committed, 1);
     assert_eq!(report.replay.projection_preset, Some(projection_preset));
     assert_eq!(report.replay.projection_replay_scope, Some("fixed-range"));
-    assert!(report.replay.derive_wall_clock_seconds.is_some());
+    assert!(report.replay.projection_build_wall_clock_seconds.is_some());
     assert!(
         report
             .replay
-            .derive_bytes_written
+            .projection_logical_write_bytes
             .is_some_and(|bytes| bytes > 0)
     );
     assert!(report.replay.projection_row_count.is_some());
-    assert_eq!(report.replay.projection_lag_blocks, Some(0));
+    assert_eq!(report.replay.projection_event_cursor_at_tip, Some(true));
     assert!(
         report
             .replay
-            .derive_store_bytes
+            .projection_store_bytes
             .is_some_and(|bytes| bytes > 0)
     );
-    assert!(report.replay.derive_reopen_seconds.is_some());
+    assert!(report.replay.projection_store_reopen_seconds.is_some());
+    assert_eq!(report.fixture.digest_sha256.len(), 64);
+    assert!(
+        report
+            .replay
+            .canonical_writer
+            .rocksdb_resource_budget
+            .block_cache_bytes
+            > 0
+    );
+    assert_eq!(report.storage_candidate.canonical_engine, "rocksdb");
+    assert_eq!(
+        report.provenance.software_revision.as_deref(),
+        Some("test-revision")
+    );
+    assert_eq!(report.provenance.runner.id.as_deref(), Some("test-runner"));
+    assert_eq!(
+        report.acceptance.canonical_fixture_replay.scope,
+        "fixture-range"
+    );
+}
+
+fn assert_no_target_wallet_acceptance_claim(report: &zinder_bench::report::Report) -> Result<()> {
+    let report = serde_json::to_value(report)?;
+    assert!(report.get("lifecycle").is_none());
+    assert!(report["acceptance"].get("wallet_build").is_none());
+    assert!(report["acceptance"].get("wallet_build_lifecycle").is_none());
+    assert!(report["acceptance"].get("wallet_ready").is_none());
+    Ok(())
+}
+
+fn assert_projection_at_canonical_tip(
+    canonical_store: &PrimaryChainStore,
+    projection_store: &zinder_derive::DeriveStore,
+) -> Result<()> {
+    let expected_cursor = canonical_store
+        .resolve_chain_event_stream_start(
+            &EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Tip,
+        )?
+        .cursor
+        .ok_or_else(|| eyre!("committed fixture must expose a canonical event cursor"))?;
+    for consumer_name in projection_store
+        .chain_event_consumer_names()
+        .chain(projection_store.event_only_chain_event_consumer_names())
+    {
+        assert_eq!(
+            projection_store.get_chain_event_cursor(consumer_name)?,
+            Some(expected_cursor.as_bytes().to_vec()),
+            "projection {} must reach the canonical event tip",
+            consumer_name.as_str()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn thresholded_config_requires_immutable_structured_provenance_and_telemetry() -> Result<()> {
+    let fixture_directory = write_regtest_fixture()?;
+    let store_directory = tempdir()?;
+    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    config.canonical_fixture_replay_thresholds = Some(
+        AcceptanceThresholds::try_from_seconds(10.0, 20.0)
+            .map_err(|error| eyre!(error.to_string()))?,
+    );
+
+    assert!(config.validate(false).is_err());
+    config.image_reference = Some("zinder-bench:mutable".to_owned());
+    assert!(config.validate(true).is_err());
+    config.image_reference = Some(format!("@sha256:{}", "a".repeat(64)));
+    assert!(config.validate(true).is_err());
+    config.image_reference = Some(format!("sha256:{}", "a".repeat(64)));
+    config.cpu_limit_cores = None;
+    assert!(config.validate(true).is_err());
+    config.cpu_limit_cores = Some(2.0);
+    config.projection_preset = Some(ProjectionPreset::Wallet);
+    assert!(config.validate(true).is_err());
+    config.projection_preset = None;
+    config.validate(true)?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_commits_a_genesis_block_over_the_real_pipeline() -> Result<()> {
+async fn current_projection_presets_report_diagnostics_not_wallet_acceptance() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
     let wallet_store_directory = tempdir()?;
     let wallet_report = replay_fixture(
@@ -134,6 +278,11 @@ async fn replay_commits_a_genesis_block_over_the_real_pipeline() -> Result<()> {
     )
     .await?;
     assert_projection_report(&wallet_report, "wallet");
+    assert_eq!(
+        wallet_report.storage_candidate.diagnostic_projection_engine,
+        Some("rocksdb")
+    );
+    assert_no_target_wallet_acceptance_claim(&wallet_report)?;
 
     let complete_store_directory = tempdir()?;
     let complete_report = replay_fixture(
@@ -146,6 +295,13 @@ async fn replay_commits_a_genesis_block_over_the_real_pipeline() -> Result<()> {
     )
     .await?;
     assert_projection_report(&complete_report, "complete");
+    assert_eq!(
+        complete_report
+            .storage_candidate
+            .diagnostic_projection_engine,
+        Some("rocksdb")
+    );
+    assert_no_target_wallet_acceptance_claim(&complete_report)?;
     Ok(())
 }
 
@@ -169,6 +325,11 @@ async fn complete_replay_bootstraps_ranking_while_wallet_remains_ranking_free() 
         RocksDbResourceBudget::derive_writer_defaults(),
         ProjectionPreset::Complete,
     )?;
+    let complete_canonical_store = PrimaryChainStore::open(
+        &complete_store_path,
+        zinder_store::ChainStoreOptions::for_network(Network::ZcashRegtest),
+    )?;
+    assert_projection_at_canonical_tip(&complete_canonical_store, &complete_store)?;
     let active = TransparentAddressRankingConsumer::active_metadata(&complete_store)?
         .ok_or_else(|| eyre!("complete replay must activate a ranking generation"))?;
     assert!(active.generation > 0);
@@ -203,6 +364,11 @@ async fn complete_replay_bootstraps_ranking_while_wallet_remains_ranking_free() 
         RocksDbResourceBudget::derive_writer_defaults(),
         ProjectionPreset::Wallet,
     )?;
+    let wallet_canonical_store = PrimaryChainStore::open(
+        &wallet_store_path,
+        zinder_store::ChainStoreOptions::for_network(Network::ZcashRegtest),
+    )?;
+    assert_projection_at_canonical_tip(&wallet_canonical_store, &wallet_store)?;
     assert!(!wallet_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME));
     assert_eq!(
         wallet_store.get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?,
@@ -248,5 +414,113 @@ async fn fixed_range_seeds_selected_consumers_at_the_starting_tip() -> Result<()
         }
     }
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_replay_rejects_a_preexisting_projection_store() -> Result<()> {
+    let fixture_directory = write_regtest_fixture()?;
+    let store_directory = tempdir()?;
+    let config = replay_config(
+        &fixture_directory,
+        &store_directory,
+        Some(ProjectionPreset::Wallet),
+    )?;
+    std::fs::create_dir_all(&config.store_path)?;
+    let projection_store = zinder_derive::DeriveStore::open_with_projection_preset(
+        zinder_derive::DeriveStore::path_for_canonical(&config.store_path),
+        ProjectionPreset::Wallet,
+        zinder_derive::DeriveStoreOptions {
+            sync_writes: false,
+            consumers: ProjectionPreset::Wallet.consumer_schemas(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    drop(projection_store);
+
+    let Some(error) = replay_fixture(config, None).await.err() else {
+        return Err(eyre!(
+            "projection replay must reject a populated starting projection path"
+        ));
+    };
+    assert!(error.to_string().contains("fresh projection store"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thresholded_genesis_replay_accepts_a_proven_empty_start_without_manifest() -> Result<()> {
+    let fixture_directory = write_regtest_fixture()?;
+    let store_directory = tempdir()?;
+    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    config.canonical_fixture_replay_thresholds = Some(
+        AcceptanceThresholds::try_from_seconds(10.0, 20.0)
+            .map_err(|error| eyre!(error.to_string()))?,
+    );
+    let report = replay_fixture(config, Some(install_recorder()?)).await?;
+    assert_eq!(
+        report.replay.starting_canonical_state.kind,
+        StartingCanonicalStateKind::Empty
+    );
+    assert_eq!(
+        report
+            .replay
+            .starting_canonical_state
+            .checkpoint_manifest_sha256,
+        None
+    );
+    assert_eq!(report.replay.starting_canonical_state.chain_epoch_id, None);
+    assert_eq!(report.replay.starting_canonical_state.tip_height, None);
+    assert_eq!(
+        report.replay.starting_canonical_state.tip_hash_rpc_hex,
+        None
+    );
+    report.validate_acceptance()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thresholded_non_genesis_replay_requires_a_checkpoint_manifest() -> Result<()> {
+    let fixture_directory = write_non_genesis_manifest_fixture()?;
+    let store_directory = tempdir()?;
+    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    config.canonical_fixture_replay_thresholds = Some(
+        AcceptanceThresholds::try_from_seconds(10.0, 20.0)
+            .map_err(|error| eyre!(error.to_string()))?,
+    );
+
+    let Some(error) = replay_fixture(config, Some(install_recorder()?))
+        .await
+        .err()
+    else {
+        return Err(eyre!(
+            "thresholded non-genesis replay must require checkpoint provenance"
+        ));
+    };
+    assert!(error.to_string().contains("thresholded replay requires"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_rejects_checkpoint_manifest_position_that_disagrees_with_store() -> Result<()> {
+    let fixture_directory = write_regtest_fixture()?;
+    let store_directory = tempdir()?;
+    let config = replay_config(&fixture_directory, &store_directory, None)?;
+    write_starting_checkpoint_manifest(
+        &config.store_path,
+        &serde_json::json!({
+            "chain_epoch_id": 7,
+            "visible_tip_height": 6,
+            "visible_tip_hash": "00".repeat(32),
+            "artifact_schema_version": zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+            "history_bounds": {"kind": "complete", "first_available_height": 1}
+        }),
+    )?;
+
+    let Some(error) = replay_fixture(config, None).await.err() else {
+        return Err(eyre!(
+            "replay must reject checkpoint position that disagrees with the store"
+        ));
+    };
+    assert!(error.to_string().contains("opened store is empty"));
     Ok(())
 }

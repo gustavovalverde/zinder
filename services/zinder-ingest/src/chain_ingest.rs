@@ -17,11 +17,12 @@ use thiserror::Error;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
-    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis,
+    BlockHeightRange, BlockTransactionIndexArtifact, CanonicalTransactionFacts, ChainEpoch,
+    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, PositionedCanonicalBlock,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_source::{
     NodeCapability, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
@@ -32,7 +33,10 @@ use zinder_store::{
     StoreError, StoreReadCaller,
 };
 
-use crate::ArtifactDeriveError;
+use crate::{
+    CanonicalBlockConstructionError,
+    artifact_builder::{CurrentSchemaBlockArtifacts, expand_current_schema_block_artifacts},
+};
 
 const FETCH_RETRY_MAX_ATTEMPTS: u32 = 5;
 #[cfg(not(test))]
@@ -291,7 +295,7 @@ pub enum IngestError {
         maximum_historical_height: BlockHeight,
     },
 
-    /// Bulk catchup cannot derive a chain-global commitment-tree size base.
+    /// Bulk catchup cannot resolve a chain-global commitment-tree size base.
     #[error(
         "bulk catchup from height {from_height:?} requires contiguous commitment-tree metadata; start a fresh store at height 1 or append immediately after current tip {current_tip_height:?}"
     )]
@@ -387,9 +391,9 @@ pub enum IngestError {
     #[error(transparent)]
     Source(#[from] SourceError),
 
-    /// Artifact derivation failed.
+    /// Canonical block construction failed.
     #[error(transparent)]
-    ArtifactDerive(#[from] ArtifactDeriveError),
+    CanonicalBlockConstruction(#[from] CanonicalBlockConstructionError),
 
     /// Canonical store failed.
     #[error(transparent)]
@@ -402,36 +406,6 @@ pub enum IngestError {
         /// Reason from `tokio::task::JoinError::to_string`.
         reason: String,
     },
-}
-
-/// Built canonical artifacts produced for one source block.
-///
-/// Output of [`finalize_derived_block`](crate::artifact_builder::finalize_derived_block).
-/// Each field is final once this struct exists; the consumer absorbs it
-/// into an `CanonicalBatch` and the batch is then committed atomically.
-#[derive(Debug)]
-pub struct BuiltArtifacts {
-    /// Canonical block-header facts.
-    pub block_header: BlockHeaderArtifact,
-    /// Optional raw block blob.
-    pub block_blob: Option<BlockBlobArtifact>,
-    /// Lightwalletd compact block with final `chain_metadata` stamped.
-    pub compact_block: CompactBlockArtifact,
-    /// Block-local transaction id index rows.
-    pub block_transaction_index: Vec<BlockTransactionIndexArtifact>,
-    /// Mined transaction locations.
-    pub transaction_locations: Vec<TransactionLocation>,
-    /// Per-transaction public facts.
-    pub transaction_facts: Vec<TransactionFactsArtifact>,
-    /// Per-transaction signed shielded-pool balances.
-    pub transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
-    /// Optional raw transaction blobs.
-    pub transaction_blobs: Vec<TransactionBlobArtifact>,
-    /// Transparent output artifacts keyed by outpoint. The store derives
-    /// the address-output projection rows from these at commit.
-    pub transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
-    /// Running commitment-tree position after this block is folded in.
-    pub tip_metadata: ChainTipMetadata,
 }
 
 /// In-flight canonical artifact batch accumulated between commits.
@@ -460,13 +434,16 @@ pub(crate) struct CanonicalBatch {
 }
 
 impl CanonicalBatch {
-    /// Appends one block.s built artifacts into the in-flight batch.
+    /// Appends one block's canonical facts into the in-flight batch.
     ///
-    /// Called once per `finalize_derived_block` result. Each field is
+    /// Called once per `finalize_canonical_block` result. Each field is
     /// moved into its matching `CanonicalBatch` vector; the running tip
-    /// metadata is overwritten with the latest built value.
-    pub(crate) fn absorb(&mut self, built: BuiltArtifacts) {
-        self.absorb_with_prefetched_spent_outputs(built, Vec::new());
+    /// metadata is overwritten with the latest block value.
+    pub(crate) fn absorb(
+        &mut self,
+        block: PositionedCanonicalBlock,
+    ) -> Result<(), CanonicalBlockConstructionError> {
+        self.absorb_with_prefetched_spent_outputs(block, Vec::new())
     }
 
     /// Returns the resource cost contributed by one finalized block.
@@ -475,21 +452,28 @@ impl CanonicalBatch {
     /// post-admission accumulator, so they cannot drift apart as canonical
     /// artifacts gain new write paths.
     pub(crate) fn work_cost_for_block(
-        built: &BuiltArtifacts,
+        block: &PositionedCanonicalBlock,
         prefetched_outputs: &[TransparentOutputArtifact],
     ) -> CanonicalBatchCost {
+        let facts = &block.facts;
         let transparent_spend_references =
-            transparent_spend_reference_count_for_transactions(&built.transaction_facts);
+            transparent_spend_reference_count_for_canonical_transactions(&facts.transactions);
+        let transparent_outputs = facts
+            .transactions
+            .iter()
+            .fold(0usize, |count, transaction| {
+                count.saturating_add(transaction.transparent_outputs.len())
+            });
         CanonicalBatchCost {
             blocks: 1,
-            transactions: built.transaction_facts.len(),
-            transparent_outputs: built.transparent_outputs_by_outpoint.len(),
+            transactions: facts.transactions.len(),
+            transparent_outputs,
             transparent_spend_references,
-            artifact_bytes: canonical_block_artifact_bytes(built).saturating_add(
+            artifact_bytes: canonical_block_artifact_bytes(block).saturating_add(
                 prefetched_spent_transparent_output_bytes(prefetched_outputs),
             ),
             estimated_write_bytes: canonical_block_estimated_write_bytes(
-                built,
+                block,
                 transparent_spend_references,
             ),
         }
@@ -509,36 +493,54 @@ impl CanonicalBatch {
             .saturating_add(cost.estimated_write_bytes);
     }
 
-    fn absorb_built_artifacts(&mut self, built: BuiltArtifacts) {
-        self.block_headers.push(built.block_header);
-        if let Some(block_blob) = built.block_blob {
+    fn absorb_positioned_canonical_block(
+        &mut self,
+        block: PositionedCanonicalBlock,
+    ) -> Result<(), CanonicalBlockConstructionError> {
+        let PositionedCanonicalBlock {
+            facts,
+            compact_block,
+            tip_metadata,
+        } = block;
+        let CurrentSchemaBlockArtifacts {
+            block_header,
+            block_blob,
+            block_transaction_index,
+            transaction_locations,
+            transaction_facts,
+            transaction_intrinsic_value_balances,
+            transaction_blobs,
+            transparent_outputs_by_outpoint,
+        } = expand_current_schema_block_artifacts(facts)?;
+        self.block_headers.push(block_header);
+        if let Some(block_blob) = block_blob {
             self.block_blobs.push(block_blob);
         }
-        self.compact_blocks.push(built.compact_block);
-        self.block_transaction_index
-            .extend(built.block_transaction_index);
-        self.transaction_locations
-            .extend(built.transaction_locations);
-        self.transaction_facts.extend(built.transaction_facts);
+        self.compact_blocks.push(compact_block);
+        self.block_transaction_index.extend(block_transaction_index);
+        self.transaction_locations.extend(transaction_locations);
+        self.transaction_facts.extend(transaction_facts);
         self.transaction_intrinsic_value_balances
-            .extend(built.transaction_intrinsic_value_balances);
-        self.transaction_blobs.extend(built.transaction_blobs);
+            .extend(transaction_intrinsic_value_balances);
+        self.transaction_blobs.extend(transaction_blobs);
         self.transparent_outputs_by_outpoint
-            .extend(built.transparent_outputs_by_outpoint);
-        self.tip_metadata = Some(built.tip_metadata);
+            .extend(transparent_outputs_by_outpoint);
+        self.tip_metadata = Some(tip_metadata);
+        Ok(())
     }
 
-    /// Appends built artifacts with transparent prevouts prefetched upstream.
+    /// Appends canonical block facts with transparent prevouts prefetched upstream.
     pub(crate) fn absorb_with_prefetched_spent_outputs(
         &mut self,
-        built: BuiltArtifacts,
+        block: PositionedCanonicalBlock,
         prefetched_outputs: Vec<TransparentOutputArtifact>,
-    ) {
-        let cost = Self::work_cost_for_block(&built, &prefetched_outputs);
+    ) -> Result<(), CanonicalBlockConstructionError> {
+        let cost = Self::work_cost_for_block(&block, &prefetched_outputs);
         self.absorb_work_cost(cost);
-        self.absorb_built_artifacts(built);
+        self.absorb_positioned_canonical_block(block)?;
         self.prefetched_spent_transparent_outputs
             .extend(prefetched_outputs);
+        Ok(())
     }
 
     pub(crate) fn push_tree_state_checkpoint(&mut self, tree_state: TreeStateArtifact) {
@@ -580,18 +582,21 @@ impl CanonicalBatch {
     }
 }
 
-fn canonical_block_artifact_bytes(built: &BuiltArtifacts) -> usize {
-    let block_blob_bytes = built
-        .block_blob
-        .as_ref()
-        .map_or(0, |block_blob| block_blob.raw_block_bytes.len());
-    let compact_block_bytes = built.compact_block.payload_bytes.len();
+fn canonical_block_artifact_bytes(block: &PositionedCanonicalBlock) -> usize {
+    let block_blob_bytes = block.facts.raw_block_bytes.as_ref().map_or(0, Vec::len);
+    let compact_block_bytes = block.compact_block.payload_bytes.len();
     let transaction_blob_bytes =
-        built
-            .transaction_blobs
+        block
+            .facts
+            .transactions
             .iter()
-            .fold(0usize, |bytes, transaction_blob| {
-                bytes.saturating_add(transaction_blob.raw_transaction_bytes.len())
+            .fold(0usize, |bytes, transaction| {
+                bytes.saturating_add(
+                    transaction
+                        .raw_transaction_bytes
+                        .as_ref()
+                        .map_or(0, Vec::len),
+                )
             });
     block_blob_bytes
         .saturating_add(compact_block_bytes)
@@ -599,38 +604,41 @@ fn canonical_block_artifact_bytes(built: &BuiltArtifacts) -> usize {
 }
 
 fn canonical_block_estimated_write_bytes(
-    built: &BuiltArtifacts,
+    block: &PositionedCanonicalBlock,
     transparent_spend_references: usize,
 ) -> usize {
+    let facts = &block.facts;
     let block_index_bytes = ESTIMATED_BLOCK_WRITE_BYTES
         .saturating_add(
-            built
-                .block_transaction_index
+            facts
+                .transactions
                 .len()
                 .saturating_mul(ESTIMATED_BLOCK_TRANSACTION_INDEX_WRITE_BYTES),
         )
         .saturating_add(
-            built
-                .transaction_locations
+            facts
+                .transactions
                 .len()
                 .saturating_mul(ESTIMATED_TRANSACTION_LOCATION_WRITE_BYTES),
         );
-    let transaction_fact_bytes = built
-        .transaction_facts
+    let transaction_fact_bytes = facts
+        .transactions
         .len()
         .saturating_mul(ESTIMATED_TRANSACTION_FACT_WRITE_BYTES);
-    let transparent_output_bytes = built
-        .transparent_outputs_by_outpoint
-        .len()
-        .saturating_mul(ESTIMATED_TRANSPARENT_OUTPUT_WRITE_BYTES);
-    let address_output_index_bytes = built
-        .transparent_outputs_by_outpoint
-        .len()
-        .saturating_mul(ESTIMATED_ADDRESS_OUTPUT_INDEX_WRITE_BYTES);
+    let transparent_output_count = facts
+        .transactions
+        .iter()
+        .fold(0usize, |count, transaction| {
+            count.saturating_add(transaction.transparent_outputs.len())
+        });
+    let transparent_output_bytes =
+        transparent_output_count.saturating_mul(ESTIMATED_TRANSPARENT_OUTPUT_WRITE_BYTES);
+    let address_output_index_bytes =
+        transparent_output_count.saturating_mul(ESTIMATED_ADDRESS_OUTPUT_INDEX_WRITE_BYTES);
     let transparent_spend_fact_bytes =
         transparent_spend_references.saturating_mul(ESTIMATED_TRANSPARENT_SPEND_FACT_WRITE_BYTES);
 
-    canonical_block_artifact_bytes(built)
+    canonical_block_artifact_bytes(block)
         .saturating_add(block_index_bytes)
         .saturating_add(transaction_fact_bytes)
         .saturating_add(transparent_output_bytes)
@@ -1417,8 +1425,8 @@ fn transparent_spend_references_for_transactions(
     spends
 }
 
-fn transparent_spend_reference_count_for_transactions(
-    transactions: &[TransactionFactsArtifact],
+fn transparent_spend_reference_count_for_canonical_transactions(
+    transactions: &[CanonicalTransactionFacts],
 ) -> usize {
     transactions.iter().fold(0usize, |count, transaction| {
         count.saturating_add(
@@ -1564,9 +1572,9 @@ impl Drop for SourceFetchActiveGauge {
     }
 }
 
-/// Records derive wall-clock and outcome for one source block.
+/// Records canonical block-preparation wall-clock and outcome.
 ///
-/// In bulk catchup this wraps the parallel-safe `derive_block` call inside
+/// In bulk catchup this wraps the parallel-safe `prepare_canonical_block` call inside
 /// the buffered stream; in tip-follow this wraps the one-block artifact
 /// build. The histogram is the per-block CPU contribution to ingest
 /// throughput before serial finalization and commit work.
@@ -1735,7 +1743,7 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::SystemTimeBeforeUnixEpoch { .. }) => "system_time_before_unix_epoch",
         Some(IngestError::TimestampTooLarge) => "timestamp_too_large",
         Some(IngestError::Source(_)) => "source",
-        Some(IngestError::ArtifactDerive(_)) => "artifact_derive",
+        Some(IngestError::CanonicalBlockConstruction(_)) => "canonical_block_construction",
         Some(IngestError::Store(_)) => "store",
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",

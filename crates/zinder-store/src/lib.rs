@@ -45,10 +45,11 @@ pub use chain_event::{
 };
 pub use chain_store::{
     AddressOutputIndexPage, AddressOutputIndexPageRequest, BlockValuePoolBalanceEnrichmentOutcome,
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochReadApi, ChainEventHistoryRequest,
-    ChainEventRetentionReport, ChainStoreOptions, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
-    FinalNoteCommitmentRootEnrichmentOutcome, MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH,
-    MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION, ChainEpochReadApi,
+    ChainEventHistoryRequest, ChainEventRetentionReport, ChainStoreOptions,
+    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, FinalNoteCommitmentRootEnrichmentOutcome,
+    MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH, MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH,
+    MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
     MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH,
     MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, RawBlobRetention,
     SecondaryCatchupOutcome, SecondaryChainStore,

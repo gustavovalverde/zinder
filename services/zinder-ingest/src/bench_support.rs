@@ -44,7 +44,7 @@ pub const BENCH_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 pub const BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
 /// Maximum reserved response bytes across source fetches.
 pub const BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 384 * 1024 * 1024;
-/// Maximum reserved derived artifact bytes across active and completed prepares.
+/// Maximum reserved prepared block bytes across active and completed prepares.
 pub const BENCH_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 /// Maximum safe-tip artifact bytes queued while the previous batch commits.
 pub const BENCH_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;

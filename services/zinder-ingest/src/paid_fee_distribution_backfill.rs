@@ -27,12 +27,14 @@ use zinder_store::{
 };
 
 use crate::{
-    IngestError, derive_block,
+    IngestError,
+    artifact_builder::expand_current_schema_block_artifacts,
     derive_consumers::{
         backfill_consumer_tail_boundary, derive_projection_write_guard,
         unanimous_existing_block_consumer_cursor,
     },
     ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
+    prepare_canonical_block,
 };
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -1072,12 +1074,13 @@ async fn fetch_missing_intrinsic_artifacts(
                         reason: error.to_string(),
                     })??;
             validate_source_block(&source_block, &expected)?;
-            let derived = derive_block(&source_block, &activations)?;
+            let prepared = prepare_canonical_block(&source_block, &activations)?;
+            let current_schema_artifacts = expand_current_schema_block_artifacts(prepared.facts)?;
             validate_derived_locations(
-                &derived.transaction_intrinsic_value_balances,
+                &current_schema_artifacts.transaction_intrinsic_value_balances,
                 &expected.transaction_locations,
             )?;
-            Ok::<_, IngestError>(derived.transaction_intrinsic_value_balances)
+            Ok::<_, IngestError>(current_schema_artifacts.transaction_intrinsic_value_balances)
         }
     }))
     .buffer_unordered(usize::try_from(config.fetch_concurrency.get()).unwrap_or(usize::MAX));

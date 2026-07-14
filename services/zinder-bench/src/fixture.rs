@@ -2,7 +2,7 @@
 //! [`NodeSource`] that serves captured payloads for a deterministic replay.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     num::NonZeroU32,
@@ -166,7 +166,8 @@ pub struct FixtureManifest {
     pub workload_density: WorkloadDensity,
     /// Canonical artifact schema version at capture time.
     pub artifact_schema_version: u16,
-    /// Hash of the block at `to_height`, hex-encoded, used as the replay tip.
+    /// Hash of the block at `to_height`, hex-encoded in internal byte order,
+    /// used as the replay tip.
     pub tip_hash_hex: String,
     /// Consensus activations required to derive the captured blocks.
     pub network_upgrade_activations: Vec<ActivationRecord>,
@@ -189,21 +190,115 @@ impl FixtureManifest {
                 manifest.fixture_format_version
             )));
         }
-        if manifest.workload_density.block_count != manifest.block_count {
-            return Err(BenchError::fixture_format(format!(
-                "density block count {} does not match fixture block count {}",
-                manifest.workload_density.block_count, manifest.block_count
-            )));
-        }
+        manifest.validate_structure()?;
         Ok(manifest)
     }
 
     /// Writes the manifest into a fixture directory as pretty JSON.
     pub fn write(&self, directory: &Path) -> Result<(), BenchError> {
+        self.validate_structure()?;
         let manifest_path = directory.join(MANIFEST_FILE_NAME);
         let encoded = serde_json::to_vec_pretty(self)?;
         std::fs::write(&manifest_path, encoded)
             .map_err(|source| BenchError::io(&manifest_path, source))
+    }
+
+    /// Returns a stable SHA-256 identity for the normalized manifest.
+    ///
+    /// The manifest includes the ordered SHA-256 digest of every segment, so
+    /// this value identifies both the captured source corpus and the metadata
+    /// required to replay it.
+    pub fn digest_sha256(&self) -> Result<String, BenchError> {
+        self.validate_structure()?;
+        let normalized_manifest = serde_json::to_vec(self)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"zinder-bench-fixture-manifest-v1\0");
+        hasher.update(normalized_manifest);
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    fn validate_structure(&self) -> Result<(), BenchError> {
+        let expected_block_count = self
+            .to_height
+            .checked_sub(self.from_height)
+            .and_then(|span| span.checked_add(1))
+            .ok_or_else(|| {
+                BenchError::fixture_format(format!(
+                    "fixture range {}..={} is invalid",
+                    self.from_height, self.to_height
+                ))
+            })?;
+        if self.block_count != expected_block_count {
+            return Err(BenchError::fixture_format(format!(
+                "fixture block count {} does not cover range {}..={} ({expected_block_count} blocks)",
+                self.block_count, self.from_height, self.to_height
+            )));
+        }
+        if self.workload_density.block_count != self.block_count {
+            return Err(BenchError::fixture_format(format!(
+                "density block count {} does not match fixture block count {}",
+                self.workload_density.block_count, self.block_count
+            )));
+        }
+        if self.segments.is_empty() {
+            return Err(BenchError::fixture_format(
+                "fixture must contain at least one segment".to_owned(),
+            ));
+        }
+
+        let mut next_height = self.from_height;
+        let mut described_blocks = 0_u32;
+        let mut segment_files = HashSet::new();
+        for (position, descriptor) in self.segments.iter().enumerate() {
+            let expected_index = u32::try_from(position).map_err(|_| {
+                BenchError::fixture_format(
+                    "fixture contains more than u32::MAX segments".to_owned(),
+                )
+            })?;
+            if descriptor.index != expected_index {
+                return Err(BenchError::fixture_format(format!(
+                    "segment at manifest position {position} has index {}, expected {expected_index}",
+                    descriptor.index
+                )));
+            }
+            validate_segment_descriptor(descriptor)?;
+            if descriptor.from_height != next_height {
+                return Err(BenchError::fixture_format(format!(
+                    "segment {} starts at {}, expected {}",
+                    descriptor.index, descriptor.from_height, next_height
+                )));
+            }
+            if !segment_files.insert(descriptor.file.as_str()) {
+                return Err(BenchError::fixture_format(format!(
+                    "segment file {} appears more than once",
+                    descriptor.file
+                )));
+            }
+            described_blocks = described_blocks
+                .checked_add(descriptor.block_count)
+                .ok_or_else(|| {
+                    BenchError::fixture_format("segment block count overflow".to_owned())
+                })?;
+            if position + 1 == self.segments.len() {
+                if descriptor.to_height != self.to_height {
+                    return Err(BenchError::fixture_format(format!(
+                        "final segment ends at {}, expected {}",
+                        descriptor.to_height, self.to_height
+                    )));
+                }
+            } else {
+                next_height = descriptor.to_height.checked_add(1).ok_or_else(|| {
+                    BenchError::fixture_format("segment height overflow".to_owned())
+                })?;
+            }
+        }
+        if described_blocks != self.block_count {
+            return Err(BenchError::fixture_format(format!(
+                "segments describe {described_blocks} blocks, expected {}",
+                self.block_count
+            )));
+        }
+        Ok(())
     }
 
     /// Resolves the captured network to a typed [`Network`].
@@ -230,12 +325,12 @@ impl FixtureManifest {
 
     /// Resolves the replay tip identity from the captured tip hash.
     pub fn tip_id(&self) -> Result<BlockId, BenchError> {
-        let hash = decode_block_hash_hex(&self.tip_hash_hex)?;
+        let hash = decode_internal_block_hash_hex(&self.tip_hash_hex)?;
         Ok(BlockId::new(BlockHeight::new(self.to_height), hash))
     }
 }
 
-fn decode_block_hash_hex(encoded: &str) -> Result<BlockHash, BenchError> {
+fn decode_internal_block_hash_hex(encoded: &str) -> Result<BlockHash, BenchError> {
     let bytes = hex::decode(encoded).map_err(|source| {
         BenchError::fixture_format(format!("invalid block hash hex: {source}"))
     })?;
@@ -247,6 +342,48 @@ fn decode_block_hash_hex(encoded: &str) -> Result<BlockHash, BenchError> {
 
 fn segment_file_name(index: u32) -> String {
     format!("segment-{index:06}.bin")
+}
+
+fn validate_segment_descriptor(descriptor: &SegmentDescriptor) -> Result<(), BenchError> {
+    let expected_block_count = descriptor
+        .to_height
+        .checked_sub(descriptor.from_height)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| {
+            BenchError::fixture_format(format!(
+                "segment {} range {}..={} is invalid",
+                descriptor.index, descriptor.from_height, descriptor.to_height
+            ))
+        })?;
+    if descriptor.block_count != expected_block_count {
+        return Err(BenchError::fixture_format(format!(
+            "segment {} block count {} does not cover {}..={} ({expected_block_count} blocks)",
+            descriptor.index, descriptor.block_count, descriptor.from_height, descriptor.to_height
+        )));
+    }
+    let file_path = Path::new(&descriptor.file);
+    let mut components = file_path.components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(BenchError::fixture_format(format!(
+            "segment {} file must be one relative file name",
+            descriptor.index
+        )));
+    }
+    let digest = hex::decode(&descriptor.sha256).map_err(|source| {
+        BenchError::fixture_format(format!(
+            "segment {} has an invalid SHA-256 descriptor: {source}",
+            descriptor.index
+        ))
+    })?;
+    if digest.len() != 32 {
+        return Err(BenchError::fixture_format(format!(
+            "segment {} SHA-256 descriptor must contain 32 bytes",
+            descriptor.index
+        )));
+    }
+    Ok(())
 }
 
 /// Writes one segment of contiguous blocks and returns its descriptor.
@@ -263,6 +400,18 @@ pub fn write_segment(
     let last = blocks
         .last()
         .ok_or_else(|| BenchError::invalid_argument("segment must contain at least one block"))?;
+    for pair in blocks.windows(2) {
+        let [previous, current] = pair else {
+            continue;
+        };
+        if previous.height.next() != Some(current.height) || current.parent_hash != previous.hash {
+            return Err(BenchError::invalid_argument(format!(
+                "segment blocks {} and {} are not an ordered connected pair",
+                previous.height.value(),
+                current.height.value()
+            )));
+        }
+    }
     let file_name = segment_file_name(index);
     let segment_path = directory.join(&file_name);
     let file =
@@ -328,14 +477,25 @@ pub fn read_segment_blocks(
     descriptor: &SegmentDescriptor,
     network: Network,
 ) -> Result<Vec<SourceBlock>, BenchError> {
+    validate_segment_descriptor(descriptor)?;
     let segment_path = directory.join(&descriptor.file);
+    verify_segment_sha256(&segment_path, &descriptor.sha256)?;
     let file = File::open(&segment_path).map_err(|source| BenchError::io(&segment_path, source))?;
     let mut reader = BufReader::new(file);
     read_and_verify_magic(&mut reader, &segment_path)?;
 
     let mut blocks = Vec::with_capacity(descriptor.block_count as usize);
-    for _ in 0..descriptor.block_count {
+    for offset in 0..descriptor.block_count {
         let (height, byte_len) = read_record_header(&mut reader, &segment_path)?;
+        let expected_height = descriptor.from_height.checked_add(offset).ok_or_else(|| {
+            BenchError::fixture_format("segment record height overflow".to_owned())
+        })?;
+        if height != expected_height {
+            return Err(BenchError::fixture_format(format!(
+                "segment {} record {offset} has height {height}, expected {expected_height}",
+                descriptor.index
+            )));
+        }
         let mut raw_block_bytes = vec![0_u8; byte_len as usize];
         reader
             .read_exact(&mut raw_block_bytes)
@@ -344,7 +504,26 @@ pub fn read_segment_blocks(
             SourceBlock::from_raw_block_bytes(network, BlockHeight::new(height), raw_block_bytes)?;
         blocks.push(block);
     }
+    reject_trailing_segment_bytes(&mut reader, &segment_path)?;
     Ok(blocks)
+}
+
+fn reject_trailing_segment_bytes(
+    reader: &mut BufReader<File>,
+    segment_path: &Path,
+) -> Result<(), BenchError> {
+    let mut trailing_byte = [0_u8; 1];
+    if reader
+        .read(&mut trailing_byte)
+        .map_err(|source| BenchError::io(segment_path, source))?
+        != 0
+    {
+        return Err(BenchError::fixture_format(format!(
+            "segment {} contains bytes after its declared records",
+            segment_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn read_and_verify_magic(
@@ -478,15 +657,25 @@ fn index_segments(
     let mut locations = HashMap::with_capacity(manifest.block_count as usize);
     for descriptor in &manifest.segments {
         let segment_path = directory.join(&descriptor.file);
+        verify_segment_sha256(&segment_path, &descriptor.sha256)?;
         let file =
             File::open(&segment_path).map_err(|source| BenchError::io(&segment_path, source))?;
         let mut reader = BufReader::new(file);
         read_and_verify_magic(&mut reader, &segment_path)?;
         let mut position = u64::from(u32::try_from(SEGMENT_MAGIC.len()).unwrap_or(u32::MAX));
-        for _ in 0..descriptor.block_count {
+        for offset in 0..descriptor.block_count {
             let (height, byte_len) = read_record_header(&mut reader, &segment_path)?;
+            let expected_height = descriptor.from_height.checked_add(offset).ok_or_else(|| {
+                BenchError::fixture_format("segment record height overflow".to_owned())
+            })?;
+            if height != expected_height {
+                return Err(BenchError::fixture_format(format!(
+                    "segment {} record {offset} has height {height}, expected {expected_height}",
+                    descriptor.index
+                )));
+            }
             let byte_offset = position + RECORD_HEADER_LEN;
-            locations.insert(
+            let replaced = locations.insert(
                 height,
                 BlockLocation {
                     segment_path: segment_path.clone(),
@@ -494,13 +683,63 @@ fn index_segments(
                     byte_len,
                 },
             );
+            if replaced.is_some() {
+                return Err(BenchError::fixture_format(format!(
+                    "fixture contains duplicate block height {height}"
+                )));
+            }
             reader
                 .seek(SeekFrom::Current(i64::from(byte_len)))
                 .map_err(|source| BenchError::io(&segment_path, source))?;
             position = byte_offset + u64::from(byte_len);
         }
+        reject_trailing_segment_bytes(&mut reader, &segment_path)?;
+    }
+    if locations.len() != manifest.block_count as usize {
+        return Err(BenchError::fixture_format(format!(
+            "fixture indexed {} unique blocks, expected {}",
+            locations.len(),
+            manifest.block_count
+        )));
     }
     Ok(locations)
+}
+
+fn verify_segment_sha256(segment_path: &Path, expected_hex: &str) -> Result<(), BenchError> {
+    let expected = hex::decode(expected_hex).map_err(|source| {
+        BenchError::fixture_format(format!(
+            "segment {} has an invalid SHA-256 descriptor: {source}",
+            segment_path.display()
+        ))
+    })?;
+    if expected.len() != 32 {
+        return Err(BenchError::fixture_format(format!(
+            "segment {} SHA-256 descriptor must contain 32 bytes",
+            segment_path.display()
+        )));
+    }
+
+    let file = File::open(segment_path).map_err(|source| BenchError::io(segment_path, source))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|source| BenchError::io(segment_path, source))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    let actual = hasher.finalize();
+    if actual.as_slice() != expected.as_slice() {
+        return Err(BenchError::fixture_format(format!(
+            "segment {} SHA-256 does not match its fixture descriptor",
+            segment_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn read_block_bytes(location: &BlockLocation) -> std::io::Result<Vec<u8>> {

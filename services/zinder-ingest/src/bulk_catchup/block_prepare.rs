@@ -27,7 +27,7 @@ use super::{
     BULK_STAGE_CANONICAL_BLOCK_PREPARE, BULK_STAGE_CANONICAL_PREVOUT_RESOLVE, IngestError,
     record_bulk_pipeline_stage_duration, usize_to_u32_saturating, usize_to_u64_saturating,
 };
-use crate::artifact_builder::DerivedBlockArtifacts;
+use crate::artifact_builder::{PreparedCanonicalBlock, current_schema_transparent_outputs};
 use crate::chain_ingest::{
     prefetched_spent_transparent_output_bytes, record_ingest_block_prepare_outcome,
 };
@@ -51,20 +51,20 @@ pub(super) struct BulkCatchupBlockPrepareStreamConfig {
     pub(super) store: PrimaryChainStore,
 }
 
-pub(super) struct PreparedBlockArtifacts {
-    pub(super) derived: DerivedBlockArtifacts,
+pub(super) struct CanonicalBlockCommitPreparation {
+    pub(super) prepared: PreparedCanonicalBlock,
     pub(super) prefetched_spent_transparent_outputs: Vec<TransparentOutputArtifact>,
 }
 
 pub(super) fn build_block_prepare_stream<'a, Source, F, Fut>(
     source: &'a Source,
     config: BulkCatchupBlockPrepareStreamConfig,
-    derive_fn: F,
-) -> impl Stream<Item = Result<Vec<PreparedBlockArtifacts>, IngestError>> + Send + 'a
+    prepare_fn: F,
+) -> impl Stream<Item = Result<Vec<CanonicalBlockCommitPreparation>, IngestError>> + Send + 'a
 where
     Source: NodeSource + Clone + 'a,
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
+    Fut: Future<Output = Result<PreparedCanonicalBlock, IngestError>> + Send + 'static,
 {
     let BulkCatchupBlockPrepareStreamConfig {
         request_timeout,
@@ -96,7 +96,7 @@ where
         completed_block_prepares: BTreeMap::new(),
         completed_block_prepare_bytes: 0,
         pending_source_blocks: VecDeque::new(),
-        derive_fn,
+        prepare_fn,
         store,
         block_prepare_concurrency,
         block_prepare_watermark: ByteWatermark::new(
@@ -116,15 +116,15 @@ where
     })
 }
 
-struct DerivedBlock {
+struct PreparedBlock {
     height: BlockHeight,
-    derived: DerivedBlockArtifacts,
+    prepared: PreparedCanonicalBlock,
     artifact_bytes: u64,
     reservation: ByteReservation,
 }
 
-struct QueuedDerivedBlock {
-    derived: DerivedBlockArtifacts,
+struct QueuedPreparedBlock {
+    prepared: PreparedCanonicalBlock,
     artifact_bytes: u64,
     reservation: ByteReservation,
 }
@@ -138,11 +138,11 @@ enum PendingBlockPrepareSchedule {
 struct BlockPrepareStreamState<'a, F> {
     source_blocks: BoxStream<'a, Result<Vec<SourceBlock>, IngestError>>,
     in_flight_block_prepares:
-        FuturesUnordered<BoxFuture<'static, Result<DerivedBlock, IngestError>>>,
-    completed_block_prepares: BTreeMap<BlockHeight, QueuedDerivedBlock>,
+        FuturesUnordered<BoxFuture<'static, Result<PreparedBlock, IngestError>>>,
+    completed_block_prepares: BTreeMap<BlockHeight, QueuedPreparedBlock>,
     completed_block_prepare_bytes: u64,
     pending_source_blocks: VecDeque<SourceBlock>,
-    derive_fn: F,
+    prepare_fn: F,
     store: PrimaryChainStore,
     block_prepare_concurrency: usize,
     block_prepare_watermark: ByteWatermark,
@@ -155,10 +155,10 @@ struct BlockPrepareStreamState<'a, F> {
 
 async fn next_block_prepare_chunk<F, Fut>(
     state: &mut BlockPrepareStreamState<'_, F>,
-) -> Option<Result<Vec<PreparedBlockArtifacts>, IngestError>>
+) -> Option<Result<Vec<CanonicalBlockCommitPreparation>, IngestError>>
 where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
+    Fut: Future<Output = Result<PreparedCanonicalBlock, IngestError>> + Send + 'static,
 {
     loop {
         let prepare_schedule_blocked = match schedule_next_pending_block_prepare(state) {
@@ -225,12 +225,12 @@ where
                 }
             }
             block_prepare_result = state.in_flight_block_prepares.next(), if !state.in_flight_block_prepares.is_empty() => {
-                let derived_block = match block_prepare_result {
-                    Some(Ok(derived_block)) => derived_block,
+                let prepared_block = match block_prepare_result {
+                    Some(Ok(prepared_block)) => prepared_block,
                     Some(Err(error)) => return Some(Err(error)),
                     None => continue,
                 };
-                if let Err(error) = insert_completed_block_prepare(state, derived_block) {
+                if let Err(error) = insert_completed_block_prepare(state, prepared_block) {
                     return Some(Err(error));
                 }
             }
@@ -243,7 +243,7 @@ fn schedule_next_pending_block_prepare<F, Fut>(
 ) -> PendingBlockPrepareSchedule
 where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
+    Fut: Future<Output = Result<PreparedCanonicalBlock, IngestError>> + Send + 'static,
 {
     if state.in_flight_block_prepares.len() >= state.block_prepare_concurrency {
         return PendingBlockPrepareSchedule::Idle;
@@ -262,7 +262,7 @@ where
 
 fn take_contiguous_completed_block_prepares<F>(
     state: &mut BlockPrepareStreamState<'_, F>,
-) -> Vec<QueuedDerivedBlock> {
+) -> Vec<QueuedPreparedBlock> {
     let mut ready_blocks = Vec::new();
     let mut transparent_input_count = 0usize;
     while let Some(next_emit_height) = state.next_emit_height {
@@ -277,7 +277,7 @@ fn take_contiguous_completed_block_prepares<F>(
         let Some(queued) = state.completed_block_prepares.get(&next_emit_height) else {
             break;
         };
-        let next_transparent_input_count = derived_block_transparent_input_count(&queued.derived);
+        let next_transparent_input_count = prepared_block_transparent_input_count(&queued.prepared);
         transparent_input_count =
             transparent_input_count.saturating_add(next_transparent_input_count);
         let Some(queued) = state.completed_block_prepares.remove(&next_emit_height) else {
@@ -306,7 +306,7 @@ impl<F> BlockPrepareStreamState<'_, F> {
             };
             count += 1;
             transparent_input_count = transparent_input_count
-                .saturating_add(derived_block_transparent_input_count(&queued.derived));
+                .saturating_add(prepared_block_transparent_input_count(&queued.prepared));
             next_height = height.next().filter(|height| *height <= self.to_height);
         }
         (count, transparent_input_count)
@@ -316,7 +316,7 @@ impl<F> BlockPrepareStreamState<'_, F> {
         self.next_emit_height
             .and_then(|height| self.completed_block_prepares.get(&height))
             .is_some_and(|queued| {
-                derived_block_transparent_input_count(&queued.derived)
+                prepared_block_transparent_input_count(&queued.prepared)
                     >= DENSE_BLOCK_TRANSPARENT_INPUTS
             })
     }
@@ -335,7 +335,7 @@ fn schedule_block_prepare<F, Fut>(
 ) -> Result<(), SourceBlock>
 where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
+    Fut: Future<Output = Result<PreparedCanonicalBlock, IngestError>> + Send + 'static,
 {
     if state.in_flight_block_prepares.len() >= state.block_prepare_concurrency {
         return Err(source_block);
@@ -345,27 +345,27 @@ where
     let Some(reservation) = state.reserve_block_prepare_bytes(reservation_bytes) else {
         return Err(source_block);
     };
-    let derive_fn = state.derive_fn.clone();
-    // Spawned so per-block artifact derivation progresses on runtime workers
+    let prepare_fn = state.prepare_fn.clone();
+    // Spawned so per-block canonical preparation progresses on runtime workers
     // instead of only while this stream is polled by the commit consumer.
     let block_prepare_task = AbortOnDropTask::spawn(async move {
         let height = source_block.height;
         let block_prepare_started_at = Instant::now();
         let block_prepare_outcome = async {
-            let artifact_derive_started_at = Instant::now();
-            let artifact_derive_outcome = derive_fn(source_block).await;
+            let preparation_started_at = Instant::now();
+            let preparation_outcome = prepare_fn(source_block).await;
             record_block_prepare_stage(
-                "artifact_derive",
-                artifact_derive_started_at,
-                &artifact_derive_outcome,
+                "canonical_block_prepare",
+                preparation_started_at,
+                &preparation_outcome,
             );
-            let derived = artifact_derive_outcome?;
-            let artifact_bytes = derived_block_artifact_bytes(&derived);
+            let prepared = preparation_outcome?;
+            let artifact_bytes = prepared_block_artifact_bytes(&prepared);
             let mut reservation = reservation;
             reservation.resize(artifact_bytes);
-            Ok(DerivedBlock {
+            Ok(PreparedBlock {
                 height,
-                derived,
+                prepared,
                 artifact_bytes,
                 reservation,
             })
@@ -423,30 +423,30 @@ fn record_block_prepare_stage<T>(
 
 fn insert_completed_block_prepare<F>(
     state: &mut BlockPrepareStreamState<'_, F>,
-    derived_block: DerivedBlock,
+    prepared_block: PreparedBlock,
 ) -> Result<(), IngestError> {
-    if derived_block.height > state.to_height {
+    if prepared_block.height > state.to_height {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
-            reason: "derived block completed outside the requested bulk-catchup range",
+            reason: "prepared block completed outside the requested bulk-catchup range",
         }));
     }
     state.completed_block_prepare_bytes = state
         .completed_block_prepare_bytes
-        .saturating_add(derived_block.artifact_bytes);
+        .saturating_add(prepared_block.artifact_bytes);
     if state
         .completed_block_prepares
         .insert(
-            derived_block.height,
-            QueuedDerivedBlock {
-                derived: derived_block.derived,
-                artifact_bytes: derived_block.artifact_bytes,
-                reservation: derived_block.reservation,
+            prepared_block.height,
+            QueuedPreparedBlock {
+                prepared: prepared_block.prepared,
+                artifact_bytes: prepared_block.artifact_bytes,
+                reservation: prepared_block.reservation,
             },
         )
         .is_some()
     {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
-            reason: "derived block completed twice during bulk catchup",
+            reason: "prepared block completed twice during bulk catchup",
         }));
     }
     Ok(())
@@ -596,8 +596,8 @@ impl Drop for RecentTransparentOutputCache {
 
 async fn resolve_prevouts_for_window<F>(
     state: &mut BlockPrepareStreamState<'_, F>,
-    queued_blocks: Vec<QueuedDerivedBlock>,
-) -> Result<Vec<PreparedBlockArtifacts>, IngestError> {
+    queued_blocks: Vec<QueuedPreparedBlock>,
+) -> Result<Vec<CanonicalBlockCommitPreparation>, IngestError> {
     metrics::histogram!("zinder_ingest_prevout_resolver_window_blocks")
         .record(usize_to_u32_saturating(queued_blocks.len()));
 
@@ -607,15 +607,17 @@ async fn resolve_prevouts_for_window<F>(
     let mut created_outputs_spent = HashSet::new();
     let mut cold_consumers = HashMap::<TransparentOutPoint, Vec<usize>>::new();
     let mut resolution_stats = PrevoutResolutionStats::default();
+    let created_outputs_by_block = queued_blocks
+        .iter()
+        .map(|queued| current_schema_transparent_outputs(&queued.prepared.facts))
+        .collect::<Vec<_>>();
 
     for (block_index, queued) in queued_blocks.iter().enumerate() {
-        let same_block_outputs = queued
-            .derived
-            .transparent_outputs_by_outpoint
+        let same_block_outputs = created_outputs_by_block[block_index]
             .iter()
             .map(|output| output.outpoint)
             .collect::<HashSet<_>>();
-        for spent_outpoint in spent_outpoints_for_derived_block(&queued.derived) {
+        for spent_outpoint in spent_outpoints_for_prepared_block(&queued.prepared) {
             if same_block_outputs.contains(&spent_outpoint) {
                 created_outputs_spent.insert(spent_outpoint);
                 resolution_stats.same_block = resolution_stats.same_block.saturating_add(1);
@@ -624,10 +626,8 @@ async fn resolve_prevouts_for_window<F>(
             if let Some(&(producer_block_index, producer_output_index)) =
                 window_output_locations.get(&spent_outpoint)
             {
-                let output = queued_blocks[producer_block_index]
-                    .derived
-                    .transparent_outputs_by_outpoint[producer_output_index]
-                    .clone();
+                let output =
+                    created_outputs_by_block[producer_block_index][producer_output_index].clone();
                 prefetched_by_block[block_index].push(output);
                 created_outputs_spent.insert(spent_outpoint);
                 resolution_stats.same_window = resolution_stats.same_window.saturating_add(1);
@@ -646,12 +646,7 @@ async fn resolve_prevouts_for_window<F>(
                 .push(block_index);
         }
 
-        for (output_index, output) in queued
-            .derived
-            .transparent_outputs_by_outpoint
-            .iter()
-            .enumerate()
-        {
+        for (output_index, output) in created_outputs_by_block[block_index].iter().enumerate() {
             window_output_locations.insert(output.outpoint, (block_index, output_index));
         }
     }
@@ -675,6 +670,7 @@ async fn resolve_prevouts_for_window<F>(
         state,
         queued_blocks,
         prefetched_by_block,
+        &created_outputs_by_block,
         &created_outputs_spent,
     );
     record_prevout_resolution_stats(&resolution_stats);
@@ -683,13 +679,14 @@ async fn resolve_prevouts_for_window<F>(
 
 fn prepare_resolved_window<F>(
     state: &mut BlockPrepareStreamState<'_, F>,
-    queued_blocks: Vec<QueuedDerivedBlock>,
+    queued_blocks: Vec<QueuedPreparedBlock>,
     prefetched_by_block: Vec<Vec<TransparentOutputArtifact>>,
+    created_outputs_by_block: &[Vec<TransparentOutputArtifact>],
     created_outputs_spent: &HashSet<TransparentOutPoint>,
-) -> Vec<PreparedBlockArtifacts> {
-    let outputs_to_cache = queued_blocks
+) -> Vec<CanonicalBlockCommitPreparation> {
+    let outputs_to_cache = created_outputs_by_block
         .iter()
-        .flat_map(|queued| queued.derived.transparent_outputs_by_outpoint.iter())
+        .flatten()
         .filter(|output| !created_outputs_spent.contains(&output.outpoint))
         .cloned()
         .collect::<Vec<_>>();
@@ -698,12 +695,12 @@ fn prepare_resolved_window<F>(
         .zip(prefetched_by_block)
         .map(|(queued, mut prefetched_spent_transparent_outputs)| {
             sort_outputs(&mut prefetched_spent_transparent_outputs);
-            let prepared = PreparedBlockArtifacts {
-                derived: queued.derived,
+            let prepared = CanonicalBlockCommitPreparation {
+                prepared: queued.prepared,
                 prefetched_spent_transparent_outputs,
             };
             let mut reservation = queued.reservation;
-            reservation.resize(prepared_block_artifact_bytes(&prepared));
+            reservation.resize(block_commit_preparation_bytes(&prepared));
             drop(reservation);
             prepared
         })
@@ -741,9 +738,12 @@ async fn resolve_cold_prevouts(
     })?
 }
 
-fn spent_outpoints_for_derived_block(derived: &DerivedBlockArtifacts) -> Vec<TransparentOutPoint> {
-    let mut spent_outpoints = derived
-        .transaction_facts
+fn spent_outpoints_for_prepared_block(
+    prepared: &PreparedCanonicalBlock,
+) -> Vec<TransparentOutPoint> {
+    let mut spent_outpoints = prepared
+        .facts
+        .transactions
         .iter()
         .flat_map(|transaction| {
             transaction
@@ -758,9 +758,10 @@ fn spent_outpoints_for_derived_block(derived: &DerivedBlockArtifacts) -> Vec<Tra
     spent_outpoints
 }
 
-fn derived_block_transparent_input_count(derived: &DerivedBlockArtifacts) -> usize {
-    derived
-        .transaction_facts
+fn prepared_block_transparent_input_count(prepared: &PreparedCanonicalBlock) -> usize {
+    prepared
+        .facts
+        .transactions
         .iter()
         .fold(0usize, |count, transaction| {
             count.saturating_add(transaction.transparent_inputs.len())
@@ -823,27 +824,34 @@ fn u64_to_f64(sample: u64) -> f64 {
     sample as f64
 }
 
-fn prepared_block_artifact_bytes(prepared: &PreparedBlockArtifacts) -> u64 {
-    derived_block_artifact_bytes(&prepared.derived).saturating_add(usize_to_u64_saturating(
+fn block_commit_preparation_bytes(prepared: &CanonicalBlockCommitPreparation) -> u64 {
+    prepared_block_artifact_bytes(&prepared.prepared).saturating_add(usize_to_u64_saturating(
         prefetched_spent_transparent_output_bytes(&prepared.prefetched_spent_transparent_outputs),
     ))
 }
 
-fn derived_block_artifact_bytes(derived: &DerivedBlockArtifacts) -> u64 {
-    let block_blob_bytes = derived
-        .block_blob
+fn prepared_block_artifact_bytes(prepared: &PreparedCanonicalBlock) -> u64 {
+    let block_blob_bytes = prepared
+        .facts
+        .raw_block_bytes
         .as_ref()
-        .map_or(0usize, |block_blob| block_blob.raw_block_bytes.len());
+        .map_or(0usize, Vec::len);
     let transaction_blob_bytes =
-        derived
-            .transaction_blobs
+        prepared
+            .facts
+            .transactions
             .iter()
-            .fold(0usize, |bytes, transaction_blob| {
-                bytes.saturating_add(transaction_blob.raw_transaction_bytes.len())
+            .fold(0usize, |bytes, transaction| {
+                bytes.saturating_add(
+                    transaction
+                        .raw_transaction_bytes
+                        .as_ref()
+                        .map_or(0, Vec::len),
+                )
             });
     usize_to_u64_saturating(
         block_blob_bytes
-            .saturating_add(derived.partial_compact_block.encoded_len())
+            .saturating_add(prepared.partial_compact_block.encoded_len())
             .saturating_add(transaction_blob_bytes),
     )
 }

@@ -8,7 +8,7 @@ use zinder_store::{
 };
 
 use super::abort_on_drop::AbortOnDropTask;
-use super::block_prepare::PreparedBlockArtifacts;
+use super::block_prepare::CanonicalBlockCommitPreparation;
 use super::flush::flush_pending_bulk_catchup_writes;
 use super::watermark::{record_queue_depth, record_reorder_buffer};
 use super::{
@@ -18,7 +18,7 @@ use super::{
     BulkCatchupRunConfig, BulkCatchupRunContext, BulkCatchupStart, nonzero_u64_to_usize,
     record_bulk_pipeline_stage_duration, usize_to_u64_saturating,
 };
-use crate::artifact_builder::{CommitmentTreeSizes, finalize_derived_block};
+use crate::artifact_builder::{CommitmentTreeSizes, finalize_canonical_block};
 use crate::chain_ingest::{
     CanonicalBatch, CanonicalBatchBudget, CanonicalBatchCloseTrigger, CanonicalBatchCost,
     IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
@@ -33,7 +33,8 @@ use crate::chain_ingest::{
 )]
 pub(super) async fn run_commit_reassembly<Source>(
     run: &BulkCatchupRunContext<'_, Source>,
-    block_prepare_stream: impl Stream<Item = Result<Vec<PreparedBlockArtifacts>, IngestError>> + Send,
+    block_prepare_stream: impl Stream<Item = Result<Vec<CanonicalBlockCommitPreparation>, IngestError>>
+    + Send,
     bulk_catchup_start: BulkCatchupStart,
     flush_state: &mut BulkCatchupFlushState,
     completion_flush: BulkCatchupCompletionFlush,
@@ -112,10 +113,10 @@ where
         for prepared in prepared_chunk {
             let prefetched_spent_transparent_outputs =
                 prepared.prefetched_spent_transparent_outputs;
-            let built = match finalize_derived_block(prepared.derived, &mut running_tree_sizes)
+            let block = match finalize_canonical_block(prepared.prepared, &mut running_tree_sizes)
                 .map_err(IngestError::from)
             {
-                Ok(built) => built,
+                Ok(block) => block,
                 Err(error) => {
                     record_bulk_pipeline_stage_duration(
                         BULK_STAGE_CANONICAL_FINALIZE,
@@ -139,7 +140,7 @@ where
                 }
             };
             let next_block_cost =
-                CanonicalBatch::work_cost_for_block(&built, &prefetched_spent_transparent_outputs);
+                CanonicalBatch::work_cost_for_block(&block, &prefetched_spent_transparent_outputs);
             if let Some(commit_trigger) =
                 batch_budget.commit_trigger_before_next_block(batch.work_cost(), next_block_cost)
                 && let Err(error) = close_canonical_batch_for_budget(
@@ -158,7 +159,12 @@ where
                 restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
                 return Err(error);
             }
-            batch.absorb_with_prefetched_spent_outputs(built, prefetched_spent_transparent_outputs);
+            if let Err(error) = batch
+                .absorb_with_prefetched_spent_outputs(block, prefetched_spent_transparent_outputs)
+            {
+                restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
+                return Err(error.into());
+            }
 
             if let Some(commit_trigger) = batch_budget.commit_trigger(batch.work_cost())
                 && let Err(error) = close_canonical_batch_for_budget(

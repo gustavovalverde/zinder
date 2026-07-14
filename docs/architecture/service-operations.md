@@ -134,9 +134,9 @@ Implemented baseline metrics:
 | `zinder_ingest_source_fetch_request_reservation_bytes` | gauge | `zinder-ingest` | Predicted response bytes reserved for the most recently admitted source request. |
 | `zinder_ingest_source_segment_reserved_response_bytes` | histogram | `zinder-ingest` | Distribution of predicted response-byte reservations used for source admission. |
 | `zinder_ingest_source_segment_reservation_undersized_total` | counter | `zinder-ingest` | Source segments whose measured response bytes exceeded their admission reservation. |
-| `zinder_ingest_block_prepare_duration_seconds` | histogram | `zinder-ingest` | Per-block artifact-prepare latency by status and error class. Ordered bulk-catchup prevout resolution is reported separately; tip follow records sequential derivation plus finalization. |
+| `zinder_ingest_block_prepare_duration_seconds` | histogram | `zinder-ingest` | Per-block artifact-prepare latency by status and error class. Ordered bulk-catchup prevout resolution is reported separately; tip follow records sequential construction plus finalization. |
 | `zinder_ingest_block_prepare_total` | counter | `zinder-ingest` | Per-block block-prepare count by status and error class. |
-| `zinder_ingest_block_prepare_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk prepare time split between per-block `artifact_derive` and per-window `transparent_prevout_resolve`, labeled by status. |
+| `zinder_ingest_block_prepare_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk prepare time split between per-block `canonical_block_prepare` and per-window `transparent_prevout_resolve`, labeled by status. |
 | `zinder_ingest_prevout_resolver_window_blocks` | histogram | `zinder-ingest` | Contiguous blocks coalesced into one ordered prevout-resolution window. |
 | `zinder_ingest_prevout_resolver_outpoints_total` | counter | `zinder-ingest` | Prevout resolution counts by bounded `source`: `same_block`, `same_window`, `recent_cache`, `store_requested`, `store_resolved`, or `store_missing`. |
 | `zinder_ingest_prevout_resolver_store_lookups_total` | counter | `zinder-ingest` | Deduplicated RocksDB multi-get calls issued by ordered prevout resolution. |
@@ -144,7 +144,7 @@ Implemented baseline metrics:
 | `zinder_ingest_prevout_resolver_recent_output_bytes` | gauge | `zinder-ingest` | Estimated resident bytes held by the recent-output cache. |
 | `zinder_ingest_prevout_resolver_cache_admission_total` | counter | `zinder-ingest` | Recent-output cache admissions by `cached` or `no_headroom`. |
 | `zinder_ingest_prevout_resolver_cache_evictions_total` | counter | `zinder-ingest` | Oldest recent outputs evicted to stay inside the shared block-prepare watermark. |
-| `zinder_ingest_block_derive_stage_duration_seconds` | histogram | `zinder-ingest` | Canonical artifact CPU time split between `block_parse`, `identity_validation`, `compact_artifacts`, `transparent_output_artifacts`, `transaction_artifacts`, `block_header_artifact`, and `block_blob_artifact`, labeled by status. |
+| `zinder_ingest_canonical_block_construction_stage_duration_seconds` | histogram | `zinder-ingest` | Canonical construction CPU time split between `block_parse`, `identity_validation`, `compact_artifacts`, `transaction_facts`, `block_header_artifact`, and `raw_block_bytes`, labeled by status. |
 | `zinder_ingest_block_prepare_reassembly_blocks` | gauge | `zinder-ingest` | Completed prepared blocks waiting for earlier heights before the serial finalization fold. |
 | `zinder_ingest_derive_tailer_tick_duration_seconds` | histogram | `zinder-ingest` | Derive tailer catch-up pass latency by status and error class. |
 | `zinder_ingest_derive_tailer_ticks_total` | counter | `zinder-ingest` | Derive tailer catch-up pass count by status and error class. |
