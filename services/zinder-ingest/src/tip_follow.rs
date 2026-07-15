@@ -440,7 +440,10 @@ fn compute_tip_follow_readiness_state(
 
     let lag_blocks = node_tip_value - store_tip_value;
     if lag_blocks <= config.lag_threshold_blocks {
-        Ok(ReadinessState::ready(current_height))
+        Ok(ReadinessState::ready_with_target(
+            current_height,
+            target_height,
+        ))
     } else {
         Ok(ReadinessState::syncing(
             Some(lag_blocks),
@@ -1452,6 +1455,29 @@ mod tests {
         ));
         assert_eq!(readiness_state.current_height, Some(1));
         assert_eq!(readiness_state.target_height, Some(10));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_state_preserves_target_when_ready_with_lag() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir
+            .path()
+            .join("tip-follow-readiness-ready-with-lag-store");
+        let mut config = test_tip_follow_config(&storage_path, 10);
+        config.lag_threshold_blocks = 1;
+        let source = TestNodeSource::linear(2);
+        let store = open_test_tip_follow_store(&storage_path)?;
+        let mut retry_state = IngestRetryState::default();
+        let _first = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
+
+        let node_tip_height = source.tip_id().await?.height;
+        let readiness_state =
+            super::compute_tip_follow_readiness_state(&store, node_tip_height, &config)?;
+
+        assert!(matches!(readiness_state.cause, ReadinessCause::Ready));
+        assert_eq!(readiness_state.current_height, Some(1));
+        assert_eq!(readiness_state.target_height, Some(2));
         Ok(())
     }
 

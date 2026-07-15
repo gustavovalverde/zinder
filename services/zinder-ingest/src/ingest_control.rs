@@ -21,7 +21,9 @@ use zinder_proto::v1::{
     },
     ops, wallet,
 };
-use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
+use zinder_runtime::{
+    BearerToken, BearerTokenServerInterceptor, Readiness, ReadinessCause, ReadinessReport,
+};
 use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
     ChainEventEncodeError, ChainEventHistoryRequest, ChainEventStreamFamily,
@@ -34,7 +36,7 @@ use zinder_store::{
     transparent_mempool_spend_message, transparent_output_entry_message,
 };
 
-use crate::mempool::MempoolIndex;
+use crate::{derive_status_reader::DeriveStatusReader, mempool::MempoolIndex};
 
 type IngestControlStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
 type ChainEventsStream = IngestControlStream<wallet::ChainEventEnvelope>;
@@ -59,17 +61,21 @@ pub struct IngestControlGrpcAdapter {
     node_source: Option<Arc<dyn NodeSource>>,
     bearer_token: Option<BearerToken>,
     projection_preset: ProjectionPreset,
+    readiness: Readiness,
+    derive_status_reader: Option<Arc<dyn DeriveStatusReader>>,
 }
 
 impl IngestControlGrpcAdapter {
-    /// Creates an ingest-control adapter over the primary store handle.
+    /// Creates an ingest-control adapter over the primary store.
     ///
-    /// The returned adapter does not advertise mempool surfaces; pair the
-    /// adapter with [`IngestControlGrpcAdapter::with_mempool`] to expose
-    /// `MempoolSnapshot` and `MempoolEvents` once the writer wires the
-    /// live `MempoolIndex`.
+    /// `readiness` supplies the writer's cached phase and upstream observation.
+    /// The returned adapter does not advertise derive or mempool status;
+    /// compose those optional surfaces with
+    /// [`IngestControlGrpcAdapter::with_derive_status_reader`] and
+    /// [`IngestControlGrpcAdapter::with_mempool`] to expose `MempoolSnapshot`
+    /// and `MempoolEvents` once the writer wires the live `MempoolIndex`.
     #[must_use]
-    pub fn new(network: Network, store: PrimaryChainStore) -> Self {
+    pub fn new(network: Network, store: PrimaryChainStore, readiness: Readiness) -> Self {
         Self {
             network,
             store,
@@ -77,7 +83,19 @@ impl IngestControlGrpcAdapter {
             node_source: None,
             bearer_token: None,
             projection_preset: ProjectionPreset::Complete,
+            readiness,
+            derive_status_reader: None,
         }
+    }
+
+    /// Wires backend-neutral derive-status observations into `WriterStatus`.
+    #[must_use]
+    pub fn with_derive_status_reader(
+        mut self,
+        derive_status_reader: Arc<dyn DeriveStatusReader>,
+    ) -> Self {
+        self.derive_status_reader = Some(derive_status_reader);
+        self
     }
 
     /// Selects the closed projection workload advertised by `ServerInfo`.
@@ -145,6 +163,22 @@ impl IngestControlGrpcAdapter {
             .map(|spec| spec.string.to_owned())
             .collect()
     }
+
+    fn read_derive_status(&self) -> Option<wallet::DeriveStatus> {
+        let derive_status_reader = self.derive_status_reader.as_ref()?;
+        match derive_status_reader.read_derive_status() {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "writer_status_derive_status_unavailable",
+                    error = %error,
+                    "writer status omitted unavailable derive status",
+                );
+                None
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -182,21 +216,23 @@ impl IngestControl for IngestControlGrpcAdapter {
         let started_at = Instant::now();
         let writer_status_outcome = match self.store.current_chain_epoch() {
             Ok(chain_epoch) => {
+                let readiness_report = self.readiness.report();
                 if let Some(chain_epoch) = chain_epoch {
                     record_writer_progress(chain_epoch);
                 } else {
                     record_empty_writer_progress(self.network);
                 }
-                // This endpoint reports chain progress only. Loop phase is
-                // exposed through readiness, so the ingest-control proto keeps
-                // `WriterPhase::Unspecified` for this response.
-                Ok(Response::new(WriterStatusResponse {
-                    chain_view: chain_epoch.map(chain_view_message),
-                    network_name: encode_zinder_native_chain_name(self.network).to_owned(),
-                    phase: WriterPhase::Unspecified.into(),
-                    gap_blocks: None,
-                    upstream_not_ready: None,
-                }))
+                let derive_status = if chain_epoch.is_some() {
+                    self.read_derive_status()
+                } else {
+                    None
+                };
+                Ok(Response::new(writer_status_response(
+                    self.network,
+                    chain_epoch,
+                    &readiness_report,
+                    derive_status,
+                )))
             }
             Err(error) => Err(status_from_store_error(&error)),
         };
@@ -499,6 +535,62 @@ impl IngestControl for IngestControlGrpcAdapter {
             chain_epoch,
             value_pools,
         )))
+    }
+}
+
+fn writer_status_response(
+    network: Network,
+    chain_epoch: Option<ChainEpoch>,
+    readiness_report: &ReadinessReport,
+    derive_status: Option<wallet::DeriveStatus>,
+) -> WriterStatusResponse {
+    let upstream_tip = upstream_tip_from_readiness(readiness_report);
+    let gap_blocks = chain_epoch.as_ref().and_then(|chain_epoch| {
+        upstream_tip
+            .as_ref()
+            .and_then(|upstream_tip| upstream_tip.committed_height)
+            .map(|upstream_height| {
+                upstream_height.saturating_sub(chain_epoch.visible_tip_height.value())
+            })
+    });
+    let chain_view = chain_epoch.map(|chain_epoch| {
+        let mut chain_view = chain_view_message(chain_epoch);
+        chain_view.upstream_tip = upstream_tip;
+        chain_view.derive = derive_status;
+        chain_view
+    });
+    let upstream_not_ready =
+        if let ReadinessCause::UpstreamNotReady(detail) = &readiness_report.cause {
+            Some(ops::UpstreamNotReadyDetail::from(detail))
+        } else {
+            None
+        };
+    WriterStatusResponse {
+        chain_view,
+        network_name: encode_zinder_native_chain_name(network).to_owned(),
+        phase: readiness_report
+            .phase
+            .map_or(WriterPhase::Unspecified, WriterPhase::from)
+            .into(),
+        gap_blocks,
+        upstream_not_ready,
+    }
+}
+
+fn upstream_tip_from_readiness(readiness_report: &ReadinessReport) -> Option<wallet::UpstreamTip> {
+    if let ReadinessCause::UpstreamNotReady(detail) = &readiness_report.cause {
+        (detail.upstream_committed_height.is_some() || detail.upstream_estimated_height.is_some())
+            .then_some(wallet::UpstreamTip {
+                committed_height: detail.upstream_committed_height,
+                estimated_height: detail.upstream_estimated_height,
+            })
+    } else {
+        readiness_report
+            .target_height
+            .map(|committed_height| wallet::UpstreamTip {
+                committed_height: Some(committed_height),
+                estimated_height: None,
+            })
     }
 }
 

@@ -374,7 +374,11 @@ async fn spawn_ingest_control(store: PrimaryChainStore) -> Result<std::net::Sock
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let adapter = IngestControlGrpcAdapter::new(Network::ZcashRegtest, store);
+    let adapter = IngestControlGrpcAdapter::new(
+        Network::ZcashRegtest,
+        store,
+        zinder_runtime::Readiness::default(),
+    );
     tokio::spawn(async move {
         let _ = Server::builder()
             .add_service(adapter.into_server())

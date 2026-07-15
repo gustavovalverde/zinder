@@ -16,10 +16,11 @@ use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, BlockId, NetworkUpgradeActivations};
 use zinder_ingest::{
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    HistoricalWorkGate, IngestControlGrpcAdapter, IngestError, IngestModifiers, MempoolIndex,
-    MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind, ProjectionStartupInputs,
-    ProjectionStartupPlan, ProjectionStartupSettings, TipFollowSubsystems,
-    TipFollowSubsystemsLauncher, classify_phase, current_chain_height, mempool_ready_channel,
+    DeriveStatusReader, HistoricalWorkGate, IngestControlGrpcAdapter, IngestError, IngestModifiers,
+    MempoolIndex, MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind,
+    ProjectionStartupInputs, ProjectionStartupPlan, ProjectionStartupSettings,
+    RocksDbDeriveStatusReader, TipFollowSubsystems, TipFollowSubsystemsLauncher, classify_phase,
+    current_chain_height, mempool_ready_channel,
     open_primary_derive_store_for_canonical_with_projection_preset, run_ingest_loop,
     run_mempool_orchestrator, spawn_chain_event_retention_task,
     spawn_derive_replay_budget_metrics_task, spawn_mempool_event_retention_task,
@@ -36,14 +37,15 @@ use zinder_source::{
     NodeCapability, NodeSource, NodeTarget, ZebraIndexerChainTipSource, ZebraIndexerMempoolSource,
     ZebraIndexerSourceTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::{ChainStoreOptions, PrimaryChainStore, SecondaryChainStore};
 
 use crate::config::{
-    BackupConfigOverrides, IngestCommandConfig, IngestConfigError, IngestConfigOverrides,
-    IngestCoverage,
+    BackupConfigOverrides, CanonicalReplayVerificationConfigOverrides, IngestCommandConfig,
+    IngestConfigError, IngestConfigOverrides, IngestCoverage,
 };
 
 mod backup;
+mod canonical_replay_verification;
 mod cli;
 mod config;
 
@@ -174,6 +176,9 @@ enum Command {
     Probe,
     /// Create a point-in-time `RocksDB` checkpoint of the canonical store.
     Backup(BackupArgs),
+    /// Check replay-envelope integrity and canonical-header parity through a
+    /// reader-local `RocksDB` secondary.
+    VerifyCanonicalReplay(CanonicalReplayVerificationArgs),
 }
 
 #[derive(Parser)]
@@ -190,6 +195,19 @@ struct BackupArgs {
     /// Immutable raw-blob contract used when the canonical store was created.
     #[arg(long = "raw-blob-policy")]
     raw_blob_policy: Option<String>,
+}
+
+#[derive(Parser)]
+struct CanonicalReplayVerificationArgs {
+    /// Network name, such as zcash-regtest.
+    #[arg(long)]
+    network: Option<String>,
+    /// Canonical Zinder store path opened as the secondary's primary source.
+    #[arg(long = "storage-path")]
+    storage_path: Option<PathBuf>,
+    /// Reader-local metadata path for this verification run.
+    #[arg(long = "secondary-path")]
+    secondary_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -218,6 +236,9 @@ fn run_print_config(cli: Cli) -> ExitCode {
     let render_result = match cli.command {
         None | Some(Command::Probe) => print_ingest_config(config_path, overrides),
         Some(Command::Backup(args)) => print_backup_config(config_path, args),
+        Some(Command::VerifyCanonicalReplay(args)) => {
+            print_canonical_replay_verification_config(config_path, args)
+        }
     };
 
     match render_result {
@@ -236,6 +257,9 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     let runtime_result = match cli.command {
         Some(Command::Backup(args)) => run_backup(config_path, args),
         Some(Command::Probe) => run_probe(config_path, overrides).await,
+        Some(Command::VerifyCanonicalReplay(args)) => {
+            run_canonical_replay_verification(config_path, args)
+        }
         None => run_ingest(config_path, overrides).await,
     };
 
@@ -612,6 +636,10 @@ async fn run_ingest(
                 listen_addr,
                 network: command_config.loop_config.node.network,
                 store: store.clone(),
+                derive_status_reader: Arc::new(RocksDbDeriveStatusReader::new(
+                    derive_store.clone(),
+                )),
+                readiness: readiness.clone(),
                 mempool_index: mempool_index.clone(),
                 node_source: Some(Arc::new(source.clone())),
                 projection_preset: projection_startup_plan.preset(),
@@ -1008,6 +1036,8 @@ struct IngestControlEndpointSpec {
     listen_addr: SocketAddr,
     network: zinder_core::Network,
     store: PrimaryChainStore,
+    derive_status_reader: Arc<dyn DeriveStatusReader>,
+    readiness: Readiness,
     mempool_index: MempoolIndex,
     node_source: Option<Arc<dyn NodeSource>>,
     projection_preset: zinder_derive::ProjectionPreset,
@@ -1030,7 +1060,8 @@ async fn spawn_ingest_control_endpoint(
     let endpoint_cancel_for_task = endpoint_cancel.clone();
     let shutdown_cancel = spec.cancel.clone();
     let adapter = {
-        let mut adapter = IngestControlGrpcAdapter::new(spec.network, spec.store)
+        let mut adapter = IngestControlGrpcAdapter::new(spec.network, spec.store, spec.readiness)
+            .with_derive_status_reader(spec.derive_status_reader)
             .with_projection_preset(spec.projection_preset)
             .with_mempool(spec.mempool_index);
         if let Some(node_source) = spec.node_source {
@@ -1250,6 +1281,33 @@ fn set_mempool_hydration_lagging(
     }
 }
 
+#[allow(
+    clippy::print_stdout,
+    reason = "canonical replay verification emits one machine-readable operator report"
+)]
+fn run_canonical_replay_verification(
+    config_path: Option<PathBuf>,
+    args: CanonicalReplayVerificationArgs,
+) -> Result<(), IngestConfigError> {
+    let command_config =
+        config::load_canonical_replay_verification_config(config_path, args.into())?;
+    let secondary_store = SecondaryChainStore::open(
+        &command_config.storage_path,
+        &command_config.secondary_path,
+        ChainStoreOptions {
+            rocksdb_resource_budget: command_config.canonical_rocksdb_budget,
+            ..ChainStoreOptions::for_network(command_config.network)
+        },
+    )
+    .map_err(IngestError::from)?;
+    secondary_store.try_catch_up().map_err(IngestError::from)?;
+    let report = canonical_replay_verification::verify_canonical_replay_store(&secondary_store)?;
+    let report_json = report.to_json()?;
+    println!("{report_json}");
+
+    Ok(())
+}
+
 fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), IngestConfigError> {
     let backup_config = config::load_backup_config(config_path, args.into())?;
     let projection_preset = backup::detect_backup_projection_preset(&backup_config.storage_path)
@@ -1333,6 +1391,7 @@ fn ingest_config_error_class(error: Option<&IngestConfigError>) -> &'static str 
         None => "none",
         Some(IngestConfigError::Config(_)) => "config",
         Some(IngestConfigError::Ingest(_)) => "ingest",
+        Some(IngestConfigError::CanonicalReplayVerification(_)) => "canonical_replay_verification",
         Some(IngestConfigError::IngestControlBind { .. }) => "ingest_control_bind",
         Some(IngestConfigError::IngestControlTransport { .. }) => "ingest_control_transport",
         Some(IngestConfigError::BearerToken(_)) => "bearer_token",
@@ -1361,6 +1420,15 @@ fn print_backup_config(
     config::redacted_backup_config_toml(&backup_config)
 }
 
+fn print_canonical_replay_verification_config(
+    config_path: Option<PathBuf>,
+    args: CanonicalReplayVerificationArgs,
+) -> Result<String, IngestConfigError> {
+    let command_config =
+        config::load_canonical_replay_verification_config(config_path, args.into())?;
+    config::redacted_canonical_replay_verification_config_toml(&command_config)
+}
+
 impl From<BackupArgs> for BackupConfigOverrides {
     fn from(args: BackupArgs) -> Self {
         Self {
@@ -1368,6 +1436,16 @@ impl From<BackupArgs> for BackupConfigOverrides {
             storage_path: args.storage_path,
             to_path: args.to_path,
             raw_blob_policy: args.raw_blob_policy,
+        }
+    }
+}
+
+impl From<CanonicalReplayVerificationArgs> for CanonicalReplayVerificationConfigOverrides {
+    fn from(args: CanonicalReplayVerificationArgs) -> Self {
+        Self {
+            network: args.network,
+            storage_path: args.storage_path,
+            secondary_path: args.secondary_path,
         }
     }
 }

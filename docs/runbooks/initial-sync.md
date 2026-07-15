@@ -466,6 +466,10 @@ zinder-ingest \
 
 `zinder-ingest probe` (no long-running loop) prints `{store_tip, upstream_tip, gap_blocks, phase_that_would_run, upstream_health}` and exits. Useful for one-off operator checks without spawning the full loop.
 
+`zinder-ingest verify-canonical-replay --config /etc/zinder/ingest.toml --secondary-path /var/lib/zinder/replay-verification-secondary` opens the live canonical store through a reader-local RocksDB secondary and pins one secondary-visible chain epoch. In bounded batches, it validates each replay envelope and its committed digest, compares its header facts with the separately persisted canonical header row, checks parent continuity from the retained-history checkpoint through the visible tip, and checks the final replay hash against that pinned tip. The primary may continue advancing because the verifier never refreshes its secondary after pinning. It exits nonzero if a replay or header row is missing, corrupt, or inconsistent, or if another owner advances the reader-local secondary during the scan. Success prints a JSON report whose `verification_scope` is `replay_envelope_and_canonical_header_parity`, together with the network, epoch, retained height range, block count, and ordered replay-facts sequence digest. Use a process-unique secondary path and remove it after the command exits.
+
+This command does not contact Zebra or compare against an external digest, so it does not prove source truth. Transaction and output facts are checked only through the replay envelope's self-authenticating encoding and digest; they are not independently compared with legacy artifact families or consensus block bytes. Treat the sequence digest as reproducible evidence for the pinned store view, not as an upstream attestation.
+
 ## References
 
 - [ADR-0015: Unified Phase-Driven Ingest](../adrs/0015-unified-phase-driven-ingest.md)

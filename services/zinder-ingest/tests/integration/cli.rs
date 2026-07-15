@@ -6,7 +6,10 @@
 use std::{error::Error, fs, path::Path, process::Command};
 
 use tempfile::tempdir;
-use zinder_core::{ChainEpoch, ChainEpochId, Network, wire::encode_rpc_block_hash_hex};
+use zinder_core::{
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion, ChainEpoch,
+    ChainEpochId, Network, decode_canonical_block_replay, wire::encode_rpc_block_hash_hex,
+};
 use zinder_derive::{
     BLOCK_SUMMARY_CONSUMER_NAME, DeriveStore, DeriveStoreOptions,
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
@@ -330,6 +333,96 @@ fn backup_print_config_loads_config_file() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("[backup]"));
     assert!(stdout.contains(&format!("to_path = \"{}\"", path_str(&backup_path)?)));
     assert!(stdout.contains("raw_blob_policy = \"none\""));
+
+    Ok(())
+}
+
+#[test]
+fn canonical_replay_verification_print_config_loads_secondary_path() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("verification-print-config-store");
+    let secondary_path = tempdir.path().join("verification-print-config-secondary");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(
+        &config_path,
+        canonical_replay_verification_config_toml(&storage_path, &secondary_path)?,
+    )?;
+
+    let output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "verify-canonical-replay",
+        ])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains(&format!("path = \"{}\"", path_str(&storage_path)?)));
+    assert!(stdout.contains(&format!(
+        "secondary_path = \"{}\"",
+        path_str(&secondary_path)?
+    )));
+    assert!(!stdout.contains("raw_blob_policy"));
+
+    Ok(())
+}
+
+#[test]
+fn canonical_replay_verification_scans_multiple_bounded_batches() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("verification-source-store");
+    let secondary_path = tempdir.path().join("verification-secondary");
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(257);
+    let artifacts = chain_fixture
+        .chain_epoch_artifacts(ChainEpochId::new(1))
+        .ok_or("chain fixture unexpectedly empty")?;
+    let expected_chain_epoch = artifacts.chain_epoch;
+    let mut expected_digest_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
+        CanonicalBlockFactsSequenceDigestVersion::CURRENT,
+    );
+    for replay_envelope in &artifacts.block_replay_envelopes {
+        expected_digest_builder.try_append(
+            decode_canonical_block_replay(replay_envelope.as_bytes())?.reference_digest(),
+        )?;
+    }
+    let expected_digest = expected_digest_builder.finish();
+    let primary = PrimaryChainStore::open(
+        &storage_path,
+        ChainStoreOptions::for_network(Network::ZcashRegtest),
+    )?;
+    primary.commit_chain_epoch(artifacts)?;
+
+    let output = zinder_ingest_command()
+        .args([
+            "verify-canonical-replay",
+            "--network",
+            "zcash-regtest",
+            "--storage-path",
+            path_str(&storage_path)?,
+            "--secondary-path",
+            path_str(&secondary_path)?,
+        ])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        report["verification_scope"],
+        "replay_envelope_and_canonical_header_parity"
+    );
+    assert_eq!(report["network"], "zcash-regtest");
+    assert_eq!(report["chain_epoch_id"], expected_chain_epoch.id.value());
+    assert_eq!(report["from_height"], 1);
+    assert_eq!(report["to_height"], 257);
+    assert_eq!(report["block_count"], 257);
+    assert_eq!(report["sequence_digest_version"], 1);
+    assert_eq!(
+        report["sequence_digest_sha256"],
+        hex::encode(expected_digest.as_bytes())
+    );
+    assert!(secondary_path.exists());
 
     Ok(())
 }
@@ -1256,6 +1349,23 @@ to_path = "{}"
 "#,
         path_str(storage_path)?,
         path_str(backup_path)?
+    ))
+}
+
+fn canonical_replay_verification_config_toml(
+    storage_path: &Path,
+    secondary_path: &Path,
+) -> Result<String, Box<dyn Error>> {
+    Ok(format!(
+        r#"[network]
+name = "zcash-regtest"
+
+[storage]
+path = "{}"
+secondary_path = "{}"
+"#,
+        path_str(storage_path)?,
+        path_str(secondary_path)?
     ))
 }
 

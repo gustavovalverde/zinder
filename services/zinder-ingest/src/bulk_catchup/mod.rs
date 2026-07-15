@@ -456,7 +456,7 @@ fn bulk_catchup_readiness_state(
     };
     let lag_blocks = u64::from(upstream_tip.saturating_sub(current_height));
     if lag_blocks == 0 {
-        ReadinessState::ready(Some(current_height))
+        ReadinessState::ready_with_target(Some(current_height), Some(upstream_tip))
     } else {
         ReadinessState::syncing(Some(lag_blocks), Some(current_height), Some(upstream_tip))
     }

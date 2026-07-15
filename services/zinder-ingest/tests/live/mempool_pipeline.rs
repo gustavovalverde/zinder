@@ -405,7 +405,9 @@ async fn mempool_event_log_persists_real_zebra_entry_across_writer_restart() -> 
     let listen_addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
     let cancel_for_server = cancel.clone();
-    let adapter = IngestControlGrpcAdapter::new(env.network(), store).with_mempool(mempool_index);
+    let adapter =
+        IngestControlGrpcAdapter::new(env.network(), store, zinder_runtime::Readiness::default())
+            .with_mempool(mempool_index);
     let server_handle = tokio::spawn(async move {
         let _ = Server::builder()
             .add_service(adapter.into_server())
@@ -544,7 +546,11 @@ async fn ingest_control_tip_change_publisher_fires_when_zebra_mines_block() -> R
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let ingest_control_addr = listener.local_addr()?;
     let ingest_control_cancel = cancel.clone();
-    let ingest_adapter = IngestControlGrpcAdapter::new(env.network(), store.clone());
+    let ingest_adapter = IngestControlGrpcAdapter::new(
+        env.network(),
+        store.clone(),
+        zinder_runtime::Readiness::default(),
+    );
     let ingest_control_handle = tokio::spawn(async move {
         let _serve_outcome = Server::builder()
             .add_service(ingest_adapter.into_server())

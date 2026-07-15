@@ -35,8 +35,9 @@ use zinder_runtime::{
     PrimaryStorageSection, ResolvedIngestControlWriter, ResolvedPrimaryStorage, ResolvedRetention,
     RetentionSection, RetentionToml, SecuritySection, SecurityToml, ServiceIdentifier,
     StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
-    require_field, resolve_allow_public_bind, resolve_ingest_control_writer,
-    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention,
+    require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
+    resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::{MempoolEventRetentionConfig, RocksDbResourceBudget};
@@ -210,6 +211,16 @@ pub(crate) struct BackupCommandConfig {
     pub(crate) to_path: PathBuf,
 }
 
+/// Fully loaded command configuration for
+/// `zinder-ingest verify-canonical-replay`.
+#[derive(Debug)]
+pub(crate) struct CanonicalReplayVerificationCommandConfig {
+    pub(crate) network: zinder_core::Network,
+    pub(crate) storage_path: PathBuf,
+    pub(crate) secondary_path: PathBuf,
+    pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
+}
+
 /// Command-line overrides for the unified ingest invocation.
 #[derive(Debug, Default)]
 pub(crate) struct IngestConfigOverrides {
@@ -254,6 +265,14 @@ pub(crate) struct BackupConfigOverrides {
     pub(crate) raw_blob_policy: Option<String>,
 }
 
+/// Command-line overrides for canonical replay verification.
+#[derive(Debug, Default)]
+pub(crate) struct CanonicalReplayVerificationConfigOverrides {
+    pub(crate) network: Option<String>,
+    pub(crate) storage_path: Option<PathBuf>,
+    pub(crate) secondary_path: Option<PathBuf>,
+}
+
 /// Error returned while resolving command configuration.
 #[derive(Debug, Error)]
 pub(crate) enum IngestConfigError {
@@ -262,6 +281,11 @@ pub(crate) enum IngestConfigError {
 
     #[error(transparent)]
     Ingest(#[from] IngestError),
+
+    #[error(transparent)]
+    CanonicalReplayVerification(
+        #[from] crate::canonical_replay_verification::CanonicalReplayVerificationError,
+    ),
 
     #[error("failed to bind ingest-control endpoint at {listen_addr}: {source}")]
     IngestControlBind {
@@ -585,6 +609,22 @@ pub(crate) fn load_backup_config(
     resolve_backup_config(raw_config)
 }
 
+/// Loads and validates canonical replay verification configuration.
+pub(crate) fn load_canonical_replay_verification_config(
+    config_path: Option<PathBuf>,
+    overrides: CanonicalReplayVerificationConfigOverrides,
+) -> Result<CanonicalReplayVerificationCommandConfig, IngestConfigError> {
+    let raw_config: IngestConfig = ConfigLoader::new()
+        .with_file(config_path)
+        .with_zinder_env()?
+        .with_override_if("network.name", overrides.network)?
+        .with_override_path_if("storage.path", overrides.storage_path)?
+        .with_override_path_if("storage.secondary_path", overrides.secondary_path)?
+        .load()?;
+
+    resolve_canonical_replay_verification_config(raw_config)
+}
+
 /// Renders the effective ingest configuration in the accepted TOML
 /// shape.
 pub(crate) fn redacted_ingest_config_toml(
@@ -614,6 +654,17 @@ pub(crate) fn redacted_backup_config_toml(
     Ok(rendered)
 }
 
+/// Renders the effective canonical replay verification configuration in the
+/// accepted TOML shape.
+pub(crate) fn redacted_canonical_replay_verification_config_toml(
+    config: &CanonicalReplayVerificationCommandConfig,
+) -> Result<String, IngestConfigError> {
+    toml::to_string(
+        &RedactedCanonicalReplayVerificationConfigToml::from_verification_config(config),
+    )
+    .map_err(|source| ConfigError::Render { source }.into())
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestConfig {
@@ -632,6 +683,7 @@ struct IngestConfig {
 #[serde(default, deny_unknown_fields)]
 struct IngestPrimaryStorageSection {
     path: Option<PathBuf>,
+    secondary_path: Option<PathBuf>,
     canonical: StorageRoleSection,
     derive: StorageRoleSection,
     raw_blob_policy: Option<RawBlobPolicy>,
@@ -1307,6 +1359,29 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
     })
 }
 
+fn resolve_canonical_replay_verification_config(
+    config: IngestConfig,
+) -> Result<CanonicalReplayVerificationCommandConfig, IngestConfigError> {
+    let network = config.network.resolve()?;
+    let storage_path = config
+        .storage
+        .path
+        .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
+    let secondary_path = config
+        .storage
+        .secondary_path
+        .ok_or_else(|| ConfigError::missing_field("storage.secondary_path"))?;
+    let canonical_rocksdb_budget =
+        resolve_canonical_reader_rocksdb_budget(config.storage.canonical.rocksdb)?;
+
+    Ok(CanonicalReplayVerificationCommandConfig {
+        network,
+        storage_path,
+        secondary_path,
+        canonical_rocksdb_budget,
+    })
+}
+
 fn resolve_raw_blob_policy(
     coverage: IngestCoverage,
     configured_policy: Option<RawBlobPolicy>,
@@ -1338,6 +1413,12 @@ struct RedactedBackupConfigToml {
     network: NetworkToml,
     storage: IngestStorageToml,
     backup: BackupToml,
+}
+
+#[derive(Serialize)]
+struct RedactedCanonicalReplayVerificationConfigToml {
+    network: NetworkToml,
+    storage: CanonicalReplayVerificationStorageToml,
 }
 
 impl RedactedIngestConfigToml {
@@ -1508,6 +1589,19 @@ impl RedactedBackupConfigToml {
     }
 }
 
+impl RedactedCanonicalReplayVerificationConfigToml {
+    fn from_verification_config(config: &CanonicalReplayVerificationCommandConfig) -> Self {
+        Self {
+            network: NetworkToml::from_network(config.network),
+            storage: CanonicalReplayVerificationStorageToml {
+                path: config.storage_path.display().to_string(),
+                secondary_path: config.secondary_path.display().to_string(),
+                canonical: StorageRoleToml::from_resolved(config.canonical_rocksdb_budget),
+            },
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct IngestToml {
     source: &'static str,
@@ -1581,6 +1675,13 @@ struct IngestStorageToml {
     canonical: StorageRoleToml,
     derive: StorageRoleToml,
     raw_blob_policy: RawBlobPolicy,
+}
+
+#[derive(Serialize)]
+struct CanonicalReplayVerificationStorageToml {
+    path: String,
+    secondary_path: String,
+    canonical: StorageRoleToml,
 }
 
 #[derive(Serialize)]

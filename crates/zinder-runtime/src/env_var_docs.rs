@@ -355,6 +355,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         name: "ZINDER_STORAGE__SECONDARY_PATH",
         toml_path: "storage.secondary_path",
         used_by: &[
+            "zinder-ingest (verify-canonical-replay only)",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",

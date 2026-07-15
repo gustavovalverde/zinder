@@ -161,7 +161,11 @@ async fn run_reorg_sweep(reorg_depth: u32) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let ingest_control_addr = listener.local_addr()?;
     let server_cancel = cancel.clone();
-    let ingest_adapter = IngestControlGrpcAdapter::new(env.network(), store.clone());
+    let ingest_adapter = IngestControlGrpcAdapter::new(
+        env.network(),
+        store.clone(),
+        zinder_runtime::Readiness::default(),
+    );
     let server_handle = tokio::spawn(async move {
         let _ = Server::builder()
             .add_service(ingest_adapter.into_server())

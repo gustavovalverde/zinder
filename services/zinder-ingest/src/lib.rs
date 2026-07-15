@@ -12,6 +12,7 @@ mod chain_ingest;
 mod commitment_root_backfill;
 mod conventional_fee_distribution_backfill;
 mod derive_consumers;
+mod derive_status_reader;
 mod ingest_control;
 mod ingest_loop;
 mod memory_pressure;
@@ -57,6 +58,9 @@ pub use derive_consumers::{
     open_primary_derive_store_for_canonical_with_projection_preset,
     seed_backfill_owned_consumer_cursors, seed_commitment_root_search_cursor_for_backfill,
     spawn_derive_replay_budget_metrics_task, spawn_derive_tailer_task,
+};
+pub use derive_status_reader::{
+    DeriveStatusReadError, DeriveStatusReader, RocksDbDeriveStatusReader,
 };
 pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
 pub use ingest_loop::{

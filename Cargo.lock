@@ -5799,6 +5799,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "prost",
+ "rust-rocksdb",
  "secrecy",
  "serde",
  "serde_json",
