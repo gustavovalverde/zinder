@@ -253,15 +253,13 @@ impl ZebraJsonRpcSource {
                 reason: "checkpoint activation table network does not match the node source",
             });
         }
-        for required_upgrade_name in ["Sapling", "NU5"] {
-            if network_upgrade_activations
-                .activation_height_by_name(required_upgrade_name)
-                .is_none()
-            {
-                return Err(SourceError::SourceProtocolMismatch {
-                    reason: "checkpoint activation table is missing Sapling or NU5",
-                });
-            }
+        if network_upgrade_activations
+            .activation_height_by_name("Sapling")
+            .is_none()
+        {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "checkpoint activation table is missing Sapling",
+            });
         }
         let block_unavailable = |error: JsonRpcCallError| SourceError::BlockUnavailable {
             height,

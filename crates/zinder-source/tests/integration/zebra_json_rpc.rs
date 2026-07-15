@@ -1442,6 +1442,31 @@ async fn fetch_chain_checkpoint_accepts_active_empty_canonical_frontier() -> eyr
 }
 
 #[tokio::test]
+async fn fetch_chain_checkpoint_accepts_schedule_with_post_canopy_pools_disabled()
+-> eyre::Result<()> {
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        vec![NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(1),
+            activation_height: BlockHeight::new(1),
+            name: "Sapling".to_owned(),
+        }],
+    )?;
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+
+    let checkpoint = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), Some(&final_state)),
+        &activations,
+    )
+    .await??;
+
+    assert!(checkpoint.frontiers.sapling().is_some());
+    assert!(checkpoint.frontiers.orchard().is_none());
+    assert!(checkpoint.frontiers.ironwood().is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn fetch_chain_checkpoint_decodes_same_height_pool_activations_independently()
 -> eyre::Result<()> {
     let sapling = one_leaf_sapling_frontier_rpc_parts()?;
