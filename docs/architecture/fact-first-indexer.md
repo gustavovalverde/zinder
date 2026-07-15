@@ -24,6 +24,26 @@ semantic round trip, not a production Postgres lifecycle, deployment, or
 readiness contract. The design does not create a generic multi-backend adapter
 or permit per-plane backend mixing.
 
+The [2026-07-15 live validation](../investigations/2026-07-15-fact-first-live-validation.md)
+records a fresh testnet reconstruction, full replay/header scan, and paired
+RocksDB/PostgreSQL fact-store campaign. It proves fresh reconstruction,
+projection convergence, restart, sampled wallet-serving behavior, and the new
+fact contract across both physical drivers. It does not certify the target
+fact-first runtime or the `postgres-scale-out` composition.
+
+## Implementation Status
+
+| Slice | Status | Evidence boundary |
+| --- | --- | --- |
+| `CanonicalBlockFacts`, deterministic digest, and replay envelope | Landed | Complete block-local semantic facts round-trip through the versioned contract |
+| Atomic RocksDB replay persistence | Landed | Replay is committed with the canonical epoch and survives reopen, secondary reads, and corruption checks |
+| Full replay/header verifier | Landed and live-tested | All 4.17 million pinned testnet rows passed replay, header, and continuity checks |
+| PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
+| Canonical schema without wallet indexes or historical prevout reads | Not implemented | Current canonical commit still expands facts into legacy wallet-shaped rows |
+| Independent wallet projector and store | Not implemented | Current `zinder-ingest` still owns legacy projection replay |
+| `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
+| Complete lifecycle certification | Not run | Fresh mainnet canonical, wallet construction, restore, reorg, and client parity gates remain open |
+
 ## Decision
 
 The architecture has three durable data planes and two protocol edges:

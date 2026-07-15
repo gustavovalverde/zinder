@@ -263,23 +263,44 @@ balance, missing row, or unqualified unavailable error.
    schema-1 meaning of `total_size_bytes`: the complete serialized block size
    recorded in `BlockHeaderArtifact`. Neither projector equivalence nor replay
    persistence provides fact-first throughput evidence.
-5. Add the durable projection-build lease and anchor-aware event-pruning floor
-   before any inactive builder can be promoted.
-6. Validate `rocksdb-single-host` and `postgres-scale-out` independently,
-   retain both concrete implementations, and reject per-plane backend mixing.
-7. Cut a fresh canonical schema that removes global transparent output,
+5. Cut a fresh canonical schema that removes global transparent output,
    address, spend, repair, and retention state from canonical commits.
-8. Implement the concrete wallet projection builder, ordered follower, and
-   readiness verifier; add wallet construction and wallet-ready lifecycle
+6. Implement RocksDB fresh canonical construction and live following over that
+   schema, then prove that canonical commits perform no cross-block wallet
+   lookup across the representative mainnet workload anchors.
+7. Add the durable projection-build lease and anchor-aware event-pruning floor
+   before any inactive builder can be promoted.
+8. Implement the concrete RocksDB wallet projection builder, ordered follower,
+   and readiness verifier; add wallet construction and wallet-ready lifecycle
    acceptance only with that real plane.
 9. Rewire query, client, compatibility, and downstream contracts in one
    coordinated breaking change.
-10. Move remaining explorer consumers and backfills to explorer-owned modules.
+10. Move remaining explorer consumers and backfills to explorer-owned modules,
+    then delete the legacy `zinder-derive` path.
 11. Replace configuration, readiness, metrics, snapshot operations, testkit
-   fixtures, deployment manifests, and runbooks.
-12. Build a blue-green production stack, validate it without traffic, catch up,
+    fixtures, deployment manifests, and runbooks for the target
+    `rocksdb-single-host` composition.
+12. Prove the complete `rocksdb-single-host` lifecycle, including canonical
+    construction, wallet and explorer construction, live following, reorg,
+    restart, checkpoint, restore, and client parity.
+13. Implement PostgreSQL canonical construction, live following, writer
+    fencing, epoch-pinned read sessions, and the transactional event outbox.
+14. Implement the PostgreSQL wallet and explorer projections.
+15. Add the `postgres-scale-out` configuration, readiness, metrics, snapshot,
+    testkit, deployment, and operational contracts, including TLS, role-scoped
+    credentials, replica lag, and failover.
+16. Prove the complete `postgres-scale-out` lifecycle, including stale-writer
+    rejection, failover, replica reads, restore, and client parity.
+17. Build a blue-green production stack, validate it without traffic, catch up,
     switch traffic, retain the previous stack for a bounded rollback window,
-    then delete the old storage paths and compatibility baggage.
+    then delete the old storage paths and remaining compatibility baggage.
+
+Complete topology validation cannot precede the schema and projection
+lifecycles it is meant to validate. The RocksDB composition closes first so it
+provides a reusable lifecycle suite and measured reference evidence for the
+PostgreSQL composition. Both implementations remain accountable to the
+backend-neutral digest contract and serial reference. This is an execution
+order, not a claim that PostgreSQL is optional or that RocksDB owns correctness.
 
 The current PostgreSQL diagnostic uses the production-intended
 `tokio-postgres` driver but connects without TLS only inside the isolated

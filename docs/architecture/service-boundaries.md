@@ -2,7 +2,7 @@
 
 Zinder is one product with multiple deployable services. The boundary rule is simple: the service that follows the chain writes canonical state, and the service that serves wallets reads epoch-bound state through a Zinder-owned read contract.
 
-## Boundary Map
+## Current Boundary Map
 
 | Boundary                     | Owns                                                                                                                    | Must Not Own                                                                    |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
@@ -10,6 +10,24 @@ Zinder is one product with multiple deployable services. The boundary rule is si
 | `zinder-query`               | Wallet-facing APIs, explorer read APIs, transaction broadcast facade, response consistency                              | Chain selection, canonical writes, migrations, derived-index repair             |
 | `zinder-compat-lightwalletd` | Vendored lightwalletd-compatible gRPC behavior, compatibility error mapping, protocol translation over `WalletQueryApi` | Upstream node calls, primary canonical storage, migrations, compact block construction |
 | `zinder-explorer`            | Explorer query serving, secondary derive-store reads, explorer-specific APIs and capability advertising                 | Wallet sync, canonical chain state, source truth, derive-store primary writes   |
+
+This table describes the schema-19 runtime. It is not the accepted fact-first
+ownership target because `zinder-ingest` still hosts projection writes.
+
+## Target Boundary Map
+
+| Boundary | Owns | Must not own |
+| --- | --- | --- |
+| `zinder-ingest` | Upstream connections, chain selection, canonical construction and following, reorg handling, and canonical publication | Wallet or explorer projection writes, public query traffic, or projection promotion |
+| `zinder-projector` | Build, verify, catch up, follow, and promote one selected wallet or explorer projection under an authenticated position and fence | Chain selection, canonical writes, source-node RPCs, or public query traffic |
+| `zinder-query` | Wallet-facing APIs and epoch-bound canonical plus exact wallet-projection reads | Chain selection, canonical writes, projection writes, migrations, or explorer analytics |
+| `zinder-explorer` | Explorer APIs and read-only composition of canonical, wallet, and explorer planes | Canonical, wallet, or explorer writes; source truth; or wallet sync orchestration |
+| Compatibility services | Stateless protocol translation over `WalletQuery` or `ExplorerQuery` | Direct storage access, source-node calls, migrations, or product-owned state |
+
+These boundaries apply to both retained topologies. `rocksdb-single-host` may
+colocate the processes and stores on one host; `postgres-scale-out` may deploy
+them independently. Colocation does not merge readiness, restart, migration,
+or resource ownership.
 
 ## Why This Split Exists
 
@@ -101,7 +119,7 @@ Cross-host RocksDB replicas are out of scope; see
 [ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).
 This topology is production-supported and has no Postgres dependency.
 
-### `postgres-scale-out` migration target
+### `postgres-scale-out` target
 
 This topology is not implemented or certified yet. Its accepted service shape
 keeps one fenced canonical writer while allowing projectors, query services,
