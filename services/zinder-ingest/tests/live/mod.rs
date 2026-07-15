@@ -1,4 +1,5 @@
 mod bulk_catchup;
+mod canonical_construction;
 mod cli;
 mod deep_chain;
 mod latency;

@@ -112,5 +112,5 @@ filter = "test(live::deep_chain) or test(live::tip_follow) or test(live::cli) or
 test-group = "node-mutating"
 
 [[profile.ci-live.overrides]]
-filter = "test(backfills_last_1000_blocks_from_checkpoint)"
+filter = "test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_replay_loads_1000_blocks_from_fixed_checkpoint)"
 slow-timeout = { period = "5m", terminate-after = 1 }

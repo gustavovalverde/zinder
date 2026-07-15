@@ -244,6 +244,36 @@ that target only mainnet (see below) still skip. Tests that exercise
 regtest-only RPCs (`generate`, `invalidateblock`, `reconsiderblock`) opt in
 via `require_live_for(&[Network::ZcashRegtest])` and refuse to run here.
 
+The fixed-range canonical tracer runs on testnet and mainnet. It captures one
+tip identity, retains exactly the following 1,000 blocks, loads the version-1
+replay family through the production source-to-SST path, performs a
+cache-bypassing semantic readback, and reports block and byte throughput. The
+store deliberately remains `BUILDING`: this test does not claim wallet
+readiness before the remaining canonical families and wallet projection exist.
+Run only this tracer with the same environment shown above:
+
+```bash
+cargo nextest run --profile=ci-live --run-ignored=all \
+  -E 'test(canonical_replay_loads_1000_blocks_from_fixed_checkpoint)'
+```
+
+For the local Z3 testnet topology, the dedicated Docker setup builds the test
+in release mode, joins the existing Zebra network, mounts its cookie volume
+read-only, and creates an isolated project-scoped Zinder volume. It never
+mounts Zebra's chain volume or the active Zinder data volume:
+
+```bash
+docker build -f deploy/Dockerfile \
+  --target zinder-ingest-live-tests \
+  -t zinder-ingest-live-tests:local .
+docker compose -p zinder-canonical-live-test \
+  -f deploy/docker-compose.canonical-live-test.yml \
+  run --rm canonical-replay
+docker compose -p zinder-canonical-live-test \
+  -f deploy/docker-compose.canonical-live-test.yml \
+  down -v
+```
+
 ## T3: Live mainnet (operator-hosted Zebra)
 
 Local mainnet runs are supported against an operator-hosted Zebra:

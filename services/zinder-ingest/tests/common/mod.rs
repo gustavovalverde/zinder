@@ -322,12 +322,12 @@ pub(crate) async fn rpc_reconsider_block(env: &LiveTestEnv, block_hash_hex: &str
 pub(crate) async fn fetch_live_network_upgrade_activations(
     env: &LiveTestEnv,
 ) -> Result<Arc<NetworkUpgradeActivations>> {
-    let source = zebra_json_rpc_source_for_env(env)?;
+    let source = zebra_source_for_live_env(env)?;
     let activations = source.fetch_network_upgrade_activations().await?;
     Ok(Arc::new(activations))
 }
 
-fn zebra_json_rpc_source_for_env(env: &LiveTestEnv) -> Result<ZebraJsonRpcSource> {
+pub(crate) fn zebra_source_for_live_env(env: &LiveTestEnv) -> Result<ZebraJsonRpcSource> {
     Ok(ZebraJsonRpcSource::with_options(
         env.target.network,
         &env.target.json_rpc_addr,

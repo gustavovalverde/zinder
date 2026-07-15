@@ -1,0 +1,49 @@
+services:
+  live-test-data-init:
+    image: debian:bookworm-slim
+    user: "0:0"
+    command:
+      - chown
+      - 1000:1000
+      - /var/lib/zinder-live
+    volumes:
+      - live_test_data:/var/lib/zinder-live
+    restart: "no"
+
+  canonical-replay:
+    image: ${ZINDER_INGEST_LIVE_TEST_IMAGE:-zinder-ingest-live-tests:local}
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      TMPDIR: /var/lib/zinder-live
+      ZINDER_TEST_LIVE: "1"
+      ZINDER_NETWORK: ${ZINDER_NETWORK:-zcash-testnet}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:18232}
+      ZINDER_NODE__AUTH__METHOD: cookie
+      ZINDER_NODE__AUTH__PATH: /var/run/auth/.cookie
+      ZINDER_NODE__REQUEST_TIMEOUT_SECS: ${ZINDER_NODE__REQUEST_TIMEOUT_SECS:-30}
+      ZINDER_NODE__MAX_RESPONSE_BYTES: ${ZINDER_NODE__MAX_RESPONSE_BYTES:-67108864}
+    command:
+      - live::canonical_construction::canonical_replay_loads_1000_blocks_from_fixed_checkpoint
+      - --exact
+      - --ignored
+      - --nocapture
+    volumes:
+      - live_test_data:/var/lib/zinder-live
+      - source_cookie:/var/run/auth:ro
+    depends_on:
+      live-test-data-init:
+        condition: service_completed_successfully
+    networks:
+      - source
+    restart: "no"
+
+volumes:
+  live_test_data:
+  source_cookie:
+    external: true
+    name: ${ZINDER_SOURCE_COOKIE_VOLUME_NAME:-z3-testnet-cookie}
+
+networks:
+  source:
+    external: true
+    name: ${ZINDER_SOURCE_NETWORK_NAME:-z3-testnet}
