@@ -39,6 +39,7 @@ deploy/
 !deploy/single-container/config.example.query.toml
 !deploy/single-container/config.example.explorer.toml
 !deploy/single-container/nginx.conf
+!deploy/capture-container-resource-evidence.sh
 
 # Test outputs.
 **/test-results/
