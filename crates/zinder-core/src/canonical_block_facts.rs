@@ -21,23 +21,19 @@ const SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder:canonical-block-facts:ordered-seq
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum CanonicalBlockFactsDigestVersion {
-    /// Fact-only tagged encoding after retained raw bytes became a separate contract.
-    ///
-    /// Numeric version 1 was used by a pre-release encoding that included raw
-    /// block and transaction bytes. It is deliberately unsupported rather than
-    /// reinterpreted under this incompatible semantic shape.
-    V2,
+    /// Initial fact-only tagged encoding.
+    V1,
 }
 
 impl CanonicalBlockFactsDigestVersion {
     /// Version emitted by new reference-digest computations.
-    pub const CURRENT: Self = Self::V2;
+    pub const CURRENT: Self = Self::V1;
 
     /// Returns the stable numeric version written into digest preimages.
     #[must_use]
     pub const fn value(self) -> u16 {
         match self {
-            Self::V2 => 2,
+            Self::V1 => 1,
         }
     }
 }
@@ -54,7 +50,7 @@ impl TryFrom<u16> for CanonicalBlockFactsDigestVersion {
 
     fn try_from(encoded_version: u16) -> Result<Self, Self::Error> {
         match encoded_version {
-            2 => Ok(Self::V2),
+            1 => Ok(Self::V1),
             _ => Err(UnsupportedCanonicalBlockFactsDigestVersion { encoded_version }),
         }
     }
@@ -158,7 +154,7 @@ impl CanonicalBlockFactsDigest {
         reference_encoding: &[u8],
     ) -> Self {
         let bytes = match version {
-            CanonicalBlockFactsDigestVersion::V2 => {
+            CanonicalBlockFactsDigestVersion::V1 => {
                 sha256_domain_and_bytes(BLOCK_DIGEST_DOMAIN, reference_encoding)
             }
         };
@@ -374,7 +370,7 @@ impl CanonicalBlockFacts {
         version: CanonicalBlockFactsDigestVersion,
     ) -> CanonicalBlockFactsReferenceEncoding {
         let bytes = match version {
-            CanonicalBlockFactsDigestVersion::V2 => reference_encoding_v2(self, version),
+            CanonicalBlockFactsDigestVersion::V1 => reference_encoding_v1(self, version),
         };
         CanonicalBlockFactsReferenceEncoding { version, bytes }
     }
@@ -390,7 +386,7 @@ impl CanonicalBlockFacts {
     }
 }
 
-fn reference_encoding_v2(
+fn reference_encoding_v1(
     facts: &CanonicalBlockFacts,
     version: CanonicalBlockFactsDigestVersion,
 ) -> Vec<u8> {
@@ -775,11 +771,11 @@ mod tests {
     #[test]
     fn persisted_digest_versions_fail_closed_when_unknown() {
         assert_eq!(
-            CanonicalBlockFactsDigestVersion::try_from(2),
-            Ok(CanonicalBlockFactsDigestVersion::V2)
+            CanonicalBlockFactsDigestVersion::try_from(1),
+            Ok(CanonicalBlockFactsDigestVersion::V1)
         );
         assert!(CanonicalBlockFactsDigestVersion::try_from(0).is_err());
-        assert!(CanonicalBlockFactsDigestVersion::try_from(1).is_err());
+        assert!(CanonicalBlockFactsDigestVersion::try_from(2).is_err());
         assert!(CanonicalBlockFactsDigestVersion::try_from(3).is_err());
         assert_eq!(
             CanonicalBlockFactsSequenceDigestVersion::try_from(1),
@@ -799,7 +795,7 @@ mod tests {
         };
         let before_append = builder.clone().finish();
         let digest = CanonicalBlockFactsDigest {
-            version: CanonicalBlockFactsDigestVersion::V2,
+            version: CanonicalBlockFactsDigestVersion::V1,
             bytes: [0xA5; 32],
         };
 

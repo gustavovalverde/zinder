@@ -36,7 +36,7 @@ const SCHEMA_NAME: &str = "zinder_bench_postgres_canonical_facts";
 type PostgresConnectionTask = JoinHandle<Result<(), tokio_postgres::Error>>;
 
 /// Physical schema version written by the concrete `PostgreSQL` fact candidate.
-pub const POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 2;
+pub const POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 1;
 /// Explicit TOAST compression used for canonical-fact replay encodings.
 pub const POSTGRES_REPLAY_ENVELOPE_COMPRESSION: &str = "lz4";
 

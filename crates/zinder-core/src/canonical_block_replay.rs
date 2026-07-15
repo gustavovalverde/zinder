@@ -26,23 +26,19 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum CanonicalBlockReplayFormatVersion {
-    /// Fact-only protobuf payload after retained raw bytes became a separate contract.
-    ///
-    /// Numeric version 1 described a pre-release payload containing raw block
-    /// and transaction bytes. It is deliberately unsupported rather than
-    /// decoded under this incompatible schema.
-    V2,
+    /// Initial fact-only protobuf payload.
+    V1,
 }
 
 impl CanonicalBlockReplayFormatVersion {
     /// Format emitted by new replay encodings.
-    pub const CURRENT: Self = Self::V2;
+    pub const CURRENT: Self = Self::V1;
 
     /// Returns the stable numeric version carried by the replay envelope.
     #[must_use]
     pub const fn value(self) -> u32 {
         match self {
-            Self::V2 => 2,
+            Self::V1 => 1,
         }
     }
 }
@@ -59,7 +55,7 @@ impl TryFrom<u32> for CanonicalBlockReplayFormatVersion {
 
     fn try_from(encoded_version: u32) -> Result<Self, Self::Error> {
         match encoded_version {
-            2 => Ok(Self::V2),
+            1 => Ok(Self::V1),
             _ => Err(UnsupportedCanonicalBlockReplayFormatVersion { encoded_version }),
         }
     }
@@ -327,7 +323,7 @@ fn encode_payload(
     format_version: CanonicalBlockReplayFormatVersion,
 ) -> Vec<u8> {
     match format_version {
-        CanonicalBlockReplayFormatVersion::V2 => replay_v2_record(facts).encode_to_vec(),
+        CanonicalBlockReplayFormatVersion::V1 => replay_v1_record(facts).encode_to_vec(),
     }
 }
 
@@ -336,16 +332,16 @@ fn decode_payload(
     format_version: CanonicalBlockReplayFormatVersion,
 ) -> Result<CanonicalBlockFacts, CanonicalBlockReplayDecodeError> {
     match format_version {
-        CanonicalBlockReplayFormatVersion::V2 => {
-            let record = CanonicalBlockReplayV2Record::decode(payload)
+        CanonicalBlockReplayFormatVersion::V1 => {
+            let record = CanonicalBlockReplayV1Record::decode(payload)
                 .map_err(|source| CanonicalBlockReplayDecodeError::InvalidPayload { source })?;
             canonical_block_facts_from_record(record)
         }
     }
 }
 
-fn replay_v2_record(facts: &CanonicalBlockFacts) -> CanonicalBlockReplayV2Record {
-    CanonicalBlockReplayV2Record {
+fn replay_v1_record(facts: &CanonicalBlockFacts) -> CanonicalBlockReplayV1Record {
+    CanonicalBlockReplayV1Record {
         block_header: Some(block_header_record(&facts.block_header)),
         transactions: facts
             .transactions
@@ -357,7 +353,7 @@ fn replay_v2_record(facts: &CanonicalBlockFacts) -> CanonicalBlockReplayV2Record
 }
 
 fn canonical_block_facts_from_record(
-    record: CanonicalBlockReplayV2Record,
+    record: CanonicalBlockReplayV1Record,
 ) -> Result<CanonicalBlockFacts, CanonicalBlockReplayDecodeError> {
     let block_header = required(record.block_header, "payload.block_header")?;
     Ok(CanonicalBlockFacts {
@@ -870,7 +866,7 @@ struct CanonicalBlockReplayEnvelopeRecord {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct CanonicalBlockReplayV2Record {
+struct CanonicalBlockReplayV1Record {
     #[prost(message, optional, tag = "1")]
     block_header: Option<BlockHeaderRecord>,
     #[prost(message, repeated, tag = "2")]
@@ -1043,7 +1039,7 @@ mod tests {
 
     use super::{
         CanonicalBlockReplayDecodeError, CanonicalBlockReplayEnvelopeRecord,
-        CanonicalBlockReplayFormatVersion, CanonicalBlockReplayV2Record,
+        CanonicalBlockReplayFormatVersion, CanonicalBlockReplayV1Record,
         decode_canonical_block_replay, encode_canonical_block_replay,
     };
     use crate::{
@@ -1067,7 +1063,7 @@ mod tests {
 
         assert_eq!(
             encoding.format_version(),
-            CanonicalBlockReplayFormatVersion::V2
+            CanonicalBlockReplayFormatVersion::V1
         );
         assert_eq!(replay.format_version(), encoding.format_version());
         assert_eq!(replay.reference_digest(), encoding.reference_digest());
@@ -1084,17 +1080,17 @@ mod tests {
     }
 
     #[test]
-    fn replay_v2_encoding_matches_its_golden_digest() {
+    fn replay_v1_encoding_matches_its_golden_digest() {
         let encoding = encoded_replay();
         let actual_digest: [u8; 32] = Sha256::digest(encoding.as_bytes()).into();
 
-        // This digest is the durable V2 byte contract. A semantic or wire
-        // change requires a new replay format version, not an updated V2 hash.
+        // This digest is the durable V1 byte contract. A semantic or wire
+        // change requires a new replay format version, not an updated V1 hash.
         assert_eq!(
             actual_digest,
             [
-                80, 211, 93, 194, 172, 61, 120, 97, 167, 21, 137, 34, 250, 21, 127, 145, 59, 61,
-                136, 52, 112, 166, 159, 28, 216, 38, 21, 26, 225, 130, 249, 52,
+                62, 196, 151, 44, 198, 117, 122, 214, 112, 41, 129, 136, 250, 63, 202, 68, 4, 247,
+                16, 142, 95, 70, 223, 98, 36, 145, 34, 103, 97, 110, 230, 14,
             ]
         );
     }
@@ -1160,8 +1156,8 @@ mod tests {
 
         let encoding = encode_canonical_block_replay(
             &facts,
-            CanonicalBlockReplayFormatVersion::V2,
-            CanonicalBlockFactsDigestVersion::V2,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
         );
         let replay = decode_canonical_block_replay(encoding.as_bytes())?;
 
@@ -1172,11 +1168,11 @@ mod tests {
     #[test]
     fn replay_format_versions_fail_closed_when_unknown() {
         assert_eq!(
-            CanonicalBlockReplayFormatVersion::try_from(2),
-            Ok(CanonicalBlockReplayFormatVersion::V2)
+            CanonicalBlockReplayFormatVersion::try_from(1),
+            Ok(CanonicalBlockReplayFormatVersion::V1)
         );
         assert!(CanonicalBlockReplayFormatVersion::try_from(0).is_err());
-        assert!(CanonicalBlockReplayFormatVersion::try_from(1).is_err());
+        assert!(CanonicalBlockReplayFormatVersion::try_from(2).is_err());
         assert!(CanonicalBlockReplayFormatVersion::try_from(3).is_err());
     }
 
@@ -1276,7 +1272,7 @@ mod tests {
     #[test]
     fn decode_rejects_tampered_canonical_fact_payload() -> Result<()> {
         let mut envelope = encoded_envelope()?;
-        let mut payload = CanonicalBlockReplayV2Record::decode(envelope.payload.as_slice())?;
+        let mut payload = CanonicalBlockReplayV1Record::decode(envelope.payload.as_slice())?;
         let header = payload
             .block_header
             .as_mut()
@@ -1294,7 +1290,7 @@ mod tests {
     #[test]
     fn decode_rejects_invalid_fixed_width_fact() -> Result<()> {
         let mut envelope = encoded_envelope()?;
-        let mut payload = CanonicalBlockReplayV2Record::decode(envelope.payload.as_slice())?;
+        let mut payload = CanonicalBlockReplayV1Record::decode(envelope.payload.as_slice())?;
         let header = payload
             .block_header
             .as_mut()
@@ -1316,7 +1312,7 @@ mod tests {
     #[test]
     fn decode_rejects_unknown_nested_discriminant() -> Result<()> {
         let mut envelope = encoded_envelope()?;
-        let mut payload = CanonicalBlockReplayV2Record::decode(envelope.payload.as_slice())?;
+        let mut payload = CanonicalBlockReplayV1Record::decode(envelope.payload.as_slice())?;
         let first_transaction = payload
             .transactions
             .first_mut()
@@ -1341,8 +1337,8 @@ mod tests {
     fn encoded_replay() -> super::CanonicalBlockReplayEnvelope {
         encode_canonical_block_replay(
             &rich_block_facts(),
-            CanonicalBlockReplayFormatVersion::V2,
-            CanonicalBlockFactsDigestVersion::V2,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
         )
     }
 

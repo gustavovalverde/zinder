@@ -35,10 +35,11 @@ fact-first runtime or the `postgres-scale-out` composition.
 
 | Slice | Status | Evidence boundary |
 | --- | --- | --- |
-| `CanonicalBlockFacts`, deterministic digest, and replay envelope | Landed | Complete block-local semantic facts round-trip through the versioned contract |
+| `CanonicalBlockFacts`, deterministic digest, and replay envelope | Landed | Complete block-local semantic facts round-trip through clean version-1 contracts |
 | Atomic RocksDB replay persistence | Landed | Replay is committed with the canonical epoch and survives reopen, secondary reads, and corruption checks |
 | Full replay/header verifier | Landed and live-tested | All 4.17 million pinned testnet rows passed replay, header, and continuity checks |
 | PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
+| Clean physical schema identities | Not implemented | Current canonical and projection stores still use their pre-reset layouts and compatibility machinery |
 | Canonical schema without wallet indexes or historical prevout reads | Not implemented | Current canonical commit still expands facts into legacy wallet-shaped rows |
 | Independent wallet projector and store | Not implemented | Current `zinder-ingest` still owns legacy projection replay |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
@@ -175,22 +176,46 @@ it in the same atomic RocksDB batch as the `ChainEpoch` and `ChainEvent`. The
 writer still expands the value into the legacy schema, so this seam does not
 certify fact-first throughput or remove the current cross-block work.
 
-The target hot schema is:
+The clean runtime resets every persisted contract to version 1. The version is
+paired with a domain identity, so a historical version-1 store cannot collide
+with the new layout. Canonical, wallet projection, and explorer projection
+paths each record their own identity and network before creating data families.
+A non-empty path with missing or different identity or version is refused
+without mutation. There is no migration, adoption, compatibility decoder, or
+automatic rebuild of an older format.
+
+The target canonical hot schema is:
 
 | Fact | Key | Purpose |
 | --- | --- | --- |
-| `block_header` | `(network, height)` | Block identity, parent, time, header fields, and size |
-| `block_transaction_index` | `(network, height, transaction_index)` | Canonical transaction order |
-| `transaction_location` | `(network, transaction_id)` | Direct transaction location |
-| `transaction_facts` | `(network, transaction_id)` | Public transaction shape, input outpoints, created transparent outputs, shielded component counts, and intrinsic value data |
-| `block_replay` | `(network, height)` | Compact ordered envelope of semantic block and transaction facts needed by projection replay; excludes retention-dependent raw blobs |
-| `compact_block` | `(network, height)` | Encoded lightwalletd compact block |
-| `tree_state` | `(network, height)` | Wallet scan checkpoint |
-| `subtree_root` | `(network, pool, start_index)` | Completed subtree root |
-| `chain_event` | `(network, event_sequence)` | Durable commit or reorg transition and replay cursor source |
-| `mempool_event` | `(network, event_sequence)` | Durable live-mempool transition |
-| `block_blob` | `(network, height)` | Optional compressed consensus block bytes |
-| `transaction_blob` | `(network, transaction_id)` | Optional raw transaction bytes |
+| `store_control` | singleton | Canonical identity, schema version, network, build state, visible epoch, tip, and ordered digest |
+| `block_header` | `height` | Small direct-read block identity, parent, time, header fields, and size |
+| `block_replay` | `height` | Ordered semantic block and transaction facts needed by every projection; excludes retention-dependent raw blobs |
+| `transaction_location` | `transaction_id` | Direct transaction height, index, and block identity without expanding transaction facts |
+| `compact_block` | `height` | Encoded shielded wallet-scan payload |
+| `tree_state` | `height` | Wallet scan checkpoint and commitment-tree sizes |
+| `final_note_commitment_roots` | `height` | Wallet synchronization roots not yet carried by semantic replay |
+| `subtree_root` | `(pool, start_index)` | Completed wallet subtree root |
+| `chain_event` | `event_sequence` | Durable commit or reorg transition and replay cursor source |
+| `mempool_event` | `event_sequence` | Durable live-mempool transition |
+| `displaced_block_facts` | `(event_sequence, height, block_hash)` | Immutable source facts required to rebuild explorer reorg history after the old branch disappears |
+| `block_blob` | `height` | Compressed consensus block bytes for the `explorer` workload's raw-block capability |
+| `transaction_blob` | `transaction_id` | Raw transaction bytes required by the `wallet` workload's native and lightwalletd transaction APIs |
+
+The store already has one immutable network identity, so version-1 physical
+keys do not repeat the network. `block_replay` replaces normalized transaction
+facts, intrinsic-balance rows, block transaction indexes, transparent output
+indexes, spend facts, and their repair and retention state. Address state and
+analytics are projections. Raw rows are written only for the selected workload
+and its explicitly advertised capabilities.
+
+The no-data-loss rule is strict: data may move out of canonical only after the
+version-1 replay contract can reproduce it. The current semantic aggregate does
+not contain Sapling, Orchard, and Ironwood compact scan payloads, all tree-size
+metadata, or the contents of a displaced branch. Therefore compact blocks, tree
+state, roots, and displaced-block facts remain canonical source data in version
+1. Removing them before expanding and validating replay would silently make
+wallet or explorer reconstruction incomplete.
 
 `block_replay` is not a second truth model. It is a block-local physical
 layout of the same typed facts, optimized for sequential replay. It contains no
@@ -206,14 +231,14 @@ an in-memory replay window; it does not justify another public fact model.
 schema version. Two independently versioned contracts serve different jobs:
 
 - `CanonicalBlockFactsDigestVersion` defines the deterministic correctness
-  oracle. Version 2 commits every current field through explicit numeric tags,
+  oracle. Version 1 commits every current field through explicit numeric tags,
   length prefixes, option-presence bytes, ordered vector boundaries, and fixed
-  little-endian integers. Numeric version 1 is intentionally unsupported
-  because its pre-release contract included retention-dependent raw bytes.
+  little-endian integers.
 - `CanonicalBlockReplayFormatVersion` defines the reversible persistence
-  envelope consumed by projection replay. Decoding must reconstruct the full
-  aggregate, reject unknown or non-canonical bytes, and recompute the reference
-  digest carried by the envelope.
+  envelope consumed by projection replay. Its first supported format is version
+  1. Decoding must reconstruct the full aggregate, reject unknown or
+  non-canonical bytes, and recompute the reference digest carried by the
+  envelope.
 
 The aggregate owns one block header and ordered `CanonicalTransactionFacts`;
 each transaction owns its public facts, intrinsic balances, transparent inputs
@@ -221,12 +246,13 @@ and outputs, and a SHA-256 commitment to its exact serialized bytes. The block
 aggregate carries the equivalent serialized-block commitment. Raw consensus
 payloads are not part of the aggregate, reference digest, or replay format;
 their commitments are, so store admission can bind optional retained blobs to
-the semantic replay without consensus reparsing. `zinder-bench` fixture format 4 records the
-per-block digest contract and the ordered full-sequence digest. Both diagnostic
-drivers persist replay envelopes, decode every row into complete semantic
-facts, recompute the independent reference digest, and compare the ordered
-evidence with the fixture oracle. Changing a fact, its order, either versioned
-contract, or the semantic replay result invalidates the candidate evidence.
+the semantic replay without consensus reparsing. `zinder-bench` fixture format
+1 records the per-block digest contract and the ordered full-sequence digest.
+Both diagnostic drivers persist replay envelopes, decode every row into
+complete semantic facts, recompute the independent reference digest, and
+compare the ordered evidence with the fixture oracle. Changing a fact, its
+order, either versioned contract, or the semantic replay result invalidates the
+candidate evidence.
 
 This round trip is deliberately narrower than canonical storage. It does not
 persist compact blocks, tree state, subtree roots, `ChainEpoch`, `ChainEvent`,
@@ -235,7 +261,7 @@ readiness. Its result answers whether the two physical write paths preserve
 the same block-local facts and how quickly they do so. It cannot satisfy the
 fresh canonical construction or topology-certification gates by itself.
 
-The version-2 encoder favors a small, auditable contract and may hold
+The version-1 encoder favors a small, auditable contract and may hold
 intermediate envelope buffers while encoding. Formal resource artifacts measure
 that cost across the complete candidate arm. If representative-corpus evidence
 shows that preparation memory threatens the construction target, optimize the
@@ -269,9 +295,40 @@ created earlier in the same block or preparation window from memory only when
 that resolution is part of parsing the immutable block envelope. Any
 cross-block state transition belongs to projection replay.
 
+Readiness follows the consumer boundary instead of one global sync state:
+
+- `canonical-ready` means the canonical tip, replay, compact blocks, tree data,
+  chain events, and configured raw-data capabilities cover the published epoch;
+- `wallet-ready` means the wallet projection covers that exact epoch and can
+  serve wallet and compatibility APIs; and
+- `explorer-ready` means the selected analytics cover that exact epoch.
+
+A deployment starts only the planes its consumers need. Explorer construction
+never delays wallet readiness, and optional raw-data retention never delays a
+deployment that does not advertise raw-data APIs. These are capability and
+readiness contracts, not combinations of ad hoc storage presets.
+
+Two closed user-facing workloads are supported. `wallet` is the fastest: it
+includes canonical facts, compact blocks, tree and subtree coverage,
+transaction blobs, wallet projection state, and live mempool data. `explorer`
+includes the wallet workload plus explorer projections, displaced-block views,
+and block blobs for raw explorer routes. Canonical-only construction is an
+internal lifecycle milestone rather than a user-serving deployment. The name
+`complete` is removed because it does not identify a consumer and becomes false
+as soon as another product is added.
+
 ## Wallet Projection Contract
 
-Wallet replay is one ordered transparent-state machine over canonical replay
+Fresh wallet construction and live following use different algorithms. The
+builder streams canonical replay once, emits created-output and spent-outpoint
+records into bounded sorted runs, merge-joins them by outpoint, and bulk-loads
+the final live-output set, durable spent-output rows, address history, balances,
+and commitment. RocksDB uses external SST ingestion; PostgreSQL uses binary
+`COPY` into an unpublished schema followed by deferred index construction. The
+builder validates the result, catches up the short chain-event tail, and only
+then publishes `wallet-ready`.
+
+Live following is one ordered transparent-state machine over canonical replay
 facts. For each bounded block window it:
 
 1. resolves same-block and same-window outputs in memory;

@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// Machine-readable report schema version.
-pub const REPORT_FORMAT_VERSION: u32 = 4;
+pub const REPORT_FORMAT_VERSION: u32 = 1;
 
 /// Returns whether a container image identity is content addressed.
 #[must_use]
@@ -1493,7 +1493,7 @@ mod tests {
         let report =
             build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
 
-        assert_eq!(report.report_format_version, 4);
+        assert_eq!(report.report_format_version, 1);
         assert_provenance_and_writer(&report);
         assert_eq!(report.provenance.run.trial_id.as_deref(), Some("trial-01"));
         assert!(matches!(
@@ -1502,7 +1502,7 @@ mod tests {
         ));
         assert_eq!(report.provenance.run.started_at_unix_millis, 1_000);
         assert_eq!(report.provenance.run.completed_at_unix_millis, 14_000);
-        assert_eq!(report.fixture.fixture_format_version, 4);
+        assert_eq!(report.fixture.fixture_format_version, 1);
         assert_eq!(
             report.fixture.current_schema_oracle_artifact_schema_version,
             18
@@ -1740,15 +1740,15 @@ mod tests {
                 logical_fact_bytes: 4_096,
                 physical_storage_bytes: 8_192,
                 persisted_sequence_digest: CanonicalFactSequenceDigestSummary {
-                    block_digest_version: 2,
+                    block_digest_version: 1,
                     sequence_digest_version: 1,
                     block_count: 10,
                     sha256: "persisted-digest".to_owned(),
                 },
-                replay_format_version: 2,
+                replay_format_version: 1,
                 semantic_replay_validated: true,
                 storage: CanonicalBlockFactsStorageEvidence::RocksDb {
-                    storage_schema_version: 2,
+                    storage_schema_version: 1,
                     ingestion_mode: "external-sst",
                     durability_mode: "external-sst-ingest-with-synchronous-completion-marker",
                     database_io_mode: "buffered".to_owned(),
@@ -1781,7 +1781,7 @@ mod tests {
 
         assert_eq!(json["measurement_kind"], "canonical-block-facts-round-trip");
         assert_eq!(json["storage_candidate"]["id"], "rocksdb-fact-first");
-        assert_eq!(json["round_trip"]["replay_format_version"], 2);
+        assert_eq!(json["round_trip"]["replay_format_version"], 1);
         assert_eq!(json["round_trip"]["semantic_replay_validated"], true);
         assert_eq!(json["provenance"]["run"]["trial_id"], "trial-01");
         assert_eq!(json["provenance"]["run"]["fixture_cache_policy"], "warm");
@@ -1814,11 +1814,11 @@ mod tests {
 
     fn fixture_summary() -> FixtureSummary {
         FixtureSummary {
-            fixture_format_version: 4,
+            fixture_format_version: 1,
             current_schema_oracle_artifact_schema_version: 18,
             canonical_block_facts_digest_evidence:
                 crate::fixture::CanonicalBlockFactsDigestEvidence {
-                    block_digest_version: 2,
+                    block_digest_version: 1,
                     sequence_digest_version: 1,
                     block_count: 10,
                     sequence_digest_sha256: "persisted-digest".to_owned(),

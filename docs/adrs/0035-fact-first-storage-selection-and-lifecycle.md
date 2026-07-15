@@ -49,25 +49,33 @@ Zinder implements three durable data planes:
 The canonical physical model centers on one `CanonicalBlockFacts` value per
 block with ordered transaction facts. The Rust aggregate is backend-neutral and
 does not carry a physical schema version. Its deterministic correctness oracle
-is independently versioned by `CanonicalBlockFactsDigestVersion`; version 2
+is independently versioned by `CanonicalBlockFactsDigestVersion`; version 1
 commits the header and ordered `CanonicalTransactionFacts` values with explicit
 tags, lengths, presence markers, vector boundaries, and fixed little-endian
 integers. Raw block and transaction blobs are retention-policy artifacts, so
 their bytes remain outside the aggregate, digest, and replay envelope. Typed
 SHA-256 commitments to the exact serialized block and transaction bytes remain
 inside the aggregate, allowing store admission to bind an optional retained
-blob without reparsing consensus data. Numeric digest version 1 is deliberately
-unsupported because its pre-release shape embedded retention-dependent bytes.
-The reversible storage envelope is separately versioned by
-`CanonicalBlockReplayFormatVersion`. A stored envelope is valid only when
-it decodes into the complete aggregate, has canonical bytes, and reproduces its
-independent reference digest. Replay numeric version 1 is likewise unsupported;
-version 2 is the first fact-only payload contract. Separate canonical indexes exist
-only for independently queried contracts such as chain position, transaction
-location, compact blocks, tree state, subtree roots, chain epochs, chain
-events, and mempool events. A structure-of-arrays encoding is an internal
-layout option only when a benchmark proves decoding or cache locality gains. It
-is not another public fact model.
+blob without reparsing consensus data. The reversible version-1 storage
+envelope is separately identified by `CanonicalBlockReplayFormatVersion`. A
+stored envelope is valid only when it decodes into the complete aggregate, has
+canonical bytes, and reproduces its independent reference digest. Separate
+canonical indexes exist only for independently queried contracts such as chain
+position, optional transaction location, compact blocks, tree state, subtree
+roots, chain epochs, chain events, and mempool events. A structure-of-arrays
+encoding is an internal layout option only when a benchmark proves decoding or
+cache locality gains. It is not another public fact model.
+
+Every persisted contract introduced by this architecture starts at version 1:
+canonical RocksDB and PostgreSQL, wallet projection, explorer projection,
+canonical fact digest, replay envelope, backup manifest, fixture, benchmark
+report, and physical candidate schema. This is a clean identity reset, not a
+numeric rename. Each store records its domain identity (`canonical`, `wallet
+projection`, or `explorer projection`) and exact format version before any
+column family or table is created. A non-empty path without that identity, or
+with any version other than 1, is refused without mutation. Previous stores,
+backups, fixtures, and reports are intentionally unsupported and must be
+rebuilt or recaptured.
 
 The current ingest path parses a source block's serialized header prefix first
 so bulk catchup can validate identity and parent links without deserializing
@@ -245,9 +253,11 @@ balance, missing row, or unqualified unavailable error.
    construction, snapshot restore, projection construction, following, or
    wallet readiness. Each production lifecycle gains a report field only when
    a dedicated driver owns its complete build, validate, catch-up, and publish
-   boundary.
-2. Introduce the pure `CanonicalBlockFacts` value, its dedicated reference
-   digest contract, independently versioned reversible replay format, and
+   boundary. The fixture, report, fact digest, replay envelope, and diagnostic
+   physical schemas all begin at version 1; abandoned pre-release numbers are
+   not compatibility contracts.
+2. Introduce the pure `CanonicalBlockFacts` value, its version-1 reference
+   digest contract, independently versioned version-1 replay format, and
    ordered sequence digest while the current store remains a temporary oracle.
 3. Implement the smallest fact-first RocksDB and Postgres vertical slices and
    run both from the same Docker Compose benchmark topology. Every row must
@@ -263,8 +273,11 @@ balance, missing row, or unqualified unavailable error.
    schema-1 meaning of `total_size_bytes`: the complete serialized block size
    recorded in `BlockHeaderArtifact`. Neither projector equivalence nor replay
    persistence provides fact-first throughput evidence.
-5. Cut a fresh canonical schema that removes global transparent output,
-   address, spend, repair, and retention state from canonical commits.
+5. Freeze the consumer-data matrix, then cut a fresh canonical schema with a
+   distinct `canonical` identity and exact version 1. Remove global transparent
+   output, address, spend, repair, and retention state from canonical commits.
+   Keep compact scan payloads, tree metadata, roots, and displaced-branch facts
+   canonical until version-1 replay can reproduce them without source access.
 6. Implement RocksDB fresh canonical construction and live following over that
    schema, then prove that canonical commits perform no cross-block wallet
    lookup across the representative mainnet workload anchors.

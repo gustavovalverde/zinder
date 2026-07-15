@@ -36,10 +36,10 @@ const CANONICAL_BLOCK_FACTS_COLUMN_FAMILY: &str = "canonical_block_facts";
 const STORAGE_CONTROL_COLUMN_FAMILY: &str = "storage_control";
 const COMPLETION_MARKER_KEY: &[u8] = b"canonical_fact_round_trip_complete";
 const ROW_MAGIC: [u8; 4] = *b"ZBCF";
-const COMPLETION_MARKER_FORMAT_VERSION: u16 = 2;
+const COMPLETION_MARKER_FORMAT_VERSION: u16 = 1;
 
 /// Candidate-owned physical schema version for persisted canonical fact rows.
-pub const ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 2;
+pub const ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 1;
 /// Explicit compression used for candidate SSTs and the canonical-facts column family.
 pub const ROCKSDB_CANONICAL_FACT_COMPRESSION: &str = "snappy";
 
