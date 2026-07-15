@@ -8,6 +8,7 @@ mod artifact_builder;
 pub mod bench_support;
 mod block_production_time_backfill;
 mod bulk_catchup;
+mod canonical_construction;
 mod chain_ingest;
 mod commitment_root_backfill;
 mod conventional_fee_distribution_backfill;
@@ -39,6 +40,9 @@ pub use block_production_time_backfill::spawn_block_production_time_backfill_tas
 pub use bulk_catchup::{
     BulkCatchupRunConfig, run_bulk_catchup, run_bulk_catchup_until_complete,
     run_bulk_catchup_with_store,
+};
+pub use canonical_construction::{
+    CanonicalConstructionConfig, CanonicalConstructionError, load_fresh_canonical_block_replay,
 };
 pub use chain_ingest::{
     DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,

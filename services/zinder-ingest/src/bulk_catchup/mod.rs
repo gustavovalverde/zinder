@@ -16,6 +16,11 @@ use zinder_store::{
 };
 
 use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block};
+#[cfg(test)]
+use crate::canonical_construction::source_fetch::SourceSegmentPlan;
+use crate::canonical_construction::{
+    source_fetch::SourceSegmentSizer, watermark::record_stage_duration,
+};
 use crate::chain_ingest::{
     IngestError, NodeSourceKind, canonical_writer_store_options, current_unix_millis,
     validate_writer_store_contract,
@@ -28,27 +33,13 @@ use crate::source_recovery::{
 use block_prepare::{BulkCatchupBlockPrepareStreamConfig, build_block_prepare_stream};
 use commit_reassembly::run_commit_reassembly;
 pub(crate) use flush::flush_pending_bulk_catchup_writes;
-#[cfg(test)]
-use source_fetch::SourceSegmentPlan;
-use source_fetch::SourceSegmentSizer;
-use watermark::record_stage_duration;
 
 #[cfg(test)]
 use crate::artifact_builder::{CommitmentTreeSizes, PreparedCanonicalBlock};
 
-mod abort_on_drop;
 mod block_prepare;
 mod commit_reassembly;
 mod flush;
-mod source_fetch;
-mod watermark;
-
-const SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT: usize = 64;
-const SOURCE_SEGMENT_GROW_AFTER_SUCCESS_COUNT: u32 = 8;
-const SOURCE_SEGMENT_GROW_NUMERATOR: u32 = 5;
-const SOURCE_SEGMENT_GROW_DENOMINATOR: u32 = 4;
-
-const BULK_STAGE_SOURCE_FETCH: &str = "source_fetch";
 const BULK_STAGE_CANONICAL_BLOCK_PREPARE: &str = "canonical_block_prepare";
 const BULK_STAGE_CANONICAL_PREVOUT_RESOLVE: &str = "canonical_prevout_resolve";
 const BULK_STAGE_CANONICAL_POSITION: &str = "canonical_position";
@@ -539,14 +530,6 @@ where
     .await
 }
 
-fn nonzero_u32(amount: u32) -> NonZeroU32 {
-    NonZeroU32::new(amount.max(1)).unwrap_or(NonZeroU32::MIN)
-}
-
-fn nonzero_u32_to_usize(amount: NonZeroU32) -> usize {
-    usize::try_from(amount.get()).unwrap_or(usize::MAX)
-}
-
 fn usize_to_u32_saturating(amount: usize) -> u32 {
     u32::try_from(amount).unwrap_or(u32::MAX)
 }
@@ -557,41 +540,6 @@ fn usize_to_u64_saturating(amount: usize) -> u64 {
 
 fn nonzero_u64_to_usize(amount: NonZeroU64) -> usize {
     usize::try_from(amount.get()).unwrap_or(usize::MAX)
-}
-
-fn record_source_segment_sizer_state(
-    current_blocks: NonZeroU32,
-    max_blocks: NonZeroU32,
-    target_response_payload_bytes: NonZeroU64,
-) {
-    metrics::gauge!("zinder_ingest_source_segment_next_blocks")
-        .set(f64::from(current_blocks.get()));
-    metrics::gauge!("zinder_ingest_source_segment_max_blocks").set(f64::from(max_blocks.get()));
-    metrics::gauge!("zinder_ingest_source_segment_target_response_payload_bytes")
-        .set(u64_to_f64(target_response_payload_bytes.get()));
-}
-
-fn record_source_segment_sizer_adjustment(
-    reason: &'static str,
-    previous_blocks: NonZeroU32,
-    current_blocks: NonZeroU32,
-) {
-    if previous_blocks == current_blocks && reason != "network_upgrade" {
-        return;
-    }
-    metrics::counter!(
-        "zinder_ingest_source_segment_sizing_adjustment_total",
-        "reason" => reason
-    )
-    .increment(1);
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "Prometheus gauges and histograms use f64 samples; byte counts are diagnostic magnitudes"
-)]
-fn u64_to_f64(sample: u64) -> f64 {
-    sample as f64
 }
 
 fn record_bulk_pipeline_stage_duration(

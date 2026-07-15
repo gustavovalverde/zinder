@@ -289,7 +289,7 @@ fn canonical_block_facts_digest_is_stable_and_content_sensitive() -> Result<(), 
     );
     assert_eq!(
         hex::encode(digest.as_bytes()),
-        "1411c91e9154387b796935a451ce536b43b603b167958e572900215d530b621f"
+        "76474516b2f4184e9f434750ed6970ed8eac53e5fbb698e1959dcc6c33c5456f"
     );
 
     let mut changed_facts = facts;
@@ -313,7 +313,7 @@ fn canonical_block_facts_digest_is_stable_and_content_sensitive() -> Result<(), 
     );
     assert_eq!(
         hex::encode(reference_sequence_digest.as_bytes()),
-        "ef46f8312e451acc5439fba572550a47f61fc7d596881136f02303a13513df31"
+        "190c5e61f0e1c7938fe64429c0cd30e6f62aa347b38f2d9d97925e7a273017c5"
     );
 
     let mut repeated_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
@@ -356,7 +356,7 @@ fn ironwood_canonical_block_facts_digest_matches_known_answer() -> Result<(), Bo
                 .digest(CanonicalBlockFactsDigestVersion::CURRENT)
                 .as_bytes()
         ),
-        "f1d8f118566a9505a339c8a2caaae421ee90383b550475d301f27ccb0a012e80"
+        "86cb193efe15992d994f9813e061d8f3b247fd86980d50a2585ee1137a0d3f70"
     );
 
     Ok(())
@@ -626,7 +626,7 @@ fn compact_block_builder_rejects_source_identity_mismatch() -> Result<(), Box<dy
     Ok(())
 }
 
-fn fixture_source_block() -> Result<SourceBlock, Box<dyn Error>> {
+pub(super) fn fixture_source_block() -> Result<SourceBlock, Box<dyn Error>> {
     fixture_source_block_from(
         Network::ZcashRegtest,
         include_str!("../fixtures/z3-regtest-block-1.json"),

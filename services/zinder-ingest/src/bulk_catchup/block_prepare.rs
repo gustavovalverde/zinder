@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     mem::size_of,
     num::{NonZeroU32, NonZeroU64},
@@ -25,16 +25,18 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{PrimaryChainStore, StoreReadCaller};
 
-use super::abort_on_drop::AbortOnDropTask;
-use super::source_fetch::{
-    BulkCatchupSourceFetchStreamConfig, SourceSegmentSizer, build_source_block_stream,
-};
-use super::watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer};
 use super::{
     BULK_STAGE_CANONICAL_BLOCK_PREPARE, BULK_STAGE_CANONICAL_PREVOUT_RESOLVE, IngestError,
     record_bulk_pipeline_stage_duration, usize_to_u32_saturating, usize_to_u64_saturating,
 };
 use crate::artifact_builder::{PreparedCanonicalBlock, current_schema_transparent_outputs};
+use crate::canonical_construction::{
+    abort_on_drop::AbortOnDropTask,
+    source_fetch::{
+        CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
+    },
+    watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer},
+};
 use crate::chain_ingest::{
     prefetched_spent_transparent_output_bytes, record_ingest_block_prepare_outcome,
 };
@@ -96,8 +98,9 @@ where
         store,
     } = config;
     let block_prepare_concurrency = block_prepare_concurrency.max(1);
-    let source_fetch_config = BulkCatchupSourceFetchStreamConfig {
+    let source_fetch_config = CanonicalSourceFetchConfig {
         request_timeout,
+        history_predecessor: None,
         from_height,
         to_height,
         max_response_bytes,
@@ -111,7 +114,7 @@ where
         in_flight_block_prepares: FuturesUnordered::new(),
         completed_block_prepares: BTreeMap::new(),
         completed_block_prepare_resident_bytes: 0,
-        pending_source_blocks: VecDeque::new(),
+        pending_source_chunk: None,
         prepare_fn,
         store,
         block_prepare_concurrency,
@@ -152,12 +155,12 @@ enum PendingBlockPrepareSchedule {
 }
 
 struct BlockPrepareStreamState<'a, F> {
-    source_blocks: BoxStream<'a, Result<Vec<SourceBlock>, IngestError>>,
+    source_blocks: BoxStream<'a, Result<SourceBlockChunk, IngestError>>,
     in_flight_block_prepares:
         FuturesUnordered<BoxFuture<'static, Result<PreparedBlock, IngestError>>>,
     completed_block_prepares: BTreeMap<BlockHeight, QueuedPreparedBlock>,
     completed_block_prepare_resident_bytes: u64,
-    pending_source_blocks: VecDeque<SourceBlock>,
+    pending_source_chunk: Option<SourceBlockChunk>,
     prepare_fn: F,
     store: PrimaryChainStore,
     block_prepare_concurrency: usize,
@@ -235,7 +238,7 @@ where
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(coalesce_deadline)), if state.prevout_coalesce_deadline.is_some() => {}
             source_chunk_result = state.source_blocks.next(), if can_schedule_block_prepare => {
                 match source_chunk_result {
-                    Some(Ok(source_chunk)) => state.pending_source_blocks.extend(source_chunk),
+                    Some(Ok(source_chunk)) => state.pending_source_chunk = Some(source_chunk),
                     Some(Err(error)) => return Some(Err(error)),
                     None => state.source_exhausted = true,
                 }
@@ -264,13 +267,28 @@ where
     if state.in_flight_block_prepares.len() >= state.block_prepare_concurrency {
         return PendingBlockPrepareSchedule::Idle;
     }
-    let Some(source_block) = state.pending_source_blocks.pop_front() else {
+    let Some(source_block) = state
+        .pending_source_chunk
+        .as_mut()
+        .and_then(SourceBlockChunk::pop_front)
+    else {
         return PendingBlockPrepareSchedule::Idle;
     };
     match schedule_block_prepare(state, source_block) {
-        Ok(()) => PendingBlockPrepareSchedule::Scheduled,
+        Ok(()) => {
+            if state
+                .pending_source_chunk
+                .as_ref()
+                .is_some_and(SourceBlockChunk::is_empty)
+            {
+                state.pending_source_chunk = None;
+            }
+            PendingBlockPrepareSchedule::Scheduled
+        }
         Err(source_block) => {
-            state.pending_source_blocks.push_front(source_block);
+            if let Some(source_chunk) = state.pending_source_chunk.as_mut() {
+                source_chunk.push_front(source_block);
+            }
             PendingBlockPrepareSchedule::WatermarkBlocked
         }
     }
@@ -339,7 +357,7 @@ impl<F> BlockPrepareStreamState<'_, F> {
 
     fn can_schedule_block_prepare(&self) -> bool {
         !self.source_exhausted
-            && self.pending_source_blocks.is_empty()
+            && self.pending_source_chunk.is_none()
             && self.in_flight_block_prepares.len() < self.block_prepare_concurrency
             && self.completed_block_prepares.len() < self.block_prepare_concurrency
     }
@@ -963,7 +981,7 @@ fn vector_allocation_bytes<T>(capacity: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashSet},
         error::Error,
         num::NonZeroU64,
         sync::Arc,
@@ -1140,7 +1158,7 @@ mod tests {
             in_flight_block_prepares: FuturesUnordered::new(),
             completed_block_prepares: BTreeMap::default(),
             completed_block_prepare_resident_bytes: 0,
-            pending_source_blocks: VecDeque::default(),
+            pending_source_chunk: None,
             prepare_fn,
             store,
             block_prepare_concurrency: 1,

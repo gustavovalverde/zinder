@@ -7,10 +7,8 @@ use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, PrimaryChainStore, ReorgWindowChange,
 };
 
-use super::abort_on_drop::AbortOnDropTask;
 use super::block_prepare::CanonicalBlockCommitPreparation;
 use super::flush::flush_pending_bulk_catchup_writes;
-use super::watermark::{record_queue_depth, record_reorder_buffer};
 use super::{
     BULK_STAGE_CANONICAL_BLOCK_PREPARE, BULK_STAGE_CANONICAL_COMMIT, BULK_STAGE_CANONICAL_POSITION,
     BULK_STAGE_CHECKPOINT_TREE_STATE, BULK_STAGE_COMMIT_REASSEMBLY,
@@ -19,6 +17,10 @@ use super::{
     record_bulk_pipeline_stage_duration, usize_to_u64_saturating,
 };
 use crate::artifact_builder::{CommitmentTreeSizes, position_canonical_block};
+use crate::canonical_construction::{
+    abort_on_drop::AbortOnDropTask,
+    watermark::{record_queue_depth, record_reorder_buffer},
+};
 use crate::chain_ingest::{
     CanonicalBatch, CanonicalBatchBudget, CanonicalBatchCloseTrigger, CanonicalBatchCost,
     IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
