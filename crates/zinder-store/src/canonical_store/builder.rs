@@ -139,10 +139,10 @@ impl RocksDbCanonicalBuilder {
             },
             blocks,
         )?;
-        validate_block_load_range(self.build_plan, prepared.evidence)?;
+        validate_block_load_range(self.build_plan, &prepared.evidence)?;
         let evidence = ingest_canonical_block_ssts(&self.bounded_open.db, prepared)?;
         let persisted_replays = validate_persisted_block_replays(&self.bounded_open.db)?;
-        if !persisted_replays.has_same_sequence(evidence) {
+        if !persisted_replays.has_same_sequence(&evidence) {
             return Err(CanonicalStoreError::BlockLoadReadbackMismatch.into());
         }
         staging.remove()?;
@@ -159,7 +159,7 @@ impl RocksDbCanonicalBuilder {
 
 fn validate_block_load_range(
     build_plan: CanonicalStoreBuildPlan,
-    evidence: CanonicalBlockLoadEvidence,
+    evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
     let expected_first_height = build_plan.history_bounds().first_available_height();
     if evidence.first_height != expected_first_height {
@@ -242,8 +242,11 @@ mod tests {
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
         CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
-        CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds, ChainTipMetadata,
-        CompactBlockArtifact, SerializedBytesDigest, encode_canonical_block_replay,
+        CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds, CanonicalTransactionFacts,
+        ChainTipMetadata, CompactBlockArtifact, LockTime, PrivacyShape, SerializedBytesDigest,
+        TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
+        TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
+        TransactionVersion, UnsupportedSection, encode_canonical_block_replay,
     };
 
     use super::*;
@@ -293,6 +296,66 @@ mod tests {
         assert_eq!(evidence.transaction_blob_count, 0);
         assert_eq!(evidence.block_blob_count, 0);
         assert_eq!(evidence.tip_metadata, ChainTipMetadata::new(2, 4, 6));
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_load_blocks_reports_exact_per_family_logical_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            Network::ZcashTestnet,
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+        )?;
+        let mut store = RocksDbCanonicalBuilder::create_fresh(
+            &store_path,
+            CanonicalStoreWorkload::Explorer,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let block = canonical_build_block_with_raw_blobs(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        let expected_block_replay_logical_bytes =
+            4_u64 + u64::try_from(block.replay_envelope.as_bytes().len())?;
+        let expected_compact_block_logical_bytes =
+            4_u64 + u64::try_from(block.compact_block.payload_bytes.len())?;
+
+        let evidence = store.bulk_load_blocks(vec![Ok::<_, std::io::Error>(block)])?;
+
+        assert_eq!(evidence.block_header_logical_bytes, 4 + 184);
+        assert_eq!(evidence.block_hash_index_logical_bytes, 32 + 4);
+        assert_eq!(
+            evidence.block_replay_logical_bytes,
+            expected_block_replay_logical_bytes
+        );
+        assert_eq!(
+            evidence.compact_block_logical_bytes,
+            expected_compact_block_logical_bytes
+        );
+        assert_eq!(evidence.transaction_location_logical_bytes, 32 + 40);
+        assert_eq!(evidence.transaction_blob_logical_bytes, 8 + 5);
+        assert_eq!(evidence.block_blob_logical_bytes, 4 + 3);
+        let checked_family_logical_bytes = [
+            evidence.block_header_logical_bytes,
+            evidence.block_hash_index_logical_bytes,
+            evidence.block_replay_logical_bytes,
+            evidence.compact_block_logical_bytes,
+            evidence.transaction_location_logical_bytes,
+            evidence.transaction_blob_logical_bytes,
+            evidence.block_blob_logical_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, u64::checked_add)
+        .ok_or("family logical byte sum must fit in u64")?;
+        assert_eq!(evidence.logical_bytes, checked_family_logical_bytes);
+        assert_eq!(evidence.transaction_count, 1);
+        assert_eq!(evidence.transaction_location_count, 1);
+        assert_eq!(evidence.transaction_blob_count, 1);
+        assert_eq!(evidence.block_blob_count, 1);
         Ok(())
     }
 
@@ -612,5 +675,67 @@ mod tests {
             block_blob: None,
             facts,
         }
+    }
+
+    fn canonical_build_block_with_raw_blobs(
+        height: BlockHeight,
+        block_hash: [u8; 32],
+        parent_hash: [u8; 32],
+    ) -> crate::CanonicalBuildBlock {
+        let mut block = canonical_build_block(height, block_hash, parent_hash);
+        let raw_transaction_bytes = vec![1, 2, 3, 4, 5];
+        let raw_block_bytes = vec![6, 7, 8];
+        let transaction_id = TransactionId::from_bytes([9; 32]);
+        block.facts.transactions.push(CanonicalTransactionFacts {
+            public_facts: TransactionPublicFacts {
+                transaction_id,
+                auth_digest: None,
+                wtxid: None,
+                version: TransactionVersion::Unsupported {
+                    effective_version: 0,
+                    version_group_id: None,
+                },
+                consensus_branch_id: None,
+                lock_time: LockTime::Unlocked,
+                expiry_height: None,
+                size_bytes: u32::try_from(raw_transaction_bytes.len()).unwrap_or(u32::MAX),
+                counts: TransactionComponentCounts::EMPTY,
+                orchard_value_balance_zat: None,
+                orchard_anchor: None,
+                ironwood_value_balance_zat: None,
+                privacy_shape: PrivacyShape::Unclassified,
+                is_coinbase: false,
+                unsupported_sections: vec![UnsupportedSection::FutureVersionHeader],
+            },
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
+                &raw_transaction_bytes,
+            ),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: Vec::new(),
+        });
+        block.facts.serialized_bytes_digest =
+            SerializedBytesDigest::from_serialized_bytes(&raw_block_bytes);
+        block.transaction_blobs.push(TransactionBlobArtifact::new(
+            TransactionLocation::new(
+                transaction_id,
+                height,
+                block.facts.block_header.block_hash,
+                0,
+            ),
+            raw_transaction_bytes,
+        ));
+        block.block_blob = Some(zinder_core::BlockBlobArtifact::new(
+            height,
+            block.facts.block_header.block_hash,
+            block.facts.block_header.parent_hash,
+            raw_block_bytes,
+        ));
+        block.replay_envelope = encode_canonical_block_replay(
+            &block.facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        );
+        block
     }
 }

@@ -95,6 +95,20 @@ pub struct CanonicalBlockLoadEvidence {
     pub transaction_blob_count: u64,
     /// Number of height-addressed raw block rows.
     pub block_blob_count: u64,
+    /// Header-family key and value bytes submitted to the SST writers.
+    pub block_header_logical_bytes: u64,
+    /// Block-hash-index key and value bytes submitted to the SST writers.
+    pub block_hash_index_logical_bytes: u64,
+    /// Replay-family key and value bytes submitted to the SST writers.
+    pub block_replay_logical_bytes: u64,
+    /// Compact-block key and value bytes submitted to the SST writers.
+    pub compact_block_logical_bytes: u64,
+    /// Transaction-location key and value bytes submitted to the SST writers.
+    pub transaction_location_logical_bytes: u64,
+    /// Transaction-blob key and value bytes submitted to the SST writers.
+    pub transaction_blob_logical_bytes: u64,
+    /// Block-blob key and value bytes submitted to the SST writers.
+    pub block_blob_logical_bytes: u64,
     /// Total key and value bytes submitted to the SST writers.
     pub logical_bytes: u64,
     /// Physical bytes occupied by every staged SST.
@@ -291,7 +305,7 @@ fn prepare_canonical_block_load(
 
     Ok(PreparedCanonicalBlockLoad {
         families,
-        evidence: sequence.finish(sst_file_bytes, sst_file_count),
+        evidence: sequence.finish(sst_file_bytes, sst_file_count)?,
     })
 }
 
@@ -570,7 +584,7 @@ struct BlockSequence {
     block_count: u64,
     transaction_count: u64,
     block_blob_count: u64,
-    logical_bytes: u64,
+    family_logical_bytes: BlockFamilyLogicalBytes,
     sequence_digest: CanonicalBlockFactsSequenceDigestBuilder,
 }
 
@@ -582,8 +596,19 @@ struct BlockSequenceRow {
     tip_metadata: ChainTipMetadata,
     transaction_count: u64,
     has_block_blob: bool,
-    logical_bytes: u64,
+    family_logical_bytes: BlockFamilyLogicalBytes,
     facts_digest: zinder_core::CanonicalBlockFactsDigest,
+}
+
+#[derive(Clone, Copy)]
+struct BlockFamilyLogicalBytes {
+    block_header: u64,
+    block_hash_index: u64,
+    block_replay: u64,
+    compact_block: u64,
+    transaction_location: u64,
+    transaction_blob: u64,
+    block_blob: u64,
 }
 
 impl BlockSequenceRow {
@@ -591,24 +616,20 @@ impl BlockSequenceRow {
         let transaction_count = u64::try_from(block.facts.transactions.len()).map_err(|_| {
             CanonicalStoreError::block_load_sequence("transaction count exceeds u64::MAX")
         })?;
-        let mut logical_bytes = checked_row_bytes(4, BLOCK_HEADER_VALUE_LEN)?;
-        logical_bytes = checked_add_row_bytes(logical_bytes, 32, 4)?;
-        logical_bytes =
-            checked_add_row_bytes(logical_bytes, 4, block.replay_envelope.as_bytes().len())?;
-        logical_bytes =
-            checked_add_row_bytes(logical_bytes, 4, block.compact_block.payload_bytes.len())?;
+        let mut transaction_location_logical_bytes = 0;
+        let mut transaction_blob_logical_bytes = 0;
         for transaction_blob in &block.transaction_blobs {
-            logical_bytes = checked_add_row_bytes(
-                logical_bytes,
+            transaction_blob_logical_bytes = checked_add_row_bytes(
+                transaction_blob_logical_bytes,
                 8,
                 transaction_blob.raw_transaction_bytes.len(),
             )?;
-            logical_bytes = checked_add_row_bytes(logical_bytes, 32, 40)?;
+            transaction_location_logical_bytes =
+                checked_add_row_bytes(transaction_location_logical_bytes, 32, 40)?;
         }
-        if let Some(block_blob) = &block.block_blob {
-            logical_bytes =
-                checked_add_row_bytes(logical_bytes, 4, block_blob.raw_block_bytes.len())?;
-        }
+        let block_blob_logical_bytes = block.block_blob.as_ref().map_or(Ok(0), |block_blob| {
+            checked_row_bytes(4, block_blob.raw_block_bytes.len())
+        })?;
         Ok(Self {
             height: block.facts.block_header.height,
             block_hash: block.facts.block_header.block_hash,
@@ -616,9 +637,54 @@ impl BlockSequenceRow {
             tip_metadata: block.tip_metadata,
             transaction_count,
             has_block_blob: block.block_blob.is_some(),
-            logical_bytes,
+            family_logical_bytes: BlockFamilyLogicalBytes {
+                block_header: checked_row_bytes(4, BLOCK_HEADER_VALUE_LEN)?,
+                block_hash_index: checked_row_bytes(32, 4)?,
+                block_replay: checked_row_bytes(4, block.replay_envelope.as_bytes().len())?,
+                compact_block: checked_row_bytes(4, block.compact_block.payload_bytes.len())?,
+                transaction_location: transaction_location_logical_bytes,
+                transaction_blob: transaction_blob_logical_bytes,
+                block_blob: block_blob_logical_bytes,
+            },
             facts_digest: block.facts.digest(CanonicalBlockFactsDigestVersion::V1),
         })
+    }
+}
+
+impl BlockFamilyLogicalBytes {
+    fn checked_add(self, row: Self) -> Result<Self, CanonicalStoreError> {
+        Ok(Self {
+            block_header: checked_add_logical_bytes(self.block_header, row.block_header)?,
+            block_hash_index: checked_add_logical_bytes(
+                self.block_hash_index,
+                row.block_hash_index,
+            )?,
+            block_replay: checked_add_logical_bytes(self.block_replay, row.block_replay)?,
+            compact_block: checked_add_logical_bytes(self.compact_block, row.compact_block)?,
+            transaction_location: checked_add_logical_bytes(
+                self.transaction_location,
+                row.transaction_location,
+            )?,
+            transaction_blob: checked_add_logical_bytes(
+                self.transaction_blob,
+                row.transaction_blob,
+            )?,
+            block_blob: checked_add_logical_bytes(self.block_blob, row.block_blob)?,
+        })
+    }
+
+    fn checked_sum(self) -> Result<u64, CanonicalStoreError> {
+        [
+            self.block_header,
+            self.block_hash_index,
+            self.block_replay,
+            self.compact_block,
+            self.transaction_location,
+            self.transaction_blob,
+            self.block_blob,
+        ]
+        .into_iter()
+        .try_fold(0_u64, checked_add_logical_bytes)
     }
 }
 
@@ -640,7 +706,7 @@ impl BlockSequence {
             block_count: 1,
             transaction_count: row.transaction_count,
             block_blob_count: u64::from(row.has_block_blob),
-            logical_bytes: row.logical_bytes,
+            family_logical_bytes: row.family_logical_bytes,
             sequence_digest,
         })
     }
@@ -686,12 +752,9 @@ impl BlockSequence {
             .ok_or_else(|| {
                 CanonicalStoreError::block_load_sequence("block blob count exceeds u64::MAX")
             })?;
-        self.logical_bytes = self
-            .logical_bytes
-            .checked_add(row.logical_bytes)
-            .ok_or_else(|| {
-                CanonicalStoreError::block_load_sequence("logical byte count exceeds u64::MAX")
-            })?;
+        self.family_logical_bytes = self
+            .family_logical_bytes
+            .checked_add(row.family_logical_bytes)?;
         self.sequence_digest
             .try_append(row.facts_digest)
             .map_err(|_| {
@@ -703,8 +766,14 @@ impl BlockSequence {
         Ok(())
     }
 
-    fn finish(self, sst_file_bytes: u64, sst_file_count: u64) -> CanonicalBlockLoadEvidence {
-        CanonicalBlockLoadEvidence {
+    fn finish(
+        self,
+        sst_file_bytes: u64,
+        sst_file_count: u64,
+    ) -> Result<CanonicalBlockLoadEvidence, CanonicalStoreError> {
+        let family_logical_bytes = self.family_logical_bytes;
+        let logical_bytes = family_logical_bytes.checked_sum()?;
+        Ok(CanonicalBlockLoadEvidence {
             first_height: self.first_height,
             first_parent_hash: self.first_parent_hash,
             first_hash: self.first_hash,
@@ -720,14 +789,21 @@ impl BlockSequence {
             transaction_location_count: self.transaction_count,
             transaction_blob_count: self.transaction_count,
             block_blob_count: self.block_blob_count,
-            logical_bytes: self.logical_bytes,
+            block_header_logical_bytes: family_logical_bytes.block_header,
+            block_hash_index_logical_bytes: family_logical_bytes.block_hash_index,
+            block_replay_logical_bytes: family_logical_bytes.block_replay,
+            compact_block_logical_bytes: family_logical_bytes.compact_block,
+            transaction_location_logical_bytes: family_logical_bytes.transaction_location,
+            transaction_blob_logical_bytes: family_logical_bytes.transaction_blob,
+            block_blob_logical_bytes: family_logical_bytes.block_blob,
+            logical_bytes,
             sst_file_bytes,
             sst_file_count,
             replay_format_version: CanonicalBlockReplayFormatVersion::V1,
             block_digest_version: CanonicalBlockFactsDigestVersion::V1,
             sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
             sequence_digest: self.sequence_digest.finish(),
-        }
+        })
     }
 }
 
@@ -761,5 +837,11 @@ fn checked_add_row_bytes(
 fn checked_add_sst_bytes(total: u64, file_bytes: u64) -> Result<u64, CanonicalStoreError> {
     total.checked_add(file_bytes).ok_or_else(|| {
         CanonicalStoreError::block_load_sequence("physical SST byte count exceeds u64::MAX")
+    })
+}
+
+fn checked_add_logical_bytes(total: u64, bytes: u64) -> Result<u64, CanonicalStoreError> {
+    total.checked_add(bytes).ok_or_else(|| {
+        CanonicalStoreError::block_load_sequence("logical byte count exceeds u64::MAX")
     })
 }

@@ -95,7 +95,7 @@ pub(super) fn validate_persisted_block_replays(
 }
 
 impl PersistedBlockReplayEvidence {
-    pub(super) fn has_same_sequence(self, prepared: CanonicalBlockLoadEvidence) -> bool {
+    pub(super) fn has_same_sequence(self, prepared: &CanonicalBlockLoadEvidence) -> bool {
         let replay_counts_match = self.block_count == prepared.block_count
             && prepared.block_count == prepared.block_replay_count;
         self.first_height == prepared.first_height
