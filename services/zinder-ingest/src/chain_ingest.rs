@@ -54,19 +54,6 @@ pub const DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES: u64 = 536_870_912;
 /// Default minimum batch size before estimated write bytes can close a bulk-catchup batch.
 pub const DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE: u32 = 100;
 
-/// Stride between consecutive tree-state checkpoints written by the ingest
-/// pipeline.
-///
-/// Wallet implementations (notably `zcash_client_backend`) cap their rewind
-/// window at roughly 100 blocks behind `fully_scanned_height`; if the
-/// nearest checkpoint at-or-below that window is older than the cap, the
-/// wallet cannot recover from a stall without a manual reset. An ingest
-/// batch can span thousands of blocks (bulk catchup) or tens of blocks
-/// (tip-follow during chain catchup), so a single end-of-batch checkpoint
-/// leaves arbitrary gaps. Emitting one checkpoint every 100 heights in
-/// both ingest phases guarantees the wallet can always find an anchor
-/// inside its rewind window regardless of where in a batch it landed.
-pub(crate) const TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
 const ESTIMATED_BLOCK_WRITE_BYTES: usize = 512;
 const ESTIMATED_BLOCK_TRANSACTION_INDEX_WRITE_BYTES: usize = 96;
 const ESTIMATED_TRANSACTION_LOCATION_WRITE_BYTES: usize = 96;

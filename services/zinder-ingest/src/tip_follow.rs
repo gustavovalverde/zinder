@@ -951,7 +951,7 @@ async fn populate_tip_follow_tree_state_artifacts<Source>(
         .block_headers
         .iter()
         .filter(|header| {
-            header.height.value() % crate::chain_ingest::TREE_STATE_CHECKPOINT_STRIDE == 0
+            header.height.value() % zinder_store::TREE_STATE_CHECKPOINT_STRIDE == 0
                 && !existing_heights.contains(&header.height)
         })
         .map(|header| header.height)

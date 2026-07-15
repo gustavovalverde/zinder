@@ -46,7 +46,7 @@ pub use canonical_store::{
     CanonicalBuildBlock, CanonicalStoreBuildError, CanonicalStoreBuildPlan,
     CanonicalStoreBuildPlanError, CanonicalStoreBuildState, CanonicalStoreError,
     CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore,
+    RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
 };
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;

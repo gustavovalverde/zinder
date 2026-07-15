@@ -114,6 +114,8 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
         evidence.transaction_location_count
     );
     assert_eq!(evidence.block_blob_count, 0);
+    assert_eq!(evidence.tree_state_checkpoint_count, 2);
+    assert_eq!(evidence.block_final_note_commitment_roots_count, 0);
     assert_eq!(evidence.tip_metadata, expected_tip_metadata);
     drop(builder);
 
@@ -146,6 +148,8 @@ async fn explorer_canonical_blocks_add_block_blob_retention()
 
     assert_eq!(outcome.evidence.block_count, 1);
     assert_eq!(outcome.evidence.block_blob_count, 1);
+    assert_eq!(outcome.evidence.tree_state_checkpoint_count, 2);
+    assert_eq!(outcome.evidence.block_final_note_commitment_roots_count, 1);
     assert!(outcome.evidence.transaction_location_count > 0);
     assert_eq!(
         outcome.evidence.transaction_blob_count,
@@ -261,6 +265,8 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
     assert_eq!(outcome.evidence.block_header_count, 1);
     assert_eq!(outcome.evidence.block_replay_count, 1);
     assert_eq!(outcome.evidence.compact_block_count, 1);
+    assert_eq!(outcome.evidence.tree_state_checkpoint_count, 2);
+    assert_eq!(outcome.evidence.block_final_note_commitment_roots_count, 0);
     assert_eq!(
         outcome.evidence.transaction_location_count,
         outcome.evidence.transaction_blob_count

@@ -27,8 +27,9 @@ pub(super) const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
 const DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY: &str = "daily_value_pool_balance";
 pub(super) const TRANSACTION_LOCATION_COLUMN_FAMILY: &str = "transaction_location";
 pub(super) const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
-const TREE_STATE_CHECKPOINT_COLUMN_FAMILY: &str = "tree_state_checkpoint";
-const BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str = "block_final_note_commitment_roots";
+pub(super) const TREE_STATE_CHECKPOINT_COLUMN_FAMILY: &str = "tree_state_checkpoint";
+pub(super) const BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str =
+    "block_final_note_commitment_roots";
 const SUBTREE_ROOT_COLUMN_FAMILY: &str = "subtree_root";
 const CHAIN_EPOCH_COLUMN_FAMILY: &str = "chain_epoch";
 const CHAIN_EVENT_COLUMN_FAMILY: &str = "chain_event";

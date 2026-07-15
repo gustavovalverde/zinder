@@ -1,11 +1,75 @@
 use zinder_core::{
-    BlockHash, BlockHeaderArtifact, BlockHeight, TransactionLocation,
-    wire::encode_height_key_ascending,
+    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
+    CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
+    FinalNoteCommitmentRoot, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, ShieldedProtocol,
+    TransactionLocation, wire::encode_height_key_ascending,
 };
+
+use thiserror::Error;
 
 pub(super) const BLOCK_HEADER_VALUE_LEN: usize = 184;
 pub(super) const BLOCK_HASH_INDEX_RECORD_LEN: usize = 36;
 pub(super) const TRANSACTION_LOCATION_RECORD_LEN: usize = 72;
+
+const SAPLING_PRESENCE_BIT: u8 = 1 << 0;
+const ORCHARD_PRESENCE_BIT: u8 = 1 << 1;
+const IRONWOOD_PRESENCE_BIT: u8 = 1 << 2;
+const SHIELDED_PROTOCOL_PRESENCE_MASK: u8 =
+    SAPLING_PRESENCE_BIT | ORCHARD_PRESENCE_BIT | IRONWOOD_PRESENCE_BIT;
+const TREE_STATE_CHECKPOINT_FIXED_VALUE_LEN: usize = 4 + 1;
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+/// Rejection reason for one malformed clean-v1 canonical-family value.
+pub(super) enum CanonicalFamilyValueDecodeError {
+    /// The value ended before one fixed or length-delimited field was complete.
+    #[error(
+        "{family} value ended while decoding {field}: required {required_bytes} bytes, found {remaining_bytes}"
+    )]
+    Truncated {
+        /// Canonical column family being decoded.
+        family: &'static str,
+        /// Field that could not be read completely.
+        field: &'static str,
+        /// Bytes required for the field.
+        required_bytes: usize,
+        /// Bytes still available in the value.
+        remaining_bytes: usize,
+    },
+    /// Reserved bits were set in the shielded-pool presence bitmap.
+    #[error("{family} value has unknown shielded-pool presence bits {presence_bitmap:#010b}")]
+    UnknownPresenceBits {
+        /// Canonical column family being decoded.
+        family: &'static str,
+        /// Invalid presence bitmap.
+        presence_bitmap: u8,
+    },
+    /// A frontier length exceeded the v1 domain admission bound.
+    #[error(
+        "tree_state_checkpoint {protocol:?} frontier is {encoded_bytes} bytes; maximum is {MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES}"
+    )]
+    FrontierTooLarge {
+        /// Shielded pool whose frontier was rejected.
+        protocol: ShieldedProtocol,
+        /// Frontier length declared by the encoded value.
+        encoded_bytes: usize,
+    },
+    /// The official Zcash codec rejected a frontier or its claimed root.
+    #[error("tree_state_checkpoint {protocol:?} frontier is invalid: {source}")]
+    InvalidFrontier {
+        /// Shielded pool whose frontier was rejected.
+        protocol: ShieldedProtocol,
+        #[source]
+        source: CommitmentTreeFrontierValidationError,
+    },
+    /// Bytes remained after every field selected by the presence bitmap.
+    #[error("{family} value has {trailing_bytes} trailing bytes")]
+    TrailingBytes {
+        /// Canonical column family being decoded.
+        family: &'static str,
+        /// Bytes remaining after the exact value layout.
+        trailing_bytes: usize,
+    },
+}
 
 pub(super) fn encode_block_header(header: &BlockHeaderArtifact) -> [u8; BLOCK_HEADER_VALUE_LEN] {
     let mut encoded_header = [0_u8; BLOCK_HEADER_VALUE_LEN];
@@ -48,9 +112,254 @@ pub(super) fn encode_transaction_location(location: TransactionLocation) -> [u8;
     row
 }
 
+/// Encodes one v1 tree-state checkpoint value without key-owned block identity.
+pub(super) fn encode_tree_state_checkpoint(
+    block_time_seconds: u32,
+    frontiers: &CommitmentTreeFrontiers,
+) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(
+        TREE_STATE_CHECKPOINT_FIXED_VALUE_LEN + encoded_frontiers_len(frontiers),
+    );
+    encoded.extend_from_slice(&block_time_seconds.to_le_bytes());
+    encoded.push(frontier_presence_bitmap(frontiers));
+    for protocol in shielded_protocols() {
+        let Some(frontier) = frontiers.get(protocol) else {
+            continue;
+        };
+        encoded.extend_from_slice(&frontier.final_root().as_bytes());
+        let final_state_len = u16::try_from(frontier.final_state_bytes().len()).unwrap_or(u16::MAX);
+        encoded.extend_from_slice(&final_state_len.to_le_bytes());
+        encoded.extend_from_slice(frontier.final_state_bytes());
+    }
+    encoded
+}
+
+/// Decodes and revalidates one exact v1 tree-state checkpoint value.
+pub(super) fn decode_tree_state_checkpoint(
+    encoded: &[u8],
+) -> Result<(u32, CommitmentTreeFrontiers), CanonicalFamilyValueDecodeError> {
+    let mut decoder = ValueDecoder::new("tree_state_checkpoint", encoded);
+    let block_time_seconds = decoder.read_u32("block time")?;
+    let presence_bitmap = decoder.read_presence_bitmap()?;
+    let sapling = decode_frontier(&mut decoder, presence_bitmap, ShieldedProtocol::Sapling)?;
+    let orchard = decode_frontier(&mut decoder, presence_bitmap, ShieldedProtocol::Orchard)?;
+    let ironwood = decode_frontier(&mut decoder, presence_bitmap, ShieldedProtocol::Ironwood)?;
+    decoder.reject_trailing_bytes()?;
+    Ok((
+        block_time_seconds,
+        CommitmentTreeFrontiers::from_validated_parts(sapling, orchard, ironwood),
+    ))
+}
+
+/// Encodes one v1 block-root value without key/header-owned block identity.
+pub(super) fn encode_block_final_note_commitment_roots(
+    roots: &BlockFinalNoteCommitmentRoots,
+) -> Vec<u8> {
+    let presence_bitmap = optional_root_presence_bitmap(roots);
+    let mut encoded = Vec::with_capacity(1 + 3 * 32);
+    encoded.push(presence_bitmap);
+    for root in [roots.sapling, roots.orchard, roots.ironwood]
+        .into_iter()
+        .flatten()
+    {
+        encoded.extend_from_slice(&root.as_bytes());
+    }
+    encoded
+}
+
+/// Decodes one exact v1 block-root value and restores key/header-owned identity.
+pub(super) fn decode_block_final_note_commitment_roots(
+    height: BlockHeight,
+    block_hash: BlockHash,
+    encoded: &[u8],
+) -> Result<BlockFinalNoteCommitmentRoots, CanonicalFamilyValueDecodeError> {
+    let mut decoder = ValueDecoder::new("block_final_note_commitment_roots", encoded);
+    let presence_bitmap = decoder.read_presence_bitmap()?;
+    let sapling = decoder.read_optional_root(presence_bitmap, ShieldedProtocol::Sapling)?;
+    let orchard = decoder.read_optional_root(presence_bitmap, ShieldedProtocol::Orchard)?;
+    let ironwood = decoder.read_optional_root(presence_bitmap, ShieldedProtocol::Ironwood)?;
+    decoder.reject_trailing_bytes()?;
+    Ok(BlockFinalNoteCommitmentRoots::new(
+        height, block_hash, sapling, orchard, ironwood,
+    ))
+}
+
+fn encoded_frontiers_len(frontiers: &CommitmentTreeFrontiers) -> usize {
+    shielded_protocols()
+        .into_iter()
+        .filter_map(|protocol| frontiers.get(protocol))
+        .map(|frontier| 32 + 2 + frontier.final_state_bytes().len())
+        .sum()
+}
+
+fn frontier_presence_bitmap(frontiers: &CommitmentTreeFrontiers) -> u8 {
+    shielded_protocols()
+        .into_iter()
+        .filter(|protocol| frontiers.get(*protocol).is_some())
+        .fold(0, |bitmap, protocol| {
+            bitmap | protocol_presence_bit(protocol)
+        })
+}
+
+const fn optional_root_presence_bitmap(roots: &BlockFinalNoteCommitmentRoots) -> u8 {
+    let mut bitmap = 0;
+    if roots.sapling.is_some() {
+        bitmap |= SAPLING_PRESENCE_BIT;
+    }
+    if roots.orchard.is_some() {
+        bitmap |= ORCHARD_PRESENCE_BIT;
+    }
+    if roots.ironwood.is_some() {
+        bitmap |= IRONWOOD_PRESENCE_BIT;
+    }
+    bitmap
+}
+
+const fn protocol_presence_bit(protocol: ShieldedProtocol) -> u8 {
+    match protocol {
+        ShieldedProtocol::Sapling => SAPLING_PRESENCE_BIT,
+        ShieldedProtocol::Orchard => ORCHARD_PRESENCE_BIT,
+        ShieldedProtocol::Ironwood => IRONWOOD_PRESENCE_BIT,
+        // Every caller supplies one value from `shielded_protocols`; future
+        // protocols require an explicit v1 schema decision before admission.
+        _ => 0,
+    }
+}
+
+const fn shielded_protocols() -> [ShieldedProtocol; 3] {
+    [
+        ShieldedProtocol::Sapling,
+        ShieldedProtocol::Orchard,
+        ShieldedProtocol::Ironwood,
+    ]
+}
+
+fn decode_frontier(
+    decoder: &mut ValueDecoder<'_>,
+    presence_bitmap: u8,
+    protocol: ShieldedProtocol,
+) -> Result<Option<CommitmentTreeFrontier>, CanonicalFamilyValueDecodeError> {
+    if presence_bitmap & protocol_presence_bit(protocol) == 0 {
+        return Ok(None);
+    }
+    let final_root = FinalNoteCommitmentRoot::from_bytes(
+        decoder.read_array::<32>("commitment-tree frontier root")?,
+    );
+    let final_state_len = usize::from(decoder.read_u16("commitment-tree frontier length")?);
+    if final_state_len > MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES {
+        return Err(CanonicalFamilyValueDecodeError::FrontierTooLarge {
+            protocol,
+            encoded_bytes: final_state_len,
+        });
+    }
+    let final_state_bytes = decoder
+        .read_bytes(final_state_len, "commitment-tree frontier bytes")?
+        .to_vec();
+    CommitmentTreeFrontier::from_canonical_final_state(protocol, final_root, final_state_bytes)
+        .map(Some)
+        .map_err(|source| CanonicalFamilyValueDecodeError::InvalidFrontier { protocol, source })
+}
+
+struct ValueDecoder<'encoded> {
+    family: &'static str,
+    encoded: &'encoded [u8],
+    position: usize,
+}
+
+impl<'encoded> ValueDecoder<'encoded> {
+    const fn new(family: &'static str, encoded: &'encoded [u8]) -> Self {
+        Self {
+            family,
+            encoded,
+            position: 0,
+        }
+    }
+
+    fn read_presence_bitmap(&mut self) -> Result<u8, CanonicalFamilyValueDecodeError> {
+        let presence_bitmap = self.read_u8("shielded-pool presence bitmap")?;
+        if presence_bitmap & !SHIELDED_PROTOCOL_PRESENCE_MASK != 0 {
+            return Err(CanonicalFamilyValueDecodeError::UnknownPresenceBits {
+                family: self.family,
+                presence_bitmap,
+            });
+        }
+        Ok(presence_bitmap)
+    }
+
+    fn read_optional_root(
+        &mut self,
+        presence_bitmap: u8,
+        protocol: ShieldedProtocol,
+    ) -> Result<Option<FinalNoteCommitmentRoot>, CanonicalFamilyValueDecodeError> {
+        if presence_bitmap & protocol_presence_bit(protocol) == 0 {
+            return Ok(None);
+        }
+        Ok(Some(FinalNoteCommitmentRoot::from_bytes(
+            self.read_array::<32>("final note-commitment root")?,
+        )))
+    }
+
+    fn read_u8(&mut self, field: &'static str) -> Result<u8, CanonicalFamilyValueDecodeError> {
+        Ok(self.read_array::<1>(field)?[0])
+    }
+
+    fn read_u16(&mut self, field: &'static str) -> Result<u16, CanonicalFamilyValueDecodeError> {
+        Ok(u16::from_le_bytes(self.read_array(field)?))
+    }
+
+    fn read_u32(&mut self, field: &'static str) -> Result<u32, CanonicalFamilyValueDecodeError> {
+        Ok(u32::from_le_bytes(self.read_array(field)?))
+    }
+
+    fn read_array<const LENGTH: usize>(
+        &mut self,
+        field: &'static str,
+    ) -> Result<[u8; LENGTH], CanonicalFamilyValueDecodeError> {
+        let bytes = self.read_bytes(LENGTH, field)?;
+        let mut array = [0; LENGTH];
+        array.copy_from_slice(bytes);
+        Ok(array)
+    }
+
+    fn read_bytes(
+        &mut self,
+        byte_count: usize,
+        field: &'static str,
+    ) -> Result<&'encoded [u8], CanonicalFamilyValueDecodeError> {
+        let remaining_bytes = self.encoded.len().saturating_sub(self.position);
+        if remaining_bytes < byte_count {
+            return Err(CanonicalFamilyValueDecodeError::Truncated {
+                family: self.family,
+                field,
+                required_bytes: byte_count,
+                remaining_bytes,
+            });
+        }
+        let end = self.position + byte_count;
+        let bytes = &self.encoded[self.position..end];
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn reject_trailing_bytes(self) -> Result<(), CanonicalFamilyValueDecodeError> {
+        let trailing_bytes = self.encoded.len().saturating_sub(self.position);
+        if trailing_bytes != 0 {
+            return Err(CanonicalFamilyValueDecodeError::TrailingBytes {
+                family: self.family,
+                trailing_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use zinder_core::{BlockHash, BlockHeaderArtifact, BlockHeight};
+    use zinder_core::{
+        BlockHash, BlockHeaderArtifact, BlockHeight, CommitmentTreeFrontier,
+        CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
+        ShieldedProtocol,
+    };
 
     use super::*;
 
@@ -111,5 +420,137 @@ mod tests {
         assert_eq!(&encoded_location[32..36], &[1, 2, 3, 4]);
         assert_eq!(&encoded_location[36..68], &[7; 32]);
         assert_eq!(&encoded_location[68..], &[0x11, 0x12, 0x13, 0x14]);
+    }
+
+    #[test]
+    fn tree_state_checkpoint_v1_has_exact_known_bytes_and_round_trips() {
+        let sapling = CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling);
+        let orchard = CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard);
+        let frontiers = CommitmentTreeFrontiers::from_validated_parts(
+            Some(sapling.clone()),
+            Some(orchard.clone()),
+            None,
+        );
+
+        let encoded = encode_tree_state_checkpoint(0x0102_0304, &frontiers);
+        let mut expected = vec![4, 3, 2, 1, SAPLING_PRESENCE_BIT | ORCHARD_PRESENCE_BIT];
+        expected.extend_from_slice(&sapling.final_root().as_bytes());
+        expected.extend_from_slice(&[3, 0]);
+        expected.extend_from_slice(&[0, 0, 0]);
+        expected.extend_from_slice(&orchard.final_root().as_bytes());
+        expected.extend_from_slice(&[3, 0]);
+        expected.extend_from_slice(&[0, 0, 0]);
+
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            decode_tree_state_checkpoint(&encoded),
+            Ok((0x0102_0304, frontiers))
+        );
+        assert_eq!(
+            encode_tree_state_checkpoint(0x0102_0304, &CommitmentTreeFrontiers::default()),
+            [4, 3, 2, 1, 0]
+        );
+    }
+
+    #[test]
+    fn block_final_note_commitment_roots_v1_has_exact_known_bytes_and_round_trips() {
+        let height = BlockHeight::new(0x0102_0304);
+        let block_hash = BlockHash::from_bytes([9; 32]);
+        let roots = BlockFinalNoteCommitmentRoots::new(
+            height,
+            block_hash,
+            Some(FinalNoteCommitmentRoot::from_bytes([1; 32])),
+            None,
+            Some(FinalNoteCommitmentRoot::from_bytes([3; 32])),
+        );
+        let mut expected = vec![SAPLING_PRESENCE_BIT | IRONWOOD_PRESENCE_BIT];
+        expected.extend_from_slice(&[1; 32]);
+        expected.extend_from_slice(&[3; 32]);
+
+        let encoded = encode_block_final_note_commitment_roots(&roots);
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            decode_block_final_note_commitment_roots(height, block_hash, &encoded),
+            Ok(roots)
+        );
+    }
+
+    #[test]
+    fn tree_state_checkpoint_v1_rejects_non_exact_or_invalid_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            decode_tree_state_checkpoint(&[0, 0, 0]),
+            Err(CanonicalFamilyValueDecodeError::Truncated { .. })
+        ));
+        assert_eq!(
+            decode_tree_state_checkpoint(&[0, 0, 0, 0, 0x80]),
+            Err(CanonicalFamilyValueDecodeError::UnknownPresenceBits {
+                family: "tree_state_checkpoint",
+                presence_bitmap: 0x80,
+            })
+        );
+
+        let sapling = CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling);
+        let frontiers = CommitmentTreeFrontiers::from_validated_parts(Some(sapling), None, None);
+        let mut wrong_root = encode_tree_state_checkpoint(0, &frontiers);
+        wrong_root[5] ^= 0xff;
+        assert_eq!(
+            decode_tree_state_checkpoint(&wrong_root),
+            Err(CanonicalFamilyValueDecodeError::InvalidFrontier {
+                protocol: ShieldedProtocol::Sapling,
+                source: CommitmentTreeFrontierValidationError::RootMismatch,
+            })
+        );
+
+        let oversized_len = MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES + 1;
+        let mut oversized = vec![0, 0, 0, 0, SAPLING_PRESENCE_BIT];
+        oversized.extend_from_slice(&[0; 32]);
+        oversized.extend_from_slice(&u16::try_from(oversized_len)?.to_le_bytes());
+        assert_eq!(
+            decode_tree_state_checkpoint(&oversized),
+            Err(CanonicalFamilyValueDecodeError::FrontierTooLarge {
+                protocol: ShieldedProtocol::Sapling,
+                encoded_bytes: oversized_len,
+            })
+        );
+
+        let mut trailing = encode_tree_state_checkpoint(0, &CommitmentTreeFrontiers::default());
+        trailing.push(0);
+        assert_eq!(
+            decode_tree_state_checkpoint(&trailing),
+            Err(CanonicalFamilyValueDecodeError::TrailingBytes {
+                family: "tree_state_checkpoint",
+                trailing_bytes: 1,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn block_final_note_commitment_roots_v1_rejects_non_exact_values() {
+        let height = BlockHeight::new(7);
+        let block_hash = BlockHash::from_bytes([7; 32]);
+        assert!(matches!(
+            decode_block_final_note_commitment_roots(height, block_hash, &[]),
+            Err(CanonicalFamilyValueDecodeError::Truncated { .. })
+        ));
+        assert_eq!(
+            decode_block_final_note_commitment_roots(height, block_hash, &[0x80]),
+            Err(CanonicalFamilyValueDecodeError::UnknownPresenceBits {
+                family: "block_final_note_commitment_roots",
+                presence_bitmap: 0x80,
+            })
+        );
+        assert!(matches!(
+            decode_block_final_note_commitment_roots(height, block_hash, &[SAPLING_PRESENCE_BIT]),
+            Err(CanonicalFamilyValueDecodeError::Truncated { .. })
+        ));
+        assert_eq!(
+            decode_block_final_note_commitment_roots(height, block_hash, &[0, 0]),
+            Err(CanonicalFamilyValueDecodeError::TrailingBytes {
+                family: "block_final_note_commitment_roots",
+                trailing_bytes: 1,
+            })
+        );
     }
 }

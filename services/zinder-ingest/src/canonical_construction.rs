@@ -18,13 +18,15 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use zinder_core::{
-    BlockHeight, Network, NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
-    NetworkUpgradeActivationsFingerprintVersion,
+    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
+    CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
+    ShieldedProtocol,
 };
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{
     CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalStoreBuildError, CanonicalStoreError,
-    CanonicalStoreWorkload, RocksDbCanonicalBuilder,
+    CanonicalStoreWorkload, RocksDbCanonicalBuilder, TREE_STATE_CHECKPOINT_STRIDE,
 };
 
 use crate::{
@@ -136,6 +138,39 @@ pub enum CanonicalConstructionError {
         /// Network declared by the source block.
         source_network: Network,
     },
+    /// The ordered commitment-tree accumulator rejected a predecessor or block update.
+    #[error("canonical commitment-tree state failed at height {height:?}")]
+    CommitmentTreeState {
+        /// Height being seeded or applied.
+        height: BlockHeight,
+        /// Exact accumulator failure.
+        #[source]
+        source: CommitmentTreeAccumulatorError,
+    },
+    /// A commitment copied into the compact-block representation has the wrong width.
+    #[error(
+        "block {height:?} contains a {protocol:?} compact commitment with {byte_count} bytes; expected 32"
+    )]
+    CompactCommitmentWidth {
+        /// Block containing the malformed compact commitment.
+        height: BlockHeight,
+        /// Shielded pool whose commitment was malformed.
+        protocol: ShieldedProtocol,
+        /// Observed byte length.
+        byte_count: usize,
+    },
+    /// The independently calculated compact-block position and typed frontier diverged.
+    #[error(
+        "block {height:?} commitment-tree positions diverged: size-only={positioned:?}, accumulated={accumulated:?}"
+    )]
+    CommitmentTreePositionMismatch {
+        /// Block where the two independent calculations disagreed.
+        height: BlockHeight,
+        /// Position stamped into the compact block.
+        positioned: ChainTipMetadata,
+        /// Position derived from typed commitment-tree frontiers.
+        accumulated: ChainTipMetadata,
+    },
     /// The blocking SST loader task could not complete.
     #[error("canonical loader task failed: {reason}")]
     LoaderTaskFailed {
@@ -182,7 +217,13 @@ where
         &config,
         raw_blob_policy_for_workload(workload),
     );
-    drive_block_loader(builder, prepared_blocks, block_queue_capacity).await
+    drive_block_loader(
+        builder,
+        prepared_blocks,
+        block_queue_capacity,
+        Arc::clone(&config.network_upgrade_activations),
+    )
+    .await
 }
 
 const fn raw_blob_policy_for_workload(workload: CanonicalStoreWorkload) -> RawBlobPolicy {
@@ -395,21 +436,33 @@ async fn drive_block_loader<PreparedBlocks>(
     builder: RocksDbCanonicalBuilder,
     prepared_blocks: PreparedBlocks,
     block_queue_capacity: usize,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 ) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError>
 where
     PreparedBlocks: Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>> + Send,
 {
-    let predecessor_tip_metadata = builder
-        .build_plan()
-        .history_predecessor()
-        .frontiers
-        .tip_metadata();
+    let predecessor = builder.build_plan().history_predecessor();
+    let predecessor_tip_metadata = predecessor.tip_metadata();
+    let commitment_tree_accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+        predecessor.block_id.height,
+        &predecessor.frontiers,
+        &network_upgrade_activations,
+    )
+    .map_err(|source| CanonicalConstructionError::CommitmentTreeState {
+        height: predecessor.block_id.height,
+        source,
+    })?;
+    let workload = builder.workload();
+    let build_tip_height = builder.build_plan().build_tip().height;
     let (block_sender, block_receiver) = mpsc::channel(block_queue_capacity);
     let loader_task = tokio::task::spawn_blocking(move || {
         let mut builder = builder;
         let mut build_blocks = CanonicalBuildBlockReceiver::new(
             block_receiver,
             CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
+            commitment_tree_accumulator,
+            workload,
+            build_tip_height,
         );
         let evidence = builder
             .bulk_load_blocks(&mut build_blocks)
@@ -446,17 +499,26 @@ struct CanonicalBuildBlockReceiver {
     receiver: mpsc::Receiver<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
     active_memory_permit: Option<OwnedSemaphorePermit>,
     running_tree_sizes: CommitmentTreeSizes,
+    commitment_tree_accumulator: CommitmentTreeAccumulator,
+    workload: CanonicalStoreWorkload,
+    build_tip_height: BlockHeight,
 }
 
 impl CanonicalBuildBlockReceiver {
     fn new(
         receiver: mpsc::Receiver<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
         running_tree_sizes: CommitmentTreeSizes,
+        commitment_tree_accumulator: CommitmentTreeAccumulator,
+        workload: CanonicalStoreWorkload,
+        build_tip_height: BlockHeight,
     ) -> Self {
         Self {
             receiver,
             active_memory_permit: None,
             running_tree_sizes,
+            commitment_tree_accumulator,
+            workload,
+            build_tip_height,
         }
     }
 }
@@ -476,17 +538,130 @@ impl Iterator for CanonicalBuildBlockReceiver {
             Err(source) => return Some(Err(source)),
         };
         self.active_memory_permit = Some(queued_block.memory_permit);
-        Some(
-            position_canonical_block(queued_block.prepared, &mut self.running_tree_sizes)
-                .map(canonical_build_block)
-                .map_err(|source| CanonicalConstructionError::Source {
-                    source: IngestError::from(source),
-                }),
-        )
+        Some(self.build_block(queued_block.prepared))
     }
 }
 
-fn canonical_build_block(positioned: PositionedCanonicalBlock) -> CanonicalBuildBlock {
+impl CanonicalBuildBlockReceiver {
+    fn build_block(
+        &mut self,
+        prepared: PreparedCanonicalBlock,
+    ) -> Result<CanonicalBuildBlock, CanonicalConstructionError> {
+        let height = prepared.facts.block_header.height;
+        let block_hash = prepared.facts.block_header.block_hash;
+        let block_time_seconds = prepared.partial_compact_block.time;
+        let commitments = compact_block_commitments(&prepared)?;
+        self.commitment_tree_accumulator
+            .append_block_commitments(
+                height,
+                &commitments.sapling,
+                &commitments.orchard,
+                &commitments.ironwood,
+            )
+            .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
+        let positioned =
+            position_canonical_block(prepared, &mut self.running_tree_sizes).map_err(|source| {
+                CanonicalConstructionError::Source {
+                    source: IngestError::from(source),
+                }
+            })?;
+        let accumulated = self.commitment_tree_accumulator.tip_metadata();
+        if positioned.tip_metadata != accumulated {
+            return Err(CanonicalConstructionError::CommitmentTreePositionMismatch {
+                height,
+                positioned: positioned.tip_metadata,
+                accumulated,
+            });
+        }
+        let checkpoint_required = height == self.build_tip_height
+            || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
+        let tree_state_checkpoint = checkpoint_required
+            .then(|| {
+                self.commitment_tree_accumulator
+                    .validated_frontiers()
+                    .map(|frontiers| {
+                        CommitmentTreeCheckpoint::new(
+                            BlockId::new(height, block_hash),
+                            block_time_seconds,
+                            frontiers,
+                        )
+                    })
+            })
+            .transpose()
+            .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
+        let block_final_note_commitment_roots = (self.workload == CanonicalStoreWorkload::Explorer)
+            .then(|| {
+                self.commitment_tree_accumulator
+                    .final_note_commitment_roots(block_hash)
+            })
+            .filter(|roots| {
+                roots.sapling.is_some() || roots.orchard.is_some() || roots.ironwood.is_some()
+            });
+        Ok(canonical_build_block(
+            positioned,
+            tree_state_checkpoint,
+            block_final_note_commitment_roots,
+        ))
+    }
+}
+
+#[derive(Default)]
+struct CompactBlockCommitments {
+    sapling: Vec<[u8; 32]>,
+    orchard: Vec<[u8; 32]>,
+    ironwood: Vec<[u8; 32]>,
+}
+
+fn compact_block_commitments(
+    prepared: &PreparedCanonicalBlock,
+) -> Result<CompactBlockCommitments, CanonicalConstructionError> {
+    let height = prepared.facts.block_header.height;
+    let mut commitments = CompactBlockCommitments::default();
+    for transaction in &prepared.partial_compact_block.vtx {
+        for output in &transaction.outputs {
+            commitments.sapling.push(compact_commitment_bytes(
+                height,
+                ShieldedProtocol::Sapling,
+                &output.cmu,
+            )?);
+        }
+        for action in &transaction.actions {
+            commitments.orchard.push(compact_commitment_bytes(
+                height,
+                ShieldedProtocol::Orchard,
+                &action.cmx,
+            )?);
+        }
+        for action in &transaction.ironwood_actions {
+            commitments.ironwood.push(compact_commitment_bytes(
+                height,
+                ShieldedProtocol::Ironwood,
+                &action.cmx,
+            )?);
+        }
+    }
+    Ok(commitments)
+}
+
+fn compact_commitment_bytes(
+    height: BlockHeight,
+    protocol: ShieldedProtocol,
+    bytes: &[u8],
+) -> Result<[u8; 32], CanonicalConstructionError> {
+    bytes
+        .try_into()
+        .map_err(|_| CanonicalConstructionError::CompactCommitmentWidth {
+            height,
+            protocol,
+            byte_count: bytes.len(),
+        })
+}
+
+fn canonical_build_block(
+    positioned: PositionedCanonicalBlock,
+    tree_state_checkpoint: Option<CommitmentTreeCheckpoint>,
+    block_final_note_commitment_roots: Option<zinder_core::BlockFinalNoteCommitmentRoots>,
+) -> CanonicalBuildBlock {
     let PositionedCanonicalBlock {
         facts,
         replay_envelope,
@@ -503,6 +678,8 @@ fn canonical_build_block(positioned: PositionedCanonicalBlock) -> CanonicalBuild
         replay_envelope,
         compact_block,
         tip_metadata,
+        tree_state_checkpoint,
+        block_final_note_commitment_roots,
         transaction_blobs,
         block_blob,
     }

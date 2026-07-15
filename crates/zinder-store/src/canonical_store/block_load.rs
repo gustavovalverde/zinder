@@ -5,33 +5,38 @@ mod ordered_sst;
 use std::path::{Path, PathBuf};
 
 use prost::Message;
-use rust_rocksdb::{DB, IngestExternalFileOptions, Options};
+use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode, Options};
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeight, CanonicalBlockFacts,
+    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, CanonicalBlockFacts,
     CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
-    CompactBlockArtifact, SerializedBytesDigest, TransactionBlobArtifact,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact, SerializedBytesDigest,
+    TransactionBlobArtifact,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 
 use self::{
     codec::{
         BLOCK_HASH_INDEX_RECORD_LEN, BLOCK_HEADER_VALUE_LEN, TRANSACTION_LOCATION_RECORD_LEN,
-        encode_block_hash_location, encode_block_header, encode_block_position,
-        encode_transaction_location, encode_transaction_position,
+        decode_block_final_note_commitment_roots, decode_tree_state_checkpoint,
+        encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
+        encode_block_position, encode_transaction_location, encode_transaction_position,
+        encode_tree_state_checkpoint,
     },
     fixed_record_sort::{FixedRecordSorter, record_capacity},
     ordered_sst::{OrderedSstSet, SstArtifacts},
 };
 
 use super::{
-    CanonicalStoreBuildError, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
+    TREE_STATE_CHECKPOINT_STRIDE,
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
-        COMPACT_BLOCK_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY,
+        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
+        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
 };
 
@@ -52,6 +57,10 @@ pub struct CanonicalBuildBlock {
     pub compact_block: CompactBlockArtifact,
     /// Commitment-tree positions after applying this block.
     pub tip_metadata: ChainTipMetadata,
+    /// Typed commitment-tree state at the global checkpoint cadence or exact build tip.
+    pub tree_state_checkpoint: Option<CommitmentTreeCheckpoint>,
+    /// Per-block final roots retained only by the explorer workload.
+    pub block_final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
     /// Raw transactions in exact block order.
     pub transaction_blobs: Vec<TransactionBlobArtifact>,
     /// Raw block bytes required by the explorer workload.
@@ -95,6 +104,10 @@ pub struct CanonicalBlockLoadEvidence {
     pub transaction_blob_count: u64,
     /// Number of height-addressed raw block rows.
     pub block_blob_count: u64,
+    /// Number of typed commitment-tree checkpoints, including the history predecessor.
+    pub tree_state_checkpoint_count: u64,
+    /// Number of height-addressed final note-commitment-root rows.
+    pub block_final_note_commitment_roots_count: u64,
     /// Header-family key and value bytes submitted to the SST writers.
     pub block_header_logical_bytes: u64,
     /// Block-hash-index key and value bytes submitted to the SST writers.
@@ -109,6 +122,10 @@ pub struct CanonicalBlockLoadEvidence {
     pub transaction_blob_logical_bytes: u64,
     /// Block-blob key and value bytes submitted to the SST writers.
     pub block_blob_logical_bytes: u64,
+    /// Tree-checkpoint key and value bytes submitted to the SST writers.
+    pub tree_state_checkpoint_logical_bytes: u64,
+    /// Final-root key and value bytes submitted to the SST writers.
+    pub block_final_note_commitment_roots_logical_bytes: u64,
     /// Total key and value bytes submitted to the SST writers.
     pub logical_bytes: u64,
     /// Physical bytes occupied by every staged SST.
@@ -135,6 +152,7 @@ pub(super) struct CanonicalBlockSstConfig<'options> {
     pub(super) staging_path: &'options Path,
     pub(super) options: &'options Options,
     pub(super) workload: CanonicalStoreWorkload,
+    pub(super) build_plan: &'options CanonicalStoreBuildPlan,
     pub(super) sst_target_logical_bytes: u64,
     pub(super) reverse_index_sort_memory_bytes: usize,
 }
@@ -163,9 +181,12 @@ struct CanonicalBlockSstStager<'options> {
     compact_writer: OrderedSstSet<'options>,
     transaction_blob_writer: OrderedSstSet<'options>,
     block_blob_writer: OrderedSstSet<'options>,
+    tree_state_checkpoint_writer: OrderedSstSet<'options>,
+    block_final_note_commitment_roots_writer: OrderedSstSet<'options>,
     block_hash_sorter: FixedRecordSorter<BLOCK_HASH_INDEX_RECORD_LEN>,
     transaction_location_sorter: FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
     sequence: Option<BlockSequence>,
+    predecessor_checkpoint_logical_bytes: u64,
 }
 
 impl<'options> CanonicalBlockSstStager<'options> {
@@ -180,12 +201,23 @@ impl<'options> CanonicalBlockSstStager<'options> {
         let transaction_location_capacity = record_capacity::<TRANSACTION_LOCATION_RECORD_LEN>(
             config.reverse_index_sort_memory_bytes,
         )?;
+        let mut tree_state_checkpoint_writer = config.ordered_writer("tree-state-checkpoint");
+        let predecessor = config.build_plan.history_predecessor();
+        let predecessor_key = encode_block_position(predecessor.block_id.height);
+        let predecessor_value =
+            encode_tree_state_checkpoint(predecessor.block_time_seconds, &predecessor.frontiers);
+        tree_state_checkpoint_writer.put(&predecessor_key, &predecessor_value)?;
+        let predecessor_checkpoint_logical_bytes =
+            checked_row_bytes(predecessor_key.len(), predecessor_value.len())?;
         Ok(Self {
             header_writer: config.ordered_writer("block-header"),
             replay_writer: config.ordered_writer("block-replay"),
             compact_writer: config.ordered_writer("compact-block"),
             transaction_blob_writer: config.ordered_writer("transaction-blob"),
             block_blob_writer: config.ordered_writer("block-blob"),
+            tree_state_checkpoint_writer,
+            block_final_note_commitment_roots_writer: config
+                .ordered_writer("block-final-note-commitment-roots"),
             block_hash_sorter: FixedRecordSorter::new(
                 config.staging_path,
                 "block-hash-index",
@@ -198,11 +230,12 @@ impl<'options> CanonicalBlockSstStager<'options> {
             ),
             config,
             sequence: None,
+            predecessor_checkpoint_logical_bytes,
         })
     }
 
     fn stage(&mut self, block: CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
-        validate_build_block(self.config.workload, &block)?;
+        validate_build_block(self.config.workload, self.config.build_plan, &block)?;
         let row = BlockSequenceRow::from_block(&block)?;
         match &mut self.sequence {
             Some(sequence) => sequence.append(row)?,
@@ -215,6 +248,8 @@ impl<'options> CanonicalBlockSstStager<'options> {
             &mut self.compact_writer,
             &mut self.transaction_blob_writer,
             &mut self.block_blob_writer,
+            &mut self.tree_state_checkpoint_writer,
+            &mut self.block_final_note_commitment_roots_writer,
             &mut self.block_hash_sorter,
             &mut self.transaction_location_sorter,
         )
@@ -238,8 +273,16 @@ impl<'options> CanonicalBlockSstStager<'options> {
                 .finish::<32>(self.config.options, self.config.sst_target_logical_bytes)?,
             transaction_blob: self.transaction_blob_writer.finish()?,
             block_blob: self.block_blob_writer.finish()?,
+            tree_state_checkpoint: self.tree_state_checkpoint_writer.finish()?,
+            block_final_note_commitment_roots: self
+                .block_final_note_commitment_roots_writer
+                .finish()?,
         };
-        prepare_canonical_block_load(sequence, artifacts)
+        prepare_canonical_block_load(
+            sequence,
+            artifacts,
+            self.predecessor_checkpoint_logical_bytes,
+        )
     }
 }
 
@@ -262,11 +305,14 @@ struct CanonicalBlockSstArtifacts {
     transaction_location: SstArtifacts,
     transaction_blob: SstArtifacts,
     block_blob: SstArtifacts,
+    tree_state_checkpoint: SstArtifacts,
+    block_final_note_commitment_roots: SstArtifacts,
 }
 
 fn prepare_canonical_block_load(
     sequence: BlockSequence,
     artifacts: CanonicalBlockSstArtifacts,
+    predecessor_checkpoint_logical_bytes: u64,
 ) -> Result<PreparedCanonicalBlockLoad, CanonicalStoreError> {
     let families = vec![
         PreparedColumnFamily::new(BLOCK_HEADER_COLUMN_FAMILY, artifacts.header.paths),
@@ -282,6 +328,14 @@ fn prepare_canonical_block_load(
             artifacts.transaction_blob.paths,
         ),
         PreparedColumnFamily::new(BLOCK_BLOB_COLUMN_FAMILY, artifacts.block_blob.paths),
+        PreparedColumnFamily::new(
+            TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+            artifacts.tree_state_checkpoint.paths,
+        ),
+        PreparedColumnFamily::new(
+            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+            artifacts.block_final_note_commitment_roots.paths,
+        ),
     ];
     let sst_file_bytes = [
         artifacts.header.file_bytes,
@@ -291,6 +345,8 @@ fn prepare_canonical_block_load(
         artifacts.transaction_location.file_bytes,
         artifacts.transaction_blob.file_bytes,
         artifacts.block_blob.file_bytes,
+        artifacts.tree_state_checkpoint.file_bytes,
+        artifacts.block_final_note_commitment_roots.file_bytes,
     ]
     .into_iter()
     .try_fold(0_u64, checked_add_sst_bytes)?;
@@ -305,7 +361,11 @@ fn prepare_canonical_block_load(
 
     Ok(PreparedCanonicalBlockLoad {
         families,
-        evidence: sequence.finish(sst_file_bytes, sst_file_count)?,
+        evidence: sequence.finish(
+            sst_file_bytes,
+            sst_file_count,
+            predecessor_checkpoint_logical_bytes,
+        )?,
     })
 }
 
@@ -320,6 +380,8 @@ fn write_build_block(
     compact_writer: &mut OrderedSstSet<'_>,
     transaction_blob_writer: &mut OrderedSstSet<'_>,
     block_blob_writer: &mut OrderedSstSet<'_>,
+    tree_state_checkpoint_writer: &mut OrderedSstSet<'_>,
+    block_final_note_commitment_roots_writer: &mut OrderedSstSet<'_>,
     block_hash_sorter: &mut FixedRecordSorter<BLOCK_HASH_INDEX_RECORD_LEN>,
     transaction_location_sorter: &mut FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
 ) -> Result<(), CanonicalStoreError> {
@@ -329,6 +391,8 @@ fn write_build_block(
         compact_block,
         transaction_blobs,
         block_blob,
+        tree_state_checkpoint,
+        block_final_note_commitment_roots,
         ..
     } = block;
     let height = facts.block_header.height;
@@ -357,6 +421,15 @@ fn write_build_block(
 
     if let Some(block_blob) = block_blob {
         block_blob_writer.put(&height_key, &block_blob.raw_block_bytes)?;
+    }
+    if let Some(checkpoint) = tree_state_checkpoint {
+        let checkpoint_value =
+            encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers);
+        tree_state_checkpoint_writer.put(&height_key, &checkpoint_value)?;
+    }
+    if let Some(roots) = block_final_note_commitment_roots {
+        let roots_value = encode_block_final_note_commitment_roots(&roots);
+        block_final_note_commitment_roots_writer.put(&height_key, &roots_value)?;
     }
     Ok(())
 }
@@ -398,6 +471,8 @@ pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, Canoni
         TRANSACTION_LOCATION_COLUMN_FAMILY,
         TRANSACTION_BLOB_COLUMN_FAMILY,
         BLOCK_BLOB_COLUMN_FAMILY,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
     ] {
         let column_family = db.cf_handle(name).ok_or_else(|| {
             CanonicalStoreError::block_load_sequence(format!("{name} column family is absent"))
@@ -417,8 +492,179 @@ pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, Canoni
     Ok(true)
 }
 
+pub(super) fn validate_persisted_commitment_tree_families(
+    db: &DB,
+    workload: CanonicalStoreWorkload,
+    build_plan: &CanonicalStoreBuildPlan,
+    evidence: &CanonicalBlockLoadEvidence,
+) -> Result<(), CanonicalStoreError> {
+    validate_persisted_tree_state_checkpoints(db, build_plan, evidence)?;
+    validate_persisted_block_final_note_commitment_roots(db, workload, build_plan, evidence)
+}
+
+fn validate_persisted_tree_state_checkpoints(
+    db: &DB,
+    build_plan: &CanonicalStoreBuildPlan,
+    evidence: &CanonicalBlockLoadEvidence,
+) -> Result<(), CanonicalStoreError> {
+    let family = db
+        .cf_handle(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
+        .ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(
+                "tree_state_checkpoint column family is absent",
+            )
+        })?;
+    let predecessor = build_plan.history_predecessor();
+    let mut previous_height: Option<BlockHeight> = None;
+    let mut row_count = 0_u64;
+    let mut tip_frontiers = None;
+    for row in db.iterator_cf(&family, IteratorMode::Start) {
+        let (key, encoded_checkpoint) =
+            row.map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "tree-state checkpoint persisted readback",
+                source,
+            })?;
+        let height = zinder_core::wire::decode_height_key_ascending(&key).map_err(|source| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "tree_state_checkpoint has an invalid height key: {source}"
+            ))
+        })?;
+        let (block_time_seconds, frontiers) = decode_tree_state_checkpoint(&encoded_checkpoint)
+            .map_err(|source| {
+                CanonicalStoreError::block_load_sequence(format!(
+                    "tree_state_checkpoint at height {} is invalid: {source}",
+                    height.value()
+                ))
+            })?;
+        match previous_height {
+            None if height != predecessor.block_id.height
+                || block_time_seconds != predecessor.block_time_seconds
+                || frontiers != predecessor.frontiers =>
+            {
+                return Err(CanonicalStoreError::block_load_sequence(
+                    "first persisted tree-state checkpoint does not match the history predecessor",
+                ));
+            }
+            Some(previous) => {
+                let gap = height
+                    .value()
+                    .checked_sub(previous.value())
+                    .ok_or_else(|| {
+                        CanonicalStoreError::block_load_sequence(
+                            "persisted tree-state checkpoint heights do not increase",
+                        )
+                    })?;
+                if gap == 0 || gap > TREE_STATE_CHECKPOINT_STRIDE {
+                    return Err(CanonicalStoreError::block_load_sequence(format!(
+                        "persisted tree-state checkpoint gap {gap} exceeds {TREE_STATE_CHECKPOINT_STRIDE} blocks"
+                    )));
+                }
+                let checkpoint_expected =
+                    tree_state_checkpoint_required(height, build_plan.build_tip().height);
+                if !checkpoint_expected {
+                    return Err(CanonicalStoreError::block_load_sequence(format!(
+                        "persisted tree-state checkpoint at height {} is outside the global cadence and build tip",
+                        height.value()
+                    )));
+                }
+            }
+            None => {}
+        }
+        if height == build_plan.build_tip().height {
+            tip_frontiers = Some(frontiers.clone());
+        }
+        previous_height = Some(height);
+        row_count = row_count.checked_add(1).ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(
+                "persisted tree-state checkpoint count exceeds u64::MAX",
+            )
+        })?;
+    }
+    validate_tree_state_checkpoint_readback(
+        row_count,
+        previous_height,
+        tip_frontiers.as_ref(),
+        build_plan,
+        evidence,
+    )
+}
+
+fn validate_tree_state_checkpoint_readback(
+    row_count: u64,
+    last_height: Option<BlockHeight>,
+    tip_frontiers: Option<&CommitmentTreeFrontiers>,
+    build_plan: &CanonicalStoreBuildPlan,
+    evidence: &CanonicalBlockLoadEvidence,
+) -> Result<(), CanonicalStoreError> {
+    if row_count == evidence.tree_state_checkpoint_count
+        && last_height == Some(build_plan.build_tip().height)
+        && tip_frontiers.map(CommitmentTreeFrontiers::tip_metadata) == Some(evidence.tip_metadata)
+    {
+        return Ok(());
+    }
+    Err(CanonicalStoreError::BlockLoadReadbackMismatch)
+}
+
+fn validate_persisted_block_final_note_commitment_roots(
+    db: &DB,
+    workload: CanonicalStoreWorkload,
+    build_plan: &CanonicalStoreBuildPlan,
+    evidence: &CanonicalBlockLoadEvidence,
+) -> Result<(), CanonicalStoreError> {
+    let family = db
+        .cf_handle(BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY)
+        .ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(
+                "block_final_note_commitment_roots column family is absent",
+            )
+        })?;
+    let mut row_count = 0_u64;
+    for row in db.iterator_cf(&family, IteratorMode::Start) {
+        let (key, encoded_roots) = row.map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "block final note-commitment roots persisted readback",
+            source,
+        })?;
+        let height = zinder_core::wire::decode_height_key_ascending(&key).map_err(|source| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "block_final_note_commitment_roots has an invalid height key: {source}"
+            ))
+        })?;
+        if height < build_plan.history_bounds().first_available_height()
+            || height > build_plan.build_tip().height
+        {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block_final_note_commitment_roots height {} is outside retained history",
+                height.value()
+            )));
+        }
+        decode_block_final_note_commitment_roots(
+            height,
+            BlockHash::from_bytes([0; 32]),
+            &encoded_roots,
+        )
+        .map_err(|source| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "block_final_note_commitment_roots at height {} is invalid: {source}",
+                height.value()
+            ))
+        })?;
+        row_count = row_count.checked_add(1).ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(
+                "persisted block final note-commitment roots count exceeds u64::MAX",
+            )
+        })?;
+    }
+    if row_count != evidence.block_final_note_commitment_roots_count
+        || (workload == CanonicalStoreWorkload::Wallet && row_count != 0)
+    {
+        return Err(CanonicalStoreError::BlockLoadReadbackMismatch);
+    }
+    Ok(())
+}
+
 fn validate_build_block(
     workload: CanonicalStoreWorkload,
+    build_plan: &CanonicalStoreBuildPlan,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
@@ -451,7 +697,9 @@ fn validate_build_block(
     }
     validate_compact_block_payload(block)?;
     validate_transaction_blobs(block)?;
-    validate_block_blob(workload, block)
+    validate_block_blob(workload, block)?;
+    validate_tree_state_checkpoint(build_plan, block)?;
+    validate_block_final_note_commitment_roots(workload, block)
 }
 
 fn validate_compact_block_payload(block: &CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
@@ -574,6 +822,73 @@ fn validate_block_blob(
     Ok(())
 }
 
+fn validate_tree_state_checkpoint(
+    build_plan: &CanonicalStoreBuildPlan,
+    block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
+    let header = &block.facts.block_header;
+    let height = header.height;
+    let checkpoint_required = tree_state_checkpoint_required(height, build_plan.build_tip().height);
+    match (checkpoint_required, &block.tree_state_checkpoint) {
+        (true, None) => {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block {} is missing its required tree-state checkpoint",
+                height.value()
+            )));
+        }
+        (false, Some(_)) => {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block {} has a tree-state checkpoint outside the global cadence and build tip",
+                height.value()
+            )));
+        }
+        (true, Some(checkpoint))
+            if checkpoint.block_id.height != height
+                || checkpoint.block_id.hash != header.block_hash
+                || i64::from(checkpoint.block_time_seconds) != header.block_time
+                || checkpoint.tip_metadata() != block.tip_metadata =>
+        {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block {} tree-state checkpoint does not match its canonical identity and tree positions",
+                height.value()
+            )));
+        }
+        (true, Some(_)) | (false, None) => {}
+    }
+    Ok(())
+}
+
+fn tree_state_checkpoint_required(height: BlockHeight, build_tip_height: BlockHeight) -> bool {
+    height == build_tip_height || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE)
+}
+
+fn validate_block_final_note_commitment_roots(
+    workload: CanonicalStoreWorkload,
+    block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
+    let header = &block.facts.block_header;
+    let height = header.height;
+    match (workload, block.block_final_note_commitment_roots) {
+        (CanonicalStoreWorkload::Wallet, Some(_)) => {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "wallet block {} unexpectedly contains explorer final note-commitment roots",
+                height.value()
+            )));
+        }
+        (CanonicalStoreWorkload::Explorer, Some(roots))
+            if roots.height != height || roots.block_hash != header.block_hash =>
+        {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "explorer block {} final note-commitment roots do not match its canonical identity",
+                height.value()
+            )));
+        }
+        (CanonicalStoreWorkload::Wallet, None)
+        | (CanonicalStoreWorkload::Explorer, None | Some(_)) => {}
+    }
+    Ok(())
+}
+
 struct BlockSequence {
     first_height: BlockHeight,
     first_parent_hash: BlockHash,
@@ -584,6 +899,8 @@ struct BlockSequence {
     block_count: u64,
     transaction_count: u64,
     block_blob_count: u64,
+    tree_state_checkpoint_count: u64,
+    block_final_note_commitment_roots_count: u64,
     family_logical_bytes: BlockFamilyLogicalBytes,
     sequence_digest: CanonicalBlockFactsSequenceDigestBuilder,
 }
@@ -596,6 +913,8 @@ struct BlockSequenceRow {
     tip_metadata: ChainTipMetadata,
     transaction_count: u64,
     has_block_blob: bool,
+    has_tree_state_checkpoint: bool,
+    has_block_final_note_commitment_roots: bool,
     family_logical_bytes: BlockFamilyLogicalBytes,
     facts_digest: zinder_core::CanonicalBlockFactsDigest,
 }
@@ -609,6 +928,8 @@ struct BlockFamilyLogicalBytes {
     transaction_location: u64,
     transaction_blob: u64,
     block_blob: u64,
+    tree_state_checkpoint: u64,
+    block_final_note_commitment_roots: u64,
 }
 
 impl BlockSequenceRow {
@@ -630,6 +951,26 @@ impl BlockSequenceRow {
         let block_blob_logical_bytes = block.block_blob.as_ref().map_or(Ok(0), |block_blob| {
             checked_row_bytes(4, block_blob.raw_block_bytes.len())
         })?;
+        let tree_state_checkpoint_logical_bytes =
+            block
+                .tree_state_checkpoint
+                .as_ref()
+                .map_or(Ok(0), |checkpoint| {
+                    checked_row_bytes(
+                        4,
+                        encode_tree_state_checkpoint(
+                            checkpoint.block_time_seconds,
+                            &checkpoint.frontiers,
+                        )
+                        .len(),
+                    )
+                })?;
+        let block_final_note_commitment_roots_logical_bytes = block
+            .block_final_note_commitment_roots
+            .as_ref()
+            .map_or(Ok(0), |roots| {
+                checked_row_bytes(4, encode_block_final_note_commitment_roots(roots).len())
+            })?;
         Ok(Self {
             height: block.facts.block_header.height,
             block_hash: block.facts.block_header.block_hash,
@@ -637,6 +978,10 @@ impl BlockSequenceRow {
             tip_metadata: block.tip_metadata,
             transaction_count,
             has_block_blob: block.block_blob.is_some(),
+            has_tree_state_checkpoint: block.tree_state_checkpoint.is_some(),
+            has_block_final_note_commitment_roots: block
+                .block_final_note_commitment_roots
+                .is_some(),
             family_logical_bytes: BlockFamilyLogicalBytes {
                 block_header: checked_row_bytes(4, BLOCK_HEADER_VALUE_LEN)?,
                 block_hash_index: checked_row_bytes(32, 4)?,
@@ -645,6 +990,8 @@ impl BlockSequenceRow {
                 transaction_location: transaction_location_logical_bytes,
                 transaction_blob: transaction_blob_logical_bytes,
                 block_blob: block_blob_logical_bytes,
+                tree_state_checkpoint: tree_state_checkpoint_logical_bytes,
+                block_final_note_commitment_roots: block_final_note_commitment_roots_logical_bytes,
             },
             facts_digest: block.facts.digest(CanonicalBlockFactsDigestVersion::V1),
         })
@@ -670,6 +1017,14 @@ impl BlockFamilyLogicalBytes {
                 row.transaction_blob,
             )?,
             block_blob: checked_add_logical_bytes(self.block_blob, row.block_blob)?,
+            tree_state_checkpoint: checked_add_logical_bytes(
+                self.tree_state_checkpoint,
+                row.tree_state_checkpoint,
+            )?,
+            block_final_note_commitment_roots: checked_add_logical_bytes(
+                self.block_final_note_commitment_roots,
+                row.block_final_note_commitment_roots,
+            )?,
         })
     }
 
@@ -682,6 +1037,8 @@ impl BlockFamilyLogicalBytes {
             self.transaction_location,
             self.transaction_blob,
             self.block_blob,
+            self.tree_state_checkpoint,
+            self.block_final_note_commitment_roots,
         ]
         .into_iter()
         .try_fold(0_u64, checked_add_logical_bytes)
@@ -706,6 +1063,10 @@ impl BlockSequence {
             block_count: 1,
             transaction_count: row.transaction_count,
             block_blob_count: u64::from(row.has_block_blob),
+            tree_state_checkpoint_count: u64::from(row.has_tree_state_checkpoint),
+            block_final_note_commitment_roots_count: u64::from(
+                row.has_block_final_note_commitment_roots,
+            ),
             family_logical_bytes: row.family_logical_bytes,
             sequence_digest,
         })
@@ -752,6 +1113,22 @@ impl BlockSequence {
             .ok_or_else(|| {
                 CanonicalStoreError::block_load_sequence("block blob count exceeds u64::MAX")
             })?;
+        self.tree_state_checkpoint_count = self
+            .tree_state_checkpoint_count
+            .checked_add(u64::from(row.has_tree_state_checkpoint))
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence(
+                    "tree-state checkpoint count exceeds u64::MAX",
+                )
+            })?;
+        self.block_final_note_commitment_roots_count = self
+            .block_final_note_commitment_roots_count
+            .checked_add(u64::from(row.has_block_final_note_commitment_roots))
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence(
+                    "block final note-commitment roots count exceeds u64::MAX",
+                )
+            })?;
         self.family_logical_bytes = self
             .family_logical_bytes
             .checked_add(row.family_logical_bytes)?;
@@ -770,8 +1147,13 @@ impl BlockSequence {
         self,
         sst_file_bytes: u64,
         sst_file_count: u64,
+        predecessor_checkpoint_logical_bytes: u64,
     ) -> Result<CanonicalBlockLoadEvidence, CanonicalStoreError> {
-        let family_logical_bytes = self.family_logical_bytes;
+        let mut family_logical_bytes = self.family_logical_bytes;
+        family_logical_bytes.tree_state_checkpoint = checked_add_logical_bytes(
+            family_logical_bytes.tree_state_checkpoint,
+            predecessor_checkpoint_logical_bytes,
+        )?;
         let logical_bytes = family_logical_bytes.checked_sum()?;
         Ok(CanonicalBlockLoadEvidence {
             first_height: self.first_height,
@@ -789,6 +1171,15 @@ impl BlockSequence {
             transaction_location_count: self.transaction_count,
             transaction_blob_count: self.transaction_count,
             block_blob_count: self.block_blob_count,
+            tree_state_checkpoint_count: self
+                .tree_state_checkpoint_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    CanonicalStoreError::block_load_sequence(
+                        "tree-state checkpoint count exceeds u64::MAX",
+                    )
+                })?,
+            block_final_note_commitment_roots_count: self.block_final_note_commitment_roots_count,
             block_header_logical_bytes: family_logical_bytes.block_header,
             block_hash_index_logical_bytes: family_logical_bytes.block_hash_index,
             block_replay_logical_bytes: family_logical_bytes.block_replay,
@@ -796,6 +1187,9 @@ impl BlockSequence {
             transaction_location_logical_bytes: family_logical_bytes.transaction_location,
             transaction_blob_logical_bytes: family_logical_bytes.transaction_blob,
             block_blob_logical_bytes: family_logical_bytes.block_blob,
+            tree_state_checkpoint_logical_bytes: family_logical_bytes.tree_state_checkpoint,
+            block_final_note_commitment_roots_logical_bytes: family_logical_bytes
+                .block_final_note_commitment_roots,
             logical_bytes,
             sst_file_bytes,
             sst_file_count,

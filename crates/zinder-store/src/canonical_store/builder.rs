@@ -12,7 +12,7 @@ use super::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
         CanonicalBlockSstConfig, CanonicalBuildBlock, REVERSE_INDEX_SORT_MEMORY_BYTES,
         canonical_block_families_are_empty, ingest_canonical_block_ssts,
-        write_canonical_block_ssts,
+        validate_persisted_commitment_tree_families, write_canonical_block_ssts,
     },
     block_replay::validate_persisted_block_replays,
     rocksdb::{
@@ -142,6 +142,7 @@ impl RocksDbCanonicalBuilder {
                 staging_path: staging.path(),
                 options: &sst_options,
                 workload: self.workload,
+                build_plan: &self.build_plan,
                 sst_target_logical_bytes,
                 reverse_index_sort_memory_bytes,
             },
@@ -153,6 +154,12 @@ impl RocksDbCanonicalBuilder {
         if !persisted_replays.has_same_sequence(&evidence) {
             return Err(CanonicalStoreError::BlockLoadReadbackMismatch.into());
         }
+        validate_persisted_commitment_tree_families(
+            &self.bounded_open.db,
+            self.workload,
+            &self.build_plan,
+            &evidence,
+        )?;
         staging.remove()?;
         self.canonical_blocks_loaded = true;
         Ok(evidence)
@@ -293,6 +300,10 @@ mod tests {
             )),
             Ok(canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32])),
         ];
+        let mut blocks = blocks;
+        if let Some(Ok(tip)) = blocks.last_mut() {
+            add_tree_state_checkpoint(tip)?;
+        }
 
         let evidence = store.bulk_load_blocks(blocks)?;
 
@@ -304,7 +315,8 @@ mod tests {
         assert_eq!(evidence.transaction_location_count, 0);
         assert_eq!(evidence.transaction_blob_count, 0);
         assert_eq!(evidence.block_blob_count, 0);
-        assert_eq!(evidence.tip_metadata, ChainTipMetadata::new(2, 4, 6));
+        assert_eq!(evidence.tip_metadata, ChainTipMetadata::new(0, 0, 0));
+        assert_eq!(evidence.tree_state_checkpoint_count, 2);
         Ok(())
     }
 
@@ -326,11 +338,12 @@ mod tests {
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        let block = canonical_build_block_with_raw_blobs(
+        let mut block = canonical_build_block_with_raw_blobs(
             BlockHeight::new(1),
             [1; 32],
             Network::ZcashTestnet.genesis_hash().as_bytes(),
         );
+        add_tree_state_checkpoint(&mut block)?;
         let expected_block_replay_logical_bytes =
             4_u64 + u64::try_from(block.replay_envelope.as_bytes().len())?;
         let expected_compact_block_logical_bytes =
@@ -351,6 +364,7 @@ mod tests {
         assert_eq!(evidence.transaction_location_logical_bytes, 32 + 40);
         assert_eq!(evidence.transaction_blob_logical_bytes, 8 + 5);
         assert_eq!(evidence.block_blob_logical_bytes, 4 + 3);
+        assert!(evidence.tree_state_checkpoint_logical_bytes > 0);
         let checked_family_logical_bytes = [
             evidence.block_header_logical_bytes,
             evidence.block_hash_index_logical_bytes,
@@ -359,6 +373,8 @@ mod tests {
             evidence.transaction_location_logical_bytes,
             evidence.transaction_blob_logical_bytes,
             evidence.block_blob_logical_bytes,
+            evidence.tree_state_checkpoint_logical_bytes,
+            evidence.block_final_note_commitment_roots_logical_bytes,
         ]
         .into_iter()
         .try_fold(0_u64, u64::checked_add)
@@ -398,6 +414,10 @@ mod tests {
             Ok(canonical_build_block(BlockHeight::new(2), [1; 32], [3; 32])),
             Ok(canonical_build_block(BlockHeight::new(3), [2; 32], [1; 32])),
         ];
+        let mut blocks = blocks;
+        if let Some(Ok(tip)) = blocks.last_mut() {
+            add_tree_state_checkpoint(tip)?;
+        }
 
         let evidence = store.bulk_load_blocks_with_limits(blocks, 1, 72)?;
 
@@ -491,6 +511,64 @@ mod tests {
         assert!(canonical_block_families_are_empty(
             &compact_store.bounded_open.db
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_load_blocks_rejects_missing_tip_checkpoint_and_wallet_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let tip = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32]));
+
+        let missing_checkpoint_path = temporary.path().join("missing-checkpoint");
+        let mut missing_checkpoint_store = RocksDbCanonicalBuilder::create_fresh(
+            &missing_checkpoint_path,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalStoreBuildPlan::complete(&activations, 0, tip)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let missing_checkpoint = canonical_build_block(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        let error = missing_checkpoint_store
+            .bulk_load_blocks(vec![Ok::<_, std::io::Error>(missing_checkpoint)])
+            .err()
+            .ok_or("tip without a tree-state checkpoint must be rejected")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreBuildError::Store(CanonicalStoreError::BlockLoadSequenceInvalid { .. })
+        ));
+
+        let wallet_roots_path = temporary.path().join("wallet-roots");
+        let mut wallet_roots_store = RocksDbCanonicalBuilder::create_fresh(
+            &wallet_roots_path,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalStoreBuildPlan::complete(&activations, 0, tip)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let mut wallet_roots = canonical_build_block(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        add_tree_state_checkpoint(&mut wallet_roots)?;
+        wallet_roots.block_final_note_commitment_roots =
+            Some(zinder_core::BlockFinalNoteCommitmentRoots::unavailable(
+                BlockHeight::new(1),
+                BlockHash::from_bytes([1; 32]),
+            ));
+        let error = wallet_roots_store
+            .bulk_load_blocks(vec![Ok::<_, std::io::Error>(wallet_roots)])
+            .err()
+            .ok_or("wallet workload roots must be rejected")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreBuildError::Store(CanonicalStoreError::BlockLoadSequenceInvalid { .. })
+        ));
         Ok(())
     }
 
@@ -681,9 +759,9 @@ mod tests {
             hash: encode_internal_block_hash(facts.block_header.block_hash).to_vec(),
             prev_hash: encode_internal_block_hash(facts.block_header.parent_hash).to_vec(),
             chain_metadata: Some(zinder_proto::compat::lightwalletd::ChainMetadata {
-                sapling_commitment_tree_size: height.value(),
-                orchard_commitment_tree_size: height.value().saturating_mul(2),
-                ironwood_commitment_tree_size: height.value().saturating_mul(3),
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
             }),
             ..Default::default()
         }
@@ -695,11 +773,9 @@ mod tests {
                 compact_payload,
             ),
             replay_envelope,
-            tip_metadata: ChainTipMetadata::new(
-                height.value(),
-                height.value().saturating_mul(2),
-                height.value().saturating_mul(3),
-            ),
+            tip_metadata: ChainTipMetadata::new(0, 0, 0),
+            tree_state_checkpoint: None,
+            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
@@ -766,5 +842,17 @@ mod tests {
             CanonicalBlockFactsDigestVersion::V1,
         );
         block
+    }
+
+    fn add_tree_state_checkpoint(
+        block: &mut crate::CanonicalBuildBlock,
+    ) -> Result<(), std::num::TryFromIntError> {
+        let header = &block.facts.block_header;
+        block.tree_state_checkpoint = Some(zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(header.height, header.block_hash),
+            u32::try_from(header.block_time)?,
+            zinder_core::CommitmentTreeFrontiers::default(),
+        ));
+        Ok(())
     }
 }

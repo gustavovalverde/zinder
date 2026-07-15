@@ -30,6 +30,11 @@ pub use rocksdb::RocksDbCanonicalStore;
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// Exact physical schema accepted by this canonical store implementation.
 pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
+/// Global block-height cadence for typed commitment-tree checkpoints.
+///
+/// A checkpoint at least every 100 blocks keeps wallet rewind anchors within the
+/// standard scan-recovery window regardless of canonical loader batch boundaries.
+pub const TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
 
 const REQUIRED_CANONICAL_NETWORK_UPGRADES: [&str; 5] =
     ["Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy"];

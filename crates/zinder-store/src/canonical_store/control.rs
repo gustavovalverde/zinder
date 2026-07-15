@@ -114,7 +114,7 @@ fn encode_predecessor_frontiers(
                     protocol,
                     encoded_bytes: frontier.final_state_bytes().len(),
                 }
-        })?;
+            })?;
         encoded.push(FRONTIER_PRESENT);
         encoded.extend_from_slice(&frontier.final_root().as_bytes());
         encoded.extend_from_slice(&final_state_length.to_le_bytes());
