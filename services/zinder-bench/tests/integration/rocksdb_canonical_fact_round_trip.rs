@@ -12,6 +12,7 @@ use zinder_bench::canonical_fact_round_trip::rocksdb::{
     validate_rocksdb_canonical_fact_round_trip_with_fresh_open,
 };
 use zinder_bench::fixture::FixtureManifest;
+use zinder_core::CanonicalBlockFactsReplayFormatVersion;
 use zinder_store::RocksDbResourceBudget;
 
 use crate::common::write_regtest_fixture;
@@ -36,6 +37,10 @@ async fn external_sst_round_trip_publishes_validated_facts_for_a_fresh_reader() 
     assert_eq!(result.validation.first_height, block.height);
     assert_eq!(result.validation.tip_height, block.height);
     assert_eq!(result.validation.tip_hash, block.hash);
+    assert_eq!(
+        result.validation.replay_format_version,
+        CanonicalBlockFactsReplayFormatVersion::CURRENT.value()
+    );
     assert!(result.logical_fact_bytes > 0);
     assert!(result.external_sst_bytes > 0);
     assert!(result.physical_storage_bytes >= result.external_sst_bytes);

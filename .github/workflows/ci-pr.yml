@@ -112,6 +112,7 @@ jobs:
 
       - name: Test storage benchmark contracts
         run: |
+          scripts/test-container-resource-evidence.sh
           scripts/test-storage-benchmark-campaign-validator.sh
           env \
             ZINDER_BENCH_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -128,6 +129,56 @@ jobs:
               --profile postgres \
               --profile rocksdb \
               config >/dev/null
+
+      - name: Test PostgreSQL resource observer chain
+        env:
+          ZINDER_BENCH_IMAGE: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          ZINDER_BENCH_SOFTWARE_REVISION: ci-compose
+          ZINDER_BENCH_RUNNER_ID: ci-storage-runner
+          ZINDER_BENCH_STORAGE_CLASS: ci-local-storage
+          ZINDER_BENCH_TRIAL_ID: ci-compose
+          ZINDER_BENCH_FIXTURE_CACHE_POLICY: warm
+          ZINDER_BENCH_PROJECT_NAME: zinder-storage-observer-ci
+          ZINDER_BENCH_RESULTS_PATH: ../benchmark-results
+        run: |
+          set -euo pipefail
+          evidence_path="benchmark-results/postgres-fact-first-database-ci-compose-ci-compose.resources.json"
+          mkdir -p benchmark-results
+          cleanup() {
+            docker compose \
+              --env-file deploy/.env.storage-benchmark.example \
+              -f deploy/docker-compose.storage-benchmark.yml \
+              --profile postgres \
+              down --volumes --remove-orphans
+          }
+          trap cleanup EXIT
+
+          docker compose \
+            --env-file deploy/.env.storage-benchmark.example \
+            -f deploy/docker-compose.storage-benchmark.yml \
+            --profile postgres \
+            up -d --wait postgres-database
+          docker compose \
+            --env-file deploy/.env.storage-benchmark.example \
+            -f deploy/docker-compose.storage-benchmark.yml \
+            exec -T postgres-database \
+            pg_isready --username zinder_bench --dbname zinder_bench
+          docker compose \
+            --env-file deploy/.env.storage-benchmark.example \
+            -f deploy/docker-compose.storage-benchmark.yml \
+            --profile postgres \
+            stop postgres-database
+
+          jq -e '
+            .evidence_format_version == 1
+            and .component_id == "postgres-fact-first-database"
+            and .trial_id == "ci-compose"
+            and .child_exit_status == 0
+            and .sources.cgroup_namespace.support == "verified-private"
+            and .sources.memory_peak.support == "exact"
+            and .sources.memory_current.support == "exact"
+            and .sources.storage.support == "sampled"
+          ' "$evidence_path" >/dev/null
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked --version "${CARGO_DENY_VERSION}"

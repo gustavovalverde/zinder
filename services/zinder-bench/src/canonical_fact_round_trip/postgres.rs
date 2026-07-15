@@ -36,9 +36,9 @@ const SCHEMA_NAME: &str = "zinder_bench_postgres_canonical_facts";
 type PostgresConnectionTask = JoinHandle<Result<(), tokio_postgres::Error>>;
 
 /// Physical schema version written by the concrete `PostgreSQL` fact candidate.
-pub const POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 1;
-/// Explicit TOAST compression used for canonical-fact reference encodings.
-pub const POSTGRES_REFERENCE_ENCODING_COMPRESSION: &str = "lz4";
+pub const POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 2;
+/// Explicit TOAST compression used for canonical-fact replay encodings.
+pub const POSTGRES_REPLAY_ENCODING_COMPRESSION: &str = "lz4";
 
 const SCHEMA_SQL: &str = r"
 CREATE SCHEMA zinder_bench_postgres_canonical_facts;
@@ -50,7 +50,7 @@ CREATE TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts (
     transaction_count BIGINT NOT NULL,
     digest_version SMALLINT NOT NULL,
     fact_digest BYTEA NOT NULL,
-    reference_encoding BYTEA COMPRESSION lz4 NOT NULL
+    replay_encoding BYTEA COMPRESSION lz4 NOT NULL
 );
 
 CREATE TABLE zinder_bench_postgres_canonical_facts.round_trip_completion (
@@ -65,6 +65,8 @@ CREATE TABLE zinder_bench_postgres_canonical_facts.round_trip_completion (
     transaction_count BIGINT NOT NULL,
     tip_hash BYTEA NOT NULL CHECK (octet_length(tip_hash) = 32),
     block_digest_version SMALLINT NOT NULL,
+    replay_format_version BIGINT NOT NULL
+        CHECK (replay_format_version BETWEEN 1 AND 4294967295),
     sequence_digest_version SMALLINT NOT NULL,
     sequence_digest BYTEA NOT NULL CHECK (octet_length(sequence_digest) = 32),
     logical_fact_bytes BIGINT NOT NULL
@@ -79,7 +81,7 @@ COPY zinder_bench_postgres_canonical_facts.canonical_block_facts (
     transaction_count,
     digest_version,
     fact_digest,
-    reference_encoding
+    replay_encoding
 ) FROM STDIN BINARY
 ";
 
@@ -92,7 +94,7 @@ ALTER TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts
         AND transaction_count BETWEEN 0 AND 4294967295
         AND digest_version > 0
         AND octet_length(fact_digest) = 32
-        AND octet_length(reference_encoding) > 0
+        AND octet_length(replay_encoding) > 0
     ) NOT VALID;
 ALTER TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts
     VALIDATE CONSTRAINT canonical_block_facts_shape_check;
@@ -113,7 +115,7 @@ SELECT
     transaction_count,
     digest_version,
     fact_digest,
-    reference_encoding
+    replay_encoding
 FROM zinder_bench_postgres_canonical_facts.canonical_block_facts
 ORDER BY height
 ";
@@ -131,11 +133,12 @@ INSERT INTO zinder_bench_postgres_canonical_facts.round_trip_completion (
     transaction_count,
     tip_hash,
     block_digest_version,
+    replay_format_version,
     sequence_digest_version,
     sequence_digest,
     logical_fact_bytes
 ) VALUES (
-    TRUE, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+    TRUE, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
 )
 ";
 
@@ -151,6 +154,7 @@ SELECT
     transaction_count,
     tip_hash,
     block_digest_version,
+    replay_format_version,
     sequence_digest_version,
     sequence_digest,
     logical_fact_bytes
@@ -324,14 +328,16 @@ pub struct PostgresCanonicalFactRoundTripValidation {
     pub position: CanonicalFactSequencePosition,
     /// Sum of transaction counts stored in the block envelopes.
     pub transaction_count: u64,
-    /// Ordered backend-neutral digest recomputed from persisted encodings.
+    /// Semantic replay format version decoded from every persisted row.
+    pub replay_format_version: u32,
+    /// Ordered backend-neutral digest recomputed from persisted semantic facts.
     pub sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
 /// Physical bytes written by the concrete `PostgreSQL` candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PostgresCanonicalFactStorageMeasurements {
-    /// Reference-encoding bytes submitted across all block rows.
+    /// Semantic replay encoding bytes submitted across all block rows.
     pub logical_fact_bytes: u64,
     /// Fact-table heap, TOAST, free-space-map, and visibility-map bytes.
     pub fact_table_bytes: u64,
@@ -420,7 +426,7 @@ pub async fn run_postgres_canonical_fact_round_trip(
         timings.fact_persistence_seconds += copy_started_at.elapsed().as_secs_f64();
     }
     let source_validation_started_at = Instant::now();
-    let input_validation = finish_validation(input_accumulator, input_transaction_count);
+    let input_validation = finish_validation(input_accumulator, input_transaction_count)?;
     validate_against_fixture(&manifest, &input_validation)?;
     timings.fact_preparation_seconds += source_validation_started_at.elapsed().as_secs_f64();
     let load_commit_started_at = Instant::now();
@@ -552,14 +558,18 @@ fn validate_prepared_segment(
 fn finish_validation(
     accumulator: CanonicalFactSequenceAccumulator,
     transaction_count: u64,
-) -> PostgresCanonicalFactRoundTripValidation {
+) -> Result<PostgresCanonicalFactRoundTripValidation, BenchError> {
     let position = accumulator.position();
+    let replay_format_version = position
+        .replay_format_version
+        .ok_or_else(|| candidate_error("canonical fact sequence has no replay format version"))?;
     let sequence_digest = accumulator.finish();
-    PostgresCanonicalFactRoundTripValidation {
+    Ok(PostgresCanonicalFactRoundTripValidation {
         position,
         transaction_count,
+        replay_format_version,
         sequence_digest,
-    }
+    })
 }
 
 fn validate_against_fixture(
@@ -677,7 +687,7 @@ async fn copy_fact_segment(
         let digest_version = u16_to_i16(record.digest.version().value(), "digest version")?;
         let fact_digest_bytes = record.digest.as_bytes();
         let fact_digest = fact_digest_bytes.as_slice();
-        let reference_encoding: &[u8] = &record.reference_encoding;
+        let replay_encoding: &[u8] = &record.replay_encoding;
         writer
             .as_mut()
             .write(&[
@@ -687,7 +697,7 @@ async fn copy_fact_segment(
                 &transaction_count,
                 &digest_version,
                 &fact_digest,
-                &reference_encoding,
+                &replay_encoding,
             ])
             .await
             .map_err(|error| postgres_error("binary fact COPY row", &error))?;
@@ -727,7 +737,7 @@ async fn validate_persisted_facts(
             .ok_or_else(|| candidate_error("persisted transaction count exceeds u64::MAX"))?;
         accumulator.append(&record)?;
     }
-    Ok(finish_validation(accumulator, transaction_count))
+    finish_validation(accumulator, transaction_count)
 }
 
 fn decode_fact_row(row: &Row) -> Result<CanonicalBlockFactRecord, BenchError> {
@@ -743,7 +753,7 @@ fn decode_fact_row(row: &Row) -> Result<CanonicalBlockFactRecord, BenchError> {
     let digest_version = CanonicalBlockFactsDigestVersion::try_from(digest_version_number)
         .map_err(|source| candidate_error(source.to_string()))?;
     let stored_digest = fixed_32(get_column(row, 5, "fact_digest")?, "fact_digest")?;
-    let reference_encoding = get_column(row, 6, "reference_encoding")?;
+    let replay_encoding = get_column(row, 6, "replay_encoding")?;
     CanonicalBlockFactRecord::from_persisted(PersistedCanonicalBlockFactRow {
         height: BlockHeight::new(height),
         block_hash: BlockHash::from_bytes(block_hash),
@@ -751,7 +761,7 @@ fn decode_fact_row(row: &Row) -> Result<CanonicalBlockFactRecord, BenchError> {
         transaction_count,
         digest_version,
         stored_digest,
-        reference_encoding,
+        replay_encoding,
     })
 }
 
@@ -784,6 +794,7 @@ async fn publish_completion(
             .block_digest_version,
         "block_digest_version",
     )?;
+    let replay_format_version = i64::from(validation.replay_format_version);
     let sequence_digest_version = u16_to_i16(
         validation.sequence_digest.version().value(),
         "sequence_digest_version",
@@ -817,6 +828,7 @@ async fn publish_completion(
                 &transaction_count,
                 &tip_hash,
                 &block_digest_version,
+                &replay_format_version,
                 &sequence_digest_version,
                 &sequence_digest,
                 &logical_fact_bytes,
@@ -847,6 +859,7 @@ struct CompletionRow {
     transaction_count: u64,
     tip_hash: BlockHash,
     block_digest_version: u16,
+    replay_format_version: u32,
     sequence_digest_version: u16,
     sequence_digest: [u8; 32],
     logical_fact_bytes: u64,
@@ -880,13 +893,17 @@ async fn read_completion(client: &Client) -> Result<CompletionRow, BenchError> {
             get_column(&row, 9, "block_digest_version")?,
             "block_digest_version",
         )?,
+        replay_format_version: i64_to_u32(
+            get_column(&row, 10, "replay_format_version")?,
+            "replay_format_version",
+        )?,
         sequence_digest_version: i16_to_u16(
-            get_column(&row, 10, "sequence_digest_version")?,
+            get_column(&row, 11, "sequence_digest_version")?,
             "sequence_digest_version",
         )?,
-        sequence_digest: fixed_32(get_column(&row, 11, "sequence_digest")?, "sequence_digest")?,
+        sequence_digest: fixed_32(get_column(&row, 12, "sequence_digest")?, "sequence_digest")?,
         logical_fact_bytes: i64_to_u64(
-            get_column(&row, 12, "logical_fact_bytes")?,
+            get_column(&row, 13, "logical_fact_bytes")?,
             "logical_fact_bytes",
         )?,
     })
@@ -913,6 +930,7 @@ fn validate_completion(
         || completion.transaction_count != validation.transaction_count
         || Some(completion.tip_hash) != validation.position.tip_hash
         || completion.block_digest_version != evidence.block_digest_version
+        || completion.replay_format_version != validation.replay_format_version
         || completion.sequence_digest_version != validation.sequence_digest.version().value()
         || completion.sequence_digest != validation.sequence_digest.as_bytes()
         || completion.logical_fact_bytes != validation.position.logical_fact_bytes
@@ -1095,7 +1113,8 @@ mod tests {
         assert!(FINALIZE_SCHEMA_SQL.contains("canonical_block_facts_pkey"));
         assert!(!FINALIZE_SCHEMA_SQL.contains("block_hash_uq"));
         assert!(COPY_SQL.contains("FROM STDIN BINARY"));
-        assert!(SCHEMA_SQL.contains("reference_encoding BYTEA COMPRESSION lz4 NOT NULL"));
+        assert!(SCHEMA_SQL.contains("replay_encoding BYTEA COMPRESSION lz4 NOT NULL"));
+        assert!(SCHEMA_SQL.contains("replay_format_version BIGINT NOT NULL"));
     }
 
     #[test]

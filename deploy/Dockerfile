@@ -165,11 +165,12 @@ ENTRYPOINT ["zinder-compat-lightwalletd"]
 FROM zinder-runtime-base AS zinder-bench
 
 COPY --from=zinder-binaries /zinder-binaries/zinder-bench /usr/local/bin/zinder-bench
+COPY --chmod=0755 deploy/capture-container-resource-evidence.sh /usr/local/bin/zinder-capture-container-resource-evidence
 
 USER zinder:zinder
 WORKDIR /var/lib/zinder
 
-ENTRYPOINT ["zinder-bench"]
+ENTRYPOINT ["zinder-capture-container-resource-evidence", "zinder-bench"]
 
 FROM zinder-runtime-base AS zinder-single-container
 

@@ -8,9 +8,9 @@ use zinder_bench::{
     canonical_fact_round_trip::{
         CanonicalFactSequencePosition,
         postgres::{
-            POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION,
-            POSTGRES_REFERENCE_ENCODING_COMPRESSION, PostgresCanonicalFactRoundTripConfig,
-            PostgresCanonicalFactRoundTripResult, run_postgres_canonical_fact_round_trip,
+            POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION, POSTGRES_REPLAY_ENCODING_COMPRESSION,
+            PostgresCanonicalFactRoundTripConfig, PostgresCanonicalFactRoundTripResult,
+            run_postgres_canonical_fact_round_trip,
         },
         rocksdb::{
             ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION, RocksDbCanonicalFactRoundTripConfig,
@@ -192,6 +192,8 @@ async fn run_rocksdb(
             block_digest_version,
             round_trip.validation.sequence_digest,
         ),
+        replay_format_version: round_trip.validation.replay_format_version,
+        semantic_replay_validated: true,
         storage: CanonicalBlockFactsStorageEvidence::RocksDb {
             storage_schema_version: ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION,
             ingestion_mode: "sorted-external-sst",
@@ -316,11 +318,13 @@ fn build_postgres_round_trip_output(
             block_digest_version,
             round_trip.validation.sequence_digest,
         ),
+        replay_format_version: round_trip.validation.replay_format_version,
+        semantic_replay_validated: true,
         storage: CanonicalBlockFactsStorageEvidence::Postgres {
             storage_schema_version: POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION,
             ingestion_mode: "binary-copy-single-load-transaction-with-deferred-index",
             tables_logged: true,
-            reference_encoding_compression: POSTGRES_REFERENCE_ENCODING_COMPRESSION,
+            replay_encoding_compression: POSTGRES_REPLAY_ENCODING_COMPRESSION,
             server_settings: Box::new(round_trip.server_settings),
             fact_table_bytes: round_trip.storage.fact_table_bytes,
             index_bytes: round_trip.storage.index_bytes,

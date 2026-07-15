@@ -11,6 +11,7 @@ services:
     profiles: [oracle, comparison]
     restart: "no"
     init: true
+    cgroup: private
     cpus: ${ZINDER_BENCH_ROCKSDB_ORACLE_CPUS:-8.0}
     mem_limit: ${ZINDER_BENCH_ROCKSDB_ORACLE_MEMORY_LIMIT_BYTES:-17179869184}
     networks: [storage-benchmark]
@@ -73,9 +74,20 @@ services:
     profiles: [rocksdb, comparison]
     restart: "no"
     init: true
+    cgroup: private
     cpus: ${ZINDER_BENCH_ROCKSDB_FACT_CPUS:-8.0}
     mem_limit: ${ZINDER_BENCH_ROCKSDB_FACT_MEMORY_LIMIT_BYTES:-17179869184}
     networks: [storage-benchmark]
+    environment:
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/rocksdb-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: rocksdb-fact-first-client
+      ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
+      # Includes the sibling benchmark-store.external-sst staging directory.
+      ZINDER_BENCH_RESOURCE_STORAGE_PATH: /var/lib/zinder
+      ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS: ${ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS:-1}
+      ZINDER_BENCH_RESOURCE_REQUIRE_EXACT_MEMORY: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_SAMPLED_STORAGE: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE: "true"
     ulimits:
       nofile:
         soft: 1048576
@@ -132,6 +144,7 @@ services:
     profiles: [postgres, comparison]
     restart: "no"
     init: true
+    cgroup: private
     cpus: ${ZINDER_BENCH_POSTGRES_CLIENT_CPUS:-2.0}
     mem_limit: ${ZINDER_BENCH_POSTGRES_CLIENT_MEMORY_LIMIT_BYTES:-8589934592}
     networks: [storage-benchmark]
@@ -140,6 +153,12 @@ services:
         condition: service_healthy
     environment:
       ZINDER_BENCH_POSTGRES_DATABASE_URL: "postgresql://${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}:${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}@postgres-database:5432/${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}"
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/postgres-fact-first-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: postgres-fact-first-client
+      ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
+      ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS: ${ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS:-1}
+      ZINDER_BENCH_RESOURCE_REQUIRE_EXACT_MEMORY: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE: "true"
     volumes:
       - type: bind
         source: ${ZINDER_BENCH_FIXTURE_PATH:-../fixtures/mainnet-150k-200k}
@@ -194,11 +213,18 @@ services:
     image: ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296}
     profiles: [postgres, comparison]
     restart: "no"
+    cgroup: private
     cpus: ${ZINDER_BENCH_POSTGRES_DATABASE_CPUS:-6.0}
     mem_limit: ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
     shm_size: ${ZINDER_BENCH_POSTGRES_SHARED_MEMORY_SIZE:-2g}
     stop_grace_period: 2m
     networks: [storage-benchmark]
+    # The server and client emit independent peaks. A PostgreSQL whole-arm peak
+    # is derived by time-aligning their memory.current samples, never by summing
+    # their independently observed memory.peak values.
+    entrypoint:
+      - /usr/local/bin/zinder-capture-container-resource-evidence
+      - /usr/local/bin/docker-entrypoint.sh
     environment:
       # These credentials are public and valid only for this local environment.
       POSTGRES_DB: ${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}
@@ -206,9 +232,28 @@ services:
       POSTGRES_PASSWORD: ${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}
       POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8 --locale=C --auth-host=scram-sha-256
       PGDATA: /var/lib/postgresql/18/docker
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/postgres-fact-first-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: postgres-fact-first-database
+      ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
+      ZINDER_BENCH_RESOURCE_STORAGE_PATH: /var/lib/postgresql
+      ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS: ${ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS:-1}
+      ZINDER_BENCH_RESOURCE_REQUIRE_EXACT_MEMORY: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_SAMPLED_STORAGE: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE: "true"
     ports:
       - "127.0.0.1:${ZINDER_BENCH_POSTGRES_HOST_PORT:-55432}:5432"
     volumes:
+      - type: bind
+        source: ./capture-container-resource-evidence.sh
+        target: /usr/local/bin/zinder-capture-container-resource-evidence
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../benchmark-results}
+        target: /benchmark/results
+        bind:
+          create_host_path: false
       - type: volume
         source: postgres-data
         target: /var/lib/postgresql

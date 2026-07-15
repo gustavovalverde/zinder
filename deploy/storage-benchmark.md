@@ -3,14 +3,15 @@
 `docker-compose.storage-benchmark.yml` runs the current-schema RocksDB oracle
 and 2 fact-first storage candidates from one immutable `zinder-bench` image and
 one captured fixture. The RocksDB and PostgreSQL fact-first arms persist the
-same `CanonicalBlockFacts` reference encoding, read every row back, recompute
-the ordered sequence digest, and publish a completion marker only after that
-validation succeeds.
+same versioned `CanonicalBlockFacts` semantic replay envelope, read every row
+back, reconstruct the full aggregate, recompute the independent ordered
+sequence digest, and publish a completion marker only after that validation
+succeeds.
 
 The fact-first reports prove only this persisted fact round trip. They do not
 certify fresh canonical construction, compact-block or tree-position material,
 `ChainEpoch` or `ChainEvent` publication, reorg and finality behavior, restore
-and following, wallet projection derivation, query readiness, or the complete
+and following, wallet projection construction, query readiness, or the complete
 production lifecycle. The current-schema oracle remains a separate diagnostic
 baseline, not a third interchangeable fact-first engine.
 
@@ -248,6 +249,20 @@ the database I/O mode separate from external-SST construction, which is buffered
 because the current Rust binding does not expose an external-writer I/O-mode
 override.
 
+The same container writes
+`rocksdb-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
+after the child process exits. The observer samples cgroup-v2
+`memory.current`, preserves the exact component `memory.peak`, and samples
+allocated bytes across `/var/lib/zinder`, including the sibling external-SST
+staging directory. Keep `ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS` fixed
+for the entire campaign. Storage observation runs a recursive `du`, so it adds
+nonzero, layout-dependent metadata and I/O work. Treat the configured interval
+as the delay between observations, not their actual cadence. Inspect the
+artifact timestamps and observed report-window gaps, and calibrate observer-on
+against observer-off smoke runs before using storage high-water evidence to
+select a topology. If that overhead is material, replace the sampler with a
+runner-supported quota or filesystem counter before a formal campaign.
+
 ## Run the PostgreSQL fact-first arm
 
 Start from an empty PostgreSQL volume, wait for database readiness, and inspect
@@ -255,7 +270,7 @@ the selected server before running the client. The benchmark command receives
 only the name `ZINDER_BENCH_POSTGRES_DATABASE_URL`; Compose supplies the value
 inside the client container, so credentials do not enter command arguments or
 the report. The candidate schema explicitly uses `lz4` compression for large
-reference encodings so heap and TOAST bytes do not depend on a server-wide
+replay encodings so heap and TOAST bytes do not depend on a server-wide
 default. The benchmark contract requires this endpoint to be operator
 controlled; do not point the diagnostic client at an untrusted PostgreSQL
 server.
@@ -294,6 +309,11 @@ docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
   --profile postgres run --rm --no-deps postgres-fact-first
+
+docker compose \
+  --env-file /tmp/zinder-storage-benchmark.env \
+  -f deploy/docker-compose.storage-benchmark.yml \
+  --profile postgres stop postgres-database
 ```
 
 The local host endpoint defaults to
@@ -308,6 +328,25 @@ inside one load transaction, builds its deferred primary-key index, validates
 the persisted sequence, and then commits its completion row. The report includes
 the effective database settings, database image identity, and exact client and
 database resource partition.
+
+The client resource artifact is written as
+`postgres-fact-first-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
+when the benchmark client exits. The database artifact is written as
+`postgres-fact-first-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
+only when `postgres-database` stops, because its observer owns the full server
+lifetime. Do not add a campaign row until both files exist. The database
+observer samples allocated bytes across `/var/lib/postgresql`; client storage
+is intentionally unsupported because durable candidate state belongs to the
+database component.
+
+The formal Compose services force a private cgroup namespace and require
+`/proc/self/cgroup` to identify its v2 root before accepting readable
+`memory.current` and `memory.peak` as component evidence. RocksDB and the
+PostgreSQL database also require the complete candidate volume roots to be
+sampleable. A host namespace, missing memory counters, or missing storage root
+therefore fails the container with a configuration error before a multi-hour
+trial; the standalone observer retains unsupported-source output for explicitly
+exploratory uses.
 
 ## Run the PostgreSQL driver integration gate
 
@@ -361,16 +400,16 @@ they do not clear cached pages for the bind-mounted fixture. If neither policy
 can be controlled, label the run exploratory and do not use it to choose a
 topology.
 
-Keep a tab-separated campaign ledger beside the JSON reports. It contains only
-the paired report paths; report paths are resolved relative to the ledger.
-Trial identity, cache policy, runner identity, and start/completion times come
-from the reports rather than duplicated operator claims. Record a row only
-after both arms complete successfully.
+Keep a tab-separated campaign ledger beside the JSON reports and resource
+artifacts. Its 5 artifact paths are resolved relative to the ledger. Trial
+identity, cache policy, runner identity, and start/completion times come from
+the artifacts rather than duplicated operator claims. Record a row only after
+both arms complete successfully and the PostgreSQL database has stopped.
 
 ```text
-rocksdb_report	postgres_report
-rocksdb-fact-first-REV-trial-01.json	postgres-fact-first-REV-trial-01.json
-rocksdb-fact-first-REV-trial-02.json	postgres-fact-first-REV-trial-02.json
+rocksdb_report	rocksdb_resources	postgres_report	postgres_client_resources	postgres_database_resources
+rocksdb-fact-first-REV-trial-01.json	rocksdb-fact-first-REV-trial-01.resources.json	postgres-fact-first-REV-trial-01.json	postgres-fact-first-client-REV-trial-01.resources.json	postgres-fact-first-database-REV-trial-01.resources.json
+rocksdb-fact-first-REV-trial-02.json	rocksdb-fact-first-REV-trial-02.resources.json	postgres-fact-first-REV-trial-02.json	postgres-fact-first-client-REV-trial-02.resources.json	postgres-fact-first-database-REV-trial-02.resources.json
 ```
 
 After at least five alternating pairs, validate the campaign and create the
@@ -388,10 +427,13 @@ overlapping trials or arms, nonalternating arm order, inconsistent cache or
 runner identity, duplicate paths, hashes, trial IDs, or timestamps, incomplete
 candidate evidence, mutable image identities, missing digest acceptance, and
 mismatched fixture, revision, image, resource, concurrency, or engine
-configuration. Compare paired trials first so background host variance is
-visible before relying on the aggregate. The summary preserves each arm's
-canonical report path, SHA-256, and measurements alongside the chronological
-trial evidence and candidate aggregates.
+configuration. It also rejects failed observers, unsupported required sources,
+wrong component or trial identities, uncovered report windows, excessive sample
+gaps, inconsistent sample intervals, and PostgreSQL samples that cannot be
+time-aligned. Compare paired trials first so background host variance is visible
+before relying on the aggregate. The summary preserves every artifact path and
+SHA-256 alongside chronological trial evidence and candidate
+minimum/median/maximum statistics.
 
 ## Compare fact-first reports
 
@@ -411,13 +453,24 @@ is stronger than a PostgreSQL client reconnection. Cross-arm conclusions should
 use end-to-end wall time, final storage bytes, digest equality, and the exact
 recorded resource partition together.
 
-`round_trip.benchmark_client_peak_rss` is intentionally client-process evidence,
-not whole-arm memory usage. It includes RocksDB because RocksDB is embedded in
-the client, but excludes the separate PostgreSQL server. The current `run --rm`
-workflow does not preserve whole-arm cgroup peaks, so these reports must not be
-used for memory-efficiency rankings. A later memory campaign must first add an
-in-container or external monitor that records every component's cgroup
-`memory.peak` before removal.
+`round_trip.benchmark_client_peak_rss` remains a client-process diagnostic, not
+whole-arm memory evidence. The formal campaign metric is
+`sampled_whole_arm_memory_peak_bytes`: RocksDB uses the maximum sampled
+`memory.current` inside its report window; PostgreSQL adds client and database
+`memory.current` only for nearest time-aligned samples within one configured
+sample interval, then takes the maximum aligned sum. Never sum the independent
+component `memory.peak` values: they can occur at different times. Those exact
+cgroup peaks remain useful component diagnostics in each resource artifact.
+
+The comparable storage high-water metric is
+`sampled_whole_arm_storage_peak_bytes`. RocksDB samples its complete candidate
+volume root, including external-SST staging, while PostgreSQL samples the
+database volume root. Both metrics are sampled estimates whose resolution is
+determined by their observed timestamps, not only the configured delay. The
+campaign summary records that delay and the PostgreSQL alignment tolerance,
+while each resource summary records the observed report-window sample gap. Use
+those cadence facts, the report's final physical byte count, and the sampled
+high-water metric together.
 
 ```bash
 jq '{
@@ -427,6 +480,8 @@ jq '{
   fixture_digest: .fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256,
   persisted_digest: .round_trip.persisted_sequence_digest.sha256,
   digest_match: .round_trip.fixture_sequence_digest_match,
+  replay_format_version: .round_trip.replay_format_version,
+  semantic_replay_validated: .round_trip.semantic_replay_validated,
   blocks: .round_trip.block_count,
   wall_clock_seconds: .round_trip.wall_clock_seconds,
   blocks_per_second: .round_trip.blocks_per_second,

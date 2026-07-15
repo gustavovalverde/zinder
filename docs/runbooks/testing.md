@@ -61,6 +61,8 @@ cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 cargo deny check
 cargo machete
+scripts/test-container-resource-evidence.sh
+scripts/test-storage-benchmark-campaign-validator.sh
 scripts/runbook-lint.sh docs/runbooks/testing.md
 git diff --check
 ```
@@ -68,6 +70,12 @@ git diff --check
 Expected outcome: every command exits zero. The full suite runs in ~5 minutes
 on a developer laptop. If `cargo machete` reports unused dependencies on a
 crate you did not touch, treat it as a pre-existing finding, not a blocker.
+
+The 2 storage-benchmark shell tests are hermetic contract tests. One exercises
+resource observation, failure-status preservation, and exclusive artifact
+publication against a fake cgroup; the other constructs a complete synthetic
+campaign and verifies report, resource, alignment, and aggregation rejection
+paths. Neither requires Docker or a live PostgreSQL server.
 
 `scripts/runbook-lint.sh` parses every fenced `bash` block in this runbook
 through `bash -n` (syntax-only mode) so a typo or unclosed quote in an

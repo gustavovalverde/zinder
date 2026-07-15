@@ -171,18 +171,26 @@ that representation belongs inside this replay envelope or an in-memory replay
 window. It does not justify a new public abstraction or storage plane.
 
 `CanonicalBlockFacts` is the backend-neutral Rust aggregate, not a physical
-schema version. `CanonicalBlockFactsDigestVersion` versions only its
-deterministic reference-digest encoding. Version 1 commits every current field
-through explicit numeric tags, length prefixes, option-presence bytes, ordered
-vector boundaries, and fixed little-endian integers. The aggregate owns one
-block header, optional raw block bytes, and ordered `CanonicalTransactionFacts`;
-each transaction owns its public facts, intrinsic balances, transparent inputs
-and outputs, and optional raw bytes. `zinder-bench` fixture format 3 records the
-per-block digest contract and the ordered full-sequence digest. Both concrete
-drivers persist the complete reference encodings, read every row back, and
-recompute that evidence independently of the `RocksDB` or PostgreSQL schema
-revision. Changing a fact, its order, or the digest contract changes the shared
-oracle for both candidates.
+schema version. Two independently versioned contracts serve different jobs:
+
+- `CanonicalBlockFactsDigestVersion` defines the deterministic correctness
+  oracle. Version 1 commits every current field through explicit numeric tags,
+  length prefixes, option-presence bytes, ordered vector boundaries, and fixed
+  little-endian integers.
+- `CanonicalBlockFactsReplayFormatVersion` defines the reversible persistence
+  envelope consumed by projection replay. Decoding must reconstruct the full
+  aggregate, reject unknown or non-canonical bytes, and recompute the reference
+  digest carried by the envelope.
+
+The aggregate owns one block header, optional raw block bytes, and ordered
+`CanonicalTransactionFacts`; each transaction owns its public facts, intrinsic
+balances, transparent inputs and outputs, and optional raw bytes.
+`zinder-bench` fixture format 3 records the per-block digest contract and the
+ordered full-sequence digest. Both concrete drivers persist replay envelopes,
+decode every row into complete semantic facts, recompute the independent
+reference digest, and compare the ordered evidence with the fixture oracle.
+Changing a fact, its order, either versioned contract, or the semantic replay
+result invalidates the candidate evidence.
 
 This round trip is deliberately narrower than canonical storage. It does not
 persist compact blocks, tree state, subtree roots, `ChainEpoch`, `ChainEvent`,
@@ -190,6 +198,14 @@ or mempool events; exercise reorg or publication recovery; or advertise query
 readiness. Its result answers whether the two physical write paths preserve
 the same block-local facts and how quickly they do so. It cannot satisfy the
 fresh canonical construction or topology-certification gates by itself.
+
+The version-1 encoder favors a small, auditable contract and may hold
+intermediate envelope buffers while encoding. Formal resource artifacts measure
+that cost across the complete candidate arm. If representative-corpus evidence
+shows that preparation memory threatens the construction target, optimize the
+same replay format with a consuming or streaming encoder before promoting the
+diagnostic slice into a production lifecycle; do not introduce a second fact
+model to hide allocation pressure.
 
 Canonical ingest follows one ordered contract:
 

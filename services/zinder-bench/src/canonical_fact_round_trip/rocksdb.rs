@@ -36,10 +36,10 @@ const CANONICAL_BLOCK_FACTS_COLUMN_FAMILY: &str = "canonical_block_facts";
 const STORAGE_CONTROL_COLUMN_FAMILY: &str = "storage_control";
 const COMPLETION_MARKER_KEY: &[u8] = b"canonical_fact_round_trip_complete";
 const ROW_MAGIC: [u8; 4] = *b"ZBCF";
-const COMPLETION_MARKER_FORMAT_VERSION: u16 = 1;
+const COMPLETION_MARKER_FORMAT_VERSION: u16 = 2;
 
 /// Candidate-owned physical schema version for persisted canonical fact rows.
-pub const ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 1;
+pub const ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 2;
 /// Explicit compression used for candidate SSTs and the canonical-facts column family.
 pub const ROCKSDB_CANONICAL_FACT_COMPRESSION: &str = "snappy";
 
@@ -69,9 +69,11 @@ pub struct RocksDbCanonicalFactRoundTripValidation {
     pub tip_hash: BlockHash,
     /// Number of persisted canonical fact rows.
     pub block_count: u64,
-    /// Complete reference-encoding bytes stored across all rows.
+    /// Complete semantic replay encoding bytes stored across all rows.
     pub logical_fact_bytes: u64,
-    /// Ordered digest recomputed from every persisted reference encoding.
+    /// Semantic replay format version decoded from every persisted row.
+    pub replay_format_version: u32,
+    /// Ordered digest recomputed from every decoded semantic fact aggregate.
     pub sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
@@ -84,7 +86,7 @@ pub struct RocksDbCanonicalFactRoundTripResult {
     pub timings: CanonicalFactRoundTripTimings,
     /// Evidence recomputed from the persisted rows before publication.
     pub validation: RocksDbCanonicalFactRoundTripValidation,
-    /// Reference-encoding bytes submitted as logical canonical facts.
+    /// Semantic replay encoding bytes submitted as logical canonical facts.
     pub logical_fact_bytes: u64,
     /// External-SST file size before ingestion.
     pub external_sst_bytes: u64,
@@ -377,6 +379,9 @@ fn validate_sequence_against_manifest(
     manifest: &FixtureManifest,
 ) -> Result<RocksDbCanonicalFactRoundTripValidation, BenchError> {
     let position = sequence.position();
+    let replay_format_version = position
+        .replay_format_version
+        .ok_or_else(|| candidate_error("canonical fact sequence has no replay format version"))?;
     let sequence_digest = sequence.finish();
     let expected_sequence_version = CanonicalBlockFactsSequenceDigestVersion::try_from(
         manifest
@@ -452,6 +457,7 @@ fn validate_sequence_against_manifest(
         tip_hash,
         block_count: position.block_count,
         logical_fact_bytes: position.logical_fact_bytes,
+        replay_format_version,
         sequence_digest,
     })
 }
@@ -499,9 +505,9 @@ fn decode_canonical_block_fact_key(bytes: &[u8]) -> Result<BlockHeight, BenchErr
 fn encode_canonical_block_fact_row(
     record: &CanonicalBlockFactRecord,
 ) -> Result<Vec<u8>, BenchError> {
-    let reference_encoding_len = u64::try_from(record.reference_encoding.len())
-        .map_err(|_| candidate_error("canonical fact reference encoding exceeds u64::MAX bytes"))?;
-    let mut encoded = Vec::with_capacity(120_usize.saturating_add(record.reference_encoding.len()));
+    let replay_encoding_len = u64::try_from(record.replay_encoding.len())
+        .map_err(|_| candidate_error("canonical fact replay encoding exceeds u64::MAX bytes"))?;
+    let mut encoded = Vec::with_capacity(120_usize.saturating_add(record.replay_encoding.len()));
     encoded.extend_from_slice(&ROW_MAGIC);
     encoded.extend_from_slice(&ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION.to_le_bytes());
     encoded.extend_from_slice(&record.digest.version().value().to_le_bytes());
@@ -510,8 +516,8 @@ fn encode_canonical_block_fact_row(
     encoded.extend_from_slice(&record.parent_hash.as_bytes());
     encoded.extend_from_slice(&record.transaction_count.to_le_bytes());
     encoded.extend_from_slice(&record.digest.as_bytes());
-    encoded.extend_from_slice(&reference_encoding_len.to_le_bytes());
-    encoded.extend_from_slice(&record.reference_encoding);
+    encoded.extend_from_slice(&replay_encoding_len.to_le_bytes());
+    encoded.extend_from_slice(&record.replay_encoding);
     Ok(encoded)
 }
 
@@ -533,9 +539,9 @@ fn decode_canonical_block_fact_row(bytes: &[u8]) -> Result<CanonicalBlockFactRec
     let parent_hash = BlockHash::from_bytes(decoder.read_array::<32>()?);
     let transaction_count = decoder.read_u32()?;
     let stored_digest = decoder.read_array::<32>()?;
-    let reference_encoding_len = usize::try_from(decoder.read_u64()?)
-        .map_err(|_| candidate_error("canonical fact reference length exceeds usize::MAX"))?;
-    let reference_encoding = decoder.read_bytes(reference_encoding_len)?.to_vec();
+    let replay_encoding_len = usize::try_from(decoder.read_u64()?)
+        .map_err(|_| candidate_error("canonical fact replay length exceeds usize::MAX"))?;
+    let replay_encoding = decoder.read_bytes(replay_encoding_len)?.to_vec();
     decoder.reject_trailing_bytes()?;
     CanonicalBlockFactRecord::from_persisted(PersistedCanonicalBlockFactRow {
         height,
@@ -544,7 +550,7 @@ fn decode_canonical_block_fact_row(bytes: &[u8]) -> Result<CanonicalBlockFactRec
         transaction_count,
         digest_version,
         stored_digest,
-        reference_encoding,
+        replay_encoding,
     })
 }
 
@@ -623,6 +629,7 @@ struct CompletionMarker {
     tip_hash_hex: String,
     block_count: u64,
     block_digest_version: u16,
+    replay_format_version: u32,
     sequence_digest_version: u16,
     sequence_digest_sha256: String,
     logical_fact_bytes: u64,
@@ -646,6 +653,7 @@ impl CompletionMarker {
             block_digest_version: manifest
                 .canonical_block_facts_digest_evidence
                 .block_digest_version,
+            replay_format_version: validation.replay_format_version,
             sequence_digest_version: validation.sequence_digest.version().value(),
             sequence_digest_sha256: hex::encode(validation.sequence_digest.as_bytes()),
             logical_fact_bytes: validation.logical_fact_bytes,

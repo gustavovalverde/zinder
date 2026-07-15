@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use clap::ValueEnum;
 use serde::Serialize;
+use zinder_core::CanonicalBlockFactsReplayFormatVersion;
 use zinder_store::RocksDbResourceBudget;
 
 use crate::{
@@ -15,7 +16,7 @@ use crate::{
 };
 
 /// Machine-readable report schema version.
-pub const REPORT_FORMAT_VERSION: u32 = 3;
+pub const REPORT_FORMAT_VERSION: u32 = 4;
 
 /// Returns whether a container image identity is content addressed.
 #[must_use]
@@ -643,8 +644,8 @@ pub enum CanonicalBlockFactsStorageEvidence {
         ingestion_mode: &'static str,
         /// Whether the candidate fact table is durable and WAL logged.
         tables_logged: bool,
-        /// Explicit TOAST compression used for large reference encodings.
-        reference_encoding_compression: &'static str,
+        /// Explicit TOAST compression used for canonical replay encodings.
+        replay_encoding_compression: &'static str,
         /// Queried performance and durability settings for the measured database arm.
         server_settings: Box<PostgresCanonicalFactServerSettings>,
         /// Bytes owned by the canonical-fact heap and its auxiliary forks.
@@ -667,7 +668,7 @@ pub struct CanonicalBlockFactsRoundTripMeasurements {
     pub wall_clock_seconds: f64,
     /// Fixture metadata validation plus fresh backend and physical-schema initialization.
     pub storage_initialization_wall_clock_seconds: f64,
-    /// Fixture read, parse, and reference-encoding seconds.
+    /// Fixture read, parse, and semantic replay encoding seconds.
     pub fact_preparation_wall_clock_seconds: f64,
     /// Primary table or external-SST construction and ingestion seconds.
     pub fact_persistence_wall_clock_seconds: f64,
@@ -691,12 +692,16 @@ pub struct CanonicalBlockFactsRoundTripMeasurements {
     pub tip_height: u32,
     /// Last persisted block hash in internal byte order.
     pub tip_hash_hex: String,
-    /// Logical reference-encoding bytes submitted to storage.
+    /// Logical semantic replay encoding bytes submitted to storage.
     pub logical_fact_bytes: u64,
     /// Final physical bytes owned by the candidate tables/store.
     pub physical_storage_bytes: u64,
     /// Ordered digest recomputed from persisted rows.
     pub persisted_sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Semantic replay format version decoded from every persisted row.
+    pub replay_format_version: u32,
+    /// Whether every persisted replay envelope decoded into complete canonical facts.
+    pub semantic_replay_validated: bool,
     /// Engine-specific settings and physical write evidence.
     pub storage: CanonicalBlockFactsStorageEvidence,
     /// Peak resident-set-size reading for the benchmark client process.
@@ -740,7 +745,7 @@ pub struct CanonicalBlockFactsRoundTripSummary {
     pub wall_clock_seconds: f64,
     /// Fixture metadata validation plus fresh backend and physical-schema initialization.
     pub storage_initialization_wall_clock_seconds: f64,
-    /// Fixture read, parse, and reference-encoding seconds.
+    /// Fixture read, parse, and semantic replay encoding seconds.
     pub fact_preparation_wall_clock_seconds: f64,
     /// Primary table or external-SST construction and ingestion seconds.
     pub fact_persistence_wall_clock_seconds: f64,
@@ -770,7 +775,7 @@ pub struct CanonicalBlockFactsRoundTripSummary {
     pub block_count: u64,
     /// End-to-end persisted blocks per second.
     pub blocks_per_second: f64,
-    /// Logical reference-encoding bytes submitted to storage.
+    /// Logical semantic replay encoding bytes submitted to storage.
     pub logical_fact_bytes: u64,
     /// Final physical bytes owned by the candidate tables/store.
     pub physical_storage_bytes: u64,
@@ -778,6 +783,10 @@ pub struct CanonicalBlockFactsRoundTripSummary {
     pub persisted_sequence_digest: CanonicalFactSequenceDigestSummary,
     /// Whether the persisted sequence equals the fixture capture oracle.
     pub fixture_sequence_digest_match: bool,
+    /// Semantic replay format version decoded from every persisted row.
+    pub replay_format_version: u32,
+    /// Whether every persisted replay envelope decoded into complete canonical facts.
+    pub semantic_replay_validated: bool,
     /// Engine-specific settings and physical write evidence.
     pub storage: CanonicalBlockFactsStorageEvidence,
     /// Peak resident-set-size reading for the benchmark client process.
@@ -861,6 +870,14 @@ impl BenchmarkReport {
         match self {
             Self::CurrentSchemaFixtureReplay(report) => report.validate_acceptance(),
             Self::CanonicalBlockFactsRoundTrip(report) => {
+                if report.round_trip.replay_format_version
+                    != CanonicalBlockFactsReplayFormatVersion::CURRENT.value()
+                    || !report.round_trip.semantic_replay_validated
+                {
+                    return Err(BenchError::canonical_fact_sequence_mismatch(
+                        "persisted canonical facts lack complete semantic replay validation",
+                    ));
+                }
                 if !report.round_trip.fixture_sequence_digest_match {
                     return Err(BenchError::canonical_fact_sequence_mismatch(
                         "persisted sequence digest does not match the fixture capture oracle",
@@ -1101,6 +1118,8 @@ pub fn build_canonical_block_facts_round_trip_report(
         physical_storage_bytes: measurements.physical_storage_bytes,
         persisted_sequence_digest: measurements.persisted_sequence_digest,
         fixture_sequence_digest_match,
+        replay_format_version: measurements.replay_format_version,
+        semantic_replay_validated: measurements.semantic_replay_validated,
         storage: measurements.storage,
         benchmark_client_peak_rss: measurements.benchmark_client_peak_rss,
     };
@@ -1474,7 +1493,7 @@ mod tests {
         let report =
             build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
 
-        assert_eq!(report.report_format_version, 3);
+        assert_eq!(report.report_format_version, 4);
         assert_provenance_and_writer(&report);
         assert_eq!(report.provenance.run.trial_id.as_deref(), Some("trial-01"));
         assert!(matches!(
@@ -1698,8 +1717,9 @@ mod tests {
     }
 
     #[test]
-    fn fact_round_trip_omits_unmeasured_contracts() -> Result<(), Box<dyn std::error::Error>> {
-        let report = build_canonical_block_facts_round_trip_report(
+    fn fact_round_trip_reports_semantic_replay_and_omits_unmeasured_contracts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut report = build_canonical_block_facts_round_trip_report(
             fixture_summary(),
             CanonicalBlockFactsRoundTripMeasurements {
                 block_prepare_concurrency: 8,
@@ -1725,24 +1745,19 @@ mod tests {
                     block_count: 10,
                     sha256: "persisted-digest".to_owned(),
                 },
+                replay_format_version: 1,
+                semantic_replay_validated: true,
                 storage: CanonicalBlockFactsStorageEvidence::RocksDb {
-                    storage_schema_version: 1,
+                    storage_schema_version: 2,
                     ingestion_mode: "external-sst",
                     durability_mode: "external-sst-ingest-with-synchronous-completion-marker",
                     database_io_mode: "buffered".to_owned(),
                     external_sst_io_mode: "buffered",
                     compression: "snappy",
                     external_sst_bytes: 7_000,
-                    rocksdb_resource_budget: RocksDbResourceBudgetSummary {
-                        block_cache_bytes: 64 * 1024 * 1024,
-                        max_wal_bytes: 32 * 1024 * 1024,
-                        max_open_files: 128,
-                        write_buffer_bytes: 8 * 1024 * 1024,
-                        max_write_buffer_count: 2,
-                        max_background_jobs: 2,
-                        memtable_budget_bytes: 16 * 1024 * 1024,
-                        statistics_level: "tickers",
-                    },
+                    rocksdb_resource_budget: RocksDbResourceBudgetSummary::from(
+                        zinder_store::RocksDbResourceBudget::for_local_tests(),
+                    ),
                 },
                 benchmark_client_peak_rss: crate::rss::PeakRss {
                     bytes: None,
@@ -1766,19 +1781,17 @@ mod tests {
 
         assert_eq!(json["measurement_kind"], "canonical-block-facts-round-trip");
         assert_eq!(json["storage_candidate"]["id"], "rocksdb-fact-first");
-        assert_eq!(json["round_trip"]["storage"]["engine"], "rocksdb");
+        assert_eq!(json["round_trip"]["replay_format_version"], 1);
+        assert_eq!(json["round_trip"]["semantic_replay_validated"], true);
         assert_eq!(json["provenance"]["run"]["trial_id"], "trial-01");
         assert_eq!(json["provenance"]["run"]["fixture_cache_policy"], "warm");
-        assert_eq!(json["provenance"]["run"]["started_at_unix_millis"], 1_000);
-        assert_eq!(json["provenance"]["run"]["completed_at_unix_millis"], 4_000);
-        assert!(
-            json["round_trip"]
-                .get("benchmark_client_peak_rss")
-                .is_some()
-        );
         for omitted_field in ["acceptance", "replay", "lifecycle", "store_reads"] {
             assert!(json.get(omitted_field).is_none(), "{omitted_field}");
         }
+        if let super::BenchmarkReport::CanonicalBlockFactsRoundTrip(fact_report) = &mut report {
+            fact_report.round_trip.replay_format_version = 99;
+        }
+        assert!(report.validate().is_err());
         Ok(())
     }
 

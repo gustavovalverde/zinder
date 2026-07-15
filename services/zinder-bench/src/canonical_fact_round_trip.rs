@@ -9,8 +9,10 @@ use std::{num::NonZeroU32, path::Path, sync::Arc};
 use futures_util::{StreamExt as _, stream};
 use zinder_core::{
     BlockHash, BlockHeight, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
-    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestBuilder,
-    CanonicalBlockFactsSequenceDigestVersion, Network, NetworkUpgradeActivations,
+    CanonicalBlockFactsReplayFormatVersion, CanonicalBlockFactsSequenceDigest,
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion, Network,
+    NetworkUpgradeActivations, decode_canonical_block_facts_replay,
+    encode_canonical_block_facts_replay,
 };
 use zinder_ingest::prepare_canonical_block;
 
@@ -51,50 +53,43 @@ pub struct CanonicalFactRoundTripTimings {
 
 /// Complete block-local fact payload lowered for one concrete storage writer.
 ///
-/// The reference encoding contains every field committed by
-/// [`CanonicalBlockFactsDigest`]. The scalar identity columns support ordered
-/// access, while read-back validation ties them to the versioned reference
-/// encoding before using them for continuity checks.
+/// The replay encoding reconstructs the complete semantic fact aggregate. The
+/// scalar identity columns support ordered access, while read-back validation
+/// ties them to the decoded facts before using them for continuity checks.
 #[derive(Clone, Debug)]
-pub struct CanonicalBlockFactRecord {
+struct CanonicalBlockFactRecord {
     /// Source block height.
-    pub height: BlockHeight,
+    height: BlockHeight,
     /// Source block hash in Zinder's internal byte order.
-    pub block_hash: BlockHash,
+    block_hash: BlockHash,
     /// Parent hash in Zinder's internal byte order.
-    pub parent_hash: BlockHash,
+    parent_hash: BlockHash,
     /// Ordered transaction count in the aggregate.
-    pub transaction_count: u32,
-    /// Digest of the complete reference encoding.
-    pub digest: CanonicalBlockFactsDigest,
-    /// Complete backend-neutral reference encoding.
-    pub reference_encoding: Vec<u8>,
+    transaction_count: u32,
+    /// Backend-neutral reference digest committed by the replay envelope.
+    digest: CanonicalBlockFactsDigest,
+    /// Version of the semantic replay format.
+    replay_format_version: CanonicalBlockFactsReplayFormatVersion,
+    /// Complete backend-neutral semantic replay encoding.
+    replay_encoding: Vec<u8>,
 }
 
 /// Physical row values read back by either concrete storage candidate.
-pub struct PersistedCanonicalBlockFactRow {
+struct PersistedCanonicalBlockFactRow {
     /// Persisted block height.
-    pub height: BlockHeight,
-    /// Persisted block hash in Zinder's internal byte order.
-    pub block_hash: BlockHash,
-    /// Persisted parent hash in Zinder's internal byte order.
-    pub parent_hash: BlockHash,
-    /// Persisted transaction count.
-    pub transaction_count: u32,
-    /// Digest contract used for the persisted reference encoding.
-    pub digest_version: CanonicalBlockFactsDigestVersion,
-    /// Digest stored alongside the reference encoding.
-    pub stored_digest: [u8; 32],
-    /// Complete backend-neutral reference encoding read from storage.
-    pub reference_encoding: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CanonicalFactReferenceScalars {
     height: BlockHeight,
+    /// Persisted block hash in Zinder's internal byte order.
     block_hash: BlockHash,
+    /// Persisted parent hash in Zinder's internal byte order.
     parent_hash: BlockHash,
-    transaction_count: u64,
+    /// Persisted transaction count.
+    transaction_count: u32,
+    /// Digest contract used for the persisted canonical facts.
+    digest_version: CanonicalBlockFactsDigestVersion,
+    /// Digest stored alongside the semantic replay encoding.
+    stored_digest: [u8; 32],
+    /// Complete backend-neutral semantic replay encoding read from storage.
+    replay_encoding: Vec<u8>,
 }
 
 impl CanonicalBlockFactRecord {
@@ -110,21 +105,27 @@ impl CanonicalBlockFactRecord {
             ))
         })?;
         let digest_version = CanonicalBlockFactsDigestVersion::CURRENT;
-        let reference_encoding = prepared.facts.reference_encoding(digest_version);
-        let digest = reference_encoding.digest();
+        let replay_encoding = encode_canonical_block_facts_replay(
+            &prepared.facts,
+            CanonicalBlockFactsReplayFormatVersion::CURRENT,
+            digest_version,
+        );
+        let replay_format_version = replay_encoding.format_version();
+        let digest = replay_encoding.reference_digest();
         Ok(Self {
             height: prepared.facts.block_header.height,
             block_hash: prepared.facts.block_header.block_hash,
             parent_hash: prepared.facts.block_header.parent_hash,
             transaction_count,
             digest,
-            reference_encoding: reference_encoding.into_bytes(),
+            replay_format_version,
+            replay_encoding: replay_encoding.into_bytes(),
         })
     }
 
     /// Reconstructs a read-back row and rejects a stored digest or scalar
-    /// column that does not match the persisted reference-encoding bytes.
-    pub fn from_persisted(row: PersistedCanonicalBlockFactRow) -> Result<Self, BenchError> {
+    /// column that does not match the decoded semantic replay facts.
+    fn from_persisted(row: PersistedCanonicalBlockFactRow) -> Result<Self, BenchError> {
         let PersistedCanonicalBlockFactRow {
             height,
             block_hash,
@@ -132,28 +133,46 @@ impl CanonicalBlockFactRecord {
             transaction_count,
             digest_version,
             stored_digest,
-            reference_encoding,
+            replay_encoding,
         } = row;
-        let digest =
-            CanonicalBlockFactsDigest::from_reference_encoding(digest_version, &reference_encoding);
-        if digest.as_bytes() != stored_digest {
+        let decoded_replay =
+            decode_canonical_block_facts_replay(&replay_encoding).map_err(|source| {
+                BenchError::canonical_fact_sequence_mismatch(format!(
+                    "block {} semantic replay decode failed: {source}",
+                    height.value()
+                ))
+            })?;
+        let replay_format_version = decoded_replay.format_version();
+        let digest = decoded_replay.reference_digest();
+        if digest.version() != digest_version {
             return Err(BenchError::canonical_fact_sequence_mismatch(format!(
-                "block {} persisted fact digest does not match its reference encoding",
+                "block {} replay digest version does not match its scalar column",
                 height.value()
             )));
         }
-        let reference_scalars =
-            decode_reference_scalars(digest_version, &reference_encoding, height)?;
-        if reference_scalars.height != height {
+        let facts = decoded_replay.facts();
+        if digest.as_bytes() != stored_digest {
+            return Err(BenchError::canonical_fact_sequence_mismatch(format!(
+                "block {} persisted fact digest does not match its replay facts",
+                height.value()
+            )));
+        }
+        if facts.block_header.height != height {
             return Err(persisted_scalar_mismatch(height, "height"));
         }
-        if reference_scalars.block_hash != block_hash {
+        if facts.block_header.block_hash != block_hash {
             return Err(persisted_scalar_mismatch(height, "block hash"));
         }
-        if reference_scalars.parent_hash != parent_hash {
+        if facts.block_header.parent_hash != parent_hash {
             return Err(persisted_scalar_mismatch(height, "parent hash"));
         }
-        if reference_scalars.transaction_count != u64::from(transaction_count) {
+        let decoded_transaction_count = u32::try_from(facts.transactions.len()).map_err(|_| {
+            BenchError::canonical_fact_sequence_mismatch(format!(
+                "block {} decoded transaction count exceeds u32",
+                height.value()
+            ))
+        })?;
+        if decoded_transaction_count != transaction_count {
             return Err(persisted_scalar_mismatch(height, "transaction count"));
         }
         Ok(Self {
@@ -162,176 +181,23 @@ impl CanonicalBlockFactRecord {
             parent_hash,
             transaction_count,
             digest,
-            reference_encoding,
+            replay_format_version,
+            replay_encoding,
         })
     }
 
     /// Returns the logical fact-envelope byte count submitted to storage.
     #[must_use]
-    pub fn logical_bytes(&self) -> u64 {
-        u64::try_from(self.reference_encoding.len()).unwrap_or(u64::MAX)
+    fn logical_bytes(&self) -> u64 {
+        u64::try_from(self.replay_encoding.len()).unwrap_or(u64::MAX)
     }
-}
-
-fn decode_reference_scalars(
-    digest_version: CanonicalBlockFactsDigestVersion,
-    reference_encoding: &[u8],
-    persisted_height: BlockHeight,
-) -> Result<CanonicalFactReferenceScalars, BenchError> {
-    match digest_version {
-        CanonicalBlockFactsDigestVersion::V1 => {
-            decode_v1_reference_scalars(reference_encoding, persisted_height)
-        }
-        _ => Err(BenchError::canonical_fact_sequence_mismatch(format!(
-            "block {} reference encoding uses an unsupported digest version {}",
-            persisted_height.value(),
-            digest_version.value()
-        ))),
-    }
-}
-
-fn decode_v1_reference_scalars(
-    reference_encoding: &[u8],
-    persisted_height: BlockHeight,
-) -> Result<CanonicalFactReferenceScalars, BenchError> {
-    let mut facts = ReferenceEncodingFieldDecoder::new(reference_encoding, persisted_height);
-    let encoded_version = decode_fixed_reference_field::<2>(
-        facts.read_field(1, "digest version")?,
-        persisted_height,
-        "digest version",
-    )?;
-    if u16::from_le_bytes(encoded_version) != CanonicalBlockFactsDigestVersion::V1.value() {
-        return Err(BenchError::canonical_fact_sequence_mismatch(format!(
-            "block {} reference encoding embeds an unexpected digest version",
-            persisted_height.value()
-        )));
-    }
-    let block_header = facts.read_field(2, "block header")?;
-    let _raw_block_bytes = facts.read_field(3, "raw block bytes")?;
-    let transactions = facts.read_field(4, "transactions")?;
-    facts.reject_trailing_bytes("canonical block facts")?;
-
-    let mut header = ReferenceEncodingFieldDecoder::new(block_header, persisted_height);
-    let encoded_height = decode_fixed_reference_field::<4>(
-        header.read_field(1, "block height")?,
-        persisted_height,
-        "block height",
-    )?;
-    let block_hash = decode_fixed_reference_field::<32>(
-        header.read_field(2, "block hash")?,
-        persisted_height,
-        "block hash",
-    )?;
-    let parent_hash = decode_fixed_reference_field::<32>(
-        header.read_field(3, "parent hash")?,
-        persisted_height,
-        "parent hash",
-    )?;
-    let encoded_transaction_count = transactions.get(..8).ok_or_else(|| {
-        BenchError::canonical_fact_sequence_mismatch(format!(
-            "block {} reference encoding transaction sequence is shorter than its count",
-            persisted_height.value()
-        ))
-    })?;
-    let transaction_count =
-        u64::from_le_bytes(encoded_transaction_count.try_into().map_err(|_| {
-            BenchError::canonical_fact_sequence_mismatch(format!(
-                "block {} reference encoding transaction count has an invalid width",
-                persisted_height.value()
-            ))
-        })?);
-
-    Ok(CanonicalFactReferenceScalars {
-        height: BlockHeight::new(u32::from_le_bytes(encoded_height)),
-        block_hash: BlockHash::from_bytes(block_hash),
-        parent_hash: BlockHash::from_bytes(parent_hash),
-        transaction_count,
-    })
-}
-
-fn decode_fixed_reference_field<const FIELD_BYTES: usize>(
-    encoded: &[u8],
-    persisted_height: BlockHeight,
-    field_name: &'static str,
-) -> Result<[u8; FIELD_BYTES], BenchError> {
-    encoded.try_into().map_err(|_| {
-        BenchError::canonical_fact_sequence_mismatch(format!(
-            "block {} reference encoding {field_name} must contain {FIELD_BYTES} bytes",
-            persisted_height.value()
-        ))
-    })
 }
 
 fn persisted_scalar_mismatch(height: BlockHeight, field_name: &'static str) -> BenchError {
     BenchError::canonical_fact_sequence_mismatch(format!(
-        "block {} persisted {field_name} does not match its reference encoding",
+        "block {} persisted {field_name} does not match its replay facts",
         height.value()
     ))
-}
-
-struct ReferenceEncodingFieldDecoder<'encoding> {
-    remaining: &'encoding [u8],
-    persisted_height: BlockHeight,
-}
-
-impl<'encoding> ReferenceEncodingFieldDecoder<'encoding> {
-    const FIELD_HEADER_BYTES: usize = 10;
-
-    fn new(remaining: &'encoding [u8], persisted_height: BlockHeight) -> Self {
-        Self {
-            remaining,
-            persisted_height,
-        }
-    }
-
-    fn read_field(
-        &mut self,
-        expected_tag: u16,
-        field_name: &'static str,
-    ) -> Result<&'encoding [u8], BenchError> {
-        let header = self
-            .remaining
-            .get(..Self::FIELD_HEADER_BYTES)
-            .ok_or_else(|| self.invalid_field(field_name, "is missing its field header"))?;
-        let encoded_tag = u16::from_le_bytes(
-            header[..2]
-                .try_into()
-                .map_err(|_| self.invalid_field(field_name, "has an invalid field tag"))?,
-        );
-        if encoded_tag != expected_tag {
-            return Err(self.invalid_field(field_name, "has an unexpected field tag"));
-        }
-        let encoded_payload_bytes = u64::from_le_bytes(
-            header[2..]
-                .try_into()
-                .map_err(|_| self.invalid_field(field_name, "has an invalid length"))?,
-        );
-        let payload_bytes = usize::try_from(encoded_payload_bytes)
-            .map_err(|_| self.invalid_field(field_name, "length exceeds usize::MAX"))?;
-        let field_bytes = Self::FIELD_HEADER_BYTES
-            .checked_add(payload_bytes)
-            .ok_or_else(|| self.invalid_field(field_name, "length overflows usize"))?;
-        let field = self
-            .remaining
-            .get(Self::FIELD_HEADER_BYTES..field_bytes)
-            .ok_or_else(|| self.invalid_field(field_name, "payload is truncated"))?;
-        self.remaining = &self.remaining[field_bytes..];
-        Ok(field)
-    }
-
-    fn reject_trailing_bytes(&self, field_name: &'static str) -> Result<(), BenchError> {
-        if self.remaining.is_empty() {
-            return Ok(());
-        }
-        Err(self.invalid_field(field_name, "contains trailing bytes"))
-    }
-
-    fn invalid_field(&self, field_name: &'static str, reason: &'static str) -> BenchError {
-        BenchError::canonical_fact_sequence_mismatch(format!(
-            "block {} reference encoding {field_name} {reason}",
-            self.persisted_height.value()
-        ))
-    }
 }
 
 /// Ordered position and reference digest accumulated from fact records.
@@ -347,14 +213,16 @@ pub struct CanonicalFactSequencePosition {
     pub tip_hash: Option<BlockHash>,
     /// Number of blocks accumulated.
     pub block_count: u64,
-    /// Sum of complete reference-encoding byte lengths.
+    /// Sum of complete semantic replay encoding byte lengths.
     pub logical_fact_bytes: u64,
+    /// Shared semantic replay format version, or `None` before any append.
+    pub replay_format_version: Option<u32>,
 }
 
 /// In-memory continuity and ordered-digest validator shared by input and
 /// persisted read-back passes.
 #[derive(Debug)]
-pub struct CanonicalFactSequenceAccumulator {
+struct CanonicalFactSequenceAccumulator {
     position: CanonicalFactSequencePosition,
     digest_builder: CanonicalBlockFactsSequenceDigestBuilder,
 }
@@ -362,7 +230,7 @@ pub struct CanonicalFactSequenceAccumulator {
 impl CanonicalFactSequenceAccumulator {
     /// Starts an empty ordered fact sequence.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             position: CanonicalFactSequencePosition {
                 first_height: None,
@@ -371,6 +239,7 @@ impl CanonicalFactSequenceAccumulator {
                 tip_hash: None,
                 block_count: 0,
                 logical_fact_bytes: 0,
+                replay_format_version: None,
             },
             digest_builder: CanonicalBlockFactsSequenceDigestBuilder::new(
                 CanonicalBlockFactsSequenceDigestVersion::CURRENT,
@@ -379,7 +248,7 @@ impl CanonicalFactSequenceAccumulator {
     }
 
     /// Validates and appends one record without mutating state on failure.
-    pub fn append(&mut self, record: &CanonicalBlockFactRecord) -> Result<(), BenchError> {
+    fn append(&mut self, record: &CanonicalBlockFactRecord) -> Result<(), BenchError> {
         if let Some(tip_height) = self.position.tip_height {
             let Some(expected_height) = tip_height.next() else {
                 return Err(BenchError::canonical_fact_sequence_mismatch(
@@ -401,6 +270,17 @@ impl CanonicalFactSequenceAccumulator {
                 "block {} parent hash does not match block {} hash",
                 record.height.value(),
                 record.height.value().saturating_sub(1)
+            )));
+        }
+        let replay_format_version = record.replay_format_version.value();
+        if let Some(expected_replay_format_version) = self.position.replay_format_version
+            && replay_format_version != expected_replay_format_version
+        {
+            return Err(BenchError::canonical_fact_sequence_mismatch(format!(
+                "block {} replay format version {} does not match sequence version {}",
+                record.height.value(),
+                replay_format_version,
+                expected_replay_format_version
             )));
         }
         let next_block_count = self.position.block_count.checked_add(1).ok_or_else(|| {
@@ -428,19 +308,20 @@ impl CanonicalFactSequenceAccumulator {
         self.position.tip_hash = Some(record.block_hash);
         self.position.block_count = next_block_count;
         self.position.logical_fact_bytes = next_logical_fact_bytes;
+        self.position.replay_format_version = Some(replay_format_version);
         self.digest_builder = next_digest_builder;
         Ok(())
     }
 
     /// Returns the current logical sequence position without consuming it.
     #[must_use]
-    pub const fn position(&self) -> CanonicalFactSequencePosition {
+    const fn position(&self) -> CanonicalFactSequencePosition {
         self.position
     }
 
     /// Finishes the ordered reference digest.
     #[must_use]
-    pub fn finish(self) -> CanonicalBlockFactsSequenceDigest {
+    fn finish(self) -> CanonicalBlockFactsSequenceDigest {
         self.digest_builder.finish()
     }
 }
@@ -455,7 +336,7 @@ impl Default for CanonicalFactSequenceAccumulator {
 ///
 /// `buffered` preserves source order even when individual blocking tasks finish
 /// out of order, so concrete writers can stream sorted rows directly.
-pub async fn prepare_fixture_segment(
+async fn prepare_fixture_segment(
     fixture_directory: &Path,
     descriptor: &SegmentDescriptor,
     network: Network,
@@ -490,6 +371,7 @@ mod tests {
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, CanonicalBlockFacts,
         CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
+        CanonicalBlockFactsReplayFormatVersion, encode_canonical_block_facts_replay,
     };
 
     use super::{
@@ -556,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_rows_reject_height_and_transaction_count_outside_the_reference_encoding()
+    fn persisted_rows_reject_height_and_transaction_count_outside_the_replay_encoding()
     -> Result<(), crate::BenchError> {
         let mut rewritten_height = persisted_row(7, [1; 32], [0; 32]);
         rewritten_height.height = BlockHeight::new(8);
@@ -586,15 +468,35 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn persisted_rows_reject_tampered_semantic_replay_bytes() -> Result<(), crate::BenchError> {
+        let mut tampered = persisted_row(7, [1; 32], [0; 32]);
+        let Some(last_byte) = tampered.replay_encoding.last_mut() else {
+            return Err(crate::BenchError::canonical_fact_sequence_mismatch(
+                "test replay encoding is empty",
+            ));
+        };
+        *last_byte ^= 1;
+
+        let Some(error) = CanonicalBlockFactRecord::from_persisted(tampered).err() else {
+            return Err(crate::BenchError::canonical_fact_sequence_mismatch(
+                "tampered replay encoding was accepted",
+            ));
+        };
+
+        assert!(error.to_string().contains("semantic replay decode"));
+        Ok(())
+    }
+
     fn record(
         height: u32,
         block_hash: [u8; 32],
         parent_hash: [u8; 32],
-        reference_encoding: &[u8],
+        replay_encoding: &[u8],
     ) -> CanonicalBlockFactRecord {
         let digest = CanonicalBlockFactsDigest::from_reference_encoding(
             CanonicalBlockFactsDigestVersion::CURRENT,
-            reference_encoding,
+            replay_encoding,
         );
         CanonicalBlockFactRecord {
             height: BlockHeight::new(height),
@@ -602,7 +504,8 @@ mod tests {
             parent_hash: BlockHash::from_bytes(parent_hash),
             transaction_count: 1,
             digest,
-            reference_encoding: reference_encoding.to_vec(),
+            replay_format_version: CanonicalBlockFactsReplayFormatVersion::CURRENT,
+            replay_encoding: replay_encoding.to_vec(),
         }
     }
 
@@ -630,8 +533,12 @@ mod tests {
             transactions: Vec::new(),
         };
         let digest_version = CanonicalBlockFactsDigestVersion::CURRENT;
-        let reference_encoding = facts.reference_encoding(digest_version);
-        let stored_digest = reference_encoding.digest().as_bytes();
+        let replay_encoding = encode_canonical_block_facts_replay(
+            &facts,
+            CanonicalBlockFactsReplayFormatVersion::CURRENT,
+            digest_version,
+        );
+        let stored_digest = replay_encoding.reference_digest().as_bytes();
         PersistedCanonicalBlockFactRow {
             height: BlockHeight::new(height),
             block_hash,
@@ -639,7 +546,7 @@ mod tests {
             transaction_count: 0,
             digest_version,
             stored_digest,
-            reference_encoding: reference_encoding.into_bytes(),
+            replay_encoding: replay_encoding.into_bytes(),
         }
     }
 }

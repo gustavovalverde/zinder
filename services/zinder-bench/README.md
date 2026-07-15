@@ -9,7 +9,7 @@ PostgreSQL.
 The captured fixture is the common input for all three arms. Current-schema
 replay also requires a matching starting canonical store supplied by the
 operator. Fact-first arms create fresh candidate storage and compare every
-persisted reference encoding against the fixture's ordered digest oracle.
+persisted semantic replay envelope against the fixture's ordered digest oracle.
 
 `zinder-bench` is a standalone binary. It links `zinder-ingest` and drives its
 real bulk-catchup pipeline (block prepare, reassembly, commit); it never ships
@@ -170,9 +170,11 @@ Omit `--report` to print the JSON to stdout (progress logs go to stderr).
 ## 4. Compare canonical-fact storage engines
 
 The fact-first commands parse the same fixture into the same complete
-`CanonicalBlockFacts` reference encodings. Each engine writes those encodings,
-reads every row back, recomputes the per-block and ordered sequence digests,
-and publishes a completion fence only after validation.
+`CanonicalBlockFacts` values. Each engine writes the same independently
+versioned semantic replay format, reads every row back, reconstructs the full
+aggregate, rejects non-canonical encodings, recomputes the independent
+per-block and ordered sequence digests, and publishes a completion fence only
+after validation.
 
 The `RocksDB` arm requires a path that does not exist:
 
@@ -235,10 +237,13 @@ ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_
 Selection runs require a repeated, alternating-order campaign and an explicit
 fixture page-cache policy. Fresh candidate volumes do not clear the host cache
 for the bind-mounted fixture. The deployment runbook defines the minimum trial
-count, unique trial IDs, warm/cold policy, and campaign ledger. Run
+count, unique trial IDs, warm/cold policy, and 5-artifact campaign ledger. Each
+trial retains the RocksDB report and resource observation plus the PostgreSQL
+report, client observation, and database observation. Run
 `scripts/validate-storage-benchmark-campaign.sh` to reject inconsistent evidence
 and compute candidate medians/minimums/maximums; a single report pair is
-diagnostic only.
+diagnostic only. The PostgreSQL database observation is complete only after the
+server stops.
 
 These commands prove a persisted `CanonicalBlockFacts` round trip only. They
 do not persist compact blocks, tree state, subtree roots, `ChainEpoch`, or
@@ -252,11 +257,17 @@ PostgreSQL client and server have a fixed resource partition, while the RocksDB
 process owns its whole arm budget. Use phase timings to explain work within each
 arm, not as interchangeable engine microbenchmarks; cross-arm conclusions need
 end-to-end time, storage bytes, digest equality, and resource evidence together.
+The campaign summary's comparable high-water metrics are
+`sampled_whole_arm_memory_peak_bytes` and
+`sampled_whole_arm_storage_peak_bytes`. PostgreSQL memory is the maximum of
+time-aligned client-plus-database `memory.current` samples, never the sum of
+independent component peaks. The exact cgroup `memory.peak` values remain
+component diagnostics in the external resource artifacts.
 
 ## Report fields
 
 - `report_format_version`: machine-readable report contract version. The
-  closed measurement contract described here is version 3.
+  closed measurement contract described here is version 4.
 - `measurement_kind`: either `current-schema-fixture-replay` or
   `canonical-block-facts-round-trip`. The tagged shape prevents fact-only
   evidence from acquiring placeholder lifecycle or current-schema telemetry
@@ -332,19 +343,26 @@ end-to-end time, storage bytes, digest equality, and resource evidence together.
   framework overhead between those timers is explicit as
   `unattributed_wall_clock_seconds`. The report also records range identity,
   block rate, logical and physical bytes, persisted sequence digest,
-  digest-match result, and process peak RSS. These names provide a common
-  diagnostic vocabulary, not interchangeable engine microbenchmarks. In the
-  fresh-reader phase RocksDB closes and reopens its files, while PostgreSQL
-  closes the client connection and reconnects to the running server; neither
-  result certifies a database-server restart.
+  digest-match result, `replay_format_version`, full semantic-replay validation,
+  and process peak RSS. These names provide a common diagnostic vocabulary,
+  not interchangeable engine microbenchmarks. In the fresh-reader phase
+  RocksDB closes and reopens its files, while PostgreSQL closes the client
+  connection and reconnects to the running server; neither result certifies a
+  database-server restart.
 - `round_trip.storage`: engine-specific evidence. The `RocksDB` variant records
   its schema, external-SST bytes, explicit compression, bounded resource budget,
   durability mode, the resolved database I/O mode, and the separately recorded
   buffered external-SST construction mode. The PostgreSQL variant records
-  schema, explicit `lz4` reference-encoding compression, the queried comparison
+  schema, explicit `lz4` replay-encoding compression, the queried comparison
   and durability server settings, table/index/WAL bytes, both component resource
   shares, and the immutable database image identity. Retain the rendered Compose
   model for initdb, shared-memory, and temporary-filesystem evidence.
+
+Container resource observations are separate, versioned evidence artifacts
+rather than fields inside the process-generated report. This keeps the report
+honest about what the benchmark process can observe while allowing the campaign
+validator to prove private component-cgroup scope, exact candidate storage
+roots, and complete report-window coverage for every component.
 
 ## Scope and faithfulness
 
@@ -362,7 +380,7 @@ end-to-end time, storage bytes, digest equality, and resource evidence together.
 - The bulk-catchup configuration uses production-representative defaults from
   `zinder_ingest::bench_support`; only the swept knobs vary between runs.
 - Fact round trips use the production block parser and complete
-  `CanonicalBlockFacts` reference encoding, but their physical schemas are
+  `CanonicalBlockFacts` semantic replay format, but their physical schemas are
   diagnostic vertical slices rather than production canonical stores.
 - The PostgreSQL slice uses the exact production-intended `tokio-postgres`
   driver. The prescribed Compose and CI clusters require SCRAM-SHA-256 host

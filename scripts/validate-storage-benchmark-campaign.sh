@@ -17,21 +17,21 @@ ledger_input="$1"
 [[ -f "$ledger_input" ]] || fail "ledger does not exist: $ledger_input"
 ledger_directory="$(CDPATH='' cd -- "$(dirname -- "$ledger_input")" && pwd)"
 ledger_path="$ledger_directory/$(basename -- "$ledger_input")"
-expected_header=$'rocksdb_report\tpostgres_report'
+expected_header=$'rocksdb_report\trocksdb_resources\tpostgres_report\tpostgres_client_resources\tpostgres_database_resources'
 actual_header="$(sed -n '1p' "$ledger_path")"
 [[ "$actual_header" == "$expected_header" ]] || fail "ledger header must be: $expected_header"
 
 scratch_directory="$(mktemp -d)"
 trap 'rm -rf "$scratch_directory"' EXIT
 trial_ids_path="$scratch_directory/trial-ids"
-report_paths_path="$scratch_directory/report-paths"
-report_hashes_path="$scratch_directory/report-hashes"
+artifact_paths_path="$scratch_directory/artifact-paths"
+artifact_hashes_path="$scratch_directory/artifact-hashes"
 run_timestamps_path="$scratch_directory/run-timestamps"
 trial_evidence_path="$scratch_directory/trials.jsonl"
 chronological_trials_path="$scratch_directory/chronological-trials.json"
 : >"$trial_ids_path"
-: >"$report_paths_path"
-: >"$report_hashes_path"
+: >"$artifact_paths_path"
+: >"$artifact_hashes_path"
 : >"$run_timestamps_path"
 : >"$trial_evidence_path"
 
@@ -43,18 +43,19 @@ campaign_runner_id=""
 common_fingerprint=""
 rocksdb_configuration=""
 postgres_configuration=""
+campaign_sample_interval_seconds=""
 
-resolve_report_path() {
+resolve_artifact_path() {
   local unresolved_path
   case "$1" in
     /*) unresolved_path="$1" ;;
     *) unresolved_path="$ledger_directory/$1" ;;
   esac
-  [[ -f "$unresolved_path" ]] || fail "report does not exist: $unresolved_path"
+  [[ -f "$unresolved_path" ]] || fail "artifact does not exist: $unresolved_path"
   realpath "$unresolved_path"
 }
 
-report_sha256() {
+artifact_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
   else
@@ -93,7 +94,7 @@ validate_report() {
       type == "string"
       and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
       and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
-    .report_format_version == 3
+    .report_format_version == 4
     and .measurement_kind == "canonical-block-facts-round-trip"
     and .storage_candidate.id == $candidate
     and .storage_candidate.canonical_engine == $engine
@@ -102,6 +103,8 @@ validate_report() {
     and .storage_candidate.topology == $topology
     and .round_trip.scope == "canonical-block-facts-fixture-round-trip"
     and .round_trip.fixture_sequence_digest_match == true
+    and .round_trip.replay_format_version == 1
+    and .round_trip.semantic_replay_validated == true
     and (.fixture.fixture_format_version > 0)
     and (.fixture.current_schema_oracle_artifact_schema_version > 0)
     and (.fixture.digest_sha256 | lowercase_sha256)
@@ -179,7 +182,7 @@ validate_report() {
     jq -e '
       def nonblank: type == "string" and (length > 0);
       .round_trip.storage.engine == "rocksdb"
-      and (.round_trip.storage.storage_schema_version > 0)
+      and .round_trip.storage.storage_schema_version == 2
       and .round_trip.storage.ingestion_mode == "sorted-external-sst"
       and (.round_trip.storage.durability_mode | nonblank)
       and (.round_trip.storage.database_io_mode | nonblank)
@@ -209,10 +212,10 @@ validate_report() {
         and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
         and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
       .round_trip.storage.engine == "postgres"
-      and (.round_trip.storage.storage_schema_version > 0)
+      and .round_trip.storage.storage_schema_version == 2
       and .round_trip.storage.ingestion_mode == "binary-copy-single-load-transaction-with-deferred-index"
       and .round_trip.storage.tables_logged == true
-      and .round_trip.storage.reference_encoding_compression == "lz4"
+      and .round_trip.storage.replay_encoding_compression == "lz4"
       and (.round_trip.storage.fact_table_bytes | positive_number)
       and (.round_trip.storage.index_bytes | positive_number)
       and (.round_trip.storage.wal_bytes | positive_number)
@@ -274,7 +277,8 @@ report_fingerprint() {
     .provenance.runner.cpu_limit_cores,
     .provenance.runner.memory_limit_bytes,
     .provenance.runner.storage_class,
-    .round_trip.block_prepare_concurrency
+    .round_trip.block_prepare_concurrency,
+    .round_trip.replay_format_version
   ]' "$1"
 }
 
@@ -291,17 +295,24 @@ report_configuration() {
 }
 
 line_number=1
-while IFS=$'\t' read -r rocksdb_report postgres_report extra; do
+while IFS=$'\t' read -r rocksdb_report rocksdb_resources postgres_report postgres_client_resources postgres_database_resources extra; do
   line_number=$((line_number + 1))
-  if [[ -z "${rocksdb_report}${postgres_report}${extra}" ]]; then
+  if [[ -z "${rocksdb_report}${rocksdb_resources}${postgres_report}${postgres_client_resources}${postgres_database_resources}${extra}" ]]; then
     continue
   fi
-  [[ -z "$extra" ]] || fail "ledger line $line_number has more than two columns"
-  [[ -n "$rocksdb_report" && -n "$postgres_report" ]] \
+  [[ -z "$extra" ]] || fail "ledger line $line_number has more than five columns"
+  [[ -n "$rocksdb_report" \
+    && -n "$rocksdb_resources" \
+    && -n "$postgres_report" \
+    && -n "$postgres_client_resources" \
+    && -n "$postgres_database_resources" ]] \
     || fail "ledger line $line_number has an empty required column"
 
-  rocksdb_path="$(resolve_report_path "$rocksdb_report")"
-  postgres_path="$(resolve_report_path "$postgres_report")"
+  rocksdb_path="$(resolve_artifact_path "$rocksdb_report")"
+  rocksdb_resources_path="$(resolve_artifact_path "$rocksdb_resources")"
+  postgres_path="$(resolve_artifact_path "$postgres_report")"
+  postgres_client_resources_path="$(resolve_artifact_path "$postgres_client_resources")"
+  postgres_database_resources_path="$(resolve_artifact_path "$postgres_database_resources")"
   validate_report "$rocksdb_path" "rocksdb-fact-first" "rocksdb" "rocksdb-single-host"
   validate_report "$postgres_path" "postgres-fact-first" "postgres" "postgres-scale-out"
 
@@ -314,35 +325,334 @@ while IFS=$'\t' read -r rocksdb_report postgres_report extra; do
   [[ "$(basename -- "$postgres_path")" == *"$rocksdb_trial_id"* ]] \
     || fail "PostgreSQL report name on line $line_number does not contain trial ID $rocksdb_trial_id"
 
-  rocksdb_report_sha256="$(report_sha256 "$rocksdb_path")"
-  postgres_report_sha256="$(report_sha256 "$postgres_path")"
+  rocksdb_report_sha256="$(artifact_sha256 "$rocksdb_path")"
+  rocksdb_resources_sha256="$(artifact_sha256 "$rocksdb_resources_path")"
+  postgres_report_sha256="$(artifact_sha256 "$postgres_path")"
+  postgres_client_resources_sha256="$(artifact_sha256 "$postgres_client_resources_path")"
+  postgres_database_resources_sha256="$(artifact_sha256 "$postgres_database_resources_path")"
   trial_evidence="$(jq -cen \
     --slurpfile rocksdb "$rocksdb_path" \
+    --slurpfile rocksdb_resources "$rocksdb_resources_path" \
     --slurpfile postgres "$postgres_path" \
+    --slurpfile postgres_client_resources "$postgres_client_resources_path" \
+    --slurpfile postgres_database_resources "$postgres_database_resources_path" \
     --arg rocksdb_path "$rocksdb_path" \
+    --arg rocksdb_resources_path "$rocksdb_resources_path" \
     --arg postgres_path "$postgres_path" \
+    --arg postgres_client_resources_path "$postgres_client_resources_path" \
+    --arg postgres_database_resources_path "$postgres_database_resources_path" \
     --arg rocksdb_sha256 "$rocksdb_report_sha256" \
-    --arg postgres_sha256 "$postgres_report_sha256" '
+    --arg rocksdb_resources_sha256 "$rocksdb_resources_sha256" \
+    --arg postgres_sha256 "$postgres_report_sha256" \
+    --arg postgres_client_resources_sha256 "$postgres_client_resources_sha256" \
+    --arg postgres_database_resources_sha256 "$postgres_database_resources_sha256" '
+    def nonblank: type == "string" and length > 0;
+    def nonnegative_integer:
+      type == "number" and . >= 0 and floor == .;
+    def positive_number: type == "number" and . > 0;
+    def absolute: if . < 0 then -. else . end;
+    def sample_bucket_key($timestamp_millis; $interval_millis):
+      (($timestamp_millis / $interval_millis) | floor | tostring);
+    def sample_buckets($samples; $interval_millis):
+      reduce $samples[] as $sample ({};
+        sample_bucket_key($sample.observed_at_unix_millis; $interval_millis) as $bucket_key
+        | .[$bucket_key] = ((.[$bucket_key] // []) + [$sample])
+      );
+    def nearest_database_sample(
+      $client_sample;
+      $database_sample_buckets;
+      $interval_millis
+    ):
+      (($client_sample.observed_at_unix_millis / $interval_millis) | floor) as $client_bucket
+      | [
+          range(($client_bucket - 1); ($client_bucket + 2)) as $candidate_bucket
+          | ($database_sample_buckets[($candidate_bucket | tostring)] // [])[]
+          | . as $database_sample
+          | (($client_sample.observed_at_unix_millis
+              - $database_sample.observed_at_unix_millis) | absolute) as $timestamp_delta_millis
+          | select($timestamp_delta_millis <= $interval_millis)
+          | {
+              database_sample: $database_sample,
+              timestamp_delta_millis: $timestamp_delta_millis
+            }
+        ]
+      | sort_by([
+          .timestamp_delta_millis,
+          .database_sample.observed_at_unix_millis
+        ])
+      | first;
+    def validated_resource_evidence(
+      $resource;
+      $expected_component;
+      $expected_trial;
+      $report;
+      $storage_required;
+      $expected_storage_path;
+      $artifact_path;
+      $artifact_sha256
+    ):
+      ($resource.samples | sort_by(.observed_at_unix_millis)) as $samples
+      | ($resource.sample_interval_seconds * 1000 | ceil) as $interval_millis
+      | if (
+          ($resource | type) == "object"
+          and $resource.evidence_format_version == 1
+          and $resource.measurement_kind == "container-resource-observation"
+          and $resource.component_id == $expected_component
+          and $resource.trial_id == $expected_trial
+          and ($resource.sample_interval_seconds | positive_number)
+          and $interval_millis > 0
+          and ($resource.started_at | type == "string" and endswith("Z"))
+          and ($resource.completed_at | type == "string" and endswith("Z"))
+          and ($resource.started_at_unix_millis | nonnegative_integer)
+          and ($resource.completed_at_unix_millis | nonnegative_integer)
+          and $resource.completed_at_unix_millis >= $resource.started_at_unix_millis
+          and $resource.started_at_unix_millis <= $report.provenance.run.started_at_unix_millis
+          and $resource.completed_at_unix_millis >= $report.provenance.run.completed_at_unix_millis
+          and $resource.child_exit_status == 0
+          and $resource.sources.cgroup_namespace.support == "verified-private"
+          and $resource.sources.cgroup_namespace.kind == "proc-self-cgroup-v2"
+          and $resource.sources.cgroup_namespace.path == "/proc/self/cgroup"
+          and ($resource.peak_memory_bytes | nonnegative_integer)
+          and $resource.sources.memory_peak.support == "exact"
+          and $resource.sources.memory_peak.kind == "cgroup-v2-memory.peak"
+          and ($resource.sources.memory_peak.path | nonblank)
+          and ($resource.sources.memory_peak.path | endswith("/memory.peak"))
+          and $resource.sources.memory_current.support == "exact"
+          and $resource.sources.memory_current.kind == "cgroup-v2-memory.current"
+          and ($resource.sources.memory_current.path | nonblank)
+          and ($resource.sources.memory_current.path | endswith("/memory.current"))
+          and ($resource.samples | type) == "array"
+          and ($samples | length) >= 2
+          and $resource.samples == $samples
+          and all($samples[];
+            (.observed_at_unix_millis | nonnegative_integer)
+            and (.memory_current_bytes | nonnegative_integer)
+            and .observed_at_unix_millis >= $resource.started_at_unix_millis
+            and .observed_at_unix_millis <= $resource.completed_at_unix_millis
+          )
+          and all(
+            range(1; ($samples | length));
+            . as $index
+            | $samples[$index - 1].observed_at_unix_millis
+                < $samples[$index].observed_at_unix_millis
+          )
+          and all(
+            (sample_buckets($samples; $interval_millis) | .[]);
+            length <= 3
+          )
+          and $resource.sampled_memory_current_peak_bytes
+            == ([$samples[].memory_current_bytes] | max)
+          and $resource.peak_memory_bytes
+            >= $resource.sampled_memory_current_peak_bytes
+          and (
+            if $storage_required then
+              $resource.sources.storage.support == "sampled"
+              and $resource.sources.storage.kind == "du-allocated-kibibytes"
+              and $resource.sources.storage.path == $expected_storage_path
+              and all($samples[]; (.storage_bytes | nonnegative_integer))
+              and $resource.sampled_storage_peak_bytes
+                == ([$samples[].storage_bytes] | max)
+            else
+              $resource.sources.storage.support == "unsupported"
+              and $resource.sources.storage.kind == "du-allocated-kibibytes"
+              and $resource.sources.storage.path == null
+              and $resource.sampled_storage_peak_bytes == null
+              and all($samples[]; .storage_bytes == null)
+            end
+          )
+        ) then
+          ($samples
+            | map(select(
+                .observed_at_unix_millis
+                  <= $report.provenance.run.started_at_unix_millis
+              ))
+            | last) as $covering_start_sample
+          | ($samples
+            | map(select(
+                .observed_at_unix_millis
+                  >= $report.provenance.run.completed_at_unix_millis
+              ))
+            | first) as $covering_end_sample
+          | if $covering_start_sample == null or $covering_end_sample == null then
+              error("resource samples do not cover the report window")
+            else
+              ($samples
+                | map(select(
+                    .observed_at_unix_millis
+                      >= $covering_start_sample.observed_at_unix_millis
+                    and .observed_at_unix_millis
+                      <= $covering_end_sample.observed_at_unix_millis
+                  ))) as $coverage_samples
+              | ([
+                  range(1; ($coverage_samples | length)) as $index
+                  | ($coverage_samples[$index].observed_at_unix_millis
+                      - $coverage_samples[$index - 1].observed_at_unix_millis)
+                ] | max // 0) as $maximum_observed_sample_gap_millis
+              | if $maximum_observed_sample_gap_millis
+                  <= (2 * $interval_millis) then
+                  {
+                    artifact_path: $artifact_path,
+                    artifact_sha256: $artifact_sha256,
+                    evidence_format_version: $resource.evidence_format_version,
+                    component_id: $resource.component_id,
+                    sample_interval_seconds: $resource.sample_interval_seconds,
+                    sample_interval_millis: $interval_millis,
+                    maximum_samples_per_interval_bucket: 3,
+                    maximum_allowed_sample_gap_millis: (2 * $interval_millis),
+                    maximum_observed_report_window_sample_gap_millis: (
+                      $maximum_observed_sample_gap_millis
+                    ),
+                    evidence_started_at_unix_millis: $resource.started_at_unix_millis,
+                    evidence_completed_at_unix_millis: $resource.completed_at_unix_millis,
+                    component_peak_memory_bytes: $resource.peak_memory_bytes,
+                    sampled_memory_current_peak_bytes: $resource.sampled_memory_current_peak_bytes,
+                    sampled_storage_peak_bytes: $resource.sampled_storage_peak_bytes,
+                    samples: $samples
+                  }
+                else
+                  error("resource samples contain a report-window gap")
+                end
+            end
+        else
+          error("resource evidence contract mismatch")
+        end;
+    def report_window_samples($resource; $report):
+      [$resource.samples[]
+        | select(
+            .observed_at_unix_millis >= $report.provenance.run.started_at_unix_millis
+            and .observed_at_unix_millis <= $report.provenance.run.completed_at_unix_millis
+          )];
+    if (
+      ($rocksdb | length) != 1
+      or ($rocksdb_resources | length) != 1
+      or ($postgres | length) != 1
+      or ($postgres_client_resources | length) != 1
+      or ($postgres_database_resources | length) != 1
+    ) then
+      error("each campaign artifact must contain exactly one JSON value")
+    else
     ($rocksdb[0].provenance.run) as $r
     | ($postgres[0].provenance.run) as $p
-    | {
+    | validated_resource_evidence(
+        $rocksdb_resources[0];
+        "rocksdb-fact-first-client";
+        $r.trial_id;
+        $rocksdb[0];
+        true;
+        "/var/lib/zinder";
+        $rocksdb_resources_path;
+        $rocksdb_resources_sha256
+      ) as $rocksdb_resource
+    | validated_resource_evidence(
+        $postgres_client_resources[0];
+        "postgres-fact-first-client";
+        $p.trial_id;
+        $postgres[0];
+        false;
+        null;
+        $postgres_client_resources_path;
+        $postgres_client_resources_sha256
+      ) as $postgres_client_resource
+    | validated_resource_evidence(
+        $postgres_database_resources[0];
+        "postgres-fact-first-database";
+        $p.trial_id;
+        $postgres[0];
+        true;
+        "/var/lib/postgresql";
+        $postgres_database_resources_path;
+        $postgres_database_resources_sha256
+      ) as $postgres_database_resource
+    | if (
+        $rocksdb_resource.sample_interval_seconds
+          != $postgres_client_resource.sample_interval_seconds
+        or $rocksdb_resource.sample_interval_seconds
+          != $postgres_database_resource.sample_interval_seconds
+      ) then
+        error("resource sample intervals differ within a paired trial")
+      else
+        $rocksdb_resource.sample_interval_millis as $alignment_tolerance_millis
+      | report_window_samples($rocksdb_resource; $rocksdb[0]) as $rocksdb_window
+      | report_window_samples($postgres_client_resource; $postgres[0]) as $postgres_client_window
+      | report_window_samples($postgres_database_resource; $postgres[0]) as $postgres_database_window
+      | sample_buckets(
+          $postgres_database_window;
+          $alignment_tolerance_millis
+        ) as $postgres_database_sample_buckets
+      | if (
+          ($rocksdb_window | length) == 0
+          or ($postgres_client_window | length) == 0
+          or ($postgres_database_window | length) == 0
+        ) then
+          error("resource samples cannot produce aligned report-window evidence")
+        else
+          [
+            $postgres_client_window[] as $client_sample
+            | nearest_database_sample(
+                $client_sample;
+                $postgres_database_sample_buckets;
+                $alignment_tolerance_millis
+              ) as $nearest_database_sample
+            | if $nearest_database_sample == null then
+                error("PostgreSQL client sample has no aligned database sample")
+              else
+                {
+                  client_timestamp_millis: $client_sample.observed_at_unix_millis,
+                  database_timestamp_millis: (
+                    $nearest_database_sample.database_sample.observed_at_unix_millis
+                  ),
+                  timestamp_delta_millis: $nearest_database_sample.timestamp_delta_millis,
+                  memory_bytes: (
+                    $client_sample.memory_current_bytes
+                    + $nearest_database_sample.database_sample.memory_current_bytes
+                  )
+                }
+              end
+          ] as $postgres_aligned_memory_samples
+        | {
         rocksdb: {
           candidate: $rocksdb[0].storage_candidate.id,
           report_path: $rocksdb_path,
           report_sha256: $rocksdb_sha256,
+          resource_evidence: ($rocksdb_resource | del(.samples)),
           wall_clock_seconds: $rocksdb[0].round_trip.wall_clock_seconds,
           blocks_per_second: $rocksdb[0].round_trip.blocks_per_second,
           logical_fact_bytes: $rocksdb[0].round_trip.logical_fact_bytes,
-          physical_storage_bytes: $rocksdb[0].round_trip.physical_storage_bytes
+          physical_storage_bytes: $rocksdb[0].round_trip.physical_storage_bytes,
+          sampled_whole_arm_memory_peak_bytes: (
+            [$rocksdb_window[].memory_current_bytes] | max
+          ),
+          sampled_whole_arm_storage_peak_bytes: (
+            [$rocksdb_window[].storage_bytes] | max
+          )
         },
         postgres: {
           candidate: $postgres[0].storage_candidate.id,
           report_path: $postgres_path,
           report_sha256: $postgres_sha256,
+          resource_evidence: {
+            client: ($postgres_client_resource | del(.samples)),
+            database: ($postgres_database_resource | del(.samples))
+          },
           wall_clock_seconds: $postgres[0].round_trip.wall_clock_seconds,
           blocks_per_second: $postgres[0].round_trip.blocks_per_second,
           logical_fact_bytes: $postgres[0].round_trip.logical_fact_bytes,
-          physical_storage_bytes: $postgres[0].round_trip.physical_storage_bytes
+          physical_storage_bytes: $postgres[0].round_trip.physical_storage_bytes,
+          sampled_whole_arm_memory_peak_bytes: (
+            [$postgres_aligned_memory_samples[].memory_bytes] | max
+          ),
+          sampled_whole_arm_storage_peak_bytes: (
+            [$postgres_database_window[].storage_bytes] | max
+          ),
+          memory_alignment: {
+            rule: "each client sample uses the nearest database sample from adjacent interval buckets within one sample interval",
+            tolerance_millis: $alignment_tolerance_millis,
+            client_sample_count: ($postgres_client_window | length),
+            aligned_sample_pair_count: ($postgres_aligned_memory_samples | length),
+            maximum_timestamp_delta_millis: (
+              [$postgres_aligned_memory_samples[].timestamp_delta_millis] | max
+            )
+          }
         }
       } as $arms
     | if $r.started_at_unix_millis == $p.started_at_unix_millis then
@@ -366,7 +676,14 @@ while IFS=$'\t' read -r rocksdb_report postgres_report extra; do
           arms: $arms
         }
       end
-  ')" || fail "could not derive arm order on line $line_number"
+      | . + {
+          resource_sample_interval_seconds: $rocksdb_resource.sample_interval_seconds,
+          memory_alignment_tolerance_millis: $alignment_tolerance_millis
+        }
+        end
+      end
+    end
+  ')" || fail "could not validate and normalize trial evidence on line $line_number"
   [[ "$(jq -r '.non_overlapping' <<<"$trial_evidence")" == "true" ]] \
     || fail "paired arms overlap on line $line_number"
   rocksdb_fingerprint="$(report_fingerprint "$rocksdb_path")"
@@ -380,6 +697,15 @@ while IFS=$'\t' read -r rocksdb_report postgres_report extra; do
   else
     [[ "$rocksdb_fingerprint" == "$common_fingerprint" ]] \
       || fail "campaign provenance differs on line $line_number"
+  fi
+  current_sample_interval_seconds="$(
+    jq -er '.resource_sample_interval_seconds' <<<"$trial_evidence"
+  )"
+  if [[ -z "$campaign_sample_interval_seconds" ]]; then
+    campaign_sample_interval_seconds="$current_sample_interval_seconds"
+  else
+    [[ "$current_sample_interval_seconds" == "$campaign_sample_interval_seconds" ]] \
+      || fail "resource sample interval differs across the campaign on line $line_number"
   fi
 
   current_rocksdb_configuration="$(report_configuration "$rocksdb_path")"
@@ -395,8 +721,18 @@ while IFS=$'\t' read -r rocksdb_report postgres_report extra; do
   fi
 
   printf '%s\n' "$rocksdb_trial_id" >>"$trial_ids_path"
-  printf '%s\n%s\n' "$rocksdb_path" "$postgres_path" >>"$report_paths_path"
-  printf '%s\n%s\n' "$rocksdb_report_sha256" "$postgres_report_sha256" >>"$report_hashes_path"
+  printf '%s\n%s\n%s\n%s\n%s\n' \
+    "$rocksdb_path" \
+    "$rocksdb_resources_path" \
+    "$postgres_path" \
+    "$postgres_client_resources_path" \
+    "$postgres_database_resources_path" >>"$artifact_paths_path"
+  printf '%s\n%s\n%s\n%s\n%s\n' \
+    "$rocksdb_report_sha256" \
+    "$rocksdb_resources_sha256" \
+    "$postgres_report_sha256" \
+    "$postgres_client_resources_sha256" \
+    "$postgres_database_resources_sha256" >>"$artifact_hashes_path"
   jq -r '[.provenance.run.started_at_unix_millis, .provenance.run.completed_at_unix_millis][]' \
     "$rocksdb_path" "$postgres_path" >>"$run_timestamps_path"
   printf '%s\n' "$trial_evidence" >>"$trial_evidence_path"
@@ -408,10 +744,12 @@ done < <(tail -n +2 "$ledger_path")
 [[ "$trial_count" -ge 5 ]] || fail "at least five paired trials are required; found $trial_count"
 unique_trial_count="$(sort -u "$trial_ids_path" | wc -l | tr -d ' ')"
 [[ "$unique_trial_count" -eq "$trial_count" ]] || fail "report trial IDs must be unique"
-unique_report_count="$(sort -u "$report_paths_path" | wc -l | tr -d ' ')"
-[[ "$unique_report_count" -eq $((trial_count * 2)) ]] || fail "each ledger arm must reference a unique canonical report path"
-unique_hash_count="$(sort -u "$report_hashes_path" | wc -l | tr -d ' ')"
-[[ "$unique_hash_count" -eq $((trial_count * 2)) ]] || fail "copied or byte-identical reports cannot represent distinct runs"
+unique_artifact_count="$(sort -u "$artifact_paths_path" | wc -l | tr -d ' ')"
+[[ "$unique_artifact_count" -eq $((trial_count * 5)) ]] \
+  || fail "every ledger column must reference a unique artifact path"
+unique_hash_count="$(sort -u "$artifact_hashes_path" | wc -l | tr -d ' ')"
+[[ "$unique_hash_count" -eq $((trial_count * 5)) ]] \
+  || fail "copied or byte-identical artifacts cannot represent distinct evidence"
 unique_timestamp_count="$(sort -u "$run_timestamps_path" | wc -l | tr -d ' ')"
 [[ "$unique_timestamp_count" -eq $((trial_count * 4)) ]] || fail "every run start and completion timestamp must be unique"
 jq -s 'sort_by(.started_at_unix_millis)' "$trial_evidence_path" >"$chronological_trials_path"
@@ -442,7 +780,8 @@ jq -s \
   --arg cache_policy "$campaign_cache_policy" \
   --arg runner_id "$campaign_runner_id" \
   --arg fixture_digest "$fixture_digest" \
-  --argjson trial_count "$trial_count" '
+  --argjson trial_count "$trial_count" \
+  --argjson sample_interval_seconds "$campaign_sample_interval_seconds" '
   def statistics:
     sort as $values
     | {
@@ -464,17 +803,38 @@ jq -s \
       fixture_cache_policy: $cache_policy,
       runner_id: $runner_id,
       fixture_sequence_digest_sha256: $fixture_digest,
+      resource_sample_interval_seconds: $sample_interval_seconds,
+      memory_alignment_tolerance_millis: ($sample_interval_seconds * 1000 | ceil),
       trials: $chronological_trials[0]
     },
     candidates: (
       sort_by(.storage_candidate.id)
       | group_by(.storage_candidate.id)
-      | map({
-          candidate: .[0].storage_candidate.id,
-          wall_clock_seconds: ([.[].round_trip.wall_clock_seconds] | statistics),
-          blocks_per_second: ([.[].round_trip.blocks_per_second] | statistics),
-          physical_storage_bytes: ([.[].round_trip.physical_storage_bytes] | statistics)
-        })
+      | map(
+          .[0].storage_candidate.id as $candidate
+          | {
+              candidate: $candidate,
+              wall_clock_seconds: ([.[].round_trip.wall_clock_seconds] | statistics),
+              blocks_per_second: ([.[].round_trip.blocks_per_second] | statistics),
+              physical_storage_bytes: ([.[].round_trip.physical_storage_bytes] | statistics),
+              sampled_whole_arm_memory_peak_bytes: (
+                if $candidate == "rocksdb-fact-first" then
+                  [$chronological_trials[0][].arms.rocksdb.sampled_whole_arm_memory_peak_bytes]
+                else
+                  [$chronological_trials[0][].arms.postgres.sampled_whole_arm_memory_peak_bytes]
+                end
+                | statistics
+              ),
+              sampled_whole_arm_storage_peak_bytes: (
+                if $candidate == "rocksdb-fact-first" then
+                  [$chronological_trials[0][].arms.rocksdb.sampled_whole_arm_storage_peak_bytes]
+                else
+                  [$chronological_trials[0][].arms.postgres.sampled_whole_arm_storage_peak_bytes]
+                end
+                | statistics
+              )
+            }
+        )
     )
   }
 ' "${all_reports[@]}"

@@ -48,12 +48,15 @@ Zinder implements three durable data planes:
 
 The canonical physical model centers on one `CanonicalBlockFacts` value per
 block with ordered transaction facts. The Rust aggregate is backend-neutral and
-does not carry a physical schema version. Its deterministic reference encoding
+does not carry a physical schema version. Its deterministic correctness oracle
 is independently versioned by `CanonicalBlockFactsDigestVersion`; version 1
 commits the header, optional raw block bytes, and ordered
 `CanonicalTransactionFacts` values with explicit tags, lengths, presence
-markers, vector boundaries, and fixed little-endian integers. Separate
-canonical indexes exist
+markers, vector boundaries, and fixed little-endian integers. Its reversible
+storage envelope is separately versioned by
+`CanonicalBlockFactsReplayFormatVersion`. A stored envelope is valid only when
+it decodes into the complete aggregate, has canonical bytes, and reproduces its
+independent reference digest. Separate canonical indexes exist
 only for independently queried contracts such as chain position, transaction
 location, compact blocks, tree state, subtree roots, chain epochs, chain
 events, and mempool events. A structure-of-arrays encoding is an internal
@@ -210,12 +213,13 @@ balance, missing row, or unqualified unavailable error.
    a dedicated driver owns its complete build, validate, catch-up, and publish
    boundary.
 2. Introduce the pure `CanonicalBlockFacts` value, its dedicated reference
-   encoding version, per-block digest, and ordered sequence digest while the
-   current store remains a temporary oracle.
+   digest contract, independently versioned reversible replay format, and
+   ordered sequence digest while the current store remains a temporary oracle.
 3. Implement the smallest fact-first RocksDB and Postgres vertical slices and
-   run both from the same Docker Compose benchmark topology. The diagnostic
-   round-trip slices now exist; they do not yet implement the complete
-   canonical lifecycle or certify either topology.
+   run both from the same Docker Compose benchmark topology. Every row must
+   decode back into complete semantic facts and reproduce the fixture digest.
+   The diagnostic round-trip slices now exist; they do not yet implement the
+   complete canonical lifecycle or certify either topology.
 4. Validate `rocksdb-single-host` and `postgres-scale-out` independently,
    retain both concrete implementations, and reject per-plane backend mixing.
 5. Cut a fresh canonical schema that removes global transparent output,

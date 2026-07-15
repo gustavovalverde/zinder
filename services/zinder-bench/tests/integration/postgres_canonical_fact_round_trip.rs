@@ -10,6 +10,7 @@ use zinder_bench::canonical_fact_round_trip::postgres::{
     PostgresCanonicalFactRoundTripConfig, run_postgres_canonical_fact_round_trip,
     validate_postgres_canonical_fact_round_trip_with_fresh_connection,
 };
+use zinder_core::CanonicalBlockFactsReplayFormatVersion;
 
 use crate::common::write_regtest_fixture;
 
@@ -31,6 +32,10 @@ async fn completed_round_trip_supports_a_fresh_reader_and_rejects_schema_reuse()
 
     assert!(result.validation.position.block_count > 0);
     assert!(result.validation.position.logical_fact_bytes > 0);
+    assert_eq!(
+        result.validation.replay_format_version,
+        CanonicalBlockFactsReplayFormatVersion::CURRENT.value()
+    );
     assert!(result.storage.fact_table_bytes > 0);
     assert!(result.storage.wal_bytes > 0);
     let fresh_reader = validate_postgres_canonical_fact_round_trip_with_fresh_connection(
