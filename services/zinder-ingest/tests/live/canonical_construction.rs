@@ -86,7 +86,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
     assert_eq!(evidence.block_count, u64::from(retained_block_count.get()));
     let io_mode = outcome.builder.io_mode();
     drop(outcome.builder);
-    let persisted = validate_persisted_wallet_families(&store_path, evidence)?;
+    let persisted = validate_persisted_wallet_families(&store_path, &evidence)?;
 
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
@@ -98,7 +98,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
     .ok_or_else(|| eyre!("block-local canonical construction must remain BUILDING"))?;
     assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
     assert!(!temporary.path().join("derive").exists());
-    assert_and_record_live_evidence(build_plan, evidence, &persisted, elapsed, io_mode);
+    assert_and_record_live_evidence(build_plan, &evidence, &persisted, elapsed, io_mode);
     Ok(())
 }
 
@@ -148,7 +148,7 @@ fn live_construction_config(
 )]
 fn assert_and_record_live_evidence(
     build_plan: CanonicalStoreBuildPlan,
-    evidence: CanonicalBlockLoadEvidence,
+    evidence: &CanonicalBlockLoadEvidence,
     persisted: &PersistedCanonicalEvidence,
     elapsed: std::time::Duration,
     io_mode: RocksDbIoMode,
@@ -226,7 +226,8 @@ fn assert_and_record_live_evidence(
              sst_file_count={} sequence_digest={} tip_sapling_tree_size={} \
              tip_orchard_tree_size={} tip_ironwood_tree_size={} elapsed_milliseconds={} \
              blocks_per_second={} logical_mib_per_second={} io_mode={io_mode:?} \
-             persisted_readback=cache_bypassing build_state=BUILDING ready_admission=REFUSED",
+             persisted_readback_milliseconds={} persisted_readback=metadata_and_boundary_samples \
+             build_state=BUILDING ready_admission=REFUSED",
             encode_zinder_native_chain_name(build_plan.network()),
             checkpoint.height.value(),
             encode_rpc_block_hash_hex(checkpoint.hash),
@@ -235,31 +236,31 @@ fn assert_and_record_live_evidence(
             evidence.block_count,
             evidence.transaction_count,
             persisted.block_header.row_count,
-            persisted.block_header.logical_bytes,
+            persisted.block_header.prepared_logical_bytes,
             persisted.block_header.sst_file_bytes,
             persisted.block_header.sst_file_count,
             persisted.block_hash_index.row_count,
-            persisted.block_hash_index.logical_bytes,
+            persisted.block_hash_index.prepared_logical_bytes,
             persisted.block_hash_index.sst_file_bytes,
             persisted.block_hash_index.sst_file_count,
             persisted.block_replay.row_count,
-            persisted.block_replay.logical_bytes,
+            persisted.block_replay.prepared_logical_bytes,
             persisted.block_replay.sst_file_bytes,
             persisted.block_replay.sst_file_count,
             persisted.compact_block.row_count,
-            persisted.compact_block.logical_bytes,
+            persisted.compact_block.prepared_logical_bytes,
             persisted.compact_block.sst_file_bytes,
             persisted.compact_block.sst_file_count,
             persisted.transaction_location.row_count,
-            persisted.transaction_location.logical_bytes,
+            persisted.transaction_location.prepared_logical_bytes,
             persisted.transaction_location.sst_file_bytes,
             persisted.transaction_location.sst_file_count,
             persisted.transaction_blob.row_count,
-            persisted.transaction_blob.logical_bytes,
+            persisted.transaction_blob.prepared_logical_bytes,
             persisted.transaction_blob.sst_file_bytes,
             persisted.transaction_blob.sst_file_count,
             persisted.block_blob.row_count,
-            persisted.block_blob.logical_bytes,
+            persisted.block_blob.prepared_logical_bytes,
             persisted.block_blob.sst_file_bytes,
             persisted.block_blob.sst_file_count,
             evidence.logical_bytes,
@@ -272,6 +273,7 @@ fn assert_and_record_live_evidence(
             elapsed_millis,
             blocks_per_second,
             logical_mib_per_second,
+            persisted.readback_milliseconds,
         );
     }
 }

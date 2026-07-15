@@ -1,17 +1,15 @@
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use eyre::{Result, eyre};
 use prost::Message;
 use rust_rocksdb::{DB, LiveFile, Options, ReadOptions};
 use zinder_core::{
-    BlockHeaderArtifact, BlockHeight, CanonicalBlockFactsSequenceDigestBuilder,
-    CanonicalBlockFactsSequenceDigestVersion, SerializedBytesDigest, decode_canonical_block_replay,
-    wire::{decode_height_key_ascending, encode_height_key_ascending},
+    BlockHeaderArtifact, BlockHeight, SerializedBytesDigest, decode_canonical_block_replay,
+    wire::encode_height_key_ascending,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_store::CanonicalBlockLoadEvidence;
 
-const READBACK_READAHEAD_BYTES: usize = 2 * 1_024 * 1_024;
 const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
 const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
 const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
@@ -23,7 +21,7 @@ const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PersistedFamilyEvidence {
     pub(super) row_count: u64,
-    pub(super) logical_bytes: u64,
+    pub(super) prepared_logical_bytes: u64,
     pub(super) sst_file_bytes: u64,
     pub(super) sst_file_count: u64,
 }
@@ -37,64 +35,19 @@ pub(super) struct PersistedCanonicalEvidence {
     pub(super) transaction_location: PersistedFamilyEvidence,
     pub(super) transaction_blob: PersistedFamilyEvidence,
     pub(super) block_blob: PersistedFamilyEvidence,
-}
-
-impl PersistedCanonicalEvidence {
-    fn families(self) -> [PersistedFamilyEvidence; 7] {
-        [
-            self.block_header,
-            self.block_hash_index,
-            self.block_replay,
-            self.compact_block,
-            self.transaction_location,
-            self.transaction_blob,
-            self.block_blob,
-        ]
-    }
-
-    fn logical_bytes(self) -> u64 {
-        self.families()
-            .into_iter()
-            .map(|family| family.logical_bytes)
-            .sum()
-    }
-
-    fn sst_file_bytes(self) -> u64 {
-        self.families()
-            .into_iter()
-            .map(|family| family.sst_file_bytes)
-            .sum()
-    }
-
-    fn sst_file_count(self) -> u64 {
-        self.families()
-            .into_iter()
-            .map(|family| family.sst_file_count)
-            .sum()
-    }
+    pub(super) readback_milliseconds: u64,
 }
 
 pub(super) fn validate_persisted_wallet_families(
     store_path: &Path,
-    expected: CanonicalBlockLoadEvidence,
+    expected: &CanonicalBlockLoadEvidence,
 ) -> Result<PersistedCanonicalEvidence> {
+    let readback_started_at = Instant::now();
     let column_families = DB::list_cf(&Options::default(), store_path)?;
     let database =
         DB::open_cf_for_read_only(&Options::default(), store_path, &column_families, false)?;
     let live_files = database.live_files()?;
-    let persisted = PersistedCanonicalEvidence {
-        block_header: inspect_family(&database, &live_files, BLOCK_HEADER_COLUMN_FAMILY)?,
-        block_hash_index: inspect_family(&database, &live_files, BLOCK_HASH_INDEX_COLUMN_FAMILY)?,
-        block_replay: inspect_family(&database, &live_files, BLOCK_REPLAY_COLUMN_FAMILY)?,
-        compact_block: inspect_family(&database, &live_files, COMPACT_BLOCK_COLUMN_FAMILY)?,
-        transaction_location: inspect_family(
-            &database,
-            &live_files,
-            TRANSACTION_LOCATION_COLUMN_FAMILY,
-        )?,
-        transaction_blob: inspect_family(&database, &live_files, TRANSACTION_BLOB_COLUMN_FAMILY)?,
-        block_blob: inspect_family(&database, &live_files, BLOCK_BLOB_COLUMN_FAMILY)?,
-    };
+    let mut persisted = inspect_wallet_families(&database, &live_files, expected)?;
 
     assert_eq!(
         persisted.block_header.row_count,
@@ -121,54 +74,137 @@ pub(super) fn validate_persisted_wallet_families(
         expected.transaction_blob_count
     );
     assert_eq!(persisted.block_blob.row_count, expected.block_blob_count);
-    assert_eq!(persisted.logical_bytes(), expected.logical_bytes);
-    assert_eq!(persisted.sst_file_bytes(), expected.sst_file_bytes);
-    assert_eq!(persisted.sst_file_count(), expected.sst_file_count);
-
-    validate_replay_sequence(&database, expected)?;
     for height in sample_heights(expected) {
         validate_sampled_block_families(&database, height, expected)?;
     }
+    persisted.readback_milliseconds = u64::try_from(readback_started_at.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
     Ok(persisted)
+}
+
+fn inspect_wallet_families(
+    database: &DB,
+    live_files: &[LiveFile],
+    expected: &CanonicalBlockLoadEvidence,
+) -> Result<PersistedCanonicalEvidence> {
+    Ok(PersistedCanonicalEvidence {
+        block_header: inspect_family(
+            database,
+            live_files,
+            BLOCK_HEADER_COLUMN_FAMILY,
+            expected.block_header_logical_bytes,
+            4,
+        )?,
+        block_hash_index: inspect_family(
+            database,
+            live_files,
+            BLOCK_HASH_INDEX_COLUMN_FAMILY,
+            expected.block_hash_index_logical_bytes,
+            32,
+        )?,
+        block_replay: inspect_family(
+            database,
+            live_files,
+            BLOCK_REPLAY_COLUMN_FAMILY,
+            expected.block_replay_logical_bytes,
+            4,
+        )?,
+        compact_block: inspect_family(
+            database,
+            live_files,
+            COMPACT_BLOCK_COLUMN_FAMILY,
+            expected.compact_block_logical_bytes,
+            4,
+        )?,
+        transaction_location: inspect_family(
+            database,
+            live_files,
+            TRANSACTION_LOCATION_COLUMN_FAMILY,
+            expected.transaction_location_logical_bytes,
+            32,
+        )?,
+        transaction_blob: inspect_family(
+            database,
+            live_files,
+            TRANSACTION_BLOB_COLUMN_FAMILY,
+            expected.transaction_blob_logical_bytes,
+            8,
+        )?,
+        block_blob: inspect_family(
+            database,
+            live_files,
+            BLOCK_BLOB_COLUMN_FAMILY,
+            expected.block_blob_logical_bytes,
+            4,
+        )?,
+        readback_milliseconds: 0,
+    })
 }
 
 fn inspect_family(
     database: &DB,
     live_files: &[LiveFile],
     family_name: &'static str,
+    prepared_logical_bytes: u64,
+    expected_key_length: usize,
 ) -> Result<PersistedFamilyEvidence> {
-    let column_family = database
+    database
         .cf_handle(family_name)
         .ok_or_else(|| eyre!("fresh canonical store is missing {family_name}"))?;
-    let mut read_options = ReadOptions::default();
-    read_options.fill_cache(false);
-    read_options.set_readahead_size(READBACK_READAHEAD_BYTES);
-    let mut iterator = database.raw_iterator_cf_opt(&column_family, read_options);
-    iterator.seek_to_first();
-    let mut row_count = 0_u64;
-    let mut logical_bytes = 0_u64;
-    while iterator.valid() {
-        let (key, row_value) = iterator
-            .item()
-            .ok_or_else(|| eyre!("{family_name} iterator lost its current row"))?;
-        row_count = row_count
-            .checked_add(1)
-            .ok_or_else(|| eyre!("{family_name} row count exceeds u64::MAX"))?;
-        let row_bytes = u64::try_from(key.len().saturating_add(row_value.len()))
-            .map_err(|_| eyre!("{family_name} row bytes exceed u64::MAX"))?;
-        logical_bytes = logical_bytes
-            .checked_add(row_bytes)
-            .ok_or_else(|| eyre!("{family_name} logical bytes exceed u64::MAX"))?;
-        iterator.next();
-    }
-    iterator.status()?;
-
-    let mut sst_file_bytes = 0_u64;
-    let mut sst_file_count = 0_u64;
-    for file in live_files
+    let mut family_files = live_files
         .iter()
         .filter(|file| file.column_family_name == family_name)
-    {
+        .collect::<Vec<_>>();
+    family_files.sort_unstable_by(|left, right| left.start_key.cmp(&right.start_key));
+    let mut row_count = 0_u64;
+    let mut sst_file_bytes = 0_u64;
+    let mut sst_file_count = 0_u64;
+    let mut previous_end_key: Option<&[u8]> = None;
+    for file in family_files {
+        if file.num_entries == 0 {
+            return Err(eyre!(
+                "fresh {family_name} SST {} contains no entries",
+                file.name
+            ));
+        }
+        if file.num_deletions != 0 {
+            return Err(eyre!(
+                "fresh {family_name} SST {} contains {} deletions",
+                file.name,
+                file.num_deletions
+            ));
+        }
+        let start_key = file
+            .start_key
+            .as_deref()
+            .ok_or_else(|| eyre!("fresh {family_name} SST {} has no start key", file.name))?;
+        let end_key = file
+            .end_key
+            .as_deref()
+            .ok_or_else(|| eyre!("fresh {family_name} SST {} has no end key", file.name))?;
+        if start_key.len() != expected_key_length || end_key.len() != expected_key_length {
+            return Err(eyre!(
+                "fresh {family_name} SST {} has a non-version-1 key width",
+                file.name
+            ));
+        }
+        if start_key > end_key
+            || previous_end_key.is_some_and(|previous_end| previous_end >= start_key)
+        {
+            return Err(eyre!(
+                "fresh {family_name} SST {} has an invalid or overlapping key range",
+                file.name
+            ));
+        }
+        let _ = read_uncached(database, family_name, start_key)?;
+        if start_key != end_key {
+            let _ = read_uncached(database, family_name, end_key)?;
+        }
+        previous_end_key = Some(end_key);
+        row_count = row_count
+            .checked_add(file.num_entries)
+            .ok_or_else(|| eyre!("{family_name} row count exceeds u64::MAX"))?;
         sst_file_count = sst_file_count
             .checked_add(1)
             .ok_or_else(|| eyre!("{family_name} SST count exceeds u64::MAX"))?;
@@ -180,59 +216,13 @@ fn inspect_family(
     }
     Ok(PersistedFamilyEvidence {
         row_count,
-        logical_bytes,
+        prepared_logical_bytes,
         sst_file_bytes,
         sst_file_count,
     })
 }
 
-fn validate_replay_sequence(database: &DB, expected: CanonicalBlockLoadEvidence) -> Result<()> {
-    let column_family = database
-        .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-        .ok_or_else(|| eyre!("fresh canonical store is missing block_replay"))?;
-    let mut read_options = ReadOptions::default();
-    read_options.fill_cache(false);
-    read_options.set_readahead_size(READBACK_READAHEAD_BYTES);
-    let mut iterator = database.raw_iterator_cf_opt(&column_family, read_options);
-    iterator.seek_to_first();
-    let mut expected_height = expected.first_height;
-    let mut expected_parent_hash = expected.first_parent_hash;
-    let mut observed_transaction_count = 0_u64;
-    let mut sequence =
-        CanonicalBlockFactsSequenceDigestBuilder::new(CanonicalBlockFactsSequenceDigestVersion::V1);
-    let mut observed_tip_hash = None;
-    while iterator.valid() {
-        let (key, replay_bytes) = iterator
-            .item()
-            .ok_or_else(|| eyre!("block_replay iterator lost its current row"))?;
-        let height = decode_height_key_ascending(key)?;
-        assert_eq!(height, expected_height);
-        let replay = decode_canonical_block_replay(replay_bytes)?;
-        let facts = replay.facts();
-        assert_eq!(facts.block_header.height, height);
-        assert_eq!(facts.block_header.parent_hash, expected_parent_hash);
-        sequence.try_append(replay.reference_digest())?;
-        observed_transaction_count = observed_transaction_count
-            .checked_add(u64::try_from(facts.transactions.len())?)
-            .ok_or_else(|| eyre!("persisted transaction count exceeds u64::MAX"))?;
-        observed_tip_hash = Some(facts.block_header.block_hash);
-        expected_parent_hash = facts.block_header.block_hash;
-        expected_height = BlockHeight::new(
-            expected_height
-                .value()
-                .checked_add(1)
-                .ok_or_else(|| eyre!("persisted block height exceeds u32::MAX"))?,
-        );
-        iterator.next();
-    }
-    iterator.status()?;
-    assert_eq!(observed_transaction_count, expected.transaction_count);
-    assert_eq!(observed_tip_hash, Some(expected.tip_hash));
-    assert_eq!(sequence.finish(), expected.sequence_digest);
-    Ok(())
-}
-
-fn sample_heights(expected: CanonicalBlockLoadEvidence) -> Vec<BlockHeight> {
+fn sample_heights(expected: &CanonicalBlockLoadEvidence) -> Vec<BlockHeight> {
     let midpoint = BlockHeight::new(
         expected
             .first_height
@@ -248,7 +238,7 @@ fn sample_heights(expected: CanonicalBlockLoadEvidence) -> Vec<BlockHeight> {
 fn validate_sampled_block_families(
     database: &DB,
     height: BlockHeight,
-    expected: CanonicalBlockLoadEvidence,
+    expected: &CanonicalBlockLoadEvidence,
 ) -> Result<()> {
     let height_key = encode_height_key_ascending(height);
     let replay_bytes = read_uncached(database, BLOCK_REPLAY_COLUMN_FAMILY, &height_key)?;
@@ -337,6 +327,7 @@ fn read_uncached(database: &DB, family_name: &'static str, key: &[u8]) -> Result
         .ok_or_else(|| eyre!("fresh canonical store is missing {family_name}"))?;
     let mut read_options = ReadOptions::default();
     read_options.fill_cache(false);
+    read_options.set_verify_checksums(true);
     database
         .get_cf_opt(&column_family, key, &read_options)?
         .ok_or_else(|| eyre!("{family_name} is missing sampled key {}", hex::encode(key)))

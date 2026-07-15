@@ -245,16 +245,19 @@ regtest-only RPCs (`generate`, `invalidateblock`, `reconsiderblock`) opt in
 via `require_live_for(&[Network::ZcashRegtest])` and refuse to run here.
 
 The fixed-range canonical tracer runs on testnet and mainnet. It captures one
-tip identity, retains exactly the following 1,000 blocks, and loads every
+tip identity, retains the requested predecessor-to-tip range, and loads every
 source-derived version-1 family retained by the Wallet workload through one
-production source-to-SST pass. It then reopens RocksDB read-only, disables
-block-cache filling, scans every populated family, recomputes the replay
-sequence identity, and cross-checks first, middle, and tip rows across the
-header, reverse index, replay, compact-block, transaction-location, and raw
-transaction families. It reports per-family row, logical-byte, and SST evidence
-plus aggregate throughput. The store deliberately remains `BUILDING`: this
-test does not claim canonical or wallet readiness before the remaining
-source-observed families, publication records, and wallet projection exist.
+production source-to-SST pass. Construction fully decodes the persisted replay
+sequence without filling the block cache. The tracer then reopens RocksDB
+read-only, checks exact live-file entry counts, rejects tombstones and
+overlapping or malformed SST key ranges, checksum-reads every SST boundary,
+and cross-checks first, middle, and tip identities across the header, reverse
+index, replay, compact-block, transaction-location, and raw transaction
+families. It reports per-family prepared logical bytes and persisted SST
+telemetry plus aggregate throughput. The store deliberately remains
+`BUILDING`: this test does not claim canonical or wallet readiness before the
+remaining source-observed families, publication records, and wallet projection
+exist.
 Run only this tracer with the same environment shown above:
 
 ```bash
