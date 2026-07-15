@@ -33,9 +33,9 @@ use std::{
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zinder_core::{BlockHeight, NetworkUpgradeActivations};
+use zinder_core::{BlockHeight, CommitmentTreeCheckpoint, NetworkUpgradeActivations};
 use zinder_runtime::{IngestPhase, Readiness};
-use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceChainCheckpoint};
+use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget};
 use zinder_store::PrimaryChainStore;
 
 use crate::bulk_catchup::{
@@ -327,7 +327,7 @@ pub struct IngestModifiers {
     /// Optional starting checkpoint resolved against the upstream node
     /// before the loop starts. Populated by the binary entrypoint after
     /// the `checkpoint_height` lookup completes.
-    pub checkpoint: Option<SourceChainCheckpoint>,
+    pub checkpoint: Option<CommitmentTreeCheckpoint>,
 }
 
 /// Subsystem handles surfaced by the spawn-once gate.
@@ -637,7 +637,7 @@ struct BulkCatchupTargetInput {
 
 fn bulk_catchup_progress_tip(
     store_tip: Option<u32>,
-    checkpoint: Option<&zinder_source::SourceChainCheckpoint>,
+    checkpoint: Option<&CommitmentTreeCheckpoint>,
 ) -> u32 {
     store_tip
         .or_else(|| checkpoint.map(|checkpoint| checkpoint.block_id.height.value()))
@@ -756,10 +756,10 @@ async fn sleep_or_cancel(duration: Duration, cancel: &CancellationToken) -> Canc
 mod tests {
     use std::path::PathBuf;
 
-    use zinder_core::{BlockHash, BlockId, CommitmentTreeFrontiers, Network};
-    use zinder_source::{
-        DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget, SourceChainCheckpoint,
+    use zinder_core::{
+        BlockHash, BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, Network,
     };
+    use zinder_source::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget};
 
     use super::*;
 
@@ -922,7 +922,7 @@ mod tests {
         // operator-supplied) checkpoint must seed `from_height` even when
         // the store is empty. Without this, `bulk catchup` rejects the batch
         // with `BulkCatchupCheckpointMisaligned`.
-        let checkpoint = SourceChainCheckpoint::new(
+        let checkpoint = CommitmentTreeCheckpoint::new(
             BlockId::new(BlockHeight::new(279_999), BlockHash::from_bytes([0xAB; 32])),
             0,
             CommitmentTreeFrontiers::default(),
@@ -947,7 +947,7 @@ mod tests {
     #[test]
     fn non_empty_store_starts_at_store_tip_plus_one_even_with_checkpoint()
     -> Result<(), &'static str> {
-        let checkpoint = SourceChainCheckpoint::new(
+        let checkpoint = CommitmentTreeCheckpoint::new(
             BlockId::new(BlockHeight::new(279_999), BlockHash::from_bytes([0xAB; 32])),
             0,
             CommitmentTreeFrontiers::default(),
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn bulk_catchup_progress_tip_uses_checkpoint_for_empty_store() {
-        let checkpoint = SourceChainCheckpoint::new(
+        let checkpoint = CommitmentTreeCheckpoint::new(
             BlockId::new(BlockHeight::new(1_592), BlockHash::from_bytes([0xAB; 32])),
             0,
             CommitmentTreeFrontiers::default(),

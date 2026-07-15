@@ -332,7 +332,7 @@ where
         source,
         CanonicalSourceFetchConfig {
             request_timeout: config.request_timeout,
-            history_predecessor: Some(build_plan.history_predecessor()),
+            history_predecessor: Some(build_plan.history_predecessor().block_id),
             from_height: first_height,
             to_height: build_plan.build_tip().height,
             max_response_bytes: config.max_response_bytes,
@@ -401,7 +401,8 @@ where
 {
     let predecessor_tip_metadata = builder
         .build_plan()
-        .history_predecessor_frontiers()
+        .history_predecessor()
+        .frontiers
         .tip_metadata();
     let (block_sender, block_receiver) = mpsc::channel(block_queue_capacity);
     let loader_task = tokio::task::spawn_blocking(move || {

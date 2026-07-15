@@ -105,6 +105,7 @@ pub use transparent_output::{
 pub use transparent_utxo_set_summary::TransparentUtxoSetSummary;
 pub use tree_state::{
     BlockFinalNoteCommitmentRoots, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
-    CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
-    FinalNoteCommitmentRoot, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, TreeStateArtifact,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
+    CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, TreeStateArtifact,
 };

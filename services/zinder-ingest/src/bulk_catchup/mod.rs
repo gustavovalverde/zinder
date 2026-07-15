@@ -7,10 +7,11 @@ use std::{
 
 use parking_lot::Mutex;
 use zinder_core::{
-    BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, Network, NetworkUpgradeActivations,
+    BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, CommitmentTreeCheckpoint, Network,
+    NetworkUpgradeActivations,
 };
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessState};
-use zinder_source::{NodeSource, NodeTarget, SourceChainCheckpoint, SourceFailureClass};
+use zinder_source::{NodeSource, NodeTarget, SourceFailureClass};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, ChainStoreOptions, PrimaryChainStore,
 };
@@ -126,7 +127,7 @@ pub struct BulkCatchupRunConfig {
     /// `tip_metadata`, then begins bulk catchup from `checkpoint.height + 1`.
     /// `from_height` must equal `checkpoint.height + 1` in this mode. Reads
     /// at heights below the checkpoint return `ArtifactUnavailable`.
-    pub checkpoint: Option<SourceChainCheckpoint>,
+    pub checkpoint: Option<CommitmentTreeCheckpoint>,
 }
 
 impl BulkCatchupRunConfig {
@@ -667,7 +668,7 @@ struct BulkCatchupStart {
 fn bootstrap_from_checkpoint_if_needed(
     store: &PrimaryChainStore,
     network: Network,
-    checkpoint: Option<&SourceChainCheckpoint>,
+    checkpoint: Option<&CommitmentTreeCheckpoint>,
     from_height: BlockHeight,
 ) -> Result<Option<ChainEpoch>, IngestError> {
     let Some(checkpoint) = checkpoint else {
@@ -840,8 +841,8 @@ mod tests {
 
     use super::*;
 
-    fn empty_checkpoint(block_id: BlockId) -> SourceChainCheckpoint {
-        SourceChainCheckpoint::new(block_id, 0, CommitmentTreeFrontiers::default())
+    fn empty_checkpoint(block_id: BlockId) -> CommitmentTreeCheckpoint {
+        CommitmentTreeCheckpoint::new(block_id, 0, CommitmentTreeFrontiers::default())
     }
 
     #[tokio::test]
@@ -884,7 +885,7 @@ mod tests {
         let checkpoint_height = BlockHeight::new(10);
         let checkpoint_hash = block_hash(checkpoint_height.value());
         let mut config = test_bulk_catchup_run_config(&storage_path, 11, 11, 1, true)?;
-        config.checkpoint = Some(SourceChainCheckpoint::new(
+        config.checkpoint = Some(CommitmentTreeCheckpoint::new(
             BlockId::new(checkpoint_height, checkpoint_hash),
             0,
             CommitmentTreeFrontiers::from_validated_parts(

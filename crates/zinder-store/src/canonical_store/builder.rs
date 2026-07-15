@@ -177,7 +177,7 @@ fn validate_block_load_range(
             evidence.first_height.value()
         )));
     }
-    if evidence.first_parent_hash != build_plan.history_predecessor().hash {
+    if evidence.first_parent_hash != build_plan.history_predecessor().block_id.hash {
         return Err(CanonicalStoreError::block_load_sequence(format!(
             "block {} parent does not match the persisted history predecessor",
             evidence.first_height.value()
@@ -317,6 +317,7 @@ mod tests {
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let build_plan = CanonicalStoreBuildPlan::complete(
             &activations,
+            0,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -379,6 +380,7 @@ mod tests {
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let build_plan = CanonicalStoreBuildPlan::complete(
             &activations,
+            0,
             BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([2; 32])),
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -590,10 +592,13 @@ mod tests {
                 )?;
                 CanonicalStoreBuildPlan::checkpointed(
                     &activations,
-                    checkpoint,
-                    crate::canonical_store::test_checkpoint_frontiers(
-                        &activations,
-                        checkpoint.height,
+                    zinder_core::CommitmentTreeCheckpoint::new(
+                        checkpoint,
+                        0,
+                        crate::canonical_store::test_checkpoint_frontiers(
+                            &activations,
+                            checkpoint.height,
+                        ),
                     ),
                     BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
                 )?
@@ -612,6 +617,7 @@ mod tests {
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         Ok(CanonicalStoreBuildPlan::complete(
             &activations,
+            0,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
         )?)
     }

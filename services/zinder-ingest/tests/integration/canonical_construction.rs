@@ -16,9 +16,10 @@ use prost::Message;
 use rust_rocksdb::{DB, Options};
 use tempfile::TempDir;
 use zinder_core::{
-    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeFrontier, CommitmentTreeFrontiers,
-    Network, NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion,
-    ShieldedProtocol, wire::encode_height_key_ascending,
+    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
+    CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
+    wire::encode_height_key_ascending,
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
@@ -179,8 +180,11 @@ async fn load_ironwood_fixture(
     let activations = regtest_activations();
     let build_plan = CanonicalStoreBuildPlan::checkpointed(
         &activations,
-        checkpoint,
-        predecessor_frontiers,
+        CommitmentTreeCheckpoint::new(
+            checkpoint,
+            source_block.block_time_seconds.saturating_sub(1),
+            predecessor_frontiers,
+        ),
         fixed_tip,
     )?;
     let temporary = TempDir::new()?;
@@ -232,8 +236,12 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
     );
     let fixed_tip = BlockId::new(source_block.height, source_block.hash);
     let activations = regtest_activations();
-    let build_plan = CanonicalStoreBuildPlan::complete(&activations, fixed_tip)?;
-    let history_predecessor = build_plan.history_predecessor();
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        &activations,
+        source_block.block_time_seconds.saturating_sub(1),
+        fixed_tip,
+    )?;
+    let history_predecessor = build_plan.history_predecessor().block_id;
     let temporary = TempDir::new()?;
     let store_path = temporary.path().join("canonical");
     let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -295,8 +303,12 @@ async fn canonical_construction_rejects_source_blocks_from_another_network()
     let source_block = fixture_source_block()?;
     let fixed_tip = BlockId::new(source_block.height, source_block.hash);
     let activations = regtest_activations();
-    let build_plan = CanonicalStoreBuildPlan::complete(&activations, fixed_tip)?;
-    let history_predecessor = build_plan.history_predecessor();
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        &activations,
+        source_block.block_time_seconds.saturating_sub(1),
+        fixed_tip,
+    )?;
+    let history_predecessor = build_plan.history_predecessor().block_id;
     let temporary = TempDir::new()?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
@@ -352,8 +364,12 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
         store_activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
     let configured_fingerprint =
         activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
-    let build_plan = CanonicalStoreBuildPlan::complete(&store_activations, fixed_tip)?;
-    let history_predecessor = build_plan.history_predecessor();
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        &store_activations,
+        source_block.block_time_seconds.saturating_sub(1),
+        fixed_tip,
+    )?;
+    let history_predecessor = build_plan.history_predecessor().block_id;
     let temporary = TempDir::new()?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),

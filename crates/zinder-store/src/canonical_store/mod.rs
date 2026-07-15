@@ -16,9 +16,10 @@ use thiserror::Error;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
-    CommitmentTreeFrontiers, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
-    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
-    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
+    ShieldedProtocol,
 };
 
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
@@ -44,8 +45,7 @@ pub struct CanonicalStoreBuildPlan {
     network: zinder_core::Network,
     network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     history_bounds: zinder_core::CanonicalHistoryBounds,
-    history_predecessor: BlockId,
-    history_predecessor_frontiers: CommitmentTreeFrontiers,
+    history_predecessor: CommitmentTreeCheckpoint,
     build_tip: BlockId,
 }
 
@@ -53,6 +53,7 @@ impl CanonicalStoreBuildPlan {
     /// Builds a plan retaining every non-genesis block through `build_tip`.
     pub fn complete(
         network_upgrade_activations: &NetworkUpgradeActivations,
+        genesis_block_time_seconds: u32,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         validate_required_network_upgrades(network_upgrade_activations)?;
@@ -62,8 +63,11 @@ impl CanonicalStoreBuildPlan {
             network_upgrade_activations
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
             zinder_core::CanonicalHistoryBounds::complete(),
-            BlockId::new(BlockHeight::new(0), network.genesis_hash()),
-            CommitmentTreeFrontiers::default(),
+            CommitmentTreeCheckpoint::new(
+                BlockId::new(BlockHeight::new(0), network.genesis_hash()),
+                genesis_block_time_seconds,
+                CommitmentTreeFrontiers::default(),
+            ),
             build_tip,
         )
     }
@@ -71,20 +75,19 @@ impl CanonicalStoreBuildPlan {
     /// Builds a plan retaining blocks immediately after `checkpoint` through `build_tip`.
     pub fn checkpointed(
         network_upgrade_activations: &NetworkUpgradeActivations,
-        checkpoint: BlockId,
-        checkpoint_frontiers: CommitmentTreeFrontiers,
+        checkpoint: CommitmentTreeCheckpoint,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         validate_required_network_upgrades(network_upgrade_activations)?;
-        if checkpoint.height.value() == 0 {
+        if checkpoint.block_id.height.value() == 0 {
             return Err(CanonicalStoreBuildPlanError::CheckpointAtGenesis);
         }
-        let history_bounds = zinder_core::CanonicalHistoryBounds::checkpointed(checkpoint)
+        let history_bounds = zinder_core::CanonicalHistoryBounds::checkpointed(checkpoint.block_id)
             .map_err(|_| CanonicalStoreBuildPlanError::CheckpointHasNoSuccessor)?;
         validate_checkpoint_frontier_presence(
             network_upgrade_activations,
-            checkpoint,
-            &checkpoint_frontiers,
+            checkpoint.block_id,
+            &checkpoint.frontiers,
         )?;
         Self::from_parts(
             network_upgrade_activations.network(),
@@ -92,30 +95,24 @@ impl CanonicalStoreBuildPlan {
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
             history_bounds,
             checkpoint,
-            checkpoint_frontiers,
             build_tip,
         )
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "decoding must reconstruct all six immutable canonical build identity fields explicitly"
-    )]
     pub(super) fn from_parts(
         network: zinder_core::Network,
         network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
         history_bounds: zinder_core::CanonicalHistoryBounds,
-        history_predecessor: BlockId,
-        history_predecessor_frontiers: CommitmentTreeFrontiers,
+        history_predecessor: CommitmentTreeCheckpoint,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         match history_bounds.preceding_checkpoint() {
-            None if history_predecessor
+            None if history_predecessor.block_id
                 != BlockId::new(BlockHeight::new(0), network.genesis_hash()) =>
             {
                 return Err(CanonicalStoreBuildPlanError::InvalidHistoryPredecessor);
             }
-            Some(checkpoint) if history_predecessor != checkpoint => {
+            Some(checkpoint) if history_predecessor.block_id != checkpoint => {
                 return Err(CanonicalStoreBuildPlanError::InvalidHistoryPredecessor);
             }
             Some(checkpoint) if checkpoint.height.value() == 0 => {
@@ -124,7 +121,7 @@ impl CanonicalStoreBuildPlan {
             None | Some(_) => {}
         }
         if history_bounds.preceding_checkpoint().is_none()
-            && history_predecessor_frontiers != CommitmentTreeFrontiers::default()
+            && history_predecessor.frontiers != CommitmentTreeFrontiers::default()
         {
             return Err(CanonicalStoreBuildPlanError::CompleteHistoryHasFrontiers);
         }
@@ -133,7 +130,7 @@ impl CanonicalStoreBuildPlan {
             ShieldedProtocol::Orchard,
             ShieldedProtocol::Ironwood,
         ] {
-            if let Some(frontier) = history_predecessor_frontiers.get(protocol)
+            if let Some(frontier) = history_predecessor.frontiers.get(protocol)
                 && frontier.final_state_bytes().len()
                     > MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES
             {
@@ -155,7 +152,6 @@ impl CanonicalStoreBuildPlan {
             network_upgrade_activations_fingerprint,
             history_bounds,
             history_predecessor,
-            history_predecessor_frontiers,
             build_tip,
         })
     }
@@ -180,16 +176,10 @@ impl CanonicalStoreBuildPlan {
         self.history_bounds
     }
 
-    /// Returns the block immediately preceding retained history.
+    /// Returns the typed checkpoint immediately preceding retained history.
     #[must_use]
-    pub const fn history_predecessor(&self) -> BlockId {
-        self.history_predecessor
-    }
-
-    /// Returns the commitment-tree frontiers immediately before retained history.
-    #[must_use]
-    pub const fn history_predecessor_frontiers(&self) -> &CommitmentTreeFrontiers {
-        &self.history_predecessor_frontiers
+    pub const fn history_predecessor(&self) -> &CommitmentTreeCheckpoint {
+        &self.history_predecessor
     }
 
     /// Returns the exact source tip this build must reach.
@@ -573,22 +563,23 @@ mod tests {
         let network = zinder_core::Network::ZcashTestnet;
         let activations = test_network_upgrade_activations(network)?;
         let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
-        let plan = CanonicalStoreBuildPlan::complete(&activations, build_tip)?;
+        let plan = CanonicalStoreBuildPlan::complete(&activations, 1_234, build_tip)?;
         assert_eq!(plan.network(), network);
         assert_eq!(
             plan.network_upgrade_activations_fingerprint(),
             activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
         );
         assert_eq!(
-            plan.history_predecessor(),
+            plan.history_predecessor().block_id,
             BlockId::new(BlockHeight::new(0), network.genesis_hash())
         );
+        assert_eq!(plan.history_predecessor().block_time_seconds, 1_234);
         assert_eq!(
             plan.history_bounds().first_available_height(),
             BlockHeight::new(1)
         );
         assert_eq!(
-            plan.history_predecessor_frontiers(),
+            &plan.history_predecessor().frontiers,
             &CommitmentTreeFrontiers::default()
         );
         assert_eq!(plan.build_tip(), build_tip);
@@ -599,6 +590,7 @@ mod tests {
     fn build_plan_rejects_incomplete_activation_table() {
         let error = CanonicalStoreBuildPlan::complete(
             &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
+            0,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
         )
         .err();
@@ -620,7 +612,7 @@ mod tests {
         )?;
         let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
 
-        let plan = CanonicalStoreBuildPlan::complete(&canopy_only_activations, build_tip)?;
+        let plan = CanonicalStoreBuildPlan::complete(&canopy_only_activations, 0, build_tip)?;
 
         assert_eq!(plan.build_tip(), build_tip);
         Ok(())
@@ -631,6 +623,7 @@ mod tests {
         let activations = test_network_upgrade_activations(Network::ZcashRegtest)?;
         let error = CanonicalStoreBuildPlan::complete(
             &activations,
+            0,
             BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
         )
         .err();
@@ -649,8 +642,11 @@ mod tests {
         let activations = test_network_upgrade_activations(Network::ZcashRegtest)?;
         let error = CanonicalStoreBuildPlan::checkpointed(
             &activations,
-            BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
-            CommitmentTreeFrontiers::default(),
+            CommitmentTreeCheckpoint::new(
+                BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
+                99,
+                CommitmentTreeFrontiers::default(),
+            ),
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
         )
         .err();
@@ -668,13 +664,13 @@ mod tests {
         let checkpoint_frontiers = active_empty_frontiers();
         let plan = CanonicalStoreBuildPlan::checkpointed(
             &activations,
-            checkpoint,
-            checkpoint_frontiers.clone(),
+            CommitmentTreeCheckpoint::new(checkpoint, 1_234, checkpoint_frontiers.clone()),
             BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
         )?;
 
-        assert_eq!(plan.history_predecessor(), checkpoint);
-        assert_eq!(plan.history_predecessor_frontiers(), &checkpoint_frontiers);
+        assert_eq!(plan.history_predecessor().block_id, checkpoint);
+        assert_eq!(plan.history_predecessor().block_time_seconds, 1_234);
+        assert_eq!(plan.history_predecessor().frontiers, checkpoint_frontiers);
         Ok(())
     }
 
@@ -687,11 +683,14 @@ mod tests {
             network,
             activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
             zinder_core::CanonicalHistoryBounds::complete(),
-            BlockId::new(BlockHeight::new(0), network.genesis_hash()),
-            CommitmentTreeFrontiers::from_validated_parts(
-                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
-                None,
-                None,
+            CommitmentTreeCheckpoint::new(
+                BlockId::new(BlockHeight::new(0), network.genesis_hash()),
+                0,
+                CommitmentTreeFrontiers::from_validated_parts(
+                    Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+                    None,
+                    None,
+                ),
             ),
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
         )
@@ -712,8 +711,7 @@ mod tests {
         assert_eq!(
             CanonicalStoreBuildPlan::checkpointed(
                 &activations,
-                genesis,
-                CommitmentTreeFrontiers::default(),
+                CommitmentTreeCheckpoint::new(genesis, 0, CommitmentTreeFrontiers::default(),),
                 BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             )
             .err(),
@@ -724,8 +722,7 @@ mod tests {
         assert!(matches!(
             CanonicalStoreBuildPlan::checkpointed(
                 &activations,
-                checkpoint,
-                CommitmentTreeFrontiers::default(),
+                CommitmentTreeCheckpoint::new(checkpoint, 0, CommitmentTreeFrontiers::default(),),
                 BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32])),
             )
             .err(),

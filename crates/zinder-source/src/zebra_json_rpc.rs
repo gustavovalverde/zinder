@@ -20,17 +20,17 @@ use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, BlockValuePoolBalances,
     BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
     BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainValuePool, ChainValuePools,
-    CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
-    ConsensusBranchId, FinalNoteCommitmentRoot, Network, NetworkUpgradeActivation,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootHash,
-    SubtreeRootIndex, TransactionBroadcastResult, TransactionId, ValuePoolBalance,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
+    CommitmentTreeFrontiers, ConsensusBranchId, FinalNoteCommitmentRoot, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId, ValuePoolBalance,
 };
 
 use crate::{
     CookieSource, CookieSourceError, NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig,
-    NodeSource, ResilientClient, SourceBlock, SourceChainCheckpoint, SourceChainCursor,
-    SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
-    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, TransactionBroadcaster,
+    NodeSource, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
+    SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
+    SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, TransactionBroadcaster,
     TreeStateUpstream, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
@@ -247,7 +247,7 @@ impl ZebraJsonRpcSource {
         &self,
         height: BlockHeight,
         network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<SourceChainCheckpoint, SourceError> {
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
         if network_upgrade_activations.network() != self.network {
             return Err(SourceError::SourceProtocolMismatch {
                 reason: "checkpoint activation table network does not match the node source",
@@ -287,7 +287,7 @@ impl ZebraJsonRpcSource {
             network_upgrade_activations,
         )?;
 
-        Ok(SourceChainCheckpoint::new(
+        Ok(CommitmentTreeCheckpoint::new(
             block_id,
             block_time_seconds,
             frontiers,

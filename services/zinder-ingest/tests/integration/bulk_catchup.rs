@@ -16,8 +16,8 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tempfile::tempdir;
 use zinder_core::{
-    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeFrontier, CommitmentTreeFrontiers,
-    Network, ShieldedProtocol, SubtreeRootIndex,
+    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
+    CommitmentTreeFrontiers, Network, ShieldedProtocol, SubtreeRootIndex,
 };
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, DeriveStoreError, ProjectionPreset,
@@ -31,8 +31,8 @@ use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
     DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapabilities, NodeCapability, NodeSource,
-    NodeTarget, SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoots,
-    SourceTreeState, decode_rpc_block_hash,
+    NodeTarget, SourceBlock, SourceError, SourceSubtreeRoots, SourceTreeState,
+    decode_rpc_block_hash,
 };
 use zinder_store::{
     ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
@@ -58,8 +58,8 @@ fn test_all_blob_store_options() -> ChainStoreOptions {
     }
 }
 
-fn empty_checkpoint(block_id: BlockId) -> SourceChainCheckpoint {
-    SourceChainCheckpoint::new(block_id, 0, CommitmentTreeFrontiers::default())
+fn empty_checkpoint(block_id: BlockId) -> CommitmentTreeCheckpoint {
+    CommitmentTreeCheckpoint::new(block_id, 0, CommitmentTreeFrontiers::default())
 }
 
 #[tokio::test]
@@ -370,7 +370,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_valid_nonzero_checkpoint() -> 
     let source_block = super::fixture_block::fixture_ironwood_source_block()
         .map_err(|error| eyre!(error.to_string()))?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = SourceChainCheckpoint::new(
+    let checkpoint = CommitmentTreeCheckpoint::new(
         BlockId::new(checkpoint_height, source_block.parent_hash),
         0,
         CommitmentTreeFrontiers::from_validated_parts(

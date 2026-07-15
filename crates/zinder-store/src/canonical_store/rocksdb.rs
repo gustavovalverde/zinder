@@ -656,6 +656,7 @@ mod tests {
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         Ok(CanonicalStoreBuildPlan::complete(
             &activations,
+            0,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
         )?)
     }

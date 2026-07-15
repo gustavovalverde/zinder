@@ -62,13 +62,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
     let checkpoint = source
         .fetch_chain_checkpoint(checkpoint_height, &activations)
         .await?;
-    let checkpoint_id = checkpoint.block_id;
-    let build_plan = CanonicalStoreBuildPlan::checkpointed(
-        &activations,
-        checkpoint_id,
-        checkpoint.frontiers,
-        fixed_tip,
-    )?;
+    let build_plan = CanonicalStoreBuildPlan::checkpointed(&activations, checkpoint, fixed_tip)?;
     let temporary = tempdir()?;
     let store_path = temporary.path().join("canonical");
     let resource_budget = RocksDbResourceBudget::canonical_writer_defaults();
@@ -167,7 +161,7 @@ fn assert_and_record_live_evidence(
         .saturating_div(elapsed_millis)
         .saturating_div(MIB);
     let fixed_tip = build_plan.build_tip();
-    let checkpoint = build_plan.history_predecessor();
+    let checkpoint = build_plan.history_predecessor().block_id;
 
     assert_eq!(
         evidence.first_height,
@@ -175,7 +169,7 @@ fn assert_and_record_live_evidence(
     );
     assert_eq!(
         evidence.first_parent_hash,
-        build_plan.history_predecessor().hash
+        build_plan.history_predecessor().block_id.hash
     );
     assert_eq!(evidence.block_header_count, evidence.block_count);
     assert_eq!(evidence.block_hash_index_count, evidence.block_count);

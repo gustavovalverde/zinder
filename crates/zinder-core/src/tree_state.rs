@@ -349,6 +349,43 @@ impl CommitmentTreeFrontiers {
     }
 }
 
+/// Exact block and commitment-tree state used to resume canonical history.
+///
+/// The block time is retained with the validated frontiers so a checkpoint can
+/// serve the complete typed tree-state contract without consulting its source
+/// node again.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CommitmentTreeCheckpoint {
+    /// Exact canonical block at which these frontiers were observed.
+    pub block_id: BlockId,
+    /// Checkpoint block timestamp in Unix seconds.
+    pub block_time_seconds: u32,
+    /// Validated frontiers after applying `block_id`.
+    pub frontiers: CommitmentTreeFrontiers,
+}
+
+impl CommitmentTreeCheckpoint {
+    /// Creates one typed commitment-tree checkpoint.
+    #[must_use]
+    pub const fn new(
+        block_id: BlockId,
+        block_time_seconds: u32,
+        frontiers: CommitmentTreeFrontiers,
+    ) -> Self {
+        Self {
+            block_id,
+            block_time_seconds,
+            frontiers,
+        }
+    }
+
+    /// Derives the commitment-tree sizes represented by this checkpoint.
+    #[must_use]
+    pub fn tip_metadata(&self) -> ChainTipMetadata {
+        self.frontiers.tip_metadata()
+    }
+}
+
 /// In-memory note-commitment-tree state used while applying canonical blocks.
 ///
 /// The accumulator is initialized from one validated predecessor checkpoint,

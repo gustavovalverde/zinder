@@ -1369,7 +1369,7 @@ fn checkpoint_response_with_all_frontiers(
 async fn fetch_checkpoint_response(
     response: Value,
     activations: &NetworkUpgradeActivations,
-) -> eyre::Result<Result<zinder_source::SourceChainCheckpoint, SourceError>> {
+) -> eyre::Result<Result<zinder_core::CommitmentTreeCheckpoint, SourceError>> {
     let server =
         JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(response))])?;
     let source = ZebraJsonRpcSource::new(
