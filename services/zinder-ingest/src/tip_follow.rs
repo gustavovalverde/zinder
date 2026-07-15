@@ -385,23 +385,31 @@ fn set_tip_follow_readiness(
         lag_state
     };
 
-    let current_cause = readiness.report().cause;
     // Don't override retention-driven warning states with the lag-derived
     // Ready: the retention task owns the cursor-at-risk lifecycle and the
     // orchestrator owns mempool source/hydration causes. Leaving those in
-    // place keeps each subsystem the source of truth for its own causes.
-    if matches!(
-        current_cause,
-        ReadinessCause::CursorAtRisk { .. }
-            | ReadinessCause::MempoolCursorAtRisk { .. }
-            | ReadinessCause::MempoolSourceUnavailable
-            | ReadinessCause::MempoolHydrationLagging { .. }
-    ) && matches!(gated_state.cause, ReadinessCause::Ready)
-    {
-        return;
-    }
+    // place keeps each subsystem the source of truth for its own causes. The
+    // tip-follow observation still owns current and target heights, so advance
+    // those fields while the orthogonal warning remains active.
+    readiness.update(|current_state| {
+        let warning_owns_cause = matches!(gated_state.cause, ReadinessCause::Ready)
+            && matches!(
+                current_state.cause,
+                ReadinessCause::CursorAtRisk { .. }
+                    | ReadinessCause::MempoolCursorAtRisk { .. }
+                    | ReadinessCause::MempoolSourceUnavailable
+                    | ReadinessCause::MempoolHydrationLagging { .. }
+            );
+        if warning_owns_cause {
+            current_state.current_height = gated_state.current_height;
+            current_state.target_height = gated_state.target_height;
+            return;
+        }
 
-    readiness.set(gated_state);
+        let phase = gated_state.phase.or(current_state.phase);
+        *current_state = gated_state;
+        current_state.phase = phase;
+    });
 }
 
 fn set_tip_follow_node_unavailable(
@@ -1082,7 +1090,7 @@ mod tests {
         BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, SubtreeRootHash, SubtreeRootIndex,
     };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
-    use zinder_runtime::ReadinessCause;
+    use zinder_runtime::{IngestPhase, ReadinessCause};
     use zinder_source::{
         ChainTipNotification, ChainTipNotificationStream, NodeCapabilities, SourceBlockHeader,
         SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
@@ -1115,6 +1123,33 @@ mod tests {
         assert!(!reached_target_height(Some(BlockHeight::new(10)), None));
         assert!(!reached_target_height(Some(BlockHeight::new(10)), Some(9)));
         assert!(reached_target_height(Some(BlockHeight::new(10)), Some(10)));
+    }
+
+    #[test]
+    fn tip_follow_ready_updates_heights_without_clearing_owned_warning() {
+        let warning_states = [
+            ReadinessState::cursor_at_risk(23, 24, Some(100)),
+            ReadinessState::mempool_cursor_at_risk(59, 60, Some(100)),
+            ReadinessState::mempool_source_unavailable(Some(100)),
+            ReadinessState::mempool_hydration_lagging(3, Some(100)),
+        ];
+
+        for warning_state in warning_states {
+            let expected_cause = warning_state.cause.clone();
+            let readiness = Readiness::new(warning_state.with_phase(IngestPhase::FollowingTip));
+
+            set_tip_follow_readiness(
+                &readiness,
+                ReadinessState::ready_with_target(Some(120), Some(121)),
+                None,
+            );
+
+            let report = readiness.report();
+            assert_eq!(report.cause, expected_cause);
+            assert_eq!(report.current_height, Some(120));
+            assert_eq!(report.target_height, Some(121));
+            assert_eq!(report.phase, Some(IngestPhase::FollowingTip));
+        }
     }
 
     #[tokio::test]
