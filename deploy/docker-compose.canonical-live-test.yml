@@ -10,7 +10,7 @@ services:
       - live_test_data:/var/lib/zinder-live
     restart: "no"
 
-  canonical-replay:
+  canonical-blocks:
     image: ${ZINDER_INGEST_LIVE_TEST_IMAGE:-zinder-ingest-live-tests:local}
     environment:
       RUST_LOG: ${RUST_LOG:-info}
@@ -23,7 +23,7 @@ services:
       ZINDER_NODE__REQUEST_TIMEOUT_SECS: ${ZINDER_NODE__REQUEST_TIMEOUT_SECS:-30}
       ZINDER_NODE__MAX_RESPONSE_BYTES: ${ZINDER_NODE__MAX_RESPONSE_BYTES:-67108864}
     command:
-      - live::canonical_construction::canonical_replay_loads_1000_blocks_from_fixed_checkpoint
+      - live::canonical_construction::canonical_blocks_load_1000_blocks_from_fixed_checkpoint
       - --exact
       - --ignored
       - --nocapture

@@ -245,16 +245,21 @@ regtest-only RPCs (`generate`, `invalidateblock`, `reconsiderblock`) opt in
 via `require_live_for(&[Network::ZcashRegtest])` and refuse to run here.
 
 The fixed-range canonical tracer runs on testnet and mainnet. It captures one
-tip identity, retains exactly the following 1,000 blocks, loads the version-1
-replay family through the production source-to-SST path, performs a
-cache-bypassing semantic readback, and reports block and byte throughput. The
-store deliberately remains `BUILDING`: this test does not claim wallet
-readiness before the remaining canonical families and wallet projection exist.
+tip identity, retains exactly the following 1,000 blocks, and loads every
+source-derived version-1 family retained by the Wallet workload through one
+production source-to-SST pass. It then reopens RocksDB read-only, disables
+block-cache filling, scans every populated family, recomputes the replay
+sequence identity, and cross-checks first, middle, and tip rows across the
+header, reverse index, replay, compact-block, transaction-location, and raw
+transaction families. It reports per-family row, logical-byte, and SST evidence
+plus aggregate throughput. The store deliberately remains `BUILDING`: this
+test does not claim canonical or wallet readiness before the remaining
+source-observed families, publication records, and wallet projection exist.
 Run only this tracer with the same environment shown above:
 
 ```bash
 cargo nextest run --profile=ci-live --run-ignored=all \
-  -E 'test(canonical_replay_loads_1000_blocks_from_fixed_checkpoint)'
+  -E 'test(canonical_blocks_load_1000_blocks_from_fixed_checkpoint)'
 ```
 
 For the local Z3 testnet topology, the dedicated Docker setup builds the test
@@ -268,7 +273,7 @@ docker build -f deploy/Dockerfile \
   -t zinder-ingest-live-tests:local .
 docker compose -p zinder-canonical-live-test \
   -f deploy/docker-compose.canonical-live-test.yml \
-  run --rm canonical-replay
+  run --rm canonical-blocks
 docker compose -p zinder-canonical-live-test \
   -f deploy/docker-compose.canonical-live-test.yml \
   down -v

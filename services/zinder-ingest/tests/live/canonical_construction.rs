@@ -17,10 +17,10 @@ use zinder_core::{
     NetworkUpgradeActivations,
     wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name},
 };
-use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical_block_replay};
+use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical_blocks};
 use zinder_source::NodeSource;
 use zinder_store::{
-    CanonicalBlockReplayLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
+    CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
     CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbIoMode,
     RocksDbResourceBudget,
 };
@@ -28,12 +28,16 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 
 use crate::common::{fetch_live_network_upgrade_activations, zebra_source_for_live_env};
 
+mod persisted_wallet_readback;
+
+use persisted_wallet_readback::{PersistedCanonicalEvidence, validate_persisted_wallet_families};
+
 const RETAINED_BLOCK_COUNT: u32 = 1_000;
 const MIB: u64 = 1_024 * 1_024;
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn canonical_replay_loads_1000_blocks_from_fixed_checkpoint() -> Result<()> {
+async fn canonical_blocks_load_1000_blocks_from_fixed_checkpoint() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashTestnet, Network::ZcashMainnet])? else {
         return Ok(());
@@ -47,7 +51,7 @@ async fn canonical_replay_loads_1000_blocks_from_fixed_checkpoint() -> Result<()
         .map(BlockHeight::new)
         .ok_or_else(|| {
             eyre!(
-                "canonical replay tracer needs a tip at or above {RETAINED_BLOCK_COUNT}; got {}",
+                "canonical block tracer needs a tip at or above {RETAINED_BLOCK_COUNT}; got {}",
                 fixed_tip.height.value()
             )
         })?;
@@ -72,16 +76,13 @@ async fn canonical_replay_loads_1000_blocks_from_fixed_checkpoint() -> Result<()
         build_plan,
         resource_budget,
     )?;
-    let outcome = load_fresh_canonical_block_replay(builder, &source, config).await?;
+    let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
     let elapsed = construction_started_at.elapsed();
-    assert_and_record_live_evidence(
-        build_plan,
-        outcome.evidence,
-        elapsed,
-        outcome.builder.io_mode(),
-    );
-
+    let evidence = outcome.evidence;
+    let io_mode = outcome.builder.io_mode();
     drop(outcome.builder);
+    let persisted = validate_persisted_wallet_families(&store_path, evidence)?;
+
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
         env.network(),
@@ -89,9 +90,10 @@ async fn canonical_replay_loads_1000_blocks_from_fixed_checkpoint() -> Result<()
         resource_budget,
     )
     .err()
-    .ok_or_else(|| eyre!("replay-only live construction must remain BUILDING"))?;
+    .ok_or_else(|| eyre!("block-local canonical construction must remain BUILDING"))?;
     assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
     assert!(!temporary.path().join("derive").exists());
+    assert_and_record_live_evidence(build_plan, evidence, &persisted, elapsed, io_mode);
     Ok(())
 }
 
@@ -122,9 +124,14 @@ fn live_construction_config(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the calibration record lists every canonical family measurement explicitly"
+)]
 fn assert_and_record_live_evidence(
     build_plan: CanonicalStoreBuildPlan,
-    evidence: CanonicalBlockReplayLoadEvidence,
+    evidence: CanonicalBlockLoadEvidence,
+    persisted: &PersistedCanonicalEvidence,
     elapsed: std::time::Duration,
     io_mode: RocksDbIoMode,
 ) {
@@ -136,7 +143,7 @@ fn assert_and_record_live_evidence(
         .saturating_mul(1_000)
         .saturating_div(elapsed_millis);
     let logical_mib_per_second = evidence
-        .logical_replay_bytes
+        .logical_bytes
         .saturating_mul(1_000)
         .saturating_div(elapsed_millis)
         .saturating_div(MIB);
@@ -152,6 +159,16 @@ fn assert_and_record_live_evidence(
         build_plan.history_predecessor().hash
     );
     assert_eq!(evidence.block_count, u64::from(RETAINED_BLOCK_COUNT));
+    assert_eq!(evidence.block_header_count, evidence.block_count);
+    assert_eq!(evidence.block_hash_index_count, evidence.block_count);
+    assert_eq!(evidence.block_replay_count, evidence.block_count);
+    assert_eq!(evidence.compact_block_count, evidence.block_count);
+    assert_eq!(
+        evidence.transaction_location_count,
+        evidence.transaction_count
+    );
+    assert_eq!(evidence.transaction_blob_count, evidence.transaction_count);
+    assert_eq!(evidence.block_blob_count, 0);
     assert_eq!(evidence.tip_height, fixed_tip.height);
     assert_eq!(evidence.tip_hash, fixed_tip.hash);
     assert_eq!(
@@ -166,7 +183,7 @@ fn assert_and_record_live_evidence(
         evidence.sequence_digest_version,
         CanonicalBlockFactsSequenceDigestVersion::V1
     );
-    assert!(evidence.logical_replay_bytes > 0);
+    assert!(evidence.logical_bytes > 0);
     assert!(evidence.sst_file_bytes > 0);
     assert!(evidence.sst_file_count > 0);
 
@@ -176,20 +193,65 @@ fn assert_and_record_live_evidence(
     )]
     {
         eprintln!(
-            "canonical_replay_live_evidence network={} checkpoint_height={} checkpoint_hash={} \
-             tip_height={} tip_hash={} block_count={} logical_replay_bytes={} sst_file_bytes={} \
-             sst_file_count={} sequence_digest={} elapsed_milliseconds={} blocks_per_second={} \
-             logical_mib_per_second={} io_mode={io_mode:?}",
+            "canonical_blocks_live_evidence network={} checkpoint_height={} checkpoint_hash={} \
+             tip_height={} tip_hash={} block_count={} transaction_count={} \
+             block_header_rows={} block_header_logical_bytes={} block_header_sst_bytes={} \
+             block_header_sst_files={} block_hash_index_rows={} \
+             block_hash_index_logical_bytes={} block_hash_index_sst_bytes={} \
+             block_hash_index_sst_files={} block_replay_rows={} block_replay_logical_bytes={} \
+             block_replay_sst_bytes={} block_replay_sst_files={} compact_block_rows={} \
+             compact_block_logical_bytes={} compact_block_sst_bytes={} compact_block_sst_files={} \
+             transaction_location_rows={} transaction_location_logical_bytes={} \
+             transaction_location_sst_bytes={} transaction_location_sst_files={} \
+             transaction_blob_rows={} transaction_blob_logical_bytes={} transaction_blob_sst_bytes={} \
+             transaction_blob_sst_files={} block_blob_rows={} block_blob_logical_bytes={} \
+             block_blob_sst_bytes={} block_blob_sst_files={} logical_bytes={} sst_file_bytes={} \
+             sst_file_count={} sequence_digest={} tip_sapling_tree_size={} \
+             tip_orchard_tree_size={} tip_ironwood_tree_size={} elapsed_milliseconds={} \
+             blocks_per_second={} logical_mib_per_second={} io_mode={io_mode:?} \
+             persisted_readback=cache_bypassing build_state=BUILDING ready_admission=REFUSED",
             encode_zinder_native_chain_name(build_plan.network()),
             checkpoint.height.value(),
             encode_rpc_block_hash_hex(checkpoint.hash),
             fixed_tip.height.value(),
             encode_rpc_block_hash_hex(fixed_tip.hash),
             evidence.block_count,
-            evidence.logical_replay_bytes,
+            evidence.transaction_count,
+            persisted.block_header.row_count,
+            persisted.block_header.logical_bytes,
+            persisted.block_header.sst_file_bytes,
+            persisted.block_header.sst_file_count,
+            persisted.block_hash_index.row_count,
+            persisted.block_hash_index.logical_bytes,
+            persisted.block_hash_index.sst_file_bytes,
+            persisted.block_hash_index.sst_file_count,
+            persisted.block_replay.row_count,
+            persisted.block_replay.logical_bytes,
+            persisted.block_replay.sst_file_bytes,
+            persisted.block_replay.sst_file_count,
+            persisted.compact_block.row_count,
+            persisted.compact_block.logical_bytes,
+            persisted.compact_block.sst_file_bytes,
+            persisted.compact_block.sst_file_count,
+            persisted.transaction_location.row_count,
+            persisted.transaction_location.logical_bytes,
+            persisted.transaction_location.sst_file_bytes,
+            persisted.transaction_location.sst_file_count,
+            persisted.transaction_blob.row_count,
+            persisted.transaction_blob.logical_bytes,
+            persisted.transaction_blob.sst_file_bytes,
+            persisted.transaction_blob.sst_file_count,
+            persisted.block_blob.row_count,
+            persisted.block_blob.logical_bytes,
+            persisted.block_blob.sst_file_bytes,
+            persisted.block_blob.sst_file_count,
+            evidence.logical_bytes,
             evidence.sst_file_bytes,
             evidence.sst_file_count,
             hex::encode(evidence.sequence_digest.as_bytes()),
+            evidence.tip_metadata.sapling_commitment_tree_size,
+            evidence.tip_metadata.orchard_commitment_tree_size,
+            evidence.tip_metadata.ironwood_commitment_tree_size,
             elapsed_millis,
             blocks_per_second,
             logical_mib_per_second,
