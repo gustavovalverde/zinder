@@ -16,6 +16,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       TMPDIR: /var/lib/zinder-live
       ZINDER_TEST_LIVE: "1"
+      ZINDER_TEST_CANONICAL_BLOCK_COUNT: ${ZINDER_TEST_CANONICAL_BLOCK_COUNT:-1000}
       ZINDER_NETWORK: ${ZINDER_NETWORK:-zcash-testnet}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:18232}
       ZINDER_NODE__AUTH__METHOD: cookie
@@ -23,7 +24,7 @@ services:
       ZINDER_NODE__REQUEST_TIMEOUT_SECS: ${ZINDER_NODE__REQUEST_TIMEOUT_SECS:-30}
       ZINDER_NODE__MAX_RESPONSE_BYTES: ${ZINDER_NODE__MAX_RESPONSE_BYTES:-67108864}
     command:
-      - live::canonical_construction::canonical_blocks_load_1000_blocks_from_fixed_checkpoint
+      - live::canonical_construction::canonical_blocks_load_requested_range_from_fixed_checkpoint
       - --exact
       - --ignored
       - --nocapture

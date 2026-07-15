@@ -4,6 +4,7 @@
 )]
 
 use std::{
+    env::VarError,
     num::{NonZeroU32, NonZeroU64},
     sync::Arc,
     time::Instant,
@@ -32,26 +33,29 @@ mod persisted_wallet_readback;
 
 use persisted_wallet_readback::{PersistedCanonicalEvidence, validate_persisted_wallet_families};
 
-const RETAINED_BLOCK_COUNT: u32 = 1_000;
+const CANONICAL_BLOCK_COUNT_ENV: &str = "ZINDER_TEST_CANONICAL_BLOCK_COUNT";
+const DEFAULT_CANONICAL_BLOCK_COUNT: u32 = 1_000;
 const MIB: u64 = 1_024 * 1_024;
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn canonical_blocks_load_1000_blocks_from_fixed_checkpoint() -> Result<()> {
+async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashTestnet, Network::ZcashMainnet])? else {
         return Ok(());
     };
     let source = zebra_source_for_live_env(&env)?;
+    let retained_block_count = requested_canonical_block_count()?;
     let fixed_tip = source.tip_id().await?;
     let checkpoint_height = fixed_tip
         .height
         .value()
-        .checked_sub(RETAINED_BLOCK_COUNT)
+        .checked_sub(retained_block_count.get())
         .map(BlockHeight::new)
         .ok_or_else(|| {
             eyre!(
-                "canonical block tracer needs a tip at or above {RETAINED_BLOCK_COUNT}; got {}",
+                "canonical block tracer needs a tip at or above {}; got {}",
+                retained_block_count.get(),
                 fixed_tip.height.value()
             )
         })?;
@@ -79,6 +83,7 @@ async fn canonical_blocks_load_1000_blocks_from_fixed_checkpoint() -> Result<()>
     let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
     let elapsed = construction_started_at.elapsed();
     let evidence = outcome.evidence;
+    assert_eq!(evidence.block_count, u64::from(retained_block_count.get()));
     let io_mode = outcome.builder.io_mode();
     drop(outcome.builder);
     let persisted = validate_persisted_wallet_families(&store_path, evidence)?;
@@ -95,6 +100,19 @@ async fn canonical_blocks_load_1000_blocks_from_fixed_checkpoint() -> Result<()>
     assert!(!temporary.path().join("derive").exists());
     assert_and_record_live_evidence(build_plan, evidence, &persisted, elapsed, io_mode);
     Ok(())
+}
+
+fn requested_canonical_block_count() -> Result<NonZeroU32> {
+    match std::env::var(CANONICAL_BLOCK_COUNT_ENV) {
+        Ok(encoded_block_count) => encoded_block_count.parse::<NonZeroU32>().map_err(|source| {
+            eyre!("invalid {CANONICAL_BLOCK_COUNT_ENV}={encoded_block_count:?}: {source}")
+        }),
+        Err(VarError::NotPresent) => NonZeroU32::new(DEFAULT_CANONICAL_BLOCK_COUNT)
+            .ok_or_else(|| eyre!("default canonical block count must be nonzero")),
+        Err(source) => Err(eyre!(
+            "could not read {CANONICAL_BLOCK_COUNT_ENV}: {source}"
+        )),
+    }
 }
 
 fn live_construction_config(
@@ -158,7 +176,6 @@ fn assert_and_record_live_evidence(
         evidence.first_parent_hash,
         build_plan.history_predecessor().hash
     );
-    assert_eq!(evidence.block_count, u64::from(RETAINED_BLOCK_COUNT));
     assert_eq!(evidence.block_header_count, evidence.block_count);
     assert_eq!(evidence.block_hash_index_count, evidence.block_count);
     assert_eq!(evidence.block_replay_count, evidence.block_count);

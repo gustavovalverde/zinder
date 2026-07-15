@@ -259,8 +259,12 @@ Run only this tracer with the same environment shown above:
 
 ```bash
 cargo nextest run --profile=ci-live --run-ignored=all \
-  -E 'test(canonical_blocks_load_1000_blocks_from_fixed_checkpoint)'
+  -E 'test(canonical_blocks_load_requested_range_from_fixed_checkpoint)'
 ```
+
+The tracer retains 1,000 blocks by default. Set
+`ZINDER_TEST_CANONICAL_BLOCK_COUNT` to a positive integer for a larger
+fixed-tip calibration range.
 
 For the local Z3 testnet topology, the dedicated Docker setup builds the test
 in release mode, joins the existing Zebra network, mounts its cookie volume
