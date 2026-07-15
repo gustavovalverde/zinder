@@ -24,11 +24,11 @@ use super::{
 pub(super) const STORE_CONTROL_KEY: &[u8] = b"store_control";
 pub(super) const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
 pub(super) const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
-const BLOCK_VALUE_POOL_BALANCES_COLUMN_FAMILY: &str = "block_value_pool_balances";
+const DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY: &str = "daily_value_pool_balance";
 pub(super) const TRANSACTION_LOCATION_COLUMN_FAMILY: &str = "transaction_location";
 pub(super) const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
-const TREE_STATE_COLUMN_FAMILY: &str = "tree_state";
-const FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str = "final_note_commitment_roots";
+const TREE_STATE_CHECKPOINT_COLUMN_FAMILY: &str = "tree_state_checkpoint";
+const BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str = "block_final_note_commitment_roots";
 const SUBTREE_ROOT_COLUMN_FAMILY: &str = "subtree_root";
 const CHAIN_EPOCH_COLUMN_FAMILY: &str = "chain_epoch";
 const CHAIN_EVENT_COLUMN_FAMILY: &str = "chain_event";
@@ -41,11 +41,11 @@ pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 15] = [
     BLOCK_HEADER_COLUMN_FAMILY,
     BLOCK_HASH_INDEX_COLUMN_FAMILY,
     BLOCK_REPLAY_COLUMN_FAMILY,
-    BLOCK_VALUE_POOL_BALANCES_COLUMN_FAMILY,
+    DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
     TRANSACTION_LOCATION_COLUMN_FAMILY,
     COMPACT_BLOCK_COLUMN_FAMILY,
-    TREE_STATE_COLUMN_FAMILY,
-    FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+    TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+    BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
     SUBTREE_ROOT_COLUMN_FAMILY,
     CHAIN_EPOCH_COLUMN_FAMILY,
     CHAIN_EVENT_COLUMN_FAMILY,

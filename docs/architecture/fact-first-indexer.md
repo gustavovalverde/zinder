@@ -193,12 +193,12 @@ The target canonical hot schema is:
 | `block_header` | `height` | Small direct-read block identity, parent, time, header fields, and size |
 | `block_hash_index` | `block_hash` | Direct hash-to-height resolution without scanning or expanding replay facts |
 | `block_replay` | `height` | Ordered semantic block and transaction facts needed by every projection; excludes retention-dependent raw blobs |
-| `block_value_pool_balances` | `height` | Authoritative per-pool chain-value snapshots required to rebuild explorer value-pool history |
+| `daily_value_pool_balance` | `day_start_unix_seconds` | Explorer-only highest-canonical-height value-pool winner for one UTC day |
 | `transaction_location` | `transaction_id` | Direct transaction height, index, and block identity without expanding transaction facts |
 | `compact_block` | `height` | Encoded shielded wallet-scan payload |
-| `tree_state` | `height` | Wallet scan checkpoint and commitment-tree sizes |
-| `final_note_commitment_roots` | `height` | Wallet synchronization roots not yet carried by semantic replay |
-| `subtree_root` | `(pool, start_index)` | Completed wallet subtree root |
+| `tree_state_checkpoint` | `height` | Typed wallet commitment-tree frontier at the history predecessor, at most every 100 blocks, and at the fixed build tip |
+| `block_final_note_commitment_roots` | `height` | Explorer-only final Sapling, Orchard, and Ironwood roots for every retained root-bearing block |
+| `subtree_root` | `(shielded_protocol, subtree_index)` | Completed wallet subtree root |
 | `chain_epoch` | `chain_epoch_id` | Durable visibility snapshot retained independently of event pruning |
 | `chain_event` | `event_sequence` | Durable commit or reorg transition and replay cursor source |
 | `mempool_event` | `event_sequence` | Durable live-mempool transition |
@@ -273,10 +273,21 @@ exhaustive payload scrubbing is outside the sync-time acceptance path.
 The no-data-loss rule is strict: data may move out of canonical only after the
 version-1 replay contract can reproduce it. The current semantic aggregate does
 not contain Sapling, Orchard, and Ironwood compact scan payloads, all tree-size
-metadata, or the contents of a displaced branch. Therefore compact blocks, tree
-state, roots, and displaced-block facts remain canonical source data in version
-1. Removing them before expanding and validating replay would silently make
-wallet or explorer reconstruction incomplete.
+metadata, or the contents of a displaced branch. Therefore compact blocks,
+typed tree-state checkpoints, wallet subtree roots, explorer-only final roots,
+and displaced-block facts remain canonical source data in version 1. Removing
+them before expanding and validating replay would silently make wallet or
+explorer reconstruction incomplete.
+
+Family completeness follows the consumer contract rather than a misleading
+all-height row count. Wallet construction retains the history-predecessor
+frontiers, checkpoints no more than 100 blocks apart, the exact build-tip
+frontiers, and continuous subtree indexes for every active pool. It omits
+per-block final roots and daily value-pool balances entirely. Explorer
+construction additionally retains final roots for every root-bearing canonical
+height and one authoritative highest-height value-pool winner for every covered
+UTC day. Initial daily winners require approximately one verbose source block
+observation per day, not one per historical block.
 
 `block_replay` is not a second truth model. It is a block-local physical
 layout of the same typed facts, optimized for sequential replay. It contains no

@@ -314,9 +314,15 @@ pub enum CanonicalStoreBuildError<SourceError> {
 /// incomplete build after restart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalStoreWorkload {
-    /// Wallet APIs, including retained raw transactions.
+    /// Wallet APIs, including retained raw transactions, typed tree-state
+    /// checkpoints, and continuous subtree roots.
+    ///
+    /// This workload omits per-block final roots, daily value-pool balances,
+    /// and raw block blobs so explorer-only acquisition cannot slow the
+    /// fastest supported sync path.
     Wallet,
-    /// Wallet APIs plus explorer raw blocks and explorer-only source facts.
+    /// Wallet APIs plus per-block final roots, daily value-pool balances, raw
+    /// blocks, and other explorer-only source facts.
     Explorer,
 }
 
