@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use async_trait::async_trait;
 use zinder_core::{
     BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastResult,
+    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult,
 };
 
 use crate::{
@@ -118,6 +118,22 @@ pub trait NodeSource: Send + Sync + 'static {
         max_entries: NonZeroU32,
     ) -> Result<SourceSubtreeRoots, SourceError> {
         let _ = (protocol, start_index, max_entries);
+        Err(SourceError::NodeCapabilityMissing {
+            capability: crate::NodeCapability::SubtreeRoots,
+        })
+    }
+
+    /// Fetches every shielded subtree root in `range` with one source request.
+    ///
+    /// Unlike [`Self::fetch_subtree_roots`], this exact-range contract rejects
+    /// a short response. Canonical construction uses it only after computing
+    /// the completed-subtree range at a fixed chain tip, so accepting a partial
+    /// response could publish an incomplete wallet artifact family.
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        let _ = range;
         Err(SourceError::NodeCapabilityMissing {
             capability: crate::NodeCapability::SubtreeRoots,
         })

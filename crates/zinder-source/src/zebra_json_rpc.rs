@@ -23,7 +23,8 @@ use zinder_core::{
     CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
     CommitmentTreeFrontiers, ConsensusBranchId, FinalNoteCommitmentRoot, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId, ValuePoolBalance,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
+    ValuePoolBalance,
 };
 
 use crate::{
@@ -837,6 +838,87 @@ impl ZebraJsonRpcSource {
             )),
         }
     }
+
+    async fn fetch_bounded_subtree_roots(
+        &self,
+        protocol: ShieldedProtocol,
+        start_index: SubtreeRootIndex,
+        max_entries: NonZeroU32,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        let subtree_response: ZebraSubtreeRootsByIndex = self
+            .call_typed(
+                "z_getsubtreesbyindex",
+                positional_params([
+                    Value::from(protocol.rpc_pool_name()),
+                    Value::from(start_index.value()),
+                    Value::from(max_entries.get()),
+                ])?,
+                |error| SourceError::SubtreeRootsUnavailable {
+                    protocol,
+                    start_index,
+                    reason: error.message,
+                },
+            )
+            .await?;
+
+        if subtree_response.pool != protocol.rpc_pool_name() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "subtree roots pool does not match requested protocol",
+            });
+        }
+        if subtree_response.start_index != start_index.value() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "subtree roots start index does not match requested index",
+            });
+        }
+        let response_entry_count =
+            u32::try_from(subtree_response.subtrees.len()).map_err(|_| {
+                SourceError::SourceProtocolMismatch {
+                    reason: "subtree roots response has too many entries",
+                }
+            })?;
+        if response_entry_count > max_entries.get() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "subtree roots response exceeds the requested bound",
+            });
+        }
+
+        let mut subtree_roots = Vec::with_capacity(subtree_response.subtrees.len());
+        let mut previous_completing_block_height = None;
+        for (offset, subtree) in subtree_response.subtrees.into_iter().enumerate() {
+            let offset =
+                u32::try_from(offset).map_err(|_| SourceError::SourceProtocolMismatch {
+                    reason: "subtree roots response has too many entries",
+                })?;
+            let subtree_index = start_index
+                .value()
+                .checked_add(offset)
+                .map(SubtreeRootIndex::new)
+                .ok_or(SourceError::SourceProtocolMismatch {
+                    reason: "subtree roots response exceeds the SubtreeRootIndex range",
+                })?;
+            let completing_block_height = BlockHeight::new(subtree.end_height);
+            if previous_completing_block_height
+                .is_some_and(|previous_height| completing_block_height < previous_height)
+            {
+                return Err(SourceError::SourceProtocolMismatch {
+                    reason: "subtree root completion heights are not ascending",
+                });
+            }
+            previous_completing_block_height = Some(completing_block_height);
+            subtree_roots.push(SourceSubtreeRoot::new(
+                subtree_index,
+                decode_subtree_root_hash(&subtree.root)?,
+                completing_block_height,
+            ));
+        }
+
+        Ok(SourceSubtreeRoots::new(
+            protocol,
+            start_index,
+            subtree_roots,
+        ))
+    }
 }
 
 #[async_trait]
@@ -994,59 +1076,34 @@ impl NodeSource for ZebraJsonRpcSource {
         start_index: SubtreeRootIndex,
         max_entries: NonZeroU32,
     ) -> Result<SourceSubtreeRoots, SourceError> {
-        let subtree_response: ZebraSubtreeRootsByIndex = self
-            .call_typed(
-                "z_getsubtreesbyindex",
-                positional_params([
-                    Value::from(protocol.rpc_pool_name()),
-                    Value::from(start_index.value()),
-                    Value::from(max_entries.get()),
-                ])?,
-                |error| SourceError::SubtreeRootsUnavailable {
-                    protocol,
-                    start_index,
-                    reason: error.message,
-                },
-            )
+        self.fetch_bounded_subtree_roots(protocol, start_index, max_entries)
+            .await
+    }
+
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        let subtree_roots = self
+            .fetch_bounded_subtree_roots(range.protocol, range.start_index, range.max_entries)
             .await?;
-
-        if subtree_response.pool != protocol.rpc_pool_name() {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "subtree roots pool does not match requested protocol",
+        let actual_count = u32::try_from(subtree_roots.subtree_roots.len()).map_err(|_| {
+            SourceError::SourceProtocolMismatch {
+                reason: "subtree roots response has too many entries",
+            }
+        })?;
+        if actual_count != range.max_entries.get() {
+            return Err(SourceError::SubtreeRootsUnavailable {
+                protocol: range.protocol,
+                start_index: range.start_index,
+                reason: format!(
+                    "expected {} subtree roots, got {actual_count}",
+                    range.max_entries
+                ),
             });
         }
 
-        if subtree_response.start_index != start_index.value() {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "subtree roots start index does not match requested index",
-            });
-        }
-
-        let mut subtree_roots = Vec::with_capacity(subtree_response.subtrees.len());
-        for (offset, subtree) in subtree_response.subtrees.into_iter().enumerate() {
-            let offset =
-                u32::try_from(offset).map_err(|_| SourceError::SourceProtocolMismatch {
-                    reason: "subtree roots response has too many entries",
-                })?;
-            let subtree_index = start_index
-                .value()
-                .checked_add(offset)
-                .map(SubtreeRootIndex::new)
-                .ok_or(SourceError::SourceProtocolMismatch {
-                    reason: "subtree roots response exceeds the SubtreeRootIndex range",
-                })?;
-            subtree_roots.push(SourceSubtreeRoot::new(
-                subtree_index,
-                decode_subtree_root_hash(&subtree.root)?,
-                BlockHeight::new(subtree.end_height),
-            ));
-        }
-
-        Ok(SourceSubtreeRoots::new(
-            protocol,
-            start_index,
-            subtree_roots,
-        ))
+        Ok(subtree_roots)
     }
 
     async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {

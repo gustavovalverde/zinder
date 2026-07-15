@@ -17,7 +17,7 @@ use zcash_primitives::merkle_tree::write_commitment_tree;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BroadcastAccepted, ConsensusBranchId, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
+    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
 };
 use zinder_source::{
     NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor, SourceChainUpdate,
@@ -847,6 +847,169 @@ async fn fetch_subtree_roots_uses_expected_json_rpc_request() -> eyre::Result<()
         subtree_roots.subtree_roots[1].completing_block_height,
         BlockHeight::new(670_209)
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_subtree_root_range_requires_every_requested_root() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_getsubtreesbyindex").reply(
+        RpcReply::result(json!({
+            "pool": "orchard",
+            "start_index": 9,
+            "subtrees": [
+                {
+                    "root": "3333333333333333333333333333333333333333333333333333333333333333",
+                    "end_height": 1_687_104
+                },
+                {
+                    "root": "4444444444444444444444444444444444444444444444444444444444444444",
+                    "end_height": 1_689_227
+                }
+            ]
+        })),
+    )])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    let requested_range = SubtreeRootRange::new(
+        ShieldedProtocol::Orchard,
+        SubtreeRootIndex::new(9),
+        std::num::NonZeroU32::new(2).ok_or_else(|| eyre!("invalid root count"))?,
+    );
+
+    let subtree_roots = source.fetch_subtree_root_range(requested_range).await?;
+    let requests = server.requests_for("z_getsubtreesbyindex")?;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].params, json!(["orchard", 9, 2]));
+    assert_eq!(subtree_roots.protocol, ShieldedProtocol::Orchard);
+    assert_eq!(subtree_roots.start_index, SubtreeRootIndex::new(9));
+    assert_eq!(subtree_roots.subtree_roots.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_subtree_root_range_rejects_incomplete_response() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_getsubtreesbyindex").reply(
+        RpcReply::result(json!({
+            "pool": "sapling",
+            "start_index": 4,
+            "subtrees": [{
+                "root": "1111111111111111111111111111111111111111111111111111111111111111",
+                "end_height": 558_822
+            }]
+        })),
+    )])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    let requested_range = SubtreeRootRange::new(
+        ShieldedProtocol::Sapling,
+        SubtreeRootIndex::new(4),
+        std::num::NonZeroU32::new(2).ok_or_else(|| eyre!("invalid root count"))?,
+    );
+
+    let outcome = source.fetch_subtree_root_range(requested_range).await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SubtreeRootsUnavailable {
+            protocol: ShieldedProtocol::Sapling,
+            start_index,
+            ..
+        }) if start_index == SubtreeRootIndex::new(4)
+    ));
+    assert_eq!(server.requests_for("z_getsubtreesbyindex")?.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_subtree_roots_rejects_response_above_requested_bound() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_getsubtreesbyindex").reply(
+        RpcReply::result(json!({
+            "pool": "sapling",
+            "start_index": 0,
+            "subtrees": [
+                {
+                    "root": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "end_height": 558_822
+                },
+                {
+                    "root": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "end_height": 670_209
+                }
+            ]
+        })),
+    )])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let outcome = source
+        .fetch_subtree_roots(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            std::num::NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
+        )
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_subtree_roots_rejects_descending_completion_heights() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_getsubtreesbyindex").reply(
+        RpcReply::result(json!({
+            "pool": "sapling",
+            "start_index": 0,
+            "subtrees": [
+                {
+                    "root": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "end_height": 670_209
+                },
+                {
+                    "root": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "end_height": 558_822
+                }
+            ]
+        })),
+    )])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let outcome = source
+        .fetch_subtree_roots(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            std::num::NonZeroU32::new(2).ok_or_else(|| eyre!("invalid max entries"))?,
+        )
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
 
     Ok(())
 }
