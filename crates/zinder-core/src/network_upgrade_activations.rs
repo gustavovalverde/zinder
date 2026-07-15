@@ -18,7 +18,13 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
 use crate::chain_epoch::{BlockHeight, Network};
+
+const ACTIVATION_FINGERPRINT_DOMAIN: &[u8] =
+    b"zinder:network-upgrade-activations:fingerprint:sha256\0";
 
 /// Zcash consensus branch identifier (ZIP-200 §`CONSENSUS_BRANCH_ID`).
 ///
@@ -95,6 +101,75 @@ pub struct NetworkUpgradeActivation {
     /// `"Sapling"`, `"NU5"`, `"NU6"`). Carried verbatim so unknown future
     /// upgrades remain serviceable without a Zinder code change.
     pub name: String,
+}
+
+/// Version of the immutable network-upgrade activation-table fingerprint.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum NetworkUpgradeActivationsFingerprintVersion {
+    /// Initial domain-separated SHA-256 contract.
+    V1,
+}
+
+impl NetworkUpgradeActivationsFingerprintVersion {
+    /// Version emitted for newly created canonical stores.
+    pub const CURRENT: Self = Self::V1;
+
+    /// Returns the stable numeric encoding.
+    #[must_use]
+    pub const fn value(self) -> u16 {
+        match self {
+            Self::V1 => 1,
+        }
+    }
+}
+
+/// An encoded activation fingerprint version this binary does not support.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("unsupported network upgrade activations fingerprint version {encoded_version}")]
+pub struct UnsupportedNetworkUpgradeActivationsFingerprintVersion {
+    encoded_version: u16,
+}
+
+impl TryFrom<u16> for NetworkUpgradeActivationsFingerprintVersion {
+    type Error = UnsupportedNetworkUpgradeActivationsFingerprintVersion;
+
+    fn try_from(encoded_version: u16) -> Result<Self, Self::Error> {
+        match encoded_version {
+            1 => Ok(Self::V1),
+            _ => Err(UnsupportedNetworkUpgradeActivationsFingerprintVersion { encoded_version }),
+        }
+    }
+}
+
+/// Immutable identity of one node-discovered activation table.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NetworkUpgradeActivationsFingerprint {
+    version: NetworkUpgradeActivationsFingerprintVersion,
+    bytes: [u8; 32],
+}
+
+impl NetworkUpgradeActivationsFingerprint {
+    /// Reconstructs a fingerprint from an admitted durable record.
+    #[must_use]
+    pub const fn from_bytes(
+        version: NetworkUpgradeActivationsFingerprintVersion,
+        bytes: [u8; 32],
+    ) -> Self {
+        Self { version, bytes }
+    }
+
+    /// Returns the fingerprint algorithm version.
+    #[must_use]
+    pub const fn version(self) -> NetworkUpgradeActivationsFingerprintVersion {
+        self.version
+    }
+
+    /// Returns the domain-separated SHA-256 bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.bytes
+    }
 }
 
 /// Validation failures encountered while constructing a
@@ -177,6 +252,41 @@ impl NetworkUpgradeActivations {
     #[must_use]
     pub fn activations(&self) -> &[NetworkUpgradeActivation] {
         &self.activations
+    }
+
+    /// Commits to the exact network and ordered activation table.
+    ///
+    /// Distinct activation heights are canonicalized by [`Self::new`]. The
+    /// stable order of entries at the same height remains significant because
+    /// it determines which branch is active at that height.
+    #[must_use]
+    pub fn fingerprint(
+        &self,
+        version: NetworkUpgradeActivationsFingerprintVersion,
+    ) -> NetworkUpgradeActivationsFingerprint {
+        let mut hasher = Sha256::new();
+        hasher.update(ACTIVATION_FINGERPRINT_DOMAIN);
+        hasher.update(version.value().to_le_bytes());
+        hasher.update(self.network.id().to_le_bytes());
+        hasher.update(
+            u64::try_from(self.activations.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for activation in &self.activations {
+            hasher.update(activation.branch_id.value().to_le_bytes());
+            hasher.update(activation.activation_height.value().to_le_bytes());
+            hasher.update(
+                u64::try_from(activation.name.len())
+                    .unwrap_or(u64::MAX)
+                    .to_le_bytes(),
+            );
+            hasher.update(activation.name.as_bytes());
+        }
+        NetworkUpgradeActivationsFingerprint {
+            version,
+            bytes: hasher.finalize().into(),
+        }
     }
 
     /// Returns the activation active at `height`: the entry with the largest
@@ -432,5 +542,118 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["Sapling", "NU6"]);
         Ok(())
+    }
+
+    #[test]
+    fn activation_fingerprint_v1_matches_known_answer() -> TestResult {
+        let fingerprint = sample_regtest_activations()?
+            .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+        assert_eq!(
+            hex::encode(fingerprint.as_bytes()),
+            "f6a66ed2897330b0f1237d37df807d9329225b23f56c67ad30877e10dddee24a"
+        );
+        assert_eq!(
+            fingerprint.version(),
+            NetworkUpgradeActivationsFingerprintVersion::V1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_fingerprint_canonicalizes_distinct_height_input_order() -> TestResult {
+        let sorted = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![
+                activation(1, 1, "first"),
+                activation(2, 2, "second"),
+                activation(3, 3, "third"),
+            ],
+        )?;
+        let reversed = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            sorted.activations().iter().cloned().rev().collect(),
+        )?;
+        assert_eq!(
+            sorted.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+            reversed.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_fingerprint_preserves_same_height_tie_order() -> TestResult {
+        let first = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![activation(1, 1, "first"), activation(2, 1, "second")],
+        )?;
+        let second = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![activation(2, 1, "second"), activation(1, 1, "first")],
+        )?;
+        assert_ne!(
+            first.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+            second.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_fingerprint_commits_to_network_and_exact_fields() -> TestResult {
+        let base = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![activation(1, 1, "Sapling")],
+        )?;
+        let variants = [
+            NetworkUpgradeActivations::new(
+                Network::ZcashTestnet,
+                vec![activation(1, 1, "Sapling")],
+            )?,
+            NetworkUpgradeActivations::new(
+                Network::ZcashRegtest,
+                vec![activation(2, 1, "Sapling")],
+            )?,
+            NetworkUpgradeActivations::new(
+                Network::ZcashRegtest,
+                vec![activation(1, 2, "Sapling")],
+            )?,
+            NetworkUpgradeActivations::new(
+                Network::ZcashRegtest,
+                vec![activation(1, 1, "sapling")],
+            )?,
+        ];
+        let base_fingerprint = base.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+        for variant in variants {
+            assert_ne!(
+                base_fingerprint,
+                variant.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn activation_fingerprint_version_rejects_unknown_values() {
+        assert_eq!(
+            NetworkUpgradeActivationsFingerprintVersion::try_from(2),
+            Err(UnsupportedNetworkUpgradeActivationsFingerprintVersion { encoded_version: 2 })
+        );
+    }
+
+    #[test]
+    fn empty_activation_fingerprints_commit_to_network() {
+        assert_ne!(
+            NetworkUpgradeActivations::empty(Network::ZcashRegtest)
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+            NetworkUpgradeActivations::empty(Network::ZcashTestnet)
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
+        );
+    }
+
+    fn activation(branch_id: u32, height: u32, name: &str) -> NetworkUpgradeActivation {
+        NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(branch_id),
+            activation_height: BlockHeight::new(height),
+            name: name.to_owned(),
+        }
     }
 }

@@ -73,7 +73,9 @@ pub use mempool::{
 };
 pub use network_upgrade_activations::{
     ConsensusBranchId, NetworkUpgradeActivation, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsError,
+    NetworkUpgradeActivationsError, NetworkUpgradeActivationsFingerprint,
+    NetworkUpgradeActivationsFingerprintVersion,
+    UnsupportedNetworkUpgradeActivationsFingerprintVersion,
 };
 pub use subtree_root::{
     SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
