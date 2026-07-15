@@ -4,6 +4,7 @@
 //! canonical data plane. It deliberately exposes no generic database adapter
 //! and no compatibility decoder for earlier Zinder stores.
 
+mod block_load;
 mod block_replay;
 mod builder;
 mod control;
@@ -18,7 +19,7 @@ use zinder_core::{
     ChainTipMetadata,
 };
 
-pub use block_replay::CanonicalBlockReplayLoadEvidence;
+pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use builder::RocksDbCanonicalBuilder;
 pub use rocksdb::RocksDbCanonicalStore;
 
@@ -263,11 +264,11 @@ pub enum CanonicalStoreError {
         path: PathBuf,
     },
 
-    /// A prior process left the deterministic block-replay staging directory.
+    /// A prior process left the deterministic canonical block staging directory.
     #[error(
-        "canonical block replay staging path already exists and requires full build cleanup: {path:?}"
+        "canonical block staging path already exists and requires full build cleanup: {path:?}"
     )]
-    BlockReplayStagingExists {
+    BlockLoadStagingExists {
         /// Existing staging path preserved without repair or deletion.
         path: PathBuf,
     },
@@ -339,15 +340,22 @@ pub enum CanonicalStoreError {
         reason: String,
     },
 
-    /// Block replay rows already exist in a store that has not reached READY.
-    #[error(
-        "canonical block replay is already populated in a BUILDING store; full build cleanup is required"
-    )]
-    BlockReplayAlreadyLoaded,
+    /// Canonical block-family input is empty, discontinuous, or inconsistent.
+    #[error("canonical block sequence is invalid: {reason}")]
+    BlockLoadSequenceInvalid {
+        /// Exact sequence invariant that failed.
+        reason: String,
+    },
 
-    /// Persisted replay evidence differs from the sequence prepared for ingestion.
-    #[error("canonical block replay readback does not match the prepared version-1 sequence")]
-    BlockReplayReadbackMismatch,
+    /// Canonical block-family rows already exist in an unpublished store.
+    #[error(
+        "canonical block families are already populated in a BUILDING store; full build cleanup is required"
+    )]
+    BlockLoadAlreadyLoaded,
+
+    /// Persisted replay rows differ from the prepared canonical block sequence.
+    #[error("canonical block replay readback does not match the prepared version-1 block sequence")]
+    BlockLoadReadbackMismatch,
 }
 
 impl CanonicalStoreError {
@@ -367,6 +375,12 @@ impl CanonicalStoreError {
     fn block_replay_invalid(height: BlockHeight, reason: impl Into<String>) -> Self {
         Self::BlockReplayInvalid {
             height: height.value(),
+            reason: reason.into(),
+        }
+    }
+
+    fn block_load_sequence(reason: impl Into<String>) -> Self {
+        Self::BlockLoadSequenceInvalid {
             reason: reason.into(),
         }
     }

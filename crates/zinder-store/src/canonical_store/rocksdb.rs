@@ -19,19 +19,19 @@ use super::{
 };
 
 pub(super) const STORE_CONTROL_KEY: &[u8] = b"store_control";
-const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
-const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
+pub(super) const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
+pub(super) const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
 const BLOCK_VALUE_POOL_BALANCES_COLUMN_FAMILY: &str = "block_value_pool_balances";
-const TRANSACTION_LOCATION_COLUMN_FAMILY: &str = "transaction_location";
-const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
+pub(super) const TRANSACTION_LOCATION_COLUMN_FAMILY: &str = "transaction_location";
+pub(super) const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
 const TREE_STATE_COLUMN_FAMILY: &str = "tree_state";
 const FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str = "final_note_commitment_roots";
 const SUBTREE_ROOT_COLUMN_FAMILY: &str = "subtree_root";
 const CHAIN_EVENT_COLUMN_FAMILY: &str = "chain_event";
 const MEMPOOL_EVENT_COLUMN_FAMILY: &str = "mempool_event";
 const DISPLACED_BLOCK_FACTS_COLUMN_FAMILY: &str = "displaced_block_facts";
-const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
-const TRANSACTION_BLOB_COLUMN_FAMILY: &str = "transaction_blob";
+pub(super) const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
+pub(super) const TRANSACTION_BLOB_COLUMN_FAMILY: &str = "transaction_blob";
 
 pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 14] = [
     BLOCK_HEADER_COLUMN_FAMILY,

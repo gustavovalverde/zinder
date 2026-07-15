@@ -1,0 +1,765 @@
+mod codec;
+mod fixed_record_sort;
+mod ordered_sst;
+
+use std::path::{Path, PathBuf};
+
+use prost::Message;
+use rust_rocksdb::{DB, IngestExternalFileOptions, Options};
+use zinder_core::{
+    BlockBlobArtifact, BlockHash, BlockHeight, CanonicalBlockFacts,
+    CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
+    CompactBlockArtifact, SerializedBytesDigest, TransactionBlobArtifact,
+};
+use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
+
+use self::{
+    codec::{
+        BLOCK_HASH_INDEX_RECORD_LEN, BLOCK_HEADER_VALUE_LEN, TRANSACTION_LOCATION_RECORD_LEN,
+        encode_block_hash_location, encode_block_header, encode_block_position,
+        encode_transaction_location, encode_transaction_position,
+    },
+    fixed_record_sort::{FixedRecordSorter, record_capacity},
+    ordered_sst::{OrderedSstSet, SstArtifacts},
+};
+
+use super::{
+    CanonicalStoreBuildError, CanonicalStoreError, CanonicalStoreWorkload,
+    block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+    rocksdb::{
+        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
+        COMPACT_BLOCK_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
+        TRANSACTION_LOCATION_COLUMN_FAMILY,
+    },
+};
+
+pub(super) const CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const REVERSE_INDEX_SORT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+
+/// All source-derived values for one block in a fresh canonical construction.
+///
+/// This value deliberately does not implement `Clone`: raw transaction and
+/// block bytes have one owner and move directly into bounded SST staging.
+#[derive(Debug)]
+pub struct CanonicalBuildBlock {
+    /// Backend-neutral semantic facts used by every later projection.
+    pub facts: CanonicalBlockFacts,
+    /// Stable version-1 recovery representation of `facts`.
+    pub replay_envelope: CanonicalBlockReplayEnvelope,
+    /// Wallet protocol bytes derived while the source block is already parsed.
+    pub compact_block: CompactBlockArtifact,
+    /// Commitment-tree positions after applying this block.
+    pub tip_metadata: ChainTipMetadata,
+    /// Raw transactions in exact block order.
+    pub transaction_blobs: Vec<TransactionBlobArtifact>,
+    /// Raw block bytes required by the explorer workload.
+    pub block_blob: Option<BlockBlobArtifact>,
+}
+
+/// Prepared identity and bounded-load measurements for ingested block families.
+///
+/// This value proves what was staged and that every staged SST was accepted by
+/// `RocksDB`; it is not cache-bypassing persisted readback evidence and cannot
+/// by itself publish a canonical store as READY.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalBlockLoadEvidence {
+    /// First retained block height.
+    pub first_height: BlockHeight,
+    /// Parent of the first retained block.
+    pub first_parent_hash: BlockHash,
+    /// First retained block hash.
+    pub first_hash: BlockHash,
+    /// Last retained block height.
+    pub tip_height: BlockHeight,
+    /// Last retained block hash.
+    pub tip_hash: BlockHash,
+    /// Commitment-tree positions after the last retained block.
+    pub tip_metadata: ChainTipMetadata,
+    /// Number of contiguous source blocks.
+    pub block_count: u64,
+    /// Number of source transactions.
+    pub transaction_count: u64,
+    /// Number of height-addressed header rows.
+    pub block_header_count: u64,
+    /// Number of hash-addressed block-location rows.
+    pub block_hash_index_count: u64,
+    /// Number of height-addressed semantic replay rows.
+    pub block_replay_count: u64,
+    /// Number of height-addressed compact block rows.
+    pub compact_block_count: u64,
+    /// Number of transaction-id-addressed location rows.
+    pub transaction_location_count: u64,
+    /// Number of position-addressed raw transaction rows.
+    pub transaction_blob_count: u64,
+    /// Number of height-addressed raw block rows.
+    pub block_blob_count: u64,
+    /// Total key and value bytes submitted to the SST writers.
+    pub logical_bytes: u64,
+    /// Physical bytes occupied by every staged SST.
+    pub sst_file_bytes: u64,
+    /// Number of staged SST files.
+    pub sst_file_count: u64,
+    /// Canonical replay-envelope contract validated for every block.
+    pub replay_format_version: CanonicalBlockReplayFormatVersion,
+    /// Semantic fact-digest contract validated for every block.
+    pub block_digest_version: CanonicalBlockFactsDigestVersion,
+    /// Ordered fact-sequence digest contract.
+    pub sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
+    /// Ordered digest of every block's semantic facts.
+    pub sequence_digest: CanonicalBlockFactsSequenceDigest,
+}
+
+pub(super) struct PreparedCanonicalBlockLoad {
+    families: Vec<PreparedColumnFamily>,
+    pub(super) evidence: CanonicalBlockLoadEvidence,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CanonicalBlockSstConfig<'options> {
+    pub(super) staging_path: &'options Path,
+    pub(super) options: &'options Options,
+    pub(super) workload: CanonicalStoreWorkload,
+    pub(super) sst_target_logical_bytes: u64,
+    pub(super) reverse_index_sort_memory_bytes: usize,
+}
+
+struct PreparedColumnFamily {
+    name: &'static str,
+    paths: Vec<PathBuf>,
+}
+
+pub(super) fn write_canonical_block_ssts<SourceError>(
+    config: CanonicalBlockSstConfig<'_>,
+    blocks: impl IntoIterator<Item = Result<CanonicalBuildBlock, SourceError>>,
+) -> Result<PreparedCanonicalBlockLoad, CanonicalStoreBuildError<SourceError>> {
+    let mut stager = CanonicalBlockSstStager::new(config)?;
+    for source_block in blocks {
+        let block = source_block.map_err(|source| CanonicalStoreBuildError::Source { source })?;
+        stager.stage(block)?;
+    }
+    Ok(stager.finish()?)
+}
+
+struct CanonicalBlockSstStager<'options> {
+    config: CanonicalBlockSstConfig<'options>,
+    header_writer: OrderedSstSet<'options>,
+    replay_writer: OrderedSstSet<'options>,
+    compact_writer: OrderedSstSet<'options>,
+    transaction_blob_writer: OrderedSstSet<'options>,
+    block_blob_writer: OrderedSstSet<'options>,
+    block_hash_sorter: FixedRecordSorter<BLOCK_HASH_INDEX_RECORD_LEN>,
+    transaction_location_sorter: FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
+    sequence: Option<BlockSequence>,
+}
+
+impl<'options> CanonicalBlockSstStager<'options> {
+    fn new(config: CanonicalBlockSstConfig<'options>) -> Result<Self, CanonicalStoreError> {
+        if config.sst_target_logical_bytes == 0 {
+            return Err(CanonicalStoreError::block_load_sequence(
+                "SST target logical bytes must be greater than zero",
+            ));
+        }
+        let block_hash_capacity =
+            record_capacity::<BLOCK_HASH_INDEX_RECORD_LEN>(config.reverse_index_sort_memory_bytes)?;
+        let transaction_location_capacity = record_capacity::<TRANSACTION_LOCATION_RECORD_LEN>(
+            config.reverse_index_sort_memory_bytes,
+        )?;
+        Ok(Self {
+            header_writer: config.ordered_writer("block-header"),
+            replay_writer: config.ordered_writer("block-replay"),
+            compact_writer: config.ordered_writer("compact-block"),
+            transaction_blob_writer: config.ordered_writer("transaction-blob"),
+            block_blob_writer: config.ordered_writer("block-blob"),
+            block_hash_sorter: FixedRecordSorter::new(
+                config.staging_path,
+                "block-hash-index",
+                block_hash_capacity,
+            ),
+            transaction_location_sorter: FixedRecordSorter::new(
+                config.staging_path,
+                "transaction-location",
+                transaction_location_capacity,
+            ),
+            config,
+            sequence: None,
+        })
+    }
+
+    fn stage(&mut self, block: CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
+        validate_build_block(self.config.workload, &block)?;
+        let row = BlockSequenceRow::from_block(&block)?;
+        match &mut self.sequence {
+            Some(sequence) => sequence.append(row)?,
+            None => self.sequence = Some(BlockSequence::new(row)?),
+        }
+        write_build_block(
+            block,
+            &mut self.header_writer,
+            &mut self.replay_writer,
+            &mut self.compact_writer,
+            &mut self.transaction_blob_writer,
+            &mut self.block_blob_writer,
+            &mut self.block_hash_sorter,
+            &mut self.transaction_location_sorter,
+        )
+    }
+
+    fn finish(self) -> Result<PreparedCanonicalBlockLoad, CanonicalStoreError> {
+        let sequence = self.sequence.ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(
+                "a canonical block load must contain at least one block",
+            )
+        })?;
+        let artifacts = CanonicalBlockSstArtifacts {
+            header: self.header_writer.finish()?,
+            block_hash: self
+                .block_hash_sorter
+                .finish::<32>(self.config.options, self.config.sst_target_logical_bytes)?,
+            replay: self.replay_writer.finish()?,
+            compact: self.compact_writer.finish()?,
+            transaction_location: self
+                .transaction_location_sorter
+                .finish::<32>(self.config.options, self.config.sst_target_logical_bytes)?,
+            transaction_blob: self.transaction_blob_writer.finish()?,
+            block_blob: self.block_blob_writer.finish()?,
+        };
+        prepare_canonical_block_load(sequence, artifacts)
+    }
+}
+
+impl<'options> CanonicalBlockSstConfig<'options> {
+    fn ordered_writer(self, prefix: &'static str) -> OrderedSstSet<'options> {
+        OrderedSstSet::new(
+            self.staging_path,
+            prefix,
+            self.options,
+            self.sst_target_logical_bytes,
+        )
+    }
+}
+
+struct CanonicalBlockSstArtifacts {
+    header: SstArtifacts,
+    block_hash: SstArtifacts,
+    replay: SstArtifacts,
+    compact: SstArtifacts,
+    transaction_location: SstArtifacts,
+    transaction_blob: SstArtifacts,
+    block_blob: SstArtifacts,
+}
+
+fn prepare_canonical_block_load(
+    sequence: BlockSequence,
+    artifacts: CanonicalBlockSstArtifacts,
+) -> Result<PreparedCanonicalBlockLoad, CanonicalStoreError> {
+    let families = vec![
+        PreparedColumnFamily::new(BLOCK_HEADER_COLUMN_FAMILY, artifacts.header.paths),
+        PreparedColumnFamily::new(BLOCK_HASH_INDEX_COLUMN_FAMILY, artifacts.block_hash.paths),
+        PreparedColumnFamily::new(BLOCK_REPLAY_COLUMN_FAMILY, artifacts.replay.paths),
+        PreparedColumnFamily::new(COMPACT_BLOCK_COLUMN_FAMILY, artifacts.compact.paths),
+        PreparedColumnFamily::new(
+            TRANSACTION_LOCATION_COLUMN_FAMILY,
+            artifacts.transaction_location.paths,
+        ),
+        PreparedColumnFamily::new(
+            TRANSACTION_BLOB_COLUMN_FAMILY,
+            artifacts.transaction_blob.paths,
+        ),
+        PreparedColumnFamily::new(BLOCK_BLOB_COLUMN_FAMILY, artifacts.block_blob.paths),
+    ];
+    let sst_file_bytes = [
+        artifacts.header.file_bytes,
+        artifacts.block_hash.file_bytes,
+        artifacts.replay.file_bytes,
+        artifacts.compact.file_bytes,
+        artifacts.transaction_location.file_bytes,
+        artifacts.transaction_blob.file_bytes,
+        artifacts.block_blob.file_bytes,
+    ]
+    .into_iter()
+    .try_fold(0_u64, checked_add_sst_bytes)?;
+    let sst_file_count = families.iter().try_fold(0_u64, |count, family| {
+        let family_count = u64::try_from(family.paths.len()).map_err(|_| {
+            CanonicalStoreError::block_load_sequence("SST file count exceeds u64::MAX")
+        })?;
+        count.checked_add(family_count).ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence("SST file count exceeds u64::MAX")
+        })
+    })?;
+
+    Ok(PreparedCanonicalBlockLoad {
+        families,
+        evidence: sequence.finish(sst_file_bytes, sst_file_count),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one independently staged physical block family"
+)]
+fn write_build_block(
+    block: CanonicalBuildBlock,
+    header_writer: &mut OrderedSstSet<'_>,
+    replay_writer: &mut OrderedSstSet<'_>,
+    compact_writer: &mut OrderedSstSet<'_>,
+    transaction_blob_writer: &mut OrderedSstSet<'_>,
+    block_blob_writer: &mut OrderedSstSet<'_>,
+    block_hash_sorter: &mut FixedRecordSorter<BLOCK_HASH_INDEX_RECORD_LEN>,
+    transaction_location_sorter: &mut FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
+) -> Result<(), CanonicalStoreError> {
+    let CanonicalBuildBlock {
+        facts,
+        replay_envelope,
+        compact_block,
+        transaction_blobs,
+        block_blob,
+        ..
+    } = block;
+    let height = facts.block_header.height;
+    let height_key = encode_block_position(height);
+    let header_value = encode_block_header(&facts.block_header);
+    header_writer.put(&height_key, &header_value)?;
+    replay_writer.put(&height_key, replay_envelope.as_bytes())?;
+    compact_writer.put(&height_key, &compact_block.payload_bytes)?;
+
+    let block_hash_record = encode_block_hash_location(facts.block_header.block_hash, height);
+    block_hash_sorter.push(block_hash_record)?;
+
+    for (transaction_index, transaction_blob) in transaction_blobs.into_iter().enumerate() {
+        let transaction_index = u32::try_from(transaction_index).map_err(|_| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "block {} transaction count exceeds u32::MAX",
+                height.value()
+            ))
+        })?;
+        let transaction_key = encode_transaction_position(height, transaction_index);
+        transaction_blob_writer.put(&transaction_key, &transaction_blob.raw_transaction_bytes)?;
+
+        let location_record = encode_transaction_location(transaction_blob.location);
+        transaction_location_sorter.push(location_record)?;
+    }
+
+    if let Some(block_blob) = block_blob {
+        block_blob_writer.put(&height_key, &block_blob.raw_block_bytes)?;
+    }
+    Ok(())
+}
+
+pub(super) fn ingest_canonical_block_ssts(
+    db: &DB,
+    prepared: PreparedCanonicalBlockLoad,
+) -> Result<CanonicalBlockLoadEvidence, CanonicalStoreError> {
+    for family in prepared.families {
+        if family.paths.is_empty() {
+            continue;
+        }
+        let column_family = db.cf_handle(family.name).ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "{} column family is absent",
+                family.name
+            ))
+        })?;
+        let mut options = IngestExternalFileOptions::default();
+        options.set_move_files(true);
+        options.set_snapshot_consistency(true);
+        options.set_allow_global_seqno(false);
+        options.set_allow_blocking_flush(false);
+        db.ingest_external_file_cf_opts(&column_family, &options, family.paths)
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "canonical block-family external SST ingestion",
+                source,
+            })?;
+    }
+    Ok(prepared.evidence)
+}
+
+pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, CanonicalStoreError> {
+    for name in [
+        BLOCK_HEADER_COLUMN_FAMILY,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY,
+        BLOCK_REPLAY_COLUMN_FAMILY,
+        COMPACT_BLOCK_COLUMN_FAMILY,
+        TRANSACTION_LOCATION_COLUMN_FAMILY,
+        TRANSACTION_BLOB_COLUMN_FAMILY,
+        BLOCK_BLOB_COLUMN_FAMILY,
+    ] {
+        let column_family = db.cf_handle(name).ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(format!("{name} column family is absent"))
+        })?;
+        let mut iterator = db.raw_iterator_cf(&column_family);
+        iterator.seek_to_first();
+        if iterator.valid() {
+            return Ok(false);
+        }
+        iterator
+            .status()
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "canonical block-family empty-state validation",
+                source,
+            })?;
+    }
+    Ok(true)
+}
+
+fn validate_build_block(
+    workload: CanonicalStoreWorkload,
+    block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
+    let header = &block.facts.block_header;
+    let height = header.height;
+    if block.replay_envelope.format_version() != CanonicalBlockReplayFormatVersion::V1
+        || block.replay_envelope.reference_digest().version()
+            != CanonicalBlockFactsDigestVersion::V1
+    {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "block {} does not use the version-1 replay and fact-digest contracts",
+            height.value()
+        )));
+    }
+    if block.replay_envelope.block_height() != height
+        || block.replay_envelope.block_hash() != header.block_hash
+        || block.replay_envelope.parent_hash() != header.parent_hash
+        || block.replay_envelope.reference_digest()
+            != block.facts.digest(CanonicalBlockFactsDigestVersion::V1)
+    {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "block {} replay envelope does not match its canonical facts",
+            height.value()
+        )));
+    }
+    if block.compact_block.height != height || block.compact_block.block_hash != header.block_hash {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "block {} compact artifact does not match its canonical facts",
+            height.value()
+        )));
+    }
+    validate_compact_block_payload(block)?;
+    validate_transaction_blobs(block)?;
+    validate_block_blob(workload, block)
+}
+
+fn validate_compact_block_payload(block: &CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
+    let header = &block.facts.block_header;
+    let compact = LightwalletdCompactBlock::decode(block.compact_block.payload_bytes.as_slice())
+        .map_err(|_| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "block {} compact payload is not valid protobuf",
+                header.height.value()
+            ))
+        })?;
+    let metadata = compact.chain_metadata.ok_or_else(|| {
+        CanonicalStoreError::block_load_sequence(format!(
+            "block {} compact payload has no chain metadata",
+            header.height.value()
+        ))
+    })?;
+    if compact.height != u64::from(header.height.value())
+        || compact.hash != header.block_hash.as_bytes()
+        || compact.prev_hash != header.parent_hash.as_bytes()
+        || metadata.sapling_commitment_tree_size != block.tip_metadata.sapling_commitment_tree_size
+        || metadata.orchard_commitment_tree_size != block.tip_metadata.orchard_commitment_tree_size
+        || metadata.ironwood_commitment_tree_size
+            != block.tip_metadata.ironwood_commitment_tree_size
+    {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "block {} compact payload identity or tree positions do not match canonical facts",
+            header.height.value()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_transaction_blobs(block: &CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
+    let height = block.facts.block_header.height;
+    if block.transaction_blobs.len() != block.facts.transactions.len() {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "block {} has {} facts but {} raw transaction blobs",
+            height.value(),
+            block.facts.transactions.len(),
+            block.transaction_blobs.len()
+        )));
+    }
+    for (transaction_index, (transaction, blob)) in block
+        .facts
+        .transactions
+        .iter()
+        .zip(&block.transaction_blobs)
+        .enumerate()
+    {
+        let transaction_index = u32::try_from(transaction_index).map_err(|_| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "block {} transaction count exceeds u32::MAX",
+                height.value()
+            ))
+        })?;
+        let location = blob.location;
+        if location.transaction_id != transaction.public_facts.transaction_id
+            || location.block_height != height
+            || location.block_hash != block.facts.block_header.block_hash
+            || location.tx_index_in_block != transaction_index
+        {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block {} transaction {transaction_index} raw blob has the wrong location",
+                height.value()
+            )));
+        }
+        if SerializedBytesDigest::from_serialized_bytes(&blob.raw_transaction_bytes)
+            != transaction.serialized_bytes_digest
+        {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block {} transaction {transaction_index} raw bytes do not match canonical facts",
+                height.value()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_block_blob(
+    workload: CanonicalStoreWorkload,
+    block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
+    let header = &block.facts.block_header;
+    let height = header.height;
+    match (workload, &block.block_blob) {
+        (CanonicalStoreWorkload::Wallet, Some(_)) => {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "wallet block {} unexpectedly contains an explorer raw block",
+                height.value()
+            )));
+        }
+        (CanonicalStoreWorkload::Explorer, None) => {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "explorer block {} is missing its raw block",
+                height.value()
+            )));
+        }
+        (CanonicalStoreWorkload::Explorer, Some(blob))
+            if blob.height != height
+                || blob.block_hash != header.block_hash
+                || blob.parent_hash != header.parent_hash =>
+        {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "explorer block {} raw block identity does not match its canonical facts",
+                height.value()
+            )));
+        }
+        (CanonicalStoreWorkload::Explorer, Some(blob))
+            if SerializedBytesDigest::from_serialized_bytes(&blob.raw_block_bytes)
+                != block.facts.serialized_bytes_digest =>
+        {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "explorer block {} raw bytes do not match canonical facts",
+                height.value()
+            )));
+        }
+        (CanonicalStoreWorkload::Wallet, None) | (CanonicalStoreWorkload::Explorer, Some(_)) => {}
+    }
+    Ok(())
+}
+
+struct BlockSequence {
+    first_height: BlockHeight,
+    first_parent_hash: BlockHash,
+    first_hash: BlockHash,
+    tip_height: BlockHeight,
+    tip_hash: BlockHash,
+    tip_metadata: ChainTipMetadata,
+    block_count: u64,
+    transaction_count: u64,
+    block_blob_count: u64,
+    logical_bytes: u64,
+    sequence_digest: CanonicalBlockFactsSequenceDigestBuilder,
+}
+
+#[derive(Clone, Copy)]
+struct BlockSequenceRow {
+    height: BlockHeight,
+    block_hash: BlockHash,
+    parent_hash: BlockHash,
+    tip_metadata: ChainTipMetadata,
+    transaction_count: u64,
+    has_block_blob: bool,
+    logical_bytes: u64,
+    facts_digest: zinder_core::CanonicalBlockFactsDigest,
+}
+
+impl BlockSequenceRow {
+    fn from_block(block: &CanonicalBuildBlock) -> Result<Self, CanonicalStoreError> {
+        let transaction_count = u64::try_from(block.facts.transactions.len()).map_err(|_| {
+            CanonicalStoreError::block_load_sequence("transaction count exceeds u64::MAX")
+        })?;
+        let mut logical_bytes = checked_row_bytes(4, BLOCK_HEADER_VALUE_LEN)?;
+        logical_bytes = checked_add_row_bytes(logical_bytes, 32, 4)?;
+        logical_bytes =
+            checked_add_row_bytes(logical_bytes, 4, block.replay_envelope.as_bytes().len())?;
+        logical_bytes =
+            checked_add_row_bytes(logical_bytes, 4, block.compact_block.payload_bytes.len())?;
+        for transaction_blob in &block.transaction_blobs {
+            logical_bytes = checked_add_row_bytes(
+                logical_bytes,
+                8,
+                transaction_blob.raw_transaction_bytes.len(),
+            )?;
+            logical_bytes = checked_add_row_bytes(logical_bytes, 32, 40)?;
+        }
+        if let Some(block_blob) = &block.block_blob {
+            logical_bytes =
+                checked_add_row_bytes(logical_bytes, 4, block_blob.raw_block_bytes.len())?;
+        }
+        Ok(Self {
+            height: block.facts.block_header.height,
+            block_hash: block.facts.block_header.block_hash,
+            parent_hash: block.facts.block_header.parent_hash,
+            tip_metadata: block.tip_metadata,
+            transaction_count,
+            has_block_blob: block.block_blob.is_some(),
+            logical_bytes,
+            facts_digest: block.facts.digest(CanonicalBlockFactsDigestVersion::V1),
+        })
+    }
+}
+
+impl BlockSequence {
+    fn new(row: BlockSequenceRow) -> Result<Self, CanonicalStoreError> {
+        let mut sequence_digest = CanonicalBlockFactsSequenceDigestBuilder::new(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+        );
+        sequence_digest.try_append(row.facts_digest).map_err(|_| {
+            CanonicalStoreError::block_load_sequence("block sequence count exceeds u64::MAX")
+        })?;
+        Ok(Self {
+            first_height: row.height,
+            first_parent_hash: row.parent_hash,
+            first_hash: row.block_hash,
+            tip_height: row.height,
+            tip_hash: row.block_hash,
+            tip_metadata: row.tip_metadata,
+            block_count: 1,
+            transaction_count: row.transaction_count,
+            block_blob_count: u64::from(row.has_block_blob),
+            logical_bytes: row.logical_bytes,
+            sequence_digest,
+        })
+    }
+
+    fn append(&mut self, row: BlockSequenceRow) -> Result<(), CanonicalStoreError> {
+        if self.tip_height.next() != Some(row.height) {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "height {} does not immediately follow height {}",
+                row.height.value(),
+                self.tip_height.value()
+            )));
+        }
+        if row.parent_hash != self.tip_hash {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block {} parent does not match the preceding block",
+                row.height.value()
+            )));
+        }
+        if row.tip_metadata.sapling_commitment_tree_size
+            < self.tip_metadata.sapling_commitment_tree_size
+            || row.tip_metadata.orchard_commitment_tree_size
+                < self.tip_metadata.orchard_commitment_tree_size
+            || row.tip_metadata.ironwood_commitment_tree_size
+                < self.tip_metadata.ironwood_commitment_tree_size
+        {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block {} commitment-tree positions move backwards",
+                row.height.value()
+            )));
+        }
+        self.block_count = self.block_count.checked_add(1).ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence("block count exceeds u64::MAX")
+        })?;
+        self.transaction_count = self
+            .transaction_count
+            .checked_add(row.transaction_count)
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence("transaction count exceeds u64::MAX")
+            })?;
+        self.block_blob_count = self
+            .block_blob_count
+            .checked_add(u64::from(row.has_block_blob))
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence("block blob count exceeds u64::MAX")
+            })?;
+        self.logical_bytes = self
+            .logical_bytes
+            .checked_add(row.logical_bytes)
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence("logical byte count exceeds u64::MAX")
+            })?;
+        self.sequence_digest
+            .try_append(row.facts_digest)
+            .map_err(|_| {
+                CanonicalStoreError::block_load_sequence("block sequence count exceeds u64::MAX")
+            })?;
+        self.tip_height = row.height;
+        self.tip_hash = row.block_hash;
+        self.tip_metadata = row.tip_metadata;
+        Ok(())
+    }
+
+    fn finish(self, sst_file_bytes: u64, sst_file_count: u64) -> CanonicalBlockLoadEvidence {
+        CanonicalBlockLoadEvidence {
+            first_height: self.first_height,
+            first_parent_hash: self.first_parent_hash,
+            first_hash: self.first_hash,
+            tip_height: self.tip_height,
+            tip_hash: self.tip_hash,
+            tip_metadata: self.tip_metadata,
+            block_count: self.block_count,
+            transaction_count: self.transaction_count,
+            block_header_count: self.block_count,
+            block_hash_index_count: self.block_count,
+            block_replay_count: self.block_count,
+            compact_block_count: self.block_count,
+            transaction_location_count: self.transaction_count,
+            transaction_blob_count: self.transaction_count,
+            block_blob_count: self.block_blob_count,
+            logical_bytes: self.logical_bytes,
+            sst_file_bytes,
+            sst_file_count,
+            replay_format_version: CanonicalBlockReplayFormatVersion::V1,
+            block_digest_version: CanonicalBlockFactsDigestVersion::V1,
+            sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
+            sequence_digest: self.sequence_digest.finish(),
+        }
+    }
+}
+
+impl PreparedColumnFamily {
+    fn new(name: &'static str, paths: Vec<PathBuf>) -> Self {
+        Self { name, paths }
+    }
+}
+
+fn checked_row_bytes(key_len: usize, value_len: usize) -> Result<u64, CanonicalStoreError> {
+    let row_len = key_len.checked_add(value_len).ok_or_else(|| {
+        CanonicalStoreError::block_load_sequence("logical row byte count exceeds usize::MAX")
+    })?;
+    u64::try_from(row_len).map_err(|_| {
+        CanonicalStoreError::block_load_sequence("logical row byte count exceeds u64::MAX")
+    })
+}
+
+fn checked_add_row_bytes(
+    total: u64,
+    key_len: usize,
+    value_len: usize,
+) -> Result<u64, CanonicalStoreError> {
+    total
+        .checked_add(checked_row_bytes(key_len, value_len)?)
+        .ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence("logical byte count exceeds u64::MAX")
+        })
+}
+
+fn checked_add_sst_bytes(total: u64, file_bytes: u64) -> Result<u64, CanonicalStoreError> {
+    total.checked_add(file_bytes).ok_or_else(|| {
+        CanonicalStoreError::block_load_sequence("physical SST byte count exceeds u64::MAX")
+    })
+}

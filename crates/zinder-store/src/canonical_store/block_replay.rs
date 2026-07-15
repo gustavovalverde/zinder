@@ -1,165 +1,37 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
-use rust_rocksdb::{
-    BoundColumnFamily, DB, IngestExternalFileOptions, Options, ReadOptions, SstFileWriter,
-};
+use rust_rocksdb::{BoundColumnFamily, DB, ReadOptions};
 use zinder_core::{
     BlockHash, BlockHeight, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestBuilder,
-    CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayEnvelope,
-    CanonicalBlockReplayFormatVersion, decode_canonical_block_replay,
-    wire::{decode_height_key_ascending, encode_height_key_ascending},
+    CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion,
+    decode_canonical_block_replay, wire::decode_height_key_ascending,
 };
 
-use super::{CanonicalStoreBuildError, CanonicalStoreError};
+use super::{CanonicalBlockLoadEvidence, CanonicalStoreError};
 
 pub(super) const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
-pub(super) const BLOCK_REPLAY_SST_TARGET_LOGICAL_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Persisted identity and measurements of one complete canonical replay load.
-///
-/// This evidence is returned only after the ingested column family has been
-/// decoded and compared with the ordered input. It does not publish the whole
-/// canonical store as ready; every other required family must be completed and
-/// validated first.
+/// Cache-bypassing semantic proof of the persisted replay family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CanonicalBlockReplayLoadEvidence {
-    /// First retained block height.
-    pub first_height: BlockHeight,
-    /// Parent of the first retained block.
-    pub first_parent_hash: BlockHash,
-    /// First retained block hash.
-    pub first_hash: BlockHash,
-    /// Last retained block height.
-    pub tip_height: BlockHeight,
-    /// Last retained block hash.
-    pub tip_hash: BlockHash,
-    /// Number of contiguous replay rows.
-    pub block_count: u64,
-    /// Complete semantic replay-envelope bytes.
-    pub logical_replay_bytes: u64,
-    /// Physical bytes of every ingested SST file.
-    pub sst_file_bytes: u64,
-    /// Number of bounded SST files ingested in one atomic call.
-    pub sst_file_count: u64,
-    /// Canonical replay-envelope contract validated for every row.
-    pub replay_format_version: CanonicalBlockReplayFormatVersion,
-    /// Semantic block-facts digest contract validated for every row.
-    pub block_digest_version: CanonicalBlockFactsDigestVersion,
-    /// Version of the ordered sequence digest.
-    pub sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
-    /// Ordered digest of every replay row's semantic fact digest.
-    pub sequence_digest: CanonicalBlockFactsSequenceDigest,
+pub(super) struct PersistedBlockReplayEvidence {
+    pub(super) first_height: BlockHeight,
+    pub(super) first_parent_hash: BlockHash,
+    pub(super) first_hash: BlockHash,
+    pub(super) tip_height: BlockHeight,
+    pub(super) tip_hash: BlockHash,
+    pub(super) block_count: u64,
+    pub(super) logical_replay_bytes: u64,
+    pub(super) replay_format_version: CanonicalBlockReplayFormatVersion,
+    pub(super) block_digest_version: CanonicalBlockFactsDigestVersion,
+    pub(super) sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
+    pub(super) sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
-pub(super) struct PreparedBlockReplayLoad {
-    pub(super) external_sst_paths: Vec<PathBuf>,
-    pub(super) evidence: CanonicalBlockReplayLoadEvidence,
-}
-
-pub(super) fn write_block_replay_ssts_with_target<SourceError>(
-    staging_path: &std::path::Path,
-    options: &Options,
-    sst_target_logical_bytes: u64,
-    replay_envelopes: impl IntoIterator<Item = Result<CanonicalBlockReplayEnvelope, SourceError>>,
-) -> Result<PreparedBlockReplayLoad, CanonicalStoreBuildError<SourceError>> {
-    let mut replay_envelopes = replay_envelopes.into_iter();
-    let first_replay = match replay_envelopes.next() {
-        Some(Ok(replay)) => replay,
-        Some(Err(source)) => return Err(CanonicalStoreBuildError::Source { source }),
-        None => {
-            return Err(CanonicalStoreError::block_replay_sequence(
-                "a canonical replay load must contain at least one row",
-            )
-            .into());
-        }
-    };
-
-    let mut sequence = ReplaySequence::from_envelope(&first_replay)?;
-    let mut external_sst_paths = Vec::new();
-    let mut sst_file_bytes = 0_u64;
-    let mut sst_index = 0_u64;
-    let mut current_path = replay_sst_path(staging_path, sst_index);
-    let mut writer = open_sst_writer(options, &current_path)?;
-    write_replay(&mut writer, &first_replay)?;
-    let mut current_sst_logical_bytes = checked_replay_len(&first_replay)?;
-
-    for replay in replay_envelopes {
-        let replay = replay.map_err(|source| CanonicalStoreBuildError::Source { source })?;
-        sequence.append_envelope(&replay)?;
-        if current_sst_logical_bytes >= sst_target_logical_bytes {
-            sst_file_bytes = finish_sst(writer, &current_path, sst_file_bytes)?;
-            external_sst_paths.push(current_path);
-            sst_index = sst_index.checked_add(1).ok_or_else(|| {
-                CanonicalStoreError::block_replay_sequence("SST file count exceeds u64::MAX")
-            })?;
-            current_path = replay_sst_path(staging_path, sst_index);
-            writer = open_sst_writer(options, &current_path)?;
-            current_sst_logical_bytes = 0;
-        }
-        write_replay(&mut writer, &replay)?;
-        current_sst_logical_bytes = current_sst_logical_bytes
-            .checked_add(checked_replay_len(&replay)?)
-            .ok_or_else(|| {
-                CanonicalStoreError::block_replay_sequence(
-                    "current SST logical byte count exceeds u64::MAX",
-                )
-            })?;
-    }
-
-    sst_file_bytes = finish_sst(writer, &current_path, sst_file_bytes)?;
-    external_sst_paths.push(current_path);
-    let sst_file_count = u64::try_from(external_sst_paths.len()).map_err(|_| {
-        CanonicalStoreError::block_replay_sequence("SST file count exceeds u64::MAX")
-    })?;
-    Ok(PreparedBlockReplayLoad {
-        external_sst_paths,
-        evidence: sequence.finish(sst_file_bytes, sst_file_count),
-    })
-}
-
-pub(super) fn ingest_block_replay_ssts(
-    db: &DB,
-    external_sst_paths: Vec<PathBuf>,
-) -> Result<(), CanonicalStoreError> {
-    if external_sst_paths.is_empty() {
-        return Err(CanonicalStoreError::block_replay_sequence(
-            "external SST ingestion requires at least one file",
-        ));
-    }
-    let block_replay = block_replay_column_family(db)?;
-    let mut options = IngestExternalFileOptions::default();
-    options.set_move_files(true);
-    options.set_snapshot_consistency(true);
-    options.set_allow_global_seqno(false);
-    options.set_allow_blocking_flush(false);
-    db.ingest_external_file_cf_opts(&block_replay, &options, external_sst_paths)
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "block replay external SST ingestion",
-            source,
-        })
-}
-
-pub(super) fn block_replay_is_empty(db: &DB) -> Result<bool, CanonicalStoreError> {
-    let block_replay = block_replay_column_family(db)?;
-    let mut iterator = db.raw_iterator_cf(&block_replay);
-    iterator.seek_to_first();
-    if iterator.valid() {
-        return Ok(false);
-    }
-    iterator
-        .status()
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "block replay empty-state validation",
-            source,
-        })?;
-    Ok(true)
-}
-
+/// Decodes every persisted replay row without populating the block cache.
 pub(super) fn validate_persisted_block_replays(
     db: &DB,
-    sst_file_bytes: u64,
-) -> Result<CanonicalBlockReplayLoadEvidence, CanonicalStoreError> {
+) -> Result<PersistedBlockReplayEvidence, CanonicalStoreError> {
     let block_replay = block_replay_column_family(db)?;
     let mut read_options = ReadOptions::default();
     read_options.fill_cache(false);
@@ -196,23 +68,16 @@ pub(super) fn validate_persisted_block_replays(
         let replay_bytes = u64::try_from(encoded_replay.len()).map_err(|_| {
             CanonicalStoreError::block_replay_sequence("replay byte length exceeds u64::MAX")
         })?;
+        let row = ReplaySequenceRow {
+            height,
+            block_hash: facts.block_header.block_hash,
+            parent_hash: facts.block_header.parent_hash,
+            reference_digest: replay.reference_digest(),
+            replay_bytes,
+        };
         match &mut sequence {
-            None => {
-                sequence = Some(ReplaySequence::new(ReplaySequenceRow {
-                    height,
-                    block_hash: facts.block_header.block_hash,
-                    parent_hash: facts.block_header.parent_hash,
-                    reference_digest: replay.reference_digest(),
-                    replay_bytes,
-                })?);
-            }
-            Some(sequence) => sequence.append(ReplaySequenceRow {
-                height,
-                block_hash: facts.block_header.block_hash,
-                parent_hash: facts.block_header.parent_hash,
-                reference_digest: replay.reference_digest(),
-                replay_bytes,
-            })?,
+            None => sequence = Some(ReplaySequence::new(row)?),
+            Some(sequence) => sequence.append(row)?,
         }
         iterator.next();
     }
@@ -222,79 +87,33 @@ pub(super) fn validate_persisted_block_replays(
             operation: "block replay readback iteration",
             source,
         })?;
-    sequence
-        .map(|sequence| sequence.finish(sst_file_bytes, 0))
-        .ok_or_else(|| {
-            CanonicalStoreError::block_replay_sequence(
-                "persisted block replay family must not be empty",
-            )
-        })
+    sequence.map(ReplaySequence::finish).ok_or_else(|| {
+        CanonicalStoreError::block_replay_sequence(
+            "persisted block replay family must not be empty",
+        )
+    })
+}
+
+impl PersistedBlockReplayEvidence {
+    pub(super) fn has_same_sequence(self, prepared: CanonicalBlockLoadEvidence) -> bool {
+        let replay_counts_match = self.block_count == prepared.block_count
+            && prepared.block_count == prepared.block_replay_count;
+        self.first_height == prepared.first_height
+            && self.first_parent_hash == prepared.first_parent_hash
+            && self.first_hash == prepared.first_hash
+            && self.tip_height == prepared.tip_height
+            && self.tip_hash == prepared.tip_hash
+            && replay_counts_match
+            && self.replay_format_version == prepared.replay_format_version
+            && self.block_digest_version == prepared.block_digest_version
+            && self.sequence_digest_version == prepared.sequence_digest_version
+            && self.sequence_digest == prepared.sequence_digest
+    }
 }
 
 fn block_replay_column_family(db: &DB) -> Result<Arc<BoundColumnFamily<'_>>, CanonicalStoreError> {
     db.cf_handle(BLOCK_REPLAY_COLUMN_FAMILY).ok_or_else(|| {
         CanonicalStoreError::block_replay_sequence("block_replay column family is absent")
-    })
-}
-
-fn replay_sst_path(staging_path: &std::path::Path, index: u64) -> PathBuf {
-    staging_path.join(format!("block-replay-{index:08}.sst"))
-}
-
-fn open_sst_writer<'options>(
-    options: &'options Options,
-    path: &std::path::Path,
-) -> Result<SstFileWriter<'options>, CanonicalStoreError> {
-    let writer = SstFileWriter::create(options);
-    writer
-        .open(path)
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "block replay SST open",
-            source,
-        })?;
-    Ok(writer)
-}
-
-fn finish_sst(
-    mut writer: SstFileWriter<'_>,
-    path: &std::path::Path,
-    total_sst_file_bytes: u64,
-) -> Result<u64, CanonicalStoreError> {
-    writer
-        .finish()
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "block replay SST finish",
-            source,
-        })?;
-    let file_bytes = fs::metadata(path)
-        .map_err(|source| CanonicalStoreError::PathUnavailable {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .len();
-    total_sst_file_bytes.checked_add(file_bytes).ok_or_else(|| {
-        CanonicalStoreError::block_replay_sequence("physical SST byte count exceeds u64::MAX")
-    })
-}
-
-fn write_replay(
-    writer: &mut SstFileWriter<'_>,
-    replay: &CanonicalBlockReplayEnvelope,
-) -> Result<(), CanonicalStoreError> {
-    writer
-        .put(
-            encode_height_key_ascending(replay.block_height()),
-            replay.as_bytes(),
-        )
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "block replay SST write",
-            source,
-        })
-}
-
-fn checked_replay_len(replay: &CanonicalBlockReplayEnvelope) -> Result<u64, CanonicalStoreError> {
-    u64::try_from(replay.as_bytes().len()).map_err(|_| {
-        CanonicalStoreError::block_replay_sequence("replay byte length exceeds u64::MAX")
     })
 }
 
@@ -318,24 +137,7 @@ struct ReplaySequenceRow {
     replay_bytes: u64,
 }
 
-impl ReplaySequenceRow {
-    fn from_envelope(replay: &CanonicalBlockReplayEnvelope) -> Result<Self, CanonicalStoreError> {
-        validate_replay_versions(replay.format_version(), replay.reference_digest())?;
-        Ok(Self {
-            height: replay.block_height(),
-            block_hash: replay.block_hash(),
-            parent_hash: replay.parent_hash(),
-            reference_digest: replay.reference_digest(),
-            replay_bytes: checked_replay_len(replay)?,
-        })
-    }
-}
-
 impl ReplaySequence {
-    fn from_envelope(replay: &CanonicalBlockReplayEnvelope) -> Result<Self, CanonicalStoreError> {
-        Self::new(ReplaySequenceRow::from_envelope(replay)?)
-    }
-
     fn new(row: ReplaySequenceRow) -> Result<Self, CanonicalStoreError> {
         let mut digest_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
             CanonicalBlockFactsSequenceDigestVersion::V1,
@@ -353,13 +155,6 @@ impl ReplaySequence {
             logical_replay_bytes: row.replay_bytes,
             digest_builder,
         })
-    }
-
-    fn append_envelope(
-        &mut self,
-        replay: &CanonicalBlockReplayEnvelope,
-    ) -> Result<(), CanonicalStoreError> {
-        self.append(ReplaySequenceRow::from_envelope(replay)?)
     }
 
     fn append(&mut self, row: ReplaySequenceRow) -> Result<(), CanonicalStoreError> {
@@ -398,8 +193,8 @@ impl ReplaySequence {
         Ok(())
     }
 
-    fn finish(self, sst_file_bytes: u64, sst_file_count: u64) -> CanonicalBlockReplayLoadEvidence {
-        CanonicalBlockReplayLoadEvidence {
+    fn finish(self) -> PersistedBlockReplayEvidence {
+        PersistedBlockReplayEvidence {
             first_height: self.first_height,
             first_parent_hash: self.first_parent_hash,
             first_hash: self.first_hash,
@@ -407,29 +202,11 @@ impl ReplaySequence {
             tip_hash: self.tip_hash,
             block_count: self.block_count,
             logical_replay_bytes: self.logical_replay_bytes,
-            sst_file_bytes,
-            sst_file_count,
             replay_format_version: CanonicalBlockReplayFormatVersion::V1,
             block_digest_version: CanonicalBlockFactsDigestVersion::V1,
             sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
             sequence_digest: self.digest_builder.finish(),
         }
-    }
-}
-
-impl CanonicalBlockReplayLoadEvidence {
-    pub(super) fn has_same_sequence(self, other: Self) -> bool {
-        self.first_height == other.first_height
-            && self.first_parent_hash == other.first_parent_hash
-            && self.first_hash == other.first_hash
-            && self.tip_height == other.tip_height
-            && self.tip_hash == other.tip_hash
-            && self.block_count == other.block_count
-            && self.logical_replay_bytes == other.logical_replay_bytes
-            && self.replay_format_version == other.replay_format_version
-            && self.block_digest_version == other.block_digest_version
-            && self.sequence_digest_version == other.sequence_digest_version
-            && self.sequence_digest == other.sequence_digest
     }
 }
 
