@@ -4,7 +4,10 @@ use rust_rocksdb::{
     Cache, ColumnFamilyDescriptor, DB, DBCompressionType, DEFAULT_COLUMN_FAMILY_NAME, IteratorMode,
     Options, WriteBatch, WriteOptions,
 };
-use zinder_core::{CanonicalHistoryBounds, Network, NetworkUpgradeActivationsFingerprint};
+use zinder_core::{
+    CanonicalHistoryBounds, Network, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
+};
 
 use crate::{
     BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
@@ -27,13 +30,14 @@ pub(super) const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
 const TREE_STATE_COLUMN_FAMILY: &str = "tree_state";
 const FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str = "final_note_commitment_roots";
 const SUBTREE_ROOT_COLUMN_FAMILY: &str = "subtree_root";
+const CHAIN_EPOCH_COLUMN_FAMILY: &str = "chain_epoch";
 const CHAIN_EVENT_COLUMN_FAMILY: &str = "chain_event";
 const MEMPOOL_EVENT_COLUMN_FAMILY: &str = "mempool_event";
 const DISPLACED_BLOCK_FACTS_COLUMN_FAMILY: &str = "displaced_block_facts";
 pub(super) const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
 pub(super) const TRANSACTION_BLOB_COLUMN_FAMILY: &str = "transaction_blob";
 
-pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 14] = [
+pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 15] = [
     BLOCK_HEADER_COLUMN_FAMILY,
     BLOCK_HASH_INDEX_COLUMN_FAMILY,
     BLOCK_REPLAY_COLUMN_FAMILY,
@@ -43,6 +47,7 @@ pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 14] = [
     TREE_STATE_COLUMN_FAMILY,
     FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
     SUBTREE_ROOT_COLUMN_FAMILY,
+    CHAIN_EPOCH_COLUMN_FAMILY,
     CHAIN_EVENT_COLUMN_FAMILY,
     MEMPOOL_EVENT_COLUMN_FAMILY,
     DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
@@ -56,10 +61,8 @@ pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 14] = [
 /// This serving type cannot represent or reopen an unpublished BUILDING store.
 pub struct RocksDbCanonicalStore {
     bounded_open: BoundedRocksDbOpen,
-    network: Network,
-    network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     workload: CanonicalStoreWorkload,
-    history_bounds: CanonicalHistoryBounds,
+    build_plan: super::CanonicalStoreBuildPlan,
     _cursor_auth_key: [u8; 32],
     ready_evidence: CanonicalStoreReadyEvidence,
 }
@@ -68,19 +71,27 @@ impl RocksDbCanonicalStore {
     /// Opens an existing READY version-1 canonical store after exact admission.
     ///
     /// Admission validates the complete column-family set, singleton control
-    /// key, identity, schema, network, workload, source range, and readiness
-    /// evidence before opening a writer that cannot create data families.
+    /// key, identity, schema, exact network-upgrade activation table, workload,
+    /// source range, and readiness evidence before opening a writer that cannot
+    /// create data families.
     pub fn open_ready(
         path: impl AsRef<Path>,
-        expected_network: Network,
+        expected_network_upgrade_activations: &NetworkUpgradeActivations,
         expected_workload: CanonicalStoreWorkload,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
         let path = path.as_ref();
+        let expected_network = expected_network_upgrade_activations.network();
+        let expected_activations_fingerprint = expected_network_upgrade_activations
+            .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
         validate_resource_budget(resource_budget)?;
         let store_path = canonical_store_path(path)?;
-        let (admitted_database_identity, admitted_control) =
-            admit_existing_store(&store_path, expected_network, expected_workload)?;
+        let (admitted_database_identity, admitted_control) = admit_existing_store(
+            &store_path,
+            expected_network,
+            expected_activations_fingerprint,
+            expected_workload,
+        )?;
         let CanonicalStoreBuildState::Ready(admitted_ready_evidence) = admitted_control.build_state
         else {
             return Err(CanonicalStoreError::StoreNotReady { path: store_path });
@@ -110,6 +121,7 @@ impl RocksDbCanonicalStore {
             &bounded_open.db,
             &store_path,
             expected_network,
+            expected_activations_fingerprint,
             expected_workload,
         )?;
         if opened_control != admitted_control {
@@ -128,14 +140,11 @@ impl RocksDbCanonicalStore {
                 "ready evidence changed during admission",
             ));
         }
+        let build_plan = opened_control.build_plan;
         Ok(Self {
             bounded_open,
-            network: expected_network,
-            network_upgrade_activations_fingerprint: opened_control
-                .build_plan
-                .network_upgrade_activations_fingerprint(),
             workload: expected_workload,
-            history_bounds: opened_control.build_plan.history_bounds(),
+            build_plan,
             _cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
         })
@@ -144,7 +153,7 @@ impl RocksDbCanonicalStore {
     /// Returns the immutable network persisted by the store control record.
     #[must_use]
     pub const fn network(&self) -> Network {
-        self.network
+        self.build_plan.network()
     }
 
     /// Returns the admitted activation-table identity persisted by the store.
@@ -152,7 +161,7 @@ impl RocksDbCanonicalStore {
     pub const fn network_upgrade_activations_fingerprint(
         &self,
     ) -> NetworkUpgradeActivationsFingerprint {
-        self.network_upgrade_activations_fingerprint
+        self.build_plan.network_upgrade_activations_fingerprint()
     }
 
     /// Returns the immutable canonical workload persisted by the store.
@@ -164,7 +173,13 @@ impl RocksDbCanonicalStore {
     /// Returns the durable boundary of intentionally retained history.
     #[must_use]
     pub const fn history_bounds(&self) -> CanonicalHistoryBounds {
-        self.history_bounds
+        self.build_plan.history_bounds()
+    }
+
+    /// Returns the complete admitted canonical construction identity.
+    #[must_use]
+    pub const fn build_plan(&self) -> &super::CanonicalStoreBuildPlan {
+        &self.build_plan
     }
 
     /// Returns the evidence that admitted this store as READY.
@@ -247,7 +262,7 @@ pub(super) fn create_fresh_directory(path: &Path) -> Result<(), CanonicalStoreEr
 pub(super) fn initialize_store_identity(
     path: &Path,
     workload: CanonicalStoreWorkload,
-    build_plan: super::CanonicalStoreBuildPlan,
+    build_plan: &super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
 ) -> Result<(), CanonicalStoreError> {
     let mut database_options = Options::default();
@@ -259,10 +274,9 @@ pub(super) fn initialize_store_identity(
         }
     })?;
     let mut batch = WriteBatch::default();
-    batch.put(
-        STORE_CONTROL_KEY,
-        encode_building_store_control(workload, build_plan, cursor_auth_key),
-    );
+    let encoded_control = encode_building_store_control(workload, build_plan, cursor_auth_key)
+        .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
+    batch.put(STORE_CONTROL_KEY, encoded_control);
     let mut options = WriteOptions::default();
     options.disable_wal(false);
     options.set_sync(true);
@@ -276,6 +290,7 @@ pub(super) fn initialize_store_identity(
 fn admit_existing_store(
     path: &Path,
     expected_network: Network,
+    expected_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     expected_workload: CanonicalStoreWorkload,
 ) -> Result<(Vec<u8>, DecodedStoreControl), CanonicalStoreError> {
     let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
@@ -286,7 +301,13 @@ fn admit_existing_store(
         .map_err(|source| {
             CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
         })?;
-    let control = validate_open_store_control(&db, path, expected_network, expected_workload)?;
+    let control = validate_open_store_control(
+        &db,
+        path,
+        expected_network,
+        expected_activations_fingerprint,
+        expected_workload,
+    )?;
     let database_identity = db.get_db_identity().map_err(|source| {
         CanonicalStoreError::admission(path, format!("database identity read failed: {source}"))
     })?;
@@ -320,6 +341,7 @@ fn validate_open_store_control(
     db: &DB,
     path: &Path,
     expected_network: Network,
+    expected_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     expected_workload: CanonicalStoreWorkload,
 ) -> Result<DecodedStoreControl, CanonicalStoreError> {
     let mut control = None;
@@ -352,6 +374,15 @@ fn validate_open_store_control(
             ),
         ));
     }
+    let persisted_activations_fingerprint = persisted
+        .build_plan
+        .network_upgrade_activations_fingerprint();
+    if persisted_activations_fingerprint != expected_activations_fingerprint {
+        return Err(CanonicalStoreError::admission(
+            path,
+            "persisted network upgrade activations do not equal the requested activation table",
+        ));
+    }
     if persisted.workload != expected_workload {
         return Err(CanonicalStoreError::admission(
             path,
@@ -368,22 +399,13 @@ fn validate_open_store_control(
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
-    use zinder_core::{
-        BlockHash, BlockHeight, BlockId, NetworkUpgradeActivationsFingerprint,
-        NetworkUpgradeActivationsFingerprintVersion,
-    };
+    use zinder_core::{BlockHash, BlockHeight, BlockId};
 
     use super::*;
     use crate::{
         CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildPlan,
         RocksDbCanonicalBuilder,
     };
-
-    const ACTIVATIONS_FINGERPRINT: NetworkUpgradeActivationsFingerprint =
-        NetworkUpgradeActivationsFingerprint::from_bytes(
-            NetworkUpgradeActivationsFingerprintVersion::V1,
-            [23; 32],
-        );
 
     #[test]
     fn building_layout_is_exact_and_not_servable() -> Result<(), Box<dyn std::error::Error>> {
@@ -396,9 +418,11 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(store.network(), Network::ZcashTestnet);
+        let testnet_activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         assert_eq!(
             store.network_upgrade_activations_fingerprint(),
-            ACTIVATIONS_FINGERPRINT
+            testnet_activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
         );
         assert_eq!(store.workload(), CanonicalStoreWorkload::Explorer);
         assert_eq!(
@@ -419,7 +443,7 @@ mod tests {
 
         let error = RocksDbCanonicalStore::open_ready(
             &path,
-            Network::ZcashTestnet,
+            &testnet_activations,
             CanonicalStoreWorkload::Explorer,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -428,9 +452,11 @@ mod tests {
         assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
 
         let control_before = read_control(&path)?;
+        let mainnet_activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashMainnet)?;
         let error = RocksDbCanonicalStore::open_ready(
             &path,
-            Network::ZcashMainnet,
+            &mainnet_activations,
             CanonicalStoreWorkload::Explorer,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -444,7 +470,7 @@ mod tests {
 
         let error = RocksDbCanonicalStore::open_ready(
             &path,
-            Network::ZcashTestnet,
+            &testnet_activations,
             CanonicalStoreWorkload::Wallet,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -452,6 +478,47 @@ mod tests {
         .ok_or("workload mismatch should be rejected")?;
         assert!(error.to_string().contains("persisted workload explorer"));
         assert_eq!(read_control(&path)?, control_before);
+        Ok(())
+    }
+
+    #[test]
+    fn ready_open_rejects_activation_table_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let path = temporary.path().join("activation-mismatch");
+        let store = RocksDbCanonicalBuilder::create_fresh(
+            &path,
+            CanonicalStoreWorkload::Explorer,
+            complete_build_plan()?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        drop(store);
+
+        let testnet_activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let mut shifted_activation_rows = testnet_activations.activations().to_vec();
+        let latest_activation = shifted_activation_rows
+            .last_mut()
+            .ok_or("canonical activation fixture must not be empty")?;
+        latest_activation.activation_height = BlockHeight::new(
+            latest_activation
+                .activation_height
+                .value()
+                .saturating_add(1),
+        );
+        let shifted_activations = zinder_core::NetworkUpgradeActivations::new(
+            Network::ZcashTestnet,
+            shifted_activation_rows,
+        )?;
+
+        let error = RocksDbCanonicalStore::open_ready(
+            &path,
+            &shifted_activations,
+            CanonicalStoreWorkload::Explorer,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("activation mismatch should be rejected")?;
+        assert!(error.to_string().contains("network upgrade activations"));
         Ok(())
     }
 
@@ -472,7 +539,7 @@ mod tests {
 
         let error = RocksDbCanonicalStore::open_ready(
             &path,
-            Network::ZcashTestnet,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -517,7 +584,7 @@ mod tests {
 
         let error = RocksDbCanonicalStore::open_ready(
             &path,
-            Network::ZcashTestnet,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -549,7 +616,7 @@ mod tests {
 
         let error = RocksDbCanonicalStore::open_ready(
             &path,
-            Network::ZcashTestnet,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -585,9 +652,10 @@ mod tests {
     }
 
     fn complete_build_plan() -> Result<CanonicalStoreBuildPlan, Box<dyn std::error::Error>> {
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         Ok(CanonicalStoreBuildPlan::complete(
-            Network::ZcashTestnet,
-            ACTIVATIONS_FINGERPRINT,
+            &activations,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
         )?)
     }

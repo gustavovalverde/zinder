@@ -1,14 +1,16 @@
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion,
-    CanonicalHistoryBounds, ChainEpochId, ChainTipMetadata, Network,
+    CanonicalHistoryBounds, ChainEpochId, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+    FinalNoteCommitmentRoot, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, Network,
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
+    ShieldedProtocol,
 };
 
 use super::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildPlan,
-    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload,
+    CanonicalStoreBuildPlanError, CanonicalStoreBuildState, CanonicalStoreError,
+    CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
 };
 
 const BUILDING_STATE: u8 = 1;
@@ -17,22 +19,24 @@ const COMPLETE_HISTORY: u8 = 0;
 const CHECKPOINTED_HISTORY: u8 = 1;
 const WALLET_WORKLOAD: u8 = 1;
 const EXPLORER_WORKLOAD: u8 = 2;
+const FRONTIER_ABSENT: u8 = 0;
+const FRONTIER_PRESENT: u8 = 1;
 const ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH: usize = 2 + 32;
-const HISTORY_FIELDS_LENGTH: usize = 1 + 4 + 32 + 4 + 4 + 4;
+const HISTORY_FIXED_FIELDS_LENGTH: usize = 1 + 4 + 32 + 3;
 const BUILD_TIP_FIELDS_LENGTH: usize = 4 + 32;
 const READY_FIELDS_LENGTH: usize = 4 + 32 + 4 + 32 + 8 + 8 + 2 + 4 + 2 + 32 + 8;
-const STORE_CONTROL_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
+const STORE_CONTROL_MINIMUM_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + 2
     + 4
     + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
     + 1
-    + HISTORY_FIELDS_LENGTH
+    + HISTORY_FIXED_FIELDS_LENGTH
     + BUILD_TIP_FIELDS_LENGTH
     + 32
     + 1
     + READY_FIELDS_LENGTH;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DecodedStoreControl {
     pub(super) network: Network,
     pub(super) workload: CanonicalStoreWorkload,
@@ -43,10 +47,10 @@ pub(super) struct DecodedStoreControl {
 
 pub(super) fn encode_building_store_control(
     workload: CanonicalStoreWorkload,
-    build_plan: CanonicalStoreBuildPlan,
+    build_plan: &CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
-) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(STORE_CONTROL_LENGTH);
+) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
+    let mut encoded = Vec::with_capacity(STORE_CONTROL_MINIMUM_LENGTH);
     encoded.extend_from_slice(CANONICAL_STORE_IDENTITY.as_bytes());
     encoded.extend_from_slice(&CANONICAL_STORE_SCHEMA_VERSION.to_le_bytes());
     encoded.extend_from_slice(&build_plan.network().id().to_le_bytes());
@@ -75,28 +79,42 @@ pub(super) fn encode_building_store_control(
             encoded.extend_from_slice(&checkpoint.hash.as_bytes());
         }
     }
-    let predecessor_tip_metadata = build_plan.history_predecessor_tip_metadata();
-    encoded.extend_from_slice(
-        &predecessor_tip_metadata
-            .sapling_commitment_tree_size
-            .to_le_bytes(),
-    );
-    encoded.extend_from_slice(
-        &predecessor_tip_metadata
-            .orchard_commitment_tree_size
-            .to_le_bytes(),
-    );
-    encoded.extend_from_slice(
-        &predecessor_tip_metadata
-            .ironwood_commitment_tree_size
-            .to_le_bytes(),
-    );
+    encode_predecessor_frontiers(&mut encoded, build_plan.history_predecessor_frontiers())?;
     encoded.extend_from_slice(&build_plan.build_tip().height.value().to_le_bytes());
     encoded.extend_from_slice(&build_plan.build_tip().hash.as_bytes());
     encoded.extend_from_slice(&cursor_auth_key);
     encoded.push(BUILDING_STATE);
-    encoded.resize(STORE_CONTROL_LENGTH, 0);
-    encoded
+    encoded.resize(encoded.len() + READY_FIELDS_LENGTH, 0);
+    Ok(encoded)
+}
+
+fn encode_predecessor_frontiers(
+    encoded: &mut Vec<u8>,
+    frontiers: &CommitmentTreeFrontiers,
+) -> Result<(), CanonicalStoreBuildPlanError> {
+    for protocol in [
+        ShieldedProtocol::Sapling,
+        ShieldedProtocol::Orchard,
+        ShieldedProtocol::Ironwood,
+    ] {
+        let Some(frontier) = frontiers.get(protocol) else {
+            encoded.push(FRONTIER_ABSENT);
+            continue;
+        };
+        let final_state_length =
+            u16::try_from(frontier.final_state_bytes().len()).map_err(|_| {
+                CanonicalStoreBuildPlanError::PredecessorFrontierTooLarge {
+                    protocol,
+                    encoded_bytes: frontier.final_state_bytes().len(),
+                }
+            })?;
+        encoded.push(FRONTIER_PRESENT);
+        encoded.extend_from_slice(&frontier.tree_size().to_le_bytes());
+        encoded.extend_from_slice(&frontier.final_root().as_bytes());
+        encoded.extend_from_slice(&final_state_length.to_le_bytes());
+        encoded.extend_from_slice(frontier.final_state_bytes());
+    }
+    Ok(())
 }
 
 pub(super) fn decode_store_control(
@@ -139,7 +157,7 @@ pub(super) fn decode_store_control(
             ));
         }
     };
-    let (history_bounds, history_predecessor, history_predecessor_tip_metadata) =
+    let (history_bounds, history_predecessor, history_predecessor_frontiers) =
         decode_history_bounds(&mut decoder)?;
     let build_tip = BlockId::new(
         BlockHeight::new(decoder.read_u32("build tip height")?),
@@ -150,7 +168,7 @@ pub(super) fn decode_store_control(
         network_upgrade_activations_fingerprint,
         history_bounds,
         history_predecessor,
-        history_predecessor_tip_metadata,
+        history_predecessor_frontiers,
         build_tip,
     )
     .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
@@ -201,7 +219,7 @@ fn decode_network_upgrade_activations_fingerprint(
 
 fn decode_history_bounds(
     decoder: &mut Decoder<'_>,
-) -> Result<(CanonicalHistoryBounds, BlockId, ChainTipMetadata), CanonicalStoreError> {
+) -> Result<(CanonicalHistoryBounds, BlockId, CommitmentTreeFrontiers), CanonicalStoreError> {
     let kind = decoder.read_u8("history kind")?;
     let predecessor_height = decoder.read_u32("history predecessor height")?;
     let predecessor_hash = decoder.read_array::<32>("history predecessor hash")?;
@@ -222,16 +240,74 @@ fn decode_history_bounds(
             format!("store control contains unknown history kind {kind}"),
         )),
     }?;
-    let history_predecessor_tip_metadata = ChainTipMetadata::new(
-        decoder.read_u32("history predecessor sapling tree size")?,
-        decoder.read_u32("history predecessor orchard tree size")?,
-        decoder.read_u32("history predecessor ironwood tree size")?,
+    let history_predecessor_frontiers = CommitmentTreeFrontiers::from_validated_parts(
+        decode_predecessor_frontier(decoder, ShieldedProtocol::Sapling)?,
+        decode_predecessor_frontier(decoder, ShieldedProtocol::Orchard)?,
+        decode_predecessor_frontier(decoder, ShieldedProtocol::Ironwood)?,
     );
     Ok((
         history_bounds,
         history_predecessor,
-        history_predecessor_tip_metadata,
+        history_predecessor_frontiers,
     ))
+}
+
+fn decode_predecessor_frontier(
+    decoder: &mut Decoder<'_>,
+    protocol: ShieldedProtocol,
+) -> Result<Option<CommitmentTreeFrontier>, CanonicalStoreError> {
+    match decoder.read_u8("history predecessor frontier presence")? {
+        FRONTIER_ABSENT => Ok(None),
+        FRONTIER_PRESENT => {
+            let tree_size = decoder.read_u32("history predecessor frontier tree size")?;
+            let final_root = FinalNoteCommitmentRoot::from_bytes(
+                decoder.read_array::<32>("history predecessor frontier root")?,
+            );
+            let final_state_length =
+                usize::from(decoder.read_u16("history predecessor frontier finalState length")?);
+            if final_state_length > MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES {
+                return Err(CanonicalStoreError::admission(
+                    decoder.path,
+                    format!(
+                        "store control {protocol:?} predecessor frontier finalState is {final_state_length} bytes; maximum is {MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES}"
+                    ),
+                ));
+            }
+            let final_state_bytes = decoder
+                .read_bytes(
+                    final_state_length,
+                    "history predecessor frontier finalState bytes",
+                )?
+                .to_vec();
+            let frontier = CommitmentTreeFrontier::from_canonical_final_state(
+                protocol,
+                final_root,
+                final_state_bytes,
+            )
+            .map_err(|source| {
+                CanonicalStoreError::admission(
+                    decoder.path,
+                    format!("store control {protocol:?} predecessor frontier is invalid: {source}"),
+                )
+            })?;
+            if frontier.tree_size() != tree_size {
+                return Err(CanonicalStoreError::admission(
+                    decoder.path,
+                    format!(
+                        "store control {protocol:?} predecessor frontier size {tree_size} does not match derived size {}",
+                        frontier.tree_size()
+                    ),
+                ));
+            }
+            Ok(Some(frontier))
+        }
+        presence => Err(CanonicalStoreError::admission(
+            decoder.path,
+            format!(
+                "store control contains unknown {protocol:?} predecessor frontier presence {presence}"
+            ),
+        )),
+    }
 }
 
 struct Decoder<'encoded> {
@@ -407,17 +483,15 @@ mod tests {
                 CanonicalStoreWorkload::Wallet,
                 CanonicalStoreWorkload::Explorer,
             ] {
-                let encoded = encode_building_store_control(
-                    workload,
-                    complete_build_plan(network),
-                    CURSOR_AUTH_KEY,
-                );
+                let build_plan = complete_build_plan(network);
+                let encoded =
+                    encode_building_store_control(workload, &build_plan, CURSOR_AUTH_KEY)?;
                 assert_eq!(
                     decode_store_control(Path::new("canonical"), &encoded)?,
                     DecodedStoreControl {
                         network,
                         workload,
-                        build_plan: complete_build_plan(network),
+                        build_plan,
                         cursor_auth_key: CURSOR_AUTH_KEY,
                         build_state: CanonicalStoreBuildState::Building,
                     }
@@ -427,11 +501,12 @@ mod tests {
 
         let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
         let history_bounds = CanonicalHistoryBounds::checkpointed(checkpoint)?;
+        let build_plan = checkpointed_build_plan(checkpoint, history_bounds);
         let encoded = encode_building_store_control(
             CanonicalStoreWorkload::Wallet,
-            checkpointed_build_plan(checkpoint, history_bounds),
+            &build_plan,
             CURSOR_AUTH_KEY,
-        );
+        )?;
         assert_eq!(
             decode_store_control(Path::new("canonical"), &encoded)?
                 .build_plan
@@ -441,26 +516,26 @@ mod tests {
         assert_eq!(
             decode_store_control(Path::new("canonical"), &encoded)?
                 .build_plan
-                .history_predecessor_tip_metadata(),
-            ChainTipMetadata::new(1, 2, 3)
+                .history_predecessor_frontiers(),
+            build_plan.history_predecessor_frontiers()
         );
         Ok(())
     }
 
     #[test]
-    fn ready_control_requires_complete_version_one_evidence() -> Result<(), CanonicalStoreError> {
+    fn ready_control_requires_complete_version_one_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
         let encoded = valid_ready_control();
         let decoded_ready = decode_store_control(Path::new("canonical"), &encoded)?;
         assert_eq!(decoded_ready, expected_ready_control());
 
-        let decoded_building = decode_store_control(
-            Path::new("canonical"),
-            &encode_building_store_control(
-                CanonicalStoreWorkload::Explorer,
-                complete_build_plan(Network::ZcashTestnet),
-                CURSOR_AUTH_KEY,
-            ),
+        let building_plan = complete_build_plan(Network::ZcashTestnet);
+        let building_control = encode_building_store_control(
+            CanonicalStoreWorkload::Explorer,
+            &building_plan,
+            CURSOR_AUTH_KEY,
         )?;
+        let decoded_building = decode_store_control(Path::new("canonical"), &building_control)?;
         assert_ne!(decoded_building, decoded_ready);
 
         let ready_fields = CANONICAL_STORE_IDENTITY.len()
@@ -468,7 +543,7 @@ mod tests {
             + 4
             + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
             + 1
-            + HISTORY_FIELDS_LENGTH
+            + HISTORY_FIXED_FIELDS_LENGTH
             + BUILD_TIP_FIELDS_LENGTH
             + 32
             + 1;
@@ -512,20 +587,21 @@ mod tests {
         clippy::too_many_lines,
         reason = "the table enumerates each version-1 control field that must fail closed"
     )]
-    fn malformed_control_variants_fail_closed() -> Result<(), CanonicalStoreError> {
+    fn malformed_control_variants_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let build_plan = complete_build_plan(Network::ZcashTestnet);
         let base = encode_building_store_control(
             CanonicalStoreWorkload::Explorer,
-            complete_build_plan(Network::ZcashTestnet),
+            &build_plan,
             CURSOR_AUTH_KEY,
-        );
+        )?;
         let identity_end = CANONICAL_STORE_IDENTITY.len();
         let network_start = identity_end + 2;
         let activations_fingerprint_version = network_start + 4;
         let workload_offset =
             activations_fingerprint_version + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH;
         let history_kind = workload_offset + 1;
-        let predecessor_tree_sizes = history_kind + 1 + 4 + 32;
-        let build_tip = history_kind + HISTORY_FIELDS_LENGTH;
+        let sapling_frontier_presence = history_kind + 1 + 4 + 32;
+        let build_tip = history_kind + HISTORY_FIXED_FIELDS_LENGTH;
         let cursor_auth_key = build_tip + BUILD_TIP_FIELDS_LENGTH;
         let state_offset = cursor_auth_key + 32;
         let ready_fields_start = state_offset + 1;
@@ -564,9 +640,8 @@ mod tests {
             },
             {
                 let mut encoded = base.clone();
-                encoded[predecessor_tree_sizes..predecessor_tree_sizes + 4]
-                    .copy_from_slice(&1_u32.to_le_bytes());
-                (encoded, "commitment-tree sizes")
+                encoded[sapling_frontier_presence] = 99;
+                (encoded, "unknown Sapling predecessor frontier presence")
             },
             {
                 let mut encoded = base.clone();
@@ -601,8 +676,56 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn persisted_checkpoint_frontiers_are_intrinsically_revalidated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
+        let history_bounds = CanonicalHistoryBounds::checkpointed(checkpoint)?;
+        let build_plan = checkpointed_build_plan(checkpoint, history_bounds);
+        let encoded = encode_building_store_control(
+            CanonicalStoreWorkload::Wallet,
+            &build_plan,
+            CURSOR_AUTH_KEY,
+        )?;
+        let history_kind =
+            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1;
+        let sapling_presence = history_kind + 1 + 4 + 32;
+        assert_eq!(encoded[sapling_presence], FRONTIER_PRESENT);
+        let sapling_size = sapling_presence + 1;
+        let sapling_root = sapling_size + 4;
+        let sapling_state_length = sapling_root + 32;
+
+        let mut wrong_size = encoded.clone();
+        wrong_size[sapling_size..sapling_size + 4].copy_from_slice(&1_u32.to_le_bytes());
+        let size_error = decode_store_control(Path::new("canonical"), &wrong_size)
+            .err()
+            .ok_or_else(|| CanonicalStoreError::admission(Path::new("canonical"), "expected"))?;
+        assert!(
+            size_error
+                .to_string()
+                .contains("does not match derived size")
+        );
+
+        let mut wrong_root = encoded.clone();
+        wrong_root[sapling_root] ^= 0xff;
+        let root_error = decode_store_control(Path::new("canonical"), &wrong_root)
+            .err()
+            .ok_or_else(|| CanonicalStoreError::admission(Path::new("canonical"), "expected"))?;
+        assert!(root_error.to_string().contains("root does not match"));
+
+        let mut oversized = encoded;
+        oversized[sapling_state_length..sapling_state_length + 2].copy_from_slice(
+            &u16::try_from(MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES + 1)?.to_le_bytes(),
+        );
+        let oversize_error = decode_store_control(Path::new("canonical"), &oversized)
+            .err()
+            .ok_or_else(|| CanonicalStoreError::admission(Path::new("canonical"), "expected"))?;
+        assert!(oversize_error.to_string().contains("maximum is 1090"));
+        Ok(())
+    }
+
     fn valid_ready_control() -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(STORE_CONTROL_LENGTH);
+        let mut encoded = Vec::with_capacity(STORE_CONTROL_MINIMUM_LENGTH);
         encoded.extend_from_slice(CANONICAL_STORE_IDENTITY.as_bytes());
         encoded.extend_from_slice(&CANONICAL_STORE_SCHEMA_VERSION.to_le_bytes());
         encoded.extend_from_slice(&Network::ZcashTestnet.id().to_le_bytes());
@@ -612,9 +735,9 @@ mod tests {
         encoded.push(COMPLETE_HISTORY);
         encoded.extend_from_slice(&0_u32.to_le_bytes());
         encoded.extend_from_slice(&Network::ZcashTestnet.genesis_hash().as_bytes());
-        encoded.extend_from_slice(&0_u32.to_le_bytes());
-        encoded.extend_from_slice(&0_u32.to_le_bytes());
-        encoded.extend_from_slice(&0_u32.to_le_bytes());
+        encoded.push(FRONTIER_ABSENT);
+        encoded.push(FRONTIER_ABSENT);
+        encoded.push(FRONTIER_ABSENT);
         encoded.extend_from_slice(&2_u32.to_le_bytes());
         encoded.extend_from_slice(&[2; 32]);
         encoded.extend_from_slice(&CURSOR_AUTH_KEY);
@@ -634,7 +757,7 @@ mod tests {
         );
         encoded.extend_from_slice(&[3; 32]);
         encoded.extend_from_slice(&1_u64.to_le_bytes());
-        assert_eq!(encoded.len(), STORE_CONTROL_LENGTH);
+        assert_eq!(encoded.len(), STORE_CONTROL_MINIMUM_LENGTH);
         encoded
     }
 
@@ -666,7 +789,7 @@ mod tests {
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
             history_bounds: CanonicalHistoryBounds::complete(),
             history_predecessor: BlockId::new(BlockHeight::new(0), network.genesis_hash()),
-            history_predecessor_tip_metadata: ChainTipMetadata::empty(),
+            history_predecessor_frontiers: CommitmentTreeFrontiers::default(),
             build_tip: BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
         }
     }
@@ -680,7 +803,11 @@ mod tests {
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
             history_bounds,
             history_predecessor: checkpoint,
-            history_predecessor_tip_metadata: ChainTipMetadata::new(1, 2, 3),
+            history_predecessor_frontiers: CommitmentTreeFrontiers::from_validated_parts(
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
+            ),
             build_tip: BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
         }
     }

@@ -16,7 +16,9 @@ use thiserror::Error;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
-    ChainTipMetadata, NetworkUpgradeActivationsFingerprint,
+    CommitmentTreeFrontiers, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
+    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
 };
 
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
@@ -28,55 +30,69 @@ pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// Exact physical schema accepted by this canonical store implementation.
 pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
 
+const REQUIRED_CANONICAL_NETWORK_UPGRADES: [&str; 5] =
+    ["Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy"];
+
 /// Fixed source-chain range for one fresh canonical construction.
 ///
 /// The predecessor anchors the first retained block even for complete history,
 /// where it is the network's height-zero block. The fixed tip prevents an
 /// exhausted or failed source stream from publishing a contiguous prefix as a
 /// complete build.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreBuildPlan {
     network: zinder_core::Network,
     network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     history_bounds: zinder_core::CanonicalHistoryBounds,
     history_predecessor: BlockId,
-    history_predecessor_tip_metadata: ChainTipMetadata,
+    history_predecessor_frontiers: CommitmentTreeFrontiers,
     build_tip: BlockId,
 }
 
 impl CanonicalStoreBuildPlan {
     /// Builds a plan retaining every non-genesis block through `build_tip`.
     pub fn complete(
-        network: zinder_core::Network,
-        network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+        network_upgrade_activations: &NetworkUpgradeActivations,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
+        validate_required_network_upgrades(network_upgrade_activations)?;
+        let network = network_upgrade_activations.network();
         Self::from_parts(
             network,
-            network_upgrade_activations_fingerprint,
+            network_upgrade_activations
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
             zinder_core::CanonicalHistoryBounds::complete(),
             BlockId::new(BlockHeight::new(0), network.genesis_hash()),
-            ChainTipMetadata::empty(),
+            CommitmentTreeFrontiers::default(),
             build_tip,
         )
     }
 
     /// Builds a plan retaining blocks immediately after `checkpoint` through `build_tip`.
     pub fn checkpointed(
-        network: zinder_core::Network,
-        network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+        network_upgrade_activations: &NetworkUpgradeActivations,
         checkpoint: BlockId,
-        checkpoint_tip_metadata: ChainTipMetadata,
+        checkpoint_frontiers: CommitmentTreeFrontiers,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
+        validate_required_network_upgrades(network_upgrade_activations)?;
+        if checkpoint.height.value() == 0 {
+            return Err(CanonicalStoreBuildPlanError::CheckpointAtGenesis);
+        }
         let history_bounds = zinder_core::CanonicalHistoryBounds::checkpointed(checkpoint)
             .map_err(|_| CanonicalStoreBuildPlanError::CheckpointHasNoSuccessor)?;
+        validate_checkpoint_frontier_presence(
+            network_upgrade_activations,
+            checkpoint,
+            &checkpoint_frontiers,
+        )?;
         Self::from_parts(
-            network,
-            network_upgrade_activations_fingerprint,
+            network_upgrade_activations.network(),
+            network_upgrade_activations
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
             history_bounds,
             checkpoint,
-            checkpoint_tip_metadata,
+            checkpoint_frontiers,
             build_tip,
         )
     }
@@ -90,7 +106,7 @@ impl CanonicalStoreBuildPlan {
         network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
         history_bounds: zinder_core::CanonicalHistoryBounds,
         history_predecessor: BlockId,
-        history_predecessor_tip_metadata: ChainTipMetadata,
+        history_predecessor_frontiers: CommitmentTreeFrontiers,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         match history_bounds.preceding_checkpoint() {
@@ -102,12 +118,30 @@ impl CanonicalStoreBuildPlan {
             Some(checkpoint) if history_predecessor != checkpoint => {
                 return Err(CanonicalStoreBuildPlanError::InvalidHistoryPredecessor);
             }
+            Some(checkpoint) if checkpoint.height.value() == 0 => {
+                return Err(CanonicalStoreBuildPlanError::CheckpointAtGenesis);
+            }
             None | Some(_) => {}
         }
         if history_bounds.preceding_checkpoint().is_none()
-            && history_predecessor_tip_metadata != ChainTipMetadata::empty()
+            && history_predecessor_frontiers != CommitmentTreeFrontiers::default()
         {
-            return Err(CanonicalStoreBuildPlanError::CompleteHistoryHasNonEmptyTipMetadata);
+            return Err(CanonicalStoreBuildPlanError::CompleteHistoryHasFrontiers);
+        }
+        for protocol in [
+            ShieldedProtocol::Sapling,
+            ShieldedProtocol::Orchard,
+            ShieldedProtocol::Ironwood,
+        ] {
+            if let Some(frontier) = history_predecessor_frontiers.get(protocol)
+                && frontier.final_state_bytes().len()
+                    > MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES
+            {
+                return Err(CanonicalStoreBuildPlanError::PredecessorFrontierTooLarge {
+                    protocol,
+                    encoded_bytes: frontier.final_state_bytes().len(),
+                });
+            }
         }
         let first_available_height = history_bounds.first_available_height();
         if build_tip.height.value() < first_available_height.value() {
@@ -121,46 +155,46 @@ impl CanonicalStoreBuildPlan {
             network_upgrade_activations_fingerprint,
             history_bounds,
             history_predecessor,
-            history_predecessor_tip_metadata,
+            history_predecessor_frontiers,
             build_tip,
         })
     }
 
     /// Returns the immutable network for this build.
     #[must_use]
-    pub const fn network(self) -> zinder_core::Network {
+    pub const fn network(&self) -> zinder_core::Network {
         self.network
     }
 
     /// Returns the immutable node activation-table identity for this build.
     #[must_use]
     pub const fn network_upgrade_activations_fingerprint(
-        self,
+        &self,
     ) -> NetworkUpgradeActivationsFingerprint {
         self.network_upgrade_activations_fingerprint
     }
 
     /// Returns the durable boundary of intentionally retained history.
     #[must_use]
-    pub const fn history_bounds(self) -> zinder_core::CanonicalHistoryBounds {
+    pub const fn history_bounds(&self) -> zinder_core::CanonicalHistoryBounds {
         self.history_bounds
     }
 
     /// Returns the block immediately preceding retained history.
     #[must_use]
-    pub const fn history_predecessor(self) -> BlockId {
+    pub const fn history_predecessor(&self) -> BlockId {
         self.history_predecessor
     }
 
-    /// Returns commitment-tree sizes immediately before retained history.
+    /// Returns the commitment-tree frontiers immediately before retained history.
     #[must_use]
-    pub const fn history_predecessor_tip_metadata(self) -> ChainTipMetadata {
-        self.history_predecessor_tip_metadata
+    pub const fn history_predecessor_frontiers(&self) -> &CommitmentTreeFrontiers {
+        &self.history_predecessor_frontiers
     }
 
     /// Returns the exact source tip this build must reach.
     #[must_use]
-    pub const fn build_tip(self) -> BlockId {
+    pub const fn build_tip(&self) -> BlockId {
         self.build_tip
     }
 }
@@ -168,15 +202,44 @@ impl CanonicalStoreBuildPlan {
 /// Invalid source-chain range for canonical construction.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CanonicalStoreBuildPlanError {
+    /// The node activation table cannot interpret the universal v3-v4 history baseline.
+    #[error("canonical build activation table is missing required network upgrade {name}")]
+    MissingRequiredNetworkUpgrade {
+        /// Exact node-advertised upgrade name required by v1.
+        name: &'static str,
+    },
     /// The checkpoint cannot have retained history after it.
     #[error("canonical build checkpoint has no successor height")]
     CheckpointHasNoSuccessor,
+    /// Height zero has complete-history semantics and cannot be a checkpoint.
+    #[error("canonical build checkpoint cannot be the height-zero genesis block")]
+    CheckpointAtGenesis,
     /// The predecessor does not match the selected complete or checkpointed history.
     #[error("canonical build history predecessor does not match its history bounds")]
     InvalidHistoryPredecessor,
-    /// A complete build must start from the empty height-zero tree position.
-    #[error("complete history predecessor commitment-tree sizes must be empty")]
-    CompleteHistoryHasNonEmptyTipMetadata,
+    /// A complete build must start before every shielded-pool frontier.
+    #[error("complete history predecessor commitment-tree frontiers must all be absent")]
+    CompleteHistoryHasFrontiers,
+    /// One predecessor frontier exceeds the exact version-1 store-control bound.
+    #[error(
+        "canonical build {protocol:?} predecessor frontier is {encoded_bytes} bytes; maximum is 1090"
+    )]
+    PredecessorFrontierTooLarge {
+        /// Shielded pool whose frontier exceeded the bound.
+        protocol: ShieldedProtocol,
+        /// Observed canonical `finalState` byte length.
+        encoded_bytes: usize,
+    },
+    /// Checkpoint frontier presence disagrees with the source activation table.
+    #[error(
+        "canonical build {protocol:?} predecessor frontier presence at height {checkpoint_height} does not match the network upgrade activations"
+    )]
+    PredecessorFrontierActivationMismatch {
+        /// Shielded pool whose presence was inconsistent.
+        protocol: ShieldedProtocol,
+        /// Checkpoint height used for activation admission.
+        checkpoint_height: u32,
+    },
     /// The target tip is below the first retained height.
     #[error(
         "canonical build tip {build_tip} precedes first available height {first_available_height}"
@@ -187,6 +250,45 @@ pub enum CanonicalStoreBuildPlanError {
         /// First retained height required by the history bounds.
         first_available_height: u32,
     },
+}
+
+fn validate_required_network_upgrades(
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<(), CanonicalStoreBuildPlanError> {
+    for name in REQUIRED_CANONICAL_NETWORK_UPGRADES {
+        if network_upgrade_activations
+            .activation_height_by_name(name)
+            .is_none()
+        {
+            return Err(CanonicalStoreBuildPlanError::MissingRequiredNetworkUpgrade { name });
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_frontier_presence(
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    checkpoint: BlockId,
+    frontiers: &CommitmentTreeFrontiers,
+) -> Result<(), CanonicalStoreBuildPlanError> {
+    for protocol in [
+        ShieldedProtocol::Sapling,
+        ShieldedProtocol::Orchard,
+        ShieldedProtocol::Ironwood,
+    ] {
+        let is_active = network_upgrade_activations
+            .activation_height_by_name(protocol.activation_upgrade_name())
+            .is_some_and(|activation_height| activation_height <= checkpoint.height);
+        if frontiers.get(protocol).is_some() != is_active {
+            return Err(
+                CanonicalStoreBuildPlanError::PredecessorFrontierActivationMismatch {
+                    protocol,
+                    checkpoint_height: checkpoint.height.value(),
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Failure while streaming source facts into a fresh canonical build.
@@ -406,26 +508,70 @@ impl CanonicalStoreError {
 }
 
 #[cfg(test)]
+pub(crate) fn test_network_upgrade_activations(
+    network: zinder_core::Network,
+) -> Result<NetworkUpgradeActivations, zinder_core::NetworkUpgradeActivationsError> {
+    let activations = [
+        "Overwinter",
+        "Sapling",
+        "Blossom",
+        "Heartwood",
+        "Canopy",
+        "NU5",
+        "NU6",
+        "NU6.1",
+        "NU6.2",
+        "NU6.3",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, name)| zinder_core::NetworkUpgradeActivation {
+        branch_id: zinder_core::ConsensusBranchId::new(
+            u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1),
+        ),
+        activation_height: BlockHeight::new(
+            u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1),
+        ),
+        name: name.to_owned(),
+    })
+    .collect();
+    NetworkUpgradeActivations::new(network, activations)
+}
+
+#[cfg(test)]
+pub(crate) fn test_checkpoint_frontiers(
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    checkpoint_height: BlockHeight,
+) -> CommitmentTreeFrontiers {
+    let active_frontier = |protocol: ShieldedProtocol| {
+        network_upgrade_activations
+            .activation_height_by_name(protocol.activation_upgrade_name())
+            .is_some_and(|activation_height| activation_height <= checkpoint_height)
+            .then(|| zinder_core::CommitmentTreeFrontier::empty(protocol))
+    };
+    CommitmentTreeFrontiers::from_validated_parts(
+        active_frontier(ShieldedProtocol::Sapling),
+        active_frontier(ShieldedProtocol::Orchard),
+        active_frontier(ShieldedProtocol::Ironwood),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use zinder_core::NetworkUpgradeActivationsFingerprintVersion;
-
-    const ACTIVATIONS_FINGERPRINT: NetworkUpgradeActivationsFingerprint =
-        NetworkUpgradeActivationsFingerprint::from_bytes(
-            NetworkUpgradeActivationsFingerprintVersion::V1,
-            [7; 32],
-        );
+    use zinder_core::{CommitmentTreeFrontier, Network};
 
     #[test]
     fn complete_build_plan_preserves_genesis_anchor_and_tip()
-    -> Result<(), CanonicalStoreBuildPlanError> {
+    -> Result<(), Box<dyn std::error::Error>> {
         let network = zinder_core::Network::ZcashTestnet;
+        let activations = test_network_upgrade_activations(network)?;
         let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
-        let plan = CanonicalStoreBuildPlan::complete(network, ACTIVATIONS_FINGERPRINT, build_tip)?;
+        let plan = CanonicalStoreBuildPlan::complete(&activations, build_tip)?;
         assert_eq!(plan.network(), network);
         assert_eq!(
             plan.network_upgrade_activations_fingerprint(),
-            ACTIVATIONS_FINGERPRINT
+            activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
         );
         assert_eq!(
             plan.history_predecessor(),
@@ -436,18 +582,49 @@ mod tests {
             BlockHeight::new(1)
         );
         assert_eq!(
-            plan.history_predecessor_tip_metadata(),
-            ChainTipMetadata::empty()
+            plan.history_predecessor_frontiers(),
+            &CommitmentTreeFrontiers::default()
         );
         assert_eq!(plan.build_tip(), build_tip);
         Ok(())
     }
 
     #[test]
-    fn build_plan_rejects_tip_before_retained_history() {
+    fn build_plan_rejects_incomplete_activation_table() {
         let error = CanonicalStoreBuildPlan::complete(
-            zinder_core::Network::ZcashRegtest,
-            ACTIVATIONS_FINGERPRINT,
+            &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+        )
+        .err();
+        assert_eq!(
+            error,
+            Some(
+                CanonicalStoreBuildPlanError::MissingRequiredNetworkUpgrade { name: "Overwinter" }
+            )
+        );
+    }
+
+    #[test]
+    fn build_plan_accepts_regtest_with_post_canopy_upgrades_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let full_activations = test_network_upgrade_activations(Network::ZcashRegtest)?;
+        let canopy_only_activations = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            full_activations.activations()[..REQUIRED_CANONICAL_NETWORK_UPGRADES.len()].to_vec(),
+        )?;
+        let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
+
+        let plan = CanonicalStoreBuildPlan::complete(&canopy_only_activations, build_tip)?;
+
+        assert_eq!(plan.build_tip(), build_tip);
+        Ok(())
+    }
+
+    #[test]
+    fn build_plan_rejects_tip_before_retained_history() -> Result<(), Box<dyn std::error::Error>> {
+        let activations = test_network_upgrade_activations(Network::ZcashRegtest)?;
+        let error = CanonicalStoreBuildPlan::complete(
+            &activations,
             BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
         )
         .err();
@@ -458,15 +635,16 @@ mod tests {
                 first_available_height: 1,
             })
         ));
+        Ok(())
     }
 
     #[test]
-    fn checkpointed_build_plan_rejects_height_ceiling() {
+    fn checkpointed_build_plan_rejects_height_ceiling() -> Result<(), Box<dyn std::error::Error>> {
+        let activations = test_network_upgrade_activations(Network::ZcashRegtest)?;
         let error = CanonicalStoreBuildPlan::checkpointed(
-            zinder_core::Network::ZcashRegtest,
-            ACTIVATIONS_FINGERPRINT,
+            &activations,
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
-            ChainTipMetadata::new(1, 2, 3),
+            CommitmentTreeFrontiers::default(),
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
         )
         .err();
@@ -474,45 +652,92 @@ mod tests {
             error,
             Some(CanonicalStoreBuildPlanError::CheckpointHasNoSuccessor)
         );
-    }
-
-    #[test]
-    fn checkpointed_build_plan_preserves_tree_position() -> Result<(), CanonicalStoreBuildPlanError>
-    {
-        let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
-        let checkpoint_tip_metadata = ChainTipMetadata::new(11, 22, 33);
-        let plan = CanonicalStoreBuildPlan::checkpointed(
-            zinder_core::Network::ZcashTestnet,
-            ACTIVATIONS_FINGERPRINT,
-            checkpoint,
-            checkpoint_tip_metadata,
-            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
-        )?;
-
-        assert_eq!(plan.history_predecessor(), checkpoint);
-        assert_eq!(
-            plan.history_predecessor_tip_metadata(),
-            checkpoint_tip_metadata
-        );
         Ok(())
     }
 
     #[test]
-    fn complete_build_plan_domain_rejects_nonempty_tree_position() {
+    fn checkpointed_build_plan_preserves_tree_position() -> Result<(), Box<dyn std::error::Error>> {
+        let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
+        let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let checkpoint_frontiers = active_empty_frontiers();
+        let plan = CanonicalStoreBuildPlan::checkpointed(
+            &activations,
+            checkpoint,
+            checkpoint_frontiers.clone(),
+            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+        )?;
+
+        assert_eq!(plan.history_predecessor(), checkpoint);
+        assert_eq!(plan.history_predecessor_frontiers(), &checkpoint_frontiers);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_build_plan_domain_rejects_predecessor_frontiers()
+    -> Result<(), Box<dyn std::error::Error>> {
         let network = zinder_core::Network::ZcashTestnet;
+        let activations = test_network_upgrade_activations(network)?;
         let error = CanonicalStoreBuildPlan::from_parts(
             network,
-            ACTIVATIONS_FINGERPRINT,
+            activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
             zinder_core::CanonicalHistoryBounds::complete(),
             BlockId::new(BlockHeight::new(0), network.genesis_hash()),
-            ChainTipMetadata::new(1, 0, 0),
+            CommitmentTreeFrontiers::from_validated_parts(
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+                None,
+                None,
+            ),
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
         )
         .err();
 
         assert_eq!(
             error,
-            Some(CanonicalStoreBuildPlanError::CompleteHistoryHasNonEmptyTipMetadata)
+            Some(CanonicalStoreBuildPlanError::CompleteHistoryHasFrontiers)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpointed_build_plan_rejects_genesis_and_activation_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = test_network_upgrade_activations(Network::ZcashRegtest)?;
+        let genesis = BlockId::new(BlockHeight::new(0), Network::ZcashRegtest.genesis_hash());
+        assert_eq!(
+            CanonicalStoreBuildPlan::checkpointed(
+                &activations,
+                genesis,
+                CommitmentTreeFrontiers::default(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            )
+            .err(),
+            Some(CanonicalStoreBuildPlanError::CheckpointAtGenesis)
+        );
+
+        let checkpoint = BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32]));
+        assert!(matches!(
+            CanonicalStoreBuildPlan::checkpointed(
+                &activations,
+                checkpoint,
+                CommitmentTreeFrontiers::default(),
+                BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32])),
+            )
+            .err(),
+            Some(
+                CanonicalStoreBuildPlanError::PredecessorFrontierActivationMismatch {
+                    protocol: ShieldedProtocol::Sapling,
+                    checkpoint_height: 3,
+                }
+            )
+        ));
+        Ok(())
+    }
+
+    fn active_empty_frontiers() -> CommitmentTreeFrontiers {
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
+        )
     }
 }

@@ -55,7 +55,7 @@ impl RocksDbCanonicalBuilder {
             .map_err(|source| CanonicalStoreError::EntropyUnavailable { source })?;
         create_fresh_directory(path)?;
         let store_path = canonical_store_path(path)?;
-        initialize_store_identity(path, workload, build_plan, cursor_auth_key)?;
+        initialize_store_identity(path, workload, &build_plan, cursor_auth_key)?;
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary { path },
             resource_budget,
@@ -99,8 +99,8 @@ impl RocksDbCanonicalBuilder {
 
     /// Returns the exact predecessor-to-tip source range persisted by this build.
     #[must_use]
-    pub const fn build_plan(&self) -> CanonicalStoreBuildPlan {
-        self.build_plan
+    pub const fn build_plan(&self) -> &CanonicalStoreBuildPlan {
+        &self.build_plan
     }
 
     /// Bulk-loads every source-derived version-1 canonical block family.
@@ -147,7 +147,7 @@ impl RocksDbCanonicalBuilder {
             },
             blocks,
         )?;
-        validate_block_load_range(self.build_plan, &prepared.evidence)?;
+        validate_block_load_range(&self.build_plan, &prepared.evidence)?;
         let evidence = ingest_canonical_block_ssts(&self.bounded_open.db, prepared)?;
         let persisted_replays = validate_persisted_block_replays(&self.bounded_open.db)?;
         if !persisted_replays.has_same_sequence(&evidence) {
@@ -166,7 +166,7 @@ impl RocksDbCanonicalBuilder {
 }
 
 fn validate_block_load_range(
-    build_plan: CanonicalStoreBuildPlan,
+    build_plan: &CanonicalStoreBuildPlan,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
     let expected_first_height = build_plan.history_bounds().first_available_height();
@@ -251,11 +251,11 @@ mod tests {
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
         CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
         CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds, CanonicalTransactionFacts,
-        ChainTipMetadata, CompactBlockArtifact, LockTime, NetworkUpgradeActivationsFingerprint,
-        NetworkUpgradeActivationsFingerprintVersion, PrivacyShape, SerializedBytesDigest,
+        ChainTipMetadata, CompactBlockArtifact, LockTime, PrivacyShape, SerializedBytesDigest,
         TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
         TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
         TransactionVersion, UnsupportedSection, encode_canonical_block_replay,
+        wire::encode_internal_block_hash,
     };
 
     use super::*;
@@ -263,12 +263,6 @@ mod tests {
         block_load::canonical_block_families_are_empty, block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
         rocksdb::BLOCK_HASH_INDEX_COLUMN_FAMILY,
     };
-
-    const ACTIVATIONS_FINGERPRINT: NetworkUpgradeActivationsFingerprint =
-        NetworkUpgradeActivationsFingerprint::from_bytes(
-            NetworkUpgradeActivationsFingerprintVersion::V1,
-            [17; 32],
-        );
 
     #[test]
     fn builder_refuses_every_existing_path() -> Result<(), Box<dyn std::error::Error>> {
@@ -319,9 +313,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let build_plan = CanonicalStoreBuildPlan::complete(
-            Network::ZcashTestnet,
-            ACTIVATIONS_FINGERPRINT,
+            &activations,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -380,9 +375,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let build_plan = CanonicalStoreBuildPlan::complete(
-            Network::ZcashTestnet,
-            ACTIVATIONS_FINGERPRINT,
+            &activations,
             BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([2; 32])),
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -588,13 +584,20 @@ mod tests {
     ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
         let build_plan = match history_bounds.preceding_checkpoint() {
             None => complete_build_plan()?,
-            Some(checkpoint) => CanonicalStoreBuildPlan::checkpointed(
-                Network::ZcashTestnet,
-                ACTIVATIONS_FINGERPRINT,
-                checkpoint,
-                zinder_core::ChainTipMetadata::new(1, 2, 3),
-                BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
-            )?,
+            Some(checkpoint) => {
+                let activations = crate::canonical_store::test_network_upgrade_activations(
+                    Network::ZcashTestnet,
+                )?;
+                CanonicalStoreBuildPlan::checkpointed(
+                    &activations,
+                    checkpoint,
+                    crate::canonical_store::test_checkpoint_frontiers(
+                        &activations,
+                        checkpoint.height,
+                    ),
+                    BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+                )?
+            }
         };
         Ok(RocksDbCanonicalBuilder::create_fresh(
             path,
@@ -605,9 +608,10 @@ mod tests {
     }
 
     fn complete_build_plan() -> Result<CanonicalStoreBuildPlan, Box<dyn std::error::Error>> {
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         Ok(CanonicalStoreBuildPlan::complete(
-            Network::ZcashTestnet,
-            ACTIVATIONS_FINGERPRINT,
+            &activations,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
         )?)
     }
@@ -668,8 +672,8 @@ mod tests {
         );
         let compact_payload = zinder_proto::compat::lightwalletd::CompactBlock {
             height: u64::from(height.value()),
-            hash: facts.block_header.block_hash.as_bytes().to_vec(),
-            prev_hash: facts.block_header.parent_hash.as_bytes().to_vec(),
+            hash: encode_internal_block_hash(facts.block_header.block_hash).to_vec(),
+            prev_hash: encode_internal_block_hash(facts.block_header.parent_hash).to_vec(),
             chain_metadata: Some(zinder_proto::compat::lightwalletd::ChainMetadata {
                 sapling_commitment_tree_size: height.value(),
                 orchard_commitment_tree_size: height.value().saturating_mul(2),

@@ -1,37 +1,29 @@
 //! Zebra JSON-RPC source adapter.
 
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use incrementalmerkletree::{
-    Hashable, Position,
-    frontier::{CommitmentTree, Frontier},
-};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::core::params::{ArrayParams, BatchRequestBuilder};
 use jsonrpsee::http_client::{HeaderMap, HeaderValue, HttpClient};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
-use orchard::tree::MerkleHashOrchard;
 use parking_lot::Mutex;
-use sapling::Node as SaplingNode;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
-use zcash_primitives::merkle_tree::{HashSer, read_commitment_tree, write_commitment_tree};
 use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, BlockValuePoolBalances,
     BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
     BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainValuePool, ChainValuePools,
-    CommitmentTreeFrontier, CommitmentTreeFrontiers, ConsensusBranchId, FinalNoteCommitmentRoot,
-    Network, NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
-    ValuePoolBalance,
+    CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
+    ConsensusBranchId, FinalNoteCommitmentRoot, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootHash,
+    SubtreeRootIndex, TransactionBroadcastResult, TransactionId, ValuePoolBalance,
 };
 
 use crate::{
@@ -1730,38 +1722,28 @@ fn parse_zebra_final_note_commitment_root(
     decode_final_note_commitment_root_hex(protocol, root_hex).map(Some)
 }
 
-const MAX_CANONICAL_COMMITMENT_TREE_FRONTIER_BYTES: usize = 1_090;
-const NOTE_COMMITMENT_TREE_DEPTH: u8 = 32;
-
 fn decode_zebra_commitment_tree_frontiers(
     tree_state: ZebraGetTreestate,
     height: BlockHeight,
     network_upgrade_activations: &NetworkUpgradeActivations,
 ) -> Result<CommitmentTreeFrontiers, SourceError> {
-    let sapling = decode_zebra_commitment_tree_frontier::<SaplingNode>(
+    let sapling = decode_zebra_commitment_tree_frontier(
         ShieldedProtocol::Sapling,
         tree_state.sapling,
         height,
         network_upgrade_activations,
-        |root| {
-            let mut root_bytes = root.to_bytes();
-            root_bytes.reverse();
-            root_bytes
-        },
     )?;
-    let orchard = decode_zebra_commitment_tree_frontier::<MerkleHashOrchard>(
+    let orchard = decode_zebra_commitment_tree_frontier(
         ShieldedProtocol::Orchard,
         tree_state.orchard,
         height,
         network_upgrade_activations,
-        MerkleHashOrchard::to_bytes,
     )?;
-    let ironwood = decode_zebra_commitment_tree_frontier::<MerkleHashOrchard>(
+    let ironwood = decode_zebra_commitment_tree_frontier(
         ShieldedProtocol::Ironwood,
         tree_state.ironwood,
         height,
         network_upgrade_activations,
-        MerkleHashOrchard::to_bytes,
     )?;
 
     Ok(CommitmentTreeFrontiers::from_validated_parts(
@@ -1769,16 +1751,12 @@ fn decode_zebra_commitment_tree_frontiers(
     ))
 }
 
-fn decode_zebra_commitment_tree_frontier<Node>(
+fn decode_zebra_commitment_tree_frontier(
     protocol: ShieldedProtocol,
     tree_state: Option<ZebraTreestate>,
     height: BlockHeight,
     network_upgrade_activations: &NetworkUpgradeActivations,
-    root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
-) -> Result<Option<CommitmentTreeFrontier>, SourceError>
-where
-    Node: Clone + Hashable + HashSer,
-{
+) -> Result<Option<CommitmentTreeFrontier>, SourceError> {
     let commitments = tree_state.and_then(|state| state.commitments);
     let (final_root_hex, final_state_hex) = commitments.map_or((None, None), |commitments| {
         (commitments.final_root, commitments.final_state)
@@ -1813,106 +1791,37 @@ where
     let final_root = decode_final_note_commitment_root_hex(protocol, &final_root_hex)?;
     let final_state_bytes = hex::decode(final_state_hex)
         .map_err(|source| SourceError::InvalidCommitmentTreeFrontierHex { protocol, source })?;
-    if final_state_bytes.len() > MAX_CANONICAL_COMMITMENT_TREE_FRONTIER_BYTES {
-        return Err(SourceError::CommitmentTreeFrontierTooLarge {
-            protocol,
-            byte_count: final_state_bytes.len(),
-            max_byte_count: MAX_CANONICAL_COMMITMENT_TREE_FRONTIER_BYTES,
-        });
-    }
-
-    let mut reader = Cursor::new(final_state_bytes.as_slice());
-    let legacy_tree = read_commitment_tree::<Node, _, NOTE_COMMITMENT_TREE_DEPTH>(&mut reader)
-        .map_err(|_| SourceError::InvalidCommitmentTreeFrontierEncoding {
-            protocol,
-            reason: "finalState is not a valid legacy CommitmentTree encoding",
-        })?;
-    if reader.position() != u64::try_from(final_state_bytes.len()).unwrap_or(u64::MAX) {
-        return Err(SourceError::InvalidCommitmentTreeFrontierEncoding {
-            protocol,
-            reason: "finalState contains trailing bytes",
-        });
-    }
-
-    let frontier = frontier_from_legacy_tree(&legacy_tree, protocol)?;
-    let tree_size = frontier.tree_size();
-    let tree_size =
-        u32::try_from(tree_size).map_err(|_| SourceError::CommitmentTreeSizeOutOfRange {
-            protocol,
-            tree_size,
-        })?;
-
-    let canonical_tree = CommitmentTree::from_frontier(&frontier);
-    let mut canonical_bytes = Vec::new();
-    write_commitment_tree(&canonical_tree, &mut canonical_bytes).map_err(|_| {
-        SourceError::InvalidCommitmentTreeFrontierEncoding {
-            protocol,
-            reason: "validated frontier could not be canonically encoded",
-        }
-    })?;
-    if canonical_bytes != final_state_bytes {
-        return Err(SourceError::InvalidCommitmentTreeFrontierEncoding {
-            protocol,
-            reason: "finalState is not the canonical Zebra RPC encoding",
-        });
-    }
-
-    if root_bytes_in_rpc_order(&frontier.root()) != final_root.as_bytes() {
-        return Err(SourceError::CommitmentTreeFrontierRootMismatch { protocol });
-    }
-
-    Ok(Some(CommitmentTreeFrontier::from_validated_parts(
-        tree_size,
-        final_root,
-        final_state_bytes,
-    )))
+    CommitmentTreeFrontier::from_canonical_final_state(protocol, final_root, final_state_bytes)
+        .map(Some)
+        .map_err(|source| map_frontier_validation_error(protocol, source))
 }
 
-fn frontier_from_legacy_tree<Node>(
-    legacy_tree: &CommitmentTree<Node, NOTE_COMMITMENT_TREE_DEPTH>,
+const fn map_frontier_validation_error(
     protocol: ShieldedProtocol,
-) -> Result<Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH>, SourceError>
-where
-    Node: Clone,
-{
-    let (leaf, mut ommers, mut tree_size) = match (legacy_tree.left(), legacy_tree.right()) {
-        (None, None) => {
-            if legacy_tree.parents().iter().any(Option::is_some) {
-                return Err(SourceError::InvalidCommitmentTreeFrontierEncoding {
-                    protocol,
-                    reason: "empty tree contains parent nodes",
-                });
-            }
-            return Ok(Frontier::empty());
+    source: CommitmentTreeFrontierValidationError,
+) -> SourceError {
+    match source {
+        CommitmentTreeFrontierValidationError::TooLarge {
+            byte_count,
+            max_byte_count,
+        } => SourceError::CommitmentTreeFrontierTooLarge {
+            protocol,
+            byte_count,
+            max_byte_count,
+        },
+        CommitmentTreeFrontierValidationError::InvalidEncoding { reason } => {
+            SourceError::InvalidCommitmentTreeFrontierEncoding { protocol, reason }
         }
-        (None, Some(_)) => {
-            return Err(SourceError::InvalidCommitmentTreeFrontierEncoding {
+        CommitmentTreeFrontierValidationError::TreeSizeOutOfRange { tree_size } => {
+            SourceError::CommitmentTreeSizeOutOfRange {
                 protocol,
-                reason: "right leaf is present without a left leaf",
-            });
+                tree_size,
+            }
         }
-        (Some(left), None) => (left.clone(), Vec::new(), 1u64),
-        (Some(left), Some(right)) => (right.clone(), vec![left.clone()], 2u64),
-    };
-
-    for (parent_index, parent) in legacy_tree.parents().iter().enumerate() {
-        if let Some(parent) = parent {
-            ommers.push(parent.clone());
-            tree_size = tree_size.checked_add(1u64 << (parent_index + 1)).ok_or(
-                SourceError::InvalidCommitmentTreeFrontierEncoding {
-                    protocol,
-                    reason: "legacy tree size overflowed u64",
-                },
-            )?;
+        CommitmentTreeFrontierValidationError::RootMismatch => {
+            SourceError::CommitmentTreeFrontierRootMismatch { protocol }
         }
     }
-    let position = Position::from(tree_size - 1);
-    Frontier::from_parts(position, leaf, ommers).map_err(|_| {
-        SourceError::InvalidCommitmentTreeFrontierEncoding {
-            protocol,
-            reason: "legacy tree occupancy does not form a valid frontier",
-        }
-    })
 }
 
 fn commitment_tree_is_active(

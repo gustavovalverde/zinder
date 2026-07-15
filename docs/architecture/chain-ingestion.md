@@ -102,9 +102,11 @@ Orchard tree-size fields for readers that want the counter without decoding
 Commitment-tree sizes must be chain-global. A fresh bulk-catchup run may start at
 height 1, an existing store may append immediately after its current tip, and a
 checkpoint-bounded bulk-catchup run may start at `SourceChainCheckpoint.height + 1` after
-seeding the builder from the checkpoint's `ChainTipMetadata`. Arbitrary
-non-genesis or non-contiguous bulk-catchup ranges still fail closed unless they are backed
-by a resolved upstream node checkpoint.
+validating and persisting the checkpoint's canonical Sapling, Orchard, and
+Ironwood `finalRoot` and `finalState` frontiers. The builder derives
+`ChainTipMetadata` from those frontiers once before entering the block hot path.
+Arbitrary non-genesis or non-contiguous bulk-catchup ranges still fail closed
+unless they are backed by a resolved upstream node checkpoint.
 
 ## Chain Epochs
 

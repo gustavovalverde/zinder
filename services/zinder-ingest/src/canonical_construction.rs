@@ -170,15 +170,15 @@ pub async fn load_fresh_canonical_blocks<Source>(
 where
     Source: NodeSource + Clone,
 {
-    let build_plan = builder.build_plan();
+    let build_plan = builder.build_plan().clone();
     let workload = builder.workload();
-    validate_construction_identity(build_plan, &config)?;
+    validate_construction_identity(&build_plan, &config)?;
     let block_queue_capacity = usize::try_from(config.block_prepare_concurrency.get())
         .unwrap_or(usize::MAX)
         .max(1);
     let prepared_blocks = build_prepared_block_stream(
         source,
-        build_plan,
+        &build_plan,
         &config,
         raw_blob_policy_for_workload(workload),
     );
@@ -193,7 +193,7 @@ const fn raw_blob_policy_for_workload(workload: CanonicalStoreWorkload) -> RawBl
 }
 
 fn validate_construction_identity(
-    build_plan: zinder_store::CanonicalStoreBuildPlan,
+    build_plan: &zinder_store::CanonicalStoreBuildPlan,
     config: &CanonicalConstructionConfig,
 ) -> Result<(), CanonicalConstructionError> {
     let store_network = build_plan.network();
@@ -312,7 +312,7 @@ fn admit_source_blocks(
 
 fn build_prepared_block_stream<'source, Source>(
     source: &'source Source,
-    build_plan: zinder_store::CanonicalStoreBuildPlan,
+    build_plan: &zinder_store::CanonicalStoreBuildPlan,
     config: &CanonicalConstructionConfig,
     raw_blob_policy: RawBlobPolicy,
 ) -> impl Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>>
@@ -399,13 +399,16 @@ async fn drive_block_loader<PreparedBlocks>(
 where
     PreparedBlocks: Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>> + Send,
 {
-    let build_plan = builder.build_plan();
+    let predecessor_tip_metadata = builder
+        .build_plan()
+        .history_predecessor_frontiers()
+        .tip_metadata();
     let (block_sender, block_receiver) = mpsc::channel(block_queue_capacity);
     let loader_task = tokio::task::spawn_blocking(move || {
         let mut builder = builder;
         let mut build_blocks = CanonicalBuildBlockReceiver::new(
             block_receiver,
-            CommitmentTreeSizes::from_tip_metadata(build_plan.history_predecessor_tip_metadata()),
+            CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
         );
         let evidence = builder
             .bulk_load_blocks(&mut build_blocks)

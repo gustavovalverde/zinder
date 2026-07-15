@@ -15,7 +15,6 @@ use tempfile::tempdir;
 use zinder_core::{
     BlockHeight, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalBlockReplayFormatVersion, Network, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsFingerprintVersion,
     wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name},
 };
 use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical_blocks};
@@ -65,22 +64,21 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
         .await?;
     let checkpoint_id = checkpoint.block_id;
     let build_plan = CanonicalStoreBuildPlan::checkpointed(
-        env.network(),
-        activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+        &activations,
         checkpoint_id,
-        checkpoint.tip_metadata(),
+        checkpoint.frontiers,
         fixed_tip,
     )?;
     let temporary = tempdir()?;
     let store_path = temporary.path().join("canonical");
     let resource_budget = RocksDbResourceBudget::canonical_writer_defaults();
-    let config = live_construction_config(&env, activations)?;
+    let config = live_construction_config(&env, activations.clone())?;
 
     let construction_started_at = Instant::now();
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &store_path,
         CanonicalStoreWorkload::Wallet,
-        build_plan,
+        build_plan.clone(),
         resource_budget,
     )?;
     let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
@@ -93,7 +91,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
 
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
-        env.network(),
+        &activations,
         CanonicalStoreWorkload::Wallet,
         resource_budget,
     )
@@ -101,7 +99,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
     .ok_or_else(|| eyre!("block-local canonical construction must remain BUILDING"))?;
     assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
     assert!(!temporary.path().join("derive").exists());
-    assert_and_record_live_evidence(build_plan, &evidence, &persisted, elapsed, io_mode);
+    assert_and_record_live_evidence(&build_plan, &evidence, &persisted, elapsed, io_mode);
     Ok(())
 }
 
@@ -150,7 +148,7 @@ fn live_construction_config(
     reason = "the calibration record lists every canonical family measurement explicitly"
 )]
 fn assert_and_record_live_evidence(
-    build_plan: CanonicalStoreBuildPlan,
+    build_plan: &CanonicalStoreBuildPlan,
     evidence: &CanonicalBlockLoadEvidence,
     persisted: &PersistedCanonicalEvidence,
     elapsed: std::time::Duration,

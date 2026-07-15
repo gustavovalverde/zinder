@@ -16,8 +16,9 @@ use prost::Message;
 use rust_rocksdb::{DB, Options};
 use tempfile::TempDir;
 use zinder_core::{
-    BlockHeight, BlockId, ChainTipMetadata, Network, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsFingerprintVersion, wire::encode_height_key_ascending,
+    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+    Network, NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion,
+    ShieldedProtocol, wire::encode_height_key_ascending,
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
@@ -119,13 +120,13 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
     let compact_metadata = compact_block
         .chain_metadata
         .ok_or("persisted compact block must carry chain metadata")?;
-    assert_eq!(compact_metadata.sapling_commitment_tree_size, 11);
-    assert_eq!(compact_metadata.orchard_commitment_tree_size, 22);
-    assert_eq!(compact_metadata.ironwood_commitment_tree_size, 35);
+    assert_eq!(compact_metadata.sapling_commitment_tree_size, 0);
+    assert_eq!(compact_metadata.orchard_commitment_tree_size, 0);
+    assert_eq!(compact_metadata.ironwood_commitment_tree_size, 2);
 
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
-        Network::ZcashRegtest,
+        &regtest_activations(),
         CanonicalStoreWorkload::Wallet,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -172,15 +173,14 @@ async fn load_ironwood_fixture(
         .map(BlockHeight::new)
         .ok_or("fixture must have a predecessor")?;
     let checkpoint = BlockId::new(predecessor_height, source_block.parent_hash);
-    let predecessor_tip_metadata = ChainTipMetadata::new(11, 22, 33);
-    let expected_tip_metadata = ChainTipMetadata::new(11, 22, 35);
+    let predecessor_frontiers = pre_ironwood_empty_frontiers();
+    let expected_tip_metadata = ChainTipMetadata::new(0, 0, 2);
     let fixed_tip = BlockId::new(source_block.height, source_block.hash);
     let activations = regtest_activations();
     let build_plan = CanonicalStoreBuildPlan::checkpointed(
-        Network::ZcashRegtest,
-        activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+        &activations,
         checkpoint,
-        predecessor_tip_metadata,
+        predecessor_frontiers,
         fixed_tip,
     )?;
     let temporary = TempDir::new()?;
@@ -195,6 +195,14 @@ async fn load_ironwood_fixture(
     let config = CanonicalConstructionConfig::for_local_tests(Duration::from_secs(5), activations);
     let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
     Ok((temporary, store_path, outcome, expected_tip_metadata))
+}
+
+fn pre_ironwood_empty_frontiers() -> CommitmentTreeFrontiers {
+    CommitmentTreeFrontiers::from_validated_parts(
+        Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+        Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+        None,
+    )
 }
 
 fn read_compact_block(
@@ -224,11 +232,8 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
     );
     let fixed_tip = BlockId::new(source_block.height, source_block.hash);
     let activations = regtest_activations();
-    let build_plan = CanonicalStoreBuildPlan::complete(
-        Network::ZcashRegtest,
-        activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
-        fixed_tip,
-    )?;
+    let build_plan = CanonicalStoreBuildPlan::complete(&activations, fixed_tip)?;
+    let history_predecessor = build_plan.history_predecessor();
     let temporary = TempDir::new()?;
     let store_path = temporary.path().join("canonical");
     let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -237,7 +242,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
-    let source = SingleBlockSource::new(source_block, build_plan.history_predecessor());
+    let source = SingleBlockSource::new(source_block, history_predecessor);
     let config = CanonicalConstructionConfig::for_local_tests(Duration::from_secs(5), activations);
 
     let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
@@ -258,7 +263,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
 
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
-        Network::ZcashRegtest,
+        &regtest_activations(),
         CanonicalStoreWorkload::Wallet,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -290,11 +295,8 @@ async fn canonical_construction_rejects_source_blocks_from_another_network()
     let source_block = fixture_source_block()?;
     let fixed_tip = BlockId::new(source_block.height, source_block.hash);
     let activations = regtest_activations();
-    let build_plan = CanonicalStoreBuildPlan::complete(
-        Network::ZcashRegtest,
-        activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
-        fixed_tip,
-    )?;
+    let build_plan = CanonicalStoreBuildPlan::complete(&activations, fixed_tip)?;
+    let history_predecessor = build_plan.history_predecessor();
     let temporary = TempDir::new()?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
@@ -307,7 +309,7 @@ async fn canonical_construction_rejects_source_blocks_from_another_network()
             network: Network::ZcashMainnet,
             ..source_block
         },
-        build_plan.history_predecessor(),
+        history_predecessor,
     );
     let config = CanonicalConstructionConfig::for_local_tests(Duration::from_secs(5), activations);
 
@@ -333,15 +335,25 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
     let source_block = fixture_source_block()?;
     let fixed_tip = BlockId::new(source_block.height, source_block.hash);
     let activations = regtest_activations();
+    let mut store_activation_rows = activations.activations().to_vec();
+    let latest_activation = store_activation_rows
+        .last_mut()
+        .ok_or("regtest activation fixture must not be empty")?;
+    latest_activation.activation_height = BlockHeight::new(
+        latest_activation
+            .activation_height
+            .value()
+            .saturating_add(1),
+    );
+    let store_activations =
+        NetworkUpgradeActivations::new(Network::ZcashRegtest, store_activation_rows)?;
+    assert_ne!(&store_activations, activations.as_ref());
+    let store_fingerprint =
+        store_activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
     let configured_fingerprint =
         activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
-    let store_fingerprint = zinder_core::NetworkUpgradeActivationsFingerprint::from_bytes(
-        NetworkUpgradeActivationsFingerprintVersion::V1,
-        [0; 32],
-    );
-    assert_ne!(store_fingerprint, configured_fingerprint);
-    let build_plan =
-        CanonicalStoreBuildPlan::complete(Network::ZcashRegtest, store_fingerprint, fixed_tip)?;
+    let build_plan = CanonicalStoreBuildPlan::complete(&store_activations, fixed_tip)?;
+    let history_predecessor = build_plan.history_predecessor();
     let temporary = TempDir::new()?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
@@ -349,7 +361,7 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
-    let source = SingleBlockSource::new(source_block, build_plan.history_predecessor());
+    let source = SingleBlockSource::new(source_block, history_predecessor);
     let config = CanonicalConstructionConfig::for_local_tests(Duration::from_secs(5), activations);
 
     let error = load_fresh_canonical_blocks(builder, &source, config)

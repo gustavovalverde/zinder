@@ -38,6 +38,7 @@
 //! [`PrimaryChainStore`]: zinder_store::PrimaryChainStore
 
 pub mod chain_fixture;
+pub mod commitment_tree_fixtures;
 pub mod deploy;
 pub mod derive_fixture;
 pub mod json_rpc_test_server;
@@ -55,6 +56,7 @@ pub use chain_fixture::{
     encode_fixture_block_replay, encode_fixture_block_replay_with_raw_block,
     synthetic_transaction_public_facts,
 };
+pub use commitment_tree_fixtures::{completed_sapling_subtree_frontier, one_leaf_sapling_frontier};
 pub use derive_fixture::{
     DeriveFixtureError, open_test_derive_store_for_canonical,
     seed_transparent_address_transaction_history, seed_transparent_outpoint_spends,

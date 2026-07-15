@@ -11,8 +11,8 @@
 //!
 //! - [`sample_regtest_upgrade_activations`] returns a hand-built table that
 //!   matches ZFND's `z3` regtest sidecar defaults
-//!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.2 at 3,
-//!   later upgrades unset). Intended for in-process integration tests that
+//!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.1 and NU6.2 at 3,
+//!   and NU6.3 at 603). Intended for in-process integration tests that
 //!   exercise `GetLightdInfo` or `MinedDetails.consensus_branch_id` without a
 //!   live node. Live tests must discover the activations from the running node,
 //!   not hard-code them here.
@@ -35,9 +35,9 @@ use zinder_core::{
 
 /// Sample regtest [`NetworkUpgradeActivations`] for in-process tests.
 ///
-/// Matches the activation heights ZFND's `z3` regtest sidecar is configured
-/// with by default: Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.2 at 3,
-/// later upgrades unset. Intended for integration tests that exercise
+/// Matches the activation heights of the captured ZFND `z3` regtest fixtures:
+/// Overwinter..Canopy at 1, NU5 and NU6 at 2, NU6.1 and NU6.2 at 3, and
+/// NU6.3 at 603. Intended for integration tests that exercise
 /// `GetLightdInfo` or `MinedDetails.consensus_branch_id` without a live node.
 /// Live tests must discover the activations from the running node, not
 /// hard-code them here.
@@ -86,9 +86,19 @@ pub fn sample_regtest_upgrade_activations() -> NetworkUpgradeActivations {
                 name: "NU6".to_owned(),
             },
             NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x4dec_4df0),
+                activation_height: CoreBlockHeight::new(3),
+                name: "NU6.1".to_owned(),
+            },
+            NetworkUpgradeActivation {
                 branch_id: ConsensusBranchId::new(0x5437_f330),
                 activation_height: CoreBlockHeight::new(3),
                 name: "NU6.2".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x37a5_165b),
+                activation_height: CoreBlockHeight::new(603),
+                name: "NU6.3".to_owned(),
             },
         ],
     )

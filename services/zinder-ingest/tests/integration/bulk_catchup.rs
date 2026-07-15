@@ -17,7 +17,7 @@ use serde_json::Value;
 use tempfile::tempdir;
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeFrontier, CommitmentTreeFrontiers,
-    FinalNoteCommitmentRoot, Network, ShieldedProtocol, SubtreeRootIndex,
+    Network, ShieldedProtocol, SubtreeRootIndex,
 };
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, DeriveStoreError, ProjectionPreset,
@@ -38,7 +38,7 @@ use zinder_store::{
     ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
     PrimaryChainStore, RawBlobRetention,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{one_leaf_sapling_frontier, sample_regtest_upgrade_activations};
 
 fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
     Ok(zinder_derive::DeriveStore::open(
@@ -58,25 +58,8 @@ fn test_all_blob_store_options() -> ChainStoreOptions {
     }
 }
 
-fn checkpoint_with_tree_sizes(
-    block_id: BlockId,
-    tip_metadata: ChainTipMetadata,
-) -> SourceChainCheckpoint {
-    let frontier = |tree_size| {
-        Some(CommitmentTreeFrontier::from_validated_parts(
-            tree_size,
-            FinalNoteCommitmentRoot::from_bytes([0; 32]),
-            [0, 0, 0].as_slice(),
-        ))
-    };
-    SourceChainCheckpoint::new(
-        block_id,
-        CommitmentTreeFrontiers::from_validated_parts(
-            frontier(tip_metadata.sapling_commitment_tree_size),
-            frontier(tip_metadata.orchard_commitment_tree_size),
-            frontier(tip_metadata.ironwood_commitment_tree_size),
-        ),
-    )
+fn empty_checkpoint(block_id: BlockId) -> SourceChainCheckpoint {
+    SourceChainCheckpoint::new(block_id, CommitmentTreeFrontiers::default())
 }
 
 #[tokio::test]
@@ -87,10 +70,7 @@ fn checkpoint_with_tree_sizes(
 async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = checkpoint_with_tree_sizes(
-        BlockId::new(checkpoint_height, source_block.parent_hash),
-        ChainTipMetadata::empty(),
-    );
+    let checkpoint = empty_checkpoint(BlockId::new(checkpoint_height, source_block.parent_hash));
     let fetched_heights = Arc::new(Mutex::new(Vec::new()));
     let source = FixtureCheckpointSource {
         block: source_block.clone(),
@@ -214,10 +194,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
 async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = checkpoint_with_tree_sizes(
-        BlockId::new(checkpoint_height, source_block.parent_hash),
-        ChainTipMetadata::empty(),
-    );
+    let checkpoint = empty_checkpoint(BlockId::new(checkpoint_height, source_block.parent_hash));
     let source = FixtureCheckpointSource {
         block: source_block.clone(),
         tip_height: BlockHeight::new(source_block.height.value().saturating_add(200)),
@@ -389,14 +366,17 @@ fn assert_block_summary_materialized(
 }
 
 #[tokio::test]
-async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()> {
-    let checkpoint_tip_metadata = ChainTipMetadata::new(107_795, 0, 0);
-    let expected_tip_metadata = ChainTipMetadata::new(107_796, 0, 0);
-    let source_block = fixture_source_block()?;
+async fn bulk_catchup_seeds_compact_metadata_from_valid_nonzero_checkpoint() -> Result<()> {
+    let source_block = super::fixture_block::fixture_ironwood_source_block()
+        .map_err(|error| eyre!(error.to_string()))?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = checkpoint_with_tree_sizes(
+    let checkpoint = SourceChainCheckpoint::new(
         BlockId::new(checkpoint_height, source_block.parent_hash),
-        checkpoint_tip_metadata,
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(one_leaf_sapling_frontier()?),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+            None,
+        ),
     );
     let source = FixtureCheckpointSource {
         block: source_block.clone(),
@@ -407,7 +387,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
     let tempdir = tempdir()?;
     let bulk_catchup_config = BulkCatchupRunConfig {
         node: NodeTarget::new(
-            Network::ZcashTestnet,
+            Network::ZcashRegtest,
             "http://127.0.0.1:39232".to_owned(),
             NodeAuth::None,
             Duration::from_secs(30),
@@ -457,8 +437,10 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
         .await?
         .ok_or_else(|| eyre!("expected checkpoint bulk catchup to commit"))?;
 
-    assert_eq!(outcome.chain_epoch.tip_metadata, expected_tip_metadata);
-
+    assert_eq!(
+        outcome.chain_epoch.tip_metadata,
+        ChainTipMetadata::new(1, 0, 2)
+    );
     Ok(())
 }
 
@@ -470,10 +452,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
 async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = checkpoint_with_tree_sizes(
-        BlockId::new(checkpoint_height, source_block.parent_hash),
-        ChainTipMetadata::empty(),
-    );
+    let checkpoint = empty_checkpoint(BlockId::new(checkpoint_height, source_block.parent_hash));
     let pending_retryable_fetch_failures = Arc::new(Mutex::new(6));
     let fetched_heights = Arc::new(Mutex::new(Vec::new()));
     let source = FixtureCheckpointSource {

@@ -818,11 +818,11 @@ mod tests {
     use futures_util::StreamExt as _;
     use parking_lot::Mutex;
     use tempfile::tempdir;
+    use zinder_core::SUBTREE_LEAF_COUNT;
     use zinder_core::{
         BlockHash, BlockId, CanonicalTransactionFacts, CommitmentTreeFrontier,
-        CommitmentTreeFrontiers, ConsensusBranchId, FinalNoteCommitmentRoot,
-        NetworkUpgradeActivation, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash,
-        SubtreeRootIndex, TransactionBlobArtifact, TransactionId,
+        CommitmentTreeFrontiers, ConsensusBranchId, NetworkUpgradeActivation, ShieldedProtocol,
+        SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact, TransactionId,
         TransactionIntrinsicValueBalances, TransactionLocation, TransparentAddressScriptHash,
         TransparentInputFact, TransparentOutPoint, TransparentOutputFact, TransparentUnspentOutput,
         UnixTimestampMillis, wire::encode_internal_block_hash,
@@ -834,30 +834,14 @@ mod tests {
         SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
     };
     use zinder_store::{ChainEventHistoryRequest, StoreReadCaller};
+    use zinder_testkit::completed_sapling_subtree_frontier;
 
     use crate::CanonicalBlockConstructionError;
 
     use super::*;
 
-    fn checkpoint_with_tree_sizes(
-        block_id: BlockId,
-        tip_metadata: ChainTipMetadata,
-    ) -> SourceChainCheckpoint {
-        let frontier = |tree_size| {
-            Some(CommitmentTreeFrontier::from_validated_parts(
-                tree_size,
-                FinalNoteCommitmentRoot::from_bytes([0; 32]),
-                [0, 0, 0].as_slice(),
-            ))
-        };
-        SourceChainCheckpoint::new(
-            block_id,
-            CommitmentTreeFrontiers::from_validated_parts(
-                frontier(tip_metadata.sapling_commitment_tree_size),
-                frontier(tip_metadata.orchard_commitment_tree_size),
-                frontier(tip_metadata.ironwood_commitment_tree_size),
-            ),
-        )
+    fn empty_checkpoint(block_id: BlockId) -> SourceChainCheckpoint {
+        SourceChainCheckpoint::new(block_id, CommitmentTreeFrontiers::default())
     }
 
     #[tokio::test]
@@ -889,6 +873,43 @@ mod tests {
             error,
             IngestError::Store(zinder_store::StoreError::RawBlobRetentionMismatch { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_catchup_from_checkpoint_skips_pre_checkpoint_subtree_root_indexes()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("checkpoint-subtree-indexes-store");
+        let checkpoint_height = BlockHeight::new(10);
+        let checkpoint_hash = block_hash(checkpoint_height.value());
+        let mut config = test_bulk_catchup_run_config(&storage_path, 11, 11, 1, true)?;
+        config.checkpoint = Some(SourceChainCheckpoint::new(
+            BlockId::new(checkpoint_height, checkpoint_hash),
+            CommitmentTreeFrontiers::from_validated_parts(
+                Some(completed_sapling_subtree_frontier()?),
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+                None,
+            ),
+        ));
+        let source = TestNodeSource {
+            tip_height: BlockHeight::new(200),
+            network: Network::ZcashRegtest,
+        };
+
+        // The checkpoint already covers subtree index 0. The next block adds
+        // no commitments, so catchup must not fetch a root completed before
+        // retained history.
+        let commit_outcome =
+            bulk_catchup_with_bootstrap_using_mock_prepare(&config, &source, |source_block| {
+                Ok(test_prepared_block(source_block, 0, 0))
+            })
+            .await?;
+
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(11)
+        );
         Ok(())
     }
 
@@ -2309,15 +2330,13 @@ mod tests {
         // Match the TestNodeSource's block hash convention so the first
         // bulk-caught-up block (height 11) finds the right parent linkage.
         let checkpoint_hash = block_hash(checkpoint_height.value());
-        // Tree sizes well below SUBTREE_LEAF_COUNT so no subtree completes
-        // during bulk catchup; the unit test validates the bootstrap + extend
-        // round-trip without spawning a real source subtree path.
-        let checkpoint_tip_metadata = ChainTipMetadata::new(0, 0, 0);
+        // The empty checkpoint validates bootstrap plus extension without
+        // spawning a real source subtree path.
         let mut config = test_bulk_catchup_run_config(&storage_path, 11, 12, 1, true)?;
-        config.checkpoint = Some(checkpoint_with_tree_sizes(
-            BlockId::new(checkpoint_height, checkpoint_hash),
-            checkpoint_tip_metadata,
-        ));
+        config.checkpoint = Some(empty_checkpoint(BlockId::new(
+            checkpoint_height,
+            checkpoint_hash,
+        )));
         let source = TestNodeSource {
             tip_height: BlockHeight::new(200),
             network: Network::ZcashRegtest,
@@ -2351,47 +2370,6 @@ mod tests {
             )?)
         );
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bulk_catchup_from_checkpoint_skips_pre_checkpoint_subtree_root_indexes()
-    -> Result<(), Box<dyn Error>> {
-        let tempdir = tempdir()?;
-        let storage_path = tempdir.path().join("checkpoint-subtree-indexes-store");
-        let checkpoint_height = BlockHeight::new(10);
-        let checkpoint_hash = block_hash(checkpoint_height.value());
-        // Checkpoint encodes one already-completed Sapling subtree. Without
-        // seeding `IngestSubtreeRootIndexes` from `tip_metadata`, the bulk catchup
-        // would ask the node for subtree 0 (completing far below the
-        // batch range) and surface SubtreeRootCompletingBlockMissing. This
-        // mirrors the live mainnet failure observed when calibrating against
-        // a checkpoint at `tip - 1000`.
-        let checkpoint_tip_metadata = ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0);
-        let mut config = test_bulk_catchup_run_config(&storage_path, 11, 11, 1, true)?;
-        config.checkpoint = Some(checkpoint_with_tree_sizes(
-            BlockId::new(checkpoint_height, checkpoint_hash),
-            checkpoint_tip_metadata,
-        ));
-        let source = TestNodeSource {
-            tip_height: BlockHeight::new(200),
-            network: Network::ZcashRegtest,
-        };
-
-        // Checkpoint already carries SUBTREE_LEAF_COUNT outputs, so the
-        // post-checkpoint block contributes a zero delta. The defense
-        // under test is that the writer does not re-fetch the
-        // already-recorded subtree root for the checkpoint range.
-        let commit_outcome =
-            bulk_catchup_with_bootstrap_using_mock_prepare(&config, &source, |sb| {
-                Ok(test_prepared_block(sb, 0, 0))
-            })
-            .await?;
-
-        assert_eq!(
-            commit_outcome.chain_epoch.visible_tip_height,
-            BlockHeight::new(11)
-        );
         Ok(())
     }
 
@@ -2435,10 +2413,10 @@ mod tests {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("misaligned-checkpoint-store");
         let mut config = test_bulk_catchup_run_config(&storage_path, 50, 60, 1, true)?;
-        config.checkpoint = Some(checkpoint_with_tree_sizes(
-            BlockId::new(BlockHeight::new(10), BlockHash::from_bytes([0xa5; 32])),
-            ChainTipMetadata::empty(),
-        ));
+        config.checkpoint = Some(empty_checkpoint(BlockId::new(
+            BlockHeight::new(10),
+            BlockHash::from_bytes([0xa5; 32]),
+        )));
         let source = TestNodeSource {
             tip_height: BlockHeight::new(200),
             network: Network::ZcashRegtest,
