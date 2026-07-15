@@ -17,6 +17,7 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
 };
 
+pub use block_replay::CanonicalBlockReplayLoadEvidence;
 pub use builder::RocksDbCanonicalBuilder;
 pub use rocksdb::RocksDbCanonicalStore;
 

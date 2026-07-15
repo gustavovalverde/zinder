@@ -102,12 +102,11 @@ impl RocksDbCanonicalBuilder {
     pub fn bulk_load_block_replay<SourceError>(
         &mut self,
         replay_envelopes: impl IntoIterator<Item = Result<CanonicalBlockReplayEnvelope, SourceError>>,
-    ) -> Result<(), CanonicalStoreBuildError<SourceError>> {
+    ) -> Result<CanonicalBlockReplayLoadEvidence, CanonicalStoreBuildError<SourceError>> {
         self.bulk_load_block_replay_with_sst_target(
             replay_envelopes,
             BLOCK_REPLAY_SST_TARGET_LOGICAL_BYTES,
         )
-        .map(|_| ())
     }
 
     pub(super) fn bulk_load_block_replay_with_sst_target<SourceError>(

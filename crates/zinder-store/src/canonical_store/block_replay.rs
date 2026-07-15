@@ -23,33 +23,33 @@ pub(super) const BLOCK_REPLAY_SST_TARGET_LOGICAL_BYTES: u64 = 256 * 1024 * 1024;
 /// canonical store as ready; every other required family must be completed and
 /// validated first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CanonicalBlockReplayLoadEvidence {
+pub struct CanonicalBlockReplayLoadEvidence {
     /// First retained block height.
-    pub(super) first_height: BlockHeight,
+    pub first_height: BlockHeight,
     /// Parent of the first retained block.
-    pub(super) first_parent_hash: BlockHash,
+    pub first_parent_hash: BlockHash,
     /// First retained block hash.
-    pub(super) first_hash: BlockHash,
+    pub first_hash: BlockHash,
     /// Last retained block height.
-    pub(super) tip_height: BlockHeight,
+    pub tip_height: BlockHeight,
     /// Last retained block hash.
-    pub(super) tip_hash: BlockHash,
+    pub tip_hash: BlockHash,
     /// Number of contiguous replay rows.
-    pub(super) block_count: u64,
+    pub block_count: u64,
     /// Complete semantic replay-envelope bytes.
-    pub(super) logical_replay_bytes: u64,
+    pub logical_replay_bytes: u64,
     /// Physical bytes of every ingested SST file.
-    pub(super) sst_file_bytes: u64,
+    pub sst_file_bytes: u64,
     /// Number of bounded SST files ingested in one atomic call.
-    pub(super) sst_file_count: u64,
+    pub sst_file_count: u64,
     /// Canonical replay-envelope contract validated for every row.
-    pub(super) replay_format_version: CanonicalBlockReplayFormatVersion,
+    pub replay_format_version: CanonicalBlockReplayFormatVersion,
     /// Semantic block-facts digest contract validated for every row.
-    pub(super) block_digest_version: CanonicalBlockFactsDigestVersion,
+    pub block_digest_version: CanonicalBlockFactsDigestVersion,
     /// Version of the ordered sequence digest.
-    pub(super) sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
+    pub sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
     /// Ordered digest of every replay row's semantic fact digest.
-    pub(super) sequence_digest: CanonicalBlockFactsSequenceDigest,
+    pub sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
 pub(super) struct PreparedBlockReplayLoad {

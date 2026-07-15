@@ -91,9 +91,14 @@ async fn canonical_replay_reaches_fixed_source_tip_without_wallet_state_writes()
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let builder = load_fresh_canonical_block_replay(builder, &source, config).await?;
-    assert_eq!(builder.build_plan().build_tip(), fixed_tip);
-    drop(builder);
+    let outcome = load_fresh_canonical_block_replay(builder, &source, config).await?;
+    assert_eq!(outcome.builder.build_plan().build_tip(), fixed_tip);
+    assert_eq!(outcome.evidence.block_count, 1);
+    assert_eq!(outcome.evidence.tip_height, fixed_tip.height);
+    assert_eq!(outcome.evidence.tip_hash, fixed_tip.hash);
+    assert!(outcome.evidence.logical_replay_bytes > 0);
+    assert!(outcome.evidence.sst_file_bytes > 0);
+    drop(outcome.builder);
 
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,

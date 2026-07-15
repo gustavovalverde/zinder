@@ -19,7 +19,10 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use zinder_core::{BlockHeight, CanonicalBlockReplayEnvelope, Network, NetworkUpgradeActivations};
 use zinder_source::{NodeSource, SourceBlock};
-use zinder_store::{CanonicalStoreBuildError, CanonicalStoreError, RocksDbCanonicalBuilder};
+use zinder_store::{
+    CanonicalBlockReplayLoadEvidence, CanonicalStoreBuildError, CanonicalStoreError,
+    RocksDbCanonicalBuilder,
+};
 
 use crate::{RawBlobPolicy, artifact_builder::prepare_canonical_block, chain_ingest::IngestError};
 use source_fetch::{
@@ -121,6 +124,14 @@ pub enum CanonicalConstructionError {
     },
 }
 
+/// Validated result of loading canonical replay into a fresh unpublished store.
+pub struct CanonicalReplayLoadOutcome {
+    /// Exclusive builder retained for subsequent canonical family loads.
+    pub builder: RocksDbCanonicalBuilder,
+    /// Exact persisted and cache-bypassing readback evidence for replay facts.
+    pub evidence: CanonicalBlockReplayLoadEvidence,
+}
+
 /// Loads the replay family of one fresh canonical build from an ordered source pass.
 ///
 /// Source fetching and block-local preparation are asynchronous and bounded.
@@ -132,7 +143,7 @@ pub async fn load_fresh_canonical_block_replay<Source>(
     builder: RocksDbCanonicalBuilder,
     source: &Source,
     config: CanonicalConstructionConfig,
-) -> Result<RocksDbCanonicalBuilder, CanonicalConstructionError>
+) -> Result<CanonicalReplayLoadOutcome, CanonicalConstructionError>
 where
     Source: NodeSource + Clone,
 {
@@ -329,17 +340,17 @@ async fn drive_replay_loader<PreparedReplays>(
     builder: RocksDbCanonicalBuilder,
     prepared_replays: PreparedReplays,
     replay_queue_capacity: usize,
-) -> Result<RocksDbCanonicalBuilder, CanonicalConstructionError>
+) -> Result<CanonicalReplayLoadOutcome, CanonicalConstructionError>
 where
     PreparedReplays: Stream<Item = Result<QueuedReplayEnvelope, CanonicalConstructionError>> + Send,
 {
     let (replay_sender, replay_receiver) = mpsc::channel(replay_queue_capacity);
     let loader_task = tokio::task::spawn_blocking(move || {
         let mut builder = builder;
-        builder
+        let evidence = builder
             .bulk_load_block_replay(ReplayEnvelopeReceiver::new(replay_receiver))
             .map_err(canonical_build_error)?;
-        Ok(builder)
+        Ok(CanonicalReplayLoadOutcome { builder, evidence })
     });
 
     let mut prepared_replays = Box::pin(prepared_replays);
