@@ -505,7 +505,8 @@ where
                 }
             }
             IngestPhase::BulkCatchup => {
-                let store_tip = bulk_catchup_progress_tip(store_tip, config.modifiers.checkpoint);
+                let store_tip =
+                    bulk_catchup_progress_tip(store_tip, config.modifiers.checkpoint.as_ref());
                 let Some(batch_target) = compute_bulk_catchup_target(BulkCatchupTargetInput {
                     upstream_tip,
                     progress_tip: store_tip,
@@ -636,10 +637,10 @@ struct BulkCatchupTargetInput {
 
 fn bulk_catchup_progress_tip(
     store_tip: Option<u32>,
-    checkpoint: Option<zinder_source::SourceChainCheckpoint>,
+    checkpoint: Option<&zinder_source::SourceChainCheckpoint>,
 ) -> u32 {
     store_tip
-        .or_else(|| checkpoint.map(|checkpoint| checkpoint.height.value()))
+        .or_else(|| checkpoint.map(|checkpoint| checkpoint.block_id.height.value()))
         .unwrap_or(0)
 }
 
@@ -650,8 +651,12 @@ fn build_bulk_catchup_batch_config(
     batch_target: u32,
     upstream_tip: BlockHeight,
 ) -> BulkCatchupRunConfig {
-    let from_height = match config.modifiers.checkpoint {
-        Some(checkpoint) if store_tip == 0 => checkpoint.height.next().unwrap_or(checkpoint.height),
+    let from_height = match &config.modifiers.checkpoint {
+        Some(checkpoint) if store_tip == 0 => checkpoint
+            .block_id
+            .height
+            .next()
+            .unwrap_or(checkpoint.block_id.height),
         _ => BlockHeight::new(store_tip.saturating_add(1)),
     };
     BulkCatchupRunConfig {
@@ -690,7 +695,7 @@ fn build_bulk_catchup_batch_config(
         flush_interval_epochs: config.bulk_catchup.flush_interval_epochs,
         upstream_tip_hint: Some(upstream_tip),
         allow_near_tip_finalize: config.modifiers.allow_near_tip_finalize,
-        checkpoint: config.modifiers.checkpoint,
+        checkpoint: config.modifiers.checkpoint.clone(),
     }
 }
 
@@ -751,7 +756,7 @@ async fn sleep_or_cancel(duration: Duration, cancel: &CancellationToken) -> Canc
 mod tests {
     use std::path::PathBuf;
 
-    use zinder_core::{BlockHash, ChainTipMetadata, Network};
+    use zinder_core::{BlockHash, BlockId, CommitmentTreeFrontiers, Network};
     use zinder_source::{
         DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget, SourceChainCheckpoint,
     };
@@ -918,9 +923,8 @@ mod tests {
         // the store is empty. Without this, `bulk catchup` rejects the batch
         // with `BulkCatchupCheckpointMisaligned`.
         let checkpoint = SourceChainCheckpoint::new(
-            BlockHeight::new(279_999),
-            BlockHash::from_bytes([0xAB; 32]),
-            ChainTipMetadata::empty(),
+            BlockId::new(BlockHeight::new(279_999), BlockHash::from_bytes([0xAB; 32])),
+            CommitmentTreeFrontiers::default(),
         );
         let config = sample_loop_config(IngestModifiers {
             checkpoint: Some(checkpoint),
@@ -943,9 +947,8 @@ mod tests {
     fn non_empty_store_starts_at_store_tip_plus_one_even_with_checkpoint()
     -> Result<(), &'static str> {
         let checkpoint = SourceChainCheckpoint::new(
-            BlockHeight::new(279_999),
-            BlockHash::from_bytes([0xAB; 32]),
-            ChainTipMetadata::empty(),
+            BlockId::new(BlockHeight::new(279_999), BlockHash::from_bytes([0xAB; 32])),
+            CommitmentTreeFrontiers::default(),
         );
         let config = sample_loop_config(IngestModifiers {
             checkpoint: Some(checkpoint),
@@ -1064,14 +1067,13 @@ mod tests {
     #[test]
     fn bulk_catchup_progress_tip_uses_checkpoint_for_empty_store() {
         let checkpoint = SourceChainCheckpoint::new(
-            BlockHeight::new(1_592),
-            BlockHash::from_bytes([0xAB; 32]),
-            ChainTipMetadata::empty(),
+            BlockId::new(BlockHeight::new(1_592), BlockHash::from_bytes([0xAB; 32])),
+            CommitmentTreeFrontiers::default(),
         );
 
-        assert_eq!(bulk_catchup_progress_tip(None, Some(checkpoint)), 1_592);
+        assert_eq!(bulk_catchup_progress_tip(None, Some(&checkpoint)), 1_592);
         assert_eq!(
-            bulk_catchup_progress_tip(Some(1_617), Some(checkpoint)),
+            bulk_catchup_progress_tip(Some(1_617), Some(&checkpoint)),
             1_617
         );
         assert_eq!(bulk_catchup_progress_tip(None, None), 0);

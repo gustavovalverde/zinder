@@ -13,9 +13,9 @@ use std::{
 use eyre::{Result, eyre};
 use tempfile::tempdir;
 use zinder_core::{
-    BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
-    CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, Network,
-    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion,
+    BlockHeight, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalBlockReplayFormatVersion, Network, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsFingerprintVersion,
     wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name},
 };
 use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical_blocks};
@@ -59,14 +59,16 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
                 fixed_tip.height.value()
             )
         })?;
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    let checkpoint_id = BlockId::new(checkpoint.height, checkpoint.hash);
     let activations = fetch_live_network_upgrade_activations(&env).await?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(checkpoint_height, &activations)
+        .await?;
+    let checkpoint_id = checkpoint.block_id;
     let build_plan = CanonicalStoreBuildPlan::checkpointed(
         env.network(),
         activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
         checkpoint_id,
-        checkpoint.tip_metadata,
+        checkpoint.tip_metadata(),
         fixed_tip,
     )?;
     let temporary = tempdir()?;

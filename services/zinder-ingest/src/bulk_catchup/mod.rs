@@ -304,7 +304,7 @@ where
     let current_chain_epoch = match bootstrap_from_checkpoint_if_needed(
         run.store,
         config.node.network,
-        config.checkpoint,
+        config.checkpoint.as_ref(),
         config.from_height,
     )? {
         Some(bootstrapped) => Some(bootstrapped),
@@ -667,7 +667,7 @@ struct BulkCatchupStart {
 fn bootstrap_from_checkpoint_if_needed(
     store: &PrimaryChainStore,
     network: Network,
-    checkpoint: Option<SourceChainCheckpoint>,
+    checkpoint: Option<&SourceChainCheckpoint>,
     from_height: BlockHeight,
 ) -> Result<Option<ChainEpoch>, IngestError> {
     let Some(checkpoint) = checkpoint else {
@@ -676,10 +676,14 @@ fn bootstrap_from_checkpoint_if_needed(
     if store.current_chain_epoch()?.is_some() {
         return Ok(None);
     }
-    let expected_from_height = checkpoint.height.next().unwrap_or(checkpoint.height);
+    let expected_from_height = checkpoint
+        .block_id
+        .height
+        .next()
+        .unwrap_or(checkpoint.block_id.height);
     if from_height != expected_from_height {
         return Err(IngestError::BulkCatchupCheckpointMisaligned {
-            checkpoint_height: checkpoint.height,
+            checkpoint_height: checkpoint.block_id.height,
             from_height,
         });
     }
@@ -687,12 +691,12 @@ fn bootstrap_from_checkpoint_if_needed(
     let bootstrap_chain_epoch = ChainEpoch {
         id: ChainEpochId::new(1),
         network,
-        visible_tip_height: checkpoint.height,
-        visible_tip_hash: checkpoint.hash,
-        settled_tip_height: checkpoint.height,
-        settled_tip_hash: checkpoint.hash,
+        visible_tip_height: checkpoint.block_id.height,
+        visible_tip_hash: checkpoint.block_id.hash,
+        settled_tip_height: checkpoint.block_id.height,
+        settled_tip_hash: checkpoint.block_id.hash,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-        tip_metadata: checkpoint.tip_metadata,
+        tip_metadata: checkpoint.tip_metadata(),
         created_at: current_unix_millis()?,
     };
     let outcome = store.commit_artifactless_checkpoint(bootstrap_chain_epoch)?;
@@ -774,14 +778,15 @@ fn warn_if_checkpoint_within_reorg_window(
     let Some(checkpoint) = config.checkpoint.as_ref() else {
         return;
     };
-    if !checkpoint_within_reorg_window(checkpoint.height, tip_height, reorg_window_blocks) {
+    if !checkpoint_within_reorg_window(checkpoint.block_id.height, tip_height, reorg_window_blocks)
+    {
         return;
     }
     let safe_floor = tip_height.value().saturating_sub(reorg_window_blocks);
     tracing::warn!(
         target: "zinder::ingest",
         event = "bulk_catchup_checkpoint_within_reorg_window",
-        checkpoint_height = checkpoint.height.value(),
+        checkpoint_height = checkpoint.block_id.height.value(),
         tip_height = tip_height.value(),
         reorg_window_blocks,
         safe_checkpoint_floor = safe_floor,
@@ -814,12 +819,13 @@ mod tests {
     use parking_lot::Mutex;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockHash, BlockId, CanonicalTransactionFacts, ConsensusBranchId, NetworkUpgradeActivation,
-        SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
-        TransactionBlobArtifact, TransactionId, TransactionIntrinsicValueBalances,
-        TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
-        TransparentOutPoint, TransparentOutputFact, TransparentUnspentOutput, UnixTimestampMillis,
-        wire::encode_internal_block_hash,
+        BlockHash, BlockId, CanonicalTransactionFacts, CommitmentTreeFrontier,
+        CommitmentTreeFrontiers, ConsensusBranchId, FinalNoteCommitmentRoot,
+        NetworkUpgradeActivation, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash,
+        SubtreeRootIndex, TransactionBlobArtifact, TransactionId,
+        TransactionIntrinsicValueBalances, TransactionLocation, TransparentAddressScriptHash,
+        TransparentInputFact, TransparentOutPoint, TransparentOutputFact, TransparentUnspentOutput,
+        UnixTimestampMillis, wire::encode_internal_block_hash,
     };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{
@@ -832,6 +838,27 @@ mod tests {
     use crate::CanonicalBlockConstructionError;
 
     use super::*;
+
+    fn checkpoint_with_tree_sizes(
+        block_id: BlockId,
+        tip_metadata: ChainTipMetadata,
+    ) -> SourceChainCheckpoint {
+        let frontier = |tree_size| {
+            Some(CommitmentTreeFrontier::from_validated_parts(
+                tree_size,
+                FinalNoteCommitmentRoot::from_bytes([0; 32]),
+                [0, 0, 0].as_slice(),
+            ))
+        };
+        SourceChainCheckpoint::new(
+            block_id,
+            CommitmentTreeFrontiers::from_validated_parts(
+                frontier(tip_metadata.sapling_commitment_tree_size),
+                frontier(tip_metadata.orchard_commitment_tree_size),
+                frontier(tip_metadata.ironwood_commitment_tree_size),
+            ),
+        )
+    }
 
     #[tokio::test]
     async fn until_complete_rejects_a_mismatched_writer_before_catchup()
@@ -2287,9 +2314,8 @@ mod tests {
         // round-trip without spawning a real source subtree path.
         let checkpoint_tip_metadata = ChainTipMetadata::new(0, 0, 0);
         let mut config = test_bulk_catchup_run_config(&storage_path, 11, 12, 1, true)?;
-        config.checkpoint = Some(SourceChainCheckpoint::new(
-            checkpoint_height,
-            checkpoint_hash,
+        config.checkpoint = Some(checkpoint_with_tree_sizes(
+            BlockId::new(checkpoint_height, checkpoint_hash),
             checkpoint_tip_metadata,
         ));
         let source = TestNodeSource {
@@ -2343,9 +2369,8 @@ mod tests {
         // a checkpoint at `tip - 1000`.
         let checkpoint_tip_metadata = ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0);
         let mut config = test_bulk_catchup_run_config(&storage_path, 11, 11, 1, true)?;
-        config.checkpoint = Some(SourceChainCheckpoint::new(
-            checkpoint_height,
-            checkpoint_hash,
+        config.checkpoint = Some(checkpoint_with_tree_sizes(
+            BlockId::new(checkpoint_height, checkpoint_hash),
             checkpoint_tip_metadata,
         ));
         let source = TestNodeSource {
@@ -2410,9 +2435,8 @@ mod tests {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("misaligned-checkpoint-store");
         let mut config = test_bulk_catchup_run_config(&storage_path, 50, 60, 1, true)?;
-        config.checkpoint = Some(SourceChainCheckpoint::new(
-            BlockHeight::new(10),
-            BlockHash::from_bytes([0xa5; 32]),
+        config.checkpoint = Some(checkpoint_with_tree_sizes(
+            BlockId::new(BlockHeight::new(10), BlockHash::from_bytes([0xa5; 32])),
             ChainTipMetadata::empty(),
         ));
         let source = TestNodeSource {
@@ -2469,7 +2493,7 @@ mod tests {
         let bootstrapped = bootstrap_from_checkpoint_if_needed(
             &store,
             config.node.network,
-            config.checkpoint,
+            config.checkpoint.as_ref(),
             config.from_height,
         )?;
         let initial_tip_metadata = bootstrapped

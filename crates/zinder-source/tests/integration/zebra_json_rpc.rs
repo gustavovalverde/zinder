@@ -6,11 +6,18 @@
 use std::{collections::HashSet, num::NonZeroU64, time::Duration};
 
 use eyre::eyre;
+use incrementalmerkletree::{
+    Position,
+    frontier::{CommitmentTree, Frontier},
+};
+use orchard::tree::MerkleHashOrchard;
+use sapling::Node as SaplingNode;
 use serde_json::{Value, json};
+use zcash_primitives::merkle_tree::write_commitment_tree;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, BroadcastAccepted, ChainTipMetadata, Network,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastResult,
-    TransactionId,
+    BlockHash, BlockHeight, BlockId, BroadcastAccepted, ConsensusBranchId, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootIndex, TransactionBroadcastResult, TransactionId,
 };
 use zinder_source::{
     NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor, SourceChainUpdate,
@@ -1213,74 +1220,441 @@ async fn probe_capabilities_keeps_only_advertised_capabilities_on_success() -> e
     Ok(())
 }
 
-#[tokio::test]
-async fn fetch_chain_checkpoint_parses_getblock_trees_field() -> eyre::Result<()> {
-    let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
-        "height": 100,
-        "hash": block_hash_hex,
-        "trees": {
-            "sapling": {"size": 1234},
-            "orchard": {"size": 567},
-            "ironwood": {"size": 89},
+const CHECKPOINT_BLOCK_HASH_HEX: &str =
+    "010101010101010101010101010101010101010101010101010101010101010f";
+const ONE_LEAF_SAPLING_FINAL_STATE_HEX: &str = "010100000000000000000000000000000000000000000000000000000000000000001f00000000000000000000000000000000000000000000000000000000000000";
+
+fn checkpoint_activations(
+    sapling_height: u32,
+    orchard_height: u32,
+) -> eyre::Result<NetworkUpgradeActivations> {
+    checkpoint_activations_with_ironwood(sapling_height, orchard_height, None)
+}
+
+fn checkpoint_activations_with_ironwood(
+    sapling_height: u32,
+    orchard_height: u32,
+    ironwood_height: Option<u32>,
+) -> eyre::Result<NetworkUpgradeActivations> {
+    let mut activations = vec![
+        NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(1),
+            activation_height: BlockHeight::new(sapling_height),
+            name: "Sapling".to_owned(),
         },
-    })))])?;
+        NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(2),
+            activation_height: BlockHeight::new(orchard_height),
+            name: "NU5".to_owned(),
+        },
+    ];
+    if let Some(ironwood_height) = ironwood_height {
+        activations.push(NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(3),
+            activation_height: BlockHeight::new(ironwood_height),
+            name: "NU6.3".to_owned(),
+        });
+    }
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        activations,
+    )?)
+}
+
+fn sapling_frontier_rpc_parts(
+    frontier: &Frontier<SaplingNode, 32>,
+) -> eyre::Result<(String, String)> {
+    let tree = CommitmentTree::from_frontier(frontier);
+    let mut final_state_bytes = Vec::new();
+    write_commitment_tree(&tree, &mut final_state_bytes)?;
+    let mut final_root_bytes = frontier.root().to_bytes();
+    final_root_bytes.reverse();
+    Ok((
+        hex::encode(final_root_bytes),
+        hex::encode(final_state_bytes),
+    ))
+}
+
+fn empty_sapling_frontier_rpc_parts() -> eyre::Result<(String, String)> {
+    sapling_frontier_rpc_parts(&Frontier::empty())
+}
+
+fn one_leaf_sapling_frontier_rpc_parts() -> eyre::Result<(String, String)> {
+    let leaf_bytes = {
+        let mut bytes = [0; 32];
+        bytes[0] = 1;
+        bytes
+    };
+    let leaf = Option::<SaplingNode>::from(SaplingNode::from_bytes(leaf_bytes))
+        .ok_or_else(|| eyre!("one is a canonical Sapling field element"))?;
+    let frontier: Frontier<SaplingNode, 32> =
+        Frontier::from_parts(Position::from(0), leaf, Vec::new())
+            .map_err(|error| eyre!("valid one-leaf frontier rejected: {error:?}"))?;
+    sapling_frontier_rpc_parts(&frontier)
+}
+
+fn one_leaf_orchard_frontier_rpc_parts(leaf_byte: u8) -> eyre::Result<(String, String)> {
+    let leaf_bytes = {
+        let mut bytes = [0; 32];
+        bytes[0] = leaf_byte;
+        bytes
+    };
+    let leaf = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&leaf_bytes))
+        .ok_or_else(|| eyre!("small integers are canonical Orchard field elements"))?;
+    let frontier: Frontier<MerkleHashOrchard, 32> =
+        Frontier::from_parts(Position::from(0), leaf, Vec::new())
+            .map_err(|error| eyre!("valid one-leaf frontier rejected: {error:?}"))?;
+    let tree = CommitmentTree::from_frontier(&frontier);
+    let mut final_state_bytes = Vec::new();
+    write_commitment_tree(&tree, &mut final_state_bytes)?;
+    Ok((
+        hex::encode(frontier.root().to_bytes()),
+        hex::encode(final_state_bytes),
+    ))
+}
+
+fn full_sapling_frontier_state_hex() -> eyre::Result<String> {
+    let leaf_bytes = {
+        let mut bytes = [0; 32];
+        bytes[0] = 1;
+        bytes
+    };
+    let leaf = Option::<SaplingNode>::from(SaplingNode::from_bytes(leaf_bytes))
+        .ok_or_else(|| eyre!("one is a canonical Sapling field element"))?;
+    let tree =
+        CommitmentTree::<SaplingNode, 32>::from_parts(Some(leaf), Some(leaf), vec![Some(leaf); 31])
+            .map_err(|()| eyre!("depth-32 legacy tree accepts 31 parent slots"))?;
+    let mut final_state_bytes = Vec::new();
+    write_commitment_tree(&tree, &mut final_state_bytes)?;
+    Ok(hex::encode(final_state_bytes))
+}
+
+fn checkpoint_response(final_root: Option<&str>, final_state: Option<&str>) -> Value {
+    json!({
+        "height": 100,
+        "hash": CHECKPOINT_BLOCK_HASH_HEX,
+        "sapling": {"commitments": {
+            "finalRoot": final_root,
+            "finalState": final_state,
+        }},
+        "orchard": {"commitments": {}},
+    })
+}
+
+fn checkpoint_response_with_all_frontiers(
+    sapling: (&str, &str),
+    orchard: (&str, &str),
+    ironwood: (&str, &str),
+) -> Value {
+    json!({
+        "height": 100,
+        "hash": CHECKPOINT_BLOCK_HASH_HEX,
+        "sapling": {"commitments": {
+            "finalRoot": sapling.0,
+            "finalState": sapling.1,
+        }},
+        "orchard": {"commitments": {
+            "finalRoot": orchard.0,
+            "finalState": orchard.1,
+        }},
+        "ironwood": {"commitments": {
+            "finalRoot": ironwood.0,
+            "finalState": ironwood.1,
+        }},
+    })
+}
+
+async fn fetch_checkpoint_response(
+    response: Value,
+    activations: &NetworkUpgradeActivations,
+) -> eyre::Result<Result<zinder_source::SourceChainCheckpoint, SourceError>> {
+    let server =
+        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(response))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
         NodeAuth::None,
         Duration::from_secs(5),
     )?;
+    Ok(source
+        .fetch_chain_checkpoint(BlockHeight::new(100), activations)
+        .await)
+}
 
-    let checkpoint = source.fetch_chain_checkpoint(BlockHeight::new(100)).await?;
+#[tokio::test]
+async fn fetch_chain_checkpoint_uses_one_tree_state_request_and_decodes_nonempty_frontier()
+-> eyre::Result<()> {
+    let (final_root, final_state) = one_leaf_sapling_frontier_rpc_parts()?;
+    assert_eq!(final_state, ONE_LEAF_SAPLING_FINAL_STATE_HEX);
+    let server = JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(
+        checkpoint_response(Some(&final_root), Some(&final_state)),
+    ))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    let activations = checkpoint_activations(1, 200)?;
 
-    assert_eq!(checkpoint.height, BlockHeight::new(100));
-    assert_eq!(checkpoint.hash, decode_rpc_block_hash(block_hash_hex)?);
+    let checkpoint = source
+        .fetch_chain_checkpoint(BlockHeight::new(100), &activations)
+        .await?;
+
+    assert_eq!(checkpoint.block_id.height, BlockHeight::new(100));
     assert_eq!(
-        checkpoint.tip_metadata,
-        ChainTipMetadata::new(1234, 567, 89)
+        checkpoint.block_id.hash,
+        decode_rpc_block_hash(CHECKPOINT_BLOCK_HASH_HEX)?
     );
-    assert!(
-        server.requests_for("getblockhash")?.is_empty(),
-        "checkpoint fetch should use height-keyed getblock directly"
+    assert_eq!(checkpoint.tip_metadata().sapling_commitment_tree_size, 1);
+    assert_eq!(
+        checkpoint
+            .frontiers
+            .sapling()
+            .ok_or_else(|| eyre!("sapling frontier must be present"))?
+            .final_state_bytes(),
+        hex::decode(ONE_LEAF_SAPLING_FINAL_STATE_HEX)?,
+    );
+    assert_eq!(server.requests()?.len(), 1);
+    assert_eq!(
+        server.requests_for("z_gettreestate")?[0].params,
+        json!(["100"])
+    );
+    assert!(server.requests_for("getblock")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_accepts_active_empty_canonical_frontier() -> eyre::Result<()> {
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+    assert_eq!(final_state, "000000");
+    let checkpoint = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), Some(&final_state)),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await??;
+
+    assert_eq!(checkpoint.tip_metadata().sapling_commitment_tree_size, 0);
+    assert!(checkpoint.frontiers.sapling().is_some());
+    assert!(checkpoint.frontiers.orchard().is_none());
+    assert!(checkpoint.frontiers.ironwood().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_decodes_same_height_pool_activations_independently()
+-> eyre::Result<()> {
+    let sapling = one_leaf_sapling_frontier_rpc_parts()?;
+    let orchard = one_leaf_orchard_frontier_rpc_parts(1)?;
+    let ironwood = one_leaf_orchard_frontier_rpc_parts(2)?;
+    let response = checkpoint_response_with_all_frontiers(
+        (&sapling.0, &sapling.1),
+        (&orchard.0, &orchard.1),
+        (&ironwood.0, &ironwood.1),
+    );
+    let checkpoint = fetch_checkpoint_response(
+        response,
+        &checkpoint_activations_with_ironwood(1, 1, Some(1))?,
+    )
+    .await??;
+
+    assert_eq!(checkpoint.tip_metadata().sapling_commitment_tree_size, 1);
+    assert_eq!(checkpoint.tip_metadata().orchard_commitment_tree_size, 1);
+    assert_eq!(checkpoint.tip_metadata().ironwood_commitment_tree_size, 1);
+    assert_eq!(
+        checkpoint
+            .frontiers
+            .orchard()
+            .ok_or_else(|| eyre!("orchard frontier must be present"))?
+            .final_root()
+            .as_bytes(),
+        <[u8; 32]>::try_from(hex::decode(&orchard.0)?.as_slice())?,
+        "Orchard finalRoot bytes must stay in direct RPC order",
     );
     assert_eq!(
-        server.requests_for("getblock")?[0].params,
-        json!(["100", 1])
+        checkpoint
+            .frontiers
+            .ironwood()
+            .ok_or_else(|| eyre!("ironwood frontier must be present"))?
+            .final_state_bytes(),
+        hex::decode(&ironwood.1)?,
+    );
+    assert_ne!(
+        checkpoint
+            .frontiers
+            .orchard()
+            .ok_or_else(|| eyre!("orchard frontier must be present"))?
+            .final_root(),
+        checkpoint
+            .frontiers
+            .ironwood()
+            .ok_or_else(|| eyre!("ironwood frontier must be present"))?
+            .final_root(),
+        "Orchard and Ironwood use independent frontiers",
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_chain_checkpoint_defaults_missing_tree_pools_to_zero() -> eyre::Result<()> {
-    let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
-        "height": 100,
-        "hash": block_hash_hex,
-        "trees": {},
-    })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    let checkpoint = source.fetch_chain_checkpoint(BlockHeight::new(100)).await?;
-
-    assert_eq!(checkpoint.height, BlockHeight::new(100));
-    assert_eq!(checkpoint.hash, decode_rpc_block_hash(block_hash_hex)?);
-    assert_eq!(checkpoint.tip_metadata, ChainTipMetadata::empty());
+async fn fetch_chain_checkpoint_rejects_height_mismatch() -> eyre::Result<()> {
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+    let mut response = checkpoint_response(Some(&final_root), Some(&final_state));
+    response["height"] = json!(99);
+    let outcome = fetch_checkpoint_response(response, &checkpoint_activations(1, 200)?).await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_chain_checkpoint_rejects_response_without_trees() -> eyre::Result<()> {
-    let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
-        "height": 100,
-        "hash": block_hash_hex,
-    })))])?;
+async fn fetch_chain_checkpoint_rejects_one_sided_frontier() -> eyre::Result<()> {
+    let (final_root, _) = empty_sapling_frontier_rpc_parts()?;
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), None),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::MalformedCommitmentTreeFrontier {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_trailing_frontier_bytes() -> eyre::Result<()> {
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), Some(&format!("{final_state}00"))),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::InvalidCommitmentTreeFrontierEncoding {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_frontier_root_mismatch() -> eyre::Result<()> {
+    let (_, final_state) = empty_sapling_frontier_rpc_parts()?;
+    let wrong_root = hex::encode([0; 32]);
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&wrong_root), Some(&final_state)),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::CommitmentTreeFrontierRootMismatch {
+            protocol: ShieldedProtocol::Sapling,
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_tree_size_outside_u32_contract() -> eyre::Result<()> {
+    let final_state = full_sapling_frontier_state_hex()?;
+    let placeholder_root = hex::encode([0; 32]);
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&placeholder_root), Some(&final_state)),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::CommitmentTreeSizeOutOfRange {
+            protocol: ShieldedProtocol::Sapling,
+            tree_size: 4_294_967_296,
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_inactive_present_frontier() -> eyre::Result<()> {
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), Some(&final_state)),
+        &checkpoint_activations(200, 300)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::CommitmentTreeFrontierActivationMismatch {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_active_missing_frontier() -> eyre::Result<()> {
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(None, None),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::CommitmentTreeFrontierActivationMismatch {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_activation_table_without_required_upgrades()
+-> eyre::Result<()> {
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        vec![NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(2),
+            activation_height: BlockHeight::new(200),
+            name: "NU5".to_owned(),
+        }],
+    )?;
+    let outcome = fetch_checkpoint_response(json!({}), &activations).await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_activation_table_for_another_network_before_rpc()
+-> eyre::Result<()> {
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashTestnet,
+        vec![
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(1),
+                activation_height: BlockHeight::new(1),
+                name: "Sapling".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(2),
+                activation_height: BlockHeight::new(1),
+                name: "NU5".to_owned(),
+            },
+        ],
+    )?;
+    let server =
+        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(json!({})))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -1288,12 +1662,15 @@ async fn fetch_chain_checkpoint_rejects_response_without_trees() -> eyre::Result
         Duration::from_secs(5),
     )?;
 
-    let outcome = source.fetch_chain_checkpoint(BlockHeight::new(100)).await;
+    let outcome = source
+        .fetch_chain_checkpoint(BlockHeight::new(100), &activations)
+        .await;
 
     assert!(matches!(
         outcome,
         Err(SourceError::SourceProtocolMismatch { .. })
     ));
+    assert!(server.requests()?.is_empty());
     Ok(())
 }
 

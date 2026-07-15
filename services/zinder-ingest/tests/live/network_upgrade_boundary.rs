@@ -112,8 +112,11 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
     if let Some(checkpoint_height) = checkpoint_height {
-        bulk_catchup_config.checkpoint =
-            Some(source.fetch_chain_checkpoint(checkpoint_height).await?);
+        bulk_catchup_config.checkpoint = Some(
+            source
+                .fetch_chain_checkpoint(checkpoint_height, &activations)
+                .await?,
+        );
     }
     run_bulk_catchup(&bulk_catchup_config, &source)
         .await?

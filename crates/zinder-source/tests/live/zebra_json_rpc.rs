@@ -24,19 +24,21 @@ async fn fetch_chain_checkpoint_at_tip_reflects_supported_tree_sizes() -> Result
     };
     let source = zebra_source(&env)?;
     let tip = NodeSource::tip_id(&source).await?.height;
-    let checkpoint = source.fetch_chain_checkpoint(tip).await?;
+    let activations = source.fetch_network_upgrade_activations().await?;
+    let checkpoint = source.fetch_chain_checkpoint(tip, &activations).await?;
+    let tip_metadata = checkpoint.tip_metadata();
 
-    assert_eq!(checkpoint.height, tip);
+    assert_eq!(checkpoint.block_id.height, tip);
     assert_eq!(
-        checkpoint.tip_metadata.sapling_commitment_tree_size, 0,
+        tip_metadata.sapling_commitment_tree_size, 0,
         "coinbase-only regtest blocks should not advance the sapling tree"
     );
     assert_eq!(
-        checkpoint.tip_metadata.orchard_commitment_tree_size, 0,
+        tip_metadata.orchard_commitment_tree_size, 0,
         "coinbase-only regtest blocks should not advance the orchard tree"
     );
     assert_eq!(
-        checkpoint.tip_metadata.ironwood_commitment_tree_size, 0,
+        tip_metadata.ironwood_commitment_tree_size, 0,
         "coinbase-only regtest blocks should not advance the ironwood tree"
     );
     Ok(())
@@ -52,18 +54,22 @@ async fn fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet() -> Res
     let source = zebra_source(&env)?;
     let tip = NodeSource::tip_id(&source).await?.height;
     let checkpoint_height = BlockHeight::new(tip.value().saturating_sub(1_000));
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
+    let activations = source.fetch_network_upgrade_activations().await?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(checkpoint_height, &activations)
+        .await?;
+    let tip_metadata = checkpoint.tip_metadata();
 
-    assert_eq!(checkpoint.height, checkpoint_height);
+    assert_eq!(checkpoint.block_id.height, checkpoint_height);
     assert!(
-        checkpoint.tip_metadata.sapling_commitment_tree_size > 100_000,
+        tip_metadata.sapling_commitment_tree_size > 100_000,
         "mainnet sapling tree size at recent height should be well above 100k; got {}",
-        checkpoint.tip_metadata.sapling_commitment_tree_size
+        tip_metadata.sapling_commitment_tree_size
     );
     assert!(
-        checkpoint.tip_metadata.orchard_commitment_tree_size > 10_000,
+        tip_metadata.orchard_commitment_tree_size > 10_000,
         "mainnet orchard tree size at recent height should be above 10k; got {}",
-        checkpoint.tip_metadata.orchard_commitment_tree_size
+        tip_metadata.orchard_commitment_tree_size
     );
     Ok(())
 }

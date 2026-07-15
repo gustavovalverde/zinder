@@ -103,4 +103,7 @@ pub use transparent_output::{
     TransparentUnspentOutputsByOutpointResponse,
 };
 pub use transparent_utxo_set_summary::TransparentUtxoSetSummary;
-pub use tree_state::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, TreeStateArtifact};
+pub use tree_state::{
+    BlockFinalNoteCommitmentRoots, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+    FinalNoteCommitmentRoot, TreeStateArtifact,
+};

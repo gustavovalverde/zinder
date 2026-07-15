@@ -115,6 +115,74 @@ pub enum SourceError {
         byte_count: usize,
     },
 
+    /// A note-commitment frontier did not have the required response shape.
+    #[error("{protocol:?} note-commitment frontier is malformed: {reason}")]
+    MalformedCommitmentTreeFrontier {
+        /// Shielded protocol whose frontier was malformed.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Frontier invariant that was violated.
+        reason: &'static str,
+    },
+
+    /// A note-commitment frontier was not valid hex.
+    #[error("{protocol:?} note-commitment frontier is not valid hex")]
+    InvalidCommitmentTreeFrontierHex {
+        /// Shielded protocol whose frontier was invalid.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Hex decoding failure.
+        #[source]
+        source: hex::FromHexError,
+    },
+
+    /// A note-commitment frontier exceeded the maximum canonical RPC length.
+    #[error(
+        "{protocol:?} note-commitment frontier exceeds {max_byte_count} bytes: got {byte_count}"
+    )]
+    CommitmentTreeFrontierTooLarge {
+        /// Shielded protocol whose frontier was oversized.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Actual decoded frontier length.
+        byte_count: usize,
+        /// Maximum canonical frontier length.
+        max_byte_count: usize,
+    },
+
+    /// A note-commitment frontier was not a canonical legacy tree encoding.
+    #[error("{protocol:?} note-commitment frontier encoding is invalid: {reason}")]
+    InvalidCommitmentTreeFrontierEncoding {
+        /// Shielded protocol whose frontier was invalid.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Encoding invariant that was violated.
+        reason: &'static str,
+    },
+
+    /// A decoded note-commitment frontier cannot be represented by Zinder.
+    #[error("{protocol:?} note-commitment tree size {tree_size} exceeds u32")]
+    CommitmentTreeSizeOutOfRange {
+        /// Shielded protocol whose tree was too large.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Decoded tree size.
+        tree_size: u64,
+    },
+
+    /// A note-commitment frontier did not match its advertised final root.
+    #[error("{protocol:?} note-commitment frontier does not match finalRoot")]
+    CommitmentTreeFrontierRootMismatch {
+        /// Shielded protocol whose root did not match.
+        protocol: zinder_core::ShieldedProtocol,
+    },
+
+    /// A pool's frontier presence disagreed with its activation height.
+    #[error("{protocol:?} note-commitment frontier activation mismatch at {height:?}: {reason}")]
+    CommitmentTreeFrontierActivationMismatch {
+        /// Shielded protocol whose presence was invalid.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Checkpoint height being validated.
+        height: BlockHeight,
+        /// Presence invariant that was violated.
+        reason: &'static str,
+    },
+
     /// Raw block bytes did not contain a valid serialized Zcash block header.
     ///
     /// Prefer this variant when bytes decoded from hex successfully but the
@@ -436,6 +504,13 @@ impl SourceError {
             | Self::MalformedFinalNoteCommitmentRoot { .. }
             | Self::InvalidFinalNoteCommitmentRootHex { .. }
             | Self::InvalidFinalNoteCommitmentRootLength { .. }
+            | Self::MalformedCommitmentTreeFrontier { .. }
+            | Self::InvalidCommitmentTreeFrontierHex { .. }
+            | Self::CommitmentTreeFrontierTooLarge { .. }
+            | Self::InvalidCommitmentTreeFrontierEncoding { .. }
+            | Self::CommitmentTreeSizeOutOfRange { .. }
+            | Self::CommitmentTreeFrontierRootMismatch { .. }
+            | Self::CommitmentTreeFrontierActivationMismatch { .. }
             | Self::RawBlockParseFailed { .. }
             | Self::RawTransactionParseFailed { .. }
             | Self::TransactionComponentIndexOverflow { .. }

@@ -1,39 +1,36 @@
 //! Node-observed chain checkpoint values.
 //!
-//! A [`SourceChainCheckpoint`] records the minimum data needed to seed a
-//! Zinder canonical chain epoch at a non-genesis height: the block hash and
-//! commitment-tree sizes that an [`ingest`-style consumer] needs to produce a
-//! valid [`ChainTipMetadata`] without re-deriving every commitment from
-//! genesis.
+//! A [`SourceChainCheckpoint`] records the minimum data needed to seed note
+//! commitment trees at a non-genesis height: the exact block identity and the
+//! validated frontier of every active shielded pool.
 //!
-//! Zebra's `getblock` (verbosity 1) is the source of truth for these values
-//! today. Future node adapters can populate this struct from any
-//! equivalent observation.
-//!
-//! [`ChainTipMetadata`]: zinder_core::ChainTipMetadata
-//! [`ingest`-style consumer]: https://github.com/gustavovalverde/zinder
+//! Zebra's `z_gettreestate` is the source of truth for these values. Future
+//! node adapters can populate this struct from any equivalent observation.
 
-use zinder_core::{BlockHash, BlockHeight, ChainTipMetadata};
+use zinder_core::{BlockId, ChainTipMetadata, CommitmentTreeFrontiers};
 
 /// One node-observed chain checkpoint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceChainCheckpoint {
-    /// Block height at which this checkpoint was observed.
-    pub height: BlockHeight,
-    /// Canonical block hash at `height`, in internal little-endian byte order.
-    pub hash: BlockHash,
-    /// Commitment-tree sizes after applying the block at `height`.
-    pub tip_metadata: ChainTipMetadata,
+    /// Exact canonical block at which this checkpoint was observed.
+    pub block_id: BlockId,
+    /// Validated frontiers after applying `block_id`.
+    pub frontiers: CommitmentTreeFrontiers,
 }
 
 impl SourceChainCheckpoint {
     /// Creates a checkpoint observation.
     #[must_use]
-    pub const fn new(height: BlockHeight, hash: BlockHash, tip_metadata: ChainTipMetadata) -> Self {
+    pub const fn new(block_id: BlockId, frontiers: CommitmentTreeFrontiers) -> Self {
         Self {
-            height,
-            hash,
-            tip_metadata,
+            block_id,
+            frontiers,
         }
+    }
+
+    /// Derives the commitment-tree sizes represented by this checkpoint.
+    #[must_use]
+    pub fn tip_metadata(&self) -> ChainTipMetadata {
+        self.frontiers.tip_metadata()
     }
 }

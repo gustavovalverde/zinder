@@ -13,7 +13,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
-use zinder_core::{BlockHeight, BlockId, NetworkUpgradeActivations};
+use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
     DeriveStatusReader, HistoricalWorkGate, IngestControlGrpcAdapter, IngestError, IngestModifiers,
@@ -458,7 +458,10 @@ async fn run_ingest(
         return Err(error);
     }
     if let Some(checkpoint_height) = command_config.loop_config.modifiers.checkpoint_height {
-        let checkpoint = match source.fetch_chain_checkpoint(checkpoint_height).await {
+        let checkpoint = match source
+            .fetch_chain_checkpoint(checkpoint_height, &network_upgrade_activations)
+            .await
+        {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 let wrapped: IngestConfigError = IngestError::from(error).into();
@@ -467,13 +470,14 @@ async fn run_ingest(
                 return Err(wrapped);
             }
         };
+        let checkpoint_tip_metadata = checkpoint.tip_metadata();
         tracing::info!(
             target: "zinder::ingest",
             event = "ingest_checkpoint_resolved",
-            checkpoint_height = checkpoint.height.value(),
-            sapling_commitment_tree_size = checkpoint.tip_metadata.sapling_commitment_tree_size,
-            orchard_commitment_tree_size = checkpoint.tip_metadata.orchard_commitment_tree_size,
-            ironwood_commitment_tree_size = checkpoint.tip_metadata.ironwood_commitment_tree_size,
+            checkpoint_height = checkpoint.block_id.height.value(),
+            sapling_commitment_tree_size = checkpoint_tip_metadata.sapling_commitment_tree_size,
+            orchard_commitment_tree_size = checkpoint_tip_metadata.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size = checkpoint_tip_metadata.ironwood_commitment_tree_size,
             "fetched bootstrap checkpoint from upstream node"
         );
         command_config.loop_config.modifiers.checkpoint = Some(checkpoint);
@@ -529,7 +533,7 @@ async fn run_ingest(
         .modifiers
         .checkpoint
         .as_ref()
-        .map(|checkpoint| BlockId::new(checkpoint.height, checkpoint.hash));
+        .map(|checkpoint| checkpoint.block_id);
     if let Err(error) = store.reconcile_canonical_history_bounds(configured_checkpoint) {
         let wrapped: IngestConfigError = IngestError::from(error).into();
         open_storage_phase.fail(&wrapped);
@@ -899,7 +903,7 @@ fn resolve_wallet_serving_modifiers(
         target_height: command_config.loop_config.modifiers.target_height,
         checkpoint_height: Some(checkpoint_height),
         allow_near_tip_finalize: command_config.loop_config.modifiers.allow_near_tip_finalize,
-        checkpoint: command_config.loop_config.modifiers.checkpoint,
+        checkpoint: command_config.loop_config.modifiers.checkpoint.clone(),
     };
     tracing::info!(
         target: "zinder::ingest",

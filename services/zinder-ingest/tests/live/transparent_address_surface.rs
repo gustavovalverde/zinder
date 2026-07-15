@@ -188,10 +188,13 @@ async fn bulk_catchup_and_sample_tip_coinbase(
         Arc::clone(&activations),
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(checkpoint_height, &activations)
+        .await?;
+    let checkpoint_tip_metadata = checkpoint.tip_metadata();
     let subtree_root_start_indices = SubtreeRootStartIndices {
-        sapling: checkpoint.tip_metadata.sapling_commitment_tree_size / SUBTREE_LEAF_COUNT,
-        orchard: checkpoint.tip_metadata.orchard_commitment_tree_size / SUBTREE_LEAF_COUNT,
+        sapling: checkpoint_tip_metadata.sapling_commitment_tree_size / SUBTREE_LEAF_COUNT,
+        orchard: checkpoint_tip_metadata.orchard_commitment_tree_size / SUBTREE_LEAF_COUNT,
     };
     bulk_catchup_config.checkpoint = Some(checkpoint);
     run_bulk_catchup(&bulk_catchup_config, &source)

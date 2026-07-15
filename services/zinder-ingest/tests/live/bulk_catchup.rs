@@ -125,7 +125,9 @@ async fn bulk_catchup_from_checkpoint() -> Result<()> {
         Arc::clone(&activations),
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(checkpoint_height, &activations)
+        .await?;
     bulk_catchup_config.checkpoint = Some(checkpoint);
 
     let commit_outcome = run_bulk_catchup(&bulk_catchup_config, &source)
@@ -217,9 +219,12 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
         Arc::clone(&activations),
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
-    let checkpoint_sapling_size = checkpoint.tip_metadata.sapling_commitment_tree_size;
-    let checkpoint_orchard_size = checkpoint.tip_metadata.orchard_commitment_tree_size;
+    let checkpoint = source
+        .fetch_chain_checkpoint(checkpoint_height, &activations)
+        .await?;
+    let checkpoint_tip_metadata = checkpoint.tip_metadata();
+    let checkpoint_sapling_size = checkpoint_tip_metadata.sapling_commitment_tree_size;
+    let checkpoint_orchard_size = checkpoint_tip_metadata.orchard_commitment_tree_size;
     bulk_catchup_config.checkpoint = Some(checkpoint);
 
     let bulk_catchup_started_at = std::time::Instant::now();
