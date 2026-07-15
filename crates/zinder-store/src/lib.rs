@@ -9,6 +9,7 @@ mod block_artifact;
 mod block_hash_index;
 mod block_replay;
 mod block_value_pool_balances;
+mod canonical_store;
 mod chain_epoch;
 mod chain_epoch_reader;
 mod chain_event;
@@ -40,6 +41,11 @@ pub use block_artifact::{
 pub use block_hash_index::BlockHashLookup;
 pub use block_replay::{BlockReplayBatchRequest, BlockReplayStore, MAX_BLOCK_REPLAY_BATCH_BLOCKS};
 pub use block_value_pool_balances::BlockValuePoolBalancesStore;
+pub use canonical_store::{
+    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildState,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    RocksDbCanonicalStore,
+};
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;
 pub use chain_event::{

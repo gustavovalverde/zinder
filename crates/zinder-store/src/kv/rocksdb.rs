@@ -145,6 +145,12 @@ pub enum RocksDbOpenRole<'path> {
         /// Primary store path.
         path: &'path Path,
     },
+    /// Primary writer opening a path whose identity and exact column-family
+    /// contract were already admitted.
+    ExistingPrimary {
+        /// Previously admitted primary store path.
+        path: &'path Path,
+    },
     /// Secondary reader opening a writer-owned primary path plus its own
     /// reader-local metadata path.
     Secondary {
@@ -159,24 +165,25 @@ impl<'path> RocksDbOpenRole<'path> {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Primary { .. } => "primary",
+            Self::ExistingPrimary { .. } => "existing_primary",
             Self::Secondary { .. } => "secondary",
         }
     }
 
     const fn store_path(self) -> &'path Path {
         match self {
-            Self::Primary { path } => path,
+            Self::Primary { path } | Self::ExistingPrimary { path } => path,
             Self::Secondary { primary_path, .. } => primary_path,
         }
     }
 
     const fn is_primary(self) -> bool {
-        matches!(self, Self::Primary { .. })
+        matches!(self, Self::Primary { .. } | Self::ExistingPrimary { .. })
     }
 
     const fn open_posture(self) -> RocksDbOpenPosture {
         match self {
-            Self::Primary { .. } => RocksDbOpenPosture::Primary,
+            Self::Primary { .. } | Self::ExistingPrimary { .. } => RocksDbOpenPosture::Primary,
             Self::Secondary { .. } => RocksDbOpenPosture::Secondary,
         }
     }
@@ -208,6 +215,9 @@ pub fn open_bounded_rocksdb(
     rocksdb_resource_budget: RocksDbResourceBudget,
     build_column_families: impl Fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
 ) -> Result<BoundedRocksDbOpen, rust_rocksdb::Error> {
+    if let RocksDbOpenRole::ExistingPrimary { path } = role {
+        DB::list_cf(&Options::default(), path)?;
+    }
     let block_cache = build_block_cache(rocksdb_resource_budget.block_cache_bytes);
     let write_buffer_manager =
         build_write_buffer_manager(rocksdb_resource_budget.memtable_budget_bytes);
@@ -275,6 +285,12 @@ where
         RocksDbOpenRole::Primary { .. } => build_primary_db_options(
             open_attempt.rocksdb_resource_budget,
             open_attempt.block_cache,
+            true,
+        ),
+        RocksDbOpenRole::ExistingPrimary { .. } => build_primary_db_options(
+            open_attempt.rocksdb_resource_budget,
+            open_attempt.block_cache,
+            false,
         ),
         RocksDbOpenRole::Secondary { .. } => build_secondary_db_options(
             open_attempt.rocksdb_resource_budget,
@@ -302,7 +318,7 @@ where
     );
 
     let db = match open_attempt.role {
-        RocksDbOpenRole::Primary { path } => {
+        RocksDbOpenRole::Primary { path } | RocksDbOpenRole::ExistingPrimary { path } => {
             DB::open_cf_descriptors(&db_options, path, column_families)
         }
         RocksDbOpenRole::Secondary {
@@ -1132,10 +1148,11 @@ fn apply_statistics_level(db_options: &mut Options, level: RocksDbStatisticsLeve
 fn build_primary_db_options(
     rocksdb_resource_budget: RocksDbResourceBudget,
     cache: &Cache,
+    create_missing: bool,
 ) -> Options {
     let mut db_options = Options::default();
-    db_options.create_if_missing(true);
-    db_options.create_missing_column_families(true);
+    db_options.create_if_missing(create_missing);
+    db_options.create_missing_column_families(create_missing);
     apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_total_wal_size(rocksdb_resource_budget.max_wal_bytes);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
@@ -2126,12 +2143,21 @@ mod tests {
         let primary_open = RocksDbOpenRole::Primary {
             path: Path::new("primary"),
         };
+        let existing_primary_open = RocksDbOpenRole::ExistingPrimary {
+            path: Path::new("primary"),
+        };
         let secondary_open = RocksDbOpenRole::Secondary {
             primary_path: Path::new("primary"),
             secondary_path: Path::new("secondary"),
         };
         assert_eq!(
             primary_open
+                .open_posture()
+                .effective_max_background_jobs(budget),
+            Some(6)
+        );
+        assert_eq!(
+            existing_primary_open
                 .open_posture()
                 .effective_max_background_jobs(budget),
             Some(6)
@@ -2155,6 +2181,20 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn existing_primary_never_creates_a_missing_store() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let path = temporary.path().join("missing-store");
+        let result = open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary { path: &path },
+            RocksDbResourceBudget::for_local_tests(),
+            |_, _| Vec::new(),
+        );
+        assert!(result.is_err());
+        assert!(!path.exists());
+        Ok(())
     }
 
     #[test]

@@ -188,9 +188,11 @@ The target canonical hot schema is:
 
 | Fact | Key | Purpose |
 | --- | --- | --- |
-| `store_control` | singleton | Canonical identity, schema version, network, build state, visible epoch, tip, and ordered digest |
+| `store_control` | singleton | Canonical identity, schema version, network, workload, history bounds, cursor-authentication key, build state, visible epoch, tip, and ordered digest |
 | `block_header` | `height` | Small direct-read block identity, parent, time, header fields, and size |
+| `block_hash_index` | `block_hash` | Direct hash-to-height resolution without scanning or expanding replay facts |
 | `block_replay` | `height` | Ordered semantic block and transaction facts needed by every projection; excludes retention-dependent raw blobs |
+| `block_value_pool_balances` | `height` | Authoritative per-pool chain-value snapshots required to rebuild explorer value-pool history |
 | `transaction_location` | `transaction_id` | Direct transaction height, index, and block identity without expanding transaction facts |
 | `compact_block` | `height` | Encoded shielded wallet-scan payload |
 | `tree_state` | `height` | Wallet scan checkpoint and commitment-tree sizes |
