@@ -188,7 +188,7 @@ The target canonical hot schema is:
 
 | Fact | Key | Purpose |
 | --- | --- | --- |
-| `store_control` | singleton | Canonical identity, schema version, network, workload, history bounds, cursor-authentication key, build state, visible epoch, tip, and ordered digest |
+| `store_control` | singleton | Canonical identity, schema version, network, workload, exact history predecessor, fixed build tip, cursor-authentication key, build state, visible epoch, and ordered digest |
 | `block_header` | `height` | Small direct-read block identity, parent, time, header fields, and size |
 | `block_hash_index` | `block_hash` | Direct hash-to-height resolution without scanning or expanding replay facts |
 | `block_replay` | `height` | Ordered semantic block and transaction facts needed by every projection; excludes retention-dependent raw blobs |
@@ -210,6 +210,27 @@ facts, intrinsic-balance rows, block transaction indexes, transparent output
 indexes, spend facts, and their repair and retention state. Address state and
 analytics are projections. Raw rows are written only for the selected workload
 and its explicitly advertised capabilities.
+
+Fresh construction has a separate lifecycle type from serving. A
+`RocksDbCanonicalBuilder` owns only a new `BUILDING` path; it cannot reopen or
+repair an existing path. `RocksDbCanonicalStore` admits only a fully validated
+`READY` path. Before any data family is created, `store_control` fixes the
+history predecessor, the first retained height, and the exact build-tip block
+identity. Complete-history builds persist the height-zero block hash as their
+predecessor, derived from the selected `Network`; checkpointed builds persist
+the selected checkpoint and network in one immutable build plan. This anchors
+the retained chain and prevents source exhaustion from turning a contiguous
+prefix into an apparently complete build.
+
+Canonical replay construction accepts a fallible ordered source stream. It
+validates the first block before opening staging, rotates bounded sorted SST
+files, and passes every file to one atomic RocksDB ingestion call. A complete
+cache-bypassing readback then decodes the persisted rows, validates version-1
+replay and digest contracts, height keys, parent linkage, the fixed tip, and the
+ordered sequence digest. SST paths and family-local evidence remain private.
+Any source error, leftover staging directory, populated BUILDING family, or
+post-ingestion mismatch requires deletion of the incomplete build; version 1
+does not define resume, adoption, or repair semantics.
 
 The no-data-loss rule is strict: data may move out of canonical only after the
 version-1 replay contract can reproduce it. The current semantic aggregate does

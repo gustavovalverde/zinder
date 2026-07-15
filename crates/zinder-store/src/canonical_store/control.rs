@@ -5,8 +5,9 @@ use zinder_core::{
 };
 
 use super::{
-    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildState,
-    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildPlan,
+    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload,
 };
 
 const BUILDING_STATE: u8 = 1;
@@ -16,12 +17,14 @@ const CHECKPOINTED_HISTORY: u8 = 1;
 const WALLET_WORKLOAD: u8 = 1;
 const EXPLORER_WORKLOAD: u8 = 2;
 const HISTORY_FIELDS_LENGTH: usize = 1 + 4 + 32;
+const BUILD_TIP_FIELDS_LENGTH: usize = 4 + 32;
 const READY_FIELDS_LENGTH: usize = 4 + 32 + 4 + 32 + 8 + 8 + 2 + 4 + 2 + 32 + 8;
 const STORE_CONTROL_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + 2
     + 4
     + 1
     + HISTORY_FIELDS_LENGTH
+    + BUILD_TIP_FIELDS_LENGTH
     + 32
     + 1
     + READY_FIELDS_LENGTH;
@@ -30,30 +33,35 @@ const STORE_CONTROL_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
 pub(super) struct DecodedStoreControl {
     pub(super) network: Network,
     pub(super) workload: CanonicalStoreWorkload,
-    pub(super) history_bounds: CanonicalHistoryBounds,
+    pub(super) build_plan: CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) build_state: CanonicalStoreBuildState,
 }
 
 pub(super) fn encode_building_store_control(
-    network: Network,
     workload: CanonicalStoreWorkload,
-    history_bounds: CanonicalHistoryBounds,
+    build_plan: CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
 ) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(STORE_CONTROL_LENGTH);
     encoded.extend_from_slice(CANONICAL_STORE_IDENTITY.as_bytes());
     encoded.extend_from_slice(&CANONICAL_STORE_SCHEMA_VERSION.to_le_bytes());
-    encoded.extend_from_slice(&network.id().to_le_bytes());
+    encoded.extend_from_slice(&build_plan.network().id().to_le_bytes());
     encoded.push(match workload {
         CanonicalStoreWorkload::Wallet => WALLET_WORKLOAD,
         CanonicalStoreWorkload::Explorer => EXPLORER_WORKLOAD,
     });
-    match history_bounds.preceding_checkpoint() {
+    match build_plan.history_bounds().preceding_checkpoint() {
         None => {
             encoded.push(COMPLETE_HISTORY);
-            encoded.extend_from_slice(&0_u32.to_le_bytes());
-            encoded.extend_from_slice(&[0; 32]);
+            encoded.extend_from_slice(
+                &build_plan
+                    .history_predecessor()
+                    .height
+                    .value()
+                    .to_le_bytes(),
+            );
+            encoded.extend_from_slice(&build_plan.history_predecessor().hash.as_bytes());
         }
         Some(checkpoint) => {
             encoded.push(CHECKPOINTED_HISTORY);
@@ -61,6 +69,8 @@ pub(super) fn encode_building_store_control(
             encoded.extend_from_slice(&checkpoint.hash.as_bytes());
         }
     }
+    encoded.extend_from_slice(&build_plan.build_tip().height.value().to_le_bytes());
+    encoded.extend_from_slice(&build_plan.build_tip().hash.as_bytes());
     encoded.extend_from_slice(&cursor_auth_key);
     encoded.push(BUILDING_STATE);
     encoded.resize(STORE_CONTROL_LENGTH, 0);
@@ -105,16 +115,27 @@ pub(super) fn decode_store_control(
             ));
         }
     };
-    let history_bounds = decode_history_bounds(&mut decoder)?;
+    let (history_bounds, history_predecessor) = decode_history_bounds(&mut decoder)?;
+    let build_tip = BlockId::new(
+        BlockHeight::new(decoder.read_u32("build tip height")?),
+        BlockHash::from_bytes(decoder.read_array::<32>("build tip hash")?),
+    );
+    let build_plan = CanonicalStoreBuildPlan::from_parts(
+        network,
+        history_bounds,
+        history_predecessor,
+        build_tip,
+    )
+    .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
     let cursor_auth_key = decoder.read_array::<32>("cursor authentication key")?;
     let build_state = match decoder.read_u8("build state")? {
         BUILDING_STATE => {
             decoder.reject_nonzero_building_fields()?;
             CanonicalStoreBuildState::Building
         }
-        READY_STATE => {
-            CanonicalStoreBuildState::Ready(decoder.decode_ready_evidence(history_bounds)?)
-        }
+        READY_STATE => CanonicalStoreBuildState::Ready(
+            decoder.decode_ready_evidence(history_bounds, build_tip)?,
+        ),
         state => {
             return Err(CanonicalStoreError::admission(
                 path,
@@ -126,7 +147,7 @@ pub(super) fn decode_store_control(
     Ok(DecodedStoreControl {
         network,
         workload,
-        history_bounds,
+        build_plan,
         cursor_auth_key,
         build_state,
     })
@@ -134,23 +155,25 @@ pub(super) fn decode_store_control(
 
 fn decode_history_bounds(
     decoder: &mut Decoder<'_>,
-) -> Result<CanonicalHistoryBounds, CanonicalStoreError> {
+) -> Result<(CanonicalHistoryBounds, BlockId), CanonicalStoreError> {
     let kind = decoder.read_u8("history kind")?;
-    let checkpoint_height = decoder.read_u32("history checkpoint height")?;
-    let checkpoint_hash = decoder.read_array::<32>("history checkpoint hash")?;
+    let predecessor_height = decoder.read_u32("history predecessor height")?;
+    let predecessor_hash = decoder.read_array::<32>("history predecessor hash")?;
+    let history_predecessor = BlockId::new(
+        BlockHeight::new(predecessor_height),
+        BlockHash::from_bytes(predecessor_hash),
+    );
     match kind {
-        COMPLETE_HISTORY if checkpoint_height == 0 && checkpoint_hash == [0; 32] => {
-            Ok(CanonicalHistoryBounds::complete())
+        COMPLETE_HISTORY if predecessor_height == 0 => {
+            Ok((CanonicalHistoryBounds::complete(), history_predecessor))
         }
         COMPLETE_HISTORY => Err(CanonicalStoreError::admission(
             decoder.path,
-            "complete history control contains checkpoint data",
+            "complete history predecessor must be the height-zero block",
         )),
-        CHECKPOINTED_HISTORY => CanonicalHistoryBounds::checkpointed(BlockId::new(
-            BlockHeight::new(checkpoint_height),
-            BlockHash::from_bytes(checkpoint_hash),
-        ))
-        .map_err(|source| CanonicalStoreError::admission(decoder.path, source.to_string())),
+        CHECKPOINTED_HISTORY => CanonicalHistoryBounds::checkpointed(history_predecessor)
+            .map(|history_bounds| (history_bounds, history_predecessor))
+            .map_err(|source| CanonicalStoreError::admission(decoder.path, source.to_string())),
         _ => Err(CanonicalStoreError::admission(
             decoder.path,
             format!("store control contains unknown history kind {kind}"),
@@ -176,6 +199,7 @@ impl<'encoded> Decoder<'encoded> {
     fn decode_ready_evidence(
         &mut self,
         history_bounds: CanonicalHistoryBounds,
+        build_tip: BlockId,
     ) -> Result<CanonicalStoreReadyEvidence, CanonicalStoreError> {
         let first_height = self.read_u32("first height")?;
         let first_hash = self.read_array::<32>("first hash")?;
@@ -201,6 +225,8 @@ impl<'encoded> Decoder<'encoded> {
             .map(u64::from)
             .and_then(|height_span| height_span.checked_add(1));
         if first_height != history_bounds.first_available_height().value()
+            || tip_height != build_tip.height.value()
+            || tip_hash != build_tip.hash.as_bytes()
             || visible_epoch == 0
             || expected_block_count != Some(block_count)
         {
@@ -324,9 +350,8 @@ mod tests {
                 CanonicalStoreWorkload::Explorer,
             ] {
                 let encoded = encode_building_store_control(
-                    network,
                     workload,
-                    CanonicalHistoryBounds::complete(),
+                    complete_build_plan(network),
                     CURSOR_AUTH_KEY,
                 );
                 assert_eq!(
@@ -334,7 +359,7 @@ mod tests {
                     DecodedStoreControl {
                         network,
                         workload,
-                        history_bounds: CanonicalHistoryBounds::complete(),
+                        build_plan: complete_build_plan(network),
                         cursor_auth_key: CURSOR_AUTH_KEY,
                         build_state: CanonicalStoreBuildState::Building,
                     }
@@ -345,13 +370,14 @@ mod tests {
         let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
         let history_bounds = CanonicalHistoryBounds::checkpointed(checkpoint)?;
         let encoded = encode_building_store_control(
-            Network::ZcashTestnet,
             CanonicalStoreWorkload::Wallet,
-            history_bounds,
+            checkpointed_build_plan(checkpoint, history_bounds),
             CURSOR_AUTH_KEY,
         );
         assert_eq!(
-            decode_store_control(Path::new("canonical"), &encoded)?.history_bounds,
+            decode_store_control(Path::new("canonical"), &encoded)?
+                .build_plan
+                .history_bounds(),
             history_bounds
         );
         Ok(())
@@ -366,16 +392,21 @@ mod tests {
         let decoded_building = decode_store_control(
             Path::new("canonical"),
             &encode_building_store_control(
-                Network::ZcashTestnet,
                 CanonicalStoreWorkload::Explorer,
-                CanonicalHistoryBounds::complete(),
+                complete_build_plan(Network::ZcashTestnet),
                 CURSOR_AUTH_KEY,
             ),
         )?;
         assert_ne!(decoded_building, decoded_ready);
 
-        let ready_fields =
-            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + 1 + HISTORY_FIELDS_LENGTH + 32 + 1;
+        let ready_fields = CANONICAL_STORE_IDENTITY.len()
+            + 2
+            + 4
+            + 1
+            + HISTORY_FIELDS_LENGTH
+            + BUILD_TIP_FIELDS_LENGTH
+            + 32
+            + 1;
         let visible_epoch = ready_fields + 4 + 32 + 4 + 32;
         let mut changed_epoch = encoded.clone();
         changed_epoch[visible_epoch..visible_epoch + 8].copy_from_slice(&2_u64.to_le_bytes());
@@ -414,16 +445,16 @@ mod tests {
     #[test]
     fn malformed_control_variants_fail_closed() -> Result<(), CanonicalStoreError> {
         let base = encode_building_store_control(
-            Network::ZcashTestnet,
             CanonicalStoreWorkload::Explorer,
-            CanonicalHistoryBounds::complete(),
+            complete_build_plan(Network::ZcashTestnet),
             CURSOR_AUTH_KEY,
         );
         let identity_end = CANONICAL_STORE_IDENTITY.len();
         let network_start = identity_end + 2;
         let workload_offset = network_start + 4;
         let history_kind = workload_offset + 1;
-        let cursor_auth_key = history_kind + HISTORY_FIELDS_LENGTH;
+        let build_tip = history_kind + HISTORY_FIELDS_LENGTH;
+        let cursor_auth_key = build_tip + BUILD_TIP_FIELDS_LENGTH;
         let state_offset = cursor_auth_key + 32;
         let ready_fields_start = state_offset + 1;
         let cases = [
@@ -436,6 +467,12 @@ mod tests {
                 let mut encoded = base.clone();
                 encoded[network_start..network_start + 4].copy_from_slice(&99_u32.to_le_bytes());
                 (encoded, "unknown network")
+            },
+            {
+                let mut encoded = base.clone();
+                encoded[network_start..network_start + 4]
+                    .copy_from_slice(&Network::ZcashMainnet.id().to_le_bytes());
+                (encoded, "history predecessor")
             },
             {
                 let mut encoded = base.clone();
@@ -488,7 +525,9 @@ mod tests {
         encoded.push(EXPLORER_WORKLOAD);
         encoded.push(COMPLETE_HISTORY);
         encoded.extend_from_slice(&0_u32.to_le_bytes());
-        encoded.extend_from_slice(&[0; 32]);
+        encoded.extend_from_slice(&Network::ZcashTestnet.genesis_hash().as_bytes());
+        encoded.extend_from_slice(&2_u32.to_le_bytes());
+        encoded.extend_from_slice(&[2; 32]);
         encoded.extend_from_slice(&CURSOR_AUTH_KEY);
         encoded.push(READY_STATE);
         encoded.extend_from_slice(&1_u32.to_le_bytes());
@@ -514,7 +553,7 @@ mod tests {
         DecodedStoreControl {
             network: Network::ZcashTestnet,
             workload: CanonicalStoreWorkload::Explorer,
-            history_bounds: CanonicalHistoryBounds::complete(),
+            build_plan: complete_build_plan(Network::ZcashTestnet),
             cursor_auth_key: CURSOR_AUTH_KEY,
             build_state: CanonicalStoreBuildState::Ready(CanonicalStoreReadyEvidence {
                 first_height: BlockHeight::new(1),
@@ -529,6 +568,27 @@ mod tests {
                 sequence_digest: [3; 32],
                 logical_fact_bytes: 1,
             }),
+        }
+    }
+
+    fn complete_build_plan(network: Network) -> CanonicalStoreBuildPlan {
+        CanonicalStoreBuildPlan {
+            network,
+            history_bounds: CanonicalHistoryBounds::complete(),
+            history_predecessor: BlockId::new(BlockHeight::new(0), network.genesis_hash()),
+            build_tip: BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+        }
+    }
+
+    fn checkpointed_build_plan(
+        checkpoint: BlockId,
+        history_bounds: CanonicalHistoryBounds,
+    ) -> CanonicalStoreBuildPlan {
+        CanonicalStoreBuildPlan {
+            network: Network::ZcashTestnet,
+            history_bounds,
+            history_predecessor: checkpoint,
+            build_tip: BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
         }
     }
 }

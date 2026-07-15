@@ -12,14 +12,15 @@ use crate::{
 };
 
 use super::{
-    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload,
+    block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     control::{DecodedStoreControl, decode_store_control, encode_building_store_control},
 };
 
-const STORE_CONTROL_KEY: &[u8] = b"store_control";
+pub(super) const STORE_CONTROL_KEY: &[u8] = b"store_control";
 const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
 const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
-const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
 const BLOCK_VALUE_POOL_BALANCES_COLUMN_FAMILY: &str = "block_value_pool_balances";
 const TRANSACTION_LOCATION_COLUMN_FAMILY: &str = "transaction_location";
 const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
@@ -32,7 +33,7 @@ const DISPLACED_BLOCK_FACTS_COLUMN_FAMILY: &str = "displaced_block_facts";
 const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
 const TRANSACTION_BLOB_COLUMN_FAMILY: &str = "transaction_blob";
 
-const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 14] = [
+pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 14] = [
     BLOCK_HEADER_COLUMN_FAMILY,
     BLOCK_HASH_INDEX_COLUMN_FAMILY,
     BLOCK_REPLAY_COLUMN_FAMILY,
@@ -49,64 +50,26 @@ const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 14] = [
     TRANSACTION_BLOB_COLUMN_FAMILY,
 ];
 
-/// One admitted, clean version-1 `RocksDB` canonical store.
+/// One admitted READY canonical version-1 `RocksDB` store.
 ///
-/// This type currently owns layout creation and admission. Bulk construction
-/// and live commits will be added against these already-fixed data families;
-/// the diagnostic benchmark candidate is intentionally not reused here.
+/// Construction is owned exclusively by [`super::RocksDbCanonicalBuilder`].
+/// This serving type cannot represent or reopen an unpublished BUILDING store.
 pub struct RocksDbCanonicalStore {
     bounded_open: BoundedRocksDbOpen,
     network: Network,
     workload: CanonicalStoreWorkload,
     history_bounds: CanonicalHistoryBounds,
     _cursor_auth_key: [u8; 32],
-    build_state: CanonicalStoreBuildState,
+    ready_evidence: CanonicalStoreReadyEvidence,
 }
 
 impl RocksDbCanonicalStore {
-    /// Creates a new version-1 canonical store at a path that does not exist.
-    ///
-    /// Existing paths are refused before `RocksDB` is opened. This builder
-    /// never adopts, deletes, migrates, or repairs another store layout.
-    pub fn create_fresh(
-        path: impl AsRef<Path>,
-        network: Network,
-        workload: CanonicalStoreWorkload,
-        history_bounds: CanonicalHistoryBounds,
-        resource_budget: RocksDbResourceBudget,
-    ) -> Result<Self, CanonicalStoreError> {
-        let path = path.as_ref();
-        validate_resource_budget(resource_budget)?;
-        let mut cursor_auth_key = [0; 32];
-        getrandom::fill(&mut cursor_auth_key)
-            .map_err(|source| CanonicalStoreError::EntropyUnavailable { source })?;
-        create_fresh_directory(path)?;
-        initialize_store_identity(path, network, workload, history_bounds, cursor_auth_key)?;
-        let bounded_open = open_bounded_rocksdb(
-            RocksDbOpenRole::Primary { path },
-            resource_budget,
-            canonical_column_family_descriptors,
-        )
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "create",
-            source,
-        })?;
-        Ok(Self {
-            bounded_open,
-            network,
-            workload,
-            history_bounds,
-            _cursor_auth_key: cursor_auth_key,
-            build_state: CanonicalStoreBuildState::Building,
-        })
-    }
-
-    /// Reopens an existing version-1 canonical store after exact admission.
+    /// Opens an existing READY version-1 canonical store after exact admission.
     ///
     /// Admission validates the complete column-family set, singleton control
-    /// key, identity, schema, build-state encoding, and network before opening
-    /// a writer that is forbidden from creating a database or data family.
-    pub fn reopen(
+    /// key, identity, schema, network, workload, source range, and readiness
+    /// evidence before opening a writer that cannot create data families.
+    pub fn open_ready(
         path: impl AsRef<Path>,
         expected_network: Network,
         expected_workload: CanonicalStoreWorkload,
@@ -114,15 +77,20 @@ impl RocksDbCanonicalStore {
     ) -> Result<Self, CanonicalStoreError> {
         let path = path.as_ref();
         validate_resource_budget(resource_budget)?;
+        let store_path = canonical_store_path(path)?;
         let (admitted_database_identity, admitted_control) =
-            admit_existing_store(path, expected_network, expected_workload)?;
+            admit_existing_store(&store_path, expected_network, expected_workload)?;
+        let CanonicalStoreBuildState::Ready(admitted_ready_evidence) = admitted_control.build_state
+        else {
+            return Err(CanonicalStoreError::StoreNotReady { path: store_path });
+        };
         let bounded_open = open_bounded_rocksdb(
-            RocksDbOpenRole::ExistingPrimary { path },
+            RocksDbOpenRole::ExistingPrimary { path: &store_path },
             resource_budget,
             canonical_column_family_descriptors,
         )
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "reopen",
+            operation: "open ready",
             source,
         })?;
         let opened_database_identity = bounded_open.db.get_db_identity().map_err(|source| {
@@ -133,29 +101,39 @@ impl RocksDbCanonicalStore {
         })?;
         if opened_database_identity != admitted_database_identity {
             return Err(CanonicalStoreError::admission(
-                path,
+                &store_path,
                 "database identity changed during admission",
             ));
         }
         let opened_control = validate_open_store_control(
             &bounded_open.db,
-            path,
+            &store_path,
             expected_network,
             expected_workload,
         )?;
         if opened_control != admitted_control {
             return Err(CanonicalStoreError::admission(
-                path,
+                &store_path,
                 "store control changed during admission",
+            ));
+        }
+        let CanonicalStoreBuildState::Ready(opened_ready_evidence) = opened_control.build_state
+        else {
+            return Err(CanonicalStoreError::StoreNotReady { path: store_path });
+        };
+        if opened_ready_evidence != admitted_ready_evidence {
+            return Err(CanonicalStoreError::admission(
+                &store_path,
+                "ready evidence changed during admission",
             ));
         }
         Ok(Self {
             bounded_open,
             network: expected_network,
             workload: expected_workload,
-            history_bounds: opened_control.history_bounds,
+            history_bounds: opened_control.build_plan.history_bounds(),
             _cursor_auth_key: opened_control.cursor_auth_key,
-            build_state: opened_control.build_state,
+            ready_evidence: opened_ready_evidence,
         })
     }
 
@@ -177,10 +155,10 @@ impl RocksDbCanonicalStore {
         self.history_bounds
     }
 
-    /// Returns whether this store is still building or has published evidence.
+    /// Returns the evidence that admitted this store as READY.
     #[must_use]
-    pub const fn build_state(&self) -> CanonicalStoreBuildState {
-        self.build_state
+    pub const fn ready_evidence(&self) -> CanonicalStoreReadyEvidence {
+        self.ready_evidence
     }
 
     /// Returns the filesystem I/O mode selected by the bounded `RocksDB` open.
@@ -190,26 +168,40 @@ impl RocksDbCanonicalStore {
     }
 }
 
-fn canonical_column_family_descriptors(
+pub(super) fn canonical_column_family_descriptors(
     block_cache: &Cache,
     resource_budget: RocksDbResourceBudget,
 ) -> Vec<ColumnFamilyDescriptor> {
     CANONICAL_DATA_COLUMN_FAMILIES
         .into_iter()
         .map(|name| {
-            let mut options = Options::default();
-            options.set_compression_type(DBCompressionType::Snappy);
-            options.set_block_based_table_factory(&build_block_based_table_factory(block_cache));
-            options.set_write_buffer_size(
-                usize::try_from(resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
-            );
-            options.set_max_write_buffer_number(resource_budget.max_write_buffer_count);
-            ColumnFamilyDescriptor::new(name, options)
+            ColumnFamilyDescriptor::new(name, canonical_data_options(block_cache, resource_budget))
         })
         .collect()
 }
 
-fn validate_resource_budget(
+pub(super) fn canonical_data_options(
+    block_cache: &Cache,
+    resource_budget: RocksDbResourceBudget,
+) -> Options {
+    let mut options = Options::default();
+    options.set_compression_type(DBCompressionType::Snappy);
+    options.set_block_based_table_factory(&build_block_based_table_factory(block_cache));
+    options.set_write_buffer_size(
+        usize::try_from(resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
+    );
+    options.set_max_write_buffer_number(resource_budget.max_write_buffer_count);
+    options
+}
+
+pub(super) fn canonical_store_path(path: &Path) -> Result<std::path::PathBuf, CanonicalStoreError> {
+    fs::canonicalize(path).map_err(|source| CanonicalStoreError::PathUnavailable {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+pub(super) fn validate_resource_budget(
     resource_budget: RocksDbResourceBudget,
 ) -> Result<(), CanonicalStoreError> {
     resource_budget
@@ -217,7 +209,7 @@ fn validate_resource_budget(
         .map_err(|reason| CanonicalStoreError::InvalidResourceBudget { reason })
 }
 
-fn create_fresh_directory(path: &Path) -> Result<(), CanonicalStoreError> {
+pub(super) fn create_fresh_directory(path: &Path) -> Result<(), CanonicalStoreError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -240,11 +232,10 @@ fn create_fresh_directory(path: &Path) -> Result<(), CanonicalStoreError> {
     }
 }
 
-fn initialize_store_identity(
+pub(super) fn initialize_store_identity(
     path: &Path,
-    network: Network,
     workload: CanonicalStoreWorkload,
-    history_bounds: CanonicalHistoryBounds,
+    build_plan: super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
 ) -> Result<(), CanonicalStoreError> {
     let mut database_options = Options::default();
@@ -258,7 +249,7 @@ fn initialize_store_identity(
     let mut batch = WriteBatch::default();
     batch.put(
         STORE_CONTROL_KEY,
-        encode_building_store_control(network, workload, history_bounds, cursor_auth_key),
+        encode_building_store_control(workload, build_plan, cursor_auth_key),
     );
     let mut options = WriteOptions::default();
     options.disable_wal(false);
@@ -365,26 +356,30 @@ fn validate_open_store_control(
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+    use zinder_core::{BlockHash, BlockHeight, BlockId};
 
     use super::*;
-    use crate::{CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION};
+    use crate::{
+        CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildPlan,
+        RocksDbCanonicalBuilder,
+    };
 
     #[test]
-    fn exact_version_one_layout_reopens_only_for_its_network()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn building_layout_is_exact_and_not_servable() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let path = temporary.path().join("canonical");
-        let store = RocksDbCanonicalStore::create_fresh(
+        let store = RocksDbCanonicalBuilder::create_fresh(
             &path,
-            Network::ZcashTestnet,
             CanonicalStoreWorkload::Explorer,
-            CanonicalHistoryBounds::complete(),
+            complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(store.network(), Network::ZcashTestnet);
         assert_eq!(store.workload(), CanonicalStoreWorkload::Explorer);
-        assert_eq!(store.history_bounds(), CanonicalHistoryBounds::complete());
-        assert_eq!(store.build_state(), CanonicalStoreBuildState::Building);
+        assert_eq!(
+            store.build_plan().history_bounds(),
+            CanonicalHistoryBounds::complete()
+        );
         drop(store);
 
         let mut observed = DB::list_cf(&Options::default(), &path)?;
@@ -397,17 +392,18 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(observed, expected);
 
-        let reopened = RocksDbCanonicalStore::reopen(
+        let error = RocksDbCanonicalStore::open_ready(
             &path,
             Network::ZcashTestnet,
             CanonicalStoreWorkload::Explorer,
             RocksDbResourceBudget::for_local_tests(),
-        )?;
-        assert_eq!(reopened.network(), Network::ZcashTestnet);
-        drop(reopened);
+        )
+        .err()
+        .ok_or("a BUILDING store must not be servable")?;
+        assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
 
         let control_before = read_control(&path)?;
-        let error = RocksDbCanonicalStore::reopen(
+        let error = RocksDbCanonicalStore::open_ready(
             &path,
             Network::ZcashMainnet,
             CanonicalStoreWorkload::Explorer,
@@ -421,7 +417,7 @@ mod tests {
         ));
         assert_eq!(read_control(&path)?, control_before);
 
-        let error = RocksDbCanonicalStore::reopen(
+        let error = RocksDbCanonicalStore::open_ready(
             &path,
             Network::ZcashTestnet,
             CanonicalStoreWorkload::Wallet,
@@ -449,7 +445,7 @@ mod tests {
         db.put(b"schema_version", 1_u16.to_le_bytes())?;
         drop(db);
 
-        let error = RocksDbCanonicalStore::reopen(
+        let error = RocksDbCanonicalStore::open_ready(
             &path,
             Network::ZcashTestnet,
             CanonicalStoreWorkload::Explorer,
@@ -477,11 +473,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let path = temporary.path().join("wrong-schema-version");
-        let store = RocksDbCanonicalStore::create_fresh(
+        let store = RocksDbCanonicalBuilder::create_fresh(
             &path,
-            Network::ZcashTestnet,
             CanonicalStoreWorkload::Explorer,
-            CanonicalHistoryBounds::complete(),
+            complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         drop(store);
@@ -495,7 +490,7 @@ mod tests {
         db.put(STORE_CONTROL_KEY, &control)?;
         drop(db);
 
-        let error = RocksDbCanonicalStore::reopen(
+        let error = RocksDbCanonicalStore::open_ready(
             &path,
             Network::ZcashTestnet,
             CanonicalStoreWorkload::Explorer,
@@ -509,31 +504,14 @@ mod tests {
     }
 
     #[test]
-    fn builder_refuses_every_existing_path() -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let error = RocksDbCanonicalStore::create_fresh(
-            temporary.path(),
-            Network::ZcashRegtest,
-            CanonicalStoreWorkload::Wallet,
-            CanonicalHistoryBounds::complete(),
-            RocksDbResourceBudget::for_local_tests(),
-        )
-        .err()
-        .ok_or("existing path should be rejected")?;
-        assert!(matches!(error, CanonicalStoreError::PathNotFresh { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn reopen_does_not_recreate_a_missing_required_family() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn ready_open_does_not_recreate_a_missing_required_family()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let path = temporary.path().join("missing-family");
-        let store = RocksDbCanonicalStore::create_fresh(
+        let store = RocksDbCanonicalBuilder::create_fresh(
             &path,
-            Network::ZcashTestnet,
             CanonicalStoreWorkload::Explorer,
-            CanonicalHistoryBounds::complete(),
+            complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         drop(store);
@@ -544,7 +522,7 @@ mod tests {
         drop(db);
         let families_without_transaction_blobs = DB::list_cf(&Options::default(), &path)?;
 
-        let error = RocksDbCanonicalStore::reopen(
+        let error = RocksDbCanonicalStore::open_ready(
             &path,
             Network::ZcashTestnet,
             CanonicalStoreWorkload::Explorer,
@@ -579,5 +557,12 @@ mod tests {
         let db = DB::open_cf_for_read_only(&Options::default(), path, &column_families, false)?;
         db.get(STORE_CONTROL_KEY)?
             .ok_or_else(|| "store control should exist".into())
+    }
+
+    fn complete_build_plan() -> Result<CanonicalStoreBuildPlan, Box<dyn std::error::Error>> {
+        Ok(CanonicalStoreBuildPlan::complete(
+            Network::ZcashTestnet,
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+        )?)
     }
 }

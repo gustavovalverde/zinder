@@ -4,6 +4,8 @@
 //! canonical data plane. It deliberately exposes no generic database adapter
 //! and no compatibility decoder for earlier Zinder stores.
 
+mod block_replay;
+mod builder;
 mod control;
 mod rocksdb;
 
@@ -11,16 +13,149 @@ use std::{io, path::PathBuf};
 
 use thiserror::Error;
 use zinder_core::{
-    BlockHash, BlockHeight, CanonicalBlockFactsDigestVersion,
+    BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
 };
 
+pub use builder::RocksDbCanonicalBuilder;
 pub use rocksdb::RocksDbCanonicalStore;
 
 /// Exact persisted identity of the clean canonical store.
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// Exact physical schema accepted by this canonical store implementation.
 pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
+
+/// Fixed source-chain range for one fresh canonical construction.
+///
+/// The predecessor anchors the first retained block even for complete history,
+/// where it is the network's height-zero block. The fixed tip prevents an
+/// exhausted or failed source stream from publishing a contiguous prefix as a
+/// complete build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalStoreBuildPlan {
+    network: zinder_core::Network,
+    history_bounds: zinder_core::CanonicalHistoryBounds,
+    history_predecessor: BlockId,
+    build_tip: BlockId,
+}
+
+impl CanonicalStoreBuildPlan {
+    /// Builds a plan retaining every non-genesis block through `build_tip`.
+    pub fn complete(
+        network: zinder_core::Network,
+        build_tip: BlockId,
+    ) -> Result<Self, CanonicalStoreBuildPlanError> {
+        Self::from_parts(
+            network,
+            zinder_core::CanonicalHistoryBounds::complete(),
+            BlockId::new(BlockHeight::new(0), network.genesis_hash()),
+            build_tip,
+        )
+    }
+
+    /// Builds a plan retaining blocks immediately after `checkpoint` through `build_tip`.
+    pub fn checkpointed(
+        network: zinder_core::Network,
+        checkpoint: BlockId,
+        build_tip: BlockId,
+    ) -> Result<Self, CanonicalStoreBuildPlanError> {
+        let history_bounds = zinder_core::CanonicalHistoryBounds::checkpointed(checkpoint)
+            .map_err(|_| CanonicalStoreBuildPlanError::CheckpointHasNoSuccessor)?;
+        Self::from_parts(network, history_bounds, checkpoint, build_tip)
+    }
+
+    pub(super) fn from_parts(
+        network: zinder_core::Network,
+        history_bounds: zinder_core::CanonicalHistoryBounds,
+        history_predecessor: BlockId,
+        build_tip: BlockId,
+    ) -> Result<Self, CanonicalStoreBuildPlanError> {
+        match history_bounds.preceding_checkpoint() {
+            None if history_predecessor
+                != BlockId::new(BlockHeight::new(0), network.genesis_hash()) =>
+            {
+                return Err(CanonicalStoreBuildPlanError::InvalidHistoryPredecessor);
+            }
+            Some(checkpoint) if history_predecessor != checkpoint => {
+                return Err(CanonicalStoreBuildPlanError::InvalidHistoryPredecessor);
+            }
+            None | Some(_) => {}
+        }
+        let first_available_height = history_bounds.first_available_height();
+        if build_tip.height.value() < first_available_height.value() {
+            return Err(CanonicalStoreBuildPlanError::BuildTipPrecedesHistory {
+                build_tip: build_tip.height.value(),
+                first_available_height: first_available_height.value(),
+            });
+        }
+        Ok(Self {
+            network,
+            history_bounds,
+            history_predecessor,
+            build_tip,
+        })
+    }
+
+    /// Returns the immutable network for this build.
+    #[must_use]
+    pub const fn network(self) -> zinder_core::Network {
+        self.network
+    }
+
+    /// Returns the durable boundary of intentionally retained history.
+    #[must_use]
+    pub const fn history_bounds(self) -> zinder_core::CanonicalHistoryBounds {
+        self.history_bounds
+    }
+
+    /// Returns the block immediately preceding retained history.
+    #[must_use]
+    pub const fn history_predecessor(self) -> BlockId {
+        self.history_predecessor
+    }
+
+    /// Returns the exact source tip this build must reach.
+    #[must_use]
+    pub const fn build_tip(self) -> BlockId {
+        self.build_tip
+    }
+}
+
+/// Invalid source-chain range for canonical construction.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum CanonicalStoreBuildPlanError {
+    /// The checkpoint cannot have retained history after it.
+    #[error("canonical build checkpoint has no successor height")]
+    CheckpointHasNoSuccessor,
+    /// The predecessor does not match the selected complete or checkpointed history.
+    #[error("canonical build history predecessor does not match its history bounds")]
+    InvalidHistoryPredecessor,
+    /// The target tip is below the first retained height.
+    #[error(
+        "canonical build tip {build_tip} precedes first available height {first_available_height}"
+    )]
+    BuildTipPrecedesHistory {
+        /// Invalid target height.
+        build_tip: u32,
+        /// First retained height required by the history bounds.
+        first_available_height: u32,
+    },
+}
+
+/// Failure while streaming source facts into a fresh canonical build.
+#[derive(Debug, Error)]
+pub enum CanonicalStoreBuildError<SourceError> {
+    /// Upstream fetch or canonical preparation failed before ingestion.
+    #[error("canonical source stream failed")]
+    Source {
+        /// Concrete upstream failure preserved for diagnosis.
+        #[source]
+        source: SourceError,
+    },
+    /// Canonical storage construction failed.
+    #[error(transparent)]
+    Store(#[from] CanonicalStoreError),
+}
 
 /// Closed canonical data workload persisted before any data family is built.
 ///
@@ -101,6 +236,15 @@ pub enum CanonicalStoreError {
         path: PathBuf,
     },
 
+    /// A prior process left the deterministic block-replay staging directory.
+    #[error(
+        "canonical block replay staging path already exists and requires full build cleanup: {path:?}"
+    )]
+    BlockReplayStagingExists {
+        /// Existing staging path preserved without repair or deletion.
+        path: PathBuf,
+    },
+
     /// A filesystem operation failed.
     #[error("canonical store path {path:?} is unavailable")]
     PathUnavailable {
@@ -128,6 +272,13 @@ pub enum CanonicalStoreError {
         reason: String,
     },
 
+    /// A serving store open encountered an unpublished BUILDING store.
+    #[error("canonical store is not READY: {path:?}")]
+    StoreNotReady {
+        /// Exact store path that remains unpublished.
+        path: PathBuf,
+    },
+
     /// A `RocksDB` operation failed after identity admission.
     #[error("canonical store RocksDB {operation} failed")]
     RocksDbOperation {
@@ -137,6 +288,39 @@ pub enum CanonicalStoreError {
         #[source]
         source: rust_rocksdb::Error,
     },
+
+    /// Canonical block replay input is empty, discontinuous, or inconsistent.
+    #[error("canonical block replay sequence is invalid: {reason}")]
+    BlockReplaySequenceInvalid {
+        /// Exact sequence invariant that failed.
+        reason: String,
+    },
+
+    /// A persisted canonical block replay row is malformed or mis-keyed.
+    #[error("canonical block replay at height {height} is invalid: {reason}")]
+    BlockReplayInvalid {
+        /// Height used to address the replay row.
+        height: u32,
+        /// Exact replay invariant that failed.
+        reason: String,
+    },
+
+    /// A persisted replay key is not the exact version-1 ascending height key.
+    #[error("canonical block replay key is invalid: {reason}")]
+    BlockReplayKeyInvalid {
+        /// Exact key-decoding failure.
+        reason: String,
+    },
+
+    /// Block replay rows already exist in a store that has not reached READY.
+    #[error(
+        "canonical block replay is already populated in a BUILDING store; full build cleanup is required"
+    )]
+    BlockReplayAlreadyLoaded,
+
+    /// Persisted replay evidence differs from the sequence prepared for ingestion.
+    #[error("canonical block replay readback does not match the prepared version-1 sequence")]
+    BlockReplayReadbackMismatch,
 }
 
 impl CanonicalStoreError {
@@ -145,5 +329,72 @@ impl CanonicalStoreError {
             path: path.to_path_buf(),
             reason: reason.into(),
         }
+    }
+
+    fn block_replay_sequence(reason: impl Into<String>) -> Self {
+        Self::BlockReplaySequenceInvalid {
+            reason: reason.into(),
+        }
+    }
+
+    fn block_replay_invalid(height: BlockHeight, reason: impl Into<String>) -> Self {
+        Self::BlockReplayInvalid {
+            height: height.value(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_build_plan_preserves_genesis_anchor_and_tip()
+    -> Result<(), CanonicalStoreBuildPlanError> {
+        let network = zinder_core::Network::ZcashTestnet;
+        let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
+        let plan = CanonicalStoreBuildPlan::complete(network, build_tip)?;
+        assert_eq!(plan.network(), network);
+        assert_eq!(
+            plan.history_predecessor(),
+            BlockId::new(BlockHeight::new(0), network.genesis_hash())
+        );
+        assert_eq!(
+            plan.history_bounds().first_available_height(),
+            BlockHeight::new(1)
+        );
+        assert_eq!(plan.build_tip(), build_tip);
+        Ok(())
+    }
+
+    #[test]
+    fn build_plan_rejects_tip_before_retained_history() {
+        let error = CanonicalStoreBuildPlan::complete(
+            zinder_core::Network::ZcashRegtest,
+            BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
+        )
+        .err();
+        assert!(matches!(
+            error,
+            Some(CanonicalStoreBuildPlanError::BuildTipPrecedesHistory {
+                build_tip: 0,
+                first_available_height: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn checkpointed_build_plan_rejects_height_ceiling() {
+        let error = CanonicalStoreBuildPlan::checkpointed(
+            zinder_core::Network::ZcashRegtest,
+            BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
+            BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
+        )
+        .err();
+        assert_eq!(
+            error,
+            Some(CanonicalStoreBuildPlanError::CheckpointHasNoSuccessor)
+        );
     }
 }

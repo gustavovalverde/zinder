@@ -42,9 +42,10 @@ pub use block_hash_index::BlockHashLookup;
 pub use block_replay::{BlockReplayBatchRequest, BlockReplayStore, MAX_BLOCK_REPLAY_BATCH_BLOCKS};
 pub use block_value_pool_balances::BlockValuePoolBalancesStore;
 pub use canonical_store::{
-    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildState,
+    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildError,
+    CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    RocksDbCanonicalStore,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore,
 };
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;

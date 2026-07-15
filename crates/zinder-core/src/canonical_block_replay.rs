@@ -64,10 +64,15 @@ impl TryFrom<u32> for CanonicalBlockReplayFormatVersion {
 /// Canonical bytes and metadata produced by the semantic replay encoder.
 ///
 /// The encoder returns this wrapper so callers can persist the bytes and reuse
-/// the already-computed reference digest without serializing the facts twice.
+/// the already-computed block identity and reference digest without decoding or
+/// serializing the facts again. The block identity is in-memory metadata; it is
+/// not appended to the durable replay bytes or included in the reference digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalBlockReplayEnvelope {
     format_version: CanonicalBlockReplayFormatVersion,
+    block_height: BlockHeight,
+    block_hash: BlockHash,
+    parent_hash: BlockHash,
     reference_digest: CanonicalBlockFactsDigest,
     bytes: Vec<u8>,
 }
@@ -77,6 +82,24 @@ impl CanonicalBlockReplayEnvelope {
     #[must_use]
     pub const fn format_version(&self) -> CanonicalBlockReplayFormatVersion {
         self.format_version
+    }
+
+    /// Returns the source block height without decoding the replay bytes.
+    #[must_use]
+    pub const fn block_height(&self) -> BlockHeight {
+        self.block_height
+    }
+
+    /// Returns the source block hash without decoding the replay bytes.
+    #[must_use]
+    pub const fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
+    /// Returns the source block's parent hash without decoding the replay bytes.
+    #[must_use]
+    pub const fn parent_hash(&self) -> BlockHash {
+        self.parent_hash
     }
 
     /// Returns the backend-neutral digest already committed by the envelope.
@@ -240,6 +263,9 @@ pub fn encode_canonical_block_replay(
     let bytes = replay_envelope_record(format_version, payload, reference_digest).encode_to_vec();
     CanonicalBlockReplayEnvelope {
         format_version,
+        block_height: facts.block_header.height,
+        block_hash: facts.block_header.block_hash,
+        parent_hash: facts.block_header.parent_hash,
         reference_digest,
         bytes,
     }
@@ -1076,6 +1102,26 @@ mod tests {
         );
         assert_eq!(reencoded, encoding);
         assert_eq!(replay.into_facts(), facts);
+        Ok(())
+    }
+
+    #[test]
+    fn encoder_wrapper_exposes_block_identity_without_changing_durable_bytes() -> Result<()> {
+        let facts = rich_block_facts();
+        let encoding = encode_canonical_block_replay(
+            &facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        );
+
+        assert_eq!(encoding.block_height(), facts.block_header.height);
+        assert_eq!(encoding.block_hash(), facts.block_header.block_hash);
+        assert_eq!(encoding.parent_hash(), facts.block_header.parent_hash);
+
+        // The added identity remains wrapper-only metadata: the existing
+        // durable bytes still decode to the complete canonical facts.
+        let replay = decode_canonical_block_replay(encoding.as_bytes())?;
+        assert_eq!(replay.facts(), &facts);
         Ok(())
     }
 
