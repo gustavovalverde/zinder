@@ -39,8 +39,10 @@ fact-first runtime or the `postgres-scale-out` composition.
 | Atomic RocksDB replay persistence | Landed | Replay is committed with the canonical epoch and survives reopen, secondary reads, and corruption checks |
 | Full replay/header verifier | Landed and live-tested | All 4.17 million pinned testnet rows passed replay, header, and continuity checks |
 | PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
-| Clean physical schema identities | Not implemented | Current canonical and projection stores still use their pre-reset layouts and compatibility machinery |
-| Canonical schema without wallet indexes or historical prevout reads | Not implemented | Current canonical commit still expands facts into legacy wallet-shaped rows |
+| Clean physical schema identities | Landed | Canonical, wallet, and explorer contracts use identity-scoped version 1 and refuse prior layouts without migration or adoption |
+| Fresh RocksDB canonical builder | Landed and live-tested | A new `BUILDING` path fixes its workload, source range, checkpoint tree position, and build tip before bounded replay ingestion |
+| Replay-only Zebra tracer | Landed and live-tested | An isolated release container loaded and cache-bypass validated 1,000 fixed testnet blocks in 193 to 458 ms; this proves replay construction, not canonical or wallet readiness |
+| One-pass wallet canonical family load | In implementation | One parse must fan into header, hash index, replay, transaction location, compact block, and transaction blobs before tree construction publishes `READY` |
 | Independent wallet projector and store | Not implemented | Current `zinder-ingest` still owns legacy projection replay |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
 | Complete lifecycle certification | Not run | Fresh mainnet canonical, wallet construction, restore, reorg, and client parity gates remain open |
@@ -188,7 +190,7 @@ The target canonical hot schema is:
 
 | Fact | Key | Purpose |
 | --- | --- | --- |
-| `store_control` | singleton | Canonical identity, schema version, network, workload, exact history predecessor, fixed build tip, cursor-authentication key, build state, visible epoch, and ordered digest |
+| `store_control` | singleton | Canonical identity, schema version, network, workload, exact history predecessor and tree position, fixed build tip, cursor-authentication key, build state, visible epoch, and ordered digest |
 | `block_header` | `height` | Small direct-read block identity, parent, time, header fields, and size |
 | `block_hash_index` | `block_hash` | Direct hash-to-height resolution without scanning or expanding replay facts |
 | `block_replay` | `height` | Ordered semantic block and transaction facts needed by every projection; excludes retention-dependent raw blobs |
@@ -202,7 +204,7 @@ The target canonical hot schema is:
 | `mempool_event` | `event_sequence` | Durable live-mempool transition |
 | `displaced_block_facts` | `(event_sequence, height, block_hash)` | Immutable source facts required to rebuild explorer reorg history after the old branch disappears |
 | `block_blob` | `height` | Compressed consensus block bytes for the `explorer` workload's raw-block capability |
-| `transaction_blob` | `transaction_id` | Raw transaction bytes required by the `wallet` workload's native and lightwalletd transaction APIs |
+| `transaction_blob` | `(height, transaction_index)` | Source-ordered raw transaction bytes; `transaction_location` resolves a transaction ID to this position in 2 point reads |
 
 The store already has one immutable network identity, so version-1 physical
 keys do not repeat the network. `block_replay` replaces normalized transaction
@@ -215,12 +217,13 @@ Fresh construction has a separate lifecycle type from serving. A
 `RocksDbCanonicalBuilder` owns only a new `BUILDING` path; it cannot reopen or
 repair an existing path. `RocksDbCanonicalStore` admits only a fully validated
 `READY` path. Before any data family is created, `store_control` fixes the
-history predecessor, the first retained height, and the exact build-tip block
-identity. Complete-history builds persist the height-zero block hash as their
-predecessor, derived from the selected `Network`; checkpointed builds persist
-the selected checkpoint and network in one immutable build plan. This anchors
-the retained chain and prevents source exhaustion from turning a contiguous
-prefix into an apparently complete build.
+history predecessor, its 3 commitment-tree sizes, the first retained height,
+and the exact build-tip block identity. Complete-history builds persist the
+height-zero block hash with an empty tree position, while checkpointed builds
+persist the selected checkpoint and its node-observed tree sizes. This anchors
+the retained chain, seeds compact-block positioning without reprocessing prior
+history, and prevents source exhaustion from turning a contiguous prefix into
+an apparently complete build.
 
 Canonical replay construction accepts a fallible ordered source stream. It
 validates the first block before opening staging, rotates bounded sorted SST
@@ -243,9 +246,10 @@ wallet or explorer reconstruction incomplete.
 `block_replay` is not a second truth model. It is a block-local physical
 layout of the same typed facts, optimized for sequential replay. It contains no
 retention-dependent block or transaction blob, address balance, spend status,
-or cross-block lookup result. `RetainedRawBlobs` carries optional raw block
-and transaction artifacts beside, rather than inside, semantic replay, so a
-deployment's raw-blob policy cannot change canonical fact identity. If
+or cross-block lookup result. Parallel preparation carries raw bytes beside,
+rather than inside, semantic replay until the workload-specific writer consumes
+them. The `wallet` workload retains transaction blobs, while `explorer` also
+retains block blobs, so retention cannot change canonical fact identity. If
 benchmarks show that a structure-of-arrays representation improves decoding
 and cache locality, that representation belongs inside this replay envelope or
 an in-memory replay window; it does not justify another public fact model.
