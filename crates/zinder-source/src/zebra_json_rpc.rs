@@ -227,8 +227,8 @@ impl ZebraJsonRpcSource {
         }
     }
 
-    /// Fetches the chain checkpoint identity and commitment-tree frontiers at
-    /// `height` from the node.
+    /// Fetches the chain checkpoint identity, block time, and commitment-tree
+    /// frontiers at `height` from the node.
     ///
     /// This is the data Zinder needs to bootstrap canonical storage from a
     /// recent height instead of replaying the chain from genesis. The values
@@ -280,13 +280,18 @@ impl ZebraJsonRpcSource {
         }
         let block_hash = decode_rpc_block_hash(&tree_state.hash)?;
         let block_id = BlockId::new(height, block_hash);
+        let block_time_seconds = tree_state.time;
         let frontiers = decode_zebra_commitment_tree_frontiers(
             tree_state,
             height,
             network_upgrade_activations,
         )?;
 
-        Ok(SourceChainCheckpoint::new(block_id, frontiers))
+        Ok(SourceChainCheckpoint::new(
+            block_id,
+            block_time_seconds,
+            frontiers,
+        ))
     }
 
     async fn fetch_connected_block_update(
@@ -2081,6 +2086,7 @@ struct ZebraSubtreeRootsByIndex {
 struct ZebraGetTreestate {
     hash: String,
     height: u32,
+    time: u32,
     #[serde(default)]
     sapling: Option<ZebraTreestate>,
     #[serde(default)]

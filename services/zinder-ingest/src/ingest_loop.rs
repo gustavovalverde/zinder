@@ -924,6 +924,7 @@ mod tests {
         // with `BulkCatchupCheckpointMisaligned`.
         let checkpoint = SourceChainCheckpoint::new(
             BlockId::new(BlockHeight::new(279_999), BlockHash::from_bytes([0xAB; 32])),
+            0,
             CommitmentTreeFrontiers::default(),
         );
         let config = sample_loop_config(IngestModifiers {
@@ -948,6 +949,7 @@ mod tests {
     -> Result<(), &'static str> {
         let checkpoint = SourceChainCheckpoint::new(
             BlockId::new(BlockHeight::new(279_999), BlockHash::from_bytes([0xAB; 32])),
+            0,
             CommitmentTreeFrontiers::default(),
         );
         let config = sample_loop_config(IngestModifiers {
@@ -1068,6 +1070,7 @@ mod tests {
     fn bulk_catchup_progress_tip_uses_checkpoint_for_empty_store() {
         let checkpoint = SourceChainCheckpoint::new(
             BlockId::new(BlockHeight::new(1_592), BlockHash::from_bytes([0xAB; 32])),
+            0,
             CommitmentTreeFrontiers::default(),
         );
 

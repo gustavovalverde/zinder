@@ -59,7 +59,7 @@ fn test_all_blob_store_options() -> ChainStoreOptions {
 }
 
 fn empty_checkpoint(block_id: BlockId) -> SourceChainCheckpoint {
-    SourceChainCheckpoint::new(block_id, CommitmentTreeFrontiers::default())
+    SourceChainCheckpoint::new(block_id, 0, CommitmentTreeFrontiers::default())
 }
 
 #[tokio::test]
@@ -372,6 +372,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_valid_nonzero_checkpoint() -> 
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
     let checkpoint = SourceChainCheckpoint::new(
         BlockId::new(checkpoint_height, source_block.parent_hash),
+        0,
         CommitmentTreeFrontiers::from_validated_parts(
             Some(one_leaf_sapling_frontier()?),
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),

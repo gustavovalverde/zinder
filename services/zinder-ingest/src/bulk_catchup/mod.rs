@@ -841,7 +841,7 @@ mod tests {
     use super::*;
 
     fn empty_checkpoint(block_id: BlockId) -> SourceChainCheckpoint {
-        SourceChainCheckpoint::new(block_id, CommitmentTreeFrontiers::default())
+        SourceChainCheckpoint::new(block_id, 0, CommitmentTreeFrontiers::default())
     }
 
     #[tokio::test]
@@ -886,6 +886,7 @@ mod tests {
         let mut config = test_bulk_catchup_run_config(&storage_path, 11, 11, 1, true)?;
         config.checkpoint = Some(SourceChainCheckpoint::new(
             BlockId::new(checkpoint_height, checkpoint_hash),
+            0,
             CommitmentTreeFrontiers::from_validated_parts(
                 Some(completed_sapling_subtree_frontier()?),
                 Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),

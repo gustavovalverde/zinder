@@ -1333,6 +1333,7 @@ fn checkpoint_response(final_root: Option<&str>, final_state: Option<&str>) -> V
     json!({
         "height": 100,
         "hash": CHECKPOINT_BLOCK_HASH_HEX,
+        "time": 1_774_668_700,
         "sapling": {"commitments": {
             "finalRoot": final_root,
             "finalState": final_state,
@@ -1349,6 +1350,7 @@ fn checkpoint_response_with_all_frontiers(
     json!({
         "height": 100,
         "hash": CHECKPOINT_BLOCK_HASH_HEX,
+        "time": 1_774_668_700,
         "sapling": {"commitments": {
             "finalRoot": sapling.0,
             "finalState": sapling.1,
@@ -1402,6 +1404,7 @@ async fn fetch_chain_checkpoint_uses_one_tree_state_request_and_decodes_nonempty
         .await?;
 
     assert_eq!(checkpoint.block_id.height, BlockHeight::new(100));
+    assert_eq!(checkpoint.block_time_seconds, 1_774_668_700);
     assert_eq!(
         checkpoint.block_id.hash,
         decode_rpc_block_hash(CHECKPOINT_BLOCK_HASH_HEX)?
