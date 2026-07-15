@@ -12,8 +12,8 @@ This plan combines the implementation sequence with the investigation findings t
 | --- | --- | --- |
 | Phase 0 | Complete | Deterministic recent and dense-mainnet controls use fixed bytes and cloned starting state. The dense pair and repeat satisfy R-BENCHMARK-1. |
 | Phase 1 | Complete | Wallet history and spender reads plus explorer transaction history use typed projection-specific readiness and capability decisions. |
-| Phase 2 | Complete; go gate | Wallet and complete execution cross registration, dispatch, startup composition, replay, retention, public reads, compatibility tests, and backup metadata. |
-| Phase 3 | Complete | Fresh stores accept `wallet` or `complete`; configuration, readiness, server information, metrics, readers, and omitted capabilities agree on the persisted selection. |
+| Phase 2 | Complete; go gate | Wallet and explorer execution cross registration, dispatch, startup composition, replay, retention, public reads, compatibility tests, and backup metadata. |
+| Phase 3 | Complete | Fresh stores accept `wallet` or `explorer`; configuration, readiness, server information, metrics, readers, and omitted capabilities agree on the persisted selection. |
 | Phase 4 | Complete for recorded claim | Backup, restore admission, restart, shutdown, compact and transparent reads, broadcast, pending-input protection, and native reorg recovery passed within the evidence-scoped configurations. |
 | Phase 5 | Trigger-gated | No database-adapter or worker-extraction trigger has opened this phase. |
 
@@ -21,7 +21,7 @@ Raw measurements and live observations are recorded in `docs/investigations/2026
 
 ## Outcome
 
-Zinder will support a fresh-store wallet preset that materializes only wallet-required projections and a complete preset that preserves the current shared-product workload. Presets expand to stable projection identities, while canonical facts, payload retention, projection lifecycle state, and future worker placement remain independent.
+Zinder will support a fresh-store wallet preset that materializes only wallet-required projections and an explorer preset that materializes the wallet and explorer product views. Presets expand to stable projection identities, while canonical facts, payload retention, projection lifecycle state, and future worker placement remain independent.
 
 The implementation does not start by adding a configuration enum. It first establishes a reproducible workload benchmark and a typed projection-read seam, then proves the wallet projection set as an internal end-to-end slice. Public configuration follows only after the measured and correctness gates pass.
 
@@ -30,7 +30,7 @@ The implementation does not start by adding a configuration enum. It first estab
 ### Product selection
 
 - The operator interface is a closed preset, not an arbitrary projection allowlist.
-- The initial presets are `wallet` and `complete`; `complete` preserves current default behavior.
+- The initial presets are `wallet` and `explorer`; `explorer` is the default for new deployments.
 - A preset expands to stable projection identities and required startup work.
 - Per-projection manifests, schemas, cursors, recovery coverage, freshness, and retention authority remain the durable state.
 
@@ -38,7 +38,7 @@ The implementation does not start by adding a configuration enum. It first estab
 
 - `transparent_outpoint_spend` is wallet-correctness and retention-critical.
 - `transparent_address_transaction_history` is wallet-serving but does not gate canonical retention.
-- Every other current bundled projection is an optional product view and belongs only to `complete` initially.
+- Every other current bundled projection is an optional product view and belongs only to `explorer` initially.
 - New projections must declare a product role and preset membership before they ship.
 
 ### Canonical and payload separation
@@ -47,14 +47,14 @@ The implementation does not start by adding a configuration enum. It first estab
 - The plan does not introduce wallet-specific canonical schemas.
 - Raw payload retention remains an independent policy.
 - Projection selection does not mutate payload retention. Wallet-serving coverage defaults to transaction blobs; full-block wallet deployments select block and transaction blobs.
-- The complete preset does not imply raw block retention.
+- The explorer preset does not imply raw block retention.
 
 ### Lifecycle
 
 - Public preset selection applies only to fresh canonical-plus-projection stores in the first release.
 - A mismatch fails before projection-manifest mutation.
-- Existing-store expansion, reduction, and disk reclamation remain unsupported until a separate migration design proves recovery and rollback.
-- The complete preset remains the compatibility path for existing stores and deployments.
+- Existing-store expansion, reduction, and disk reclamation are unsupported; operators rebuild into a fresh store.
+- Stores and configuration using names from earlier implementations are rejected. No alias or in-place migration is provided.
 
 ### Execution topology
 
@@ -67,7 +67,7 @@ The implementation does not start by adding a configuration enum. It first estab
 
 ### Current selection is implicit and all-or-nothing
 
-The production composition opens the selected derive schema set, dispatches only selected consumers, and expands that same selection into startup guards, seeds, replay, snapshot bootstrap, tailing, backfills, and verification. Operators can select `wallet` or `complete` for a fresh store; omission resolves to `complete`.
+The production composition opens the selected derive schema set, dispatches only selected consumers, and expands that same selection into startup guards, seeds, replay, snapshot bootstrap, tailing, backfills, and verification. Operators can select `wallet` or `explorer` for a fresh store; omission resolves to `explorer`.
 
 This means projection selection crosses 7 concerns: primary registration, event dispatch, cursor discovery, startup jobs, secondary readers, capability decisions, and backup. Adding `if wallet` checks at each location would create a shallow configuration feature with poor locality. One orchestration module must own the effective projection set and provide it to each concern.
 
@@ -113,7 +113,7 @@ Every implementation phase must preserve these invariants:
 5. The wallet preset preserves compact sync, tree state, subtree roots, transparent UTXOs, transparent history, durable spend resolution, broadcast, chain events, and mempool behavior.
 6. Raw block availability follows payload retention, not projection preset.
 7. Preset validation completes before any manifest, schema, cursor, or projection row mutation.
-8. The complete preset stays behaviorally compatible with the current shared deployment.
+8. The explorer preset contains every wallet and explorer projection declared by the current release.
 9. Benchmarks compare identical source input, starting store state, resource limits, and binary configuration except for the selected projection set.
 10. Support claims distinguish method coverage, configuration, adapter implementation, historical evidence, and current certification.
 
@@ -121,14 +121,14 @@ Every implementation phase must preserve these invariants:
 
 | Product behavior | Canonical facts or live state | Required projection | Payload requirement | Preset |
 | --- | --- | --- | --- | --- |
-| Compact shielded sync | Compact blocks, tree state, subtree roots | None | None | Wallet and complete |
-| Transparent UTXO discovery | Canonical transparent output indexes | None | None | Wallet and complete |
-| Transparent transaction history | Transaction facts and locations | `transparent_address_transaction_history` | Transaction blobs for the complete compatibility contract | Wallet and complete |
-| Durable spender resolution | Canonical spend facts and retention markers | `transparent_outpoint_spend` | None | Wallet and complete |
-| Full-block scanning | Canonical block blobs | None | Block and transaction blobs | Wallet and complete when configured |
-| Broadcast and live mempool | Writer-owned live state and event history | None of the selected derive projections | Submitted transaction bytes are request data | Wallet and complete |
-| Explorer summaries and histories | Canonical facts and events | Product-specific explorer projections | Usually none unless the method returns raw bytes | Complete |
-| Analytics distributions and rankings | Canonical facts and events | Product-specific analytics projections | None by default | Complete |
+| Compact shielded sync | Compact blocks, tree state, subtree roots | None | None | Wallet and explorer |
+| Transparent UTXO discovery | Canonical transparent output indexes | None | None | Wallet and explorer |
+| Transparent transaction history | Transaction facts and locations | `transparent_address_transaction_history` | Transaction blobs for the full wallet compatibility contract | Wallet and explorer |
+| Durable spender resolution | Canonical spend facts and retention markers | `transparent_outpoint_spend` | None | Wallet and explorer |
+| Full-block scanning | Canonical block blobs | None | Block and transaction blobs | Wallet and explorer when configured |
+| Broadcast and live mempool | Writer-owned live state and event history | None of the selected derive projections | Submitted transaction bytes are request data | Wallet and explorer |
+| Explorer summaries and histories | Canonical facts and events | Product-specific explorer projections | Usually none unless the method returns raw bytes | Explorer |
+| Analytics distributions and rankings | Canonical facts and events | Product-specific analytics projections | None by default | Explorer |
 
 The matrix is normative for the first implementation. A code change that introduces another dependency updates the PRD and this matrix before changing preset membership.
 
@@ -138,7 +138,7 @@ The matrix is normative for the first implementation. A code change that introdu
 
 ### What to build
 
-Complete the deterministic fixed-range replay harness and establish the complete-preset control on one dense historical range and one recent range. Finish the higher-priority ordered prevout resolver, canonical-first scheduling, and shared memory-ownership work before using the harness to judge projection selection. Add or confirm executable canonical invariants for writer exclusion, epoch atomicity, reorg repair, retention, and event history.
+Complete the deterministic fixed-range replay harness and establish the explorer-preset control on one dense historical range and one recent range. Finish the higher-priority ordered prevout resolver, canonical-first scheduling, and shared memory-ownership work before using the harness to judge projection selection. Add or confirm executable canonical invariants for writer exclusion, epoch atomicity, reorg repair, retention, and event history.
 
 This phase does not add public preset configuration. It creates the evidence and correctness floor every later slice uses.
 
@@ -157,7 +157,7 @@ This phase does not add public preset configuration. It creates the evidence and
 
 ### What to build
 
-Move wallet and explorer projection reads behind a typed projection-read seam without changing the active complete projection set. The seam reports projection identity, availability, schema compatibility, freshness, and verified coverage, and public capability decisions consume that information rather than a store-wide online flag.
+Move wallet and explorer projection reads behind a typed projection-read seam without changing the active explorer projection set. The seam reports projection identity, availability, schema compatibility, freshness, and verified coverage, and public capability decisions consume that information rather than a store-wide online flag.
 
 The slice is complete when one existing wallet projection and one existing explorer projection travel through the seam from persisted state to public capability and error behavior. The remaining projection reads then migrate using the same contract.
 
@@ -166,7 +166,7 @@ The slice is complete when one existing wallet projection and one existing explo
 - [x] Query behavior no longer infers every projection's availability from a generic derive-store status.
 - [x] One wallet projection and one optional product projection expose independent readiness and failure states end to end.
 - [x] Missing, lagging, incompatible, and incomplete projection states map to explicit existing or newly documented errors.
-- [x] Complete-preset behavior and capability output remain unchanged.
+- [x] Explorer-preset behavior and capability output remain unchanged.
 - [x] Tests exercise public reads and capability decisions, not concrete column-family access.
 - [x] The seam contains no generic byte-row or scan interface.
 
@@ -178,7 +178,7 @@ The slice is complete when one existing wallet projection and one existing explo
 
 Add an internal, test-only execution path that expands the wallet preset to the 2 required projection identities on a fresh store. Carry that selection through primary registration, event dispatch, startup replay, retention acknowledgement, secondary reading, query readiness, compatibility reads, and backup capture.
 
-Run the wallet and complete projection sets against the Phase 0 harness. This slice proves the architecture and produces the go or no-go evidence; it does not create an operator-facing configuration promise.
+Run the wallet and explorer projection sets against the Phase 0 harness. This slice proves the architecture and produces the go or no-go evidence; it does not create an operator-facing configuration promise.
 
 ### Acceptance criteria
 
@@ -186,7 +186,7 @@ Run the wallet and complete projection sets against the Phase 0 harness. This sl
 - [x] Optional product consumers, backfills, verifiers, and bootstrap jobs do not run in the wallet arm.
 - [x] Transparent history and durable spender resolution work through public wallet and compatibility reads.
 - [x] The retention floor advances only after durable outpoint-spend projection progress.
-- [x] The wallet and complete arms run against identical fixed inputs and resource limits.
+- [x] The wallet and explorer arms run against identical fixed inputs and resource limits.
 - [x] Results satisfy PRD requirement R-BENCHMARK-1 before public configuration.
 - [x] The investigation report records any canonical, query, backup, or recovery dependency that the 2-projection model missed.
 
@@ -196,20 +196,20 @@ Run the wallet and complete projection sets against the Phase 0 harness. This sl
 
 ### What to build
 
-Expose the validated wallet and complete presets as one operator choice. Resolve the preset before storage opens, preflight it against store identity and projection manifests, and pass the effective projection set through every production composition path. Keep complete as the default.
+Expose the validated wallet and explorer presets as one operator choice. Resolve the preset before storage opens, preflight it against store identity and projection manifests, and pass the effective projection set through every production composition path. Keep explorer as the default.
 
-The same slice adds printed configuration, readiness, server information, and metrics for the effective set. Payload retention remains independent: the wallet-serving coverage profile defaults to transaction blobs, full-block deployments select all blobs, and complete does not imply full blocks.
+The same slice adds printed configuration, readiness, server information, and metrics for the effective set. Payload retention remains independent: the wallet-serving coverage profile defaults to transaction blobs, full-block deployments select all blobs, and explorer does not imply full blocks.
 
 ### Acceptance criteria
 
 - [x] A fresh wallet store starts and reaches wallet-serving readiness with only the 2 required projections.
-- [x] A fresh complete store preserves the current projection and capability set.
+- [x] A fresh explorer store preserves the current projection and capability set.
 - [x] Configuration output states the selected preset and effective identities with secrets redacted.
 - [x] Preset and payload-retention validation reports actionable errors.
 - [x] An incompatible existing store fails before manifest mutation and points to the supported rebuild path.
 - [x] Reader processes, compatibility adapters, explorer processes, and local clients interpret the same effective projection set.
 - [x] Omitted optional projections remove only their dependent capabilities.
-- [x] Existing configuration with no preset continues as complete.
+- [x] Existing configuration with no preset resolves to explorer for a fresh store.
 
 ## Phase 4: Recovery and Wallet Certification
 

@@ -391,7 +391,7 @@ fn storage_candidate_identity(
 ) -> Result<StorageCandidateIdentity, BenchError> {
     match projection_preset {
         None => Ok(StorageCandidateIdentity::rocksdb_current_schema_oracle()),
-        Some(ProjectionPreset::Wallet | ProjectionPreset::Complete) => {
+        Some(ProjectionPreset::Wallet | ProjectionPreset::Explorer) => {
             Ok(StorageCandidateIdentity::rocksdb_current_schema_with_diagnostic_projections())
         }
         Some(_) => Err(BenchError::invalid_argument(

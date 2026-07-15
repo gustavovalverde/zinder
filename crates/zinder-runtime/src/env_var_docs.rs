@@ -634,8 +634,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Closed derive workload: `\"wallet\"` or `\"complete\"`. Defaults to \
-                      `\"complete\"`. Selection is supported only when creating a fresh \
+        description: "Closed derive workload: `\"wallet\"` or `\"explorer\"`. Defaults to \
+                      `\"explorer\"`. Selection is supported only when creating a fresh \
                       canonical-plus-projection store.",
     },
     EnvVarDoc {

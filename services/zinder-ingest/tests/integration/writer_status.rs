@@ -42,7 +42,7 @@ fn bulk_catchup_readiness(current_height: u32, upstream_height: u32) -> Readines
 fn open_derive_store(store_fixture: &StoreFixture) -> Result<DeriveStore> {
     Ok(DeriveStore::open_with_projection_preset(
         DeriveStore::path_for_canonical(store_fixture.tempdir_path()),
-        ProjectionPreset::Complete,
+        ProjectionPreset::Explorer,
         DeriveStoreOptions {
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
             ..DeriveStoreOptions::default()

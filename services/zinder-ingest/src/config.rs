@@ -129,7 +129,7 @@ const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_BATCH_BLOCKS: u32 = 10_000;
 const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
 const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
-const DEFAULT_PROJECTION_PRESET: ProjectionPreset = ProjectionPreset::Complete;
+const DEFAULT_PROJECTION_PRESET: ProjectionPreset = ProjectionPreset::Explorer;
 
 /// Fully loaded command configuration for the unified `zinder-ingest`
 /// run (no subcommand and the `probe` subcommand both consume this).
@@ -706,7 +706,7 @@ struct IngestSection {
     /// implemented; [ADR-0016](../../../docs/adrs/0016-source-streaming-pipeline.md)
     /// reserves `auto`, `zebra-indexer-grpc`, and `zebra-in-process`.
     source: Option<String>,
-    /// Closed derive workload. Existing configuration defaults to `complete`.
+    /// Closed derive workload. Omitted configuration defaults to `explorer`.
     projection_preset: Option<String>,
     /// Chain-truth invariant: how deep into the upstream tip the
     /// safe-tip cliff sits. Defaults to `100`.
@@ -871,9 +871,9 @@ fn parse_derive_replay_policy(policy_text: &str) -> Result<DeriveReplayPolicy, C
 fn parse_projection_preset(preset_text: &str) -> Result<ProjectionPreset, ConfigError> {
     match preset_text {
         "wallet" => Ok(ProjectionPreset::Wallet),
-        "complete" => Ok(ProjectionPreset::Complete),
+        "explorer" => Ok(ProjectionPreset::Explorer),
         _ => Err(ConfigError::invalid(
-            "ingest.projection_preset must be one of: wallet, complete",
+            "ingest.projection_preset must be one of: wallet, explorer",
         )),
     }
 }

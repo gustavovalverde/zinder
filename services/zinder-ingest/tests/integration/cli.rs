@@ -83,7 +83,7 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[ingest]"));
-    assert!(stdout.contains("projection_preset = \"complete\""));
+    assert!(stdout.contains("projection_preset = \"explorer\""));
     assert!(stdout.contains("# effective_projection_identities = ["));
     assert!(stdout.contains("reorg_window_blocks = 100"));
     assert!(stdout.contains("[ingest.phases]"));
@@ -204,8 +204,50 @@ fn unsupported_projection_preset_fails_before_storage_open() -> Result<(), Box<d
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.projection_preset must be one of: wallet, complete"),
+        stderr.contains("ingest.projection_preset must be one of: wallet, explorer"),
         "{stderr}"
+    );
+    assert!(!storage_path.exists());
+
+    Ok(())
+}
+
+#[test]
+fn removed_complete_projection_preset_is_rejected() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("removed-complete-preset-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = ingest_config_toml(&storage_path)?
+        .replace("[ingest]\n", "[ingest]\nprojection_preset = \"complete\"\n");
+    fs::write(&config_path, config)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("ingest.projection_preset must be one of: wallet, explorer"),
+        "{stderr}"
+    );
+    assert!(!storage_path.exists());
+
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+    let cli_output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--projection-preset",
+            "complete",
+        ])
+        .output()?;
+    assert!(!cli_output.status.success());
+    let cli_stderr = String::from_utf8(cli_output.stderr)?;
+    assert!(
+        cli_stderr.contains("invalid value 'complete'"),
+        "{cli_stderr}"
     );
     assert!(!storage_path.exists());
 
@@ -436,7 +478,7 @@ fn assert_complete_backup_manifest(
     )?)?;
     assert_eq!(manifest["format_version"], 3);
     assert_eq!(manifest["network"], "zcash-regtest");
-    assert_eq!(manifest["projection_preset"], "complete");
+    assert_eq!(manifest["projection_preset"], "explorer");
     assert_eq!(manifest["raw_blob_retention"], "all");
     assert_eq!(
         manifest["canonical_position"]["visible_tip_hash"],

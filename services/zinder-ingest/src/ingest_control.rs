@@ -82,7 +82,7 @@ impl IngestControlGrpcAdapter {
             mempool_index: None,
             node_source: None,
             bearer_token: None,
-            projection_preset: ProjectionPreset::Complete,
+            projection_preset: ProjectionPreset::Explorer,
             readiness,
             derive_status_reader: None,
         }

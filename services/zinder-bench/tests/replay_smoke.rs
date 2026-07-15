@@ -293,68 +293,68 @@ async fn current_projection_presets_report_diagnostics_not_wallet_acceptance() -
     );
     assert_no_target_wallet_acceptance_claim(&wallet_report)?;
 
-    let complete_store_directory = tempdir()?;
-    let complete_report = replay_fixture(
+    let explorer_store_directory = tempdir()?;
+    let explorer_report = replay_fixture(
         replay_config(
             &fixture_directory,
-            &complete_store_directory,
-            Some(ProjectionPreset::Complete),
+            &explorer_store_directory,
+            Some(ProjectionPreset::Explorer),
         )?,
         None,
     )
     .await?;
-    assert_projection_report(&complete_report, "complete");
+    assert_projection_report(&explorer_report, "explorer");
     assert_eq!(
-        complete_report
+        explorer_report
             .storage_candidate
             .diagnostic_projection_engine,
         Some("rocksdb")
     );
-    assert_no_target_wallet_acceptance_claim(&complete_report)?;
+    assert_no_target_wallet_acceptance_claim(&explorer_report)?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn complete_replay_bootstraps_ranking_while_wallet_remains_ranking_free() -> Result<()> {
+async fn explorer_replay_bootstraps_ranking_while_wallet_remains_ranking_free() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
-    let complete_store_directory = tempdir()?;
+    let explorer_store_directory = tempdir()?;
     replay_fixture(
         replay_config(
             &fixture_directory,
-            &complete_store_directory,
-            Some(ProjectionPreset::Complete),
+            &explorer_store_directory,
+            Some(ProjectionPreset::Explorer),
         )?,
         None,
     )
     .await?;
 
-    let complete_store_path = complete_store_directory.path().join("canonical");
-    let complete_store = open_primary_derive_store_for_canonical_with_projection_preset(
-        &complete_store_path,
+    let explorer_store_path = explorer_store_directory.path().join("canonical");
+    let explorer_store = open_primary_derive_store_for_canonical_with_projection_preset(
+        &explorer_store_path,
         RocksDbResourceBudget::derive_writer_defaults(),
-        ProjectionPreset::Complete,
+        ProjectionPreset::Explorer,
     )?;
-    let complete_canonical_store = PrimaryChainStore::open(
-        &complete_store_path,
+    let explorer_canonical_store = PrimaryChainStore::open(
+        &explorer_store_path,
         zinder_store::ChainStoreOptions::for_network(Network::ZcashRegtest),
     )?;
-    assert_projection_at_canonical_tip(&complete_canonical_store, &complete_store)?;
-    let active = TransparentAddressRankingConsumer::active_metadata(&complete_store)?
-        .ok_or_else(|| eyre!("complete replay must activate a ranking generation"))?;
+    assert_projection_at_canonical_tip(&explorer_canonical_store, &explorer_store)?;
+    let active = TransparentAddressRankingConsumer::active_metadata(&explorer_store)?
+        .ok_or_else(|| eyre!("explorer replay must activate a ranking generation"))?;
     assert!(active.generation > 0);
     assert_eq!(
         active.coverage.balance_complete_through_height,
         BlockHeight::new(1)
     );
-    assert!(TransparentAddressRankingConsumer::build_metadata(&complete_store)?.is_none());
-    let ranking_cursor = complete_store
+    assert!(TransparentAddressRankingConsumer::build_metadata(&explorer_store)?.is_none());
+    let ranking_cursor = explorer_store
         .get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
-        .ok_or_else(|| eyre!("complete replay must commit the ranking cursor"))?;
+        .ok_or_else(|| eyre!("explorer replay must commit the ranking cursor"))?;
     assert_eq!(
         Some(ranking_cursor),
-        complete_store.get_chain_event_cursor(TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME)?
+        explorer_store.get_chain_event_cursor(TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME)?
     );
-    drop(complete_store);
+    drop(explorer_store);
 
     let wallet_store_directory = tempdir()?;
     replay_fixture(
@@ -405,10 +405,10 @@ async fn fixed_range_seeds_selected_consumers_at_the_starting_tip() -> Result<()
     )?;
     let derive_store = zinder_derive::DeriveStore::open_with_projection_preset(
         zinder_derive::DeriveStore::path_for_canonical(&range_store_path),
-        ProjectionPreset::Complete,
+        ProjectionPreset::Explorer,
         zinder_derive::DeriveStoreOptions {
             sync_writes: false,
-            consumers: ProjectionPreset::Complete.consumer_schemas(),
+            consumers: ProjectionPreset::Explorer.consumer_schemas(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;

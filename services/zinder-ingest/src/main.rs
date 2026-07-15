@@ -91,8 +91,8 @@ struct Cli {
     /// Canonical Zinder store path.
     #[arg(long = "storage-path", global = true)]
     storage_path: Option<PathBuf>,
-    /// Closed derive workload to materialize: wallet or complete.
-    #[arg(long = "projection-preset", value_parser = ["wallet", "complete"], global = true)]
+    /// Closed derive workload to materialize: wallet or explorer.
+    #[arg(long = "projection-preset", value_parser = ["wallet", "explorer"], global = true)]
     projection_preset: Option<String>,
     /// Node request timeout in seconds.
     #[arg(long = "request-timeout-secs", global = true)]

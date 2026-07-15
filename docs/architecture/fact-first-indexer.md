@@ -440,7 +440,7 @@ Fresh construction is resource-exclusive by default:
 1. canonical `BulkCatchup` owns the ingest budget;
 2. after canonical reaches `FollowingTip`, wallet replay drains;
 3. after wallet coverage is current, wallet APIs become ready;
-4. complete deployments then drain explorer replay; and
+4. explorer deployments then drain explorer replay; and
 5. low-priority historical backfills run only after their owning projection is
    current.
 
@@ -515,7 +515,7 @@ are ancestors of `main` or their rejected status is recorded here.
 
 ### 4. Separate explorer projections
 
-- move complete-only consumers into the explorer projection database;
+- move explorer-only consumers into the explorer projection database;
 - compose explorer transaction and address views through the wallet contract
   instead of duplicating wallet state;
 - keep each explorer consumer independently rebuildable and capability-gated;

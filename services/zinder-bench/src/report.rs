@@ -1689,7 +1689,7 @@ mod tests {
     #[test]
     fn diagnostic_projection_presets_do_not_create_target_plane_acceptance_contracts()
     -> Result<(), Box<dyn std::error::Error>> {
-        for projection_preset in ["wallet", "complete"] {
+        for projection_preset in ["wallet", "explorer"] {
             let mut measurements = canonical_measurements();
             measurements.projection_preset = Some(projection_preset);
             measurements.projection_replay_scope = Some("retained-history");

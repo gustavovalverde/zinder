@@ -38,9 +38,9 @@ silent partial history.
 
 ## Workload selection
 
-`zinder-ingest` exposes one closed `ingest.projection_preset` choice. `wallet` materializes `transparent_address_transaction_history` and `transparent_outpoint_spend`; `complete` materializes every projection bundled with the release and remains the default. The preset expands through one startup plan that owns registration, dispatch, replay, optional background work, reader discovery, capability decisions, and backup metadata.
+`zinder-ingest` exposes one closed `ingest.projection_preset` choice. `wallet` materializes `transparent_address_transaction_history` and `transparent_outpoint_spend`; `explorer` materializes the wallet projections and every explorer projection bundled with the release and remains the default. The preset expands through one startup plan that owns registration, dispatch, replay, optional background work, reader discovery, capability decisions, and backup metadata.
 
-Preset selection is supported only when creating a fresh canonical-plus-projection store. Reopening a store with a different preset fails before manifest reconciliation and directs the operator to rebuild at a new empty storage path. Expanding, reducing, or reclaiming an existing projection store requires a separate migration design.
+Preset selection is supported only when creating a fresh canonical-plus-projection store. Reopening a store with a different preset fails before manifest reconciliation and directs the operator to rebuild at a new empty storage path. Expanding, reducing, reclaiming, or translating an existing projection store is unsupported. Earlier preset names are rejected rather than interpreted as aliases.
 
 The preset does not change canonical artifacts, event history, historical coverage, or `storage.raw_blob_policy`. Wallet-serving coverage and raw payload retention remain separate choices because a wallet may need transaction blobs, full block blobs, or neither independently of which read models are materialized.
 

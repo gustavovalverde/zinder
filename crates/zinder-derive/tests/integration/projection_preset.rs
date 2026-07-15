@@ -53,14 +53,14 @@ fn wallet_preset_persists_only_wallet_projection_schemas() -> Result<()> {
 }
 
 #[test]
-fn persisted_workload_detection_distinguishes_wallet_complete_and_missing_paths() -> Result<()> {
+fn persisted_workload_detection_distinguishes_wallet_explorer_and_missing_paths() -> Result<()> {
     let wallet = TempDir::new()?;
-    let complete = TempDir::new()?;
+    let explorer = TempDir::new()?;
     let missing = TempDir::new()?;
     DeriveStore::open_with_projection_preset(wallet.path(), ProjectionPreset::Wallet, options())?;
     DeriveStore::open_with_projection_preset(
-        complete.path(),
-        ProjectionPreset::Complete,
+        explorer.path(),
+        ProjectionPreset::Explorer,
         options(),
     )?;
 
@@ -69,8 +69,8 @@ fn persisted_workload_detection_distinguishes_wallet_complete_and_missing_paths(
         Some(ProjectionPreset::Wallet)
     );
     assert_eq!(
-        DeriveStore::detect_projection_preset_at_path(complete.path())?,
-        Some(ProjectionPreset::Complete)
+        DeriveStore::detect_projection_preset_at_path(explorer.path())?,
+        Some(ProjectionPreset::Explorer)
     );
     assert_eq!(
         DeriveStore::detect_projection_preset_at_path(missing.path())?,
@@ -94,13 +94,13 @@ fn changing_a_persisted_projection_preset_fails_before_manifest_mutation() -> Re
 
     let outcome = DeriveStore::open_with_projection_preset(
         primary.path(),
-        ProjectionPreset::Complete,
+        ProjectionPreset::Explorer,
         options(),
     );
     assert!(matches!(
         outcome,
         Err(DeriveStoreError::ProjectionPresetRequiresFreshStore {
-            requested: "complete",
+            requested: "explorer",
         })
     ));
     let column_families_after =
@@ -121,12 +121,12 @@ fn changing_a_persisted_projection_preset_fails_before_manifest_mutation() -> Re
 }
 
 #[test]
-fn reducing_complete_to_wallet_fails_before_column_family_mutation() -> Result<()> {
+fn reducing_explorer_to_wallet_fails_before_column_family_mutation() -> Result<()> {
     let primary = TempDir::new()?;
     {
         DeriveStore::open_with_projection_preset(
             primary.path(),
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
             options(),
         )?;
     }
@@ -151,7 +151,7 @@ fn reducing_complete_to_wallet_fails_before_column_family_mutation() -> Result<(
 }
 
 #[test]
-fn complete_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()> {
+fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()> {
     let primary = TempDir::new()?;
     {
         let store = DeriveStore::open(
@@ -168,7 +168,7 @@ fn complete_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
 
     let outcome =
-        DeriveStore::inspect_projection_store_at_path(primary.path(), ProjectionPreset::Complete);
+        DeriveStore::inspect_projection_store_at_path(primary.path(), ProjectionPreset::Explorer);
     assert!(matches!(
         outcome,
         Err(DeriveStoreError::ConsumerNotDeclared {
@@ -199,13 +199,13 @@ fn complete_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
 }
 
 #[test]
-fn projection_catalog_declares_every_complete_and_wallet_identity_once() {
+fn projection_catalog_declares_every_explorer_and_wallet_identity_once() {
     let definitions = bundled_projection_definitions();
     assert_eq!(
         definitions.len(),
-        ProjectionPreset::Complete.consumer_schemas().len()
+        ProjectionPreset::Explorer.consumer_schemas().len()
     );
-    for schema in ProjectionPreset::Complete.consumer_schemas() {
+    for schema in ProjectionPreset::Explorer.consumer_schemas() {
         assert_eq!(
             definitions
                 .iter()

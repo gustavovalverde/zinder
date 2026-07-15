@@ -229,7 +229,7 @@ async fn startup_defers_existing_derive_replay_to_the_tailer() -> Result<()> {
 
 #[test]
 fn complete_startup_plan_owns_every_optional_projection_job() {
-    let plan = ProjectionStartupPlan::for_preset(ProjectionPreset::Complete);
+    let plan = ProjectionStartupPlan::for_preset(ProjectionPreset::Explorer);
     assert_eq!(
         plan.selected_work().collect::<Vec<_>>(),
         ProjectionStartupWork::all().to_vec()
@@ -255,7 +255,7 @@ async fn startup_rejects_a_plan_store_mismatch() -> Result<()> {
     readiness.set_phase(IngestPhase::BulkCatchup);
     let historical_work_gate = HistoricalWorkGate::new(readiness);
 
-    let outcome = ProjectionStartupPlan::for_preset(ProjectionPreset::Complete)
+    let outcome = ProjectionStartupPlan::for_preset(ProjectionPreset::Explorer)
         .start(ProjectionStartupInputs {
             settings: enabled_settings(),
             request_timeout: Duration::from_secs(1),

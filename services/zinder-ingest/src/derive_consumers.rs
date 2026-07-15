@@ -427,7 +427,7 @@ pub fn open_primary_derive_store_for_canonical(
     open_primary_derive_store_for_canonical_with_projection_preset(
         canonical_path,
         rocksdb_resource_budget,
-        ProjectionPreset::Complete,
+        ProjectionPreset::Explorer,
     )
 }
 

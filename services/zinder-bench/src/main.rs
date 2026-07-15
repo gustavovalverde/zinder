@@ -102,7 +102,7 @@ struct CurrentSchemaReplayArgs {
     /// Optional canonical block-cache override in bytes.
     #[arg(long = "block-cache-bytes")]
     block_cache_bytes: Option<u64>,
-    /// Projection preset to replay after canonical ingest. `complete` is a
+    /// Projection preset to replay after canonical ingest. `explorer` is a
     /// diagnostic replay, not projection-readiness certification. Omit for a
     /// canonical-only run.
     #[arg(long = "projection-preset")]
@@ -154,14 +154,14 @@ struct CurrentSchemaReplayArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CliProjectionPreset {
     Wallet,
-    Complete,
+    Explorer,
 }
 
 impl From<CliProjectionPreset> for ProjectionPreset {
     fn from(preset: CliProjectionPreset) -> Self {
         match preset {
             CliProjectionPreset::Wallet => Self::Wallet,
-            CliProjectionPreset::Complete => Self::Complete,
+            CliProjectionPreset::Explorer => Self::Explorer,
         }
     }
 }

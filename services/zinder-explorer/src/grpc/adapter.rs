@@ -332,7 +332,7 @@ impl ExplorerQueryGrpcAdapter {
         ExplorerReadiness {
             wallet_query_online,
             canonical_store_online: self.canonical_store.is_some(),
-            derive_store_online: self.projection_preset == Some(ProjectionPreset::Complete),
+            derive_store_online: self.projection_preset == Some(ProjectionPreset::Explorer),
             prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
             payment_disclosure_verifier_online: self.payment_disclosure_verifier_online,
             transaction_history_available: transaction_history_readiness
@@ -1532,7 +1532,7 @@ impl ExplorerQueryGrpcAdapter {
                  --storage-path and start the explorer with the consumer wired"
             )))
         })?;
-        if self.projection_preset != Some(ProjectionPreset::Complete) {
+        if self.projection_preset != Some(ProjectionPreset::Explorer) {
             return Err(ExplorerError::unsupported(format!(
                 "{method} is unavailable because the stored projection workload omits \
                  explorer product views"
@@ -1846,7 +1846,7 @@ mod tests {
         let tempdir = tempdir()?;
         let derive_store = DeriveStore::open_with_projection_preset(
             tempdir.path(),
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
             DeriveStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..DeriveStoreOptions::default()

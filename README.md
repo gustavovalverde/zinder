@@ -102,7 +102,7 @@ flowchart LR
     Zebra["Zebra node"] --> Ingest["zinder-ingest<br/>indexes the chain once"]
     Ingest --> Canonical[("Canonical chain view<br/>shared source of truth")]
     Canonical --> APIs["Zinder APIs<br/>WalletQuery · lightwalletd · ExplorerQuery"]
-    Canonical -->|"rebuildable events"| Projections[("Selected derived views<br/>wallet or complete")]
+    Canonical -->|"rebuildable events"| Projections[("Selected derived views<br/>wallet or explorer")]
     Projections --> APIs
     APIs --> Consumers["Wallets · applications · explorers"]
 ```

@@ -41,7 +41,7 @@ The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
 `manifest.json` recording the network, range, consensus activations,
 current-schema oracle artifact version, replay tip hash, per-segment SHA-256,
 and any shielded subtree roots that complete inside the range. Fixture format
-version 4 also records the versioned `CanonicalBlockFacts` block-digest and
+version 1 records the versioned `CanonicalBlockFacts` block-digest and
 ordered sequence-digest evidence used by both fact-first arms. Workload totals
 and per-block maxima let reviewers detect burst-dominated ranges.
 
@@ -122,10 +122,10 @@ identical runs (each against a fresh store clone):
 
 - `--block-prepare-concurrency 4|8|12|24` for the prepare-concurrency sweep.
 - `--block-cache-bytes <N>` for the canonical block-cache-size sweep.
-- `--projection-preset wallet|complete` to drive one explicit projection
+- `--projection-preset wallet|explorer` to drive one explicit projection
   diagnostic over the committed range. Neither preset builds ADR-0035's wallet
   plane: they do not own its live set, balances, address index, undo state, or
-  readiness contract. `complete` also does not drive projection-startup
+  readiness contract. `explorer` also does not drive projection-startup
   historical backfills or the coverage verifier. Neither preset can produce a
   wallet construction or wallet-ready acceptance result.
 - `--projection-replay-scope fixed-range|retained-history` to compare only the
@@ -267,7 +267,7 @@ component diagnostics in the external resource artifacts.
 ## Report fields
 
 - `report_format_version`: machine-readable report contract version. The
-  closed measurement contract described here is version 4.
+  closed measurement contract described here is version 1.
 - `measurement_kind`: either `current-schema-fixture-replay` or
   `canonical-block-facts-round-trip`. The tagged shape prevents fact-only
   evidence from acquiring placeholder lifecycle or current-schema telemetry
