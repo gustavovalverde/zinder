@@ -320,7 +320,16 @@ docker compose \
 The local host endpoint defaults to
 `postgresql://zinder_bench:zinder_bench_local_only@127.0.0.1:55432/zinder_bench`.
 Its credentials are intentionally public and valid only for this loopback-bound
-environment.
+environment. `postgres-database` joins both the private `storage-benchmark`
+network used by the benchmark client and a dedicated `postgres-host-access`
+bridge that makes the loopback endpoint publishable. Docker does not publish a
+host port for a container attached only to an internal network; no other
+benchmark service joins the host-access bridge. The second bridge has ordinary
+Docker bridge semantics, so `postgres-database` is not egress-denied. The
+isolation guarantee is therefore project-private client/database traffic and
+loopback-only host ingress, not database egress prevention. The digest-pinned
+official database image runs only PostgreSQL and the local resource observer,
+and no benchmark input depends on external network access.
 
 The report is written as
 `postgres-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`. This arm creates a

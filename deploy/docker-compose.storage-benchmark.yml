@@ -218,7 +218,7 @@ services:
     mem_limit: ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
     shm_size: ${ZINDER_BENCH_POSTGRES_SHARED_MEMORY_SIZE:-2g}
     stop_grace_period: 2m
-    networks: [storage-benchmark]
+    networks: [storage-benchmark, postgres-host-access]
     # The server and client emit independent peaks. A PostgreSQL whole-arm peak
     # is derived by time-aligning their memory.current samples, never by summing
     # their independently observed memory.peak values.
@@ -313,6 +313,12 @@ services:
 networks:
   storage-benchmark:
     internal: true
+  # Docker does not publish host ports for containers attached only to an
+  # internal network. This ordinary bridge makes the loopback-bound local
+  # driver gate reachable; benchmark clients continue to use the internal
+  # `storage-benchmark` network. The runbook documents the resulting database
+  # egress boundary explicitly.
+  postgres-host-access:
 
 volumes:
   rocksdb-current-schema-store:

@@ -163,6 +163,14 @@ jobs:
             -f deploy/docker-compose.storage-benchmark.yml \
             exec -T postgres-database \
             pg_isready --username zinder_bench --dbname zinder_bench
+          published_postgres_endpoint="$(
+            docker compose \
+              --env-file deploy/.env.storage-benchmark.example \
+              -f deploy/docker-compose.storage-benchmark.yml \
+              port postgres-database 5432
+          )"
+          test "${published_postgres_endpoint}" = "127.0.0.1:55432"
+          python3 -c 'import socket; connection = socket.create_connection(("127.0.0.1", 55432), timeout=5); connection.close()'
           docker compose \
             --env-file deploy/.env.storage-benchmark.example \
             -f deploy/docker-compose.storage-benchmark.yml \
