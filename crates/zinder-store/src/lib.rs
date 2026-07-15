@@ -43,10 +43,11 @@ pub use block_replay::{BlockReplayBatchRequest, BlockReplayStore, MAX_BLOCK_REPL
 pub use block_value_pool_balances::BlockValuePoolBalancesStore;
 pub use canonical_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBlockLoadEvidence,
-    CanonicalBuildBlock, CanonicalStoreBuildError, CanonicalStoreBuildPlan,
-    CanonicalStoreBuildPlanError, CanonicalStoreBuildState, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
+    CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalStoreBuildError,
+    CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalSubtreeRootLoadEvidence, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+    TREE_STATE_CHECKPOINT_STRIDE,
 };
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;

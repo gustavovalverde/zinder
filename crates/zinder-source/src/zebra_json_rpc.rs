@@ -1022,6 +1022,14 @@ impl NodeSource for ZebraJsonRpcSource {
         ))
     }
 
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        Self::fetch_chain_checkpoint(self, height, network_upgrade_activations).await
+    }
+
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
         let mut retries_remaining = TIP_VIEW_RETRY_COUNT;
         loop {

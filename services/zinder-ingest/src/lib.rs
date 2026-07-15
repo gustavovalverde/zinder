@@ -43,7 +43,8 @@ pub use bulk_catchup::{
 };
 pub use canonical_construction::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
-    load_fresh_canonical_blocks,
+    CanonicalSourceLoadOutcome, load_fresh_canonical, load_fresh_canonical_blocks,
+    load_fresh_canonical_source_families,
 };
 pub use chain_ingest::{
     DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,

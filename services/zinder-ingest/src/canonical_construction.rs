@@ -25,8 +25,9 @@ use zinder_core::{
 };
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{
-    CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalStoreBuildError, CanonicalStoreError,
-    CanonicalStoreWorkload, RocksDbCanonicalBuilder, TREE_STATE_CHECKPOINT_STRIDE,
+    CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
+    CanonicalStoreBuildError, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalSubtreeRootLoadEvidence, RocksDbCanonicalBuilder, TREE_STATE_CHECKPOINT_STRIDE,
 };
 
 use crate::{
@@ -177,6 +178,14 @@ pub enum CanonicalConstructionError {
         /// Tokio blocking-task failure.
         reason: String,
     },
+    /// One exact source-family request exceeded the construction deadline.
+    #[error("canonical source request {operation} exceeded timeout {timeout:?}")]
+    SourceRequestTimedOut {
+        /// Exact source operation that did not finish.
+        operation: &'static str,
+        /// Per-request deadline from construction config.
+        timeout: Duration,
+    },
 }
 
 /// Result of staging and ingesting block-local families into a fresh store.
@@ -190,6 +199,16 @@ pub struct CanonicalBlockLoadOutcome {
     pub evidence: CanonicalBlockLoadEvidence,
 }
 
+/// Complete source-family outcome ready for fresh-reopen publication validation.
+pub struct CanonicalSourceLoadOutcome {
+    /// Exclusive builder retaining authenticated source evidence.
+    pub builder: RocksDbCanonicalBuilder,
+    /// Block-local family measurements.
+    pub block_evidence: CanonicalBlockLoadEvidence,
+    /// Contiguous completed-subtree measurements.
+    pub subtree_root_evidence: CanonicalSubtreeRootLoadEvidence,
+}
+
 /// Loads every block-local canonical family from one ordered source pass.
 ///
 /// Parallel preparation parses each source block exactly once. The blocking
@@ -200,21 +219,21 @@ pub struct CanonicalBlockLoadOutcome {
 pub async fn load_fresh_canonical_blocks<Source>(
     builder: RocksDbCanonicalBuilder,
     source: &Source,
-    config: CanonicalConstructionConfig,
+    config: &CanonicalConstructionConfig,
 ) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError>
 where
     Source: NodeSource + Clone,
 {
     let build_plan = builder.build_plan().clone();
     let workload = builder.workload();
-    validate_construction_identity(&build_plan, &config)?;
+    validate_construction_identity(&build_plan, config)?;
     let block_queue_capacity = usize::try_from(config.block_prepare_concurrency.get())
         .unwrap_or(usize::MAX)
         .max(1);
     let prepared_blocks = build_prepared_block_stream(
         source,
         &build_plan,
-        &config,
+        config,
         raw_blob_policy_for_workload(workload),
     );
     drive_block_loader(
@@ -224,6 +243,82 @@ where
         Arc::clone(&config.network_upgrade_activations),
     )
     .await
+}
+
+/// Loads the exact completed-subtree ranges and authenticates the final fixed tip.
+pub async fn load_fresh_canonical_source_families<Source>(
+    block_outcome: CanonicalBlockLoadOutcome,
+    source: &Source,
+    config: &CanonicalConstructionConfig,
+) -> Result<CanonicalSourceLoadOutcome, CanonicalConstructionError>
+where
+    Source: NodeSource,
+{
+    let CanonicalBlockLoadOutcome {
+        mut builder,
+        evidence: block_evidence,
+    } = block_outcome;
+    validate_network_upgrade_activations(
+        builder.build_plan(),
+        &config.network_upgrade_activations,
+    )?;
+    let required_ranges = builder.required_subtree_root_ranges()?;
+    let mut subtree_roots = Vec::new();
+    for range in required_ranges {
+        let source_roots = tokio::time::timeout(
+            config.request_timeout,
+            source.fetch_subtree_root_range(range),
+        )
+        .await
+        .map_err(|_| CanonicalConstructionError::SourceRequestTimedOut {
+            operation: "fetch exact subtree-root range",
+            timeout: config.request_timeout,
+        })?
+        .map_err(|source| CanonicalConstructionError::Source {
+            source: IngestError::from(source),
+        })?;
+        subtree_roots.extend(source_roots.subtree_roots.into_iter().map(|root| {
+            CanonicalBuildSubtreeRoot {
+                protocol: source_roots.protocol,
+                subtree_index: root.subtree_index,
+                root_hash: root.root_hash,
+                completing_block_height: root.completing_block_height,
+            }
+        }));
+    }
+    let subtree_root_evidence = builder.load_subtree_roots(subtree_roots)?;
+    let fixed_tip = builder.build_plan().build_tip();
+    let source_tip_checkpoint = tokio::time::timeout(
+        config.request_timeout,
+        source.fetch_chain_checkpoint(fixed_tip.height, &config.network_upgrade_activations),
+    )
+    .await
+    .map_err(|_| CanonicalConstructionError::SourceRequestTimedOut {
+        operation: "fetch fixed-tip checkpoint",
+        timeout: config.request_timeout,
+    })?
+    .map_err(|source| CanonicalConstructionError::Source {
+        source: IngestError::from(source),
+    })?;
+    builder.confirm_source_tip_checkpoint(&source_tip_checkpoint)?;
+    Ok(CanonicalSourceLoadOutcome {
+        builder,
+        block_evidence,
+        subtree_root_evidence,
+    })
+}
+
+/// Loads every clean-v1 source family needed before publication validation.
+pub async fn load_fresh_canonical<Source>(
+    builder: RocksDbCanonicalBuilder,
+    source: &Source,
+    config: &CanonicalConstructionConfig,
+) -> Result<CanonicalSourceLoadOutcome, CanonicalConstructionError>
+where
+    Source: NodeSource + Clone,
+{
+    let block_outcome = load_fresh_canonical_blocks(builder, source, config).await?;
+    load_fresh_canonical_source_families(block_outcome, source, config).await
 }
 
 const fn raw_blob_policy_for_workload(workload: CanonicalStoreWorkload) -> RawBlobPolicy {
@@ -237,8 +332,15 @@ fn validate_construction_identity(
     build_plan: &zinder_store::CanonicalStoreBuildPlan,
     config: &CanonicalConstructionConfig,
 ) -> Result<(), CanonicalConstructionError> {
+    validate_network_upgrade_activations(build_plan, &config.network_upgrade_activations)
+}
+
+fn validate_network_upgrade_activations(
+    build_plan: &zinder_store::CanonicalStoreBuildPlan,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<(), CanonicalConstructionError> {
     let store_network = build_plan.network();
-    let configured_network = config.network_upgrade_activations.network();
+    let configured_network = network_upgrade_activations.network();
     if configured_network != store_network {
         return Err(CanonicalConstructionError::NetworkMismatch {
             store_network,
@@ -246,9 +348,8 @@ fn validate_construction_identity(
         });
     }
     let store_fingerprint = build_plan.network_upgrade_activations_fingerprint();
-    let configured_fingerprint = config
-        .network_upgrade_activations
-        .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+    let configured_fingerprint =
+        network_upgrade_activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
     if configured_fingerprint != store_fingerprint {
         return Err(
             CanonicalConstructionError::NetworkUpgradeActivationsMismatch {

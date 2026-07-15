@@ -75,7 +75,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
         build_plan.clone(),
         resource_budget,
     )?;
-    let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
+    let outcome = load_fresh_canonical_blocks(builder, &source, &config).await?;
     let elapsed = construction_started_at.elapsed();
     let evidence = outcome.evidence;
     assert_eq!(evidence.block_count, u64::from(retained_block_count.get()));

@@ -7,7 +7,7 @@ use zinder_core::{
 
 use thiserror::Error;
 
-pub(super) const BLOCK_HEADER_VALUE_LEN: usize = 184;
+pub(in crate::canonical_store) const BLOCK_HEADER_VALUE_LEN: usize = 184;
 pub(super) const BLOCK_HASH_INDEX_RECORD_LEN: usize = 36;
 pub(super) const TRANSACTION_LOCATION_RECORD_LEN: usize = 72;
 
@@ -92,7 +92,7 @@ pub(super) fn encode_transaction_position(height: BlockHeight, transaction_index
     key
 }
 
-pub(super) fn encode_block_position(height: BlockHeight) -> [u8; 4] {
+pub(in crate::canonical_store) fn encode_block_position(height: BlockHeight) -> [u8; 4] {
     encode_height_key_ascending(height)
 }
 

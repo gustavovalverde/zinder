@@ -9,6 +9,7 @@ mod block_replay;
 mod builder;
 mod control;
 mod rocksdb;
+mod subtree_load;
 
 use std::{io, path::PathBuf};
 
@@ -25,6 +26,7 @@ use zinder_core::{
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use builder::RocksDbCanonicalBuilder;
 pub use rocksdb::RocksDbCanonicalStore;
+pub use subtree_load::{CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence};
 
 /// Exact persisted identity of the clean canonical store.
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
@@ -478,6 +480,32 @@ pub enum CanonicalStoreError {
     /// Persisted replay rows differ from the prepared canonical block sequence.
     #[error("canonical block replay readback does not match the prepared version-1 block sequence")]
     BlockLoadReadbackMismatch,
+
+    /// Subtree roots were requested before the canonical block families were complete.
+    #[error("canonical subtree roots require completed canonical block families")]
+    CanonicalBlocksNotLoaded,
+
+    /// Subtree roots were already loaded into this fresh build.
+    #[error("canonical subtree roots are already populated; full build cleanup is required")]
+    SubtreeRootLoadAlreadyLoaded,
+
+    /// Source subtree roots do not exactly cover the predecessor-to-tip ranges.
+    #[error("canonical subtree-root sequence is invalid: {reason}")]
+    SubtreeRootSequenceInvalid {
+        /// Exact source or chain-identity mismatch.
+        reason: String,
+    },
+
+    /// Persisted subtree-root rows differ from the authenticated source sequence.
+    #[error("canonical subtree-root readback does not match the authenticated source sequence")]
+    SubtreeRootReadbackMismatch,
+
+    /// The final source checkpoint does not authenticate the locally accumulated fixed tip.
+    #[error("canonical fixed-tip source checkpoint is invalid: {reason}")]
+    SourceTipCheckpointMismatch {
+        /// Exact identity, time, or frontier mismatch.
+        reason: String,
+    },
 }
 
 impl CanonicalStoreError {
@@ -503,6 +531,18 @@ impl CanonicalStoreError {
 
     fn block_load_sequence(reason: impl Into<String>) -> Self {
         Self::BlockLoadSequenceInvalid {
+            reason: reason.into(),
+        }
+    }
+
+    fn subtree_root_sequence(reason: impl Into<String>) -> Self {
+        Self::SubtreeRootSequenceInvalid {
+            reason: reason.into(),
+        }
+    }
+
+    fn source_tip_checkpoint(reason: impl Into<String>) -> Self {
+        Self::SourceTipCheckpointMismatch {
             reason: reason.into(),
         }
     }

@@ -23,7 +23,7 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
-    load_fresh_canonical_blocks,
+    load_fresh_canonical, load_fresh_canonical_blocks,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_source::{
@@ -42,6 +42,7 @@ use super::fixture_block::{fixture_ironwood_source_block, fixture_source_block};
 struct SingleBlockSource {
     block: SourceBlock,
     expected_predecessor: BlockId,
+    chain_checkpoint: Option<CommitmentTreeCheckpoint>,
     request_count: Arc<AtomicUsize>,
 }
 
@@ -50,8 +51,14 @@ impl SingleBlockSource {
         Self {
             block,
             expected_predecessor,
+            chain_checkpoint: None,
             request_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn with_chain_checkpoint(mut self, chain_checkpoint: CommitmentTreeCheckpoint) -> Self {
+        self.chain_checkpoint = Some(chain_checkpoint);
+        self
     }
 
     fn request_count(&self) -> usize {
@@ -93,6 +100,22 @@ impl NodeSource for SingleBlockSource {
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
         self.request_count.fetch_add(1, Ordering::Relaxed);
         Ok(BlockId::new(self.block.height, self.block.hash))
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        _network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.chain_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.block_id.height == height)
+            .cloned()
+            .ok_or_else(|| SourceError::BlockUnavailable {
+                height,
+                reason: "single-block source has no checkpoint at the requested height".to_owned(),
+            })
     }
 }
 
@@ -201,7 +224,7 @@ async fn load_ironwood_fixture(
     )?;
     let source = SingleBlockSource::new(source_block, checkpoint);
     let config = CanonicalConstructionConfig::for_local_tests(Duration::from_secs(5), activations);
-    let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
+    let outcome = load_fresh_canonical_blocks(builder, &source, &config).await?;
     Ok((temporary, store_path, outcome, expected_tip_metadata))
 }
 
@@ -257,7 +280,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
     let source = SingleBlockSource::new(source_block, history_predecessor);
     let config = CanonicalConstructionConfig::for_local_tests(Duration::from_secs(5), activations);
 
-    let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
+    let outcome = load_fresh_canonical_blocks(builder, &source, &config).await?;
     assert_eq!(outcome.builder.build_plan().build_tip(), fixed_tip);
     assert_eq!(outcome.evidence.block_count, 1);
     assert_eq!(outcome.evidence.tip_height, fixed_tip.height);
@@ -304,6 +327,50 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
 }
 
 #[tokio::test]
+async fn canonical_source_families_authenticate_empty_subtree_ranges_and_fixed_tip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_block = fixture_source_block()?;
+    let fixed_tip = BlockId::new(source_block.height, source_block.hash);
+    let activations = regtest_activations();
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        &activations,
+        source_block.block_time_seconds.saturating_sub(1),
+        fixed_tip,
+    )?;
+    let history_predecessor = build_plan.history_predecessor().block_id;
+    let source_checkpoint = CommitmentTreeCheckpoint::new(
+        fixed_tip,
+        source_block.block_time_seconds,
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+            None,
+            None,
+        ),
+    );
+    let temporary = TempDir::new()?;
+    let builder = RocksDbCanonicalBuilder::create_fresh(
+        temporary.path().join("canonical"),
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let source = SingleBlockSource::new(source_block, history_predecessor)
+        .with_chain_checkpoint(source_checkpoint);
+    let config = CanonicalConstructionConfig::for_local_tests(
+        Duration::from_secs(5),
+        Arc::clone(&activations),
+    );
+
+    let source_outcome = load_fresh_canonical(builder, &source, &config).await?;
+
+    assert_eq!(source_outcome.block_evidence.block_count, 1);
+    assert_eq!(source_outcome.subtree_root_evidence.subtree_root_count, 0);
+    assert!(source_outcome.builder.is_source_tip_checkpoint_confirmed());
+    assert_eq!(source.request_count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn canonical_construction_rejects_source_blocks_from_another_network()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_block = fixture_source_block()?;
@@ -331,7 +398,7 @@ async fn canonical_construction_rejects_source_blocks_from_another_network()
     );
     let config = CanonicalConstructionConfig::for_local_tests(Duration::from_secs(5), activations);
 
-    let error = load_fresh_canonical_blocks(builder, &source, config)
+    let error = load_fresh_canonical_blocks(builder, &source, &config)
         .await
         .err()
         .ok_or("wrong-network source block must be rejected")?;
@@ -386,7 +453,7 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
     let source = SingleBlockSource::new(source_block, history_predecessor);
     let config = CanonicalConstructionConfig::for_local_tests(Duration::from_secs(5), activations);
 
-    let error = load_fresh_canonical_blocks(builder, &source, config)
+    let error = load_fresh_canonical_blocks(builder, &source, &config)
         .await
         .err()
         .ok_or("activation mismatch must be rejected")?;

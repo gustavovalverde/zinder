@@ -18,15 +18,16 @@ use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock
 
 use self::{
     codec::{
-        BLOCK_HASH_INDEX_RECORD_LEN, BLOCK_HEADER_VALUE_LEN, TRANSACTION_LOCATION_RECORD_LEN,
+        BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN,
         decode_block_final_note_commitment_roots, decode_tree_state_checkpoint,
         encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
-        encode_block_position, encode_transaction_location, encode_transaction_position,
-        encode_tree_state_checkpoint,
+        encode_transaction_location, encode_transaction_position, encode_tree_state_checkpoint,
     },
     fixed_record_sort::{FixedRecordSorter, record_capacity},
     ordered_sst::{OrderedSstSet, SstArtifacts},
 };
+
+pub(super) use self::codec::{BLOCK_HEADER_VALUE_LEN, encode_block_position};
 
 use super::{
     CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
@@ -500,6 +501,52 @@ pub(super) fn validate_persisted_commitment_tree_families(
 ) -> Result<(), CanonicalStoreError> {
     validate_persisted_tree_state_checkpoints(db, build_plan, evidence)?;
     validate_persisted_block_final_note_commitment_roots(db, workload, build_plan, evidence)
+}
+
+pub(super) fn validate_source_tip_checkpoint(
+    db: &DB,
+    build_plan: &CanonicalStoreBuildPlan,
+    evidence: &CanonicalBlockLoadEvidence,
+    source_checkpoint: &CommitmentTreeCheckpoint,
+) -> Result<(), CanonicalStoreError> {
+    let expected_tip = build_plan.build_tip();
+    if source_checkpoint.block_id != expected_tip
+        || source_checkpoint.tip_metadata() != evidence.tip_metadata
+    {
+        return Err(CanonicalStoreError::source_tip_checkpoint(
+            "source checkpoint identity or tree positions differ from the fixed canonical tip",
+        ));
+    }
+    let family = db
+        .cf_handle(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
+        .ok_or_else(|| {
+            CanonicalStoreError::source_tip_checkpoint(
+                "tree_state_checkpoint column family is absent",
+            )
+        })?;
+    let encoded_checkpoint = db
+        .get_cf(&family, encode_block_position(expected_tip.height))
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "read fixed-tip tree-state checkpoint",
+            source,
+        })?
+        .ok_or_else(|| {
+            CanonicalStoreError::source_tip_checkpoint("fixed-tip tree-state checkpoint is absent")
+        })?;
+    let (block_time_seconds, frontiers) = decode_tree_state_checkpoint(&encoded_checkpoint)
+        .map_err(|source| {
+            CanonicalStoreError::source_tip_checkpoint(format!(
+                "fixed-tip tree-state checkpoint is invalid: {source}"
+            ))
+        })?;
+    if block_time_seconds != source_checkpoint.block_time_seconds
+        || frontiers != source_checkpoint.frontiers
+    {
+        return Err(CanonicalStoreError::source_tip_checkpoint(
+            "persisted fixed-tip checkpoint differs from the source-authenticated checkpoint",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_persisted_tree_state_checkpoints(

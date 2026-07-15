@@ -4,8 +4,9 @@ use std::num::NonZeroU32;
 
 use async_trait::async_trait;
 use zinder_core::{
-    BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult,
+    BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, CommitmentTreeCheckpoint,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBroadcastResult,
 };
 
 use crate::{
@@ -98,6 +99,18 @@ pub trait NodeSource: Send + Sync + 'static {
         block_id: BlockId,
     ) -> Result<SourceTreeState, SourceError> {
         let _ = block_id;
+        Err(SourceError::NodeCapabilityMissing {
+            capability: crate::NodeCapability::TreeState,
+        })
+    }
+
+    /// Fetches one source-authenticated checkpoint with validated typed frontiers.
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        let _ = (height, network_upgrade_activations);
         Err(SourceError::NodeCapabilityMissing {
             capability: crate::NodeCapability::TreeState,
         })

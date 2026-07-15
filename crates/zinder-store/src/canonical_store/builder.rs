@@ -12,12 +12,17 @@ use super::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
         CanonicalBlockSstConfig, CanonicalBuildBlock, REVERSE_INDEX_SORT_MEMORY_BYTES,
         canonical_block_families_are_empty, ingest_canonical_block_ssts,
-        validate_persisted_commitment_tree_families, write_canonical_block_ssts,
+        validate_persisted_commitment_tree_families, validate_source_tip_checkpoint,
+        write_canonical_block_ssts,
     },
     block_replay::validate_persisted_block_replays,
     rocksdb::{
         canonical_column_family_descriptors, canonical_data_options, canonical_store_path,
         create_fresh_directory, initialize_store_identity, validate_resource_budget,
+    },
+    subtree_load::{
+        CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence, load_subtree_roots,
+        required_subtree_root_ranges,
     },
 };
 
@@ -32,7 +37,9 @@ pub struct RocksDbCanonicalBuilder {
     network: Network,
     workload: CanonicalStoreWorkload,
     build_plan: CanonicalStoreBuildPlan,
-    canonical_blocks_loaded: bool,
+    canonical_block_evidence: Option<CanonicalBlockLoadEvidence>,
+    subtree_root_evidence: Option<CanonicalSubtreeRootLoadEvidence>,
+    confirmed_source_tip_checkpoint: Option<zinder_core::CommitmentTreeCheckpoint>,
     _cursor_auth_key: [u8; 32],
 }
 
@@ -72,7 +79,9 @@ impl RocksDbCanonicalBuilder {
             network,
             workload,
             build_plan,
-            canonical_blocks_loaded: false,
+            canonical_block_evidence: None,
+            subtree_root_evidence: None,
+            confirmed_source_tip_checkpoint: None,
             _cursor_auth_key: cursor_auth_key,
         })
     }
@@ -128,7 +137,7 @@ impl RocksDbCanonicalBuilder {
         sst_target_logical_bytes: u64,
         reverse_index_sort_memory_bytes: usize,
     ) -> Result<CanonicalBlockLoadEvidence, CanonicalStoreBuildError<SourceError>> {
-        if self.canonical_blocks_loaded
+        if self.canonical_block_evidence.is_some()
             || !canonical_block_families_are_empty(&self.bounded_open.db)?
         {
             return Err(CanonicalStoreError::BlockLoadAlreadyLoaded.into());
@@ -161,8 +170,69 @@ impl RocksDbCanonicalBuilder {
             &evidence,
         )?;
         staging.remove()?;
-        self.canonical_blocks_loaded = true;
+        self.canonical_block_evidence = Some(evidence);
         Ok(evidence)
+    }
+
+    /// Returns the exact non-empty source ranges required after the block load.
+    pub fn required_subtree_root_ranges(
+        &self,
+    ) -> Result<Vec<zinder_core::SubtreeRootRange>, CanonicalStoreError> {
+        let block_evidence = self
+            .canonical_block_evidence
+            .as_ref()
+            .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
+        required_subtree_root_ranges(
+            self.build_plan.history_predecessor().tip_metadata(),
+            block_evidence.tip_metadata,
+        )
+    }
+
+    /// Atomically loads every source-authenticated completed subtree root.
+    pub fn load_subtree_roots(
+        &mut self,
+        subtree_roots: impl IntoIterator<Item = CanonicalBuildSubtreeRoot>,
+    ) -> Result<CanonicalSubtreeRootLoadEvidence, CanonicalStoreError> {
+        if self.subtree_root_evidence.is_some() {
+            return Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded);
+        }
+        let block_evidence = self
+            .canonical_block_evidence
+            .as_ref()
+            .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
+        let evidence = load_subtree_roots(
+            &self.bounded_open.db,
+            &self.build_plan,
+            block_evidence,
+            subtree_roots,
+        )?;
+        self.subtree_root_evidence = Some(evidence);
+        Ok(evidence)
+    }
+
+    /// Confirms that the persisted exact-tip frontier matches a final source observation.
+    pub fn confirm_source_tip_checkpoint(
+        &mut self,
+        source_checkpoint: &zinder_core::CommitmentTreeCheckpoint,
+    ) -> Result<(), CanonicalStoreError> {
+        let block_evidence = self
+            .canonical_block_evidence
+            .as_ref()
+            .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
+        validate_source_tip_checkpoint(
+            &self.bounded_open.db,
+            &self.build_plan,
+            block_evidence,
+            source_checkpoint,
+        )?;
+        self.confirmed_source_tip_checkpoint = Some(source_checkpoint.clone());
+        Ok(())
+    }
+
+    /// Returns whether the exact fixed tip was authenticated against the source.
+    #[must_use]
+    pub const fn is_source_tip_checkpoint_confirmed(&self) -> bool {
+        self.confirmed_source_tip_checkpoint.is_some()
     }
 
     /// Returns the filesystem I/O mode selected by the bounded `RocksDB` open.
@@ -317,6 +387,65 @@ mod tests {
         assert_eq!(evidence.block_blob_count, 0);
         assert_eq!(evidence.tip_metadata, ChainTipMetadata::new(0, 0, 0));
         assert_eq!(evidence.tree_state_checkpoint_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn subtree_root_load_requires_blocks_and_is_atomic_and_single_use()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let mut store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
+        assert!(matches!(
+            store.required_subtree_root_ranges(),
+            Err(CanonicalStoreError::CanonicalBlocksNotLoaded)
+        ));
+
+        let first = canonical_build_block(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        let mut tip = canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32]);
+        add_tree_state_checkpoint(&mut tip)?;
+        store.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok(tip)])?;
+        assert!(store.required_subtree_root_ranges()?.is_empty());
+
+        let unexpected_root = CanonicalBuildSubtreeRoot {
+            protocol: zinder_core::ShieldedProtocol::Sapling,
+            subtree_index: zinder_core::SubtreeRootIndex::new(0),
+            root_hash: zinder_core::SubtreeRootHash::from_bytes([7; 32]),
+            completing_block_height: BlockHeight::new(1),
+        };
+        assert!(matches!(
+            store.load_subtree_roots([unexpected_root]),
+            Err(CanonicalStoreError::SubtreeRootSequenceInvalid { .. })
+        ));
+
+        let evidence = store.load_subtree_roots(std::iter::empty())?;
+        assert_eq!(evidence.subtree_root_count, 0);
+        assert_eq!(evidence.subtree_root_logical_bytes, 0);
+        let wrong_tip = zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([9; 32])),
+            2,
+            zinder_core::CommitmentTreeFrontiers::default(),
+        );
+        assert!(matches!(
+            store.confirm_source_tip_checkpoint(&wrong_tip),
+            Err(CanonicalStoreError::SourceTipCheckpointMismatch { .. })
+        ));
+        assert!(!store.is_source_tip_checkpoint_confirmed());
+        let source_tip = zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            2,
+            zinder_core::CommitmentTreeFrontiers::default(),
+        );
+        store.confirm_source_tip_checkpoint(&source_tip)?;
+        assert!(store.is_source_tip_checkpoint_confirmed());
+        assert!(matches!(
+            store.load_subtree_roots(std::iter::empty()),
+            Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded)
+        ));
         Ok(())
     }
 

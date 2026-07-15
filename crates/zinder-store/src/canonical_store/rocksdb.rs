@@ -30,7 +30,7 @@ pub(super) const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
 pub(super) const TREE_STATE_CHECKPOINT_COLUMN_FAMILY: &str = "tree_state_checkpoint";
 pub(super) const BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str =
     "block_final_note_commitment_roots";
-const SUBTREE_ROOT_COLUMN_FAMILY: &str = "subtree_root";
+pub(super) const SUBTREE_ROOT_COLUMN_FAMILY: &str = "subtree_root";
 const CHAIN_EPOCH_COLUMN_FAMILY: &str = "chain_epoch";
 const CHAIN_EVENT_COLUMN_FAMILY: &str = "chain_event";
 const MEMPOOL_EVENT_COLUMN_FAMILY: &str = "mempool_event";
