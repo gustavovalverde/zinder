@@ -10,8 +10,8 @@ use zinder_core::{
     CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore,
-    RawBlobRetention, SecondaryChainStore, StoreError,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainStoreOptions, PrimaryChainStore, RawBlobRetention,
+    SecondaryChainStore, StoreError,
 };
 
 #[test]
@@ -45,7 +45,7 @@ fn secondary_catches_up_after_primary_commits() -> eyre::Result<()> {
     let primary = PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
 
     let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
-    primary.commit_chain_epoch(ChainEpochArtifacts::new(
+    primary.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         first_epoch,
         vec![first_block],
         vec![first_compact_block],
@@ -59,7 +59,7 @@ fn secondary_catches_up_after_primary_commits() -> eyre::Result<()> {
     assert_eq!(secondary.current_chain_epoch()?, Some(first_epoch));
 
     let (second_epoch, second_block, second_compact_block) = synthetic_epoch(2, 2);
-    primary.commit_chain_epoch(ChainEpochArtifacts::new(
+    primary.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         second_epoch,
         vec![second_block.clone()],
         vec![second_compact_block],
@@ -119,13 +119,13 @@ fn secondary_continues_serving_after_primary_drops() -> eyre::Result<()> {
     let final_epoch = {
         let primary = PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
         let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
-        primary.commit_chain_epoch(ChainEpochArtifacts::new(
+        primary.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
             first_epoch,
             vec![first_block],
             vec![first_compact_block],
         ))?;
         let (second_epoch, second_block, second_compact_block) = synthetic_epoch(2, 2);
-        primary.commit_chain_epoch(ChainEpochArtifacts::new(
+        primary.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
             second_epoch,
             vec![second_block],
             vec![second_compact_block],
@@ -163,7 +163,7 @@ fn checkpoint_round_trip_preserves_visible_epoch() -> eyre::Result<()> {
     let primary = PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
 
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-    primary.commit_chain_epoch(ChainEpochArtifacts::new(
+    primary.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block.clone()],
         vec![compact_block],
@@ -212,7 +212,7 @@ fn secondary_reads_persisted_raw_blob_retention_after_catch_up() -> eyre::Result
 }
 
 #[test]
-fn primary_reopen_overwrites_raw_blob_retention_signal() -> eyre::Result<()> {
+fn empty_primary_reopen_can_change_raw_blob_retention() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let primary_path = tempdir.path().join("primary");
     {
@@ -234,6 +234,58 @@ fn primary_reopen_overwrites_raw_blob_retention_signal() -> eyre::Result<()> {
         },
     )?;
     assert_eq!(primary.raw_blob_retention()?, RawBlobRetention::All);
+
+    Ok(())
+}
+
+#[test]
+fn committed_primary_reopen_rejects_raw_blob_retention_change() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let primary_path = tempdir.path().join("primary");
+    let committed_epoch;
+    {
+        let primary = PrimaryChainStore::open(
+            &primary_path,
+            ChainStoreOptions {
+                raw_blob_retention: RawBlobRetention::None,
+                ..ChainStoreOptions::for_local_tests()
+            },
+        )?;
+        let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+        committed_epoch = chain_epoch;
+        primary.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
+            chain_epoch,
+            vec![block],
+            vec![compact_block],
+        ))?;
+    }
+
+    let Err(error) = PrimaryChainStore::open(
+        &primary_path,
+        ChainStoreOptions {
+            raw_blob_retention: RawBlobRetention::All,
+            ..ChainStoreOptions::for_local_tests()
+        },
+    ) else {
+        return Err(eyre!("expected retention mismatch on committed store"));
+    };
+    assert!(matches!(
+        error,
+        StoreError::RawBlobRetentionMismatch {
+            persisted: RawBlobRetention::None,
+            configured: RawBlobRetention::All,
+        }
+    ));
+
+    let reopened = PrimaryChainStore::open(
+        &primary_path,
+        ChainStoreOptions {
+            raw_blob_retention: RawBlobRetention::None,
+            ..ChainStoreOptions::for_local_tests()
+        },
+    )?;
+    assert_eq!(reopened.raw_blob_retention()?, RawBlobRetention::None);
+    assert_eq!(reopened.current_chain_epoch()?, Some(committed_epoch));
 
     Ok(())
 }

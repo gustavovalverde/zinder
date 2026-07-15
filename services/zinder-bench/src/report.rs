@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use clap::ValueEnum;
 use serde::Serialize;
-use zinder_core::CanonicalBlockFactsReplayFormatVersion;
+use zinder_core::CanonicalBlockReplayFormatVersion;
 use zinder_store::RocksDbResourceBudget;
 
 use crate::{
@@ -645,7 +645,7 @@ pub enum CanonicalBlockFactsStorageEvidence {
         /// Whether the candidate fact table is durable and WAL logged.
         tables_logged: bool,
         /// Explicit TOAST compression used for canonical replay encodings.
-        replay_encoding_compression: &'static str,
+        replay_envelope_compression: &'static str,
         /// Queried performance and durability settings for the measured database arm.
         server_settings: Box<PostgresCanonicalFactServerSettings>,
         /// Bytes owned by the canonical-fact heap and its auxiliary forks.
@@ -871,7 +871,7 @@ impl BenchmarkReport {
             Self::CurrentSchemaFixtureReplay(report) => report.validate_acceptance(),
             Self::CanonicalBlockFactsRoundTrip(report) => {
                 if report.round_trip.replay_format_version
-                    != CanonicalBlockFactsReplayFormatVersion::CURRENT.value()
+                    != CanonicalBlockReplayFormatVersion::CURRENT.value()
                     || !report.round_trip.semantic_replay_validated
                 {
                     return Err(BenchError::canonical_fact_sequence_mismatch(
@@ -1502,7 +1502,7 @@ mod tests {
         ));
         assert_eq!(report.provenance.run.started_at_unix_millis, 1_000);
         assert_eq!(report.provenance.run.completed_at_unix_millis, 14_000);
-        assert_eq!(report.fixture.fixture_format_version, 3);
+        assert_eq!(report.fixture.fixture_format_version, 4);
         assert_eq!(
             report.fixture.current_schema_oracle_artifact_schema_version,
             18
@@ -1740,12 +1740,12 @@ mod tests {
                 logical_fact_bytes: 4_096,
                 physical_storage_bytes: 8_192,
                 persisted_sequence_digest: CanonicalFactSequenceDigestSummary {
-                    block_digest_version: 1,
+                    block_digest_version: 2,
                     sequence_digest_version: 1,
                     block_count: 10,
                     sha256: "persisted-digest".to_owned(),
                 },
-                replay_format_version: 1,
+                replay_format_version: 2,
                 semantic_replay_validated: true,
                 storage: CanonicalBlockFactsStorageEvidence::RocksDb {
                     storage_schema_version: 2,
@@ -1781,7 +1781,7 @@ mod tests {
 
         assert_eq!(json["measurement_kind"], "canonical-block-facts-round-trip");
         assert_eq!(json["storage_candidate"]["id"], "rocksdb-fact-first");
-        assert_eq!(json["round_trip"]["replay_format_version"], 1);
+        assert_eq!(json["round_trip"]["replay_format_version"], 2);
         assert_eq!(json["round_trip"]["semantic_replay_validated"], true);
         assert_eq!(json["provenance"]["run"]["trial_id"], "trial-01");
         assert_eq!(json["provenance"]["run"]["fixture_cache_policy"], "warm");
@@ -1814,11 +1814,11 @@ mod tests {
 
     fn fixture_summary() -> FixtureSummary {
         FixtureSummary {
-            fixture_format_version: 3,
+            fixture_format_version: 4,
             current_schema_oracle_artifact_schema_version: 18,
             canonical_block_facts_digest_evidence:
                 crate::fixture::CanonicalBlockFactsDigestEvidence {
-                    block_digest_version: 1,
+                    block_digest_version: 2,
                     sequence_digest_version: 1,
                     block_count: 10,
                     sequence_digest_sha256: "persisted-digest".to_owned(),

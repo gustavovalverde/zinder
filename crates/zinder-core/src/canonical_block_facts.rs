@@ -4,10 +4,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    BlockHeaderArtifact, CompactBlockArtifact, ConsensusBranchId, LockTime, PrivacyShape,
-    TransactionComponentCounts, TransactionIntrinsicValueBalances, TransactionPublicFacts,
-    TransactionVersion, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
-    UnsupportedSection,
+    BlockHeaderArtifact, ConsensusBranchId, LockTime, PrivacyShape, TransactionComponentCounts,
+    TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
+    TransparentInputFact, TransparentOutPoint, TransparentOutputFact, UnsupportedSection,
 };
 
 const BLOCK_DIGEST_DOMAIN: &[u8] = b"zinder:canonical-block-facts:sha256\0";
@@ -22,19 +21,23 @@ const SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder:canonical-block-facts:ordered-seq
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum CanonicalBlockFactsDigestVersion {
-    /// Initial explicit tagged encoding covering every canonical block fact.
-    V1,
+    /// Fact-only tagged encoding after retained raw bytes became a separate contract.
+    ///
+    /// Numeric version 1 was used by a pre-release encoding that included raw
+    /// block and transaction bytes. It is deliberately unsupported rather than
+    /// reinterpreted under this incompatible semantic shape.
+    V2,
 }
 
 impl CanonicalBlockFactsDigestVersion {
     /// Version emitted by new reference-digest computations.
-    pub const CURRENT: Self = Self::V1;
+    pub const CURRENT: Self = Self::V2;
 
     /// Returns the stable numeric version written into digest preimages.
     #[must_use]
     pub const fn value(self) -> u16 {
         match self {
-            Self::V1 => 1,
+            Self::V2 => 2,
         }
     }
 }
@@ -51,7 +54,7 @@ impl TryFrom<u16> for CanonicalBlockFactsDigestVersion {
 
     fn try_from(encoded_version: u16) -> Result<Self, Self::Error> {
         match encoded_version {
-            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
             _ => Err(UnsupportedCanonicalBlockFactsDigestVersion { encoded_version }),
         }
     }
@@ -73,6 +76,34 @@ pub struct CanonicalBlockFactsReferenceEncoding {
 pub struct CanonicalBlockFactsDigest {
     version: CanonicalBlockFactsDigestVersion,
     bytes: [u8; 32],
+}
+
+/// SHA-256 commitment to one exact consensus-serialized byte sequence.
+///
+/// This digest is not a block hash or transaction ID. It binds optional raw
+/// payload retention to the canonical facts without placing the payload bytes
+/// themselves in the replay contract.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SerializedBytesDigest([u8; 32]);
+
+impl SerializedBytesDigest {
+    /// Computes the digest of one exact serialized byte sequence.
+    #[must_use]
+    pub fn from_serialized_bytes(serialized_bytes: &[u8]) -> Self {
+        Self(Sha256::digest(serialized_bytes).into())
+    }
+
+    /// Reconstructs a digest previously stored in a validated wire record.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the committed SHA-256 bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
 }
 
 /// Version of the ordered canonical-fact sequence digest algorithm.
@@ -127,7 +158,7 @@ impl CanonicalBlockFactsDigest {
         reference_encoding: &[u8],
     ) -> Self {
         let bytes = match version {
-            CanonicalBlockFactsDigestVersion::V1 => {
+            CanonicalBlockFactsDigestVersion::V2 => {
                 sha256_domain_and_bytes(BLOCK_DIGEST_DOMAIN, reference_encoding)
             }
         };
@@ -264,7 +295,7 @@ impl CanonicalBlockFactsSequenceDigestBuilder {
             .checked_add(1)
             .ok_or(CanonicalBlockFactsSequenceLengthOverflow)?;
         let CanonicalBlockFactsDigest { version, bytes } = digest;
-        let mut block_digest_encoding = FactsV1Encoder::new();
+        let mut block_digest_encoding = TaggedFactsEncoder::new();
         block_digest_encoding.field(1, &version.value().to_le_bytes());
         block_digest_encoding.field(2, &bytes);
         self.ordered_item_hasher
@@ -282,7 +313,7 @@ impl CanonicalBlockFactsSequenceDigestBuilder {
             block_count,
         } = self;
         let ordered_item_digest: [u8; 32] = ordered_item_hasher.finalize().into();
-        let mut sequence = FactsV1Encoder::new();
+        let mut sequence = TaggedFactsEncoder::new();
         sequence.field(1, &sequence_version.value().to_le_bytes());
         sequence.field(2, &block_count.to_le_bytes());
         sequence.field(3, &ordered_item_digest);
@@ -304,27 +335,28 @@ impl CanonicalBlockFactsSequenceDigestBuilder {
 pub struct CanonicalTransactionFacts {
     /// Public transaction identity and scalar protocol facts.
     pub public_facts: TransactionPublicFacts,
+    /// Commitment to the exact consensus-serialized transaction bytes.
+    pub serialized_bytes_digest: SerializedBytesDigest,
     /// Transaction-intrinsic shielded-pool balances.
     pub intrinsic_value_balances: TransactionIntrinsicValueBalances,
     /// Ordered transparent inputs observed in the transaction.
     pub transparent_inputs: Vec<TransparentInputFact>,
     /// Ordered transparent outputs created by the transaction.
     pub transparent_outputs: Vec<TransparentOutputFact>,
-    /// Optional serialized consensus transaction bytes.
-    pub raw_transaction_bytes: Option<Vec<u8>>,
 }
 
-/// Source-block-local canonical facts and optionally retained payloads.
+/// Source-block-local canonical facts used by deterministic projections.
 ///
 /// Every field is immutable and computable from one source block. Chain
-/// position, resolved transparent spends, and address indexes are deliberately
-/// absent because they require ordered cross-block state.
+/// position, resolved transparent spends, address indexes, and retention-policy
+/// payload blobs are deliberately absent. The same source block therefore has
+/// one fact identity under every raw-blob retention policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalBlockFacts {
     /// Canonical block-header facts.
     pub block_header: BlockHeaderArtifact,
-    /// Optional serialized consensus block bytes.
-    pub raw_block_bytes: Option<Vec<u8>>,
+    /// Commitment to the exact consensus-serialized block bytes.
+    pub serialized_bytes_digest: SerializedBytesDigest,
     /// Transactions in canonical block order.
     pub transactions: Vec<CanonicalTransactionFacts>,
 }
@@ -342,7 +374,7 @@ impl CanonicalBlockFacts {
         version: CanonicalBlockFactsDigestVersion,
     ) -> CanonicalBlockFactsReferenceEncoding {
         let bytes = match version {
-            CanonicalBlockFactsDigestVersion::V1 => reference_encoding_v1(self, version),
+            CanonicalBlockFactsDigestVersion::V2 => reference_encoding_v2(self, version),
         };
         CanonicalBlockFactsReferenceEncoding { version, bytes }
     }
@@ -358,35 +390,19 @@ impl CanonicalBlockFacts {
     }
 }
 
-/// Canonical block facts placed at an ordered commitment-tree position.
-///
-/// The block-local facts remain intact while the compact block and tip
-/// metadata carry the chain-prefix position assigned during serial
-/// finalization. Resolved spend and projection state remain outside this
-/// boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PositionedCanonicalBlock {
-    /// Immutable facts parsed from the source block.
-    pub facts: CanonicalBlockFacts,
-    /// Lightwalletd compact block with final chain metadata stamped.
-    pub compact_block: CompactBlockArtifact,
-    /// Running commitment-tree position after this block.
-    pub tip_metadata: crate::ChainTipMetadata,
-}
-
-fn reference_encoding_v1(
+fn reference_encoding_v2(
     facts: &CanonicalBlockFacts,
     version: CanonicalBlockFactsDigestVersion,
 ) -> Vec<u8> {
     let CanonicalBlockFacts {
         block_header,
-        raw_block_bytes,
+        serialized_bytes_digest,
         transactions,
     } = facts;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &version.value().to_le_bytes());
     fields.field(2, &encode_block_header(block_header));
-    fields.field(3, &encode_optional_raw_bytes(raw_block_bytes.as_deref()));
+    fields.field(3, &serialized_bytes_digest.as_bytes());
     fields.field(
         4,
         &encode_sequence(transactions, encode_canonical_transaction_facts),
@@ -407,7 +423,7 @@ fn encode_block_header(header: &BlockHeaderArtifact) -> Vec<u8> {
         version: block_version,
         block_size_bytes,
     } = header;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &height.value().to_le_bytes());
     fields.field(2, &block_hash.as_bytes());
     fields.field(3, &parent_hash.as_bytes());
@@ -421,28 +437,15 @@ fn encode_block_header(header: &BlockHeaderArtifact) -> Vec<u8> {
     fields.into_bytes()
 }
 
-fn encode_optional_raw_bytes(raw_bytes: Option<&[u8]>) -> Vec<u8> {
-    let mut optional_bytes_encoding = Vec::new();
-    match raw_bytes {
-        None => optional_bytes_encoding.push(0),
-        Some(raw_bytes) => {
-            optional_bytes_encoding.push(1);
-            push_length(&mut optional_bytes_encoding, raw_bytes.len());
-            optional_bytes_encoding.extend_from_slice(raw_bytes);
-        }
-    }
-    optional_bytes_encoding
-}
-
 fn encode_canonical_transaction_facts(facts: &CanonicalTransactionFacts) -> Vec<u8> {
     let CanonicalTransactionFacts {
         public_facts,
+        serialized_bytes_digest,
         intrinsic_value_balances,
         transparent_inputs,
         transparent_outputs,
-        raw_transaction_bytes,
     } = facts;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &encode_transaction_public_facts(public_facts));
     fields.field(
         2,
@@ -456,10 +459,7 @@ fn encode_canonical_transaction_facts(facts: &CanonicalTransactionFacts) -> Vec<
         4,
         &encode_sequence(transparent_outputs, encode_transparent_output_fact),
     );
-    fields.field(
-        5,
-        &encode_optional_raw_bytes(raw_transaction_bytes.as_deref()),
-    );
+    fields.field(5, &serialized_bytes_digest.as_bytes());
     fields.into_bytes()
 }
 
@@ -481,7 +481,7 @@ fn encode_transaction_public_facts(facts: &TransactionPublicFacts) -> Vec<u8> {
         is_coinbase,
         unsupported_sections,
     } = facts;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &transaction_id.as_bytes());
     fields.field(
         2,
@@ -518,7 +518,7 @@ fn encode_transaction_public_facts(facts: &TransactionPublicFacts) -> Vec<u8> {
 }
 
 fn encode_transaction_version(version: TransactionVersion) -> Vec<u8> {
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     match version {
         TransactionVersion::V1 => fields.field(1, &[1]),
         TransactionVersion::V2 => fields.field(1, &[2]),
@@ -539,7 +539,7 @@ fn encode_transaction_version(version: TransactionVersion) -> Vec<u8> {
 }
 
 fn encode_lock_time(lock_time: LockTime) -> Vec<u8> {
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     match lock_time {
         LockTime::Unlocked => fields.field(1, &[1]),
         LockTime::Height(height) => {
@@ -564,7 +564,7 @@ fn encode_transaction_counts(counts: TransactionComponentCounts) -> Vec<u8> {
         ironwood_action_count,
         sprout_joinsplit_count,
     } = counts;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &transparent_input_count.to_le_bytes());
     fields.field(2, &transparent_output_count.to_le_bytes());
     fields.field(3, &sapling_spend_count.to_le_bytes());
@@ -601,7 +601,7 @@ fn encode_transparent_input_fact(input: &TransparentInputFact) -> Vec<u8> {
         input_index,
         spent_outpoint,
     } = input;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &input_index.to_le_bytes());
     fields.field(2, &encode_transparent_outpoint(spent_outpoint));
     fields.into_bytes()
@@ -614,7 +614,7 @@ fn encode_transparent_output_fact(output: &TransparentOutputFact) -> Vec<u8> {
         script_pub_key,
         address_script_hash,
     } = output;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &output_index.to_le_bytes());
     fields.field(2, &value_zat.to_le_bytes());
     fields.field(3, script_pub_key);
@@ -629,7 +629,7 @@ fn encode_intrinsic_value_balances(value_balances: &TransactionIntrinsicValueBal
         orchard_zat,
         ironwood_zat,
     } = value_balances;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &sprout_zat.to_le_bytes());
     fields.field(2, &sapling_zat.to_le_bytes());
     fields.field(3, &orchard_zat.to_le_bytes());
@@ -642,7 +642,7 @@ fn encode_transparent_outpoint(outpoint: &TransparentOutPoint) -> Vec<u8> {
         transaction_id,
         output_index,
     } = outpoint;
-    let mut fields = FactsV1Encoder::new();
+    let mut fields = TaggedFactsEncoder::new();
     fields.field(1, &transaction_id.as_bytes());
     fields.field(2, &output_index.to_le_bytes());
     fields.into_bytes()
@@ -695,7 +695,7 @@ fn encode_sequence<T>(sequence_entries: &[T], encode_entry: impl Fn(&T) -> Vec<u
     encoded
 }
 
-fn sha256_domain_and_fields(domain: &[u8], fields: FactsV1Encoder) -> [u8; 32] {
+fn sha256_domain_and_fields(domain: &[u8], fields: TaggedFactsEncoder) -> [u8; 32] {
     sha256_domain_and_bytes(domain, &fields.into_bytes())
 }
 
@@ -713,11 +713,11 @@ fn push_length(output: &mut Vec<u8>, length: usize) {
     output.extend_from_slice(&length.to_le_bytes());
 }
 
-struct FactsV1Encoder {
+struct TaggedFactsEncoder {
     bytes: Vec<u8>,
 }
 
-impl FactsV1Encoder {
+impl TaggedFactsEncoder {
     fn new() -> Self {
         Self { bytes: Vec::new() }
     }
@@ -740,7 +740,7 @@ mod tests {
         CanonicalBlockFactsReferenceEncoding, CanonicalBlockFactsSequenceDigestBuilder,
         CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockFactsSequenceLengthOverflow,
     };
-    use crate::{BlockHash, BlockHeaderArtifact, BlockHeight};
+    use crate::{BlockHash, BlockHeaderArtifact, BlockHeight, SerializedBytesDigest};
 
     #[test]
     fn reference_encoding_recomputes_the_canonical_digest_from_stored_bytes() {
@@ -775,11 +775,12 @@ mod tests {
     #[test]
     fn persisted_digest_versions_fail_closed_when_unknown() {
         assert_eq!(
-            CanonicalBlockFactsDigestVersion::try_from(1),
-            Ok(CanonicalBlockFactsDigestVersion::V1)
+            CanonicalBlockFactsDigestVersion::try_from(2),
+            Ok(CanonicalBlockFactsDigestVersion::V2)
         );
         assert!(CanonicalBlockFactsDigestVersion::try_from(0).is_err());
-        assert!(CanonicalBlockFactsDigestVersion::try_from(2).is_err());
+        assert!(CanonicalBlockFactsDigestVersion::try_from(1).is_err());
+        assert!(CanonicalBlockFactsDigestVersion::try_from(3).is_err());
         assert_eq!(
             CanonicalBlockFactsSequenceDigestVersion::try_from(1),
             Ok(CanonicalBlockFactsSequenceDigestVersion::V1)
@@ -798,7 +799,7 @@ mod tests {
         };
         let before_append = builder.clone().finish();
         let digest = CanonicalBlockFactsDigest {
-            version: CanonicalBlockFactsDigestVersion::V1,
+            version: CanonicalBlockFactsDigestVersion::V2,
             bytes: [0xA5; 32],
         };
 
@@ -823,7 +824,7 @@ mod tests {
                 4,
                 128,
             ),
-            raw_block_bytes: Some(vec![0xAA, 0xBB]),
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[]),
             transactions: Vec::new(),
         }
     }

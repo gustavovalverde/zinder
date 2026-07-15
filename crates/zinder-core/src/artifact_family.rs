@@ -12,6 +12,8 @@ pub const CHAIN_EPOCH: &str = "chain_epoch";
 pub const CHAIN_EVENT: &str = "chain_event";
 /// Canonical block-header facts.
 pub const BLOCK_HEADER_ARTIFACT: &str = "block_header";
+/// Complete semantic facts needed to replay one canonical block.
+pub const BLOCK_REPLAY: &str = "block_replay";
 /// Optional raw block blob.
 pub const BLOCK_BLOB: &str = "block_blob";
 /// Compact-block artifact.

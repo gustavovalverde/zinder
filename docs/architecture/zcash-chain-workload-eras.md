@@ -163,7 +163,7 @@ Canopy `1046400`, NU5 `1687104`, NU6 `2726400`, and NU6.1 `3146400`.
 The parser benchmark used local raw blocks from that node and ran
 `SourceBlock::from_raw_block_bytes` followed by the function then named
 `derive_block_with_raw_blob_policy(..., RawBlobPolicy::None)`. That function is
-now named `prepare_canonical_block_with_raw_blob_policy`; the historical
+now named `prepare_canonical_block`; the historical
 measurement still describes its pre-optimization implementation. Those values
 are the baseline because that implementation parsed the complete block twice
 and serialized plus parsed each transaction again. The current bulk source

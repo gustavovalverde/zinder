@@ -116,11 +116,12 @@ persisted, not advertised unconditionally:
 
 The signal travels in a `StorageControl` `raw_blob_policy` singleton
 (key byte 16, one-byte value: `0 = none`, `1 = transactions`,
-`2 = all`). The primary writer persists it on every open inside the
-control lock; readers read it. An absent key on a legacy store reads
-back as `none`, so the deployment advertises the minimum until the next
-ingest restart persists the real signal. The signal needs no schema
-bump: `StorageControl` is an unstructured key-value bag.
+`2 = all`). An empty primary may replace the signal before its first canonical
+commit. After that commit, the value is the store's immutable historical
+coverage contract: opening the primary with another policy fails with
+`RawBlobRetentionMismatch` and requires a rebuild. Readers use only the
+persisted value. A non-empty schema-14 store with no signal is corrupt and
+fails closed; it is never treated as `none`.
 
 ## Projection capabilities require projection evidence
 

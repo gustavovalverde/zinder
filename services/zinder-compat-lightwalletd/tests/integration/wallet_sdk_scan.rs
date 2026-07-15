@@ -49,6 +49,7 @@ use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_query::WalletQuery;
+use zinder_store::RawBlobRetention;
 use zinder_testkit::{
     ChainFixture, FixtureBlock, FixtureTransactionRows, StoreFixture,
     sample_regtest_upgrade_activations,
@@ -169,6 +170,7 @@ async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::R
 
 fn sdk_scan_store_fixture() -> eyre::Result<StoreFixture> {
     let base_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
         .extend_blocks(SDK_SCAN_BLOCK_COUNT)
         .with_tip_metadata_override(ChainTipMetadata::new(SDK_SCAN_SAPLING_TREE_SIZE, 0, 0));
 

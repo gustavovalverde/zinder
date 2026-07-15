@@ -16,10 +16,13 @@ use zinder_proto::v1::wallet::{
     self, AddressLookup, address_lookup, wallet_query_server::WalletQuery as WalletQueryService,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_store::{ChainEpochArtifacts, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
-use crate::common::{split_unspent_outputs_stream, synthetic_chain_epoch};
+use crate::common::{
+    chain_epoch_artifacts_with_transparent_facts, split_unspent_outputs_stream,
+    synthetic_chain_epoch,
+};
 
 const ADDRESS_SCRIPT_HASH_BYTES: [u8; 32] = [0xAB; 32];
 const SCRIPT_PUB_KEY: &[u8] = &[
@@ -236,15 +239,20 @@ fn commit_address_output_then_spend(
         output.block_height,
         output.block_hash,
     );
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_one, vec![block_one], vec![compact_one])
-            .with_transparent_outputs_by_outpoint(vec![output]),
-    )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_two, vec![block_two], vec![compact_two])
-            .with_transparent_spend_facts(vec![spend]),
-    )?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        epoch_one,
+        vec![block_one],
+        vec![compact_one],
+        &[output],
+        Vec::new(),
+    ))?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        epoch_two,
+        vec![block_two],
+        vec![compact_two],
+        &[],
+        vec![spend],
+    ))?;
 
     Ok(())
 }
@@ -278,8 +286,13 @@ fn commit_unspent_outputs(
         .iter()
         .map(transparent_output_from_utxo)
         .collect::<Vec<_>>();
-    let artifacts = ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-        .with_transparent_outputs_by_outpoint(prevouts);
+    let artifacts = chain_epoch_artifacts_with_transparent_facts(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+        &prevouts,
+        Vec::new(),
+    );
     store.commit_chain_epoch(artifacts)?;
 
     Ok(utxos)

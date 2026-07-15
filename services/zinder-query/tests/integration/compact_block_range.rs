@@ -21,7 +21,9 @@ use zinder_query::{
     tree_state_at_response,
 };
 use zinder_store::{ArtifactFamily, ChainEpochArtifacts};
-use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+};
 
 use crate::common::{compact_block_with_tree_sizes, synthetic_chain_epoch};
 
@@ -31,15 +33,19 @@ async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
     let store = store_fixture.chain_store().clone();
     let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
     let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let first_replay = encode_fixture_block_replay(&first_block, &[]);
+    let second_replay = encode_fixture_block_replay(&second_block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         first_epoch,
         vec![first_block],
+        vec![first_replay],
         vec![first_compact_block.clone()],
     ))?;
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         second_epoch,
         vec![second_block],
+        vec![second_replay],
         vec![second_compact_block.clone()],
     ))?;
 
@@ -61,14 +67,20 @@ async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the test keeps the complete native compact-block wire shape in one assertion scope"
+)]
 async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block.clone()],
     ))?;
 
@@ -152,10 +164,12 @@ async fn latest_block_response_uses_native_wallet_proto_shape() -> eyre::Result<
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 
@@ -193,9 +207,10 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
         chain_epoch.visible_tip_hash,
         b"tree-state-1".to_vec(),
     );
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
             .with_tree_states(vec![tree_state.clone()]),
     )?;
 
@@ -230,9 +245,10 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
         chain_epoch.visible_tip_hash,
         b"tree-state-1".to_vec(),
     );
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
             .with_tree_states(vec![tree_state.clone()]),
     )?;
 
@@ -257,10 +273,12 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
     let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 0, 0);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 
@@ -292,10 +310,12 @@ async fn subtree_roots_response_reports_unavailable_when_completed_root_is_missi
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
     chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
     let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 
@@ -343,9 +363,10 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
         block.height,
         block.block_hash,
     );
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
             .with_subtree_roots(vec![subtree_root.clone()]),
     )?;
 
@@ -413,9 +434,10 @@ async fn subtree_roots_response_uses_stored_tip_metadata_not_compact_block_paylo
         block.height,
         block.block_hash,
     );
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
             .with_subtree_roots(vec![subtree_root.clone()]),
     )?;
 
@@ -443,9 +465,11 @@ async fn compact_block_range_reports_unavailable_artifact_without_node_repair() 
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 
@@ -482,10 +506,12 @@ async fn tree_state_checkpoint_response_reports_unavailable_artifact_without_nod
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 

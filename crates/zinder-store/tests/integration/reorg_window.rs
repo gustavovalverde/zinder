@@ -9,6 +9,7 @@ use zinder_core::{
     ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
     ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
     TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_store::{
@@ -29,7 +30,7 @@ fn replacing_non_safe_tip_state_emits_chain_reorged() -> eyre::Result<()> {
     let (replacement_epoch, replacement_block, replacement_compact_block) =
         synthetic_epoch(2, 2, 1, replacement_hash, block_hash(1));
     let reorged = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block.clone()],
             vec![replacement_compact_block],
@@ -74,7 +75,7 @@ fn replacement_cannot_cross_safe_tip_height() -> eyre::Result<()> {
     let (attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 2, 1, block_hash(20), block_hash(1));
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![attempted_block],
             vec![attempted_compact_block],
@@ -105,7 +106,7 @@ fn replacement_beyond_reorg_window_is_rejected() -> eyre::Result<()> {
     let (attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 102, 0, block_hash(202), block_hash(101));
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![attempted_block],
             vec![attempted_compact_block],
@@ -136,7 +137,7 @@ fn replacement_start_after_current_tip_is_rejected() -> eyre::Result<()> {
     let (attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 3, 1, block_hash(3), block_hash(2));
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![attempted_block],
             vec![attempted_compact_block],
@@ -181,7 +182,7 @@ fn safe_tip_height_can_advance_without_new_block_artifacts() -> eyre::Result<()>
         ..initial_epoch
     };
     let committed = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             safe_tip_epoch,
             Vec::<zinder_core::BlockHeaderArtifact>::new(),
             Vec::new(),
@@ -227,7 +228,7 @@ fn unchanged_commit_without_visible_transition_is_rejected() -> eyre::Result<()>
         ..initial_epoch
     };
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             Vec::<zinder_core::BlockHeaderArtifact>::new(),
             Vec::new(),
@@ -260,7 +261,7 @@ fn replacement_start_after_attempted_tip_reports_boundary_error() -> eyre::Resul
     let (attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 4, 1, block_hash(40), block_hash(3));
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![attempted_block],
             vec![attempted_compact_block],
@@ -302,7 +303,7 @@ fn advance_safe_tip_can_target_height_below_current_safe_tip() -> eyre::Result<(
         ..initial_epoch
     };
     let committed = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             safe_tip_epoch,
             Vec::<zinder_core::BlockHeaderArtifact>::new(),
             Vec::new(),
@@ -330,7 +331,7 @@ fn append_extend_window_ending_at_tip_is_valid() -> eyre::Result<()> {
     let (attempted_epoch, appended_block, appended_compact_block) =
         synthetic_epoch(2, 3, 1, block_hash(3), block_hash(2));
     let committed = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![appended_block],
             vec![appended_compact_block],
@@ -358,7 +359,7 @@ fn extend_window_end_after_tip_is_rejected() -> eyre::Result<()> {
     let (attempted_epoch, appended_block, appended_compact_block) =
         synthetic_epoch(2, 3, 1, block_hash(3), block_hash(2));
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![appended_block],
             vec![appended_compact_block],
@@ -393,7 +394,7 @@ fn replacement_cannot_lower_safe_tip_anchor() -> eyre::Result<()> {
     let (attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 6, 4, block_hash(60), block_hash(5));
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![attempted_block],
             vec![attempted_compact_block],
@@ -428,7 +429,7 @@ fn replacement_cannot_change_safe_tip_anchor_hash() -> eyre::Result<()> {
         synthetic_epoch(2, 6, 5, block_hash(60), block_hash(5));
     attempted_epoch.settled_tip_hash = block_hash(50);
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![attempted_block],
             vec![attempted_compact_block],
@@ -462,7 +463,7 @@ fn non_replacement_commit_cannot_lower_tip_height() -> eyre::Result<()> {
     let (attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 1, 1, block_hash(1), block_hash(0));
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             attempted_epoch,
             vec![attempted_block],
             vec![attempted_compact_block],
@@ -495,7 +496,7 @@ fn non_replacement_commit_cannot_lower_safe_tip_height() -> eyre::Result<()> {
 
     let (attempted_epoch, attempted_block, attempted_compact_block) =
         synthetic_epoch(2, 3, 1, block_hash(3), block_hash(2));
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let error = match store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         attempted_epoch,
         vec![attempted_block],
         vec![attempted_compact_block],
@@ -530,7 +531,7 @@ fn append_commit_cannot_publish_block_for_existing_visible_height() -> eyre::Res
         block_hash(1),
         b"rewritten-block-2",
     );
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let error = match store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         attempted_epoch,
         vec![rewritten_block, appended_block],
         vec![appended_compact_block],
@@ -559,7 +560,7 @@ fn append_commit_must_link_first_new_block_to_current_tip() -> eyre::Result<()> 
 
     let (attempted_epoch, appended_block, appended_compact_block) =
         synthetic_epoch(2, 3, 1, block_hash(3), block_hash(99));
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let error = match store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         attempted_epoch,
         vec![appended_block],
         vec![appended_compact_block],
@@ -589,7 +590,7 @@ fn safe_tip_hash_must_match_existing_visible_block() -> eyre::Result<()> {
     let (mut attempted_epoch, appended_block, appended_compact_block) =
         synthetic_epoch(2, 3, 2, block_hash(3), block_hash(2));
     attempted_epoch.settled_tip_hash = block_hash(99);
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let error = match store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         attempted_epoch,
         vec![appended_block],
         vec![appended_compact_block],
@@ -614,7 +615,7 @@ fn transaction_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
 
     let transaction_id = TransactionId::from_bytes([9; 32]);
     let old_hash = block_hash(2);
-    let (transaction_index, transaction_location, old_transaction_facts, transaction_blob) =
+    let (transaction_index, transaction_location, old_transaction_facts, _) =
         super::synthetic_transaction_rows(
             transaction_id,
             BlockHeight::new(2),
@@ -624,13 +625,18 @@ fn transaction_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
         );
     let (initial_epoch, _initial_block, _initial_compact_block) =
         synthetic_epoch(1, 2, 1, old_hash, block_hash(1));
-    store.commit_chain_epoch(
+    store.commit_chain_epoch(super::with_synthetic_block_replay_envelopes(
         artifacts_from_height_one_to_tip(initial_epoch)
             .with_block_transaction_index(vec![transaction_index])
             .with_transaction_locations(vec![transaction_location])
             .with_transaction_facts(vec![old_transaction_facts.clone()])
-            .with_transaction_blobs(vec![transaction_blob]),
-    )?;
+            .with_transaction_intrinsic_value_balances(vec![
+                TransactionIntrinsicValueBalancesArtifact::new(
+                    transaction_location,
+                    TransactionIntrinsicValueBalances::default(),
+                ),
+            ]),
+    ))?;
 
     let initial_reader = store.current_chain_epoch_reader()?;
     assert_eq!(
@@ -642,7 +648,7 @@ fn transaction_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
     let (replacement_epoch, replacement_block, replacement_compact_block) =
         synthetic_epoch(2, 2, 1, replacement_hash, block_hash(1));
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -701,7 +707,7 @@ fn subtree_root_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
     let (replacement_epoch, replacement_block, replacement_compact_block) =
         synthetic_epoch(2, 2, 1, replacement_hash, block_hash(1));
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -747,7 +753,7 @@ fn tree_state_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
     let (replacement_epoch, replacement_block, replacement_compact_block) =
         synthetic_epoch(2, 2, 1, replacement_hash, block_hash(1));
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -832,7 +838,7 @@ fn artifacts_from_height_one_to_tip(chain_epoch: ChainEpoch) -> ChainEpochArtifa
         ));
     }
 
-    ChainEpochArtifacts::new(chain_epoch, blocks, compact_blocks)
+    super::synthetic_chain_epoch_artifacts(chain_epoch, blocks, compact_blocks)
 }
 
 fn block_hash(seed: u32) -> BlockHash {

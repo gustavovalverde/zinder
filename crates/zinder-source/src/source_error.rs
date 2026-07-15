@@ -115,11 +115,12 @@ pub enum SourceError {
         byte_count: usize,
     },
 
-    /// Raw block bytes could not be parsed as a Zcash block.
+    /// Raw block bytes did not contain a valid serialized Zcash block header.
     ///
     /// Prefer this variant when bytes decoded from hex successfully but the
-    /// resulting buffer is not a valid Zcash block (truncated header,
-    /// unexpected transaction encoding). For hex-layer failures use
+    /// header prefix is truncated or malformed. Full-block and transaction
+    /// validation belongs to canonical preparation after the source adapter has
+    /// established the ordered header identity. For hex-layer failures use
     /// [`Self::InvalidRawBlockHex`]; for JSON-RPC envelope violations use
     /// [`Self::SourceProtocolMismatch`].
     #[error("raw block parse failed: {reason}")]
@@ -140,25 +141,6 @@ pub enum SourceError {
     TransactionComponentIndexOverflow {
         /// Component whose zero-based index overflowed.
         component: &'static str,
-    },
-
-    /// Parsed raw block did not contain a coinbase height.
-    #[error("raw block is missing its coinbase height")]
-    RawBlockCoinbaseHeightMissing,
-
-    /// Parsed raw block height did not match the node-reported height.
-    ///
-    /// Prefer this variant when the bytes parsed cleanly but the coinbase
-    /// height disagrees with what the node-side height lookup returned (a
-    /// Zcash consensus-level mismatch). For JSON-RPC envelope mismatches
-    /// (header object reports a different height than requested) use
-    /// [`Self::SourceProtocolMismatch`] instead.
-    #[error("raw block height {parsed_height} does not match source height {source_height:?}")]
-    RawBlockHeightMismatch {
-        /// Height parsed from the raw block coinbase transaction.
-        parsed_height: u32,
-        /// Height reported by the node request path.
-        source_height: BlockHeight,
     },
 
     /// Parsed raw block timestamp could not be represented as Unix seconds.
@@ -283,9 +265,7 @@ pub enum SourceError {
     /// wrong: missing fields, wrong types, header height disagreeing with the
     /// requested height, tree-state hash disagreeing with the anchor hash. For
     /// hex-layer failures use [`Self::InvalidRawBlockHex`]; for byte-level
-    /// parse failures use [`Self::RawBlockParseFailed`]; for coinbase-height
-    /// disagreements after successful parse use
-    /// [`Self::RawBlockHeightMismatch`].
+    /// parse failures use [`Self::RawBlockParseFailed`].
     #[error("source protocol mismatch: {reason}")]
     SourceProtocolMismatch {
         /// Protocol mismatch reason.
@@ -459,8 +439,6 @@ impl SourceError {
             | Self::RawBlockParseFailed { .. }
             | Self::RawTransactionParseFailed { .. }
             | Self::TransactionComponentIndexOverflow { .. }
-            | Self::RawBlockCoinbaseHeightMissing
-            | Self::RawBlockHeightMismatch { .. }
             | Self::RawBlockTimeOutOfRange
             | Self::SourcePayloadEncodingFailed { .. } => SourceFailureClass::Malformed,
         }

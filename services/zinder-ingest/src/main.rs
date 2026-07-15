@@ -169,8 +169,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Print store + upstream state, the phase the loop would run, and the
-    /// upstream-health snapshot, then exit. Diagnostic only; does not
-    /// open the store for writing.
+    /// upstream-health snapshot, then exit. Diagnostic only; does not ingest
+    /// or commit chain data.
     Probe,
     /// Create a point-in-time `RocksDB` checkpoint of the canonical store.
     Backup(BackupArgs),
@@ -187,6 +187,9 @@ struct BackupArgs {
     /// Destination directory for the `RocksDB` checkpoint.
     #[arg(long = "to")]
     to_path: Option<PathBuf>,
+    /// Immutable raw-blob contract used when the canonical store was created.
+    #[arg(long = "raw-blob-policy")]
+    raw_blob_policy: Option<String>,
 }
 
 #[tokio::main]
@@ -322,7 +325,7 @@ async fn run_probe(
         .value();
     let store = PrimaryChainStore::open(
         &loop_config.storage_path,
-        ChainStoreOptions::for_network(loop_config.node.network),
+        loop_config.canonical_store_options(),
     )
     .map_err(IngestError::from)?;
     let store_tip = current_chain_height(&store);
@@ -461,10 +464,13 @@ async fn run_ingest(
         ProjectionStartupPlan::for_preset(command_config.projection_preset);
     let restore_admission = match backup::admit_restore_bundle_if_present(
         &command_config.loop_config.storage_path,
-        command_config.loop_config.node.network,
-        projection_startup_plan.preset(),
-        command_config.loop_config.canonical_rocksdb_budget,
-        command_config.loop_config.derive_rocksdb_budget,
+        backup::RestoreAdmissionOptions {
+            network: command_config.loop_config.node.network,
+            projection_preset: projection_startup_plan.preset(),
+            canonical_rocksdb_budget: command_config.loop_config.canonical_rocksdb_budget,
+            derive_rocksdb_budget: command_config.loop_config.derive_rocksdb_budget,
+            raw_blob_policy: command_config.loop_config.raw_blob_policy,
+        },
     ) {
         Ok(admission) => admission,
         Err(error) => {
@@ -483,11 +489,7 @@ async fn run_ingest(
             "validated restored canonical and projection bundle before writer open"
         );
     }
-    let store_options = ChainStoreOptions {
-        rocksdb_resource_budget: command_config.loop_config.canonical_rocksdb_budget,
-        raw_blob_retention: command_config.loop_config.raw_blob_policy.to_retention(),
-        ..ChainStoreOptions::for_network(command_config.loop_config.node.network)
-    };
+    let store_options = command_config.loop_config.canonical_store_options();
     let store =
         match PrimaryChainStore::open(&command_config.loop_config.storage_path, store_options) {
             Ok(store) => store,
@@ -655,7 +657,7 @@ async fn run_ingest(
         source_segment_target_response_bytes = command_config.loop_config.bulk_catchup.source_segment_target_response_bytes.get(),
         source_fetch_max_in_flight_requests = command_config.loop_config.bulk_catchup.source_fetch_max_in_flight_requests.get(),
         source_fetch_max_in_flight_bytes = command_config.loop_config.bulk_catchup.source_fetch_max_in_flight_bytes.get(),
-        block_prepare_max_in_flight_artifact_bytes = command_config.loop_config.bulk_catchup.block_prepare_max_in_flight_artifact_bytes.get(),
+        block_prepare_memory_watermark_bytes = command_config.loop_config.bulk_catchup.block_prepare_memory_watermark_bytes.get(),
         commit_reassembly_max_queued_artifact_bytes = command_config.loop_config.bulk_catchup.commit_reassembly_max_queued_artifact_bytes.get(),
         derive_replay_batch_blocks = command_config.loop_config.derive.replay_batch_blocks.get(),
         derive_memory_degrade_ratio = command_config.loop_config.derive.memory_degrade_ratio,
@@ -1254,16 +1256,20 @@ fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), Inge
         .map_err(IngestConfigError::from)?;
     backup::admit_restore_bundle_if_present(
         &backup_config.storage_path,
-        backup_config.network,
-        projection_preset,
-        backup_config.canonical_rocksdb_budget,
-        backup_config.derive_rocksdb_budget,
+        backup::RestoreAdmissionOptions {
+            network: backup_config.network,
+            projection_preset,
+            canonical_rocksdb_budget: backup_config.canonical_rocksdb_budget,
+            derive_rocksdb_budget: backup_config.derive_rocksdb_budget,
+            raw_blob_policy: backup_config.raw_blob_policy,
+        },
     )
     .map_err(IngestConfigError::from)?;
     let canonical_store = PrimaryChainStore::open(
         &backup_config.storage_path,
         ChainStoreOptions {
             rocksdb_resource_budget: backup_config.canonical_rocksdb_budget,
+            raw_blob_retention: backup_config.raw_blob_policy.to_retention(),
             ..ChainStoreOptions::for_network(backup_config.network)
         },
     )
@@ -1361,6 +1367,7 @@ impl From<BackupArgs> for BackupConfigOverrides {
             network: args.network,
             storage_path: args.storage_path,
             to_path: args.to_path,
+            raw_blob_policy: args.raw_blob_policy,
         }
     }
 }

@@ -18,13 +18,13 @@ break deterministic epoch ordering and reorg invariants.
 ## Decision
 
 Bulk catchup splits per-block work into a parallel block-prepare stage and an
-ordered finalize/commit stage.
+ordered position/commit stage.
 
 ```text
 ordered source segment
   -> parallel prepare_canonical_block on the blocking pool
   -> ordered windowed transparent-prevout resolution
-  -> ordered finalize_canonical_block fold
+  -> ordered position_canonical_block fold
   -> canonical commit
 ```
 
@@ -44,8 +44,10 @@ cache carried by the bulk-catchup stream. It issues one sorted, deduplicated
 RocksDB multi-get for the remaining cold outpoints and distributes resolved
 artifacts back to their consuming blocks. The recent-output cache shares the
 block-prepare byte watermark, evicts oldest entries to admit new prepare work,
-and is discarded with the stream on completion, restart, or error. Commit keeps
-the authoritative fallback lookup.
+and is discarded with the stream on completion, restart, or error. Each block
+keeps the larger of its prepare-peak or measured-resident reservation through
+resolution, then carries a resident handoff reservation until commit reassembly
+takes ownership. Commit keeps the authoritative fallback lookup.
 
 ## Consequences
 

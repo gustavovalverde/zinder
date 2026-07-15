@@ -49,7 +49,9 @@ directory from the new upstream tag, reapply the smallest reviewed dependency
 delta, and update the commit and local version recorded here.
 `scripts/check-postgres-protocol-patch.sh` fails once the currently conflicting
 `bip32` prerelease leaves the workspace graph so this bridge cannot silently
-become permanent.
+become permanent. It also verifies `ZINDER-SHA256SUMS`, a reviewed manifest of
+every vendored source, manifest, license, and metadata file. Any vendor edit
+therefore fails CI until its exact diff and replacement digest are reviewed.
 
 Run at least:
 

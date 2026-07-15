@@ -505,9 +505,10 @@ fn decode_canonical_block_fact_key(bytes: &[u8]) -> Result<BlockHeight, BenchErr
 fn encode_canonical_block_fact_row(
     record: &CanonicalBlockFactRecord,
 ) -> Result<Vec<u8>, BenchError> {
-    let replay_encoding_len = u64::try_from(record.replay_encoding.len())
+    let replay_envelope_len = u64::try_from(record.replay_envelope_bytes.len())
         .map_err(|_| candidate_error("canonical fact replay encoding exceeds u64::MAX bytes"))?;
-    let mut encoded = Vec::with_capacity(120_usize.saturating_add(record.replay_encoding.len()));
+    let mut encoded =
+        Vec::with_capacity(120_usize.saturating_add(record.replay_envelope_bytes.len()));
     encoded.extend_from_slice(&ROW_MAGIC);
     encoded.extend_from_slice(&ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION.to_le_bytes());
     encoded.extend_from_slice(&record.digest.version().value().to_le_bytes());
@@ -516,8 +517,8 @@ fn encode_canonical_block_fact_row(
     encoded.extend_from_slice(&record.parent_hash.as_bytes());
     encoded.extend_from_slice(&record.transaction_count.to_le_bytes());
     encoded.extend_from_slice(&record.digest.as_bytes());
-    encoded.extend_from_slice(&replay_encoding_len.to_le_bytes());
-    encoded.extend_from_slice(&record.replay_encoding);
+    encoded.extend_from_slice(&replay_envelope_len.to_le_bytes());
+    encoded.extend_from_slice(&record.replay_envelope_bytes);
     Ok(encoded)
 }
 
@@ -539,9 +540,9 @@ fn decode_canonical_block_fact_row(bytes: &[u8]) -> Result<CanonicalBlockFactRec
     let parent_hash = BlockHash::from_bytes(decoder.read_array::<32>()?);
     let transaction_count = decoder.read_u32()?;
     let stored_digest = decoder.read_array::<32>()?;
-    let replay_encoding_len = usize::try_from(decoder.read_u64()?)
+    let replay_envelope_len = usize::try_from(decoder.read_u64()?)
         .map_err(|_| candidate_error("canonical fact replay length exceeds usize::MAX"))?;
-    let replay_encoding = decoder.read_bytes(replay_encoding_len)?.to_vec();
+    let replay_envelope_bytes = decoder.read_bytes(replay_envelope_len)?.to_vec();
     decoder.reject_trailing_bytes()?;
     CanonicalBlockFactRecord::from_persisted(PersistedCanonicalBlockFactRow {
         height,
@@ -550,7 +551,7 @@ fn decode_canonical_block_fact_row(bytes: &[u8]) -> Result<CanonicalBlockFactRec
         transaction_count,
         digest_version,
         stored_digest,
-        replay_encoding,
+        replay_envelope_bytes,
     })
 }
 

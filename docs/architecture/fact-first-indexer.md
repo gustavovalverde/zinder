@@ -17,12 +17,12 @@ and explorer state are separate durability roles whether the
 schemas, and process placement do not change the data contracts.
 
 [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) owns the
-topology contract. A fact-first `rocksdb-single-host` implementation and a
-block-granular `postgres-scale-out` implementation consume the same captured
-facts and pass the same lifecycle and correctness checks plus their own
-topology-specific gates. Both remain supported product topologies. The design
-does not create a generic multi-backend adapter or permit per-plane backend
-mixing.
+topology contract. `rocksdb-single-host` is the current runtime topology;
+`postgres-scale-out` remains a retained target whose block-granular diagnostic
+driver consumes the same captured facts. The diagnostic driver proves a narrow
+semantic round trip, not a production Postgres lifecycle, deployment, or
+readiness contract. The design does not create a generic multi-backend adapter
+or permit per-plane backend mixing.
 
 ## Decision
 
@@ -137,14 +137,23 @@ smaller and easier to operate than abstracting every database operation.
 
 ## Canonical Fact Contract
 
-Canonical ingest parses a block once and emits immutable rows that can be read
-in block order. The first implementation seam is the in-memory
-`CanonicalBlockFacts` value. Its explicitly tagged, versioned reference digest
-defines the shared correctness oracle for the concrete `RocksDB` and
-PostgreSQL diagnostic drivers without imposing either engine's physical
-encoding. The current production `RocksDB` writer still expands that value
-into the existing schema. Removing its cross-block reads and projection-owned
-writes is the next schema slice, not a performance claim for this seam alone.
+Canonical ingest separates early source validation from canonical parsing.
+The source adapter parses only the serialized header prefix to obtain block
+identity, parent identity, and time for link validation. Parallel canonical
+preparation then performs exactly one full block parse, validates the coinbase
+height and source identity, derives the semantic `CanonicalBlockFacts`, and
+encodes its replay envelope. Ordered positioning's only stateful computation
+folds the running commitment-tree sizes; it stamps that metadata, serializes the
+prepared compact block, and moves the prepared replay bytes into the commit.
+
+`CanonicalBlockFacts` is the shared correctness seam for the concrete RocksDB
+runtime and the PostgreSQL diagnostic driver. Its explicitly tagged,
+versioned reference digest does not impose either engine's physical encoding.
+Store schema 14 and artifact schema 19 require one replay envelope per
+committed header, validate it against the redundant semantic rows, and persist
+it in the same atomic RocksDB batch as the `ChainEpoch` and `ChainEvent`. The
+writer still expands the value into the legacy schema, so this seam does not
+certify fact-first throughput or remove the current cross-block work.
 
 The target hot schema is:
 
@@ -154,7 +163,7 @@ The target hot schema is:
 | `block_transaction_index` | `(network, height, transaction_index)` | Canonical transaction order |
 | `transaction_location` | `(network, transaction_id)` | Direct transaction location |
 | `transaction_facts` | `(network, transaction_id)` | Public transaction shape, input outpoints, created transparent outputs, shielded component counts, and intrinsic value data |
-| `block_replay_facts` | `(network, height)` | Compact ordered envelope of transaction facts needed by projection replay |
+| `block_replay` | `(network, height)` | Compact ordered envelope of semantic block and transaction facts needed by projection replay; excludes retention-dependent raw blobs |
 | `compact_block` | `(network, height)` | Encoded lightwalletd compact block |
 | `tree_state` | `(network, height)` | Wallet scan checkpoint |
 | `subtree_root` | `(network, pool, start_index)` | Completed subtree root |
@@ -163,34 +172,41 @@ The target hot schema is:
 | `block_blob` | `(network, height)` | Optional compressed consensus block bytes |
 | `transaction_blob` | `(network, transaction_id)` | Optional raw transaction bytes |
 
-`block_replay_facts` is not a second truth model. It is a block-local physical
+`block_replay` is not a second truth model. It is a block-local physical
 layout of the same typed facts, optimized for sequential replay. It contains no
-address balance, spend status, or cross-block lookup result. If benchmarks show
-that a structure-of-arrays representation improves decoding and cache locality,
-that representation belongs inside this replay envelope or an in-memory replay
-window. It does not justify a new public abstraction or storage plane.
+retention-dependent block or transaction blob, address balance, spend status,
+or cross-block lookup result. `RetainedRawBlobs` carries optional raw block
+and transaction artifacts beside, rather than inside, semantic replay, so a
+deployment's raw-blob policy cannot change canonical fact identity. If
+benchmarks show that a structure-of-arrays representation improves decoding
+and cache locality, that representation belongs inside this replay envelope or
+an in-memory replay window; it does not justify another public fact model.
 
 `CanonicalBlockFacts` is the backend-neutral Rust aggregate, not a physical
 schema version. Two independently versioned contracts serve different jobs:
 
 - `CanonicalBlockFactsDigestVersion` defines the deterministic correctness
-  oracle. Version 1 commits every current field through explicit numeric tags,
+  oracle. Version 2 commits every current field through explicit numeric tags,
   length prefixes, option-presence bytes, ordered vector boundaries, and fixed
-  little-endian integers.
-- `CanonicalBlockFactsReplayFormatVersion` defines the reversible persistence
+  little-endian integers. Numeric version 1 is intentionally unsupported
+  because its pre-release contract included retention-dependent raw bytes.
+- `CanonicalBlockReplayFormatVersion` defines the reversible persistence
   envelope consumed by projection replay. Decoding must reconstruct the full
   aggregate, reject unknown or non-canonical bytes, and recompute the reference
   digest carried by the envelope.
 
-The aggregate owns one block header, optional raw block bytes, and ordered
-`CanonicalTransactionFacts`; each transaction owns its public facts, intrinsic
-balances, transparent inputs and outputs, and optional raw bytes.
-`zinder-bench` fixture format 3 records the per-block digest contract and the
-ordered full-sequence digest. Both concrete drivers persist replay envelopes,
-decode every row into complete semantic facts, recompute the independent
-reference digest, and compare the ordered evidence with the fixture oracle.
-Changing a fact, its order, either versioned contract, or the semantic replay
-result invalidates the candidate evidence.
+The aggregate owns one block header and ordered `CanonicalTransactionFacts`;
+each transaction owns its public facts, intrinsic balances, transparent inputs
+and outputs, and a SHA-256 commitment to its exact serialized bytes. The block
+aggregate carries the equivalent serialized-block commitment. Raw consensus
+payloads are not part of the aggregate, reference digest, or replay format;
+their commitments are, so store admission can bind optional retained blobs to
+the semantic replay without consensus reparsing. `zinder-bench` fixture format 4 records the
+per-block digest contract and the ordered full-sequence digest. Both diagnostic
+drivers persist replay envelopes, decode every row into complete semantic
+facts, recompute the independent reference digest, and compare the ordered
+evidence with the fixture oracle. Changing a fact, its order, either versioned
+contract, or the semantic replay result invalidates the candidate evidence.
 
 This round trip is deliberately narrower than canonical storage. It does not
 persist compact blocks, tree state, subtree roots, `ChainEpoch`, `ChainEvent`,
@@ -199,7 +215,7 @@ readiness. Its result answers whether the two physical write paths preserve
 the same block-local facts and how quickly they do so. It cannot satisfy the
 fresh canonical construction or topology-certification gates by itself.
 
-The version-1 encoder favors a small, auditable contract and may hold
+The version-2 encoder favors a small, auditable contract and may hold
 intermediate envelope buffers while encoding. Formal resource artifacts measure
 that cost across the complete candidate arm. If representative-corpus evidence
 shows that preparation memory threatens the construction target, optimize the
@@ -207,12 +223,24 @@ same replay format with a consuming or streaming encoder before promoting the
 diagnostic slice into a production lifecycle; do not introduce a second fact
 model to hide allocation pressure.
 
+Projection readers consume semantic replay through
+`BlockReplayBatchRequest`, a forward request containing `start_height` and
+a nonzero `max_blocks`. The store rejects a request above 256 blocks, returns
+an empty batch when the start is beyond the pinned visible tip, and clips a
+batch that crosses the tip. It resolves the batch's source epochs with one
+ordered visibility-index scan, fetches the replay rows with one `multi_get`,
+and fails the whole batch when any required row is missing or corrupt. Callers
+advance by the returned count instead of materializing an unbounded chain
+range.
+
 Canonical ingest follows one ordered contract:
 
 ```text
 source segment
-  -> parse each block once
-  -> build immutable canonical and replay facts
+  -> parse each header prefix for early link validation
+  -> fully parse each block exactly once on the parallel preparation lane
+  -> build semantic facts, retained raw blobs, compact artifacts, and replay bytes
+  -> position only ordered commitment-tree metadata
   -> atomically commit ChainEpoch plus ChainEvent
 ```
 
@@ -269,12 +297,22 @@ rankings, mining statistics, migration views, and historical aggregates belong
 to explorer projections. This keeps expensive scans and compactions out of both
 canonical catchup and wallet readiness.
 
-`zinder-explorer` is a reader and API service. It does not become another
-indexer. `zinder-ingest` remains source-to-canonical only. An independent
-`zinder-projector` process owns build, verify, catch-up, follow, and promotion
-for one selected projection. `rocksdb-single-host` may colocate these processes
-on one host. `postgres-scale-out` preserves independent role credentials and
-deployment boundaries. Both retain explicit readiness and restart ownership.
+`BlockSummaryConsumer` keeps its schema-1 contract: `total_size_bytes` is the
+complete serialized block size recorded in `BlockHeaderArtifact`. The pure
+`project_block_summary_record` function can compute the existing record
+directly from decoded `CanonicalBlockFacts`; unit tests and a persisted fixture
+prove equivalence with the current commit-context projector. Production derive
+dispatch still supplies `BlockCommitContext`, so this seam is not yet
+fact-first throughput evidence.
+
+In the target architecture, `zinder-explorer` remains a reader and API service
+rather than becoming another indexer, while `zinder-ingest` remains
+source-to-canonical only. An independent `zinder-projector` process will own
+build, verify, catch-up, follow, and promotion for one selected projection.
+`rocksdb-single-host` may colocate these processes on one host; a certified
+`postgres-scale-out` composition will preserve independent role credentials
+and deployment boundaries. Both contracts retain explicit readiness and
+restart ownership.
 
 ## Consumer and Data Matrix
 
@@ -298,24 +336,27 @@ current-height claim for missing data.
 
 ## Deployment and Scheduling
 
-Zinder supports two application-level deployment topologies:
+Zinder retains 2 application-level deployment topology contracts:
 
 | Topology | Durable storage | Scaling boundary | Operational contract |
 | --- | --- | --- | --- |
 | `rocksdb-single-host` | RocksDB stores for canonical, wallet, and explorer state | Separate services may run on one host and share host-local storage | No Postgres dependency; exclusive primary ownership, crash-safe restart, secondary catch-up, and coherent checkpoint bundles |
 | `postgres-scale-out` | One Postgres database per Zcash network with `canonical`, `wallet`, and `explorer` schemas | The canonical writer, projectors, query replicas, and database replicas deploy independently | Role-scoped credentials, durable writer fencing, failover, replica-lag reporting, and request-scoped read fences |
 
-Both are production-supported after passing their gates.
-`rocksdb-single-host` names the engine and placement constraint rather than a
-lower quality tier. `postgres-scale-out` names the engine and supported scaling
-capability and may still run on one host for testing. The term `embedded`
-remains reserved for an indexer inside a consumer process, not for Zinder's
-service deployment.
+These are the 2 retained topology contracts, but only `rocksdb-single-host` has
+a current service composition. `postgres-scale-out` names the intended scaling
+boundary and may run on one host for diagnostic testing; its current
+`tokio-postgres` driver does not provide production schema ownership, TLS,
+writer fencing, replica reads, failover, or readiness. It becomes a supported
+deployment only after its complete lifecycle and topology-specific gates pass.
+The term `embedded` remains reserved for an indexer inside a consumer process,
+not for Zinder's service deployment.
 
-A deployment selects one topology for all three durable planes. Zinder does not
-support a hybrid matrix that independently chooses RocksDB or Postgres per
-plane. That boundary retains two concrete, testable operational contracts
-without introducing a universal database adapter.
+Once both composition roots exist, a deployment selects one topology for all 3
+durable planes. Zinder will not support a hybrid matrix that independently
+chooses RocksDB or Postgres per plane. That boundary retains 2 concrete,
+testable operational contracts without introducing a universal database
+adapter.
 
 Fresh construction is resource-exclusive by default:
 
@@ -331,6 +372,14 @@ latency and memory remain unaffected. A projection handoff may use a bounded
 in-memory notification for low latency, but the durable chain-event cursor is
 always the recovery contract. A slow or failed projection can never
 backpressure or roll back a committed canonical epoch.
+
+Inactive projection promotion remains blocked on an unimplemented lifecycle
+contract. That contract requires a durable, expiring `ProjectionBuildLease`
+anchored to a canonical epoch and chain event, with event pruning retaining the
+anchor while the lease remains valid. The current implementation does not
+persist or renew this lease, protect its anchor from pruning, or promote an
+inactive generation under it, so inactive promotion has no production contract
+yet.
 
 Backups record canonical, wallet, and explorer checkpoints independently. A
 restore is admitted only when each included projection proves its schema,
@@ -367,8 +416,8 @@ are ancestors of `main` or their rejected status is recorded here.
 
 ### 2. Introduce canonical schema vNext
 
-- persist the `CanonicalBlockFacts` replay envelope and make its storage
-  encoding versioned;
+- retain the schema-19 RocksDB tracer that persists the independently
+  versioned `CanonicalBlockFacts` replay envelope atomically with each epoch;
 - stop writing canonical address, live-output, and spent-output read models;
 - remove cross-block prevout reads from canonical preparation;
 - keep the existing canonical schema readable only for controlled export or
@@ -378,6 +427,8 @@ are ancestors of `main` or their rejected status is recorded here.
 
 ### 3. Build the wallet state machine
 
+- acquire and renew a durable `ProjectionBuildLease` whose anchor event is a
+  hard floor for chain-event pruning until catch-up or expiry;
 - create the live-output, address, spent-output, history, undo, cursor, and
   coverage tables in the wallet projection database;
 - replay ordered block facts in cost-bounded batches;

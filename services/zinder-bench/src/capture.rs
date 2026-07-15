@@ -14,7 +14,7 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigestVersion, Network, NetworkUpgradeActivations, ShieldedProtocol,
     SubtreeRootIndex, wire::encode_zinder_native_chain_name,
 };
-use zinder_ingest::prepare_canonical_block;
+use zinder_ingest::{RawBlobPolicy, prepare_canonical_block};
 use zinder_source::{
     NodeAuth, NodeSource, SourceBlock, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
@@ -214,7 +214,7 @@ pub fn measure_fixture_blocks(
     let mut density = WorkloadDensity::default();
     let mut block_digests = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let prepared = prepare_canonical_block(block, activations)?;
+        let prepared = prepare_canonical_block(block, activations, RawBlobPolicy::None)?;
         let transaction_count = u32::try_from(prepared.facts.transactions.len()).map_err(|_| {
             BenchError::fixture_format("block transaction count exceeds u32".to_owned())
         })?;

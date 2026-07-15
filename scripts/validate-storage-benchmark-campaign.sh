@@ -103,13 +103,13 @@ validate_report() {
     and .storage_candidate.topology == $topology
     and .round_trip.scope == "canonical-block-facts-fixture-round-trip"
     and .round_trip.fixture_sequence_digest_match == true
-    and .round_trip.replay_format_version == 1
+    and .round_trip.replay_format_version == 2
     and .round_trip.semantic_replay_validated == true
-    and (.fixture.fixture_format_version > 0)
+    and .fixture.fixture_format_version == 4
     and (.fixture.current_schema_oracle_artifact_schema_version > 0)
     and (.fixture.digest_sha256 | lowercase_sha256)
-    and (.fixture.canonical_block_facts_digest_evidence.block_digest_version > 0)
-    and (.fixture.canonical_block_facts_digest_evidence.sequence_digest_version > 0)
+    and .fixture.canonical_block_facts_digest_evidence.block_digest_version == 2
+    and .fixture.canonical_block_facts_digest_evidence.sequence_digest_version == 1
     and (.fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 | lowercase_sha256)
     and (.fixture.tip_hash_hex | lowercase_sha256)
     and (.fixture.network | nonblank)
@@ -215,7 +215,7 @@ validate_report() {
       and .round_trip.storage.storage_schema_version == 2
       and .round_trip.storage.ingestion_mode == "binary-copy-single-load-transaction-with-deferred-index"
       and .round_trip.storage.tables_logged == true
-      and .round_trip.storage.replay_encoding_compression == "lz4"
+      and .round_trip.storage.replay_envelope_compression == "lz4"
       and (.round_trip.storage.fact_table_bytes | positive_number)
       and (.round_trip.storage.index_bytes | positive_number)
       and (.round_trip.storage.wal_bytes | positive_number)

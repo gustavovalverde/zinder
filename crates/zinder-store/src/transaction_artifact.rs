@@ -137,7 +137,7 @@ fn seek_transaction_facts_keys(
             *transaction_id,
             chain_epoch.id,
         );
-        let Some(source_epoch_bytes) =
+        let Some((matched_key, source_epoch_bytes)) =
             inner.get_previous_by_prefix(StorageTable::ReorgWindow, &prefix, &seek_key)?
         else {
             seek_outcomes.push((*transaction_id, None));
@@ -145,7 +145,7 @@ fn seek_transaction_facts_keys(
         };
         let source_epoch = decode_visible_source_epoch(
             ArtifactFamily::TransactionFacts,
-            &seek_key,
+            &matched_key,
             &source_epoch_bytes,
         )?;
         let key = StoreKey::transaction_facts(chain_epoch.network, source_epoch, *transaction_id);
@@ -322,7 +322,7 @@ pub(crate) fn read_transaction_intrinsic_value_balances_batch(
             transaction_id,
             chain_epoch.id,
         );
-        let Some(source_epoch_bytes) =
+        let Some((matched_key, source_epoch_bytes)) =
             inner.get_previous_by_prefix(StorageTable::ReorgWindow, &prefix, &seek_key)?
         else {
             seek_outcomes.push((transaction_id, None));
@@ -330,7 +330,7 @@ pub(crate) fn read_transaction_intrinsic_value_balances_batch(
         };
         let source_epoch = decode_visible_source_epoch(
             ArtifactFamily::TransactionIntrinsicValueBalances,
-            &seek_key,
+            &matched_key,
             &source_epoch_bytes,
         )?;
         let artifact_key = StoreKey::transaction_intrinsic_value_balances(
@@ -414,15 +414,15 @@ pub(crate) fn visible_transaction_source_epoch(
     let prefix = StoreKey::visible_transaction_epoch_prefix(chain_epoch.network, transaction_id);
     let seek_key =
         StoreKey::visible_transaction_epoch(chain_epoch.network, transaction_id, chain_epoch.id);
-    let Some(source_epoch_bytes) =
+    let Some((matched_key, source_epoch_bytes)) =
         inner.get_previous_by_prefix(StorageTable::ReorgWindow, &prefix, &seek_key)?
     else {
         return Ok(None);
     };
     let source_epoch = decode_visible_source_epoch(
         ArtifactFamily::TransactionLocation,
-        &seek_key,
+        &matched_key,
         &source_epoch_bytes,
     )?;
-    Ok(Some((source_epoch, seek_key)))
+    Ok(Some((source_epoch, matched_key)))
 }

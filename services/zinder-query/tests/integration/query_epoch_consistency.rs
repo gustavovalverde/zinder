@@ -20,7 +20,9 @@ use zinder_store::{
     ChainEpochArtifacts, ChainEpochReadApi, ChainEpochReader, ChainEventEnvelope,
     ChainEventHistoryRequest, PrimaryChainStore, StoreError,
 };
-use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+};
 
 use crate::common::{compact_block_with_tree_sizes, synthetic_chain_epoch};
 
@@ -31,10 +33,13 @@ async fn compact_block_range_stays_bound_to_reader_epoch_if_current_epoch_advanc
     let store = store_fixture.chain_store().clone();
     let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
     let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let first_replay = encode_fixture_block_replay(&first_block, &[]);
+    let second_replay = encode_fixture_block_replay(&second_block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         first_epoch,
         vec![first_block],
+        vec![first_replay],
         vec![first_compact_block.clone()],
     ))?;
 
@@ -43,6 +48,7 @@ async fn compact_block_range_stays_bound_to_reader_epoch_if_current_epoch_advanc
         Some(ChainEpochArtifacts::new(
             second_epoch,
             vec![second_block],
+            vec![second_replay],
             vec![second_compact_block],
         )),
     );
@@ -72,10 +78,13 @@ async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_adva
     let store = store_fixture.chain_store().clone();
     let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
     let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let first_replay = encode_fixture_block_replay(&first_block, &[]);
+    let second_replay = encode_fixture_block_replay(&second_block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         first_epoch,
         vec![first_block],
+        vec![first_replay],
         vec![first_compact_block],
     ))?;
 
@@ -84,6 +93,7 @@ async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_adva
         Some(ChainEpochArtifacts::new(
             second_epoch,
             vec![second_block],
+            vec![second_replay],
             vec![second_compact_block],
         )),
     );
@@ -121,10 +131,17 @@ async fn tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_current_e
         b"tree-state-1".to_vec(),
     );
     let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let first_replay = encode_fixture_block_replay(&first_block, &[]);
+    let second_replay = encode_fixture_block_replay(&second_block, &[]);
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(first_epoch, vec![first_block], vec![first_compact_block])
-            .with_tree_states(vec![first_tree_state.clone()]),
+        ChainEpochArtifacts::new(
+            first_epoch,
+            vec![first_block],
+            vec![first_replay],
+            vec![first_compact_block],
+        )
+        .with_tree_states(vec![first_tree_state.clone()]),
     )?;
 
     let read_api = CommitAfterReaderReadApi::new(
@@ -132,6 +149,7 @@ async fn tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_current_e
         Some(ChainEpochArtifacts::new(
             second_epoch,
             vec![second_block],
+            vec![second_replay],
             vec![second_compact_block],
         )),
     );
@@ -167,10 +185,17 @@ async fn latest_tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_cu
         b"tree-state-1".to_vec(),
     );
     let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let first_replay = encode_fixture_block_replay(&first_block, &[]);
+    let second_replay = encode_fixture_block_replay(&second_block, &[]);
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(first_epoch, vec![first_block], vec![first_compact_block])
-            .with_tree_states(vec![first_tree_state.clone()]),
+        ChainEpochArtifacts::new(
+            first_epoch,
+            vec![first_block],
+            vec![first_replay],
+            vec![first_compact_block],
+        )
+        .with_tree_states(vec![first_tree_state.clone()]),
     )?;
 
     let read_api = CommitAfterReaderReadApi::new(
@@ -178,6 +203,7 @@ async fn latest_tree_state_checkpoint_response_stays_bound_to_reader_epoch_if_cu
         Some(ChainEpochArtifacts::new(
             second_epoch,
             vec![second_block],
+            vec![second_replay],
             vec![second_compact_block],
         )),
     );
@@ -212,10 +238,13 @@ async fn subtree_roots_response_stays_bound_to_reader_epoch_if_current_epoch_adv
     let (second_epoch, second_block, _second_compact_block) = synthetic_chain_epoch(2, 2);
     let second_compact_block =
         compact_block_with_tree_sizes(second_block.height, second_block.block_hash, 65_536, 0);
+    let first_replay = encode_fixture_block_replay(&first_block, &[]);
+    let second_replay = encode_fixture_block_replay(&second_block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         first_epoch,
         vec![first_block],
+        vec![first_replay],
         vec![first_compact_block],
     ))?;
 
@@ -224,6 +253,7 @@ async fn subtree_roots_response_stays_bound_to_reader_epoch_if_current_epoch_adv
         Some(ChainEpochArtifacts::new(
             second_epoch,
             vec![second_block],
+            vec![second_replay],
             vec![second_compact_block],
         )),
     );

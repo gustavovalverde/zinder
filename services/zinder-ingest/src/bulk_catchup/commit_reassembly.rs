@@ -12,13 +12,13 @@ use super::block_prepare::CanonicalBlockCommitPreparation;
 use super::flush::flush_pending_bulk_catchup_writes;
 use super::watermark::{record_queue_depth, record_reorder_buffer};
 use super::{
-    BULK_STAGE_CANONICAL_BLOCK_PREPARE, BULK_STAGE_CANONICAL_COMMIT, BULK_STAGE_CANONICAL_FINALIZE,
+    BULK_STAGE_CANONICAL_BLOCK_PREPARE, BULK_STAGE_CANONICAL_COMMIT, BULK_STAGE_CANONICAL_POSITION,
     BULK_STAGE_CHECKPOINT_TREE_STATE, BULK_STAGE_COMMIT_REASSEMBLY,
     BULK_STAGE_SUBTREE_ROOT_ATTACHMENT, BulkCatchupCompletionFlush, BulkCatchupFlushState,
     BulkCatchupRunConfig, BulkCatchupRunContext, BulkCatchupStart, nonzero_u64_to_usize,
     record_bulk_pipeline_stage_duration, usize_to_u64_saturating,
 };
-use crate::artifact_builder::{CommitmentTreeSizes, finalize_canonical_block};
+use crate::artifact_builder::{CommitmentTreeSizes, position_canonical_block};
 use crate::chain_ingest::{
     CanonicalBatch, CanonicalBatchBudget, CanonicalBatchCloseTrigger, CanonicalBatchCost,
     IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
@@ -29,7 +29,7 @@ use crate::chain_ingest::{
 
 #[allow(
     clippy::too_many_lines,
-    reason = "bulk catchup orchestration keeps the ordered finalization, in-flight commit, and flush-state transitions visible in one state machine"
+    reason = "bulk catchup orchestration keeps the ordered positioning, in-flight commit, and flush-state transitions visible in one state machine"
 )]
 pub(super) async fn run_commit_reassembly<Source>(
     run: &BulkCatchupRunContext<'_, Source>,
@@ -89,7 +89,7 @@ where
             await_block_prepare_started_at,
             block_prepare_result.as_ref().err(),
         );
-        let finalize_started_at = Instant::now();
+        let position_started_at = Instant::now();
         let prepared_chunk = match block_prepare_result {
             Ok(prepared_chunk) => prepared_chunk,
             Err(error) => {
@@ -111,16 +111,19 @@ where
         };
 
         for prepared in prepared_chunk {
-            let prefetched_spent_transparent_outputs =
-                prepared.prefetched_spent_transparent_outputs;
-            let block = match finalize_canonical_block(prepared.prepared, &mut running_tree_sizes)
+            let CanonicalBlockCommitPreparation {
+                prepared,
+                prefetched_spent_transparent_outputs,
+                block_prepare_reservation,
+            } = prepared;
+            let block = match position_canonical_block(prepared, &mut running_tree_sizes)
                 .map_err(IngestError::from)
             {
                 Ok(block) => block,
                 Err(error) => {
                     record_bulk_pipeline_stage_duration(
-                        BULK_STAGE_CANONICAL_FINALIZE,
-                        finalize_started_at,
+                        BULK_STAGE_CANONICAL_POSITION,
+                        position_started_at,
                         Some(&error),
                     );
                     if let Err(commit_error) = wait_for_in_flight_canonical_commit(
@@ -165,6 +168,7 @@ where
                 restore_bulk_catchup_flush_state(flush_state, &mut loop_flush_state);
                 return Err(error.into());
             }
+            drop(block_prepare_reservation);
 
             if let Some(commit_trigger) = batch_budget.commit_trigger(batch.work_cost())
                 && let Err(error) = close_canonical_batch_for_budget(
@@ -185,8 +189,8 @@ where
             }
         }
         record_bulk_pipeline_stage_duration(
-            BULK_STAGE_CANONICAL_FINALIZE,
-            finalize_started_at,
+            BULK_STAGE_CANONICAL_POSITION,
+            position_started_at,
             None,
         );
         record_ingest_batch_work_cost(batch.work_cost());

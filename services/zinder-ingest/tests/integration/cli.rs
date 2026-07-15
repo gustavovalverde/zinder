@@ -12,7 +12,7 @@ use zinder_derive::{
     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
 };
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::{ChainStoreOptions, PrimaryChainStore, RawBlobRetention};
 use zinder_testkit::ChainFixture;
 
 #[test]
@@ -108,7 +108,7 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("source_fetch_max_in_flight_requests = 12"));
     assert!(stdout.contains("source_fetch_max_in_flight_bytes = 402653184"));
     assert!(stdout.contains("block_prepare_concurrency ="));
-    assert!(stdout.contains("block_prepare_max_in_flight_artifact_bytes = 536870912"));
+    assert!(stdout.contains("block_prepare_memory_watermark_bytes = 536870912"));
     assert!(stdout.contains("commit_reassembly_max_queued_artifact_bytes = 536870912"));
     assert!(stdout.contains("[ingest.tip_follow]"));
     assert!(stdout.contains("poll_interval_ms = 1000"));
@@ -329,6 +329,7 @@ fn backup_print_config_loads_config_file() -> Result<(), Box<dyn Error>> {
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[backup]"));
     assert!(stdout.contains(&format!("to_path = \"{}\"", path_str(&backup_path)?)));
+    assert!(stdout.contains("raw_blob_policy = \"none\""));
 
     Ok(())
 }
@@ -340,9 +341,10 @@ fn assert_complete_backup_manifest(
     let manifest: serde_json::Value = serde_json::from_slice(&fs::read(
         checkpoint_path.join("zinder-backup-manifest.json"),
     )?)?;
-    assert_eq!(manifest["format_version"], 2);
+    assert_eq!(manifest["format_version"], 3);
     assert_eq!(manifest["network"], "zcash-regtest");
     assert_eq!(manifest["projection_preset"], "complete");
+    assert_eq!(manifest["raw_blob_retention"], "all");
     assert_eq!(
         manifest["canonical_position"]["visible_tip_hash"],
         encode_rpc_block_hash_hex(expected_chain_epoch.visible_tip_hash)
@@ -370,7 +372,9 @@ fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> 
     let storage_path = tempdir.path().join("backup-source-store");
     let checkpoint_path = tempdir.path().join("backup-checkpoint");
     let checkpoint_staging_path = checkpoint_path.with_extension("staging");
-    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::All)
+        .extend_blocks(1);
     let artifacts = chain_fixture
         .chain_epoch_artifacts(ChainEpochId::new(1))
         .ok_or("chain fixture unexpectedly empty")?;
@@ -380,7 +384,10 @@ fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> 
     {
         let store = PrimaryChainStore::open(
             &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
+            ChainStoreOptions {
+                raw_blob_retention: RawBlobRetention::All,
+                ..ChainStoreOptions::for_network(Network::ZcashRegtest)
+            },
         )?;
         let commit = store.commit_chain_epoch(artifacts)?;
         expected_derive_cursor = commit.event_envelope.cursor.as_bytes().to_vec();
@@ -404,13 +411,18 @@ fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> 
             path_str(&storage_path)?,
             "--to",
             path_str(&checkpoint_path)?,
+            "--raw-blob-policy",
+            "all",
         ])
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let checkpoint = PrimaryChainStore::open(
         &checkpoint_path,
-        ChainStoreOptions::for_network(Network::ZcashRegtest),
+        ChainStoreOptions {
+            raw_blob_retention: RawBlobRetention::All,
+            ..ChainStoreOptions::for_network(Network::ZcashRegtest)
+        },
     )?;
     assert_eq!(
         checkpoint.current_chain_epoch()?,

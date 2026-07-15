@@ -31,7 +31,8 @@ use zinder_store::{
     event_stream_start_message,
 };
 use zinder_testkit::{
-    MockTransactionBroadcaster, StoreFixture, sample_regtest_upgrade_activations,
+    MockTransactionBroadcaster, StoreFixture, encode_fixture_block_replay,
+    sample_regtest_upgrade_activations,
 };
 
 use crate::common::{compact_block_with_tree_sizes, synthetic_chain_epoch};
@@ -136,10 +137,12 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
     chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
     let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 
@@ -342,9 +345,11 @@ async fn native_grpc_service_live_tail_delivers_only_post_subscribe_events() -> 
     .into_inner();
 
     let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let second_replay = encode_fixture_block_replay(&second_block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         second_epoch,
         vec![second_block],
+        vec![second_replay],
         vec![second_compact_block],
     ))?;
 
@@ -364,9 +369,11 @@ async fn native_grpc_service_expires_pruned_chain_event_cursors() -> eyre::Resul
 
     for height in 1..=3 {
         let (chain_epoch, block, compact_block) = synthetic_chain_epoch(u64::from(height), height);
+        let replay = encode_fixture_block_replay(&block, &[]);
         let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
             chain_epoch,
             vec![block],
+            vec![replay],
             vec![compact_block],
         ))?;
         if height == 1 {
@@ -423,15 +430,19 @@ async fn native_grpc_service_honors_request_epoch_pin() -> eyre::Result<()> {
     let store = store_fixture.chain_store().clone();
     let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
     let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let first_replay = encode_fixture_block_replay(&first_block, &[]);
+    let second_replay = encode_fixture_block_replay(&second_block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         first_epoch,
         vec![first_block],
+        vec![first_replay],
         vec![first_compact_block],
     ))?;
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         second_epoch,
         vec![second_block],
+        vec![second_replay],
         vec![second_compact_block],
     ))?;
 
@@ -677,11 +688,17 @@ fn commit_wallet_artifacts(store: &PrimaryChainStore) -> eyre::Result<StoredWall
         block.height,
         block.block_hash,
     );
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block.clone()])
-            .with_tree_states(vec![tree_state.clone()])
-            .with_subtree_roots(vec![subtree_root.clone()]),
+        ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block],
+            vec![replay],
+            vec![compact_block.clone()],
+        )
+        .with_tree_states(vec![tree_state.clone()])
+        .with_subtree_roots(vec![subtree_root.clone()]),
     )?;
 
     Ok(StoredWalletArtifacts {

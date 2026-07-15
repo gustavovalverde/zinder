@@ -15,8 +15,11 @@ use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, ChainStoreOptions, PrimaryChainStore,
 };
 
-use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block_with_raw_blob_policy};
-use crate::chain_ingest::{IngestError, NodeSourceKind, current_unix_millis};
+use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block};
+use crate::chain_ingest::{
+    IngestError, NodeSourceKind, canonical_writer_store_options, current_unix_millis,
+    validate_writer_store_contract,
+};
 use crate::phase::current_chain_height;
 use crate::source_recovery::{
     SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
@@ -48,7 +51,7 @@ const SOURCE_SEGMENT_GROW_DENOMINATOR: u32 = 4;
 const BULK_STAGE_SOURCE_FETCH: &str = "source_fetch";
 const BULK_STAGE_CANONICAL_BLOCK_PREPARE: &str = "canonical_block_prepare";
 const BULK_STAGE_CANONICAL_PREVOUT_RESOLVE: &str = "canonical_prevout_resolve";
-const BULK_STAGE_CANONICAL_FINALIZE: &str = "canonical_finalize";
+const BULK_STAGE_CANONICAL_POSITION: &str = "canonical_position";
 const BULK_STAGE_SUBTREE_ROOT_ATTACHMENT: &str = "subtree_root_attachment";
 const BULK_STAGE_CHECKPOINT_TREE_STATE: &str = "checkpoint_tree_state";
 const BULK_STAGE_COMMIT_REASSEMBLY: &str = "commit_reassembly";
@@ -67,6 +70,8 @@ pub struct BulkCatchupRunConfig {
     pub storage_path: PathBuf,
     /// Bounded `RocksDB` resource budget applied when opening the canonical store.
     pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    /// Reorg window used by the canonical writer and historical finality checks.
+    pub reorg_window_blocks: u32,
     /// First block height to ingest.
     pub from_height: BlockHeight,
     /// Last block height to ingest.
@@ -102,9 +107,9 @@ pub struct BulkCatchupRunConfig {
     /// Operator-tunable via `ingest.bulk_catchup.block_prepare_concurrency`.
     /// See [ADR-0021](../../../../docs/adrs/0021-parallel-block-derivation.md).
     pub block_prepare_concurrency: NonZeroU32,
-    /// Maximum reserved prepared block bytes across active and completed
-    /// block-prepare work.
-    pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
+    /// Admission watermark for prepare peak estimates, ordered prevout
+    /// resolution, and resident commit-preparation handoff data.
+    pub block_prepare_memory_watermark_bytes: NonZeroU64,
     /// Maximum safe-tip artifact bytes that can accumulate while the previous
     /// batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
@@ -131,6 +136,17 @@ pub struct BulkCatchupRunConfig {
     /// `from_height` must equal `checkpoint.height + 1` in this mode. Reads
     /// at heights below the checkpoint return `ArtifactUnavailable`.
     pub checkpoint: Option<SourceChainCheckpoint>,
+}
+
+impl BulkCatchupRunConfig {
+    fn canonical_store_options(&self) -> ChainStoreOptions {
+        canonical_writer_store_options(
+            self.node.network,
+            self.reorg_window_blocks,
+            self.canonical_rocksdb_budget,
+            self.raw_blob_policy,
+        )
+    }
 }
 
 /// Mutable state carried across bulk-catchup batches.
@@ -236,11 +252,7 @@ pub async fn run_bulk_catchup<Source>(
 where
     Source: NodeSource + Clone,
 {
-    let store_options = ChainStoreOptions {
-        rocksdb_resource_budget: config.canonical_rocksdb_budget,
-        raw_blob_retention: config.raw_blob_policy.to_retention(),
-        ..ChainStoreOptions::for_network(config.node.network)
-    };
+    let store_options = config.canonical_store_options();
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
     run_bulk_catchup_with_store(config, source, &store).await
 }
@@ -250,8 +262,9 @@ where
 /// Returns `Some(commit_outcome)` when at least one chain epoch was
 /// committed and `None` when the requested range was already present in
 /// the store. The supplied store must have been opened with the same
-/// [`ChainStoreOptions`] bulk catchup expects
-/// (`ChainStoreOptions::for_network(config.node.network)`); `RocksDB`
+/// [`ChainStoreOptions`] bulk catchup expects, including
+/// `config.reorg_window_blocks` and `config.raw_blob_policy.to_retention()`;
+/// `RocksDB`
 /// enforces a single primary handle per database, so a caller that
 /// needs to expose readable surfaces (the `IngestControl` gRPC service)
 /// during bulk catchup must open the store once and pass it to this entry
@@ -270,6 +283,7 @@ pub async fn run_bulk_catchup_with_store<Source>(
 where
     Source: NodeSource + Clone,
 {
+    validate_writer_store_contract(store, config.reorg_window_blocks, config.raw_blob_policy)?;
     let mut flush_state = BulkCatchupFlushState::default();
     let run = BulkCatchupRunContext::new(config, source, store);
     run_bulk_catchup_with_store_inner(
@@ -289,21 +303,12 @@ where
     Source: NodeSource + Clone,
 {
     let config = run.config;
-    let store_options = ChainStoreOptions::for_network(config.node.network);
     let node_tip_height = match config.upstream_tip_hint {
         Some(height) => height,
         None => run.source.tip_id().await?.height,
     };
-    validate_bulk_catchup_finality_bound(
-        config,
-        node_tip_height,
-        store_options.reorg_window_blocks,
-    )?;
-    warn_if_checkpoint_within_reorg_window(
-        config,
-        node_tip_height,
-        store_options.reorg_window_blocks,
-    );
+    validate_bulk_catchup_finality_bound(config, node_tip_height, config.reorg_window_blocks)?;
+    warn_if_checkpoint_within_reorg_window(config, node_tip_height, config.reorg_window_blocks);
 
     let current_chain_epoch = match bootstrap_from_checkpoint_if_needed(
         run.store,
@@ -346,6 +351,7 @@ pub async fn run_bulk_catchup_until_complete<Source>(
 where
     Source: NodeSource + Clone,
 {
+    validate_writer_store_contract(store, config.reorg_window_blocks, config.raw_blob_policy)?;
     let mut flush_state = BulkCatchupFlushState::default();
     let run = BulkCatchupRunContext::new(config, source, store);
     run_bulk_catchup_until_complete_inner(
@@ -505,20 +511,15 @@ where
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, bulk_catchup_start.from_height),
             block_prepare_concurrency,
-            block_prepare_max_in_flight_artifact_bytes: config
-                .block_prepare_max_in_flight_artifact_bytes,
+            block_prepare_memory_watermark_bytes: config.block_prepare_memory_watermark_bytes,
             store: run.store.clone(),
         },
         move |source_block| {
             let activations = Arc::clone(&network_upgrade_activations);
             async move {
                 tokio::task::spawn_blocking(move || {
-                    prepare_canonical_block_with_raw_blob_policy(
-                        &source_block,
-                        &activations,
-                        raw_blob_policy,
-                    )
-                    .map_err(IngestError::from)
+                    prepare_canonical_block(&source_block, &activations, raw_blob_policy)
+                        .map_err(IngestError::from)
                 })
                 .await
                 .map_err(|join_error| IngestError::BlockingTaskFailed {
@@ -617,11 +618,7 @@ where
         + Sync
         + 'static,
 {
-    let store_options = ChainStoreOptions {
-        rocksdb_resource_budget: config.canonical_rocksdb_budget,
-        raw_blob_retention: config.raw_blob_policy.to_retention(),
-        ..ChainStoreOptions::for_network(config.node.network)
-    };
+    let store_options = config.canonical_store_options();
     validate_bulk_catchup_finality_bound(
         config,
         source.tip_id().await?.height,
@@ -684,8 +681,7 @@ where
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, bulk_catchup_start.from_height),
             block_prepare_concurrency,
-            block_prepare_max_in_flight_artifact_bytes: config
-                .block_prepare_max_in_flight_artifact_bytes,
+            block_prepare_memory_watermark_bytes: config.block_prepare_memory_watermark_bytes,
             store: store.clone(),
         },
         move |source_block| {
@@ -871,8 +867,9 @@ mod tests {
     use tempfile::tempdir;
     use zinder_core::{
         BlockHash, BlockId, CanonicalTransactionFacts, ConsensusBranchId, NetworkUpgradeActivation,
-        SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, TransactionId,
-        TransactionIntrinsicValueBalances, TransparentAddressScriptHash, TransparentInputFact,
+        SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
+        TransactionBlobArtifact, TransactionId, TransactionIntrinsicValueBalances,
+        TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
         TransparentOutPoint, TransparentOutputFact, TransparentUnspentOutput, UnixTimestampMillis,
         wire::encode_internal_block_hash,
     };
@@ -887,6 +884,38 @@ mod tests {
     use crate::CanonicalBlockConstructionError;
 
     use super::*;
+
+    #[tokio::test]
+    async fn until_complete_rejects_a_mismatched_writer_before_catchup()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("mismatched-until-complete-writer");
+        let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, true)?;
+        let store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let source = TestNodeSource {
+            tip_height: BlockHeight::new(200),
+            network: Network::ZcashRegtest,
+        };
+
+        let error =
+            match run_bulk_catchup_until_complete(&config, &source, &store, &Readiness::default())
+                .await
+            {
+                Ok(outcome) => {
+                    return Err(format!("expected writer mismatch, got {outcome:?}").into());
+                }
+                Err(error) => error,
+            };
+
+        assert!(matches!(
+            error,
+            IngestError::Store(zinder_store::StoreError::RawBlobRetentionMismatch { .. })
+        ));
+        Ok(())
+    }
 
     #[test]
     fn bulk_catchup_flush_state_preserves_epoch_cadence() -> Result<(), Box<dyn Error>> {
@@ -1184,10 +1213,7 @@ mod tests {
             commit_outcome.chain_epoch.visible_tip_height,
             BlockHeight::new(10)
         );
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         assert_eq!(
             store
                 .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?
@@ -1229,7 +1255,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1275,7 +1301,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 4,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1335,7 +1361,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 1,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store: store.clone(),
             },
@@ -1407,10 +1433,8 @@ mod tests {
                         .ok_or("invalid source fetch bytes")?,
                     source_segment_sizer,
                     block_prepare_concurrency,
-                    block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
-                        .ok_or(
-                        "invalid block prepare artifact bytes",
-                    )?,
+                    block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                        .ok_or("invalid block prepare artifact bytes")?,
                     store,
                 },
                 move |source_block| async move {
@@ -1476,7 +1500,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1543,7 +1567,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1616,7 +1640,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1677,7 +1701,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1745,7 +1769,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1813,7 +1837,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1905,7 +1929,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1974,10 +1998,7 @@ mod tests {
             BlockHeight::new(8)
         );
 
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         let events =
             store.chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
         assert_eq!(events.len(), 8);
@@ -2067,10 +2088,7 @@ mod tests {
         );
         assert!(commit_held < commit_released);
 
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         let reader = store.current_chain_epoch_reader()?;
         let spend_facts = reader.transparent_spend_facts_by_outpoints(&[spent_outpoint])?;
         let spend_fact = spend_facts
@@ -2204,10 +2222,7 @@ mod tests {
             commit_outcome.chain_epoch.visible_tip_height,
             BlockHeight::new(1)
         );
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         let reader = store.current_chain_epoch_reader()?;
         let subtree_roots = reader.subtree_roots(zinder_core::SubtreeRootRange::new(
             ShieldedProtocol::Sapling,
@@ -2345,10 +2360,7 @@ mod tests {
             BlockHeight::new(12)
         );
 
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         let event_history =
             store.chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
         // 1 bootstrap commit + 2 single-block bulk catchup commits (heights 11
@@ -2499,7 +2511,7 @@ mod tests {
             + Sync
             + 'static,
     {
-        let store_options = ChainStoreOptions::for_network(config.node.network);
+        let store_options = config.canonical_store_options();
         validate_bulk_catchup_finality_bound(
             config,
             source.tip_id().await?.height,
@@ -2547,6 +2559,7 @@ mod tests {
             node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: storage_path.to_owned(),
             canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_window_blocks: 100,
             raw_blob_policy: RawBlobPolicy::All,
             network_upgrade_activations: Arc::new(
                 zinder_testkit::sample_regtest_upgrade_activations(),
@@ -2575,7 +2588,7 @@ mod tests {
                 .ok_or("invalid test source fetch bytes")?,
             block_prepare_concurrency: NonZeroU32::new(4)
                 .ok_or("invalid test prepare concurrency")?,
-            block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or("invalid test block prepare artifact bytes")?,
             commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or("invalid test commit reassembly bytes")?,
@@ -2584,6 +2597,13 @@ mod tests {
             allow_near_tip_finalize,
             checkpoint: None,
         })
+    }
+
+    fn test_all_blob_store_options() -> ChainStoreOptions {
+        ChainStoreOptions {
+            raw_blob_retention: RawBlobPolicy::All.to_retention(),
+            ..ChainStoreOptions::for_network(Network::ZcashRegtest)
+        }
     }
 
     fn test_primary_chain_store(
@@ -2649,11 +2669,26 @@ mod tests {
                 spending_transaction_id,
                 64,
             ),
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
+                &[0; 64],
+            ),
             intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
             transparent_inputs: vec![TransparentInputFact::new(0, spent_outpoint)],
             transparent_outputs: Vec::new(),
-            raw_transaction_bytes: None,
         });
+        prepared
+            .retained_raw_blobs
+            .transaction_blobs
+            .push(TransactionBlobArtifact::new(
+                TransactionLocation::new(
+                    spending_transaction_id,
+                    source_block.height,
+                    source_block.hash,
+                    0,
+                ),
+                vec![0; 64],
+            ));
+        refresh_test_replay_envelope(&mut prepared);
         prepared
     }
 
@@ -2669,6 +2704,9 @@ mod tests {
                 outpoint.transaction_id,
                 64,
             ),
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
+                &[0; 64],
+            ),
             intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
             transparent_inputs: Vec::new(),
             transparent_outputs: vec![TransparentOutputFact::new(
@@ -2677,8 +2715,20 @@ mod tests {
                 script_pub_key,
                 address_script_hash,
             )],
-            raw_transaction_bytes: None,
         });
+        prepared
+            .retained_raw_blobs
+            .transaction_blobs
+            .push(TransactionBlobArtifact::new(
+                TransactionLocation::new(
+                    outpoint.transaction_id,
+                    source_block.height,
+                    source_block.hash,
+                    0,
+                ),
+                vec![0; 64],
+            ));
+        refresh_test_replay_envelope(&mut prepared);
         prepared
     }
 
@@ -3177,7 +3227,7 @@ mod tests {
     /// drive the commit loop without parsing real Zcash bytes.
     ///
     /// The mock partial compact block carries the same identifiers the
-    /// production preparation would emit; `finalize_canonical_block` then folds
+    /// production preparation would emit; `position_canonical_block` then folds
     /// the supplied tree-size additions and stamps the final
     /// `chain_metadata` before encoding the proto.
     fn test_prepared_block(
@@ -3185,23 +3235,41 @@ mod tests {
         sapling_tree_size_addition: u32,
         orchard_tree_size_addition: u32,
     ) -> PreparedCanonicalBlock {
+        let block_header = zinder_core::BlockHeaderArtifact::new(
+            source_block.height,
+            source_block.hash,
+            source_block.parent_hash,
+            [0; 32],
+            [0; 32],
+            i64::from(source_block.block_time_seconds),
+            0,
+            [0; 32],
+            0,
+            u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+        );
+        let facts = zinder_core::CanonicalBlockFacts {
+            block_header: block_header.clone(),
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
+                &source_block.raw_block_bytes,
+            ),
+            transactions: Vec::new(),
+        };
         PreparedCanonicalBlock {
-            facts: zinder_core::CanonicalBlockFacts {
-                block_header: zinder_core::BlockHeaderArtifact::new(
-                    source_block.height,
-                    source_block.hash,
-                    source_block.parent_hash,
-                    [0; 32],
-                    [0; 32],
-                    i64::from(source_block.block_time_seconds),
-                    0,
-                    [0; 32],
-                    0,
-                    u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
-                ),
-                raw_block_bytes: Some(source_block.raw_block_bytes.clone()),
-                transactions: Vec::new(),
+            replay_envelope: zinder_core::encode_canonical_block_replay(
+                &facts,
+                zinder_core::CanonicalBlockReplayFormatVersion::CURRENT,
+                zinder_core::CanonicalBlockFactsDigestVersion::CURRENT,
+            ),
+            retained_raw_blobs: crate::RetainedRawBlobs {
+                block_blob: Some(zinder_core::BlockBlobArtifact::new(
+                    block_header.height,
+                    block_header.block_hash,
+                    block_header.parent_hash,
+                    source_block.raw_block_bytes.clone(),
+                )),
+                transaction_blobs: Vec::new(),
             },
+            facts,
             partial_compact_block: LightwalletdCompactBlock {
                 height: u64::from(source_block.height.value()),
                 hash: encode_internal_block_hash(source_block.hash).to_vec(),
@@ -3217,5 +3285,13 @@ mod tests {
                 ironwood: 0,
             },
         }
+    }
+
+    fn refresh_test_replay_envelope(prepared: &mut PreparedCanonicalBlock) {
+        prepared.replay_envelope = zinder_core::encode_canonical_block_replay(
+            &prepared.facts,
+            zinder_core::CanonicalBlockReplayFormatVersion::CURRENT,
+            zinder_core::CanonicalBlockFactsDigestVersion::CURRENT,
+        );
     }
 }

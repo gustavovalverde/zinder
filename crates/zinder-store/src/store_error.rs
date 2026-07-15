@@ -3,12 +3,13 @@
 use std::{
     error::Error,
     fmt,
+    num::NonZeroU32,
     path::{Path, PathBuf},
 };
 
 use thiserror::Error;
 
-use crate::format::StoreKey;
+use crate::{RawBlobRetention, format::StoreKey};
 use zinder_core::{BlockHeight, BlockId, ChainEpochId, Network};
 
 /// Stable storage-engine failure category for operator diagnostics.
@@ -29,6 +30,8 @@ pub enum ArtifactFamily {
     ChainEvent,
     /// Canonical block-header facts.
     BlockHeader,
+    /// Complete canonical block replay envelopes.
+    BlockReplay,
     /// Optional raw block blob.
     BlockBlob,
     /// Compact block artifact.
@@ -80,6 +83,7 @@ impl ArtifactFamily {
             Self::ChainEpoch => family::CHAIN_EPOCH,
             Self::ChainEvent => family::CHAIN_EVENT,
             Self::BlockHeader => family::BLOCK_HEADER_ARTIFACT,
+            Self::BlockReplay => family::BLOCK_REPLAY,
             Self::BlockBlob => family::BLOCK_BLOB,
             Self::CompactBlock => family::COMPACT_BLOCK,
             Self::BlockTransactionIndex => family::BLOCK_TRANSACTION_INDEX,
@@ -188,6 +192,19 @@ pub enum StoreError {
         checkpoint: BlockId,
     },
 
+    /// A bounded artifact range exceeds the store's block-count limit.
+    #[error(
+        "{family:?} range requests {requested_block_count} blocks, exceeding the maximum {maximum_block_count}"
+    )]
+    ArtifactRangeTooLarge {
+        /// Artifact family requested by the caller.
+        family: ArtifactFamily,
+        /// Block count requested by the caller.
+        requested_block_count: NonZeroU32,
+        /// Maximum block count accepted by the store.
+        maximum_block_count: NonZeroU32,
+    },
+
     /// Attempted chain epoch conflicts with the current visible epoch.
     #[error("chain epoch conflict: current {current:?}, attempted {attempted:?}")]
     ChainEpochConflict {
@@ -223,6 +240,13 @@ pub enum StoreError {
         persisted_version: u16,
         /// Schema version expected by the running binary.
         expected_version: u16,
+    },
+
+    /// Persisted metadata declares the current schema but a required column family is absent.
+    #[error("store schema is incomplete: missing column family {missing_column_family}")]
+    StoreSchemaIncomplete {
+        /// Required column family not present in the `RocksDB` manifest.
+        missing_column_family: &'static str,
     },
 
     /// Persisted artifact schema is newer than this binary supports.
@@ -389,6 +413,17 @@ pub enum StoreError {
     InvalidChainStoreOptions {
         /// Validation failure reason.
         reason: &'static str,
+    },
+
+    /// Configured raw-blob retention differs from a non-empty store's contract.
+    #[error(
+        "raw blob retention mismatch: store is {persisted}, configured {configured}; rebuild the canonical store to change retention"
+    )]
+    RawBlobRetentionMismatch {
+        /// Retention contract persisted before the first canonical commit.
+        persisted: RawBlobRetention,
+        /// Retention requested by the current primary writer.
+        configured: RawBlobRetention,
     },
 
     /// Artifact required by an epoch-bound read is missing.

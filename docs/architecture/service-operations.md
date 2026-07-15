@@ -120,7 +120,7 @@ Implemented baseline metrics:
 | `zinder_ingest_source_request_duration_seconds` | histogram | `zinder-ingest` | Ingest source fetch latency by operation, status, and error class. |
 | `zinder_ingest_source_request_total` | counter | `zinder-ingest` | Ingest source fetch count by operation, status, and error class. |
 | `zinder_ingest_source_retry_total` | counter | `zinder-ingest` | Retryable source failures by ingest operation. |
-| `zinder_ingest_bulk_pipeline_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup stage latency by stage, status, and error class. Stages include `canonical_block_prepare`, `canonical_finalize`, `subtree_root_attachment`, `checkpoint_tree_state`, `canonical_commit`, and `canonical_flush`. |
+| `zinder_ingest_bulk_pipeline_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk-catchup stage latency by stage, status, and error class. Stages include `canonical_block_prepare`, `canonical_position`, `subtree_root_attachment`, `checkpoint_tree_state`, `canonical_commit`, and `canonical_flush`. |
 | `zinder_ingest_bulk_pipeline_queue_depth` | gauge | `zinder-ingest` | Active or queued work items by bulk-catchup stage. |
 | `zinder_ingest_bulk_pipeline_queue_bytes` | gauge | `zinder-ingest` | Byte reservations held by a bulk-catchup stage, labeled by stage. |
 | `zinder_ingest_bulk_pipeline_active` | gauge | `zinder-ingest` | Active work count by bulk-catchup stage. |
@@ -134,7 +134,7 @@ Implemented baseline metrics:
 | `zinder_ingest_source_fetch_request_reservation_bytes` | gauge | `zinder-ingest` | Predicted response bytes reserved for the most recently admitted source request. |
 | `zinder_ingest_source_segment_reserved_response_bytes` | histogram | `zinder-ingest` | Distribution of predicted response-byte reservations used for source admission. |
 | `zinder_ingest_source_segment_reservation_undersized_total` | counter | `zinder-ingest` | Source segments whose measured response bytes exceeded their admission reservation. |
-| `zinder_ingest_block_prepare_duration_seconds` | histogram | `zinder-ingest` | Per-block artifact-prepare latency by status and error class. Ordered bulk-catchup prevout resolution is reported separately; tip follow records sequential construction plus finalization. |
+| `zinder_ingest_block_prepare_duration_seconds` | histogram | `zinder-ingest` | Per-block artifact-prepare latency by status and error class. Ordered bulk-catchup prevout resolution is reported separately; tip follow records sequential construction plus positioning. |
 | `zinder_ingest_block_prepare_total` | counter | `zinder-ingest` | Per-block block-prepare count by status and error class. |
 | `zinder_ingest_block_prepare_stage_duration_seconds` | histogram | `zinder-ingest` | Bulk prepare time split between per-block `canonical_block_prepare` and per-window `transparent_prevout_resolve`, labeled by status. |
 | `zinder_ingest_prevout_resolver_window_blocks` | histogram | `zinder-ingest` | Contiguous blocks coalesced into one ordered prevout-resolution window. |
@@ -144,8 +144,8 @@ Implemented baseline metrics:
 | `zinder_ingest_prevout_resolver_recent_output_bytes` | gauge | `zinder-ingest` | Estimated resident bytes held by the recent-output cache. |
 | `zinder_ingest_prevout_resolver_cache_admission_total` | counter | `zinder-ingest` | Recent-output cache admissions by `cached` or `no_headroom`. |
 | `zinder_ingest_prevout_resolver_cache_evictions_total` | counter | `zinder-ingest` | Oldest recent outputs evicted to stay inside the shared block-prepare watermark. |
-| `zinder_ingest_canonical_block_construction_stage_duration_seconds` | histogram | `zinder-ingest` | Canonical construction CPU time split between `block_parse`, `identity_validation`, `compact_artifacts`, `transaction_facts`, `block_header_artifact`, and `raw_block_bytes`, labeled by status. |
-| `zinder_ingest_block_prepare_reassembly_blocks` | gauge | `zinder-ingest` | Completed prepared blocks waiting for earlier heights before the serial finalization fold. |
+| `zinder_ingest_canonical_block_construction_stage_duration_seconds` | histogram | `zinder-ingest` | Canonical construction CPU time split between `block_parse`, `identity_validation`, `compact_artifacts`, `transaction_facts`, `block_header_artifact`, `block_blob`, and `block_replay`, labeled by status. |
+| `zinder_ingest_block_prepare_reassembly_blocks` | gauge | `zinder-ingest` | Completed prepared blocks waiting for earlier heights before the serial positioning fold. |
 | `zinder_ingest_derive_tailer_tick_duration_seconds` | histogram | `zinder-ingest` | Derive tailer catch-up pass latency by status and error class. |
 | `zinder_ingest_derive_tailer_ticks_total` | counter | `zinder-ingest` | Derive tailer catch-up pass count by status and error class. |
 | `zinder_ingest_derive_replay_stage_duration_seconds` | histogram | `zinder-ingest` | Derive tailer replay stage latency by stage, status, and error class. Stages include `build_block_contexts` and `read_transparent_spend_facts`; the former wraps context construction, the latter is only the store read. |
@@ -232,6 +232,7 @@ Implemented baseline metrics:
 | `zinder_derive_secondary_catchup_retries_total` | counter | `zinder-derive` | Internal retries that crossed a narrowly classified missing-SST primary-compaction race during secondary catchup. |
 | `zinder_store_secondary_catchup_retries_total` | counter | `zinder-store` | Canonical-secondary retries that crossed the same narrowly classified missing-SST primary-compaction race. |
 | `zinder_store_visibility_seek_total` | counter | `zinder-store` | Visibility-index reverse seeks by artifact family. |
+| `zinder_store_visibility_scan_total` | counter | `zinder-store` | Bounded, ordered visibility-index scans by artifact family. One block replay batch contributes one scan, independent of its block count. |
 | `zinder_store_rocksdb_property` | gauge | `zinder-store` | Curated RocksDB integer properties by column family, property name, and store role. The `store_role` label separates the canonical and derive stores that share the process (`canonical_primary`, `canonical_secondary`, `derive_primary`, `derive_secondary`). Per-column-family samples include level-zero files, immutable memtables, flush pending/running, compaction pending/running, base level, and pending-compaction bytes. DB-level write-controller properties (`rocksdb.actual-delayed-write-rate`, `rocksdb.is-write-stopped`) carry `cf="__db__"`. |
 | `zinder_store_wal_bytes`, `zinder_store_wal_bytes_limit`, `zinder_store_block_cache_capacity_bytes`, `zinder_store_block_cache_usage_bytes`, `zinder_store_block_cache_pinned_usage_bytes`, `zinder_store_memtable_budget_bytes`, `zinder_store_memtable_budget_usage_bytes`, `zinder_store_rocksdb_io_mode` | gauge | `zinder-store` | Bounded-RocksDB resource limits and footprints, each labeled by `store_role` so the canonical and derive stores are attributable within one process. |
 | `zinder_store_max_background_jobs` | gauge | `zinder-store` | Configured primary-writer aggregate flush and compaction job cap. Emitted only for `canonical_primary` and `derive_primary`; secondary roles have no effective background-job limit because `OpenAsSecondary` disables automatic flushes and compactions. |
@@ -527,7 +528,7 @@ source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 20
 source_fetch_max_in_flight_bytes = 671088640
 block_prepare_concurrency = 16
-block_prepare_max_in_flight_artifact_bytes = 536870912
+block_prepare_memory_watermark_bytes = 536870912
 commit_reassembly_max_queued_artifact_bytes = 536870912
 
 [ingest.tip_follow]
@@ -570,12 +571,17 @@ token through `tokio::select!` instead of polling a boolean flag.
 
 `zinder-ingest backup --to <path>` uses `[network]` and `[storage]` plus a
 subcommand-specific `[backup] to_path` field when invoked through config. It
+resolves the same immutable `storage.raw_blob_policy` as the writer; direct CLI
+invocations use `--raw-blob-policy`. The selected value must match the store's
+persisted retention contract, so backup fails before checkpoint creation when
+an operator supplies a different policy. It
 detects the effective workload from the durable derive manifest, opens the
 canonical store as `PrimaryChainStore`, opens that selected derive store as
 primary, and creates RocksDB checkpoints for both stores; it does not
 connect to the upstream node. The published directory also contains
-`zinder-backup-manifest.json`, which binds the network, workload, canonical
-history boundary, and every projection position to the reopened checkpoints.
+`zinder-backup-manifest.json`, which binds the network, workload, immutable
+raw-blob retention, canonical history boundary, and every projection position
+to the reopened checkpoints.
 A projection is recorded as `behind` only when its authenticated cursor can
 resume from retained events, or a missing cursor can replay from the canonical
 history boundary. An expired cursor, a retained suffix without that boundary,
@@ -596,7 +602,11 @@ Expected recovery behavior:
   to the running catalog. Current durable projection state then follows normal
   schema reconciliation and remains the only readiness authority.
   A pending and admitted record together, or any malformed or mismatched
-  record, fails closed.
+  record, fails closed. Pending restore admission compares the manifest's
+  raw-blob retention, the checkpoint's persisted retention signal, and the
+  configured writer policy before consuming the pending evidence. Later
+  restarts also reject a configured policy that differs from the admitted
+  retention contract.
 - Start query, compatibility, and explorer readers only after ingest admits the
   restored pair. Manifest labels such as `exact` are historical evidence, not
   capability state; each reader applies its normal schema, cursor, coverage,

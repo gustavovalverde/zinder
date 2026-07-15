@@ -173,7 +173,7 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_requires_digest_evidence() -> Result<()> {
+fn fixture_v4_requires_digest_evidence() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_digest_evidence = serde_json::to_value(&fixture.manifest)?;
     missing_digest_evidence
@@ -185,7 +185,7 @@ fn fixture_v3_requires_digest_evidence() -> Result<()> {
         serde_json::to_vec_pretty(&missing_digest_evidence)?,
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
-        return Err(eyre!("fixture v3 digest evidence must be mandatory"));
+        return Err(eyre!("fixture v4 digest evidence must be mandatory"));
     };
     assert!(
         error
@@ -196,7 +196,7 @@ fn fixture_v3_requires_digest_evidence() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_inconsistent_counts() -> Result<()> {
+fn fixture_v4_rejects_inconsistent_counts() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut inconsistent_digest_count = fixture.manifest.clone();
     inconsistent_digest_count
@@ -227,7 +227,7 @@ fn fixture_v3_rejects_inconsistent_counts() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_unknown_digest_version() -> Result<()> {
+fn fixture_v4_rejects_unknown_digest_version() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_digest_version = fixture.manifest;
     unknown_digest_version
@@ -252,7 +252,7 @@ fn fixture_v3_rejects_unknown_digest_version() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_uppercase_sequence_digest_hex() -> Result<()> {
+fn fixture_v4_rejects_uppercase_sequence_digest_hex() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut uppercase_sequence_digest = fixture.manifest;
     uppercase_sequence_digest

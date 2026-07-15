@@ -134,6 +134,7 @@ ZINDER_BENCH_SOFTWARE_REVISION=config-validation \
 ZINDER_BENCH_RUNNER_ID=config-validation \
 ZINDER_BENCH_STORAGE_CLASS=config-validation \
 ZINDER_BENCH_TRIAL_ID=config-validation \
+ZINDER_BENCH_FIXTURE_CACHE_POLICY=warm \
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \

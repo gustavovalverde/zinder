@@ -32,12 +32,11 @@ use zinder_ingest::{
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
     IngestControlWriterToml, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
-    PrimaryStorageSection, PrimaryStorageToml, ResolvedIngestControlWriter, ResolvedPrimaryStorage,
-    ResolvedRetention, RetentionSection, RetentionToml, SecuritySection, SecurityToml,
-    ServiceIdentifier, StorageRoleSection, StorageRoleToml, duration_as_millis_u64,
-    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
-    resolve_retention,
+    PrimaryStorageSection, ResolvedIngestControlWriter, ResolvedPrimaryStorage, ResolvedRetention,
+    RetentionSection, RetentionToml, SecuritySection, SecurityToml, ServiceIdentifier,
+    StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
+    require_field, resolve_allow_public_bind, resolve_ingest_control_writer,
+    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::{MempoolEventRetentionConfig, RocksDbResourceBudget};
@@ -64,16 +63,15 @@ const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
 // (`ZINDER_INGEST__BULK_CATCHUP__*_BYTES`) still win when set. See
 // [ADR-0022](../../../docs/adrs/0022-resource-budgeted-bulk-catchup.md).
 const FALLBACK_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 402_653_184; // 384 MiB
-const FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES: u64 = 536_870_912; // 512 MiB
+const FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 536_870_912; // 512 MiB
 const FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 536_870_912; // 512 MiB
 
 // Floor and divisor for the container-aware default. The divisor
 // expresses how thinly the pipeline carves up the container's memory
 // budget: at `/ 64` the four queues together claim ~6% of the
 // container, leaving the remaining ~94% for RocksDB working set,
-// per-batch decoded-artifact amplification (a watermark counts
-// "estimated artifact bytes"; the actual Rust struct memory is several
-// times larger for dense ranges), in-flight commit futures, and the
+// per-batch write-batch amplification, allocator overhead beyond the
+// pipeline's admission estimates, in-flight commit futures, and the
 // query / explorer / multiplexer planes that share the same container.
 // The 7x amplification observed on mainnet around blocks 297-298k
 // (`estimated_write_bytes=510 MB` correlated with 22.7 GB resident
@@ -208,6 +206,7 @@ pub(crate) struct BackupCommandConfig {
     pub(crate) storage_path: PathBuf,
     pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
     pub(crate) derive_rocksdb_budget: RocksDbResourceBudget,
+    pub(crate) raw_blob_policy: RawBlobPolicy,
     pub(crate) to_path: PathBuf,
 }
 
@@ -252,6 +251,7 @@ pub(crate) struct BackupConfigOverrides {
     pub(crate) network: Option<String>,
     pub(crate) storage_path: Option<PathBuf>,
     pub(crate) to_path: Option<PathBuf>,
+    pub(crate) raw_blob_policy: Option<String>,
 }
 
 /// Error returned while resolving command configuration.
@@ -337,8 +337,8 @@ pub(crate) fn load_ingest_config(
             default_block_prepare_concurrency(),
         )?
         .with_default(
-            "ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes",
-            default_pipeline_queue_bytes(FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES),
+            "ingest.bulk_catchup.block_prepare_memory_watermark_bytes",
+            default_pipeline_queue_bytes(FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES),
         )?
         .with_default(
             "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
@@ -578,6 +578,7 @@ pub(crate) fn load_backup_config(
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
         .with_override_path_if("storage.path", overrides.storage_path)?
+        .with_override_if("storage.raw_blob_policy", overrides.raw_blob_policy)?
         .with_override_path_if("backup.to_path", overrides.to_path)?
         .load()?;
 
@@ -772,7 +773,7 @@ struct IngestBulkCatchupSection {
     source_fetch_max_in_flight_requests: Option<u32>,
     source_fetch_max_in_flight_bytes: Option<u64>,
     block_prepare_concurrency: Option<u32>,
-    block_prepare_max_in_flight_artifact_bytes: Option<u64>,
+    block_prepare_memory_watermark_bytes: Option<u64>,
     commit_reassembly_max_queued_artifact_bytes: Option<u64>,
     flush_interval_epochs: Option<u32>,
 }
@@ -953,12 +954,12 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
                 "ingest.bulk_catchup.block_prepare_concurrency must be greater than zero",
             )
         })?;
-    let block_prepare_max_in_flight_artifact_bytes = nonzero_u64_config(
+    let block_prepare_memory_watermark_bytes = nonzero_u64_config(
         config
             .ingest
             .bulk_catchup
-            .block_prepare_max_in_flight_artifact_bytes,
-        "ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes",
+            .block_prepare_memory_watermark_bytes,
+        "ingest.bulk_catchup.block_prepare_memory_watermark_bytes",
     )?;
     let commit_reassembly_max_queued_artifact_bytes = nonzero_u64_config(
         config
@@ -1158,17 +1159,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     )?;
 
     let coverage = config.ingest.modifiers.coverage.unwrap_or_default();
-    let raw_blob_policy = match (coverage, configured_raw_blob_policy) {
-        (IngestCoverage::WalletServing, None) => RawBlobPolicy::Transactions,
-        (IngestCoverage::WalletServing, Some(RawBlobPolicy::None)) => {
-            return Err(ConfigError::invalid(
-                "ingest.modifiers.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
-            )
-            .into());
-        }
-        (_, Some(raw_blob_policy)) => raw_blob_policy,
-        (_, None) => DEFAULT_RAW_BLOB_POLICY,
-    };
+    let raw_blob_policy = resolve_raw_blob_policy(coverage, configured_raw_blob_policy)?;
 
     let allow_near_tip_finalize = require_field(
         config.ingest.modifiers.allow_near_tip_finalize,
@@ -1260,7 +1251,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             source_fetch_max_in_flight_requests,
             source_fetch_max_in_flight_bytes,
             block_prepare_concurrency,
-            block_prepare_max_in_flight_artifact_bytes,
+            block_prepare_memory_watermark_bytes,
             commit_reassembly_max_queued_artifact_bytes,
             flush_interval_epochs,
         },
@@ -1292,6 +1283,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
 
 fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
+    let raw_blob_policy = resolve_raw_blob_policy(
+        config.ingest.modifiers.coverage.unwrap_or_default(),
+        config.storage.raw_blob_policy,
+    )?;
     let ResolvedPrimaryStorage {
         path: storage_path,
         canonical_rocksdb_budget,
@@ -1307,8 +1302,23 @@ fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, In
         storage_path,
         canonical_rocksdb_budget,
         derive_rocksdb_budget,
+        raw_blob_policy,
         to_path,
     })
+}
+
+fn resolve_raw_blob_policy(
+    coverage: IngestCoverage,
+    configured_policy: Option<RawBlobPolicy>,
+) -> Result<RawBlobPolicy, ConfigError> {
+    match (coverage, configured_policy) {
+        (IngestCoverage::WalletServing, None) => Ok(RawBlobPolicy::Transactions),
+        (IngestCoverage::WalletServing, Some(RawBlobPolicy::None)) => Err(ConfigError::invalid(
+            "ingest.modifiers.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
+        )),
+        (_, Some(raw_blob_policy)) => Ok(raw_blob_policy),
+        (_, None) => Ok(DEFAULT_RAW_BLOB_POLICY),
+    }
 }
 
 #[derive(Serialize)]
@@ -1317,7 +1327,7 @@ struct RedactedIngestConfigToml {
     ops: OpsToml,
     security: SecurityToml,
     node: NodeToml,
-    storage: IngestPrimaryStorageToml,
+    storage: IngestStorageToml,
     ingest: IngestToml,
     ingest_control: IngestControlWriterToml,
     retention: RetentionToml,
@@ -1326,7 +1336,7 @@ struct RedactedIngestConfigToml {
 #[derive(Serialize)]
 struct RedactedBackupConfigToml {
     network: NetworkToml,
-    storage: PrimaryStorageToml,
+    storage: IngestStorageToml,
     backup: BackupToml,
 }
 
@@ -1342,7 +1352,7 @@ impl RedactedIngestConfigToml {
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             node: NodeToml::from_node_target(&loop_config.node),
-            storage: IngestPrimaryStorageToml {
+            storage: IngestStorageToml {
                 path: loop_config.storage_path.display().to_string(),
                 canonical: StorageRoleToml::from_resolved(loop_config.canonical_rocksdb_budget),
                 derive: StorageRoleToml::from_resolved(loop_config.derive_rocksdb_budget),
@@ -1448,9 +1458,9 @@ impl RedactedIngestConfigToml {
                         .bulk_catchup
                         .block_prepare_concurrency
                         .get(),
-                    block_prepare_max_in_flight_artifact_bytes: loop_config
+                    block_prepare_memory_watermark_bytes: loop_config
                         .bulk_catchup
-                        .block_prepare_max_in_flight_artifact_bytes
+                        .block_prepare_memory_watermark_bytes
                         .get(),
                     commit_reassembly_max_queued_artifact_bytes: loop_config
                         .bulk_catchup
@@ -1485,10 +1495,11 @@ impl RedactedBackupConfigToml {
     fn from_backup_config(config: &BackupCommandConfig) -> Self {
         Self {
             network: NetworkToml::from_network(config.network),
-            storage: PrimaryStorageToml {
+            storage: IngestStorageToml {
                 path: config.storage_path.display().to_string(),
                 canonical: StorageRoleToml::from_resolved(config.canonical_rocksdb_budget),
                 derive: StorageRoleToml::from_resolved(config.derive_rocksdb_budget),
+                raw_blob_policy: config.raw_blob_policy,
             },
             backup: BackupToml {
                 to_path: config.to_path.display().to_string(),
@@ -1565,7 +1576,7 @@ struct IngestValuePoolBalanceBackfillToml {
 }
 
 #[derive(Serialize)]
-struct IngestPrimaryStorageToml {
+struct IngestStorageToml {
     path: String,
     canonical: StorageRoleToml,
     derive: StorageRoleToml,
@@ -1603,7 +1614,7 @@ struct IngestBulkCatchupToml {
     source_fetch_max_in_flight_requests: u32,
     source_fetch_max_in_flight_bytes: u64,
     block_prepare_concurrency: u32,
-    block_prepare_max_in_flight_artifact_bytes: u64,
+    block_prepare_memory_watermark_bytes: u64,
     commit_reassembly_max_queued_artifact_bytes: u64,
     flush_interval_epochs: u32,
 }
@@ -1653,7 +1664,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_falls_back_when_cgroup_absent() {
-        let fallback = FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES;
+        let fallback = FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES;
         assert_eq!(
             default_pipeline_queue_bytes_from_budget(None, fallback),
             fallback,
@@ -1663,7 +1674,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_caps_at_fallback_on_fat_containers() {
-        let fallback = FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES;
+        let fallback = FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES;
         // 64 GiB container -> raw computation would give 1 GiB per queue,
         // but the fallback caps at the previously hand-tuned 512 MiB.
         let result = default_pipeline_queue_bytes_from_budget(Some(64 * ONE_GIB), fallback);
@@ -1672,7 +1683,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_shrinks_for_railway_sized_containers() {
-        let fallback = FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES;
+        let fallback = FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES;
         // The Railway zinder-mainnet incident: 24 GiB container cap,
         // OOM at the 512 MiB default. Container-aware default must
         // be smaller than the fallback to prevent recurrence.
@@ -1686,7 +1697,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_floors_at_min_for_tight_containers() {
-        let fallback = FALLBACK_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES;
+        let fallback = FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES;
         // 4 GiB container -> raw computation gives 64 MiB per queue,
         // smaller than a single mainnet block can produce. Floor at
         // 128 MiB so the pipeline can always make forward progress.

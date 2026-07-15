@@ -8,7 +8,7 @@ use zinder_bench::{
     canonical_fact_round_trip::{
         CanonicalFactSequencePosition,
         postgres::{
-            POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION, POSTGRES_REPLAY_ENCODING_COMPRESSION,
+            POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION, POSTGRES_REPLAY_ENVELOPE_COMPRESSION,
             PostgresCanonicalFactRoundTripConfig, PostgresCanonicalFactRoundTripResult,
             run_postgres_canonical_fact_round_trip,
         },
@@ -324,7 +324,7 @@ fn build_postgres_round_trip_output(
             storage_schema_version: POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION,
             ingestion_mode: "binary-copy-single-load-transaction-with-deferred-index",
             tables_logged: true,
-            replay_encoding_compression: POSTGRES_REPLAY_ENCODING_COMPRESSION,
+            replay_envelope_compression: POSTGRES_REPLAY_ENVELOPE_COMPRESSION,
             server_settings: Box::new(round_trip.server_settings),
             fact_table_bytes: round_trip.storage.fact_table_bytes,
             index_bytes: round_trip.storage.index_bytes,

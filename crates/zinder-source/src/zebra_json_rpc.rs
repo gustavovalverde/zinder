@@ -667,11 +667,8 @@ impl ZebraJsonRpcSource {
                 .map_err(|source| SourceError::InvalidRawBlockHex { source })?;
             record_block_decode_stage("hex_decode", decode_started_at);
             let header_started_at = Instant::now();
-            let source_block = SourceBlock::from_raw_block_bytes_using_header(
-                self.network,
-                height,
-                raw_block_bytes_outcome,
-            )?;
+            let source_block =
+                SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes_outcome)?;
             record_block_decode_stage("block_header", header_started_at);
             blocks.push(source_block);
         }
@@ -1505,8 +1502,6 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
             | SourceError::RawBlockParseFailed { .. }
             | SourceError::RawTransactionParseFailed { .. }
             | SourceError::TransactionComponentIndexOverflow { .. }
-            | SourceError::RawBlockCoinbaseHeightMissing
-            | SourceError::RawBlockHeightMismatch { .. }
             | SourceError::RawBlockTimeOutOfRange,
         ) => "source_decode_failed",
     }

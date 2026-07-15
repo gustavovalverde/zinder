@@ -2,10 +2,10 @@
 
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockTransactionIndexArtifact, BlockValuePoolBalances, ChainEpoch,
-    CompactBlockArtifact, SubtreeRootArtifact, TransactionBlobArtifact, TransactionFactsArtifact,
-    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutputArtifact,
-    TransparentSpendFact, TreeStateArtifact,
+    BlockHeightRange, BlockTransactionIndexArtifact, BlockValuePoolBalances,
+    CanonicalBlockReplayEnvelope, ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
 };
 
 /// Complete artifact set committed as one visible chain epoch.
@@ -15,6 +15,9 @@ pub struct ChainEpochArtifacts {
     pub chain_epoch: ChainEpoch,
     /// Block-header facts included in this commit.
     pub block_headers: Vec<BlockHeaderArtifact>,
+    /// Canonical replay envelopes for every committed block header, in
+    /// the same order as `block_headers`.
+    pub block_replay_envelopes: Vec<CanonicalBlockReplayEnvelope>,
     /// Optional raw block blobs included in this commit.
     pub block_blobs: Vec<BlockBlobArtifact>,
     /// Compact block artifacts included in this commit.
@@ -25,7 +28,7 @@ pub struct ChainEpochArtifacts {
     pub transaction_locations: Vec<TransactionLocation>,
     /// Transaction fact rows included in this commit.
     pub transaction_facts: Vec<TransactionFactsArtifact>,
-    /// Optional transaction-intrinsic value-balance artifacts included in this commit.
+    /// Transaction-intrinsic value-balance artifacts included in this commit.
     pub transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
     /// Optional raw transaction blobs included in this commit.
     pub transaction_blobs: Vec<TransactionBlobArtifact>,
@@ -47,16 +50,19 @@ pub struct ChainEpochArtifacts {
 }
 
 impl ChainEpochArtifacts {
-    /// Creates a chain epoch commit value with no transaction or tree-state artifacts.
+    /// Creates a commit value with required block replay and no other
+    /// transaction or tree-state rows.
     #[must_use]
     pub fn new(
         chain_epoch: ChainEpoch,
         block_headers: Vec<BlockHeaderArtifact>,
+        block_replay_envelopes: Vec<CanonicalBlockReplayEnvelope>,
         compact_blocks: Vec<CompactBlockArtifact>,
     ) -> Self {
         Self {
             chain_epoch,
             block_headers,
+            block_replay_envelopes,
             block_blobs: Vec::new(),
             compact_blocks,
             block_transaction_index: Vec::new(),
@@ -111,7 +117,7 @@ impl ChainEpochArtifacts {
         self
     }
 
-    /// Adds optional transaction-intrinsic value balances to this commit value.
+    /// Adds transaction-intrinsic value balances to this commit value.
     #[must_use]
     pub fn with_transaction_intrinsic_value_balances(
         mut self,

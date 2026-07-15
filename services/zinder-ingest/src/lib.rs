@@ -31,8 +31,8 @@ mod value_pool_flow_backfill;
 
 pub use artifact_builder::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
-    PreparedCanonicalBlock, RawBlobPolicy, finalize_canonical_block, prepare_canonical_block,
-    prepare_canonical_block_with_raw_blob_policy,
+    PositionedCanonicalBlock, PreparedCanonicalBlock, RawBlobPolicy, RetainedRawBlobs,
+    position_canonical_block, prepare_canonical_block,
 };
 pub use block_production_time_backfill::spawn_block_production_time_backfill_task;
 pub use bulk_catchup::{

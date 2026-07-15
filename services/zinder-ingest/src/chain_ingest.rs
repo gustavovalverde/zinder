@@ -17,9 +17,9 @@ use thiserror::Error;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockTransactionIndexArtifact, CanonicalTransactionFacts, ChainEpoch,
-    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, PositionedCanonicalBlock,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, TransactionBlobArtifact,
+    BlockHeightRange, BlockTransactionIndexArtifact, CanonicalBlockReplayEnvelope,
+    CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
+    Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, TransactionBlobArtifact,
     TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
     TransactionLocation, TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact,
     TreeStateArtifact, UnixTimestampMillis,
@@ -29,13 +29,16 @@ use zinder_source::{
     SourceError, SourceFailureClass, SourceSubtreeRoots, SourceTreeState,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, PrimaryChainStore, ReorgWindowChange,
-    StoreError, StoreReadCaller,
+    ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, ChainStoreOptions, PrimaryChainStore,
+    ReorgWindowChange, RocksDbResourceBudget, StoreError, StoreReadCaller,
 };
 
 use crate::{
     CanonicalBlockConstructionError,
-    artifact_builder::{CurrentSchemaBlockArtifacts, expand_current_schema_block_artifacts},
+    artifact_builder::{
+        CurrentSchemaBlockArtifacts, PositionedCanonicalBlock, RawBlobPolicy,
+        expand_current_schema_block_artifacts,
+    },
 };
 
 const FETCH_RETRY_MAX_ATTEMPTS: u32 = 5;
@@ -353,6 +356,17 @@ pub enum IngestError {
         configured_window_blocks: u32,
     },
 
+    /// A caller-owned canonical writer uses a different reorg-window contract.
+    #[error(
+        "caller-owned canonical writer reorg window {store_reorg_window_blocks} does not match configured reorg window {configured_reorg_window_blocks}"
+    )]
+    CanonicalWriterReorgWindowMismatch {
+        /// Reorg window used to open the caller-owned writer.
+        store_reorg_window_blocks: u32,
+        /// Reorg window selected by ingest configuration.
+        configured_reorg_window_blocks: u32,
+    },
+
     /// Retryable node failures exceeded the per-run ingest budget.
     #[error(
         "ingest source retry budget exceeded during {operation}: {retryable_failures} failures, budget {failure_budget}"
@@ -408,9 +422,50 @@ pub enum IngestError {
     },
 }
 
+/// Builds the canonical writer options shared by every ingest phase and probe.
+pub(crate) fn canonical_writer_store_options(
+    network: Network,
+    reorg_window_blocks: u32,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    raw_blob_policy: RawBlobPolicy,
+) -> ChainStoreOptions {
+    ChainStoreOptions {
+        reorg_window_blocks,
+        rocksdb_resource_budget,
+        raw_blob_retention: raw_blob_policy.to_retention(),
+        ..ChainStoreOptions::for_network(network)
+    }
+}
+
+/// Rejects a caller-owned writer whose runtime contract differs from ingest config.
+pub(crate) fn validate_writer_store_contract(
+    store: &PrimaryChainStore,
+    configured_reorg_window_blocks: u32,
+    configured_policy: RawBlobPolicy,
+) -> Result<(), IngestError> {
+    let store_reorg_window_blocks = store.reorg_window_blocks();
+    if store_reorg_window_blocks != configured_reorg_window_blocks {
+        return Err(IngestError::CanonicalWriterReorgWindowMismatch {
+            store_reorg_window_blocks,
+            configured_reorg_window_blocks,
+        });
+    }
+    let persisted_retention = store.raw_blob_retention()?;
+    let configured_retention = configured_policy.to_retention();
+    if persisted_retention != configured_retention {
+        return Err(StoreError::RawBlobRetentionMismatch {
+            persisted: persisted_retention,
+            configured: configured_retention,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// In-flight canonical artifact batch accumulated between commits.
 #[derive(Default)]
 pub(crate) struct CanonicalBatch {
+    pub(crate) block_replay_envelopes: Vec<CanonicalBlockReplayEnvelope>,
     pub(crate) block_headers: Vec<BlockHeaderArtifact>,
     pub(crate) block_blobs: Vec<BlockBlobArtifact>,
     pub(crate) compact_blocks: Vec<CompactBlockArtifact>,
@@ -436,7 +491,7 @@ pub(crate) struct CanonicalBatch {
 impl CanonicalBatch {
     /// Appends one block's canonical facts into the in-flight batch.
     ///
-    /// Called once per `finalize_canonical_block` result. Each field is
+    /// Called once per `position_canonical_block` result. Each field is
     /// moved into its matching `CanonicalBatch` vector; the running tip
     /// metadata is overwritten with the latest block value.
     pub(crate) fn absorb(
@@ -446,7 +501,7 @@ impl CanonicalBatch {
         self.absorb_with_prefetched_spent_outputs(block, Vec::new())
     }
 
-    /// Returns the resource cost contributed by one finalized block.
+    /// Returns the resource cost contributed by one positioned block.
     ///
     /// This is intentionally shared by pre-admission budgeting and the
     /// post-admission accumulator, so they cannot drift apart as canonical
@@ -499,6 +554,8 @@ impl CanonicalBatch {
     ) -> Result<(), CanonicalBlockConstructionError> {
         let PositionedCanonicalBlock {
             facts,
+            replay_envelope,
+            retained_raw_blobs,
             compact_block,
             tip_metadata,
         } = block;
@@ -511,7 +568,8 @@ impl CanonicalBatch {
             transaction_intrinsic_value_balances,
             transaction_blobs,
             transparent_outputs_by_outpoint,
-        } = expand_current_schema_block_artifacts(facts)?;
+        } = expand_current_schema_block_artifacts(facts, retained_raw_blobs)?;
+        self.block_replay_envelopes.push(replay_envelope);
         self.block_headers.push(block_header);
         if let Some(block_blob) = block_blob {
             self.block_blobs.push(block_blob);
@@ -583,22 +641,21 @@ impl CanonicalBatch {
 }
 
 fn canonical_block_artifact_bytes(block: &PositionedCanonicalBlock) -> usize {
-    let block_blob_bytes = block.facts.raw_block_bytes.as_ref().map_or(0, Vec::len);
+    let block_blob_bytes = block
+        .retained_raw_blobs
+        .block_blob
+        .as_ref()
+        .map_or(0, |blob| blob.raw_block_bytes.len());
+    let replay_envelope_byte_count = block.replay_envelope.as_bytes().len();
     let compact_block_bytes = block.compact_block.payload_bytes.len();
-    let transaction_blob_bytes =
-        block
-            .facts
-            .transactions
-            .iter()
-            .fold(0usize, |bytes, transaction| {
-                bytes.saturating_add(
-                    transaction
-                        .raw_transaction_bytes
-                        .as_ref()
-                        .map_or(0, Vec::len),
-                )
-            });
-    block_blob_bytes
+    let transaction_blob_bytes = block.retained_raw_blobs.transaction_blobs.iter().fold(
+        0usize,
+        |bytes, transaction_blob| {
+            bytes.saturating_add(transaction_blob.raw_transaction_bytes.len())
+        },
+    );
+    replay_envelope_byte_count
+        .saturating_add(block_blob_bytes)
         .saturating_add(compact_block_bytes)
         .saturating_add(transaction_blob_bytes)
 }
@@ -725,7 +782,7 @@ impl CanonicalBatchBudget {
     }
 
     /// Returns the close trigger for the current batch before admitting the
-    /// next finalized block.
+    /// next positioned block.
     ///
     /// Exact-limit blocks still join the current batch and close it through
     /// [`Self::commit_trigger`]. This path is only for an existing batch that
@@ -1457,6 +1514,7 @@ fn drain_batch_into_chain_epoch_artifacts(
     let mut artifacts = ChainEpochArtifacts::new(
         chain_epoch,
         std::mem::take(&mut batch.block_headers),
+        std::mem::take(&mut batch.block_replay_envelopes),
         std::mem::take(&mut batch.compact_blocks),
     );
     if !batch.block_blobs.is_empty() {
@@ -1577,7 +1635,7 @@ impl Drop for SourceFetchActiveGauge {
 /// In bulk catchup this wraps the parallel-safe `prepare_canonical_block` call inside
 /// the buffered stream; in tip-follow this wraps the one-block artifact
 /// build. The histogram is the per-block CPU contribution to ingest
-/// throughput before serial finalization and commit work.
+/// throughput before serial positioning and commit work.
 pub(crate) fn record_ingest_block_prepare_outcome<T>(
     started_at: Instant,
     block_prepare_outcome: &Result<T, IngestError>,
@@ -1738,6 +1796,9 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
             "tip_follow_parent_metadata_unavailable"
         }
         Some(IngestError::ReorgWindowExceeded { .. }) => "reorg_window_exceeded",
+        Some(IngestError::CanonicalWriterReorgWindowMismatch { .. }) => {
+            "canonical_writer_reorg_window_mismatch"
+        }
         Some(IngestError::SourceRetryBudgetExceeded { .. }) => "source_retry_budget_exceeded",
         Some(IngestError::SourceRetryDeadlineExceeded { .. }) => "source_retry_deadline_exceeded",
         Some(IngestError::SystemTimeBeforeUnixEpoch { .. }) => "system_time_before_unix_epoch",
@@ -1937,7 +1998,64 @@ const fn u32_to_usize(count: u32) -> usize {
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
+    use tempfile::tempdir;
+    use zinder_core::Network;
+    use zinder_store::{ChainStoreOptions, RawBlobRetention};
+
     use super::*;
+
+    #[test]
+    fn caller_owned_writer_rejects_mismatched_raw_blob_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(
+            tempdir.path(),
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+
+        let error = match validate_writer_store_contract(&store, 100, RawBlobPolicy::All) {
+            Ok(()) => return Err("an all-blob writer must reject a none-retention store".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            IngestError::Store(StoreError::RawBlobRetentionMismatch {
+                persisted: RawBlobRetention::None,
+                configured: RawBlobRetention::All,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_writer_rejects_mismatched_reorg_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(
+            tempdir.path(),
+            ChainStoreOptions {
+                reorg_window_blocks: 25,
+                ..ChainStoreOptions::for_network(Network::ZcashRegtest)
+            },
+        )?;
+
+        let error = match validate_writer_store_contract(&store, 50, RawBlobPolicy::None) {
+            Ok(()) => {
+                return Err("a caller-owned writer must reject a different reorg window".into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            IngestError::CanonicalWriterReorgWindowMismatch {
+                store_reorg_window_blocks: 25,
+                configured_reorg_window_blocks: 50,
+            }
+        ));
+        Ok(())
+    }
 
     #[test]
     fn ingest_batch_budget_triggers_on_block_count_limit() {

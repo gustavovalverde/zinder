@@ -45,6 +45,7 @@ pub(crate) fn live_bulk_catchup_run_config(
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations,
         from_height,
@@ -67,7 +68,7 @@ pub(crate) fn live_bulk_catchup_run_config(
         source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
         block_prepare_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),

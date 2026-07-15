@@ -41,7 +41,7 @@ The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
 `manifest.json` recording the network, range, consensus activations,
 current-schema oracle artifact version, replay tip hash, per-segment SHA-256,
 and any shielded subtree roots that complete inside the range. Fixture format
-version 3 also records the versioned `CanonicalBlockFacts` block-digest and
+version 4 also records the versioned `CanonicalBlockFacts` block-digest and
 ordered sequence-digest evidence used by both fact-first arms. Workload totals
 and per-block maxima let reviewers detect burst-dominated ranges.
 
@@ -334,7 +334,7 @@ component diagnostics in the external resource artifacts.
 - `stage_durations`: cumulative task seconds and call counts for block-prepare
   stages (`canonical_block_prepare`, `transparent_prevout_resolve`) and
   canonical-construction stages (`block_parse`, `identity_validation`, `compact_artifacts`,
-  `transaction_facts`, `block_header_artifact`, and `raw_block_bytes`).
+  `transaction_facts`, `block_header_artifact`, `block_blob`, and `block_replay`).
 - `rocksdb_tickers`: exported `RocksDB` statistics tickers (bloom, block cache,
   bytes read/written, stall micros, compaction bytes) per store role.
 - `round_trip`: fact-only wall time plus shared initialization, preparation,

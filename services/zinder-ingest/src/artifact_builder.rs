@@ -1,36 +1,36 @@
 //! Deterministic source-block artifact builders.
 
-use std::{fmt, time::Instant};
+use std::{fmt, io::Cursor, time::Instant};
 
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zebra_chain::{
-    block::Block as ZebraBlock,
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
+    block::{Block as ZebraBlock, merkle::Root as ZebraMerkleRoot},
+    serialization::{ZcashDeserialize, ZcashSerialize},
     transaction::Transaction as ZebraTransaction,
     transparent::Input as ZebraTransparentInput,
 };
 use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockTransactionIndexArtifact,
-    CanonicalBlockFacts, CanonicalTransactionFacts, ChainTipMetadata, CompactBlockArtifact,
-    NetworkUpgradeActivations, PositionedCanonicalBlock, ShieldedProtocol, TransactionBlobArtifact,
-    TransactionFactsArtifact, TransactionIntrinsicValueBalancesArtifact, TransactionLocation,
-    TransparentOutPoint, TransparentOutputArtifact,
+    CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
+    CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts, ChainTipMetadata,
+    CompactBlockArtifact, NetworkUpgradeActivations, SerializedBytesDigest, ShieldedProtocol,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TransparentOutPoint, TransparentOutputArtifact,
+    encode_canonical_block_replay,
     wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 use zinder_proto::compat::lightwalletd::{
     ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
     CompactTx, CompactTxIn, TxOut as CompactTxOut,
 };
-use zinder_source::{
-    SourceBlock, block_header_info_from_raw_block_bytes, transaction_public_fact_set_from_parsed,
-};
+use zinder_source::{SourceBlock, transaction_public_fact_set_from_parsed};
 use zinder_store::RawBlobRetention;
 
 const COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN: usize = 52;
 
-/// Policy controlling optional raw-byte blob writes.
+/// Configured retention policy for raw consensus block and transaction blobs.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RawBlobPolicy {
@@ -46,11 +46,7 @@ impl RawBlobPolicy {
     /// Returns the config spelling for this policy.
     #[must_use]
     pub const fn as_kebab_case(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Transactions => "transactions",
-            Self::All => "all",
-        }
+        self.to_retention().as_kebab_case()
     }
 
     const fn writes_block_blobs(self) -> bool {
@@ -61,8 +57,8 @@ impl RawBlobPolicy {
         matches!(self, Self::Transactions | Self::All)
     }
 
-    /// Maps the policy to the reader-facing retention signal the writer
-    /// persists for capability discovery.
+    /// Maps the configured policy to the immutable store retention contract
+    /// used for capability discovery and commit validation.
     #[must_use]
     pub const fn to_retention(self) -> RawBlobRetention {
         match self {
@@ -89,12 +85,15 @@ pub enum CanonicalBlockConstructionError {
         source: zebra_chain::serialization::SerializationError,
     },
 
-    /// Zebra-chain consensus transaction parse failed.
-    #[error("zebra-chain transaction parse failed: {source}")]
-    TransactionParseFailed {
-        /// Underlying parse error.
-        #[source]
-        source: zebra_chain::serialization::SerializationError,
+    /// The block parser left bytes after the one complete consensus block.
+    #[error(
+        "parsed block consumed {consumed_byte_count} of {source_byte_count} source payload bytes"
+    )]
+    SourcePayloadNotFullyConsumed {
+        /// Bytes consumed by the consensus block parser.
+        consumed_byte_count: usize,
+        /// Bytes supplied by the source adapter.
+        source_byte_count: usize,
     },
 
     /// Parsed block is missing the coinbase height.
@@ -141,13 +140,6 @@ pub enum CanonicalBlockConstructionError {
     #[error("transaction index does not fit u32")]
     TransactionIndexOverflow,
 
-    /// Parsing typed block-header facts failed.
-    #[error("block header fact parse failed: {reason}")]
-    BlockHeaderParseFailed {
-        /// Parser failure reason.
-        reason: String,
-    },
-
     /// Parsing typed transaction facts failed.
     #[error("transaction fact parse failed: {reason}")]
     TransactionFactsParseFailed {
@@ -155,12 +147,11 @@ pub enum CanonicalBlockConstructionError {
         reason: String,
     },
 
-    /// Round-tripping a parsed transaction back to canonical bytes failed.
-    #[error("transaction serialization failed: {source}")]
-    TransactionSerializationFailed {
-        /// Underlying serialization error.
-        #[source]
-        source: std::io::Error,
+    /// Parsed transaction sizes cannot be mapped back to the source block bytes.
+    #[error("parsed transaction byte ranges exceed the {block_byte_count}-byte source block")]
+    TransactionByteRangeMismatch {
+        /// Source block byte length.
+        block_byte_count: usize,
     },
 
     /// Serializing the parsed block header back to canonical bytes failed.
@@ -199,7 +190,7 @@ impl fmt::Display for BlockMismatchField {
 
 /// Shielded commitment-tree positions at one block boundary.
 ///
-/// `prepare_canonical_block` returns a per-block delta; `finalize_canonical_block` folds
+/// `prepare_canonical_block` returns a per-block delta; `position_canonical_block` folds
 /// those deltas into the running position. The same type expresses both
 /// shapes, so callers can carry one running offset through a serial loop
 /// or seed it from a `ChainTipMetadata` recovered from the store.
@@ -271,7 +262,7 @@ impl CommitmentTreeSizes {
 /// Parallel-safe preparation output for one source block.
 ///
 /// [`prepare_canonical_block`] populates every field that depends only on the
-/// block content. [`finalize_canonical_block`] stamps the position-dependent fields
+/// block content. [`position_canonical_block`] stamps the position-dependent fields
 /// (the `chain_metadata` inside `partial_compact_block` and the
 /// `tip_metadata` in the returned [`PositionedCanonicalBlock`]) after folding
 /// `tree_size_additions` into the running commitment-tree position.
@@ -279,11 +270,42 @@ impl CommitmentTreeSizes {
 pub struct PreparedCanonicalBlock {
     /// Immutable facts computed from this source block alone.
     pub facts: CanonicalBlockFacts,
+    /// Versioned projection replay bytes encoded on the parallel prepare lane.
+    pub replay_envelope: CanonicalBlockReplayEnvelope,
+    /// Retained raw blobs kept outside semantic fact identity.
+    pub retained_raw_blobs: RetainedRawBlobs,
     /// Lightwalletd compact block with `chain_metadata = None`; the
     /// serial folder stamps the final tree-size position before encoding.
     pub partial_compact_block: CompactBlock,
     /// Commitment-tree-size delta this block contributes.
     pub tree_size_additions: CommitmentTreeSizes,
+}
+
+/// Retained consensus raw blobs for one canonical block.
+///
+/// These blobs are physically and semantically separate from the replay
+/// envelope, so changing deployment retention does not change canonical digests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RetainedRawBlobs {
+    /// Optional serialized consensus block artifact.
+    pub block_blob: Option<BlockBlobArtifact>,
+    /// Optional serialized consensus transaction artifacts.
+    pub transaction_blobs: Vec<TransactionBlobArtifact>,
+}
+
+/// Prepared canonical facts placed at an ordered commitment-tree position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PositionedCanonicalBlock {
+    /// Immutable block-local projection facts.
+    pub facts: CanonicalBlockFacts,
+    /// Versioned replay envelope for `facts`.
+    pub replay_envelope: CanonicalBlockReplayEnvelope,
+    /// Retained raw blobs kept outside the replay envelope.
+    pub retained_raw_blobs: RetainedRawBlobs,
+    /// Lightwalletd compact block with final chain metadata stamped.
+    pub compact_block: CompactBlockArtifact,
+    /// Running commitment-tree position after this block.
+    pub tip_metadata: ChainTipMetadata,
 }
 
 /// Parses one source block and prepares its block-local canonical facts.
@@ -292,22 +314,14 @@ pub struct PreparedCanonicalBlock {
 /// the block's position in the running chain state.
 ///
 /// The output's `partial_compact_block.chain_metadata` is left `None`;
-/// [`finalize_canonical_block`] stamps the final commitment-tree position
+/// [`position_canonical_block`] stamps the final commitment-tree position
 /// before encoding the proto and validating against any source-supplied
 /// observation.
-pub fn prepare_canonical_block(
-    source_block: &SourceBlock,
-    activations: &NetworkUpgradeActivations,
-) -> Result<PreparedCanonicalBlock, CanonicalBlockConstructionError> {
-    prepare_canonical_block_with_raw_blob_policy(source_block, activations, RawBlobPolicy::None)
-}
-
-/// Prepares block-local canonical facts with an explicit raw-blob policy.
 #[allow(
     clippy::too_many_lines,
     reason = "one parse-and-construct pipeline keeps stage timing and field ownership auditable"
 )]
-pub fn prepare_canonical_block_with_raw_blob_policy(
+pub fn prepare_canonical_block(
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
     raw_blob_policy: RawBlobPolicy,
@@ -322,7 +336,7 @@ pub fn prepare_canonical_block_with_raw_blob_policy(
         measure_canonical_construction_stage("compact_artifacts", || {
             compact_transactions(&parsed_block)
         })?;
-    let transactions = measure_canonical_construction_stage("transaction_facts", || {
+    let prepared_transactions = measure_canonical_construction_stage("transaction_facts", || {
         prepare_canonical_transactions_from_parsed(
             &parsed_block,
             source_block,
@@ -339,23 +353,21 @@ pub fn prepare_canonical_block_with_raw_blob_policy(
                     .map_err(|source| {
                         CanonicalBlockConstructionError::BlockHeaderSerializationFailed { source }
                     })?;
-            let block_header = BlockHeaderArtifact::from_header_info_with_block_size(
-                block_header_info_from_raw_block_bytes(
-                    source_block.height,
-                    &source_block.raw_block_bytes,
-                )
-                .map_err(|source| {
-                    CanonicalBlockConstructionError::BlockHeaderParseFailed {
-                        reason: source.to_string(),
-                    }
-                })?,
+            let block_header = block_header_artifact_from_parsed_block(
+                &parsed_block,
+                source_block.height,
                 usize_to_u64_saturating(source_block.raw_block_bytes.len()),
             );
             Ok((block_header_bytes, block_header))
         })?;
-    let raw_block_bytes = measure_canonical_construction_stage("raw_block_bytes", || {
+    let block_blob = measure_canonical_construction_stage("block_blob", || {
         Ok(if raw_blob_policy.writes_block_blobs() {
-            Some(source_block.raw_block_bytes.clone())
+            Some(BlockBlobArtifact::new(
+                block_header.height,
+                block_header.block_hash,
+                block_header.parent_hash,
+                source_block.raw_block_bytes.clone(),
+            ))
         } else {
             record_raw_blob_disabled("block_blob", 1);
             None
@@ -371,30 +383,69 @@ pub fn prepare_canonical_block_with_raw_blob_policy(
         chain_metadata: None,
     };
 
+    let facts = CanonicalBlockFacts {
+        block_header,
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
+            &source_block.raw_block_bytes,
+        ),
+        transactions: prepared_transactions.facts,
+    };
+    let replay_envelope = measure_canonical_construction_stage("block_replay", || {
+        Ok(encode_canonical_block_replay(
+            &facts,
+            CanonicalBlockReplayFormatVersion::CURRENT,
+            CanonicalBlockFactsDigestVersion::CURRENT,
+        ))
+    })?;
+
     Ok(PreparedCanonicalBlock {
-        facts: CanonicalBlockFacts {
-            block_header,
-            raw_block_bytes,
-            transactions,
+        facts,
+        replay_envelope,
+        retained_raw_blobs: RetainedRawBlobs {
+            block_blob,
+            transaction_blobs: prepared_transactions.transaction_blobs,
         },
         partial_compact_block,
         tree_size_additions,
     })
 }
 
-/// Finalizes one prepared block at its ordered commitment-tree position.
+fn block_header_artifact_from_parsed_block(
+    parsed_block: &ZebraBlock,
+    height: zinder_core::BlockHeight,
+    block_size_bytes: u64,
+) -> BlockHeaderArtifact {
+    let header = &parsed_block.header;
+    let ZebraMerkleRoot(merkle_root_hash) = header.merkle_root;
+    BlockHeaderArtifact::new(
+        height,
+        BlockHash::from_bytes(parsed_block.hash().0),
+        BlockHash::from_bytes(header.previous_block_hash.0),
+        merkle_root_hash,
+        *header.commitment_bytes,
+        header.time.timestamp(),
+        u32::from_be_bytes(header.difficulty_threshold.bytes_in_display_order()),
+        *header.nonce,
+        header.version,
+        block_size_bytes,
+    )
+}
+
+/// Positions one prepared block at its ordered commitment-tree position.
 ///
 /// Applies `prepared.tree_size_additions` to `running_tree_sizes`, stamps
 /// the final `chain_metadata` into the compact block, and returns the
-/// finalized [`PositionedCanonicalBlock`].
+/// positioned [`PositionedCanonicalBlock`].
 /// Mutates `running_tree_sizes` in place so a sequential loop can carry
 /// it forward across blocks.
-pub fn finalize_canonical_block(
+pub fn position_canonical_block(
     prepared: PreparedCanonicalBlock,
     running_tree_sizes: &mut CommitmentTreeSizes,
 ) -> Result<PositionedCanonicalBlock, CanonicalBlockConstructionError> {
     let PreparedCanonicalBlock {
         facts,
+        replay_envelope,
+        retained_raw_blobs,
         mut partial_compact_block,
         tree_size_additions,
     } = prepared;
@@ -407,11 +458,12 @@ pub fn finalize_canonical_block(
         facts.block_header.block_hash,
         partial_compact_block.encode_to_vec(),
     );
-
     *running_tree_sizes = final_tree_sizes;
 
     Ok(PositionedCanonicalBlock {
         facts,
+        replay_envelope,
+        retained_raw_blobs,
         compact_block,
         tip_metadata: final_tree_sizes.tip_metadata(),
     })
@@ -436,28 +488,24 @@ pub(crate) struct CurrentSchemaBlockArtifacts {
 /// `RocksDB` schema still commits.
 pub(crate) fn expand_current_schema_block_artifacts(
     facts: CanonicalBlockFacts,
+    retained_raw_blobs: RetainedRawBlobs,
 ) -> Result<CurrentSchemaBlockArtifacts, CanonicalBlockConstructionError> {
     let transparent_outputs_by_outpoint = current_schema_transparent_outputs(&facts);
     let CanonicalBlockFacts {
         block_header,
-        raw_block_bytes,
         transactions,
+        ..
     } = facts;
     let block_height = block_header.height;
     let block_hash = block_header.block_hash;
-    let block_blob = raw_block_bytes.map(|raw_block_bytes| {
-        BlockBlobArtifact::new(
-            block_height,
-            block_hash,
-            block_header.parent_hash,
-            raw_block_bytes,
-        )
-    });
+    let RetainedRawBlobs {
+        block_blob,
+        transaction_blobs,
+    } = retained_raw_blobs;
     let mut block_transaction_index = Vec::with_capacity(transactions.len());
     let mut transaction_locations = Vec::with_capacity(transactions.len());
     let mut transaction_facts = Vec::with_capacity(transactions.len());
     let mut transaction_intrinsic_value_balances = Vec::with_capacity(transactions.len());
-    let mut transaction_blobs = Vec::new();
 
     for (tx_index_in_block, transaction) in transactions.into_iter().enumerate() {
         let tx_index_in_block = u32::try_from(tx_index_in_block)
@@ -467,7 +515,7 @@ pub(crate) fn expand_current_schema_block_artifacts(
             intrinsic_value_balances,
             transparent_inputs,
             transparent_outputs,
-            raw_transaction_bytes,
+            ..
         } = transaction;
         let transaction_id = public_facts.transaction_id;
         let location =
@@ -487,12 +535,6 @@ pub(crate) fn expand_current_schema_block_artifacts(
             location,
             intrinsic_value_balances,
         ));
-        if let Some(raw_transaction_bytes) = raw_transaction_bytes {
-            transaction_blobs.push(TransactionBlobArtifact::new(
-                location,
-                raw_transaction_bytes,
-            ));
-        }
     }
 
     Ok(CurrentSchemaBlockArtifacts {
@@ -505,6 +547,11 @@ pub(crate) fn expand_current_schema_block_artifacts(
         transaction_blobs,
         transparent_outputs_by_outpoint,
     })
+}
+
+struct PreparedCanonicalTransactions {
+    facts: Vec<CanonicalTransactionFacts>,
+    transaction_blobs: Vec<TransactionBlobArtifact>,
 }
 
 /// Expands block-local transparent outputs into current-schema outpoint rows.
@@ -537,13 +584,20 @@ fn prepare_canonical_transactions_from_parsed(
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
     raw_blob_policy: RawBlobPolicy,
-) -> Result<Vec<CanonicalTransactionFacts>, CanonicalBlockConstructionError> {
+) -> Result<PreparedCanonicalTransactions, CanonicalBlockConstructionError> {
     let mut transactions = Vec::with_capacity(parsed_block.transactions.len());
+    let mut transaction_blobs = Vec::new();
+    let mut transaction_byte_offset = first_transaction_byte_offset(parsed_block, source_block)?;
 
     for (tx_index_in_block, transaction) in parsed_block.transactions.iter().enumerate() {
-        let _tx_index_in_block = u32::try_from(tx_index_in_block)
+        let tx_index_in_block = u32::try_from(tx_index_in_block)
             .map_err(|_| CanonicalBlockConstructionError::TransactionIndexOverflow)?;
         let serialized_size = transaction.zcash_serialized_size();
+        let raw_transaction_bytes = take_transaction_bytes(
+            &source_block.raw_block_bytes,
+            &mut transaction_byte_offset,
+            serialized_size,
+        )?;
         let fact_set = transaction_public_fact_set_from_parsed(
             transaction,
             serialized_size,
@@ -555,24 +609,89 @@ fn prepare_canonical_transactions_from_parsed(
                 reason: source.to_string(),
             }
         })?;
-        let raw_transaction_bytes = if raw_blob_policy.writes_transaction_blobs() {
-            Some(transaction.zcash_serialize_to_vec().map_err(|source| {
-                CanonicalBlockConstructionError::TransactionSerializationFailed { source }
-            })?)
+        if raw_blob_policy.writes_transaction_blobs() {
+            transaction_blobs.push(TransactionBlobArtifact::new(
+                TransactionLocation::new(
+                    fact_set.public_facts.transaction_id,
+                    source_block.height,
+                    source_block.hash,
+                    tx_index_in_block,
+                ),
+                raw_transaction_bytes.to_vec(),
+            ));
         } else {
             record_raw_blob_disabled("transaction_blob", 1);
-            None
-        };
+        }
         transactions.push(CanonicalTransactionFacts {
             public_facts: fact_set.public_facts,
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
+                raw_transaction_bytes,
+            ),
             intrinsic_value_balances: fact_set.intrinsic_value_balances,
             transparent_inputs: fact_set.transparent_inputs,
             transparent_outputs: fact_set.transparent_outputs,
-            raw_transaction_bytes,
         });
     }
 
-    Ok(transactions)
+    if transaction_byte_offset != source_block.raw_block_bytes.len() {
+        return Err(
+            CanonicalBlockConstructionError::TransactionByteRangeMismatch {
+                block_byte_count: source_block.raw_block_bytes.len(),
+            },
+        );
+    }
+
+    Ok(PreparedCanonicalTransactions {
+        facts: transactions,
+        transaction_blobs,
+    })
+}
+
+fn first_transaction_byte_offset(
+    parsed_block: &ZebraBlock,
+    source_block: &SourceBlock,
+) -> Result<usize, CanonicalBlockConstructionError> {
+    let total_transaction_byte_count = parsed_block
+        .transactions
+        .iter()
+        .try_fold(0usize, |total, transaction| {
+            total.checked_add(transaction.zcash_serialized_size())
+        })
+        .ok_or(
+            CanonicalBlockConstructionError::TransactionByteRangeMismatch {
+                block_byte_count: source_block.raw_block_bytes.len(),
+            },
+        )?;
+    source_block
+        .raw_block_bytes
+        .len()
+        .checked_sub(total_transaction_byte_count)
+        .ok_or(
+            CanonicalBlockConstructionError::TransactionByteRangeMismatch {
+                block_byte_count: source_block.raw_block_bytes.len(),
+            },
+        )
+}
+
+fn take_transaction_bytes<'a>(
+    raw_block_bytes: &'a [u8],
+    byte_offset: &mut usize,
+    transaction_byte_count: usize,
+) -> Result<&'a [u8], CanonicalBlockConstructionError> {
+    let transaction_byte_end = byte_offset.checked_add(transaction_byte_count).ok_or(
+        CanonicalBlockConstructionError::TransactionByteRangeMismatch {
+            block_byte_count: raw_block_bytes.len(),
+        },
+    )?;
+    let transaction_bytes = raw_block_bytes
+        .get(*byte_offset..transaction_byte_end)
+        .ok_or(
+            CanonicalBlockConstructionError::TransactionByteRangeMismatch {
+                block_byte_count: raw_block_bytes.len(),
+            },
+        )?;
+    *byte_offset = transaction_byte_end;
+    Ok(transaction_bytes)
 }
 
 fn record_raw_blob_disabled(table: &'static str, row_count: u64) {
@@ -620,11 +739,20 @@ fn validate_source_block_payload(
 fn parse_source_block(
     source_block: &SourceBlock,
 ) -> Result<ZebraBlock, CanonicalBlockConstructionError> {
-    source_block
-        .raw_block_bytes
-        .as_slice()
-        .zcash_deserialize_into::<ZebraBlock>()
-        .map_err(|source| CanonicalBlockConstructionError::BlockParseFailed { source })
+    let mut source_bytes = Cursor::new(source_block.raw_block_bytes.as_slice());
+    let parsed_block = ZebraBlock::zcash_deserialize(&mut source_bytes)
+        .map_err(|source| CanonicalBlockConstructionError::BlockParseFailed { source })?;
+    let consumed_byte_count = usize::try_from(source_bytes.position()).unwrap_or(usize::MAX);
+    let source_byte_count = source_block.raw_block_bytes.len();
+    if consumed_byte_count != source_byte_count {
+        return Err(
+            CanonicalBlockConstructionError::SourcePayloadNotFullyConsumed {
+                consumed_byte_count,
+                source_byte_count,
+            },
+        );
+    }
+    Ok(parsed_block)
 }
 
 fn validate_parsed_block_identity(
@@ -846,19 +974,18 @@ mod tests {
     use std::error::Error;
 
     use serde_json::Value;
-    use zinder_core::{
-        ArtifactSchemaVersion, BlockHeight, ChainEpoch, ChainEpochId, Network, UnixTimestampMillis,
-    };
+    use zinder_core::{BlockHeight, ChainEpoch, ChainEpochId, Network, UnixTimestampMillis};
     use zinder_source::SourceBlock;
-    use zinder_store::ChainEpochArtifacts;
+    use zinder_store::{
+        CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention,
+    };
     use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
     use super::{
         COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CanonicalBlockConstructionError, CommitmentTreeSizes,
         CompactOrchardAction, CompactTx, RawBlobPolicy, ShieldedProtocol,
         compact_note_ciphertext_prefix, compact_transaction_has_payload,
-        expand_current_schema_block_artifacts, finalize_canonical_block,
-        prepare_canonical_block_with_raw_blob_policy,
+        expand_current_schema_block_artifacts, position_canonical_block, prepare_canonical_block,
     };
 
     #[test]
@@ -868,16 +995,18 @@ mod tests {
     )]
     fn current_schema_expansion_round_trips_real_fixture_rows() -> Result<(), Box<dyn Error>> {
         let source_block = regtest_fixture_block()?;
-        let prepared = prepare_canonical_block_with_raw_blob_policy(
+        let prepared = prepare_canonical_block(
             &source_block,
             &sample_regtest_upgrade_activations(),
             RawBlobPolicy::All,
         )?;
         let mut tree_sizes = CommitmentTreeSizes::default();
-        let positioned = finalize_canonical_block(prepared, &mut tree_sizes)?;
+        let positioned = position_canonical_block(prepared, &mut tree_sizes)?;
         let compact_block = positioned.compact_block;
+        let replay_envelope = positioned.replay_envelope;
         let tip_metadata = positioned.tip_metadata;
-        let current_schema = expand_current_schema_block_artifacts(positioned.facts)?;
+        let current_schema =
+            expand_current_schema_block_artifacts(positioned.facts, positioned.retained_raw_blobs)?;
         let location = *current_schema
             .transaction_locations
             .first()
@@ -897,7 +1026,10 @@ mod tests {
             .first()
             .cloned()
             .ok_or("fixture transparent output is missing")?;
-        let fixture = StoreFixture::open()?;
+        let fixture = StoreFixture::open_with_options(ChainStoreOptions {
+            raw_blob_retention: RawBlobRetention::All,
+            ..ChainStoreOptions::for_local_tests()
+        })?;
         let chain_epoch = ChainEpoch {
             id: ChainEpochId::new(1),
             network: Network::ZcashRegtest,
@@ -905,7 +1037,7 @@ mod tests {
             visible_tip_hash: source_block.hash,
             settled_tip_height: source_block.height,
             settled_tip_hash: source_block.hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(18),
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata,
             created_at: UnixTimestampMillis::new(1_774_669_000_000),
         };
@@ -914,6 +1046,7 @@ mod tests {
             ChainEpochArtifacts::new(
                 chain_epoch,
                 vec![current_schema.block_header],
+                vec![replay_envelope],
                 vec![compact_block],
             )
             .with_block_blobs(block_blobs)
@@ -950,6 +1083,63 @@ mod tests {
                 .get(&transparent_output.outpoint),
             Some(&transparent_output)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_replay_is_invariant_across_raw_blob_policies() -> Result<(), Box<dyn Error>> {
+        let source_block = regtest_fixture_block()?;
+        let activations = sample_regtest_upgrade_activations();
+        let no_blobs = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::None)?;
+        let transaction_blobs =
+            prepare_canonical_block(&source_block, &activations, RawBlobPolicy::Transactions)?;
+        let all_blobs = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::All)?;
+
+        assert_eq!(no_blobs.facts, transaction_blobs.facts);
+        assert_eq!(no_blobs.facts, all_blobs.facts);
+        assert_eq!(no_blobs.replay_envelope, transaction_blobs.replay_envelope);
+        assert_eq!(no_blobs.replay_envelope, all_blobs.replay_envelope);
+
+        assert!(no_blobs.retained_raw_blobs.block_blob.is_none());
+        assert!(no_blobs.retained_raw_blobs.transaction_blobs.is_empty());
+        assert!(transaction_blobs.retained_raw_blobs.block_blob.is_none());
+        assert_eq!(
+            transaction_blobs.retained_raw_blobs.transaction_blobs.len(),
+            transaction_blobs.facts.transactions.len()
+        );
+        assert!(all_blobs.retained_raw_blobs.block_blob.is_some());
+        assert_eq!(
+            all_blobs.retained_raw_blobs.transaction_blobs.len(),
+            all_blobs.facts.transactions.len()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_preparation_rejects_source_bytes_after_the_consensus_block()
+    -> Result<(), Box<dyn Error>> {
+        let mut source_block = regtest_fixture_block()?;
+        let consensus_block_byte_count = source_block.raw_block_bytes.len();
+        source_block.raw_block_bytes.push(0);
+
+        let error = prepare_canonical_block(
+            &source_block,
+            &sample_regtest_upgrade_activations(),
+            RawBlobPolicy::None,
+        )
+        .err()
+        .ok_or("source block with a trailing byte was accepted")?;
+
+        assert!(matches!(
+            error,
+            CanonicalBlockConstructionError::SourcePayloadNotFullyConsumed {
+                consumed_byte_count,
+                source_byte_count,
+            } if consumed_byte_count == consensus_block_byte_count
+                && source_byte_count == consensus_block_byte_count.saturating_add(1)
+        ));
+
         Ok(())
     }
 

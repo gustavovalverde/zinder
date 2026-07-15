@@ -1,6 +1,6 @@
 //! Chain store facade.
 
-mod schema_migration;
+mod schema_admission;
 mod validation;
 
 use std::{
@@ -36,7 +36,7 @@ use crate::{
     ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainEventStreamResume, ChainRangeReverted,
     EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
     MempoolEventPosition, MempoolEventRetentionConfig, MempoolEventRetentionReport,
-    ReorgWindowChange, RocksDbResourceBudget, StoreError, StreamCursorTokenV1,
+    RawBlobRetention, ReorgWindowChange, RocksDbResourceBudget, StoreError, StreamCursorTokenV1,
     block_artifact::read_block_header_artifact,
     block_hash_index::block_hash_index_put,
     block_value_pool_balances::read_block_value_pool_balances,
@@ -75,43 +75,12 @@ use crate::{
     },
 };
 
-use schema_migration::migrate_primary_store_schema;
+use schema_admission::validate_primary_store_schema;
 use validation::{
-    committed_block_range, validate_chain_epoch_artifacts, validate_chain_store_options,
-    validate_reorg_window_change, validate_value_pool_entries, validate_visible_chain_commit,
+    ValidatedBlockReplayOrder, committed_block_range, validate_chain_epoch_artifacts,
+    validate_chain_store_options, validate_reorg_window_change, validate_retained_blob_artifacts,
+    validate_value_pool_entries, validate_visible_chain_commit,
 };
-
-/// Raw-blob retention persisted by the writer and read by advertising readers.
-///
-/// The reader-facing projection of the ingest raw-blob policy. The writer maps
-/// its own policy type to this shape at the write boundary so the store crate
-/// stays free of the ingest config type. An absent signal on a legacy store
-/// reads back as [`RawBlobRetention::None`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum RawBlobRetention {
-    /// Neither block nor transaction blobs are retained.
-    None,
-    /// Transaction blobs are retained; block blobs are not.
-    Transactions,
-    /// Both block and transaction blobs are retained.
-    All,
-}
-
-impl RawBlobRetention {
-    /// Whether full block blobs are retained (ingest `raw_blob_policy = all`).
-    #[must_use]
-    pub const fn retains_block_blobs(self) -> bool {
-        matches!(self, Self::All)
-    }
-
-    /// Whether transaction blobs are retained (ingest `raw_blob_policy` in
-    /// {transactions, all}).
-    #[must_use]
-    pub const fn retains_transaction_blobs(self) -> bool {
-        matches!(self, Self::Transactions | Self::All)
-    }
-}
 
 /// Runtime options for [`PrimaryChainStore`] and [`SecondaryChainStore`].
 ///
@@ -188,7 +157,7 @@ impl ChainStoreOptions {
 }
 
 /// Durable canonical store schema version written by this binary.
-pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 13;
+pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 14;
 /// Durable artifact schema version written by this binary.
 ///
 /// Version 10 carried the fact-first layout with every hash-shaped proto
@@ -227,7 +196,11 @@ pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 13;
 /// index with complete retained spend facts. Older stores may have swept the
 /// point facts needed to construct those records and are refused at open.
 ///
-/// Version 14 adds per-block Sapling, Orchard, and Ironwood final
+/// Store schema version 14 adds the `block_replay` column family. Schema
+/// 13 stores do not contain the complete semantic replay envelopes and are
+/// refused at open without creating the missing column family.
+///
+/// Artifact schema version 14 adds per-block Sapling, Orchard, and Ironwood final
 /// note-commitment roots.
 ///
 /// Version 15 adds optional transaction-intrinsic Sprout, Sapling, Orchard,
@@ -248,12 +221,16 @@ pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 13;
 /// deleted after safe-tip retention, while derive rebuilds remain possible
 /// from the durable block records. Store schema 13 introduces this
 /// non-migratable payload.
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(18);
+///
+/// Version 19 requires one complete semantic replay envelope for every
+/// committed block header. Older canonical histories cannot reconstruct fields
+/// that were never retained and must be rebuilt from the source chain.
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(19);
 /// Oldest durable artifact schema version this binary can read.
 ///
-/// Version 18 is the first schema whose canonical history can rebuild the
-/// transparent spend projection after point-row retention.
-pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 18;
+/// Version 19 is the first schema whose canonical history carries complete
+/// block-local semantic replay envelopes for rebuilding independent projections.
+pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 19;
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 /// Default maximum chain events returned by one history read.
@@ -581,7 +558,8 @@ impl PrimaryChainStore {
             options.sync_writes,
             options.rocksdb_resource_budget,
         )?);
-        migrate_primary_store_schema(&inner)?;
+        validate_primary_store_schema(&inner)?;
+        inner.ensure_all_storage_tables_are_present()?;
         let store =
             ChainStoreInner::from_primary_inner(inner, options, ChainStoreReadPosture::Snapshot)?;
 
@@ -605,9 +583,16 @@ impl PrimaryChainStore {
 
     /// Reads the persisted raw-blob retention signal.
     ///
-    /// Returns [`RawBlobRetention::None`] when the store predates the signal.
+    /// Returns [`RawBlobRetention::None`] only for an empty store without a
+    /// signal. A non-empty store with no signal is corrupt and fails closed.
     pub fn raw_blob_retention(&self) -> Result<RawBlobRetention, StoreError> {
         read_raw_blob_retention_signal(self.store.inner.as_ref())
+    }
+
+    /// Returns the reorg window configured on this primary writer handle.
+    #[must_use]
+    pub const fn reorg_window_blocks(&self) -> u32 {
+        self.store.options.reorg_window_blocks
     }
 
     /// Reads the durable boundary of intentionally retained canonical history.
@@ -987,7 +972,8 @@ impl SecondaryChainStore {
 
     /// Reads the persisted raw-blob retention signal.
     ///
-    /// Returns [`RawBlobRetention::None`] when the store predates the signal.
+    /// Returns [`RawBlobRetention::None`] only for an empty store without a
+    /// signal. A non-empty store with no signal is corrupt and fails closed.
     pub fn raw_blob_retention(&self) -> Result<RawBlobRetention, StoreError> {
         read_raw_blob_retention_signal(self.store.inner.as_ref())
     }
@@ -1128,8 +1114,8 @@ impl ChainStoreInner {
             if let Some(network) = options.network {
                 ensure_store_metadata(&inner, network)?;
             }
-            persist_raw_blob_retention(&inner, options.raw_blob_retention)?;
             ensure_supported_artifact_schema(inner.as_ref())?;
+            admit_raw_blob_retention(&inner, options.raw_blob_retention)?;
             ensure_cursor_auth_key(&inner)?
         };
 
@@ -1151,6 +1137,7 @@ impl ChainStoreInner {
             if let Some(network) = options.network {
                 validate_store_metadata(inner.as_ref(), network)?;
             }
+            inner.ensure_all_storage_tables_are_present()?;
             ensure_supported_artifact_schema(inner.as_ref())?;
             read_cursor_auth_key(inner.as_ref())?
         };
@@ -1320,7 +1307,7 @@ impl ChainStoreInner {
             }
         })?;
         let checkpoint_height = chain_epoch.visible_tip_height;
-        let artifacts = ChainEpochArtifacts::new(chain_epoch, Vec::new(), Vec::new())
+        let artifacts = ChainEpochArtifacts::new(chain_epoch, Vec::new(), Vec::new(), Vec::new())
             .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
                 height: checkpoint_height,
             });
@@ -1332,11 +1319,17 @@ impl ChainStoreInner {
         artifacts: ChainEpochArtifacts,
         initial_bounds: Option<CanonicalHistoryBounds>,
     ) -> Result<ChainEpochCommitOutcome, StoreError> {
+        // Artifact consistency is independent of current store state. Keep the
+        // replay decode and exact row-parity work outside the writer control
+        // section so pure CPU work does not lengthen the exclusive writer
+        // critical section.
+        let validated_block_replay_order = validate_chain_epoch_artifacts(&artifacts)?;
+        validate_retained_blob_artifacts(&artifacts, self.options.raw_blob_retention)?;
+
         let _control_guard = self.inner.lock_control();
         let commit_read_view = self
             .inner
             .direct_read_view_for(StoreReadCaller::CommitFallback);
-        validate_chain_epoch_artifacts(&artifacts)?;
         let store_metadata_put =
             validate_store_metadata_for_commit(&self.inner, artifacts.chain_epoch.network)?;
         let current_chain_epoch = self.validate_commit_order(&artifacts.chain_epoch)?;
@@ -1368,7 +1361,8 @@ impl ChainStoreInner {
             reorg_window_change: &reorg_window_change,
             cursor_auth_key: self.cursor_auth_key,
         })?;
-        let mut puts = build_chain_epoch_puts(artifacts, &event_envelope)?;
+        let mut puts =
+            build_chain_epoch_puts(artifacts, validated_block_replay_order, &event_envelope)?;
         if let Some(bounds_put) =
             initial_canonical_history_bounds_put(current_chain_epoch, initial_bounds)?
         {
@@ -3399,11 +3393,13 @@ fn chain_event_matches_family(
 
 fn build_chain_epoch_puts(
     artifacts: ChainEpochArtifacts,
+    validated_block_replay_order: ValidatedBlockReplayOrder,
     event_envelope: &ChainEventEnvelope,
 ) -> Result<Vec<StoragePut>, StoreError> {
     let ChainEpochArtifacts {
         chain_epoch,
         block_headers,
+        block_replay_envelopes,
         block_blobs,
         compact_blocks,
         block_transaction_index,
@@ -3428,6 +3424,12 @@ fn build_chain_epoch_puts(
         value: encode_chain_epoch(&chain_epoch),
     });
     push_block_header_artifact_puts(&mut puts, chain_epoch, block_headers)?;
+    push_block_replay_envelopes_puts(
+        &mut puts,
+        chain_epoch,
+        validated_block_replay_order,
+        block_replay_envelopes,
+    )?;
     push_block_blob_artifact_puts(&mut puts, chain_epoch, block_blobs)?;
     push_compact_block_artifact_puts(&mut puts, chain_epoch, compact_blocks)?;
     push_block_transaction_index_artifact_puts(&mut puts, chain_epoch, block_transaction_index)?;
@@ -3911,14 +3913,54 @@ fn persist_raw_blob_retention(
     }])
 }
 
+fn admit_raw_blob_retention(
+    inner: &RocksChainStore,
+    configured_retention: RawBlobRetention,
+) -> Result<(), StoreError> {
+    let persisted_retention = read_raw_blob_retention_signal_if_present(inner)?;
+    if read_current_chain_epoch_id(inner)?.is_none() {
+        return persist_raw_blob_retention(inner, configured_retention);
+    }
+
+    let persisted_retention = persisted_retention.ok_or_else(missing_raw_blob_retention_error)?;
+    if persisted_retention != configured_retention {
+        return Err(StoreError::RawBlobRetentionMismatch {
+            persisted: persisted_retention,
+            configured: configured_retention,
+        });
+    }
+    Ok(())
+}
+
 fn read_raw_blob_retention_signal(
     inner: &impl RocksChainStoreRead,
 ) -> Result<RawBlobRetention, StoreError> {
+    let retention = read_raw_blob_retention_signal_if_present(inner)?;
+    if let Some(retention) = retention {
+        return Ok(retention);
+    }
+    if read_current_chain_epoch_id(inner)?.is_some() {
+        return Err(missing_raw_blob_retention_error());
+    }
+    Ok(RawBlobRetention::None)
+}
+
+fn read_raw_blob_retention_signal_if_present(
+    inner: &impl RocksChainStoreRead,
+) -> Result<Option<RawBlobRetention>, StoreError> {
     let key = StoreKey::raw_blob_retention();
     let Some(signal_bytes) = inner.get(StorageTable::StorageControl, &key)? else {
-        return Ok(RawBlobRetention::None);
+        return Ok(None);
     };
-    decode_raw_blob_retention_signal(&signal_bytes)
+    decode_raw_blob_retention_signal(&signal_bytes).map(Some)
+}
+
+fn missing_raw_blob_retention_error() -> StoreError {
+    StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::ChainEpoch,
+        key: StoreKey::raw_blob_retention().into(),
+        reason: "non-empty schema-14 store is missing its raw blob retention contract",
+    }
 }
 
 fn transparent_retention_swept_height_put(height: BlockHeight) -> StoragePut {
@@ -4170,6 +4212,33 @@ fn push_block_header_artifact_puts(
             height,
             block_hash,
         ));
+    }
+
+    Ok(())
+}
+
+fn push_block_replay_envelopes_puts(
+    puts: &mut Vec<StoragePut>,
+    chain_epoch: ChainEpoch,
+    validated_order: ValidatedBlockReplayOrder,
+    replay_envelopes: Vec<zinder_core::CanonicalBlockReplayEnvelope>,
+) -> Result<(), StoreError> {
+    if validated_order.block_heights.len() != replay_envelopes.len() {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "validated block replay order does not match the supplied replay envelopes",
+        });
+    }
+
+    for (block_height, replay_envelope) in validated_order
+        .block_heights
+        .into_iter()
+        .zip(replay_envelopes)
+    {
+        puts.push(StoragePut {
+            table: StorageTable::BlockReplay,
+            key: StoreKey::block_replay(chain_epoch.network, chain_epoch.id, block_height),
+            value: replay_envelope.into_bytes(),
+        });
     }
 
     Ok(())
@@ -5079,18 +5148,48 @@ fn record_mempool_event_retention_report(report: MempoolEventRetentionReport) {
 mod tests {
     use std::error::Error;
 
+    use rust_rocksdb::{DB, Options};
     use tempfile::tempdir;
     use zinder_core::{
-        BlockHash, BlockHeaderArtifact, BlockHeight, ChainTipMetadata, CompactBlockArtifact,
-        TreeStateArtifact, UnixTimestampMillis,
+        BlockHash, BlockHeaderArtifact, BlockHeight, CanonicalBlockFacts,
+        CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
+        CompactBlockArtifact, SerializedBytesDigest, TreeStateArtifact, UnixTimestampMillis,
+        encode_canonical_block_replay,
     };
 
     use super::*;
 
+    fn synthetic_chain_epoch_artifacts(
+        chain_epoch: ChainEpoch,
+        block_headers: Vec<BlockHeaderArtifact>,
+        compact_blocks: Vec<CompactBlockArtifact>,
+    ) -> ChainEpochArtifacts {
+        let block_replay_envelopes = block_headers
+            .iter()
+            .map(|block_header| {
+                encode_canonical_block_replay(
+                    &CanonicalBlockFacts {
+                        block_header: block_header.clone(),
+                        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[]),
+                        transactions: Vec::new(),
+                    },
+                    CanonicalBlockReplayFormatVersion::CURRENT,
+                    CanonicalBlockFactsDigestVersion::CURRENT,
+                )
+            })
+            .collect();
+        ChainEpochArtifacts::new(
+            chain_epoch,
+            block_headers,
+            block_replay_envelopes,
+            compact_blocks,
+        )
+    }
+
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 18);
-        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 18);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 19);
+        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 19);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()
@@ -5143,7 +5242,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
         let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
+        store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block],
             vec![compact_block],
@@ -5188,7 +5287,7 @@ mod tests {
         store.commit_artifactless_checkpoint(checkpoint_epoch)?;
         let (next_epoch, next_block, next_compact_block) =
             synthetic_epoch_with_hash_seed(2, 21, 21, 20);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
+        store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
             next_epoch,
             vec![next_block],
             vec![next_compact_block],
@@ -5264,7 +5363,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
         let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
+        store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block],
             vec![compact_block],
@@ -5298,12 +5397,12 @@ mod tests {
         let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
         let (second_epoch, second_block, second_compact_block) = synthetic_epoch(2, 2);
 
-        let first_commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+        let first_commit = store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
             first_epoch,
             vec![first_block],
             vec![first_compact_block],
         ))?;
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
+        store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
             second_epoch,
             vec![second_block],
             vec![second_compact_block],
@@ -5339,7 +5438,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
         let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
+        store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block],
             vec![compact_block],
@@ -5399,21 +5498,25 @@ mod tests {
             b"replacement-tree-state-2".to_vec(),
         );
 
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
+        store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
             first_epoch,
             vec![first_block],
             vec![first_compact_block],
         ))?;
         store.commit_chain_epoch(
-            ChainEpochArtifacts::new(second_epoch, vec![second_block], vec![second_compact_block])
-                .with_tree_states(vec![second_tree_state]),
+            synthetic_chain_epoch_artifacts(
+                second_epoch,
+                vec![second_block],
+                vec![second_compact_block],
+            )
+            .with_tree_states(vec![second_tree_state]),
         )?;
 
         let stale_visibility_keys = height_visibility_keys(second_epoch, BlockHeight::new(2));
         assert_reorg_window_visibility(&store, &stale_visibility_keys, true)?;
 
         store.commit_chain_epoch(
-            ChainEpochArtifacts::new(
+            synthetic_chain_epoch_artifacts(
                 replacement_epoch,
                 vec![replacement_block],
                 vec![replacement_compact_block],
@@ -5455,14 +5558,15 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_persisted_store_with_unexpected_schema_version() -> Result<(), Box<dyn Error>> {
+    fn opening_schema_13_refuses_without_creating_block_replay_column_family()
+    -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("schema-mismatch-store");
         {
             let store =
                 PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())?;
             let mut metadata_bytes = Vec::with_capacity(6);
-            metadata_bytes.extend_from_slice(&12_u16.to_be_bytes());
+            metadata_bytes.extend_from_slice(&13_u16.to_be_bytes());
             metadata_bytes.extend_from_slice(&Network::ZcashRegtest.id().to_be_bytes());
             store.store.inner.write(vec![StoragePut {
                 table: StorageTable::StorageControl,
@@ -5470,6 +5574,15 @@ mod tests {
                 value: metadata_bytes,
             }])?;
         }
+
+        let column_families = DB::list_cf(&Options::default(), &storage_path)?;
+        let database = DB::open_cf(&Options::default(), &storage_path, column_families)?;
+        database.drop_cf(StorageTable::BlockReplay.column_family_name())?;
+        drop(database);
+        let before_open = DB::list_cf(&Options::default(), &storage_path)?;
+        assert!(!before_open.iter().any(|column_family| {
+            column_family == StorageTable::BlockReplay.column_family_name()
+        }));
 
         let Err(error) =
             PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())
@@ -5483,10 +5596,48 @@ mod tests {
                 StoreError::SchemaMismatch {
                     persisted_version,
                     expected_version: CURRENT_STORE_SCHEMA_VERSION,
-                } if persisted_version == 12
+                } if persisted_version == 13
             ),
             "unexpected error: {error:?}"
         );
+        let after_open = DB::list_cf(&Options::default(), &storage_path)?;
+        assert_eq!(after_open, before_open);
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_current_schema_with_missing_block_replay_envelopes_refuses_without_mutating_manifest()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("incomplete-current-schema-store");
+        {
+            let _store =
+                PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())?;
+        }
+
+        let column_families = DB::list_cf(&Options::default(), &storage_path)?;
+        let database = DB::open_cf(&Options::default(), &storage_path, column_families)?;
+        database.drop_cf(StorageTable::BlockReplay.column_family_name())?;
+        drop(database);
+        let before_open = DB::list_cf(&Options::default(), &storage_path)?;
+
+        let Err(error) =
+            PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())
+        else {
+            return Err("expected incomplete-current-schema rejection on reopen".into());
+        };
+        assert!(
+            matches!(
+                error,
+                StoreError::StoreSchemaIncomplete {
+                    missing_column_family,
+                } if missing_column_family == StorageTable::BlockReplay.column_family_name()
+            ),
+            "unexpected error: {error:?}"
+        );
+        let after_open = DB::list_cf(&Options::default(), &storage_path)?;
+        assert_eq!(after_open, before_open);
 
         Ok(())
     }

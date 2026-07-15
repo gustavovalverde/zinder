@@ -1,10 +1,9 @@
 //! Primary-open store schema admission.
 //!
-//! Schema 13 makes block-local transparent inputs and resolved spend replay
-//! facts durable. Older schemas stored only outpoints in the block index and may already have
-//! deleted the corresponding point facts through retention, so the missing
-//! facts cannot be reconstructed reliably in place. Primary open therefore
-//! fails closed and requires a fresh canonical rebuild.
+//! Schema 14 makes complete canonical replay envelopes durable. Older schemas
+//! never retained every source-local field, so the missing envelopes cannot be
+//! reconstructed reliably in place. Primary open therefore fails closed and
+//! requires a fresh canonical rebuild.
 
 use crate::{
     StoreError,
@@ -14,7 +13,7 @@ use crate::{
 
 use super::{CURRENT_STORE_SCHEMA_VERSION, decode_store_metadata};
 
-pub(super) fn migrate_primary_store_schema(inner: &RocksChainStore) -> Result<(), StoreError> {
+pub(super) fn validate_primary_store_schema(inner: &RocksChainStore) -> Result<(), StoreError> {
     let key = StoreKey::store_metadata();
     let Some(metadata_bytes) =
         inner.get(StoreReadCaller::Query, StorageTable::StorageControl, &key)?

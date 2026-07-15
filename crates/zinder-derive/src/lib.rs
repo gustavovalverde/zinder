@@ -36,6 +36,7 @@ pub use consumer::block_production_time::{
 pub use consumer::block_summary::{
     BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
     BLOCK_SUMMARY_SCHEMA, BlockSummaryConsumer, BlockSummaryConsumerError, decode_stored_record,
+    project_block_summary_record,
 };
 pub use consumer::commitment_root_search::{
     COMMITMENT_ROOT_SEARCH_COLUMN_FAMILIES, COMMITMENT_ROOT_SEARCH_COLUMN_FAMILY,

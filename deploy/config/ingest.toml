@@ -111,7 +111,7 @@ source_segment_target_response_bytes = 33554432
 source_fetch_max_in_flight_requests = 20
 source_fetch_max_in_flight_bytes = 671088640
 block_prepare_concurrency = 16
-block_prepare_max_in_flight_artifact_bytes = 536870912
+block_prepare_memory_watermark_bytes = 536870912
 commit_reassembly_max_queued_artifact_bytes = 536870912
 # Force a RocksDB flush every N committed epochs (≈ N × canonical_batch_max_blocks
 # blocks). Caps the live WAL by writer cadence and bounds crash-recovery

@@ -28,10 +28,19 @@ impl StoreFixture {
     /// Returns an error if the temporary directory cannot be created or the
     /// store cannot be opened.
     pub fn open() -> Result<Self, StoreFixtureError> {
+        Self::open_with_options(ChainStoreOptions::for_local_tests())
+    }
+
+    /// Opens an empty [`PrimaryChainStore`] with explicit runtime options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary directory cannot be created or the
+    /// store cannot be opened with `options`.
+    pub fn open_with_options(options: ChainStoreOptions) -> Result<Self, StoreFixtureError> {
         let tempdir = TempDir::new().map_err(StoreFixtureError::TempDirCreation)?;
-        let chain_store =
-            PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())
-                .map_err(StoreFixtureError::ChainStoreOpen)?;
+        let chain_store = PrimaryChainStore::open(tempdir.path(), options)
+            .map_err(StoreFixtureError::ChainStoreOpen)?;
         Ok(Self {
             tempdir,
             chain_store,
@@ -54,7 +63,10 @@ impl StoreFixture {
             .chain_epoch_artifacts(chain_epoch_id)
             .ok_or(StoreFixtureError::EmptyChainFixture)?;
         let committed_chain_epoch = chain_epoch_artifacts.chain_epoch;
-        let mut fixture = Self::open()?;
+        let mut fixture = Self::open_with_options(ChainStoreOptions {
+            raw_blob_retention: chain_fixture.raw_blob_retention(),
+            ..ChainStoreOptions::for_local_tests()
+        })?;
         fixture
             .chain_store
             .commit_chain_epoch(chain_epoch_artifacts)

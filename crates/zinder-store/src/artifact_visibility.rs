@@ -22,7 +22,7 @@ pub(crate) fn visible_height_source_epoch(
     .increment(1);
     let prefix = index.prefix_key(chain_epoch.network, height);
     let seek_key = index.seek_key(chain_epoch.network, height, chain_epoch.id);
-    let Some(source_epoch_bytes) =
+    let Some((matched_key, source_epoch_bytes)) =
         inner.get_previous_by_prefix(StorageTable::ReorgWindow, &prefix, &seek_key)?
     else {
         return Err(StoreError::ArtifactMissing {
@@ -31,7 +31,7 @@ pub(crate) fn visible_height_source_epoch(
         });
     };
 
-    decode_visible_source_epoch(family, &seek_key, &source_epoch_bytes)
+    decode_visible_source_epoch(family, &matched_key, &source_epoch_bytes)
 }
 
 pub(crate) fn decode_visible_source_epoch(
@@ -55,7 +55,24 @@ pub(crate) fn decode_visible_source_epoch(
                 key: key.clone().into(),
                 reason: "visible artifact epoch pointer must be 8 bytes",
             })?;
-    Ok(ChainEpochId::new(u64::from_be_bytes(source_epoch)))
+    let source_epoch = ChainEpochId::new(u64::from_be_bytes(source_epoch));
+    let publication_epoch =
+        StoreKey::visibility_publication_epoch(key.as_bytes()).ok_or_else(|| {
+            StoreError::ArtifactCorrupt {
+                family,
+                key: key.clone().into(),
+                reason: "visible artifact epoch key is malformed",
+            }
+        })?;
+    if source_epoch != publication_epoch {
+        return Err(StoreError::ArtifactCorrupt {
+            family,
+            key: key.clone().into(),
+            reason: "visible artifact epoch pointer does not match its publication epoch",
+        });
+    }
+
+    Ok(source_epoch)
 }
 
 #[derive(Clone, Copy)]
@@ -115,7 +132,7 @@ pub(crate) fn visible_subtree_root_source_epoch(
         subtree_index,
         chain_epoch.id,
     );
-    let Some(source_epoch_bytes) =
+    let Some((matched_key, source_epoch_bytes)) =
         inner.get_previous_by_prefix(StorageTable::ReorgWindow, &prefix, &seek_key)?
     else {
         return Err(StoreError::ArtifactMissing {
@@ -124,5 +141,38 @@ pub(crate) fn visible_subtree_root_source_epoch(
         });
     };
 
-    decode_visible_source_epoch(ArtifactFamily::SubtreeRoot, &seek_key, &source_epoch_bytes)
+    decode_visible_source_epoch(
+        ArtifactFamily::SubtreeRoot,
+        &matched_key,
+        &source_epoch_bytes,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use zinder_core::{BlockHeight, ChainEpochId, Network};
+
+    use super::{ArtifactFamily, StoreError, StoreKey, decode_visible_source_epoch};
+
+    #[test]
+    fn visible_source_epoch_rejects_key_value_epoch_mismatch() {
+        let key = StoreKey::visible_compact_block_epoch(
+            Network::ZcashRegtest,
+            BlockHeight::new(42),
+            ChainEpochId::new(7),
+        );
+
+        assert!(matches!(
+            decode_visible_source_epoch(
+                ArtifactFamily::CompactBlock,
+                &key,
+                &ChainEpochId::new(6).value().to_be_bytes(),
+            ),
+            Err(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                reason: "visible artifact epoch pointer does not match its publication epoch",
+                ..
+            })
+        ));
+    }
 }

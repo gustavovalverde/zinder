@@ -13,8 +13,8 @@ use zinder_core::{
     TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainEvent, ChainEventHistoryRequest, ChainStoreOptions,
-    PrimaryChainStore, ReorgWindowChange, StoreError,
+    ChainEvent, ChainEventHistoryRequest, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
+    StoreError,
 };
 
 #[test]
@@ -23,7 +23,7 @@ fn commit_chain_epoch_writes_artifacts_and_visible_epoch_atomically() -> eyre::R
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
 
-    let committed = store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let committed = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block.clone()],
         vec![compact_block.clone()],
@@ -56,7 +56,7 @@ fn commit_chain_epoch_can_publish_genesis_artifacts() -> eyre::Result<()> {
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 0);
 
     let committed = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block.clone()],
             vec![compact_block.clone()],
@@ -194,7 +194,7 @@ fn concurrent_same_epoch_commits_do_not_both_publish() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         first_epoch,
         vec![first_block],
         vec![first_compact_block],
@@ -206,7 +206,7 @@ fn concurrent_same_epoch_commits_do_not_both_publish() -> eyre::Result<()> {
         let store = Arc::clone(&store);
         handles.push(thread::spawn(move || {
             let (second_epoch, second_block, second_compact_block) = synthetic_epoch(2, 2);
-            store.commit_chain_epoch(ChainEpochArtifacts::new(
+            store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
                 second_epoch,
                 vec![second_block],
                 vec![second_compact_block],
@@ -243,7 +243,7 @@ fn commit_rejects_compact_block_without_matching_block() -> eyre::Result<()> {
     let (chain_epoch, block, mut compact_block) = synthetic_epoch(1, 1);
     compact_block.block_hash = BlockHash::from_bytes([99; 32]);
 
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let error = match store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block],
         vec![compact_block],
@@ -266,7 +266,7 @@ fn commit_rejects_epoch_zero() -> eyre::Result<()> {
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(0, 1);
 
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let error = match store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block],
         vec![compact_block],
@@ -288,7 +288,7 @@ fn append_commit_must_include_the_new_tip() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         first_epoch,
         vec![first_block],
         vec![first_compact_block],
@@ -296,7 +296,7 @@ fn append_commit_must_include_the_new_tip() -> eyre::Result<()> {
 
     let (attempted_epoch, _tip_block, _tip_compact_block) = synthetic_epoch(2, 3);
     let (_, height_2_block, height_2_compact_block) = synthetic_epoch(2, 2);
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let error = match store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         attempted_epoch,
         vec![height_2_block],
         vec![height_2_compact_block],
@@ -329,7 +329,7 @@ fn commit_rejects_transaction_above_tip() -> eyre::Result<()> {
         );
 
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block])
             .with_block_transaction_index(vec![transaction_index])
             .with_transaction_locations(vec![transaction_location])
             .with_transaction_facts(vec![transaction_facts])
@@ -359,7 +359,7 @@ fn commit_rejects_tree_state_above_tip() -> eyre::Result<()> {
     );
 
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block])
             .with_tree_states(vec![tree_state]),
     ) {
         Ok(outcome) => return Err(eyre!("expected invalid artifacts, got {outcome:?}")),
@@ -386,7 +386,7 @@ fn commit_rejects_tree_state_for_wrong_block_hash() -> eyre::Result<()> {
     );
 
     let error = match store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block])
             .with_tree_states(vec![tree_state]),
     ) {
         Ok(outcome) => return Err(eyre!("expected invalid artifacts, got {outcome:?}")),
@@ -501,7 +501,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         b"compact-replaced-block".to_vec(),
     );
     let outcome = store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             replacement_chain_epoch,
             vec![replaced_block],
             vec![replaced_compact_block],

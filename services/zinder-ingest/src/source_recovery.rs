@@ -178,6 +178,7 @@ pub(crate) fn decide_recovery(
         }
         IngestError::Store(_)
         | IngestError::ReorgWindowExceeded { .. }
+        | IngestError::CanonicalWriterReorgWindowMismatch { .. }
         | IngestError::UnknownNodeSource { .. }
         | IngestError::SubtreeRootsUnavailable { .. }
         | IngestError::SubtreeRootCompletingBlockMissing { .. }

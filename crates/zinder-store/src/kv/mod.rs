@@ -15,6 +15,7 @@ pub(crate) enum StorageTable {
     StorageControl,
     ChainEpoch,
     BlockHeader,
+    BlockReplay,
     BlockBlob,
     CompactBlock,
     BlockTransactionIndex,
@@ -44,6 +45,7 @@ impl StorageTable {
             Self::StorageControl => "storage_control",
             Self::ChainEpoch => "chain_epoch",
             Self::BlockHeader => "block_header",
+            Self::BlockReplay => "block_replay",
             Self::BlockBlob => "block_blob",
             Self::CompactBlock => "compact_block",
             Self::BlockTransactionIndex => "block_transaction_index",
@@ -68,11 +70,12 @@ impl StorageTable {
         }
     }
 
-    pub(crate) const fn all() -> [Self; 24] {
+    pub(crate) const fn all() -> [Self; 25] {
         [
             Self::StorageControl,
             Self::ChainEpoch,
             Self::BlockHeader,
+            Self::BlockReplay,
             Self::BlockBlob,
             Self::CompactBlock,
             Self::BlockTransactionIndex,

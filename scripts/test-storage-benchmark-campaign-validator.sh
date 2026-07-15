@@ -47,7 +47,7 @@ write_report() {
       storage_schema_version: 2,
       ingestion_mode: "binary-copy-single-load-transaction-with-deferred-index",
       tables_logged: true,
-      replay_encoding_compression: "lz4",
+      replay_envelope_compression: "lz4",
       fact_table_bytes: 6000,
       index_bytes: 1000,
       wal_bytes: 9000,
@@ -108,10 +108,10 @@ write_report() {
           target_arch: "x86_64"
         },
         fixture: {
-          fixture_format_version: 3,
+          fixture_format_version: 4,
           current_schema_oracle_artifact_schema_version: 18,
           canonical_block_facts_digest_evidence: {
-            block_digest_version: 1,
+            block_digest_version: 2,
             sequence_digest_version: 1,
             block_count: 10,
             sequence_digest_sha256: ("c" * 64)
@@ -155,13 +155,13 @@ write_report() {
           logical_fact_bytes: 4096,
           physical_storage_bytes: 8192,
           persisted_sequence_digest: {
-            block_digest_version: 1,
+            block_digest_version: 2,
             sequence_digest_version: 1,
             block_count: 10,
             sha256: ("c" * 64)
           },
           fixture_sequence_digest_match: true,
-          replay_format_version: 1,
+          replay_format_version: 2,
           semantic_replay_validated: true,
           storage: (if $is_rocksdb then rocksdb_storage else postgres_storage end),
           benchmark_client_peak_rss: {bytes: null, source: "unavailable"}

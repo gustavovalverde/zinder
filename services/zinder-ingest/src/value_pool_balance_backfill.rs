@@ -573,6 +573,7 @@ mod tests {
         CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, ReorgWindowChange,
         RocksDbResourceBudget,
     };
+    use zinder_testkit::encode_fixture_block_replay;
 
     use super::*;
 
@@ -779,6 +780,7 @@ mod tests {
                 ),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
             .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
                 height: BlockHeight::new(settled_tip),
@@ -812,7 +814,16 @@ mod tests {
             settled_tip,
             block_hash(settled_tip, 0),
         );
-        store.commit_chain_epoch(ChainEpochArtifacts::new(epoch, headers, compact))?;
+        let block_replay_envelopes = headers
+            .iter()
+            .map(|header| encode_fixture_block_replay(header, &[]))
+            .collect();
+        store.commit_chain_epoch(ChainEpochArtifacts::new(
+            epoch,
+            headers,
+            block_replay_envelopes,
+            compact,
+        ))?;
         Ok(())
     }
 
@@ -822,11 +833,13 @@ mod tests {
     ) -> eyre::Result<()> {
         let parent = block_hash(1_001, 0);
         let replacement = header(1_002, replacement_hash, parent);
+        let replacement_replay_envelope = encode_fixture_block_replay(&replacement, &[]);
         let epoch = epoch(3, 1_002, replacement_hash, 1_001, block_hash(1_001, 0));
         store.commit_chain_epoch(
             ChainEpochArtifacts::new(
                 epoch,
                 vec![replacement],
+                vec![replacement_replay_envelope],
                 vec![CompactBlockArtifact::new(
                     BlockHeight::new(1_002),
                     replacement_hash,

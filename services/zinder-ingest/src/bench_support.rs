@@ -44,8 +44,8 @@ pub const BENCH_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 pub const BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
 /// Maximum reserved response bytes across source fetches.
 pub const BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 384 * 1024 * 1024;
-/// Maximum reserved prepared block bytes across active and completed prepares.
-pub const BENCH_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+/// Admission watermark for active prepare peaks and completed resident data.
+pub const BENCH_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 512 * 1024 * 1024;
 /// Maximum safe-tip artifact bytes queued while the previous batch commits.
 pub const BENCH_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 /// Force a `RocksDB` flush every N committed epochs.
@@ -129,6 +129,7 @@ pub fn bench_bulk_catchup_run_config(params: BenchBulkCatchupParams) -> BulkCatc
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: params.storage_path,
         canonical_rocksdb_budget: params.canonical_rocksdb_budget,
+        reorg_window_blocks: 100,
         raw_blob_policy: params.raw_blob_policy,
         network_upgrade_activations: params.network_upgrade_activations,
         from_height: params.from_height,
@@ -146,9 +147,7 @@ pub fn bench_bulk_catchup_run_config(params: BenchBulkCatchupParams) -> BulkCatc
         source_fetch_max_in_flight_requests: nz32(BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS),
         source_fetch_max_in_flight_bytes: nz64(BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES),
         block_prepare_concurrency: params.block_prepare_concurrency,
-        block_prepare_max_in_flight_artifact_bytes: nz64(
-            BENCH_BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES,
-        ),
+        block_prepare_memory_watermark_bytes: nz64(BENCH_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES),
         commit_reassembly_max_queued_artifact_bytes: nz64(
             BENCH_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES,
         ),

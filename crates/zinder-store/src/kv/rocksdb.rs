@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    ops::Range,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -333,9 +334,18 @@ fn storage_column_family_descriptors(
     rocksdb_resource_budget: RocksDbResourceBudget,
     existing_column_families: &[String],
 ) -> Vec<ColumnFamilyDescriptor> {
+    let opens_existing_zinder_store = existing_column_families
+        .iter()
+        .any(|name| name != ROCKSDB_DEFAULT_COLUMN_FAMILY);
     let mut opened_names = BTreeSet::new();
     let mut descriptors = StorageTable::all()
         .into_iter()
+        .filter(|table| {
+            !opens_existing_zinder_store
+                || existing_column_families
+                    .iter()
+                    .any(|name| name == table.column_family_name())
+        })
         .map(|table| {
             opened_names.insert(table.column_family_name().to_owned());
             ColumnFamilyDescriptor::new(
@@ -451,6 +461,17 @@ impl RocksChainStore {
         self.control_lock.lock()
     }
 
+    pub(crate) fn ensure_all_storage_tables_are_present(&self) -> Result<(), StoreError> {
+        for table in StorageTable::all() {
+            if self.db.cf_handle(table.column_family_name()).is_none() {
+                return Err(StoreError::StoreSchemaIncomplete {
+                    missing_column_family: table.column_family_name(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn get(
         &self,
         caller: StoreReadCaller,
@@ -541,7 +562,7 @@ impl RocksChainStore {
         table: StorageTable,
         prefix: &StoreKey,
         seek_key: &StoreKey,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    ) -> Result<Option<(StoreKey, Vec<u8>)>, StoreError> {
         let started_at = Instant::now();
         let read_outcome = (|| {
             let column_family = self.column_family(table)?;
@@ -562,9 +583,9 @@ impl RocksChainStore {
                 return Ok(None);
             }
 
-            Ok(Some(index_value.to_vec()))
+            Ok(Some((StoreKey::from_raw_bytes(key), index_value.to_vec())))
         })();
-        record_store_read_outcome("seek_for_prev", caller, table, started_at, &read_outcome);
+        record_store_predecessor_read_outcome(caller, table, started_at, &read_outcome);
 
         read_outcome
     }
@@ -598,7 +619,7 @@ impl RocksChainStore {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(caller, table, started_at, &scan_outcome);
+        record_store_scan_outcome("scan_prefix", caller, table, started_at, &scan_outcome);
 
         scan_outcome
     }
@@ -640,7 +661,13 @@ impl RocksChainStore {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(caller, table, started_at, &scan_outcome);
+        record_store_scan_outcome(
+            "scan_prefix_reverse",
+            caller,
+            table,
+            started_at,
+            &scan_outcome,
+        );
 
         scan_outcome
     }
@@ -700,7 +727,54 @@ impl RocksChainStore {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(caller, table, started_at, &scan_outcome);
+        record_store_scan_outcome("scan_forward", caller, table, started_at, &scan_outcome);
+
+        scan_outcome
+    }
+
+    pub(crate) fn scan_forward_range(
+        &self,
+        caller: StoreReadCaller,
+        table: StorageTable,
+        key_range: &Range<&StoreKey>,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        let start_inclusive = key_range.start;
+        let end_exclusive = key_range.end;
+        let started_at = Instant::now();
+        let scan_outcome = (|| {
+            if start_inclusive.as_bytes() >= end_exclusive.as_bytes() {
+                return Ok(());
+            }
+
+            let column_family = self.column_family(table)?;
+            let mut read_options = ReadOptions::default();
+            read_options.set_total_order_seek(true);
+            read_options.set_iterate_lower_bound(start_inclusive.as_bytes().to_vec());
+            read_options.set_iterate_upper_bound(end_exclusive.as_bytes().to_vec());
+            let mut iterator = self.db.raw_iterator_cf_opt(&column_family, read_options);
+
+            iterator.seek(start_inclusive.as_bytes());
+            while iterator.valid() {
+                let Some((key, row_value)) = iterator.item() else {
+                    iterator.status().map_err(StoreError::storage_unavailable)?;
+                    return Ok(());
+                };
+                if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
+                    break;
+                }
+                iterator.next();
+            }
+            iterator.status().map_err(StoreError::storage_unavailable)?;
+            Ok(())
+        })();
+        record_store_scan_outcome(
+            "scan_forward_range",
+            caller,
+            table,
+            started_at,
+            &scan_outcome,
+        );
 
         scan_outcome
     }
@@ -1147,7 +1221,7 @@ pub(crate) trait RocksChainStoreRead {
         table: StorageTable,
         prefix: &StoreKey,
         seek_key: &StoreKey,
-    ) -> Result<Option<Vec<u8>>, StoreError>;
+    ) -> Result<Option<(StoreKey, Vec<u8>)>, StoreError>;
 
     fn scan_prefix(
         &self,
@@ -1175,6 +1249,13 @@ pub(crate) trait RocksChainStoreRead {
         &self,
         table: StorageTable,
         start_key: &StoreKey,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError>;
+
+    fn scan_forward_range(
+        &self,
+        table: StorageTable,
+        key_range: &Range<&StoreKey>,
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError>;
 }
@@ -1210,7 +1291,7 @@ impl RocksChainStoreRead for RocksChainStore {
         table: StorageTable,
         prefix: &StoreKey,
         seek_key: &StoreKey,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    ) -> Result<Option<(StoreKey, Vec<u8>)>, StoreError> {
         Self::get_previous_by_prefix(self, StoreReadCaller::Query, table, prefix, seek_key)
     }
 
@@ -1249,6 +1330,15 @@ impl RocksChainStoreRead for RocksChainStore {
         visit: PrefixScanVisitor<'_>,
     ) -> Result<(), StoreError> {
         Self::scan_forward(self, StoreReadCaller::Query, table, start_key, visit)
+    }
+
+    fn scan_forward_range(
+        &self,
+        table: StorageTable,
+        key_range: &Range<&StoreKey>,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        Self::scan_forward_range(self, StoreReadCaller::Query, table, key_range, visit)
     }
 }
 
@@ -1301,7 +1391,7 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
         table: StorageTable,
         prefix: &StoreKey,
         seek_key: &StoreKey,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    ) -> Result<Option<(StoreKey, Vec<u8>)>, StoreError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.get_previous_by_prefix(table, prefix, seek_key),
             Self::Direct { store, caller } => {
@@ -1362,6 +1452,20 @@ impl RocksChainStoreRead for RocksChainStoreReadView<'_> {
         match self {
             Self::Snapshot(snapshot) => snapshot.scan_forward(table, start_key, visit),
             Self::Direct { store, caller } => store.scan_forward(*caller, table, start_key, visit),
+        }
+    }
+
+    fn scan_forward_range(
+        &self,
+        table: StorageTable,
+        key_range: &Range<&StoreKey>,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.scan_forward_range(table, key_range, visit),
+            Self::Direct { store, caller } => {
+                store.scan_forward_range(*caller, table, key_range, visit)
+            }
         }
     }
 }
@@ -1432,7 +1536,7 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
         table: StorageTable,
         prefix: &StoreKey,
         seek_key: &StoreKey,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    ) -> Result<Option<(StoreKey, Vec<u8>)>, StoreError> {
         let started_at = Instant::now();
         let read_outcome = (|| {
             let column_family = self.store.column_family(table)?;
@@ -1453,15 +1557,9 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
                 return Ok(None);
             }
 
-            Ok(Some(index_value.to_vec()))
+            Ok(Some((StoreKey::from_raw_bytes(key), index_value.to_vec())))
         })();
-        record_store_read_outcome(
-            "seek_for_prev",
-            self.caller,
-            table,
-            started_at,
-            &read_outcome,
-        );
+        record_store_predecessor_read_outcome(self.caller, table, started_at, &read_outcome);
 
         read_outcome
     }
@@ -1493,7 +1591,7 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(self.caller, table, started_at, &scan_outcome);
+        record_store_scan_outcome("scan_prefix", self.caller, table, started_at, &scan_outcome);
 
         scan_outcome
     }
@@ -1534,7 +1632,13 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(self.caller, table, started_at, &scan_outcome);
+        record_store_scan_outcome(
+            "scan_prefix_reverse",
+            self.caller,
+            table,
+            started_at,
+            &scan_outcome,
+        );
 
         scan_outcome
     }
@@ -1592,7 +1696,60 @@ impl RocksChainStoreRead for RocksChainStoreSnapshot<'_> {
             iterator.status().map_err(StoreError::storage_unavailable)?;
             Ok(())
         })();
-        record_store_scan_outcome(self.caller, table, started_at, &scan_outcome);
+        record_store_scan_outcome(
+            "scan_forward",
+            self.caller,
+            table,
+            started_at,
+            &scan_outcome,
+        );
+
+        scan_outcome
+    }
+
+    fn scan_forward_range(
+        &self,
+        table: StorageTable,
+        key_range: &Range<&StoreKey>,
+        visit: PrefixScanVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        let start_inclusive = key_range.start;
+        let end_exclusive = key_range.end;
+        let started_at = Instant::now();
+        let scan_outcome = (|| {
+            if start_inclusive.as_bytes() >= end_exclusive.as_bytes() {
+                return Ok(());
+            }
+
+            let column_family = self.store.column_family(table)?;
+            let mut read_options = ReadOptions::default();
+            read_options.set_total_order_seek(true);
+            read_options.set_iterate_lower_bound(start_inclusive.as_bytes().to_vec());
+            read_options.set_iterate_upper_bound(end_exclusive.as_bytes().to_vec());
+            let mut iterator = self
+                .snapshot
+                .raw_iterator_cf_opt(&column_family, read_options);
+            iterator.seek(start_inclusive.as_bytes());
+            while iterator.valid() {
+                let Some((key, row_value)) = iterator.item() else {
+                    iterator.status().map_err(StoreError::storage_unavailable)?;
+                    return Ok(());
+                };
+                if matches!(visit(key, row_value)?, PrefixScanControl::Stop) {
+                    break;
+                }
+                iterator.next();
+            }
+            iterator.status().map_err(StoreError::storage_unavailable)?;
+            Ok(())
+        })();
+        record_store_scan_outcome(
+            "scan_forward_range",
+            self.caller,
+            table,
+            started_at,
+            &scan_outcome,
+        );
 
         scan_outcome
     }
@@ -1658,6 +1815,31 @@ fn record_store_read_outcome(
     }
 }
 
+fn record_store_predecessor_read_outcome(
+    caller: StoreReadCaller,
+    table: StorageTable,
+    started_at: Instant,
+    read_outcome: &Result<Option<(StoreKey, Vec<u8>)>, StoreError>,
+) {
+    metrics::histogram!(
+        "zinder_store_read_duration_seconds",
+        "operation" => "seek_for_prev",
+        "table" => table.column_family_name(),
+        "caller" => caller.as_str(),
+        "status" => outcome_status(read_outcome)
+    )
+    .record(started_at.elapsed());
+
+    if let Ok(Some((_matched_key, stored_value_bytes))) = read_outcome {
+        metrics::counter!(
+            "zinder_store_read_bytes_total",
+            "operation" => "seek_for_prev",
+            "table" => table.column_family_name()
+        )
+        .increment(usize_to_u64(stored_value_bytes.len()));
+    }
+}
+
 fn record_store_multi_get_outcome(
     caller: StoreReadCaller,
     table: StorageTable,
@@ -1709,6 +1891,7 @@ fn record_store_multi_get_outcome(
 }
 
 fn record_store_scan_outcome(
+    operation: &'static str,
     caller: StoreReadCaller,
     table: StorageTable,
     started_at: Instant,
@@ -1716,7 +1899,7 @@ fn record_store_scan_outcome(
 ) {
     metrics::histogram!(
         "zinder_store_read_duration_seconds",
-        "operation" => "scan_prefix",
+        "operation" => operation,
         "table" => table.column_family_name(),
         "caller" => caller.as_str(),
         "status" => outcome_status(scan_outcome)

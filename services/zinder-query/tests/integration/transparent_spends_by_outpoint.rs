@@ -18,11 +18,14 @@ use zinder_query::{
 };
 use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
 use zinder_testkit::{
-    StoreFixture, open_test_derive_store_for_canonical, sample_regtest_upgrade_activations,
-    seed_transparent_outpoint_spends,
+    StoreFixture, encode_fixture_block_replay, open_test_derive_store_for_canonical,
+    sample_regtest_upgrade_activations, seed_transparent_outpoint_spends,
 };
 
-use crate::common::{block_hash_from_seed, synthetic_chain_epoch, synthetic_multi_block_epoch};
+use crate::common::{
+    block_hash_from_seed, chain_epoch_artifacts_with_transparent_facts, synthetic_chain_epoch,
+    synthetic_multi_block_epoch,
+};
 
 /// Commits a spendable output then a spend of it.
 ///
@@ -58,15 +61,20 @@ fn commit_spent_outpoint_fixture(
         output.block_height,
         output.block_hash,
     );
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_one, vec![block_one], vec![compact_one])
-            .with_transparent_outputs_by_outpoint(vec![output]),
-    )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_two, vec![block_two], vec![compact_two])
-            .with_transparent_spend_facts(vec![spend.clone()]),
-    )?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        epoch_one,
+        vec![block_one],
+        vec![compact_one],
+        &[output],
+        Vec::new(),
+    ))?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        epoch_two,
+        vec![block_two],
+        vec![compact_two],
+        &[],
+        vec![spend.clone()],
+    ))?;
 
     Ok((spent_outpoint, spend))
 }
@@ -167,15 +175,19 @@ async fn transparent_spends_by_outpoint_dedupes_repeated_request_outpoints() -> 
 /// without running a retention sweep (the swept marker stays at zero).
 fn commit_to_settled_tip_two(store: &zinder_store::PrimaryChainStore) -> eyre::Result<()> {
     let (epoch_one, block_one, compact_one) = synthetic_chain_epoch(1, 1);
+    let replay_one = encode_fixture_block_replay(&block_one, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         epoch_one,
         vec![block_one],
+        vec![replay_one],
         vec![compact_one],
     ))?;
     let (epoch_two, block_two, compact_two) = synthetic_chain_epoch(2, 2);
+    let replay_two = encode_fixture_block_replay(&block_two, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         epoch_two,
         vec![block_two],
+        vec![replay_two],
         vec![compact_two],
     ))?;
     Ok(())
@@ -295,20 +307,21 @@ fn commit_real_sweep_to_deleted_through_two(
         output.block_height,
         output.block_hash,
     );
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_one, blocks, compact_blocks)
-            .with_transparent_outputs_by_outpoint(vec![output])
-            .with_transparent_spend_facts(vec![spend]),
-    )?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        epoch_one,
+        blocks,
+        compact_blocks,
+        &[output],
+        vec![spend],
+    ))?;
 
     store.set_transparent_retention_release_height(BlockHeight::new(3))?;
     let sweep_epoch = synthetic_multi_block_epoch(2, 3, 2).0;
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(sweep_epoch, Vec::new(), Vec::new()).with_reorg_window_change(
-            ReorgWindowChange::AdvanceSafeTipTo {
+        ChainEpochArtifacts::new(sweep_epoch, Vec::new(), Vec::new(), Vec::new())
+            .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
                 height: BlockHeight::new(2),
-            },
-        ),
+            }),
     )?;
     let sweep = store.sweep_transparent_retention_once()?;
     assert_eq!(sweep.swept_heights(), 2);
@@ -460,9 +473,11 @@ async fn transparent_spends_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyre
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));

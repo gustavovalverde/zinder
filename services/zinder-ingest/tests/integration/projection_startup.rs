@@ -32,7 +32,9 @@ use zinder_store::{
     ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
     RocksDbResourceBudget,
 };
-use zinder_testkit::{ChainFixture, MockNodeSource, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    ChainFixture, MockNodeSource, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+};
 
 const LEGACY_OUTPOINT_SPEND_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
@@ -440,10 +442,13 @@ fn preflight_allows_destructive_rebuild_only_with_full_event_history() -> Result
     let chain_epoch = fixture
         .chain_epoch(ChainEpochId::new(2))
         .ok_or_else(|| eyre!("fixture epoch missing"))?;
+    let block_header = block.block_header_artifact();
+    let replay_envelope = encode_fixture_block_replay(&block_header, &[]);
     let second_commit = chain_store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             chain_epoch,
-            vec![block.block_header_artifact()],
+            vec![block_header],
+            vec![replay_envelope],
             vec![block.compact_block_artifact()],
         )
         .with_reorg_window_change(ReorgWindowChange::Extend {

@@ -35,7 +35,7 @@ use zinder_source::{
 };
 use zinder_store::{
     ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
-    PrimaryChainStore,
+    PrimaryChainStore, RawBlobRetention,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
@@ -48,6 +48,13 @@ fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStor
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?)
+}
+
+fn test_all_blob_store_options() -> ChainStoreOptions {
+    ChainStoreOptions {
+        raw_blob_retention: RawBlobRetention::All,
+        ..ChainStoreOptions::for_network(Network::ZcashTestnet)
+    }
 }
 
 #[tokio::test]
@@ -84,6 +91,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         node_source: NodeSourceKind::ZebraJsonRpc,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: storage_path.clone(),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -110,7 +118,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
         block_prepare_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
@@ -134,10 +142,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     );
     assert_eq!(fetched_heights.lock().as_slice(), [source_block.height]);
 
-    let store = PrimaryChainStore::open(
-        &storage_path,
-        ChainStoreOptions::for_network(Network::ZcashTestnet),
-    )?;
+    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
     assert_eq!(
         store
             .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?
@@ -213,6 +218,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         node_source: NodeSourceKind::ZebraJsonRpc,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: storage_path.clone(),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -239,7 +245,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
         block_prepare_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
@@ -248,10 +254,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
     };
-    let store = PrimaryChainStore::open(
-        &storage_path,
-        ChainStoreOptions::for_network(Network::ZcashTestnet),
-    )?;
+    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
     let readiness = Readiness::default();
 
     run_bulk_catchup_until_complete(&bulk_catchup_config, &source, &store, &readiness)
@@ -394,6 +397,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
         node_source: NodeSourceKind::ZebraJsonRpc,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: tempdir.path().join("nonzero-checkpoint-bulk-catchup-store"),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -420,7 +424,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
         block_prepare_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
@@ -473,6 +477,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
         node_source: NodeSourceKind::ZebraJsonRpc,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: storage_path.clone(),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -499,7 +504,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
             .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
         block_prepare_concurrency: NonZeroU32::new(4)
             .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
@@ -508,10 +513,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
     };
-    let store = PrimaryChainStore::open(
-        &storage_path,
-        ChainStoreOptions::for_network(Network::ZcashTestnet),
-    )?;
+    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
     let readiness = Readiness::default();
 
     let outcome =

@@ -5,6 +5,12 @@ script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 repository_root="$(dirname -- "$script_dir")"
 cd "$repository_root"
 
+if ! shasum -a 256 --check vendor/postgres-protocol/ZINDER-SHA256SUMS; then
+  echo >&2 'postgres-protocol compatibility patch differs from its reviewed source manifest'
+  echo >&2 'inspect the vendor diff and update ZINDER-SHA256SUMS only after review'
+  exit 1
+fi
+
 workspace_tree="$(cargo tree --workspace --locked --prefix none)"
 if ! grep -Fq 'bip32 v0.6.0-pre.1' <<<"$workspace_tree"; then
   echo >&2 'postgres-protocol compatibility patch is no longer justified: bip32 0.6.0-pre.1 left the workspace graph'

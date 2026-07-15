@@ -27,7 +27,7 @@ use zinder_store::{
 };
 
 use crate::{
-    IngestError,
+    IngestError, RawBlobPolicy,
     artifact_builder::expand_current_schema_block_artifacts,
     derive_consumers::{
         backfill_consumer_tail_boundary, derive_projection_write_guard,
@@ -1074,8 +1074,10 @@ async fn fetch_missing_intrinsic_artifacts(
                         reason: error.to_string(),
                     })??;
             validate_source_block(&source_block, &expected)?;
-            let prepared = prepare_canonical_block(&source_block, &activations)?;
-            let current_schema_artifacts = expand_current_schema_block_artifacts(prepared.facts)?;
+            let prepared =
+                prepare_canonical_block(&source_block, &activations, RawBlobPolicy::None)?;
+            let current_schema_artifacts =
+                expand_current_schema_block_artifacts(prepared.facts, prepared.retained_raw_blobs)?;
             validate_derived_locations(
                 &current_schema_artifacts.transaction_intrinsic_value_balances,
                 &expected.transaction_locations,

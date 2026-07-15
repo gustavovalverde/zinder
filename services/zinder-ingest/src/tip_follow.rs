@@ -20,18 +20,19 @@ use zinder_source::{
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
-    ChainEpochReader, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
+    ChainEpochReader, PrimaryChainStore, ReorgWindowChange,
 };
 
 use crate::artifact_builder::{
-    CommitmentTreeSizes, PreparedCanonicalBlock, RawBlobPolicy, finalize_canonical_block,
-    prepare_canonical_block_with_raw_blob_policy,
+    CommitmentTreeSizes, PreparedCanonicalBlock, RawBlobPolicy, position_canonical_block,
+    prepare_canonical_block,
 };
 use crate::chain_ingest::{
-    CanonicalBatch, IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
-    current_unix_millis, fetch_block_with_retry, next_chain_epoch_id_after,
-    next_chain_epoch_id_from, observe_final_note_commitment_roots, populate_subtree_root_artifacts,
-    record_commit_outcome, record_ingest_block_prepare_outcome, select_best_chain,
+    CanonicalBatch, IngestError, IngestRetryState, IngestSubtreeRootIndexes,
+    canonical_writer_store_options, commit_ingest_batch, current_unix_millis,
+    fetch_block_with_retry, next_chain_epoch_id_after, next_chain_epoch_id_from,
+    observe_final_note_commitment_roots, populate_subtree_root_artifacts, record_commit_outcome,
+    record_ingest_block_prepare_outcome, select_best_chain, validate_writer_store_contract,
 };
 use crate::mempool::MempoolReadyGate;
 use crate::phase::current_chain_height;
@@ -79,7 +80,7 @@ pub struct TipFollowConfig {
     pub phase_exit_lag_blocks: Option<u32>,
     /// Optional terminal height for bounded indexing runs.
     pub target_height: Option<BlockHeight>,
-    /// Optional raw-byte blob write policy.
+    /// Immutable raw-blob retention policy for this canonical store.
     pub raw_blob_policy: RawBlobPolicy,
     /// Node-discovered consensus upgrade activations used for transaction facts.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
@@ -105,9 +106,12 @@ where
 /// Binaries use this when they need to share the primary store handle with a
 /// process-local adapter, such as the private ingest-control endpoint.
 pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainStore, IngestError> {
-    let mut store_options = ChainStoreOptions::for_network(config.node.network);
-    store_options.reorg_window_blocks = config.reorg_window_blocks;
-    store_options.rocksdb_resource_budget = config.canonical_rocksdb_budget;
+    let store_options = canonical_writer_store_options(
+        config.node.network,
+        config.reorg_window_blocks,
+        config.canonical_rocksdb_budget,
+        config.raw_blob_policy,
+    );
     PrimaryChainStore::open(&config.storage_path, store_options).map_err(IngestError::from)
 }
 
@@ -122,6 +126,10 @@ pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainSto
 /// "ready" writer that has not yet rebuilt its in-process mempool index.
 /// Pass `None` for callers that do not run the mempool orchestrator
 /// (tests, bulk catchup).
+///
+/// The caller-owned store must use the same immutable raw-blob retention as
+/// `config.raw_blob_policy`; this boundary validates the contract before any
+/// source fetch or block preparation.
 #[allow(
     clippy::too_many_arguments,
     reason = "tip-follow's caller-owned dependencies are deliberately exposed as positional parameters; bundling them into an orchestration struct adds one indirection without changing the binding count callers must make."
@@ -139,6 +147,7 @@ where
     Source: NodeSource,
 {
     let raw_blob_policy = config.raw_blob_policy;
+    validate_writer_store_contract(&store, config.reorg_window_blocks, raw_blob_policy)?;
     let network_upgrade_activations = Arc::clone(&config.network_upgrade_activations);
     run_tip_follow_loop(
         config,
@@ -149,11 +158,7 @@ where
         chain_tip_source,
         cancel,
         move |source_block| {
-            prepare_canonical_block_with_raw_blob_policy(
-                source_block,
-                &network_upgrade_activations,
-                raw_blob_policy,
-            )
+            prepare_canonical_block(source_block, &network_upgrade_activations, raw_blob_policy)
         },
     )
     .await
@@ -883,7 +888,7 @@ where
         let facts_outcome = prepare_fn(&source_block)
             .map_err(IngestError::from)
             .and_then(|prepared| {
-                finalize_canonical_block(prepared, &mut running_tree_sizes)
+                position_canonical_block(prepared, &mut running_tree_sizes)
                     .map_err(IngestError::from)
             });
         record_ingest_block_prepare_outcome(block_prepare_started_at, &facts_outcome);
@@ -1033,6 +1038,7 @@ fn finalize_tip_if_ready(
                 safe_tip_advanced_chain_epoch,
                 Vec::<zinder_core::BlockHeaderArtifact>::new(),
                 Vec::new(),
+                Vec::new(),
             )
             .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
                 height: safe_tip_height,
@@ -1078,6 +1084,7 @@ mod tests {
         ChainTipNotification, ChainTipNotificationStream, NodeCapabilities, SourceBlockHeader,
         SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
     };
+    use zinder_store::ChainStoreOptions;
 
     use super::*;
 
@@ -1113,10 +1120,7 @@ mod tests {
         let storage_path = tempdir.path().join("tip-follow-empty-store");
         let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(3);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let mut retry_state = IngestRetryState::default();
 
         let commit_outcome = test_tip_follow_once(&config, &source, &store, &mut retry_state)
@@ -1149,7 +1153,7 @@ mod tests {
         for height in 1..=3 {
             let source_block = source.fetch_block_at(BlockHeight::new(height)).await?;
             let prepared = test_prepare_canonical_block(&source_block)?;
-            batch.absorb(finalize_canonical_block(prepared, &mut running_tree_sizes)?)?;
+            batch.absorb(position_canonical_block(prepared, &mut running_tree_sizes)?)?;
         }
 
         populate_tip_follow_tree_state_artifacts(&config, &source, &mut batch).await;
@@ -1172,10 +1176,7 @@ mod tests {
         let storage_path = tempdir.path().join("tip-follow-unchanged-store");
         let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(1);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let mut retry_state = IngestRetryState::default();
         let _commit_outcome =
             test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
@@ -1194,10 +1195,7 @@ mod tests {
         let mut config = test_tip_follow_config(&storage_path, 10);
         config.poll_interval = Duration::from_millis(1);
         let source = TestNodeSource::linear(2);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let mut retry_state = IngestRetryState::default();
         let _first = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
 
@@ -1224,10 +1222,7 @@ mod tests {
         let storage_path = tempdir.path().join("tip-follow-reorg-store");
         let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(2);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let mut retry_state = IngestRetryState::default();
         let _first = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
         let _second = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
@@ -1258,10 +1253,7 @@ mod tests {
         let storage_path = tempdir.path().join("tip-follow-rewind-store");
         let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(2);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let mut retry_state = IngestRetryState::default();
         let _first = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
         let _second = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
@@ -1312,10 +1304,7 @@ mod tests {
         let storage_path = tempdir.path().join("tip-follow-tip-id-recovery-store");
         let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(1).with_retryable_tip_failures(10);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let readiness = Readiness::default();
         let cancel = CancellationToken::new();
         let task = {
@@ -1355,10 +1344,7 @@ mod tests {
         let storage_path = tempdir.path().join("tip-follow-block-fetch-recovery-store");
         let config = test_tip_follow_config(&storage_path, 10);
         let source = TestNodeSource::linear(1).with_retryable_block_failures(10);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let readiness = Readiness::default();
         let cancel = CancellationToken::new();
         let task = {
@@ -1428,10 +1414,7 @@ mod tests {
         let mut config = test_tip_follow_config(&storage_path, 10);
         config.lag_threshold_blocks = 1;
         let source = TestNodeSource::linear(2);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let mut retry_state = IngestRetryState::default();
         let _first = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
         let _second = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
@@ -1453,10 +1436,7 @@ mod tests {
         let mut config = test_tip_follow_config(&storage_path, 10);
         config.lag_threshold_blocks = 1;
         let source = TestNodeSource::linear(10);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let mut retry_state = IngestRetryState::default();
         let _first = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
 
@@ -1482,10 +1462,7 @@ mod tests {
         let mut config = test_tip_follow_config(&storage_path, 10);
         config.lag_threshold_blocks = 1;
         let source = TestNodeSource::linear(2);
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = open_test_tip_follow_store(&storage_path)?;
         let mut retry_state = IngestRetryState::default();
         let _first = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
         let _second = test_tip_follow_once(&config, &source, &store, &mut retry_state).await?;
@@ -1527,6 +1504,12 @@ mod tests {
         }
     }
 
+    fn open_test_tip_follow_store(storage_path: &Path) -> Result<PrimaryChainStore, IngestError> {
+        let mut store_options = ChainStoreOptions::for_network(Network::ZcashRegtest);
+        store_options.raw_blob_retention = RawBlobPolicy::All.to_retention();
+        PrimaryChainStore::open(storage_path, store_options).map_err(IngestError::from)
+    }
+
     async fn test_tip_follow_once(
         config: &TipFollowConfig,
         source: &TestNodeSource,
@@ -1558,23 +1541,41 @@ mod tests {
     fn test_prepare_canonical_block(
         source_block: &SourceBlock,
     ) -> Result<PreparedCanonicalBlock, crate::CanonicalBlockConstructionError> {
+        let block_header = zinder_core::BlockHeaderArtifact::new(
+            source_block.height,
+            source_block.hash,
+            source_block.parent_hash,
+            [0; 32],
+            [0; 32],
+            i64::from(source_block.block_time_seconds),
+            0,
+            [0; 32],
+            0,
+            u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+        );
+        let facts = zinder_core::CanonicalBlockFacts {
+            block_header: block_header.clone(),
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
+                &source_block.raw_block_bytes,
+            ),
+            transactions: Vec::new(),
+        };
         Ok(PreparedCanonicalBlock {
-            facts: zinder_core::CanonicalBlockFacts {
-                block_header: zinder_core::BlockHeaderArtifact::new(
-                    source_block.height,
-                    source_block.hash,
-                    source_block.parent_hash,
-                    [0; 32],
-                    [0; 32],
-                    i64::from(source_block.block_time_seconds),
-                    0,
-                    [0; 32],
-                    0,
-                    u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
-                ),
-                raw_block_bytes: Some(source_block.raw_block_bytes.clone()),
-                transactions: Vec::new(),
+            replay_envelope: zinder_core::encode_canonical_block_replay(
+                &facts,
+                zinder_core::CanonicalBlockReplayFormatVersion::CURRENT,
+                zinder_core::CanonicalBlockFactsDigestVersion::CURRENT,
+            ),
+            retained_raw_blobs: crate::RetainedRawBlobs {
+                block_blob: Some(zinder_core::BlockBlobArtifact::new(
+                    block_header.height,
+                    block_header.block_hash,
+                    block_header.parent_hash,
+                    source_block.raw_block_bytes.clone(),
+                )),
+                transaction_blobs: Vec::new(),
             },
+            facts,
             partial_compact_block: LightwalletdCompactBlock {
                 height: u64::from(source_block.height.value()),
                 hash: zinder_core::wire::encode_internal_block_hash(source_block.hash).to_vec(),

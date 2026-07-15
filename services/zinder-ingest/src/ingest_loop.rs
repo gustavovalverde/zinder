@@ -42,6 +42,7 @@ use crate::bulk_catchup::{
     BulkCatchupFlushState, BulkCatchupRunContext, flush_pending_bulk_catchup_writes,
     run_bulk_catchup_until_complete_with_flush_state,
 };
+use crate::chain_ingest::validate_writer_store_contract;
 use crate::memory_pressure::wait_for_bulk_catchup_memory_headroom;
 use crate::{
     BulkCatchupRunConfig, CommitmentRootBackfillConfig, IngestError, MempoolReadyGate,
@@ -171,6 +172,19 @@ pub struct IngestLoopConfig {
     pub modifiers: IngestModifiers,
 }
 
+impl IngestLoopConfig {
+    /// Returns the canonical writer options shared by run, probe, and both ingest phases.
+    #[must_use]
+    pub fn canonical_store_options(&self) -> zinder_store::ChainStoreOptions {
+        crate::chain_ingest::canonical_writer_store_options(
+            self.node.network,
+            self.reorg_window_blocks,
+            self.canonical_rocksdb_budget,
+            self.raw_blob_policy,
+        )
+    }
+}
+
 /// Resolved `[ingest.phases]` configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhasesConfig {
@@ -265,9 +279,9 @@ pub struct BulkCatchupConfig {
     pub source_fetch_max_in_flight_bytes: NonZeroU64,
     /// Parallel canonical block-prepare slots.
     pub block_prepare_concurrency: NonZeroU32,
-    /// Maximum reserved prepared block bytes across active and completed
-    /// canonical block prepares.
-    pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
+    /// Admission watermark for active prepare peak estimates and completed
+    /// resident block data.
+    pub block_prepare_memory_watermark_bytes: NonZeroU64,
     /// Maximum safe-tip artifact bytes allowed to queue while the previous
     /// canonical batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
@@ -399,6 +413,10 @@ pub(crate) async fn wait_until_historical_work_or_cancelled(
 /// workers, and any chain-tip notification subscription. The launcher
 /// runs at most once; subsequent re-entries reuse the handles it
 /// returned.
+///
+/// The caller-owned store must use `config.reorg_window_blocks` and
+/// `config.raw_blob_policy`; the loop validates both before observing the
+/// upstream tip or launching any phase work.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -416,6 +434,7 @@ pub async fn run_ingest_loop<Source>(
 where
     Source: NodeSource + Clone,
 {
+    validate_writer_store_contract(&store, config.reorg_window_blocks, config.raw_blob_policy)?;
     let mut tip_subsystems: Option<TipFollowSubsystems> = None;
     let mut bulk_flush_state = BulkCatchupFlushState::default();
 
@@ -640,6 +659,7 @@ fn build_bulk_catchup_batch_config(
         node_source: config.node_source,
         storage_path: config.storage_path.clone(),
         canonical_rocksdb_budget: config.canonical_rocksdb_budget,
+        reorg_window_blocks: config.reorg_window_blocks,
         raw_blob_policy: config.raw_blob_policy,
         network_upgrade_activations,
         from_height,
@@ -661,9 +681,9 @@ fn build_bulk_catchup_batch_config(
             .source_fetch_max_in_flight_requests,
         source_fetch_max_in_flight_bytes: config.bulk_catchup.source_fetch_max_in_flight_bytes,
         block_prepare_concurrency: config.bulk_catchup.block_prepare_concurrency,
-        block_prepare_max_in_flight_artifact_bytes: config
+        block_prepare_memory_watermark_bytes: config
             .bulk_catchup
-            .block_prepare_max_in_flight_artifact_bytes,
+            .block_prepare_memory_watermark_bytes,
         commit_reassembly_max_queued_artifact_bytes: config
             .bulk_catchup
             .commit_reassembly_max_queued_artifact_bytes,
@@ -794,7 +814,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 block_prepare_concurrency: NonZeroU32::new(4)
                     .ok_or("invalid block prepare slots")?,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                     .ok_or("invalid commit reassembly bytes")?,
@@ -858,6 +878,37 @@ mod tests {
         cancel.cancel();
 
         assert!(wait_until_historical_work_or_cancelled(&gate, &cancel).await);
+    }
+
+    #[test]
+    fn writer_contract_propagates_to_store_and_both_ingest_phases() -> Result<(), &'static str> {
+        let mut config = sample_loop_config(IngestModifiers::default())?;
+        config.reorg_window_blocks = 37;
+        config.raw_blob_policy = RawBlobPolicy::All;
+
+        let store_options = config.canonical_store_options();
+        assert_eq!(store_options.reorg_window_blocks, 37);
+        assert_eq!(
+            store_options.raw_blob_retention,
+            zinder_store::RawBlobRetention::All
+        );
+        assert_eq!(
+            store_options.rocksdb_resource_budget,
+            config.canonical_rocksdb_budget
+        );
+
+        let activations = Arc::new(zinder_testkit::sample_regtest_upgrade_activations());
+        let bulk_config = build_bulk_catchup_batch_config(
+            &config,
+            Arc::clone(&activations),
+            0,
+            10,
+            BlockHeight::new(100),
+        );
+        let tip_config = build_tip_follow_config(&config, activations);
+        assert_eq!(bulk_config.reorg_window_blocks, 37);
+        assert_eq!(tip_config.reorg_window_blocks, 37);
+        Ok(())
     }
 
     #[test]

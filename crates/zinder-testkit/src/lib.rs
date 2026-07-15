@@ -51,7 +51,9 @@ pub mod store_fixture;
 pub mod transparent_signer;
 
 pub use chain_fixture::{
-    ChainFixture, FixtureBlock, FixtureTransactionRows, synthetic_transaction_public_facts,
+    ChainFixture, FixtureBlock, FixtureTransactionRows, build_fixture_transaction_rows,
+    encode_fixture_block_replay, encode_fixture_block_replay_with_raw_block,
+    synthetic_transaction_public_facts,
 };
 pub use derive_fixture::{
     DeriveFixtureError, open_test_derive_store_for_canonical,

@@ -619,11 +619,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Raw-byte blob write policy: `none`, `transactions`, or `all`. Defaults to \
-                      `none` for explicit coverage so fact-first indexing does not write raw block \
-                      or transaction blobs unless a deployment explicitly needs raw export. \
+        description: "Immutable raw-blob retention contract: `none`, `transactions`, or `all`. \
+                      Defaults to `none` for explicit coverage so fact-first indexing does not write \
+                      raw block or transaction blobs unless a deployment explicitly needs raw export. \
                       Wallet-serving coverage defaults to `transactions` and rejects `none`, because \
-                      lightwalletd transaction and transparent-history methods require retained bytes.",
+                      lightwalletd transaction and transparent-history methods require retained bytes. \
+                      The first canonical commit fixes historical coverage; changing a non-empty store \
+                      requires a rebuild.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__PROJECTION_PRESET",
@@ -740,13 +742,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `min(available_parallelism(), 16)`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES",
-        toml_path: "ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes",
+        name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES",
+        toml_path: "ingest.bulk_catchup.block_prepare_memory_watermark_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum reserved derived artifact bytes across active and completed \
-                      block-prepare work. Defaults to 536870912.",
+        description: "Admission watermark over conservative prepare peaks, ordered prevout \
+                      resolution, recent-output cache entries, and resident commit-preparation \
+                      handoff data. One oversized block or a larger measured result may exceed the \
+                      watermark; further prepare admission pauses until reservations fall below it. \
+                      Defaults to 536870912.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",

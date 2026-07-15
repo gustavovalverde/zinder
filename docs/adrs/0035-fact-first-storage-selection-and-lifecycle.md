@@ -49,19 +49,40 @@ Zinder implements three durable data planes:
 The canonical physical model centers on one `CanonicalBlockFacts` value per
 block with ordered transaction facts. The Rust aggregate is backend-neutral and
 does not carry a physical schema version. Its deterministic correctness oracle
-is independently versioned by `CanonicalBlockFactsDigestVersion`; version 1
-commits the header, optional raw block bytes, and ordered
-`CanonicalTransactionFacts` values with explicit tags, lengths, presence
-markers, vector boundaries, and fixed little-endian integers. Its reversible
-storage envelope is separately versioned by
-`CanonicalBlockFactsReplayFormatVersion`. A stored envelope is valid only when
+is independently versioned by `CanonicalBlockFactsDigestVersion`; version 2
+commits the header and ordered `CanonicalTransactionFacts` values with explicit
+tags, lengths, presence markers, vector boundaries, and fixed little-endian
+integers. Raw block and transaction blobs are retention-policy artifacts, so
+their bytes remain outside the aggregate, digest, and replay envelope. Typed
+SHA-256 commitments to the exact serialized block and transaction bytes remain
+inside the aggregate, allowing store admission to bind an optional retained
+blob without reparsing consensus data. Numeric digest version 1 is deliberately
+unsupported because its pre-release shape embedded retention-dependent bytes.
+The reversible storage envelope is separately versioned by
+`CanonicalBlockReplayFormatVersion`. A stored envelope is valid only when
 it decodes into the complete aggregate, has canonical bytes, and reproduces its
-independent reference digest. Separate canonical indexes exist
+independent reference digest. Replay numeric version 1 is likewise unsupported;
+version 2 is the first fact-only payload contract. Separate canonical indexes exist
 only for independently queried contracts such as chain position, transaction
 location, compact blocks, tree state, subtree roots, chain epochs, chain
 events, and mempool events. A structure-of-arrays encoding is an internal
 layout option only when a benchmark proves decoding or cache locality gains. It
 is not another public fact model.
+
+The current ingest path parses a source block's serialized header prefix first
+so bulk catchup can validate identity and parent links without deserializing
+transactions. Parallel canonical preparation then performs exactly one full
+block parse, validates the coinbase height and source identity, constructs the
+semantic facts and retained raw blobs, and encodes the replay envelope.
+The ordered positioning lane's only stateful computation folds
+commitment-tree sizes; it stamps the result, serializes the prepared compact
+block, and moves the prepared replay bytes toward atomic commit.
+
+Epoch-bound replay reads use `BlockReplayBatchRequest`. The request starts
+at one height, carries a nonzero block limit, and is rejected above 256
+blocks. A batch uses one ordered visibility-index scan followed by one
+`multi_get`; starts beyond the pinned visible tip return no rows, crossing
+batches stop at the tip, and any missing or corrupt row fails the batch.
 
 The following lifecycles remain separate deep modules:
 
@@ -72,11 +93,15 @@ The following lifecycles remain separate deep modules:
   indexes, and publishes a baseline epoch.
 - Projection construction builds an inactive read model using
   projection-owned bulk operations, validates it, catches up from its pinned
-  canonical epoch, and promotes it.
+  canonical epoch, and promotes it. Promotion requires a future durable,
+  expiring `ProjectionBuildLease` anchored to the pinned epoch and chain event;
+  event pruning must retain that anchor while the lease remains valid. The
+  current implementation has no persisted lease, renewal path, pruning floor,
+  or lease-guarded promotion.
 - Live following commits each visible canonical epoch or projection transition
   atomically under a durable writer generation.
 
-Zinder permanently supports two deployment topologies. The names describe
+Zinder retains two deployment topology contracts. The names describe
 operational shape, not quality or environment:
 
 - `rocksdb-single-host` keeps canonical, wallet, and explorer storage in RocksDB
@@ -87,12 +112,14 @@ operational shape, not quality or environment:
   query replicas, and database replicas. It may run on one host for testing,
   but its contract permits those roles to scale across hosts.
 
-Both topologies are production-supported after passing their applicable gates.
-`rocksdb-single-host` does not mean development-only, and
-`postgres-scale-out` is not a quality tier. The term `embedded` remains
-reserved for an indexer embedded in a consumer process, such as the Zaino
-integration described by the indexer-wallet boundary; a multi-service Zinder
-deployment is not an embedded indexer.
+Only `rocksdb-single-host` has a current service composition.
+`postgres-scale-out` is represented by a block-granular diagnostic driver and
+does not yet implement production schema ownership, TLS, writer fencing,
+replica reads, failover, or readiness. It becomes a supported deployment only
+after its complete lifecycle and topology-specific gates pass.
+`rocksdb-single-host` does not mean development-only, and the term `embedded`
+remains reserved for an indexer embedded in a consumer process, such as the
+Zaino integration described by the indexer-wallet boundary.
 
 The first storage implementation is a side-by-side validation, not a
 winner-takes-all backend bake-off. The candidates are:
@@ -114,11 +141,12 @@ fastest-sync sweep may compare segmented or parallel SST generation,
 PostgreSQL COPY pipelining, and resource partitions as named benchmark arms
 without changing the topology contracts or acceptance oracle.
 
-A deployment selects `rocksdb-single-host` or `postgres-scale-out` as one
-application-level contract. Per-plane mixing, such as RocksDB canonical
-storage with Postgres projections, is not a third supported topology. This
-keeps configuration, backup, recovery, readiness, and failure semantics bounded
-to two deliberate shapes.
+Once both composition roots exist, a deployment selects
+`rocksdb-single-host` or `postgres-scale-out` as one application-level
+contract. Per-plane mixing, such as RocksDB canonical storage with Postgres
+projections, will not become a third supported topology. This keeps
+configuration, backup, recovery, readiness, and failure semantics bounded to 2
+deliberate shapes.
 
 Supporting both topologies does not introduce `DatabaseAdapter`, a generic row
 transaction, or a lowest-common-denominator key-value interface. Canonical,
@@ -144,6 +172,8 @@ and durability settings are recorded with every result. At the approximately
 Chain growth does not weaken these targets silently. Benchmark reports record
 the exact source height and calculate the achieved average block rate. New
 production releases re-run the full lifecycle against the then-current tip.
+The current replay drivers do not execute this full lifecycle and therefore do
+not certify any target in this table.
 
 The restore gate uses a certified, immutable snapshot fixture for each
 candidate. Its Zinder-owned manifest records the network, backend and schema
@@ -191,6 +221,10 @@ A topology cannot be certified unless all of these pass:
 - Native API parity, the complete lightwalletd and Zallet compatibility suite,
   and the covered Zally, Zexplorer, and Cipherscan route matrices.
 
+The current diagnostic drivers satisfy only their scoped replay round trip.
+They do not provide crash-injection, snapshot-tail, projection construction,
+API-parity, or topology-certification evidence.
+
 The `postgres-scale-out` topology must additionally prove durable
 writer-generation fencing, automated failover promotion, stale-writer
 rejection, standby lag reporting, and request-scoped replica read fences. The
@@ -220,19 +254,30 @@ balance, missing row, or unqualified unavailable error.
    decode back into complete semantic facts and reproduce the fixture digest.
    The diagnostic round-trip slices now exist; they do not yet implement the
    complete canonical lifecycle or certify either topology.
-4. Validate `rocksdb-single-host` and `postgres-scale-out` independently,
+4. Persist one production RocksDB replay envelope per block in the atomic
+   canonical commit, prove append/reorg/reopen/secondary/corruption behavior,
+   and add a pure block-local `BlockSummary` projector over decoded replay. The
+   replay persistence at store schema 14 and artifact schema 19 and the pure
+   equivalence seam exist, but production `BlockSummaryConsumer` dispatch still
+   uses `BlockCommitContext`. The replay projector preserves the existing
+   schema-1 meaning of `total_size_bytes`: the complete serialized block size
+   recorded in `BlockHeaderArtifact`. Neither projector equivalence nor replay
+   persistence provides fact-first throughput evidence.
+5. Add the durable projection-build lease and anchor-aware event-pruning floor
+   before any inactive builder can be promoted.
+6. Validate `rocksdb-single-host` and `postgres-scale-out` independently,
    retain both concrete implementations, and reject per-plane backend mixing.
-5. Cut a fresh canonical schema that removes global transparent output,
+7. Cut a fresh canonical schema that removes global transparent output,
    address, spend, repair, and retention state from canonical commits.
-6. Implement the concrete wallet projection builder, ordered follower, and
+8. Implement the concrete wallet projection builder, ordered follower, and
    readiness verifier; add wallet construction and wallet-ready lifecycle
    acceptance only with that real plane.
-7. Rewire query, client, compatibility, and downstream contracts in one
+9. Rewire query, client, compatibility, and downstream contracts in one
    coordinated breaking change.
-8. Move remaining explorer consumers and backfills to explorer-owned modules.
-9. Replace configuration, readiness, metrics, snapshot operations, testkit
+10. Move remaining explorer consumers and backfills to explorer-owned modules.
+11. Replace configuration, readiness, metrics, snapshot operations, testkit
    fixtures, deployment manifests, and runbooks.
-10. Build a blue-green production stack, validate it without traffic, catch up,
+12. Build a blue-green production stack, validate it without traffic, catch up,
     switch traffic, retain the previous stack for a bounded rollback window,
     then delete the old storage paths and compatibility baggage.
 
@@ -286,9 +331,10 @@ WalletQuery and ExplorerQuery.
   reconstruction is the hours-scale disaster and verification path.
 - Initial wallet construction can use set operations instead of replaying the
   whole chain through the live row-by-row state machine.
-- Operators can run a production-supported `rocksdb-single-host` deployment
-  without Postgres or choose `postgres-scale-out` when independent workers,
-  replicas, and database operations justify the additional infrastructure.
+- Operators can run `rocksdb-single-host` without Postgres. A future certified
+  `postgres-scale-out` composition will be the option for independent workers,
+  replicas, and database operations; the present diagnostic driver is not that
+  deployment.
 - Both topologies preserve the same data-plane, readiness, and public API
   contracts; only their physical persistence and topology-specific operations
   differ.

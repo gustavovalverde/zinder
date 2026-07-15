@@ -385,10 +385,10 @@ message BlockSummary {
   // Reference: Zcash protocol spec term `\rpcByteOrder`.
   string previous_block_hash = 5;
 
-  // Sum of serialized transaction byte lengths across the block. Includes
-  // the coinbase transaction. Materialized by `BlockSummaryConsumer` at
-  // commit time so the recent-blocks listing renders block size without
-  // re-fetching every transaction.
+  // Complete serialized block byte length, including the block header,
+  // transaction-count encoding, and every transaction. Materialized by
+  // `BlockSummaryConsumer` at commit time so the recent-blocks listing
+  // renders block size without re-fetching the block.
   uint64 total_size_bytes = 6;
 
   // Sum of `zip317_conventional_fee_zat` across every non-coinbase

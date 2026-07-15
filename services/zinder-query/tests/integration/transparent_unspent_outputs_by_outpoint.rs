@@ -13,10 +13,9 @@ use zinder_core::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
-use zinder_store::ChainEpochArtifacts;
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
-use crate::common::synthetic_chain_epoch;
+use crate::common::{chain_epoch_artifacts_with_transparent_facts, synthetic_chain_epoch};
 
 /// Commits one unspent output in the first epoch and a second output that a
 /// later epoch spends.
@@ -65,15 +64,20 @@ fn commit_unspent_and_spent_outputs(
         spent_output.block_height,
         spent_output.block_hash,
     );
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_one, vec![block_one], vec![compact_one])
-            .with_transparent_outputs_by_outpoint(vec![unspent_output, spent_output]),
-    )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_two, vec![block_two], vec![compact_two])
-            .with_transparent_spend_facts(vec![spend]),
-    )?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        epoch_one,
+        vec![block_one],
+        vec![compact_one],
+        &[unspent_output, spent_output],
+        Vec::new(),
+    ))?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        epoch_two,
+        vec![block_two],
+        vec![compact_two],
+        &[],
+        vec![spend],
+    ))?;
 
     Ok((unspent_outpoint, spent_outpoint, unspent_value_zat))
 }
@@ -174,10 +178,12 @@ async fn transparent_unspent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel(
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
         chain_epoch,
         vec![block],
         vec![compact_block],
+        &[],
+        Vec::new(),
     ))?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());

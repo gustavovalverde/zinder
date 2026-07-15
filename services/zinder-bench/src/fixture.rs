@@ -28,7 +28,7 @@ use zinder_source::{
 use crate::error::BenchError;
 
 /// Version stamped into every manifest this crate writes.
-pub const FIXTURE_FORMAT_VERSION: u32 = 3;
+pub const FIXTURE_FORMAT_VERSION: u32 = 4;
 
 /// Manifest and segment file base names.
 const MANIFEST_FILE_NAME: &str = "manifest.json";
