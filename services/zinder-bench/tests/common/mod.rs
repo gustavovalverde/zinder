@@ -4,7 +4,8 @@ use tempfile::{TempDir, tempdir};
 use zinder_bench::{
     capture::measure_fixture_blocks,
     fixture::{
-        ActivationRecord, FIXTURE_FORMAT_VERSION, FixtureManifest, SubtreeRootSet, write_segment,
+        ActivationRecord, FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION, FixtureManifest,
+        SubtreeRootSet, write_segment,
     },
 };
 use zinder_core::{BlockHeight, Network, wire::encode_zinder_native_chain_name};
@@ -37,6 +38,7 @@ pub(crate) fn write_regtest_fixture() -> Result<(TempDir, SourceBlock)> {
         &sample_regtest_upgrade_activations(),
     )?;
     FixtureManifest {
+        contract_identity: FIXTURE_CONTRACT_IDENTITY.to_owned(),
         fixture_format_version: FIXTURE_FORMAT_VERSION,
         network: encode_zinder_native_chain_name(Network::ZcashRegtest).to_owned(),
         from_height: height,

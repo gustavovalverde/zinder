@@ -30,6 +30,12 @@ pub enum BenchError {
         /// Human-readable description of the mismatch.
         reason: String,
     },
+    /// A benchmark report did not match the exact serialized contract.
+    #[error("report format error: {reason}")]
+    ReportFormat {
+        /// Human-readable description of the mismatch.
+        reason: String,
+    },
     /// An upstream source call failed during capture.
     #[error("source error: {source}")]
     Source {
@@ -181,6 +187,14 @@ impl BenchError {
     #[must_use]
     pub fn fixture_format(reason: impl Into<String>) -> Self {
         Self::FixtureFormat {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a report-format error from a reason string.
+    #[must_use]
+    pub fn report_format(reason: impl Into<String>) -> Self {
+        Self::ReportFormat {
             reason: reason.into(),
         }
     }

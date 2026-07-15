@@ -10,8 +10,8 @@ use serde_json::Value;
 use tempfile::tempdir;
 use zinder_bench::capture::measure_fixture_blocks;
 use zinder_bench::fixture::{
-    ActivationRecord, FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource,
-    SegmentDescriptor, SubtreeRootSet, read_segment_blocks, write_segment,
+    ActivationRecord, FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION, FixtureManifest,
+    FixtureNodeSource, SegmentDescriptor, SubtreeRootSet, read_segment_blocks, write_segment,
 };
 use zinder_core::{BlockHeight, Network, wire::encode_zinder_native_chain_name};
 use zinder_source::{NodeSource, SourceBlock};
@@ -67,6 +67,7 @@ fn write_regtest_fixture() -> Result<RegtestFixtureCase> {
     let descriptor = write_segment(directory.path(), 0, &blocks)?;
     let measurements = measure_fixture_blocks(&blocks, &sample_regtest_upgrade_activations())?;
     let manifest = FixtureManifest {
+        contract_identity: FIXTURE_CONTRACT_IDENTITY.to_owned(),
         fixture_format_version: FIXTURE_FORMAT_VERSION,
         network: encode_zinder_native_chain_name(Network::ZcashRegtest).to_owned(),
         from_height: 603,
@@ -89,6 +90,55 @@ fn write_regtest_fixture() -> Result<RegtestFixtureCase> {
         descriptor,
         manifest,
     })
+}
+
+#[test]
+fn fixture_v1_requires_exact_contract_identity() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let mut missing_identity = serde_json::to_value(&fixture.manifest)?;
+    missing_identity
+        .as_object_mut()
+        .ok_or_else(|| eyre!("fixture manifest must encode as an object"))?
+        .remove("contract_identity");
+    std::fs::write(
+        fixture.directory.path().join("manifest.json"),
+        serde_json::to_vec_pretty(&missing_identity)?,
+    )?;
+    let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
+        return Err(eyre!("fixture v1 contract identity must be mandatory"));
+    };
+    assert!(error.to_string().contains("contract_identity"));
+
+    let mut old_identity = fixture.manifest;
+    old_identity.contract_identity = "zinder-bench-fixture-manifest".to_owned();
+    std::fs::write(
+        fixture.directory.path().join("manifest.json"),
+        serde_json::to_vec_pretty(&old_identity)?,
+    )?;
+    let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
+        return Err(eyre!("fixture v1 must reject an earlier contract identity"));
+    };
+    assert!(error.to_string().contains("fixture contract identity"));
+    Ok(())
+}
+
+#[test]
+fn fixture_v1_rejects_unknown_manifest_fields() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let mut unknown_field = serde_json::to_value(&fixture.manifest)?;
+    unknown_field
+        .as_object_mut()
+        .ok_or_else(|| eyre!("fixture manifest must encode as an object"))?
+        .insert("legacy_schema_version".to_owned(), serde_json::json!(14));
+    std::fs::write(
+        fixture.directory.path().join("manifest.json"),
+        serde_json::to_vec_pretty(&unknown_field)?,
+    )?;
+    let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
+        return Err(eyre!("fixture v1 must reject unknown manifest fields"));
+    };
+    assert!(error.to_string().contains("unknown field"));
+    Ok(())
 }
 
 #[test]

@@ -10,13 +10,18 @@ use zinder_store::RocksDbResourceBudget;
 use crate::{
     canonical_fact_round_trip::postgres::PostgresCanonicalFactServerSettings,
     error::BenchError,
-    fixture::{CanonicalBlockFactsDigestEvidence, FixtureManifest, WorkloadDensity},
+    fixture::{
+        CanonicalBlockFactsDigestEvidence, FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION,
+        FixtureManifest, WorkloadDensity,
+    },
     metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name},
     rss::PeakRss,
 };
 
 /// Machine-readable report schema version.
 pub const REPORT_FORMAT_VERSION: u32 = 1;
+/// Stable identity stamped into every benchmark report.
+pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 
 /// Returns whether a container image identity is content addressed.
 #[must_use]
@@ -68,6 +73,8 @@ const CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM: &str =
 /// Fixture identity echoed into the report.
 #[derive(Clone, Debug, Serialize)]
 pub struct FixtureSummary {
+    /// Stable fixture contract identity.
+    pub contract_identity: String,
     /// Fixture manifest format version.
     pub fixture_format_version: u32,
     /// Current-schema oracle artifact version used when capturing the fixture.
@@ -97,6 +104,7 @@ impl TryFrom<&FixtureManifest> for FixtureSummary {
 
     fn try_from(manifest: &FixtureManifest) -> Result<Self, Self::Error> {
         Ok(Self {
+            contract_identity: manifest.contract_identity.clone(),
             fixture_format_version: manifest.fixture_format_version,
             current_schema_oracle_artifact_schema_version: manifest
                 .current_schema_oracle_artifact_schema_version,
@@ -799,6 +807,8 @@ pub struct CanonicalBlockFactsRoundTripSummary {
 /// Full report for one canonical-block-facts persisted round trip.
 #[derive(Clone, Debug, Serialize)]
 pub struct CanonicalBlockFactsRoundTripReport {
+    /// Stable report contract identity.
+    pub contract_identity: String,
     /// Machine-readable report schema version.
     pub report_format_version: u32,
     /// Build and source provenance.
@@ -814,6 +824,8 @@ pub struct CanonicalBlockFactsRoundTripReport {
 /// Current-schema fixture replay report.
 #[derive(Clone, Debug, Serialize)]
 pub struct CurrentSchemaFixtureReplayReport {
+    /// Stable report contract identity.
+    pub contract_identity: String,
     /// Machine-readable report schema version.
     pub report_format_version: u32,
     /// Build and source provenance.
@@ -867,6 +879,7 @@ impl From<CanonicalBlockFactsRoundTripReport> for BenchmarkReport {
 impl BenchmarkReport {
     /// Validates the evidence boundary owned by the selected measurement.
     pub fn validate(&self) -> Result<(), BenchError> {
+        self.validate_contract_identity()?;
         match self {
             Self::CurrentSchemaFixtureReplay(report) => report.validate_acceptance(),
             Self::CanonicalBlockFactsRoundTrip(report) => {
@@ -903,6 +916,44 @@ impl BenchmarkReport {
                 Ok(())
             }
         }
+    }
+
+    fn validate_contract_identity(&self) -> Result<(), BenchError> {
+        let (contract_identity, report_format_version, fixture) = match self {
+            Self::CurrentSchemaFixtureReplay(report) => (
+                report.contract_identity.as_str(),
+                report.report_format_version,
+                &report.fixture,
+            ),
+            Self::CanonicalBlockFactsRoundTrip(report) => (
+                report.contract_identity.as_str(),
+                report.report_format_version,
+                &report.fixture,
+            ),
+        };
+        if contract_identity != REPORT_CONTRACT_IDENTITY {
+            return Err(BenchError::report_format(format!(
+                "report contract identity {contract_identity:?} does not match {REPORT_CONTRACT_IDENTITY:?}"
+            )));
+        }
+        if report_format_version != REPORT_FORMAT_VERSION {
+            return Err(BenchError::report_format(format!(
+                "report format version {report_format_version} does not match {REPORT_FORMAT_VERSION}"
+            )));
+        }
+        if fixture.contract_identity != FIXTURE_CONTRACT_IDENTITY {
+            return Err(BenchError::report_format(format!(
+                "fixture contract identity {:?} does not match {FIXTURE_CONTRACT_IDENTITY:?}",
+                fixture.contract_identity
+            )));
+        }
+        if fixture.fixture_format_version != FIXTURE_FORMAT_VERSION {
+            return Err(BenchError::report_format(format!(
+                "fixture format version {} does not match {FIXTURE_FORMAT_VERSION}",
+                fixture.fixture_format_version
+            )));
+        }
+        Ok(())
     }
 
     /// Validates telemetry coverage and the configured hard acceptance limit.
@@ -997,6 +1048,7 @@ pub fn build_current_schema_fixture_replay_report(
     let rocksdb_tickers = aggregate_tickers(&samples);
     let replay = build_replay_summary(measurements, &samples, &store_reads, &rocksdb_tickers);
     CurrentSchemaFixtureReplayReport {
+        contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
         report_format_version: REPORT_FORMAT_VERSION,
         provenance: ReportProvenance {
             benchmark_version: env!("CARGO_PKG_VERSION"),
@@ -1124,6 +1176,7 @@ pub fn build_canonical_block_facts_round_trip_report(
         benchmark_client_peak_rss: measurements.benchmark_client_peak_rss,
     };
     CanonicalBlockFactsRoundTripReport {
+        contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
         report_format_version: REPORT_FORMAT_VERSION,
         provenance,
         fixture,
@@ -1494,6 +1547,7 @@ mod tests {
             build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
 
         assert_eq!(report.report_format_version, 1);
+        assert_eq!(report.contract_identity, super::REPORT_CONTRACT_IDENTITY);
         assert_provenance_and_writer(&report);
         assert_eq!(report.provenance.run.trial_id.as_deref(), Some("trial-01"));
         assert!(matches!(
@@ -1503,6 +1557,10 @@ mod tests {
         assert_eq!(report.provenance.run.started_at_unix_millis, 1_000);
         assert_eq!(report.provenance.run.completed_at_unix_millis, 14_000);
         assert_eq!(report.fixture.fixture_format_version, 1);
+        assert_eq!(
+            report.fixture.contract_identity,
+            crate::fixture::FIXTURE_CONTRACT_IDENTITY
+        );
         assert_eq!(
             report.fixture.current_schema_oracle_artifact_schema_version,
             18
@@ -1569,6 +1627,8 @@ mod tests {
         let encoded = serde_json::to_value(super::BenchmarkReport::from(report))?;
 
         assert_eq!(encoded["measurement_kind"], "current-schema-fixture-replay");
+        assert_eq!(encoded["contract_identity"], "benchmark-report");
+        assert_eq!(encoded["fixture"]["contract_identity"], "canonical-fixture");
         Ok(())
     }
 
@@ -1780,6 +1840,8 @@ mod tests {
         let json = serde_json::to_value(&report)?;
 
         assert_eq!(json["measurement_kind"], "canonical-block-facts-round-trip");
+        assert_eq!(json["contract_identity"], "benchmark-report");
+        assert_eq!(json["fixture"]["contract_identity"], "canonical-fixture");
         assert_eq!(json["storage_candidate"]["id"], "rocksdb-fact-first");
         assert_eq!(json["round_trip"]["replay_format_version"], 1);
         assert_eq!(json["round_trip"]["semantic_replay_validated"], true);
@@ -1793,6 +1855,29 @@ mod tests {
         }
         assert!(report.validate().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn report_v1_rejects_old_contract_identities() {
+        let mut report = super::BenchmarkReport::from(build_current_schema_fixture_replay_report(
+            fixture_summary(),
+            &canonical_measurements(),
+            None,
+        ));
+        if let super::BenchmarkReport::CurrentSchemaFixtureReplay(report) = &mut report {
+            report.contract_identity = "zinder-benchmark-report".to_owned();
+        }
+        assert!(report.validate().is_err());
+
+        let mut report = super::BenchmarkReport::from(build_current_schema_fixture_replay_report(
+            fixture_summary(),
+            &canonical_measurements(),
+            None,
+        ));
+        if let super::BenchmarkReport::CurrentSchemaFixtureReplay(report) = &mut report {
+            report.fixture.contract_identity = "zinder-bench-fixture-manifest".to_owned();
+        }
+        assert!(report.validate().is_err());
     }
 
     #[test]
@@ -1814,6 +1899,7 @@ mod tests {
 
     fn fixture_summary() -> FixtureSummary {
         FixtureSummary {
+            contract_identity: crate::fixture::FIXTURE_CONTRACT_IDENTITY.to_owned(),
             fixture_format_version: 1,
             current_schema_oracle_artifact_schema_version: 18,
             canonical_block_facts_digest_evidence:

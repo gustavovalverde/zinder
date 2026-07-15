@@ -94,7 +94,8 @@ validate_report() {
       type == "string"
       and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
       and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
-    .report_format_version == 1
+    .contract_identity == "benchmark-report"
+    and .report_format_version == 1
     and .measurement_kind == "canonical-block-facts-round-trip"
     and .storage_candidate.id == $candidate
     and .storage_candidate.canonical_engine == $engine
@@ -105,6 +106,7 @@ validate_report() {
     and .round_trip.fixture_sequence_digest_match == true
     and .round_trip.replay_format_version == 1
     and .round_trip.semantic_replay_validated == true
+    and .fixture.contract_identity == "canonical-fixture"
     and .fixture.fixture_format_version == 1
     and (.fixture.current_schema_oracle_artifact_schema_version > 0)
     and (.fixture.digest_sha256 | lowercase_sha256)

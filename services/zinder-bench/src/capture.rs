@@ -23,9 +23,9 @@ use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
 use crate::{
     error::BenchError,
     fixture::{
-        ActivationRecord, CanonicalBlockFactsDigestEvidence, FIXTURE_FORMAT_VERSION,
-        FixtureManifest, SegmentDescriptor, SubtreeRootRecord, SubtreeRootSet, WorkloadDensity,
-        write_segment,
+        ActivationRecord, CanonicalBlockFactsDigestEvidence, FIXTURE_CONTRACT_IDENTITY,
+        FIXTURE_FORMAT_VERSION, FixtureManifest, SegmentDescriptor, SubtreeRootRecord,
+        SubtreeRootSet, WorkloadDensity, write_segment,
     },
 };
 
@@ -113,6 +113,7 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
         .saturating_sub(config.from_height.value())
         .saturating_add(1);
     let manifest = FixtureManifest {
+        contract_identity: FIXTURE_CONTRACT_IDENTITY.to_owned(),
         fixture_format_version: FIXTURE_FORMAT_VERSION,
         network: encode_zinder_native_chain_name(config.network).to_owned(),
         from_height: config.from_height.value(),

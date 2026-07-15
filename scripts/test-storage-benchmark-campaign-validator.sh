@@ -86,6 +86,7 @@ write_report() {
     };
     ($candidate == "rocksdb-fact-first") as $is_rocksdb
     | {
+        contract_identity: "benchmark-report",
         report_format_version: 1,
         measurement_kind: "canonical-block-facts-round-trip",
         provenance: {
@@ -108,6 +109,7 @@ write_report() {
           target_arch: "x86_64"
         },
         fixture: {
+          contract_identity: "canonical-fixture",
           fixture_format_version: 1,
           current_schema_oracle_artifact_schema_version: 18,
           canonical_block_facts_digest_evidence: {
@@ -483,6 +485,34 @@ wrong_version_campaign="$scratch_directory/wrong-version"
 cp -R "$valid_campaign" "$wrong_version_campaign"
 mutate_report "$wrong_version_campaign/rocksdb-fact-first-trial-02.json" '.report_format_version = 4'
 expect_failure "wrong report version" "$wrong_version_campaign"
+
+missing_report_identity_campaign="$scratch_directory/missing-report-identity"
+cp -R "$valid_campaign" "$missing_report_identity_campaign"
+mutate_report \
+  "$missing_report_identity_campaign/rocksdb-fact-first-trial-02.json" \
+  'del(.contract_identity)'
+expect_failure "missing report contract identity" "$missing_report_identity_campaign"
+
+old_report_identity_campaign="$scratch_directory/old-report-identity"
+cp -R "$valid_campaign" "$old_report_identity_campaign"
+mutate_report \
+  "$old_report_identity_campaign/postgres-fact-first-trial-02.json" \
+  '.contract_identity = "zinder-benchmark-report"'
+expect_failure "old report contract identity" "$old_report_identity_campaign"
+
+missing_fixture_identity_campaign="$scratch_directory/missing-fixture-identity"
+cp -R "$valid_campaign" "$missing_fixture_identity_campaign"
+mutate_report \
+  "$missing_fixture_identity_campaign/rocksdb-fact-first-trial-03.json" \
+  'del(.fixture.contract_identity)'
+expect_failure "missing fixture contract identity" "$missing_fixture_identity_campaign"
+
+old_fixture_identity_campaign="$scratch_directory/old-fixture-identity"
+cp -R "$valid_campaign" "$old_fixture_identity_campaign"
+mutate_report \
+  "$old_fixture_identity_campaign/postgres-fact-first-trial-03.json" \
+  '.fixture.contract_identity = "zinder-bench-fixture-manifest"'
+expect_failure "old fixture contract identity" "$old_fixture_identity_campaign"
 
 wrong_rocksdb_schema_campaign="$scratch_directory/wrong-rocksdb-schema"
 cp -R "$valid_campaign" "$wrong_rocksdb_schema_campaign"

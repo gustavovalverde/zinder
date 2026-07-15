@@ -29,6 +29,8 @@ use crate::error::BenchError;
 
 /// Version stamped into every manifest this crate writes.
 pub const FIXTURE_FORMAT_VERSION: u32 = 1;
+/// Stable identity stamped into every canonical fixture manifest.
+pub const FIXTURE_CONTRACT_IDENTITY: &str = "canonical-fixture";
 
 /// Manifest and segment file base names.
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -37,6 +39,7 @@ const RECORD_HEADER_LEN: u64 = 8;
 
 /// One consensus upgrade activation captured with the fixture.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActivationRecord {
     /// Consensus branch identifier as advertised by the node.
     pub branch_id: u32,
@@ -48,6 +51,7 @@ pub struct ActivationRecord {
 
 /// One captured shielded subtree root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubtreeRootRecord {
     /// Subtree index within its protocol.
     pub index: u32,
@@ -59,6 +63,7 @@ pub struct SubtreeRootRecord {
 
 /// Captured subtree roots grouped by shielded protocol.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubtreeRootSet {
     /// Sapling subtree roots, ordered by index.
     pub sapling: Vec<SubtreeRootRecord>,
@@ -70,6 +75,7 @@ pub struct SubtreeRootSet {
 
 /// One captured segment of contiguous raw blocks.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SegmentDescriptor {
     /// Zero-based segment index.
     pub index: u32,
@@ -91,6 +97,7 @@ pub struct SegmentDescriptor {
 /// identify the first divergence. The fixture manifest keeps only the ordered
 /// sequence evidence, which stays constant-size even for a full-chain corpus.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalBlockFactsDigestEvidence {
     /// Version used for every block digest folded into the sequence.
     pub block_digest_version: u16,
@@ -107,6 +114,7 @@ pub struct CanonicalBlockFactsDigestEvidence {
 /// Totals show the amount of work in the fixture, while per-block maxima and
 /// populated-block counts make burst-dominated ranges visible.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadDensity {
     /// Number of measured blocks.
     pub block_count: u32,
@@ -169,7 +177,10 @@ impl WorkloadDensity {
 
 /// The full fixed-range fixture manifest.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FixtureManifest {
+    /// Stable contract identity that disambiguates this version from earlier formats.
+    pub contract_identity: String,
     /// Fixture format version stamped by the writer.
     pub fixture_format_version: u32,
     /// Network name in Zinder-native encoding.
@@ -241,6 +252,12 @@ impl FixtureManifest {
     }
 
     fn validate_structure(&self) -> Result<(), BenchError> {
+        if self.contract_identity != FIXTURE_CONTRACT_IDENTITY {
+            return Err(BenchError::fixture_format(format!(
+                "fixture contract identity {:?} does not match {FIXTURE_CONTRACT_IDENTITY:?}",
+                self.contract_identity
+            )));
+        }
         if self.fixture_format_version != FIXTURE_FORMAT_VERSION {
             return Err(BenchError::fixture_format(format!(
                 "fixture format version {} does not match {FIXTURE_FORMAT_VERSION}",

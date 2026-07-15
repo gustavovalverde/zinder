@@ -266,6 +266,8 @@ component diagnostics in the external resource artifacts.
 
 ## Report fields
 
+- `contract_identity`: exact benchmark report contract identity. Version 1 is
+  `benchmark-report`; missing or earlier identities are rejected.
 - `report_format_version`: machine-readable report contract version. The
   closed measurement contract described here is version 1.
 - `measurement_kind`: either `current-schema-fixture-replay` or
@@ -283,12 +285,13 @@ component diagnostics in the external resource artifacts.
 - `acceptance.canonical_fixture_replay`: `fixture-range` wall time and optional
   target/hard-limit evaluation. It is the only current acceptance boundary.
   There are no placeholder production lifecycle fields.
-- `fixture.fixture_format_version`,
+- `fixture.contract_identity`, `fixture.fixture_format_version`,
   `fixture.current_schema_oracle_artifact_schema_version`,
   `fixture.canonical_block_facts_digest_evidence`, `fixture.tip_hash_hex`, and
   `fixture.digest_sha256`: fixture provenance required to compare candidates
   against identical source bytes and digest contracts. Each driver verifies
-  every segment SHA-256 before writing its rows.
+  every segment SHA-256 before writing its rows. Version 1 requires the exact
+  fixture identity `canonical-fixture`; numeric version 1 alone is not enough.
 - `fixture.workload_density`: the immutable workload totals and per-block
   maxima copied from the captured fixture manifest.
 - `replay.wall_clock_seconds`, `replay.blocks_committed`,
