@@ -135,7 +135,7 @@ jobs:
           ZINDER_INGEST_IMAGE: zinder-ingest:ci-proof
           ZINDER_QUERY_IMAGE: zinder-query:ci-proof
           ZINDER_EXPLORER_IMAGE: zinder-explorer:ci-proof
-          ZINDER_CANONICAL_VOLUME_NAME: zinder-ci-proof-canonical
+          ZINDER_SINGLE_HOST_DATA_VOLUME_NAME: zinder-ci-proof-data
           ZINDER_PROMETHEUS_VOLUME_NAME: zinder-ci-proof-prometheus
           ZINDER_GRAFANA_VOLUME_NAME: zinder-ci-proof-grafana
           ZINDER_OBSERVABILITY_NETWORK_NAME: zinder-ci-proof-observability
@@ -152,7 +152,7 @@ jobs:
               and .services["zinder-ingest"].image == "zinder-ingest:ci-proof"
               and .services["zinder-query"].image == "zinder-query:ci-proof"
               and .services["zinder-explorer"].image == "zinder-explorer:ci-proof"
-              and .volumes.data.name == "zinder-ci-proof-canonical"
+              and .volumes.data.name == "zinder-ci-proof-data"
               and .volumes.prometheus.name == "zinder-ci-proof-prometheus"
               and .volumes.grafana.name == "zinder-ci-proof-grafana"
               and .networks.observability.name == "zinder-ci-proof-observability"

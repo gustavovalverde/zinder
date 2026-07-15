@@ -42,7 +42,7 @@ name: zinder-${Z3_NETWORK_LOWER:-mainnet}
 #
 # Reproducible canary or validation runs may pin ZINDER_INGEST_IMAGE,
 # ZINDER_QUERY_IMAGE, and ZINDER_EXPLORER_IMAGE to immutable current-branch
-# tags. They may also isolate state with ZINDER_CANONICAL_VOLUME_NAME,
+# tags. They may also isolate state with ZINDER_SINGLE_HOST_DATA_VOLUME_NAME,
 # ZINDER_PROMETHEUS_VOLUME_NAME, ZINDER_GRAFANA_VOLUME_NAME, and
 # ZINDER_OBSERVABILITY_NETWORK_NAME. Normal deployments omit these overrides
 # and retain the stable per-network names below.
@@ -231,7 +231,7 @@ services:
 
 volumes:
   data:
-    name: ${ZINDER_CANONICAL_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-data}
+    name: ${ZINDER_SINGLE_HOST_DATA_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-data}
   prometheus:
     name: ${ZINDER_PROMETHEUS_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-prometheus}
   grafana:
