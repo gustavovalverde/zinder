@@ -40,9 +40,8 @@ fact-first runtime or the `postgres-scale-out` composition.
 | Full replay/header verifier | Landed and live-tested | All 4.17 million pinned testnet rows passed replay, header, and continuity checks |
 | PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
 | Clean physical schema identities | Landed | Canonical, wallet, and explorer contracts use identity-scoped version 1 and refuse prior layouts without migration or adoption |
-| Fresh RocksDB canonical builder | Landed and live-tested | A new `BUILDING` path fixes its workload, source range, checkpoint tree position, and build tip before bounded replay ingestion |
-| Replay-only Zebra tracer | Landed and live-tested | An isolated release container loaded and cache-bypass validated 1,000 fixed testnet blocks in 193 to 458 ms; this proves replay construction, not canonical or wallet readiness |
-| One-pass wallet canonical family load | In implementation | One parse must fan into header, hash index, replay, transaction location, compact block, and transaction blobs before tree construction publishes `READY` |
+| Fresh RocksDB canonical builder | Landed and live-tested | A new `BUILDING` path fixes its workload, source range, checkpoint tree position, and build tip before bounded all-family ingestion |
+| One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
 | Independent wallet projector and store | Not implemented | Current `zinder-ingest` still owns legacy projection replay |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
 | Complete lifecycle certification | Not run | Fresh mainnet canonical, wallet construction, restore, reorg, and client parity gates remain open |
@@ -225,15 +224,44 @@ the retained chain, seeds compact-block positioning without reprocessing prior
 history, and prevents source exhaustion from turning a contiguous prefix into
 an apparently complete build.
 
-Canonical replay construction accepts a fallible ordered source stream. It
-validates the first block before opening staging, rotates bounded sorted SST
-files, and passes every file to one atomic RocksDB ingestion call. A complete
-cache-bypassing readback then decodes the persisted rows, validates version-1
-replay and digest contracts, height keys, parent linkage, the fixed tip, and the
-ordered sequence digest. SST paths and family-local evidence remain private.
-Any source error, leftover staging directory, populated BUILDING family, or
-post-ingestion mismatch requires deletion of the incomplete build; version 1
-does not define resume, adoption, or repair semantics.
+Canonical block construction accepts a fallible ordered source stream. It
+validates each prepared block while fanning its owned values into the
+workload's direct and reverse-index families. Height- and position-ordered
+families rotate bounded SST files directly; the two random-key indexes use
+bounded fixed-record sort runs with a capped merge fan-in, so raw transaction
+and block payloads never enter the sort. Every family is staged before RocksDB
+ingestion begins, and the store remains `BUILDING` throughout, so a partial
+ingestion is never servable.
+
+Before returning the builder, one cache-bypassing replay pass decodes every
+persisted semantic row and validates version-1 replay and digest contracts,
+height keys, parent linkage, the fixed tip, and the ordered sequence digest.
+Prepared per-family counts and byte evidence are matched to persisted SST
+metadata and sampled cross-family identities before `READY`; exhaustive raw
+payload scrubbing is a separate background integrity operation rather than a
+second sync-time scan. Any source error, leftover staging directory, populated
+`BUILDING` family, or post-ingestion mismatch requires deletion of the
+incomplete build. Version 1 does not define resume, adoption, repair, or a
+replay-only construction route.
+
+The release-mode Docker tracer measured the same Wallet construction path
+against a local Zebra testnet node on 2026-07-15. The elapsed load includes SST
+construction, ingestion, and the full cache-bypassing replay proof; the total
+test also includes the independent acceptance readback. These checkpointed
+ranges establish the fast construction shape but do not predict a full mainnet
+build across older, denser eras.
+
+| Retained range | Transactions | Logical rows | SST bytes | Load time | Load rate | Post-reopen proof | Total acceptance time |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 blocks | 1,141 | 4.06 MB | 3.70 MB | 0.296 s | 3,378 blocks/s | 0.044 s | 0.34 s |
+| 100,000 blocks | 118,034 | 595.32 MB | 557.98 MB | 15.068 s | 6,636 blocks/s | 0.010 s | 15.10 s |
+| 1,000,000 blocks | 1,064,836 | 3.90 GB | 3.62 GB | 97.584 s | 10,247 blocks/s | 0.025 s | 97.63 s |
+
+The million-block process remained near 97 MiB of observed resident memory. An
+initial diagnostic harness took 341.87 seconds because it reread every large
+payload family and replay twice. The optimized 97.63-second result uses exact
+live-file entry metadata and checksum-verified boundary samples instead;
+exhaustive payload scrubbing is outside the sync-time acceptance path.
 
 The no-data-loss rule is strict: data may move out of canonical only after the
 version-1 replay contract can reproduce it. The current semantic aggregate does
