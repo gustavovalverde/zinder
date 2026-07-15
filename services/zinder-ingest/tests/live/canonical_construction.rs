@@ -53,8 +53,12 @@ async fn canonical_replay_loads_1000_blocks_from_fixed_checkpoint() -> Result<()
         })?;
     let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
     let checkpoint_id = BlockId::new(checkpoint.height, checkpoint.hash);
-    let build_plan =
-        CanonicalStoreBuildPlan::checkpointed(env.network(), checkpoint_id, fixed_tip)?;
+    let build_plan = CanonicalStoreBuildPlan::checkpointed(
+        env.network(),
+        checkpoint_id,
+        checkpoint.tip_metadata,
+        fixed_tip,
+    )?;
     let activations = fetch_live_network_upgrade_activations(&env).await?;
     let temporary = tempdir()?;
     let store_path = temporary.path().join("canonical");

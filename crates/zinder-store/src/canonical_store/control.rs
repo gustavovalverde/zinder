@@ -1,7 +1,7 @@
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion,
-    CanonicalHistoryBounds, ChainEpochId, Network,
+    CanonicalHistoryBounds, ChainEpochId, ChainTipMetadata, Network,
 };
 
 use super::{
@@ -16,7 +16,7 @@ const COMPLETE_HISTORY: u8 = 0;
 const CHECKPOINTED_HISTORY: u8 = 1;
 const WALLET_WORKLOAD: u8 = 1;
 const EXPLORER_WORKLOAD: u8 = 2;
-const HISTORY_FIELDS_LENGTH: usize = 1 + 4 + 32;
+const HISTORY_FIELDS_LENGTH: usize = 1 + 4 + 32 + 4 + 4 + 4;
 const BUILD_TIP_FIELDS_LENGTH: usize = 4 + 32;
 const READY_FIELDS_LENGTH: usize = 4 + 32 + 4 + 32 + 8 + 8 + 2 + 4 + 2 + 32 + 8;
 const STORE_CONTROL_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
@@ -69,6 +69,22 @@ pub(super) fn encode_building_store_control(
             encoded.extend_from_slice(&checkpoint.hash.as_bytes());
         }
     }
+    let predecessor_tip_metadata = build_plan.history_predecessor_tip_metadata();
+    encoded.extend_from_slice(
+        &predecessor_tip_metadata
+            .sapling_commitment_tree_size
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(
+        &predecessor_tip_metadata
+            .orchard_commitment_tree_size
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(
+        &predecessor_tip_metadata
+            .ironwood_commitment_tree_size
+            .to_le_bytes(),
+    );
     encoded.extend_from_slice(&build_plan.build_tip().height.value().to_le_bytes());
     encoded.extend_from_slice(&build_plan.build_tip().hash.as_bytes());
     encoded.extend_from_slice(&cursor_auth_key);
@@ -115,7 +131,8 @@ pub(super) fn decode_store_control(
             ));
         }
     };
-    let (history_bounds, history_predecessor) = decode_history_bounds(&mut decoder)?;
+    let (history_bounds, history_predecessor, history_predecessor_tip_metadata) =
+        decode_history_bounds(&mut decoder)?;
     let build_tip = BlockId::new(
         BlockHeight::new(decoder.read_u32("build tip height")?),
         BlockHash::from_bytes(decoder.read_array::<32>("build tip hash")?),
@@ -124,6 +141,7 @@ pub(super) fn decode_store_control(
         network,
         history_bounds,
         history_predecessor,
+        history_predecessor_tip_metadata,
         build_tip,
     )
     .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
@@ -155,7 +173,7 @@ pub(super) fn decode_store_control(
 
 fn decode_history_bounds(
     decoder: &mut Decoder<'_>,
-) -> Result<(CanonicalHistoryBounds, BlockId), CanonicalStoreError> {
+) -> Result<(CanonicalHistoryBounds, BlockId, ChainTipMetadata), CanonicalStoreError> {
     let kind = decoder.read_u8("history kind")?;
     let predecessor_height = decoder.read_u32("history predecessor height")?;
     let predecessor_hash = decoder.read_array::<32>("history predecessor hash")?;
@@ -163,22 +181,29 @@ fn decode_history_bounds(
         BlockHeight::new(predecessor_height),
         BlockHash::from_bytes(predecessor_hash),
     );
-    match kind {
-        COMPLETE_HISTORY if predecessor_height == 0 => {
-            Ok((CanonicalHistoryBounds::complete(), history_predecessor))
-        }
+    let history_bounds = match kind {
+        COMPLETE_HISTORY if predecessor_height == 0 => Ok(CanonicalHistoryBounds::complete()),
         COMPLETE_HISTORY => Err(CanonicalStoreError::admission(
             decoder.path,
             "complete history predecessor must be the height-zero block",
         )),
         CHECKPOINTED_HISTORY => CanonicalHistoryBounds::checkpointed(history_predecessor)
-            .map(|history_bounds| (history_bounds, history_predecessor))
             .map_err(|source| CanonicalStoreError::admission(decoder.path, source.to_string())),
         _ => Err(CanonicalStoreError::admission(
             decoder.path,
             format!("store control contains unknown history kind {kind}"),
         )),
-    }
+    }?;
+    let history_predecessor_tip_metadata = ChainTipMetadata::new(
+        decoder.read_u32("history predecessor sapling tree size")?,
+        decoder.read_u32("history predecessor orchard tree size")?,
+        decoder.read_u32("history predecessor ironwood tree size")?,
+    );
+    Ok((
+        history_bounds,
+        history_predecessor,
+        history_predecessor_tip_metadata,
+    ))
 }
 
 struct Decoder<'encoded> {
@@ -380,6 +405,12 @@ mod tests {
                 .history_bounds(),
             history_bounds
         );
+        assert_eq!(
+            decode_store_control(Path::new("canonical"), &encoded)?
+                .build_plan
+                .history_predecessor_tip_metadata(),
+            ChainTipMetadata::new(1, 2, 3)
+        );
         Ok(())
     }
 
@@ -453,6 +484,7 @@ mod tests {
         let network_start = identity_end + 2;
         let workload_offset = network_start + 4;
         let history_kind = workload_offset + 1;
+        let predecessor_tree_sizes = history_kind + 1 + 4 + 32;
         let build_tip = history_kind + HISTORY_FIELDS_LENGTH;
         let cursor_auth_key = build_tip + BUILD_TIP_FIELDS_LENGTH;
         let state_offset = cursor_auth_key + 32;
@@ -483,6 +515,12 @@ mod tests {
                 let mut encoded = base.clone();
                 encoded[history_kind] = 99;
                 (encoded, "unknown history kind")
+            },
+            {
+                let mut encoded = base.clone();
+                encoded[predecessor_tree_sizes..predecessor_tree_sizes + 4]
+                    .copy_from_slice(&1_u32.to_le_bytes());
+                (encoded, "commitment-tree sizes")
             },
             {
                 let mut encoded = base.clone();
@@ -526,6 +564,9 @@ mod tests {
         encoded.push(COMPLETE_HISTORY);
         encoded.extend_from_slice(&0_u32.to_le_bytes());
         encoded.extend_from_slice(&Network::ZcashTestnet.genesis_hash().as_bytes());
+        encoded.extend_from_slice(&0_u32.to_le_bytes());
+        encoded.extend_from_slice(&0_u32.to_le_bytes());
+        encoded.extend_from_slice(&0_u32.to_le_bytes());
         encoded.extend_from_slice(&2_u32.to_le_bytes());
         encoded.extend_from_slice(&[2; 32]);
         encoded.extend_from_slice(&CURSOR_AUTH_KEY);
@@ -576,6 +617,7 @@ mod tests {
             network,
             history_bounds: CanonicalHistoryBounds::complete(),
             history_predecessor: BlockId::new(BlockHeight::new(0), network.genesis_hash()),
+            history_predecessor_tip_metadata: ChainTipMetadata::empty(),
             build_tip: BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
         }
     }
@@ -588,6 +630,7 @@ mod tests {
             network: Network::ZcashTestnet,
             history_bounds,
             history_predecessor: checkpoint,
+            history_predecessor_tip_metadata: ChainTipMetadata::new(1, 2, 3),
             build_tip: BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
         }
     }

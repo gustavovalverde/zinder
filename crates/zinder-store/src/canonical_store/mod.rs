@@ -15,6 +15,7 @@ use thiserror::Error;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
+    ChainTipMetadata,
 };
 
 pub use block_replay::CanonicalBlockReplayLoadEvidence;
@@ -37,6 +38,7 @@ pub struct CanonicalStoreBuildPlan {
     network: zinder_core::Network,
     history_bounds: zinder_core::CanonicalHistoryBounds,
     history_predecessor: BlockId,
+    history_predecessor_tip_metadata: ChainTipMetadata,
     build_tip: BlockId,
 }
 
@@ -50,6 +52,7 @@ impl CanonicalStoreBuildPlan {
             network,
             zinder_core::CanonicalHistoryBounds::complete(),
             BlockId::new(BlockHeight::new(0), network.genesis_hash()),
+            ChainTipMetadata::empty(),
             build_tip,
         )
     }
@@ -58,17 +61,25 @@ impl CanonicalStoreBuildPlan {
     pub fn checkpointed(
         network: zinder_core::Network,
         checkpoint: BlockId,
+        checkpoint_tip_metadata: ChainTipMetadata,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         let history_bounds = zinder_core::CanonicalHistoryBounds::checkpointed(checkpoint)
             .map_err(|_| CanonicalStoreBuildPlanError::CheckpointHasNoSuccessor)?;
-        Self::from_parts(network, history_bounds, checkpoint, build_tip)
+        Self::from_parts(
+            network,
+            history_bounds,
+            checkpoint,
+            checkpoint_tip_metadata,
+            build_tip,
+        )
     }
 
     pub(super) fn from_parts(
         network: zinder_core::Network,
         history_bounds: zinder_core::CanonicalHistoryBounds,
         history_predecessor: BlockId,
+        history_predecessor_tip_metadata: ChainTipMetadata,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         match history_bounds.preceding_checkpoint() {
@@ -82,6 +93,11 @@ impl CanonicalStoreBuildPlan {
             }
             None | Some(_) => {}
         }
+        if history_bounds.preceding_checkpoint().is_none()
+            && history_predecessor_tip_metadata != ChainTipMetadata::empty()
+        {
+            return Err(CanonicalStoreBuildPlanError::CompleteHistoryHasNonEmptyTipMetadata);
+        }
         let first_available_height = history_bounds.first_available_height();
         if build_tip.height.value() < first_available_height.value() {
             return Err(CanonicalStoreBuildPlanError::BuildTipPrecedesHistory {
@@ -93,6 +109,7 @@ impl CanonicalStoreBuildPlan {
             network,
             history_bounds,
             history_predecessor,
+            history_predecessor_tip_metadata,
             build_tip,
         })
     }
@@ -115,6 +132,12 @@ impl CanonicalStoreBuildPlan {
         self.history_predecessor
     }
 
+    /// Returns commitment-tree sizes immediately before retained history.
+    #[must_use]
+    pub const fn history_predecessor_tip_metadata(self) -> ChainTipMetadata {
+        self.history_predecessor_tip_metadata
+    }
+
     /// Returns the exact source tip this build must reach.
     #[must_use]
     pub const fn build_tip(self) -> BlockId {
@@ -131,6 +154,9 @@ pub enum CanonicalStoreBuildPlanError {
     /// The predecessor does not match the selected complete or checkpointed history.
     #[error("canonical build history predecessor does not match its history bounds")]
     InvalidHistoryPredecessor,
+    /// A complete build must start from the empty height-zero tree position.
+    #[error("complete history predecessor commitment-tree sizes must be empty")]
+    CompleteHistoryHasNonEmptyTipMetadata,
     /// The target tip is below the first retained height.
     #[error(
         "canonical build tip {build_tip} precedes first available height {first_available_height}"
@@ -365,6 +391,10 @@ mod tests {
             plan.history_bounds().first_available_height(),
             BlockHeight::new(1)
         );
+        assert_eq!(
+            plan.history_predecessor_tip_metadata(),
+            ChainTipMetadata::empty()
+        );
         assert_eq!(plan.build_tip(), build_tip);
         Ok(())
     }
@@ -390,12 +420,51 @@ mod tests {
         let error = CanonicalStoreBuildPlan::checkpointed(
             zinder_core::Network::ZcashRegtest,
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
+            ChainTipMetadata::new(1, 2, 3),
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
         )
         .err();
         assert_eq!(
             error,
             Some(CanonicalStoreBuildPlanError::CheckpointHasNoSuccessor)
+        );
+    }
+
+    #[test]
+    fn checkpointed_build_plan_preserves_tree_position() -> Result<(), CanonicalStoreBuildPlanError>
+    {
+        let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
+        let checkpoint_tip_metadata = ChainTipMetadata::new(11, 22, 33);
+        let plan = CanonicalStoreBuildPlan::checkpointed(
+            zinder_core::Network::ZcashTestnet,
+            checkpoint,
+            checkpoint_tip_metadata,
+            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+        )?;
+
+        assert_eq!(plan.history_predecessor(), checkpoint);
+        assert_eq!(
+            plan.history_predecessor_tip_metadata(),
+            checkpoint_tip_metadata
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn complete_build_plan_domain_rejects_nonempty_tree_position() {
+        let network = zinder_core::Network::ZcashTestnet;
+        let error = CanonicalStoreBuildPlan::from_parts(
+            network,
+            zinder_core::CanonicalHistoryBounds::complete(),
+            BlockId::new(BlockHeight::new(0), network.genesis_hash()),
+            ChainTipMetadata::new(1, 0, 0),
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+        )
+        .err();
+
+        assert_eq!(
+            error,
+            Some(CanonicalStoreBuildPlanError::CompleteHistoryHasNonEmptyTipMetadata)
         );
     }
 }

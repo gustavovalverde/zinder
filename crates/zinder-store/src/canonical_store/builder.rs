@@ -727,6 +727,7 @@ mod tests {
             Some(checkpoint) => CanonicalStoreBuildPlan::checkpointed(
                 Network::ZcashTestnet,
                 checkpoint,
+                zinder_core::ChainTipMetadata::new(1, 2, 3),
                 BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
             )?,
         };
