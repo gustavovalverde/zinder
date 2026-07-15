@@ -10,6 +10,7 @@ runner profiles, live-node gates, and consumer-facing certification evidence.
 | ---- | -------- | ------- | ------- | ------- |
 | T0 unit | `#[cfg(test)] mod tests in src/` | `default-filter` of `default`/`ci` | Every commit | Logic regressions in the unit under test |
 | T1 integration | `tests/integration/` | `default-filter` of `default`/`ci` | Every commit | Cross-module wiring, gRPC adapter shape, store/proto round-trips |
+| T1 PostgreSQL integration | `services/zinder-bench/tests/integration/postgres_canonical_fact_round_trip.rs` | `ci-postgres` | Every pull request with disposable PostgreSQL | SCRAM connection, binary COPY, transaction, reconnect, and persisted read-back through the production-intended driver |
 | T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
 | Consumer parity | `crates/zinder-client/tests/parity/` | `ci-parity` | Consumer contract changes / release certification | Consumer-shaped request and error-shape regressions for lightwalletd-compatible wallets, Zallet, public lightwalletd operators, and explorers |
 | T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI | Real upstream-node behavior (Zebra JSON-RPC, indexer gRPC) |
@@ -27,6 +28,12 @@ talk to a node by accident.
 `ci-parity` is fixture-backed and does not require `ZINDER_TEST_LIVE`. Treat it
 as a consumer-contract gate for request and error shapes, not as a
 replacement for live SDK, Zallet, or network validation.
+
+The PostgreSQL integration test remains `#[ignore]` so the DB-free default gate
+cannot connect to an accidental local service. Pull-request CI supplies a fresh
+SCRAM-configured PostgreSQL service and runs `ci-postgres` with
+`--run-ignored=all`; developers use the same profile with an explicit
+`ZINDER_TEST_POSTGRES_DATABASE_URL`.
 
 ## Lightwalletd certification
 
@@ -68,6 +75,24 @@ operator recipe fails CI immediately rather than ambushing an on-call
 engineer. It does not execute the blocks; running them still requires the
 documented prerequisites. See [Runbook self-test](#runbook-self-test)
 below for the full contract.
+
+## PostgreSQL driver integration gate
+
+Run after changing the fact-first PostgreSQL path, its driver dependencies, or
+the benchmark database configuration. The URL must identify a fresh disposable
+database because the test deliberately leaves its completed schema in place and
+then proves reuse is rejected.
+
+```bash
+ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_only@127.0.0.1:55432/zinder_bench' \
+  cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all
+```
+
+The test generates its own one-block regtest fixture. A passing run proves a
+real TCP password-authenticated connection, binary COPY, commit, deferred index
+creation, complete read-back, completion publication, reconnect, WAL/storage
+measurement, and safe existing-schema rejection. Start and clean the disposable
+database with the commands in [Storage benchmark environment](../../deploy/storage-benchmark.md#run-the-postgresql-driver-integration-gate).
 
 ## Consumer parity gate (consumer-shaped fixtures)
 

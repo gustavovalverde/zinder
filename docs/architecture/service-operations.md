@@ -728,15 +728,18 @@ timestamps in logs after an NTP adjustment.
 
 ## Validation Tiers
 
-Tests are organized into four tiers by **runtime mechanism**. Network choice (regtest, testnet, mainnet) is a parameter on T3, not a separate tier. The detailed commands and runner profiles live in the [Testing Runbook](../runbooks/testing.md).
+Tests are organized by **runtime mechanism**. Network choice (regtest, testnet, mainnet) is a parameter on live T3 tests, not a separate tier. The detailed commands and runner profiles live in the [Testing Runbook](../runbooks/testing.md).
 
 | Tier | Mechanism | Module path | Default cadence |
 | ---- | --------- | ----------- | --------------- |
 | T0 unit | in-process pure logic | `#[cfg(test)] mod tests` in `src/` | every PR |
 | T1 integration | fixture-driven, no external state | `tests/integration/` | every PR |
+| T1 PostgreSQL | disposable external PostgreSQL driver boundary | `services/zinder-bench/tests/integration/postgres_canonical_fact_round_trip.rs` | every PR (dedicated service) |
 | T2 perf | time-budgeted, no external state | `tests/perf/` | every PR (separate job) |
 | T3 live | real upstream node | `tests/live/` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra |
 | T3 Zallet adapter | externally supplied Zallet adapter binary against Zinder's native contract | `crates/zinder-client/tests/live/zallet.rs` | adapter development / integration certification |
+| T3 deploy | Docker image and sidecar deployment smoke | `tests/deploy/` | nightly/release |
+| T4 parity | consumer-shaped public contract certification | `tests/parity/` | every PR |
 
 A test's tier is its directory. The directory listing is the tier inventory; filenames cannot lie.
 
@@ -744,4 +747,4 @@ T3 tests carry two gates: `#[ignore = LIVE_TEST_IGNORE_REASON]` plus a first-lin
 
 Test functions under `tests/live/` use plain `snake_case_describing_behavior` names. Do not include `live`, `regtest`, `testnet`, `mainnet`, or `z3` in the function name; the directory and runtime parameterization handle that.
 
-`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`) live in `.config/nextest.toml`. Live-test gates read `ZINDER_NETWORK`; production binaries read `ZINDER_NETWORK__NAME` through the nested config loader. Both use the same `ZINDER_NODE__*` node schema. The full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by the [Testing Runbook](../runbooks/testing.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).
+`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-postgres`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-deploy`, `ci-parity`) live in `.config/nextest.toml`. Live-test gates read `ZINDER_NETWORK`; production binaries read `ZINDER_NETWORK__NAME` through the nested config loader. Both use the same `ZINDER_NODE__*` node schema. The full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by the [Testing Runbook](../runbooks/testing.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).

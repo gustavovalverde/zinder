@@ -94,7 +94,7 @@ deployment is not an embedded indexer.
 The first storage implementation is a side-by-side validation, not a
 winner-takes-all backend bake-off. The candidates are:
 
-- a fact-first RocksDB control that can build sorted external SST files; and
+- a fact-first RocksDB control that currently builds one sorted external SST file; and
 - a block-granular Postgres candidate that can use binary `COPY` and deferred
   secondary-index construction while the database is not serving reads.
 
@@ -104,6 +104,12 @@ must meet every hard lifecycle gate, every universal correctness gate, and its
 topology-specific gates before Zinder advertises it as ready. A failed result
 blocks that topology from release until it is corrected; it does not demote the
 other topology or create a partial hybrid.
+
+The initial single-SST and single-load-transaction implementations are a
+correctness baseline, not a claim of maximum engine throughput. A later
+fastest-sync sweep may compare segmented or parallel SST generation,
+PostgreSQL COPY pipelining, and resource partitions as named benchmark arms
+without changing the topology contracts or acceptance oracle.
 
 A deployment selects `rocksdb-single-host` or `postgres-scale-out` as one
 application-level contract. Per-plane mixing, such as RocksDB canonical
@@ -207,7 +213,9 @@ balance, missing row, or unqualified unavailable error.
    encoding version, per-block digest, and ordered sequence digest while the
    current store remains a temporary oracle.
 3. Implement the smallest fact-first RocksDB and Postgres vertical slices and
-   run both from the same Docker Compose benchmark topology.
+   run both from the same Docker Compose benchmark topology. The diagnostic
+   round-trip slices now exist; they do not yet implement the complete
+   canonical lifecycle or certify either topology.
 4. Validate `rocksdb-single-host` and `postgres-scale-out` independently,
    retain both concrete implementations, and reject per-plane backend mixing.
 5. Cut a fresh canonical schema that removes global transparent output,
@@ -223,6 +231,12 @@ balance, missing row, or unqualified unavailable error.
 10. Build a blue-green production stack, validate it without traffic, catch up,
     switch traffic, retain the previous stack for a bounded rollback window,
     then delete the old storage paths and compatibility baggage.
+
+The current PostgreSQL diagnostic uses the production-intended
+`tokio-postgres` driver but connects without TLS only inside the isolated
+Compose network. The `postgres-scale-out` production gate additionally requires
+certificate-validated TLS, role-scoped credentials, writer fencing, replica
+lag/read fences, failover validation, and transactional reorg proof.
 
 There is no dual-write migration. A new database is built from captured source
 facts or a verified snapshot. The previous binary and volume provide rollback

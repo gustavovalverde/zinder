@@ -43,9 +43,11 @@ pub use block_header::BlockHeaderInfo;
 pub use block_id::{BlockId, BlockSelector};
 pub use canonical_block_facts::{
     CanonicalBlockFacts, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
-    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestBuilder,
-    CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockFactsSequenceLengthOverflow,
-    CanonicalTransactionFacts, PositionedCanonicalBlock,
+    CanonicalBlockFactsReferenceEncoding, CanonicalBlockFactsSequenceDigest,
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalBlockFactsSequenceLengthOverflow, CanonicalTransactionFacts, PositionedCanonicalBlock,
+    UnsupportedCanonicalBlockFactsDigestVersion,
+    UnsupportedCanonicalBlockFactsSequenceDigestVersion,
 };
 pub use canonical_history::{CanonicalHistoryBounds, CanonicalHistoryBoundsError};
 pub use chain_epoch::{

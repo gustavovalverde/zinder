@@ -9,8 +9,10 @@ use std::{
 
 use futures_util::StreamExt as _;
 use zinder_core::{
-    BlockHeight, Network, NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootIndex,
-    wire::encode_zinder_native_chain_name,
+    BlockHeight, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
+    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestBuilder,
+    CanonicalBlockFactsSequenceDigestVersion, Network, NetworkUpgradeActivations, ShieldedProtocol,
+    SubtreeRootIndex, wire::encode_zinder_native_chain_name,
 };
 use zinder_ingest::prepare_canonical_block;
 use zinder_source::{
@@ -21,8 +23,9 @@ use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
 use crate::{
     error::BenchError,
     fixture::{
-        ActivationRecord, FIXTURE_FORMAT_VERSION, FixtureManifest, SegmentDescriptor,
-        SubtreeRootRecord, SubtreeRootSet, WorkloadDensity, write_segment,
+        ActivationRecord, CanonicalBlockFactsDigestEvidence, FIXTURE_FORMAT_VERSION,
+        FixtureManifest, SegmentDescriptor, SubtreeRootRecord, SubtreeRootSet, WorkloadDensity,
+        write_segment,
     },
 };
 
@@ -92,6 +95,7 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
         segments,
         tip_hash_hex,
         workload_density,
+        canonical_block_facts_digest_evidence,
     } = capture_segments(&source, &config, &activations).await?;
 
     let subtree_roots = SubtreeRootSet {
@@ -115,7 +119,8 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
         to_height: config.to_height.value(),
         block_count,
         workload_density,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        current_schema_oracle_artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        canonical_block_facts_digest_evidence,
         tip_hash_hex,
         network_upgrade_activations: activation_records,
         segments,
@@ -129,6 +134,24 @@ struct CapturedSegments {
     segments: Vec<SegmentDescriptor>,
     tip_hash_hex: String,
     workload_density: WorkloadDensity,
+    canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence,
+}
+
+/// Density and canonical-fact digest evidence computed while parsing fixture blocks once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixtureBlockMeasurements {
+    /// Workload density derived from the prepared block-local facts.
+    pub workload_density: WorkloadDensity,
+    block_digests: Vec<CanonicalBlockFactsDigest>,
+}
+
+impl FixtureBlockMeasurements {
+    /// Builds constant-size digest evidence for exactly these measured blocks.
+    pub fn canonical_block_facts_digest_evidence(
+        &self,
+    ) -> Result<CanonicalBlockFactsDigestEvidence, BenchError> {
+        digest_evidence(&self.block_digests)
+    }
 }
 
 async fn capture_segments(
@@ -141,12 +164,19 @@ async fn capture_segments(
     let mut segment_index = 0_u32;
     let mut segment_from = config.from_height.value();
     let mut workload_density = WorkloadDensity::default();
+    let mut sequence_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
+        CanonicalBlockFactsSequenceDigestVersion::CURRENT,
+    );
     while segment_from <= config.to_height.value() {
         let segment_to = segment_end_height(segment_from, config.segment_blocks, config.to_height);
         let blocks =
             fetch_segment_blocks(source, segment_from, segment_to, config.fetch_concurrency)
                 .await?;
-        workload_density.merge(measure_workload_density(&blocks, activations)?);
+        let measurements = measure_fixture_blocks(&blocks, activations)?;
+        workload_density.merge(measurements.workload_density);
+        for digest in measurements.block_digests {
+            append_sequence_digest(&mut sequence_builder, digest)?;
+        }
         if let Some(last) = blocks.last()
             && last.height.value() == config.to_height.value()
         {
@@ -170,16 +200,19 @@ async fn capture_segments(
         segments,
         tip_hash_hex,
         workload_density,
+        canonical_block_facts_digest_evidence: digest_evidence_from_sequence(
+            sequence_builder.finish(),
+        ),
     })
 }
 
-/// Measures workload density from the same deterministic artifact parser used
-/// by canonical ingest.
-pub fn measure_workload_density(
+/// Parses captured blocks once to compute workload density and canonical-fact digests.
+pub fn measure_fixture_blocks(
     blocks: &[SourceBlock],
     activations: &NetworkUpgradeActivations,
-) -> Result<WorkloadDensity, BenchError> {
+) -> Result<FixtureBlockMeasurements, BenchError> {
     let mut density = WorkloadDensity::default();
+    let mut block_digests = Vec::with_capacity(blocks.len());
     for block in blocks {
         let prepared = prepare_canonical_block(block, activations)?;
         let transaction_count = u32::try_from(prepared.facts.transactions.len()).map_err(|_| {
@@ -236,8 +269,49 @@ pub fn measure_workload_density(
         density.max_transparent_outputs_per_block = density
             .max_transparent_outputs_per_block
             .max(transparent_output_count);
+        let reference_encoding = prepared
+            .facts
+            .reference_encoding(CanonicalBlockFactsDigestVersion::CURRENT);
+        block_digests.push(reference_encoding.digest());
     }
-    Ok(density)
+    Ok(FixtureBlockMeasurements {
+        workload_density: density,
+        block_digests,
+    })
+}
+
+fn digest_evidence(
+    block_digests: &[CanonicalBlockFactsDigest],
+) -> Result<CanonicalBlockFactsDigestEvidence, BenchError> {
+    let mut sequence_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
+        CanonicalBlockFactsSequenceDigestVersion::CURRENT,
+    );
+    for digest in block_digests {
+        append_sequence_digest(&mut sequence_builder, *digest)?;
+    }
+    Ok(digest_evidence_from_sequence(sequence_builder.finish()))
+}
+
+fn append_sequence_digest(
+    sequence_builder: &mut CanonicalBlockFactsSequenceDigestBuilder,
+    digest: CanonicalBlockFactsDigest,
+) -> Result<(), BenchError> {
+    sequence_builder.try_append(digest).map_err(|source| {
+        BenchError::fixture_format(format!(
+            "canonical block facts sequence digest failed: {source}"
+        ))
+    })
+}
+
+fn digest_evidence_from_sequence(
+    sequence_digest: CanonicalBlockFactsSequenceDigest,
+) -> CanonicalBlockFactsDigestEvidence {
+    CanonicalBlockFactsDigestEvidence {
+        block_digest_version: CanonicalBlockFactsDigestVersion::CURRENT.value(),
+        sequence_digest_version: sequence_digest.version().value(),
+        block_count: sequence_digest.block_count(),
+        sequence_digest_sha256: hex::encode(sequence_digest.as_bytes()),
+    }
 }
 
 const fn segment_end_height(

@@ -23,6 +23,7 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --profile=ci
+cargo nextest run --profile=ci-parity
 cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 cargo deny check
@@ -30,7 +31,7 @@ cargo machete
 git diff --check
 ```
 
-`cargo nextest run` is the canonical workspace runner; the test tiers and live configuration are documented in the [Testing Runbook](docs/runbooks/testing.md). Profiles in `.config/nextest.toml`: `default`, `ci`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-parity`. `cargo test --workspace --all-features` works as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
+`cargo nextest run` is the canonical workspace runner; the test tiers and live configuration are documented in the [Testing Runbook](docs/runbooks/testing.md). Profiles in `.config/nextest.toml`: `default`, `ci`, `ci-postgres`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-deploy`, `ci-parity`. `cargo test --workspace --all-features` works as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
 
 Heavier probes for trust-sensitive storage/parser changes (also run by scheduled CI):
 

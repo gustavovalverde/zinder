@@ -26,6 +26,21 @@ jobs:
     name: rust
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
+        env:
+          POSTGRES_DB: zinder_bench
+          POSTGRES_USER: zinder_bench
+          POSTGRES_PASSWORD: zinder_bench_ci_only
+          POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8 --locale=C --auth-host=scram-sha-256
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username zinder_bench --dbname zinder_bench"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -59,6 +74,11 @@ jobs:
       - name: Test (unit + integration)
         run: cargo nextest run --profile=ci
 
+      - name: Test (PostgreSQL driver)
+        env:
+          ZINDER_TEST_POSTGRES_DATABASE_URL: postgresql://zinder_bench:zinder_bench_ci_only@127.0.0.1:5432/zinder_bench
+        run: cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all
+
       - name: Test (consumer parity)
         run: cargo nextest run --profile=ci-parity
 
@@ -86,6 +106,28 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Verify PostgreSQL protocol patch
+        run: scripts/check-postgres-protocol-patch.sh
+
+      - name: Test storage benchmark contracts
+        run: |
+          scripts/test-storage-benchmark-campaign-validator.sh
+          env \
+            ZINDER_BENCH_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            ZINDER_BENCH_SOFTWARE_REVISION=ci \
+            ZINDER_BENCH_RUNNER_ID=ci-storage-runner \
+            ZINDER_BENCH_STORAGE_CLASS=ci-local-storage \
+            ZINDER_BENCH_TRIAL_ID=ci-trial \
+            ZINDER_BENCH_FIXTURE_CACHE_POLICY=warm \
+            docker compose \
+              --env-file deploy/.env.storage-benchmark.example \
+              -f deploy/docker-compose.storage-benchmark.yml \
+              --profile comparison \
+              --profile oracle \
+              --profile postgres \
+              --profile rocksdb \
+              config >/dev/null
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked --version "${CARGO_DENY_VERSION}"

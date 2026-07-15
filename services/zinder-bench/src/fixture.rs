@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, ConsensusBranchId, Network, NetworkUpgradeActivation,
+    BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
+    CanonicalBlockFactsSequenceDigestVersion, ConsensusBranchId, Network, NetworkUpgradeActivation,
     NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
     wire::decode_zinder_native_chain_name,
 };
@@ -27,7 +28,7 @@ use zinder_source::{
 use crate::error::BenchError;
 
 /// Version stamped into every manifest this crate writes.
-pub const FIXTURE_FORMAT_VERSION: u32 = 2;
+pub const FIXTURE_FORMAT_VERSION: u32 = 3;
 
 /// Manifest and segment file base names.
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -82,6 +83,23 @@ pub struct SegmentDescriptor {
     pub file: String,
     /// SHA-256 of the whole segment file, hex-encoded.
     pub sha256: String,
+}
+
+/// Backend-neutral canonical-fact oracle captured with one fixture.
+///
+/// Individual candidate rows carry their own block digests so read-back can
+/// identify the first divergence. The fixture manifest keeps only the ordered
+/// sequence evidence, which stays constant-size even for a full-chain corpus.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalBlockFactsDigestEvidence {
+    /// Version used for every block digest folded into the sequence.
+    pub block_digest_version: u16,
+    /// Version used for [`Self::sequence_digest_sha256`].
+    pub sequence_digest_version: u16,
+    /// Number of ordered block digests folded into the sequence.
+    pub block_count: u64,
+    /// Ordered full-range reference digest encoded as lowercase SHA-256 hexadecimal.
+    pub sequence_digest_sha256: String,
 }
 
 /// Source-workload density measured from the captured consensus bytes.
@@ -164,8 +182,13 @@ pub struct FixtureManifest {
     pub block_count: u32,
     /// Consensus-byte workload density for the complete captured range.
     pub workload_density: WorkloadDensity,
-    /// Canonical artifact schema version at capture time.
-    pub artifact_schema_version: u16,
+    /// Current-schema oracle artifact version at capture time.
+    ///
+    /// This is provenance for comparisons with the temporary `RocksDB` oracle;
+    /// it is not part of the backend-neutral canonical-fact contract.
+    pub current_schema_oracle_artifact_schema_version: u16,
+    /// Backend-neutral block-digest contract and ordered-sequence oracle.
+    pub canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence,
     /// Hash of the block at `to_height`, hex-encoded in internal byte order,
     /// used as the replay tip.
     pub tip_hash_hex: String,
@@ -218,6 +241,18 @@ impl FixtureManifest {
     }
 
     fn validate_structure(&self) -> Result<(), BenchError> {
+        if self.fixture_format_version != FIXTURE_FORMAT_VERSION {
+            return Err(BenchError::fixture_format(format!(
+                "fixture format version {} does not match {FIXTURE_FORMAT_VERSION}",
+                self.fixture_format_version
+            )));
+        }
+        self.validate_range_and_density()?;
+        self.validate_canonical_block_facts_digest_evidence()?;
+        self.validate_segments()
+    }
+
+    fn validate_range_and_density(&self) -> Result<(), BenchError> {
         let expected_block_count = self
             .to_height
             .checked_sub(self.from_height)
@@ -240,6 +275,10 @@ impl FixtureManifest {
                 self.workload_density.block_count, self.block_count
             )));
         }
+        Ok(())
+    }
+
+    fn validate_segments(&self) -> Result<(), BenchError> {
         if self.segments.is_empty() {
             return Err(BenchError::fixture_format(
                 "fixture must contain at least one segment".to_owned(),
@@ -301,6 +340,26 @@ impl FixtureManifest {
         Ok(())
     }
 
+    fn validate_canonical_block_facts_digest_evidence(&self) -> Result<(), BenchError> {
+        let evidence = &self.canonical_block_facts_digest_evidence;
+        CanonicalBlockFactsDigestVersion::try_from(evidence.block_digest_version)
+            .map_err(|source| BenchError::fixture_format(source.to_string()))?;
+        CanonicalBlockFactsSequenceDigestVersion::try_from(evidence.sequence_digest_version)
+            .map_err(|source| BenchError::fixture_format(source.to_string()))?;
+
+        if evidence.block_count != u64::from(self.block_count) {
+            return Err(BenchError::fixture_format(format!(
+                "canonical block facts digest count {} does not match fixture block count {}",
+                evidence.block_count, self.block_count
+            )));
+        }
+        validate_digest_hex(
+            &evidence.sequence_digest_sha256,
+            "canonical block facts sequence digest",
+        )?;
+        Ok(())
+    }
+
     /// Resolves the captured network to a typed [`Network`].
     pub fn network_typed(&self) -> Result<Network, BenchError> {
         decode_zinder_native_chain_name(&self.network)
@@ -328,6 +387,22 @@ impl FixtureManifest {
         let hash = decode_internal_block_hash_hex(&self.tip_hash_hex)?;
         Ok(BlockId::new(BlockHeight::new(self.to_height), hash))
     }
+}
+
+fn validate_digest_hex(encoded: &str, field: &str) -> Result<(), BenchError> {
+    if encoded.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(BenchError::fixture_format(format!(
+            "{field} must use lowercase hexadecimal"
+        )));
+    }
+    let bytes = hex::decode(encoded)
+        .map_err(|source| BenchError::fixture_format(format!("invalid {field} hex: {source}")))?;
+    if bytes.len() != 32 {
+        return Err(BenchError::fixture_format(format!(
+            "{field} must contain 32 bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn decode_internal_block_hash_hex(encoded: &str) -> Result<BlockHash, BenchError> {

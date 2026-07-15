@@ -10,7 +10,9 @@ This is a Rust 2024 workspace. Domain crates live under `crates/`: `zinder-core`
 - `cargo check --workspace --all-targets --all-features`: type-check all crates and test targets.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: run the strict lint gate.
 - `cargo nextest run --profile=ci`: run T0/T1 (unit + integration) tests.
+- `cargo nextest run --profile=ci-parity`: run T4 consumer-contract certification tests.
 - `cargo nextest run --profile=ci-perf`: run T2 (perf) tests.
+- PostgreSQL driver gate: start a fresh disposable database, set `ZINDER_TEST_POSTGRES_DATABASE_URL`, then run `cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all`.
 - `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps`: validate docs.
 - `cargo deny check` and `cargo machete`: check dependency policy and unused dependencies.
 - `cargo llvm-cov --workspace --all-features --no-report`: run coverage locally before risky storage/parser changes.

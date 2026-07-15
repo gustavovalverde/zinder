@@ -11,7 +11,7 @@ use std::{
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use zinder_core::{ChainEpoch, wire::encode_rpc_block_hash_hex};
+use zinder_core::{ChainEpoch, UnixTimestampMillis, wire::encode_rpc_block_hash_hex};
 use zinder_derive::{DeriveStore, ProjectionPreset, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME};
 use zinder_ingest::{
     RawBlobPolicy,
@@ -29,10 +29,12 @@ use crate::{
     error::BenchError,
     fixture::{FixtureManifest, FixtureNodeSource},
     report::{
-        AcceptanceThresholds, CanonicalReplayWriterSettings, FixtureSummary, ReplayMeasurements,
-        Report, RocksDbResourceBudgetSummary, STORE_READ_TELEMETRY_FAMILY, StartingCanonicalState,
-        StartingCanonicalStateKind, StorageCandidateIdentity, TELEMETRY_COVERAGE_TOTAL,
-        build_report,
+        AcceptanceThresholds, CurrentSchemaFixtureReplayMeasurements,
+        CurrentSchemaFixtureReplayReport, CurrentSchemaReplayWriterSettings, FixtureCachePolicy,
+        FixtureSummary, RocksDbResourceBudgetSummary, STORE_READ_TELEMETRY_FAMILY,
+        StartingCanonicalState, StartingCanonicalStateKind, StorageCandidateIdentity,
+        TELEMETRY_COVERAGE_TOTAL, build_current_schema_fixture_replay_report,
+        is_valid_benchmark_trial_id,
     },
     rss::peak_rss,
 };
@@ -56,6 +58,12 @@ pub struct ReplayConfig {
     pub projection_replay_scope: ProjectionReplayScope,
     /// Source revision of the measured binary, when known.
     pub software_revision: Option<String>,
+    /// Campaign trial identity, paired with `fixture_cache_policy` when supplied.
+    pub trial_id: Option<String>,
+    /// Controlled fixture-cache treatment for this campaign run.
+    pub fixture_cache_policy: Option<FixtureCachePolicy>,
+    /// Wall-clock Unix timestamp captured before benchmark setup begins.
+    pub run_started_at_unix_millis: u64,
     /// Stable operator label for the runner, when known.
     pub runner_id: Option<String>,
     /// CPU limit applied to the benchmark container, in logical cores.
@@ -73,10 +81,24 @@ pub struct ReplayConfig {
 impl ReplayConfig {
     /// Validates acceptance provenance and telemetry requirements before I/O.
     pub fn validate(&self, metrics_recorder_available: bool) -> Result<(), BenchError> {
+        match (&self.trial_id, self.fixture_cache_policy) {
+            (None, None) => {}
+            (Some(trial_id), Some(_)) if is_valid_benchmark_trial_id(trial_id) => {}
+            (Some(_), Some(_)) => {
+                return Err(BenchError::invalid_argument(
+                    "--trial-id must start with an ASCII alphanumeric character and contain only ASCII alphanumeric characters, '.', '_', or '-'",
+                ));
+            }
+            _ => {
+                return Err(BenchError::invalid_argument(
+                    "--trial-id and --fixture-cache-policy must be supplied together",
+                ));
+            }
+        }
         if self
             .image_reference
             .as_deref()
-            .is_some_and(|reference| !is_immutable_image_reference(reference))
+            .is_some_and(|reference| !crate::report::is_immutable_image_reference(reference))
         {
             return Err(BenchError::invalid_argument(
                 "--image-reference must be a sha256 image ID or digest-pinned image reference",
@@ -136,18 +158,6 @@ fn require_nonblank_provenance(candidate: Option<&str>, flag: &str) -> Result<()
     Ok(())
 }
 
-fn is_immutable_image_reference(reference: &str) -> bool {
-    let reference = reference.trim();
-    let digest = reference.strip_prefix("sha256:").or_else(|| {
-        reference
-            .rsplit_once("@sha256:")
-            .and_then(|(image_name, digest)| (!image_name.is_empty()).then_some(digest))
-    });
-    digest.is_some_and(|digest| {
-        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
-}
-
 /// Canonical event-history scope used for a projection benchmark arm.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProjectionReplayScope {
@@ -188,6 +198,12 @@ struct CanonicalReplayMeasurements {
     tip_hash_after_hex: Option<String>,
 }
 
+struct ReplayRunMeasurements {
+    canonical: CanonicalReplayMeasurements,
+    projection: ProjectionMeasurements,
+    completed_at_unix_millis: u64,
+}
+
 const STARTING_CHECKPOINT_MANIFEST_FILE_NAME: &str = "zinder-backup-manifest.json";
 const STARTING_CHECKPOINT_MANIFEST_FORMAT_VERSION: u32 = 2;
 
@@ -220,7 +236,7 @@ struct StartingCheckpointManifestEvidence {
 pub async fn replay_fixture(
     config: ReplayConfig,
     metrics_handle: Option<PrometheusHandle>,
-) -> Result<Report, BenchError> {
+) -> Result<CurrentSchemaFixtureReplayReport, BenchError> {
     config.validate(metrics_handle.is_some())?;
     if metrics_handle.is_some() {
         metrics::counter!(
@@ -286,26 +302,35 @@ pub async fn replay_fixture(
         projection_store,
     )
     .await?;
+    let run_completed_at_unix_millis = UnixTimestampMillis::now().value();
     let exposition = metrics_handle.map(|handle| handle.render());
-    let fixture = build_fixture_summary(&manifest)?;
-    let measurements = assemble_replay_measurements(
-        &config,
-        canonical_options,
-        starting_canonical_state,
-        canonical_measurements,
-        projection_measurements,
-    )?;
-    Ok(build_report(fixture, &measurements, exposition.as_deref()))
+    let fixture = FixtureSummary::try_from(&manifest)?;
+    let run = ReplayRunMeasurements {
+        canonical: canonical_measurements,
+        projection: projection_measurements,
+        completed_at_unix_millis: run_completed_at_unix_millis,
+    };
+    let measurements =
+        assemble_replay_measurements(&config, canonical_options, starting_canonical_state, run)?;
+    Ok(build_current_schema_fixture_replay_report(
+        fixture,
+        &measurements,
+        exposition.as_deref(),
+    ))
 }
 
 fn assemble_replay_measurements(
     config: &ReplayConfig,
     canonical_options: ChainStoreOptions,
     starting_canonical_state: StartingCanonicalState,
-    canonical: CanonicalReplayMeasurements,
-    projection: ProjectionMeasurements,
-) -> Result<ReplayMeasurements, BenchError> {
-    Ok(ReplayMeasurements {
+    run: ReplayRunMeasurements,
+) -> Result<CurrentSchemaFixtureReplayMeasurements, BenchError> {
+    let ReplayRunMeasurements {
+        canonical,
+        projection,
+        completed_at_unix_millis,
+    } = run;
+    Ok(CurrentSchemaFixtureReplayMeasurements {
         block_prepare_concurrency: config.block_prepare_concurrency.get(),
         canonical_writer: canonical_writer_settings(canonical_options),
         projection_preset: config.projection_preset.map(ProjectionPreset::as_str),
@@ -325,6 +350,10 @@ fn assemble_replay_measurements(
         peak_rss: peak_rss(),
         storage_candidate: storage_candidate_identity(config.projection_preset)?,
         software_revision: config.software_revision.clone(),
+        trial_id: config.trial_id.clone(),
+        fixture_cache_policy: config.fixture_cache_policy,
+        run_started_at_unix_millis: config.run_started_at_unix_millis,
+        run_completed_at_unix_millis: completed_at_unix_millis,
         runner_id: config.runner_id.clone(),
         cpu_limit_cores: config.cpu_limit_cores,
         memory_limit_bytes: config.memory_limit_bytes,
@@ -505,8 +534,8 @@ fn open_canonical_store(
     Ok((store, options))
 }
 
-fn canonical_writer_settings(options: ChainStoreOptions) -> CanonicalReplayWriterSettings {
-    CanonicalReplayWriterSettings {
+fn canonical_writer_settings(options: ChainStoreOptions) -> CurrentSchemaReplayWriterSettings {
+    CurrentSchemaReplayWriterSettings {
         store_schema_version: CURRENT_STORE_SCHEMA_VERSION,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         sync_writes: options.sync_writes,
@@ -519,21 +548,6 @@ fn canonical_writer_settings(options: ChainStoreOptions) -> CanonicalReplayWrite
             options.rocksdb_resource_budget,
         ),
     }
-}
-
-fn build_fixture_summary(manifest: &FixtureManifest) -> Result<FixtureSummary, BenchError> {
-    Ok(FixtureSummary {
-        fixture_format_version: manifest.fixture_format_version,
-        artifact_schema_version: manifest.artifact_schema_version,
-        tip_hash_hex: manifest.tip_hash_hex.clone(),
-        digest_sha256: manifest.digest_sha256()?,
-        network: manifest.network.clone(),
-        from_height: manifest.from_height,
-        to_height: manifest.to_height,
-        block_count: manifest.block_count,
-        workload_density: manifest.workload_density,
-        segment_count: manifest.segments.len(),
-    })
 }
 
 fn prepare_projection_replay(

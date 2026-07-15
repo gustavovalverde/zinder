@@ -9,7 +9,7 @@ use eyre::{Result, eyre};
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 use zinder_bench::{
-    capture::measure_workload_density,
+    capture::measure_fixture_blocks,
     fixture::{
         ActivationRecord, FIXTURE_FORMAT_VERSION, FixtureManifest, SubtreeRootSet, write_segment,
     },
@@ -75,7 +75,7 @@ fn write_regtest_fixture_from_json(fixture_json: &str) -> Result<TempDir> {
     )?;
     let fixture_directory = tempdir()?;
     let descriptor = write_segment(fixture_directory.path(), 0, std::slice::from_ref(&block))?;
-    let workload_density = measure_workload_density(
+    let measurements = measure_fixture_blocks(
         std::slice::from_ref(&block),
         &sample_regtest_upgrade_activations(),
     )?;
@@ -85,8 +85,11 @@ fn write_regtest_fixture_from_json(fixture_json: &str) -> Result<TempDir> {
         from_height: height,
         to_height: height,
         block_count: 1,
-        workload_density,
-        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        workload_density: measurements.workload_density,
+        current_schema_oracle_artifact_schema_version:
+            zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        canonical_block_facts_digest_evidence: measurements
+            .canonical_block_facts_digest_evidence()?,
         tip_hash_hex: hex::encode(block.hash.as_bytes()),
         network_upgrade_activations: regtest_activation_records(),
         segments: vec![descriptor],
@@ -109,6 +112,9 @@ fn replay_config(
         projection_preset,
         projection_replay_scope: ProjectionReplayScope::FixedRange,
         software_revision: Some("test-revision".to_owned()),
+        trial_id: None,
+        fixture_cache_policy: None,
+        run_started_at_unix_millis: 1,
         runner_id: Some("test-runner".to_owned()),
         cpu_limit_cores: Some(2.0),
         memory_limit_bytes: Some(1024 * 1024 * 1024),
@@ -138,7 +144,7 @@ fn write_starting_checkpoint_manifest(
 }
 
 fn assert_projection_report(
-    report: &zinder_bench::report::Report,
+    report: &zinder_bench::report::CurrentSchemaFixtureReplayReport,
     projection_preset: &'static str,
 ) {
     assert_eq!(report.fixture.workload_density.block_count, 1);
@@ -205,7 +211,9 @@ fn assert_projection_report(
     );
 }
 
-fn assert_no_target_wallet_acceptance_claim(report: &zinder_bench::report::Report) -> Result<()> {
+fn assert_no_target_wallet_acceptance_claim(
+    report: &zinder_bench::report::CurrentSchemaFixtureReplayReport,
+) -> Result<()> {
     let report = serde_json::to_value(report)?;
     assert!(report.get("lifecycle").is_none());
     assert!(report["acceptance"].get("wallet_build").is_none());

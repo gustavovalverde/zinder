@@ -140,11 +140,11 @@ smaller and easier to operate than abstracting every database operation.
 Canonical ingest parses a block once and emits immutable rows that can be read
 in block order. The first implementation seam is the in-memory
 `CanonicalBlockFacts` value. Its explicitly tagged, versioned reference digest
-defines the shared correctness oracle for the future RocksDB and Postgres
-candidate drivers without imposing either engine's physical encoding. The
-current RocksDB writer still expands that value into the existing schema;
-removing its cross-block reads and projection-owned writes is the next schema
-slice, not a performance claim for this seam alone.
+defines the shared correctness oracle for the concrete `RocksDB` and
+PostgreSQL diagnostic drivers without imposing either engine's physical
+encoding. The current production `RocksDB` writer still expands that value
+into the existing schema. Removing its cross-block reads and projection-owned
+writes is the next schema slice, not a performance claim for this seam alone.
 
 The target hot schema is:
 
@@ -177,11 +177,19 @@ through explicit numeric tags, length prefixes, option-presence bytes, ordered
 vector boundaries, and fixed little-endian integers. The aggregate owns one
 block header, optional raw block bytes, and ordered `CanonicalTransactionFacts`;
 each transaction owns its public facts, intrinsic balances, transparent inputs
-and outputs, and optional raw bytes. Candidate drivers will compare both
-per-block digests and the ordered full-sequence digest; that path is not yet
-wired into `zinder-bench`. Once wired, changing a fact, its order, or
-the digest contract will change the evidence independently of the RocksDB or
-Postgres schema revision.
+and outputs, and optional raw bytes. `zinder-bench` fixture format 3 records the
+per-block digest contract and the ordered full-sequence digest. Both concrete
+drivers persist the complete reference encodings, read every row back, and
+recompute that evidence independently of the `RocksDB` or PostgreSQL schema
+revision. Changing a fact, its order, or the digest contract changes the shared
+oracle for both candidates.
+
+This round trip is deliberately narrower than canonical storage. It does not
+persist compact blocks, tree state, subtree roots, `ChainEpoch`, `ChainEvent`,
+or mempool events; exercise reorg or publication recovery; or advertise query
+readiness. Its result answers whether the two physical write paths preserve
+the same block-local facts and how quickly they do so. It cannot satisfy the
+fresh canonical construction or topology-certification gates by itself.
 
 Canonical ingest follows one ordered contract:
 

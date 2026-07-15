@@ -1,14 +1,15 @@
 # zinder-bench
 
-Fixed-range capture and replay harness for measuring Zinder ingest changes
-against identical inputs. It is the validation vehicle for held optimizations:
-the windowed prevout resolver, canonical block-cache sizing, background-job
-counts, and allocator experiments.
+Fixed-range capture and storage benchmark harness for measuring Zinder against
+identical source bytes. It drives the current projection-coupled replay oracle
+and two backend-neutral canonical-fact round trips: one sorted external SST
+ingestion for `RocksDB` and binary `COPY` with deferred index construction for
+PostgreSQL.
 
-The harness holds two things constant so chain-content variance cannot reorder
-conclusions: the source bytes (a captured fixture) and the starting canonical
-store (a clone the operator supplies). The only time-dependent measurement is
-wall-clock duration.
+The captured fixture is the common input for all three arms. Current-schema
+replay also requires a matching starting canonical store supplied by the
+operator. Fact-first arms create fresh candidate storage and compare every
+persisted reference encoding against the fixture's ordered digest oracle.
 
 `zinder-bench` is a standalone binary. It links `zinder-ingest` and drives its
 real bulk-catchup pipeline (block prepare, reassembly, commit); it never ships
@@ -37,11 +38,12 @@ Optional flags: `--node-auth-cookie <path>` for cookie auth, `--segment-blocks`
 `--request-timeout-secs`, `--max-response-bytes`.
 
 The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
-`manifest.json` recording the network, range, consensus activations, artifact
-schema version, replay tip hash, per-segment SHA-256, and any shielded subtree
-roots that complete inside the range. It also records transaction, transparent
-input/output, and raw-byte density totals, populated-block counts, and
-per-block maxima so a benchmark range can be reviewed for burst dominance.
+`manifest.json` recording the network, range, consensus activations,
+current-schema oracle artifact version, replay tip hash, per-segment SHA-256,
+and any shielded subtree roots that complete inside the range. Fixture format
+version 3 also records the versioned `CanonicalBlockFacts` block-digest and
+ordered sequence-digest evidence used by both fact-first arms. Workload totals
+and per-block maxima let reviewers detect burst-dominated ranges.
 
 ## 2. Snapshot the starting store
 
@@ -97,14 +99,16 @@ manifest validation on reopen. Bind mounts remain appropriate for immutable
 fixture inputs and JSON reports; the writable canonical and projection stores
 must use the container VM's ext4-backed named volumes.
 
-## 3. Replay and read the report
+## 3. Run the current-schema replay oracle
 
 ```bash
-zinder-bench replay \
+zinder-bench current-schema-replay \
   --fixture ./fixtures/mainnet-150k-200k \
   --store ./fixtures/store-149999 \
   --block-prepare-concurrency 16 \
   --software-revision "$(git rev-parse HEAD)" \
+  --trial-id trial-01 \
+  --fixture-cache-policy warm \
   --runner-id linux-amd64-c8-m16-nvme-01 \
   --cpu-limit-cores 8 \
   --memory-limit-bytes 17179869184 \
@@ -163,26 +167,117 @@ the accepted hard boundary. Choose a new report path for every run.
 
 Omit `--report` to print the JSON to stdout (progress logs go to stderr).
 
+## 4. Compare canonical-fact storage engines
+
+The fact-first commands parse the same fixture into the same complete
+`CanonicalBlockFacts` reference encodings. Each engine writes those encodings,
+reads every row back, recomputes the per-block and ordered sequence digests,
+and publishes a completion fence only after validation.
+
+The `RocksDB` arm requires a path that does not exist:
+
+```bash
+zinder-bench canonical-facts-round-trip rocksdb \
+  --fixture ./fixtures/mainnet-150k-200k \
+  --store ./candidates/rocksdb-fact-first \
+  --block-prepare-concurrency 16 \
+  --software-revision "$(git rev-parse HEAD)" \
+  --trial-id trial-01 \
+  --fixture-cache-policy warm \
+  --runner-id linux-amd64-c8-m16-nvme-01 \
+  --cpu-limit-cores 8 \
+  --memory-limit-bytes 17179869184 \
+  --storage-class local-nvme \
+  --image-reference "zinder-bench@sha256:<64-hex-digest>" \
+  --report ./rocksdb-fact-first-trial-01.json
+```
+
+The PostgreSQL arm reads its URL from an environment variable so credentials
+never appear in command arguments or reports. It rejects a database where its
+candidate schema already exists. The endpoint must be operator controlled; the
+benchmark client does not treat a malicious PostgreSQL server as an input:
+
+```bash
+export ZINDER_BENCH_POSTGRES_DATABASE_URL='postgresql://...'
+zinder-bench canonical-facts-round-trip postgres \
+  --fixture ./fixtures/mainnet-150k-200k \
+  --database-url-env ZINDER_BENCH_POSTGRES_DATABASE_URL \
+  --block-prepare-concurrency 16 \
+  --software-revision "$(git rev-parse HEAD)" \
+  --trial-id trial-01 \
+  --fixture-cache-policy warm \
+  --runner-id linux-amd64-c8-m16-nvme-01 \
+  --cpu-limit-cores 8 \
+  --memory-limit-bytes 17179869184 \
+  --client-cpu-limit-cores 2 \
+  --client-memory-limit-bytes 8589934592 \
+  --database-cpu-limit-cores 6 \
+  --database-memory-limit-bytes 8589934592 \
+  --database-image-reference "postgres@sha256:<64-hex-digest>" \
+  --storage-class local-nvme \
+  --image-reference "zinder-bench@sha256:<64-hex-digest>" \
+  --report ./postgres-fact-first-trial-01.json
+```
+
+The CPU and memory values on a fact report describe the complete benchmark
+arm. PostgreSQL requires the client and database limits together, and their
+exact sum must equal the aggregate arm limits. Its report also identifies the
+database image independently from the benchmark-client image.
+
+The concrete driver gate creates its own small fixture and requires only a
+fresh disposable database URL:
+
+```bash
+ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_only@127.0.0.1:55432/zinder_bench' \
+  cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all
+```
+
+Selection runs require a repeated, alternating-order campaign and an explicit
+fixture page-cache policy. Fresh candidate volumes do not clear the host cache
+for the bind-mounted fixture. The deployment runbook defines the minimum trial
+count, unique trial IDs, warm/cold policy, and campaign ledger. Run
+`scripts/validate-storage-benchmark-campaign.sh` to reject inconsistent evidence
+and compute candidate medians/minimums/maximums; a single report pair is
+diagnostic only.
+
+These commands prove a persisted `CanonicalBlockFacts` round trip only. They
+do not persist compact blocks, tree state, subtree roots, `ChainEpoch`, or
+`ChainEvent`; exercise reorgs; build wallet or explorer projections; serve
+queries; measure fresh canonical construction; or certify either deployment
+topology.
+
+End-to-end throughput compares the complete deployment arms under their stated
+resource allocations; it is not an isolated database-engine score. The
+PostgreSQL client and server have a fixed resource partition, while the RocksDB
+process owns its whole arm budget. Use phase timings to explain work within each
+arm, not as interchangeable engine microbenchmarks; cross-arm conclusions need
+end-to-end time, storage bytes, digest equality, and resource evidence together.
+
 ## Report fields
 
 - `report_format_version`: machine-readable report contract version. The
-  acceptance/provenance contract described here is version 2.
+  closed measurement contract described here is version 3.
+- `measurement_kind`: either `current-schema-fixture-replay` or
+  `canonical-block-facts-round-trip`. The tagged shape prevents fact-only
+  evidence from acquiring placeholder lifecycle or current-schema telemetry
+  fields.
 - `provenance`: benchmark version, software revision, immutable image identity,
-  build target OS/architecture, and structured runner identity, CPU limit,
-  memory limit, and storage class.
-- `storage_candidate`: `rocksdb-current-schema-oracle`, explicitly identifying
-  the projection-coupled current canonical model. It is not the future
-  `rocksdb-fact-first` control. `diagnostic_projection_engine` is `rocksdb` only
-  when a current projection diagnostic is driven. Its topology is
-  `rocksdb-single-host`; the harness does not synthesize Postgres or target
-  wallet-plane results.
+  build target OS/architecture, structured runner identity and resources, plus
+  `run.trial_id`, `run.fixture_cache_policy`, and binary-generated start and
+  completion Unix-millisecond timestamps.
+- `storage_candidate`: identifies `rocksdb-current-schema-oracle`,
+  `rocksdb-fact-first`, or `postgres-fact-first`, including the logical model
+  and the `rocksdb-single-host` or `postgres-scale-out` topology represented by
+  that arm. This is candidate identity, not topology certification.
 - `acceptance.canonical_fixture_replay`: `fixture-range` wall time and optional
   target/hard-limit evaluation. It is the only current acceptance boundary.
   There are no placeholder production lifecycle fields.
-- `fixture.fixture_format_version`, `fixture.artifact_schema_version`,
-  `fixture.tip_hash_hex`, and `fixture.digest_sha256`: fixture provenance
-  required to compare candidates against identical source and schema inputs.
-  Replay verifies every segment SHA-256 before the replay timer starts.
+- `fixture.fixture_format_version`,
+  `fixture.current_schema_oracle_artifact_schema_version`,
+  `fixture.canonical_block_facts_digest_evidence`, `fixture.tip_hash_hex`, and
+  `fixture.digest_sha256`: fixture provenance required to compare candidates
+  against identical source bytes and digest contracts. Each driver verifies
+  every segment SHA-256 before writing its rows.
 - `fixture.workload_density`: the immutable workload totals and per-block
   maxima copied from the captured fixture manifest.
 - `replay.wall_clock_seconds`, `replay.blocks_committed`,
@@ -231,6 +326,25 @@ Omit `--report` to print the JSON to stdout (progress logs go to stderr).
   `transaction_facts`, `block_header_artifact`, and `raw_block_bytes`).
 - `rocksdb_tickers`: exported `RocksDB` statistics tickers (bloom, block cache,
   bytes read/written, stall micros, compaction bytes) per store role.
+- `round_trip`: fact-only wall time plus shared initialization, preparation,
+  persistence, index-construction, storage-optimization, validation,
+  publication, fresh-reader-validation, and storage-measurement phase times. Any
+  framework overhead between those timers is explicit as
+  `unattributed_wall_clock_seconds`. The report also records range identity,
+  block rate, logical and physical bytes, persisted sequence digest,
+  digest-match result, and process peak RSS. These names provide a common
+  diagnostic vocabulary, not interchangeable engine microbenchmarks. In the
+  fresh-reader phase RocksDB closes and reopens its files, while PostgreSQL
+  closes the client connection and reconnects to the running server; neither
+  result certifies a database-server restart.
+- `round_trip.storage`: engine-specific evidence. The `RocksDB` variant records
+  its schema, external-SST bytes, explicit compression, bounded resource budget,
+  durability mode, the resolved database I/O mode, and the separately recorded
+  buffered external-SST construction mode. The PostgreSQL variant records
+  schema, explicit `lz4` reference-encoding compression, the queried comparison
+  and durability server settings, table/index/WAL bytes, both component resource
+  shares, and the immutable database image identity. Retain the rendered Compose
+  model for initdb, shared-memory, and temporary-filesystem evidence.
 
 ## Scope and faithfulness
 
@@ -247,3 +361,12 @@ Omit `--report` to print the JSON to stdout (progress logs go to stderr).
   on the transparent hot path the backlog targets.
 - The bulk-catchup configuration uses production-representative defaults from
   `zinder_ingest::bench_support`; only the swept knobs vary between runs.
+- Fact round trips use the production block parser and complete
+  `CanonicalBlockFacts` reference encoding, but their physical schemas are
+  diagnostic vertical slices rather than production canonical stores.
+- The PostgreSQL slice uses the exact production-intended `tokio-postgres`
+  driver. The prescribed Compose and CI clusters require SCRAM-SHA-256 host
+  authentication; an arbitrary operator-supplied database URL does not itself
+  prove the session's authentication method. `NoTls` is limited to the isolated
+  benchmark network; production remote transport still requires a
+  certificate-validated TLS connector.

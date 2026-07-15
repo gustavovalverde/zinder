@@ -15,11 +15,18 @@ use zinder_bench::{
     capture::{CaptureConfig, capture_fixed_range},
     recorder::install_recorder,
     replay::{ProjectionReplayScope, ReplayConfig, replay_fixture},
-    report::{AcceptanceThresholds, Report},
+    report::{AcceptanceThresholds, BenchmarkReport, FixtureCachePolicy},
 };
-use zinder_core::{BlockHeight, Network, wire::decode_zinder_native_chain_name};
+use zinder_core::{
+    BlockHeight, Network, UnixTimestampMillis, wire::decode_zinder_native_chain_name,
+};
 use zinder_derive::ProjectionPreset;
 use zinder_source::{CookieSource, NodeAuth};
+
+#[path = "canonical_fact_round_trip/command.rs"]
+mod fact_round_trip_command;
+
+use fact_round_trip_command::{CanonicalFactsRoundTripArgs, run_canonical_facts_round_trip};
 
 const DEFAULT_FROM_HEIGHT: u32 = 150_000;
 const DEFAULT_TO_HEIGHT: u32 = 200_000;
@@ -31,7 +38,7 @@ const DEFAULT_BLOCK_PREPARE_CONCURRENCY: u32 = 16;
 
 #[derive(Parser)]
 #[command(name = "zinder-bench")]
-#[command(about = "Zinder fixed-range capture and replay benchmark harness")]
+#[command(about = "Zinder fixed-range storage benchmark harness")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,8 +48,10 @@ struct Cli {
 enum Command {
     /// Capture raw source payloads for a block range into a fixture directory.
     Capture(CaptureArgs),
-    /// Replay the bulk-catchup pipeline over a captured fixture.
-    Replay(ReplayArgs),
+    /// Replay the current projection-coupled schema over a captured fixture.
+    CurrentSchemaReplay(CurrentSchemaReplayArgs),
+    /// Persist and read back backend-neutral canonical block facts.
+    CanonicalFactsRoundTrip(CanonicalFactsRoundTripArgs),
 }
 
 #[derive(Args)]
@@ -80,7 +89,7 @@ struct CaptureArgs {
 }
 
 #[derive(Args)]
-struct ReplayArgs {
+struct CurrentSchemaReplayArgs {
     /// Captured fixture directory.
     #[arg(long)]
     fixture: PathBuf,
@@ -113,6 +122,12 @@ struct ReplayArgs {
     /// Source revision of the measured binary (commit SHA or image digest).
     #[arg(long = "software-revision")]
     software_revision: Option<String>,
+    /// Campaign trial identity; requires `--fixture-cache-policy`.
+    #[arg(long = "trial-id")]
+    trial_id: Option<String>,
+    /// Controlled fixture-cache treatment; requires `--trial-id`.
+    #[arg(long = "fixture-cache-policy", value_enum)]
+    fixture_cache_policy: Option<FixtureCachePolicy>,
     /// Stable operator label for the runner; resource facts are separate flags.
     #[arg(long = "runner-id")]
     runner_id: Option<String>,
@@ -190,7 +205,12 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), BenchError> {
     match cli.command {
         Command::Capture(args) => run_capture(args).await,
-        Command::Replay(args) => run_replay(args).await,
+        Command::CurrentSchemaReplay(args) => run_current_schema_replay(args).await,
+        Command::CanonicalFactsRoundTrip(args) => {
+            let output = run_canonical_facts_round_trip(args).await?;
+            emit_report(&output.report, output.report_path.as_deref())?;
+            output.report.validate()
+        }
     }
 }
 
@@ -227,7 +247,8 @@ async fn run_capture(args: CaptureArgs) -> Result<(), BenchError> {
     Ok(())
 }
 
-async fn run_replay(args: ReplayArgs) -> Result<(), BenchError> {
+async fn run_current_schema_replay(args: CurrentSchemaReplayArgs) -> Result<(), BenchError> {
+    let run_started_at_unix_millis = UnixTimestampMillis::now().value();
     let canonical_fixture_replay_thresholds = canonical_fixture_replay_thresholds(&args)?;
     let metrics_handle = install_recorder()?;
     let config = ReplayConfig {
@@ -241,6 +262,9 @@ async fn run_replay(args: ReplayArgs) -> Result<(), BenchError> {
         projection_preset: args.projection_preset.map(ProjectionPreset::from),
         projection_replay_scope: args.projection_replay_scope.into(),
         software_revision: args.software_revision,
+        trial_id: args.trial_id,
+        fixture_cache_policy: args.fixture_cache_policy,
+        run_started_at_unix_millis,
         runner_id: args.runner_id,
         cpu_limit_cores: args.cpu_limit_cores,
         memory_limit_bytes: args.memory_limit_bytes,
@@ -248,14 +272,14 @@ async fn run_replay(args: ReplayArgs) -> Result<(), BenchError> {
         image_reference: args.image_reference,
         canonical_fixture_replay_thresholds,
     };
-    let report = replay_fixture(config, Some(metrics_handle)).await?;
+    let report = BenchmarkReport::from(replay_fixture(config, Some(metrics_handle)).await?);
     emit_report(&report, args.report.as_deref())?;
-    report.validate_acceptance()?;
+    report.validate()?;
     Ok(())
 }
 
 fn canonical_fixture_replay_thresholds(
-    args: &ReplayArgs,
+    args: &CurrentSchemaReplayArgs,
 ) -> Result<Option<AcceptanceThresholds>, BenchError> {
     let thresholds = match (
         args.canonical_fixture_replay_target_secs,
@@ -272,7 +296,10 @@ fn canonical_fixture_replay_thresholds(
     Ok(thresholds)
 }
 
-fn emit_report(report: &Report, report_path: Option<&std::path::Path>) -> Result<(), BenchError> {
+fn emit_report(
+    report: &BenchmarkReport,
+    report_path: Option<&std::path::Path>,
+) -> Result<(), BenchError> {
     let encoded = serde_json::to_vec_pretty(report)?;
     if let Some(path) = report_path {
         create_report_file(path, &encoded)?;
@@ -329,10 +356,10 @@ mod tests {
 
     use super::{Cli, Command, canonical_fixture_replay_thresholds, create_report_file};
 
-    fn replay_args(extra: &[&str]) -> Vec<String> {
+    fn current_schema_replay_args(extra: &[&str]) -> Vec<String> {
         [
             "zinder-bench",
-            "replay",
+            "current-schema-replay",
             "--fixture",
             "fixture",
             "--store",
@@ -354,18 +381,35 @@ mod tests {
             "--wallet-build-lifecycle-target-secs",
             "--wallet-build-lifecycle-hard-limit-secs",
         ] {
-            assert!(Cli::try_parse_from(replay_args(&[removed_flag, "10"])).is_err());
+            assert!(
+                Cli::try_parse_from(current_schema_replay_args(&[removed_flag, "10"])).is_err()
+            );
         }
     }
 
     #[test]
+    fn ambiguous_legacy_replay_command_is_rejected() {
+        assert!(
+            Cli::try_parse_from([
+                "zinder-bench",
+                "replay",
+                "--fixture",
+                "fixture",
+                "--store",
+                "store",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn acceptance_threshold_flags_must_be_supplied_as_a_pair() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(replay_args(&[
+        let cli = Cli::try_parse_from(current_schema_replay_args(&[
             "--canonical-fixture-replay-target-secs",
             "10",
         ]))?;
-        let Command::Replay(args) = cli.command else {
-            return Err("expected replay command".into());
+        let Command::CurrentSchemaReplay(args) = cli.command else {
+            return Err("expected current-schema-replay command".into());
         };
 
         let Some(error) = canonical_fixture_replay_thresholds(&args).err() else {
@@ -379,14 +423,14 @@ mod tests {
 
     #[test]
     fn acceptance_threshold_pair_parses() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(replay_args(&[
+        let cli = Cli::try_parse_from(current_schema_replay_args(&[
             "--canonical-fixture-replay-target-secs",
             "10",
             "--canonical-fixture-replay-hard-limit-secs",
             "20",
         ]))?;
-        let Command::Replay(args) = cli.command else {
-            return Err("expected replay command".into());
+        let Command::CurrentSchemaReplay(args) = cli.command else {
+            return Err("expected current-schema-replay command".into());
         };
 
         assert!(canonical_fixture_replay_thresholds(&args)?.is_some());
@@ -395,9 +439,9 @@ mod tests {
 
     #[test]
     fn unthresholded_replay_allows_omitted_provenance() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(replay_args(&[]))?;
-        let Command::Replay(args) = cli.command else {
-            return Err("expected replay command".into());
+        let cli = Cli::try_parse_from(current_schema_replay_args(&[]))?;
+        let Command::CurrentSchemaReplay(args) = cli.command else {
+            return Err("expected current-schema-replay command".into());
         };
 
         assert!(canonical_fixture_replay_thresholds(&args)?.is_none());

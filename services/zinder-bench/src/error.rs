@@ -44,6 +44,26 @@ pub enum BenchError {
         #[source]
         source: Box<zinder_ingest::CanonicalBlockConstructionError>,
     },
+    /// A blocking fixture-read or fact-preparation task did not complete.
+    #[error("canonical fact preparation task failed: {reason}")]
+    CanonicalFactPreparationTask {
+        /// Human-readable join failure.
+        reason: String,
+    },
+    /// An ordered canonical fact sequence violated its range or digest contract.
+    #[error("canonical fact sequence mismatch: {reason}")]
+    CanonicalFactSequenceMismatch {
+        /// Human-readable mismatch description.
+        reason: String,
+    },
+    /// A concrete fact-first storage candidate failed its build or validation.
+    #[error("{candidate} storage candidate error: {reason}")]
+    FactStorageCandidate {
+        /// Stable benchmark candidate identifier.
+        candidate: &'static str,
+        /// Engine-specific failure description without credentials.
+        reason: String,
+    },
     /// The bulk-catchup pipeline returned an error during replay.
     #[error("ingest error: {source}")]
     Ingest {
@@ -169,6 +189,32 @@ impl BenchError {
     #[must_use]
     pub fn invalid_argument(reason: impl Into<String>) -> Self {
         Self::InvalidArgument {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a fact-preparation task error from a join failure.
+    #[must_use]
+    pub fn canonical_fact_preparation_task(reason: impl Into<String>) -> Self {
+        Self::CanonicalFactPreparationTask {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds an ordered fact-sequence validation error.
+    #[must_use]
+    pub fn canonical_fact_sequence_mismatch(reason: impl Into<String>) -> Self {
+        Self::CanonicalFactSequenceMismatch {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds an engine-specific fact storage error without exposing its
+    /// connection string or other secret-bearing configuration.
+    #[must_use]
+    pub fn fact_storage_candidate(candidate: &'static str, reason: impl Into<String>) -> Self {
+        Self::FactStorageCandidate {
+            candidate,
             reason: reason.into(),
         }
     }

@@ -39,6 +39,35 @@ impl CanonicalBlockFactsDigestVersion {
     }
 }
 
+/// An encoded canonical-block-facts digest version this binary does not support.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("unsupported canonical block facts digest version {encoded_version}")]
+pub struct UnsupportedCanonicalBlockFactsDigestVersion {
+    encoded_version: u16,
+}
+
+impl TryFrom<u16> for CanonicalBlockFactsDigestVersion {
+    type Error = UnsupportedCanonicalBlockFactsDigestVersion;
+
+    fn try_from(encoded_version: u16) -> Result<Self, Self::Error> {
+        match encoded_version {
+            1 => Ok(Self::V1),
+            _ => Err(UnsupportedCanonicalBlockFactsDigestVersion { encoded_version }),
+        }
+    }
+}
+
+/// Owned bytes of one versioned [`CanonicalBlockFacts`] reference encoding.
+///
+/// This value is the backend-neutral digest input, not a physical storage
+/// schema. It can be persisted by benchmark fixtures or storage candidates,
+/// then hashed again without reconstructing the original Rust aggregate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalBlockFactsReferenceEncoding {
+    version: CanonicalBlockFactsDigestVersion,
+    bytes: Vec<u8>,
+}
+
 /// SHA-256 reference digest of one versioned [`CanonicalBlockFacts`] value.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CanonicalBlockFactsDigest {
@@ -67,7 +96,44 @@ impl CanonicalBlockFactsSequenceDigestVersion {
     }
 }
 
+/// An encoded canonical-fact sequence digest version this binary does not support.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("unsupported canonical block facts sequence digest version {encoded_version}")]
+pub struct UnsupportedCanonicalBlockFactsSequenceDigestVersion {
+    encoded_version: u16,
+}
+
+impl TryFrom<u16> for CanonicalBlockFactsSequenceDigestVersion {
+    type Error = UnsupportedCanonicalBlockFactsSequenceDigestVersion;
+
+    fn try_from(encoded_version: u16) -> Result<Self, Self::Error> {
+        match encoded_version {
+            1 => Ok(Self::V1),
+            _ => Err(UnsupportedCanonicalBlockFactsSequenceDigestVersion { encoded_version }),
+        }
+    }
+}
+
 impl CanonicalBlockFactsDigest {
+    /// Hashes bytes that are already in the selected reference-encoding format.
+    ///
+    /// This operation does not parse the bytes, prove that they encode a
+    /// [`CanonicalBlockFacts`] value, or recover semantic facts. It only applies
+    /// the selected version's digest domain to the supplied bytes. Callers that
+    /// load a stored encoding must validate its provenance separately.
+    #[must_use]
+    pub fn from_reference_encoding(
+        version: CanonicalBlockFactsDigestVersion,
+        reference_encoding: &[u8],
+    ) -> Self {
+        let bytes = match version {
+            CanonicalBlockFactsDigestVersion::V1 => {
+                sha256_domain_and_bytes(BLOCK_DIGEST_DOMAIN, reference_encoding)
+            }
+        };
+        Self { version, bytes }
+    }
+
     /// Returns the fact-encoding version committed by this digest.
     #[must_use]
     pub const fn version(self) -> CanonicalBlockFactsDigestVersion {
@@ -78,6 +144,51 @@ impl CanonicalBlockFactsDigest {
     #[must_use]
     pub const fn as_bytes(self) -> [u8; 32] {
         self.bytes
+    }
+}
+
+impl CanonicalBlockFactsReferenceEncoding {
+    /// Wraps stored reference-encoding bytes with their checked digest version.
+    ///
+    /// This constructor deliberately does not decode or semantically validate
+    /// `bytes`. It exists so a storage implementation can recompute the
+    /// backend-neutral reference digest over bytes it previously persisted.
+    #[must_use]
+    pub fn from_stored_bytes(
+        version: CanonicalBlockFactsDigestVersion,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            version,
+            bytes: bytes.into(),
+        }
+    }
+
+    /// Returns the digest-contract version that defines these bytes.
+    #[must_use]
+    pub const fn version(&self) -> CanonicalBlockFactsDigestVersion {
+        self.version
+    }
+
+    /// Borrows the complete versioned reference encoding.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes the wrapper and returns the complete reference encoding.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Hashes these bytes under their selected reference-digest contract.
+    ///
+    /// Like [`CanonicalBlockFactsDigest::from_reference_encoding`], this does
+    /// not decode or semantically validate the bytes.
+    #[must_use]
+    pub fn digest(&self) -> CanonicalBlockFactsDigest {
+        CanonicalBlockFactsDigest::from_reference_encoding(self.version, &self.bytes)
     }
 }
 
@@ -219,6 +330,23 @@ pub struct CanonicalBlockFacts {
 }
 
 impl CanonicalBlockFacts {
+    /// Encodes this complete value under the backend-neutral digest contract.
+    ///
+    /// The returned bytes use explicit numeric field tags, `u64` length
+    /// prefixes, little-endian integers, option-presence bytes, and ordered
+    /// sequence boundaries. They are independent of Serde, `Debug`, Rust memory
+    /// layout, and any `RocksDB` or `Postgres` physical schema.
+    #[must_use]
+    pub fn reference_encoding(
+        &self,
+        version: CanonicalBlockFactsDigestVersion,
+    ) -> CanonicalBlockFactsReferenceEncoding {
+        let bytes = match version {
+            CanonicalBlockFactsDigestVersion::V1 => reference_encoding_v1(self, version),
+        };
+        CanonicalBlockFactsReferenceEncoding { version, bytes }
+    }
+
     /// Computes the backend-neutral reference digest for this complete value.
     ///
     /// The encoding uses explicit numeric field tags, `u64` length prefixes,
@@ -226,10 +354,7 @@ impl CanonicalBlockFacts {
     /// boundaries. It never depends on Serde, `Debug`, or Rust memory layout.
     #[must_use]
     pub fn digest(&self, version: CanonicalBlockFactsDigestVersion) -> CanonicalBlockFactsDigest {
-        let bytes = match version {
-            CanonicalBlockFactsDigestVersion::V1 => digest_v1(self, version),
-        };
-        CanonicalBlockFactsDigest { version, bytes }
+        self.reference_encoding(version).digest()
     }
 }
 
@@ -249,7 +374,10 @@ pub struct PositionedCanonicalBlock {
     pub tip_metadata: crate::ChainTipMetadata,
 }
 
-fn digest_v1(facts: &CanonicalBlockFacts, version: CanonicalBlockFactsDigestVersion) -> [u8; 32] {
+fn reference_encoding_v1(
+    facts: &CanonicalBlockFacts,
+    version: CanonicalBlockFactsDigestVersion,
+) -> Vec<u8> {
     let CanonicalBlockFacts {
         block_header,
         raw_block_bytes,
@@ -263,7 +391,7 @@ fn digest_v1(facts: &CanonicalBlockFacts, version: CanonicalBlockFactsDigestVers
         4,
         &encode_sequence(transactions, encode_canonical_transaction_facts),
     );
-    sha256_domain_and_fields(BLOCK_DIGEST_DOMAIN, fields)
+    fields.into_bytes()
 }
 
 fn encode_block_header(header: &BlockHeaderArtifact) -> Vec<u8> {
@@ -568,9 +696,13 @@ fn encode_sequence<T>(sequence_entries: &[T], encode_entry: impl Fn(&T) -> Vec<u
 }
 
 fn sha256_domain_and_fields(domain: &[u8], fields: FactsV1Encoder) -> [u8; 32] {
+    sha256_domain_and_bytes(domain, &fields.into_bytes())
+}
+
+fn sha256_domain_and_bytes(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(domain);
-    hasher.update(fields.into_bytes());
+    hasher.update(bytes);
     hasher.finalize().into()
 }
 
@@ -604,10 +736,57 @@ impl FactsV1Encoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
-        CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
-        CanonicalBlockFactsSequenceLengthOverflow,
+        CanonicalBlockFacts, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
+        CanonicalBlockFactsReferenceEncoding, CanonicalBlockFactsSequenceDigestBuilder,
+        CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockFactsSequenceLengthOverflow,
     };
+    use crate::{BlockHash, BlockHeaderArtifact, BlockHeight};
+
+    #[test]
+    fn reference_encoding_recomputes_the_canonical_digest_from_stored_bytes() {
+        let facts = sample_block_facts();
+        let encoding = facts.reference_encoding(CanonicalBlockFactsDigestVersion::CURRENT);
+        let stored_encoding = CanonicalBlockFactsReferenceEncoding::from_stored_bytes(
+            encoding.version(),
+            encoding.as_bytes(),
+        );
+
+        assert_eq!(stored_encoding, encoding);
+        assert_eq!(stored_encoding.digest(), facts.digest(encoding.version()));
+        assert_eq!(
+            stored_encoding.digest(),
+            CanonicalBlockFactsDigest::from_reference_encoding(
+                encoding.version(),
+                encoding.as_bytes(),
+            )
+        );
+
+        let mut changed_bytes = encoding.into_bytes();
+        changed_bytes.push(0xA5);
+        assert_ne!(
+            CanonicalBlockFactsDigest::from_reference_encoding(
+                CanonicalBlockFactsDigestVersion::CURRENT,
+                &changed_bytes,
+            ),
+            facts.digest(CanonicalBlockFactsDigestVersion::CURRENT)
+        );
+    }
+
+    #[test]
+    fn persisted_digest_versions_fail_closed_when_unknown() {
+        assert_eq!(
+            CanonicalBlockFactsDigestVersion::try_from(1),
+            Ok(CanonicalBlockFactsDigestVersion::V1)
+        );
+        assert!(CanonicalBlockFactsDigestVersion::try_from(0).is_err());
+        assert!(CanonicalBlockFactsDigestVersion::try_from(2).is_err());
+        assert_eq!(
+            CanonicalBlockFactsSequenceDigestVersion::try_from(1),
+            Ok(CanonicalBlockFactsSequenceDigestVersion::V1)
+        );
+        assert!(CanonicalBlockFactsSequenceDigestVersion::try_from(0).is_err());
+        assert!(CanonicalBlockFactsSequenceDigestVersion::try_from(2).is_err());
+    }
 
     #[test]
     fn sequence_digest_rejects_block_count_overflow_before_hashing() {
@@ -628,5 +807,24 @@ mod tests {
             Err(CanonicalBlockFactsSequenceLengthOverflow)
         );
         assert_eq!(builder.finish(), before_append);
+    }
+
+    fn sample_block_facts() -> CanonicalBlockFacts {
+        CanonicalBlockFacts {
+            block_header: BlockHeaderArtifact::new(
+                BlockHeight::new(7),
+                BlockHash::from_bytes([0x11; 32]),
+                BlockHash::from_bytes([0x22; 32]),
+                [0x33; 32],
+                [0x44; 32],
+                1_700_000_000,
+                0x1f07_ffff,
+                [0x55; 32],
+                4,
+                128,
+            ),
+            raw_block_bytes: Some(vec![0xAA, 0xBB]),
+            transactions: Vec::new(),
+        }
     }
 }

@@ -2,18 +2,44 @@
 
 use std::collections::BTreeMap;
 
+use clap::ValueEnum;
 use serde::Serialize;
 use zinder_store::RocksDbResourceBudget;
 
 use crate::{
+    canonical_fact_round_trip::postgres::PostgresCanonicalFactServerSettings,
     error::BenchError,
-    fixture::WorkloadDensity,
+    fixture::{CanonicalBlockFactsDigestEvidence, FixtureManifest, WorkloadDensity},
     metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name},
     rss::PeakRss,
 };
 
 /// Machine-readable report schema version.
-pub const REPORT_FORMAT_VERSION: u32 = 2;
+pub const REPORT_FORMAT_VERSION: u32 = 3;
+
+/// Returns whether a container image identity is content addressed.
+#[must_use]
+pub fn is_immutable_image_reference(reference: &str) -> bool {
+    let reference = reference.trim();
+    let digest = reference.strip_prefix("sha256:").or_else(|| {
+        reference
+            .rsplit_once("@sha256:")
+            .and_then(|(image_name, digest)| (!image_name.is_empty()).then_some(digest))
+    });
+    digest.is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+/// Returns whether an operator-supplied trial identity is safe and unambiguous.
+#[must_use]
+pub fn is_valid_benchmark_trial_id(trial_id: &str) -> bool {
+    let mut bytes = trial_id.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
 
 const READ_DURATION_COUNT: &str = "zinder_store_read_duration_seconds_count";
 const READ_DURATION_SUM: &str = "zinder_store_read_duration_seconds_sum";
@@ -43,8 +69,10 @@ const CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM: &str =
 pub struct FixtureSummary {
     /// Fixture manifest format version.
     pub fixture_format_version: u32,
-    /// Canonical artifact schema version used to capture the fixture.
-    pub artifact_schema_version: u16,
+    /// Current-schema oracle artifact version used when capturing the fixture.
+    pub current_schema_oracle_artifact_schema_version: u16,
+    /// Backend-neutral canonical-fact digest oracle captured with the fixture.
+    pub canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence,
     /// Captured range tip hash, hex-encoded in internal byte order.
     pub tip_hash_hex: String,
     /// SHA-256 identity of the normalized fixture manifest and segment digests.
@@ -63,13 +91,36 @@ pub struct FixtureSummary {
     pub segment_count: usize,
 }
 
+impl TryFrom<&FixtureManifest> for FixtureSummary {
+    type Error = BenchError;
+
+    fn try_from(manifest: &FixtureManifest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            fixture_format_version: manifest.fixture_format_version,
+            current_schema_oracle_artifact_schema_version: manifest
+                .current_schema_oracle_artifact_schema_version,
+            canonical_block_facts_digest_evidence: manifest
+                .canonical_block_facts_digest_evidence
+                .clone(),
+            tip_hash_hex: manifest.tip_hash_hex.clone(),
+            digest_sha256: manifest.digest_sha256()?,
+            network: manifest.network.clone(),
+            from_height: manifest.from_height,
+            to_height: manifest.to_height,
+            block_count: manifest.block_count,
+            workload_density: manifest.workload_density,
+            segment_count: manifest.segments.len(),
+        })
+    }
+}
+
 /// Direct measurements taken around the replay call.
 #[derive(Clone, Debug)]
-pub struct ReplayMeasurements {
+pub struct CurrentSchemaFixtureReplayMeasurements {
     /// Prepare concurrency the run used.
     pub block_prepare_concurrency: u32,
     /// Effective canonical writer schema, resource, and durability settings.
-    pub canonical_writer: CanonicalReplayWriterSettings,
+    pub canonical_writer: CurrentSchemaReplayWriterSettings,
     /// Projection preset replayed after canonical ingest, or `None` for a
     /// canonical-only run.
     pub projection_preset: Option<&'static str>,
@@ -102,6 +153,14 @@ pub struct ReplayMeasurements {
     pub storage_candidate: StorageCandidateIdentity,
     /// Source revision of the measured binary, when supplied by the operator.
     pub software_revision: Option<String>,
+    /// Campaign trial identity supplied by the operator, when available.
+    pub trial_id: Option<String>,
+    /// Declared fixture-cache treatment for this run, when available.
+    pub fixture_cache_policy: Option<FixtureCachePolicy>,
+    /// Wall-clock Unix timestamp captured before benchmark setup begins.
+    pub run_started_at_unix_millis: u64,
+    /// Wall-clock Unix timestamp captured after measured work completes.
+    pub run_completed_at_unix_millis: u64,
     /// Stable operator label for the runner, when supplied.
     pub runner_id: Option<String>,
     /// CPU limit applied to the benchmark container, in logical cores.
@@ -153,11 +212,35 @@ impl StorageCandidateIdentity {
             ..Self::rocksdb_current_schema_oracle()
         }
     }
+
+    /// Identifies the diagnostic fact-first `RocksDB` round-trip arm.
+    #[must_use]
+    pub const fn rocksdb_fact_first() -> Self {
+        Self {
+            id: "rocksdb-fact-first",
+            canonical_engine: "rocksdb",
+            canonical_model: "block-granular-canonical-facts",
+            diagnostic_projection_engine: None,
+            topology: "rocksdb-single-host",
+        }
+    }
+
+    /// Identifies the diagnostic fact-first Postgres round-trip arm.
+    #[must_use]
+    pub const fn postgres_fact_first() -> Self {
+        Self {
+            id: "postgres-fact-first",
+            canonical_engine: "postgres",
+            canonical_model: "block-granular-canonical-facts",
+            diagnostic_projection_engine: None,
+            topology: "postgres-scale-out",
+        }
+    }
 }
 
 /// Effective settings for the current-schema canonical replay writer.
 #[derive(Clone, Copy, Debug, Serialize)]
-pub struct CanonicalReplayWriterSettings {
+pub struct CurrentSchemaReplayWriterSettings {
     /// Durable canonical store schema written by this binary.
     pub store_schema_version: u16,
     /// Durable artifact schema written by this binary.
@@ -248,7 +331,9 @@ pub struct ReportProvenance {
     pub benchmark_version: &'static str,
     /// Source revision supplied by the operator, when available.
     pub software_revision: Option<String>,
-    /// Structured runner and container resource provenance.
+    /// Per-invocation trial, cache-policy, and timing provenance.
+    pub run: BenchmarkRunProvenance,
+    /// Structured runner and complete-arm resource provenance.
     pub runner: RunnerProvenance,
     /// Immutable container image reference supplied by the operator.
     pub image_reference: Option<String>,
@@ -258,14 +343,37 @@ pub struct ReportProvenance {
     pub target_arch: &'static str,
 }
 
-/// Operator-supplied runner and container resource provenance.
+/// Per-invocation provenance used to bind reports into a benchmark campaign.
+#[derive(Clone, Debug, Serialize)]
+pub struct BenchmarkRunProvenance {
+    /// Operator-assigned trial identity shared by the paired candidate arms.
+    pub trial_id: Option<String>,
+    /// Declared treatment of the fixture's filesystem cache.
+    pub fixture_cache_policy: Option<FixtureCachePolicy>,
+    /// Wall-clock Unix timestamp captured before benchmark setup begins.
+    pub started_at_unix_millis: u64,
+    /// Wall-clock Unix timestamp captured after measured work completes.
+    pub completed_at_unix_millis: u64,
+}
+
+/// Controlled fixture-cache treatment for a benchmark run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum FixtureCachePolicy {
+    /// The operator evicted the fixture from the filesystem cache before the run.
+    Cold,
+    /// The operator deliberately retained or preloaded the fixture cache.
+    Warm,
+}
+
+/// Operator-supplied runner and complete-arm resource provenance.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunnerProvenance {
     /// Stable runner identity; this label is not a substitute for the fields below.
     pub id: Option<String>,
-    /// CPU limit applied to the benchmark container, in logical cores.
+    /// Aggregate CPU allocation for the measured benchmark arm, in logical cores.
     pub cpu_limit_cores: Option<f64>,
-    /// Memory limit applied to the benchmark container.
+    /// Aggregate memory allocation for the measured benchmark arm.
     pub memory_limit_bytes: Option<u64>,
     /// Stable operator-defined storage performance class.
     pub storage_class: Option<String>,
@@ -339,7 +447,7 @@ pub struct AcceptanceThresholdSummary {
 
 /// Acceptance results for boundaries this command directly drives.
 #[derive(Clone, Copy, Debug, Serialize)]
-pub struct AcceptanceSummary {
+pub struct CurrentSchemaFixtureReplayAcceptance {
     /// Fixture replay into the supplied canonical-store clone.
     pub canonical_fixture_replay: AcceptanceMeasurementSummary,
 }
@@ -414,11 +522,11 @@ pub struct TickerStat {
 
 /// Replay-derived scalars folded into the report.
 #[derive(Clone, Debug, Serialize)]
-pub struct ReplaySummary {
+pub struct CurrentSchemaFixtureReplaySummary {
     /// Prepare concurrency the run used.
     pub block_prepare_concurrency: u32,
     /// Effective canonical writer schema, resource, and durability settings.
-    pub canonical_writer: CanonicalReplayWriterSettings,
+    pub canonical_writer: CurrentSchemaReplayWriterSettings,
     /// Projection preset replayed after canonical ingest, or `None` for a
     /// canonical-only run.
     pub projection_preset: Option<&'static str>,
@@ -459,9 +567,244 @@ pub struct ReplaySummary {
     pub peak_rss: PeakRss,
 }
 
-/// The full benchmark report.
+/// Digest evidence recomputed from persisted canonical fact encodings.
 #[derive(Clone, Debug, Serialize)]
-pub struct Report {
+pub struct CanonicalFactSequenceDigestSummary {
+    /// Per-block reference-encoding digest version.
+    pub block_digest_version: u16,
+    /// Ordered sequence-digest version.
+    pub sequence_digest_version: u16,
+    /// Number of ordered block digests committed by the sequence.
+    pub block_count: u64,
+    /// Sequence SHA-256, hex encoded.
+    pub sha256: String,
+}
+
+impl CanonicalFactSequenceDigestSummary {
+    /// Converts the typed core digest into report-safe scalar evidence.
+    #[must_use]
+    pub fn from_digest(
+        block_digest_version: zinder_core::CanonicalBlockFactsDigestVersion,
+        sequence_digest: zinder_core::CanonicalBlockFactsSequenceDigest,
+    ) -> Self {
+        Self {
+            block_digest_version: block_digest_version.value(),
+            sequence_digest_version: sequence_digest.version().value(),
+            block_count: sequence_digest.block_count(),
+            sha256: hex::encode(sequence_digest.as_bytes()),
+        }
+    }
+}
+
+/// `PostgreSQL` client and database runtime evidence for one measured arm.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresBenchmarkRuntimeEvidence {
+    /// Immutable database container image reference supplied by the operator.
+    pub database_image_reference: Option<String>,
+    /// CPU limit applied to the benchmark client container.
+    pub client_cpu_limit_cores: Option<f64>,
+    /// Memory limit applied to the benchmark client container.
+    pub client_memory_limit_bytes: Option<u64>,
+    /// CPU limit applied to the database container.
+    pub database_cpu_limit_cores: Option<f64>,
+    /// Memory limit applied to the database container.
+    pub database_memory_limit_bytes: Option<u64>,
+}
+
+/// Engine-specific settings and physical write evidence for one fact-first arm.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "engine", rename_all = "kebab-case")]
+pub enum CanonicalBlockFactsStorageEvidence {
+    /// `RocksDB` external-SST construction settings.
+    #[serde(rename = "rocksdb")]
+    RocksDb {
+        /// Candidate-owned physical schema version.
+        storage_schema_version: u16,
+        /// Stable construction mechanism label.
+        ingestion_mode: &'static str,
+        /// Stable durability description for ingestion and publication.
+        durability_mode: &'static str,
+        /// Resolved direct or buffered filesystem I/O mode for database access.
+        database_io_mode: String,
+        /// Filesystem I/O mode used while constructing the external SST.
+        external_sst_io_mode: &'static str,
+        /// Explicit block-compression algorithm used by both SST construction and the column family.
+        compression: &'static str,
+        /// Bytes written into the external SST before ingestion.
+        external_sst_bytes: u64,
+        /// Effective bounded `RocksDB` resources.
+        rocksdb_resource_budget: RocksDbResourceBudgetSummary,
+    },
+    /// Postgres binary-COPY construction settings.
+    Postgres {
+        /// Candidate-owned physical schema version.
+        storage_schema_version: u16,
+        /// Stable construction mechanism label.
+        ingestion_mode: &'static str,
+        /// Whether the candidate fact table is durable and WAL logged.
+        tables_logged: bool,
+        /// Explicit TOAST compression used for large reference encodings.
+        reference_encoding_compression: &'static str,
+        /// Queried performance and durability settings for the measured database arm.
+        server_settings: Box<PostgresCanonicalFactServerSettings>,
+        /// Bytes owned by the canonical-fact heap and its auxiliary forks.
+        fact_table_bytes: u64,
+        /// Bytes owned by indexes created after fact loading.
+        index_bytes: u64,
+        /// WAL bytes advanced during construction and publication.
+        wal_bytes: u64,
+        /// Client/database images and component resource limits.
+        benchmark_runtime: PostgresBenchmarkRuntimeEvidence,
+    },
+}
+
+/// Direct measurements from a persisted canonical-block-facts round trip.
+#[derive(Clone, Debug)]
+pub struct CanonicalBlockFactsRoundTripMeasurements {
+    /// Prepare concurrency used while parsing fixture blocks.
+    pub block_prepare_concurrency: u32,
+    /// Total measured round-trip seconds, including validation and publication.
+    pub wall_clock_seconds: f64,
+    /// Fixture metadata validation plus fresh backend and physical-schema initialization.
+    pub storage_initialization_wall_clock_seconds: f64,
+    /// Fixture read, parse, and reference-encoding seconds.
+    pub fact_preparation_wall_clock_seconds: f64,
+    /// Primary table or external-SST construction and ingestion seconds.
+    pub fact_persistence_wall_clock_seconds: f64,
+    /// Index construction performed after primary fact loading.
+    pub index_construction_wall_clock_seconds: f64,
+    /// Post-load storage optimization, such as `PostgreSQL` `ANALYZE`.
+    pub storage_optimization_wall_clock_seconds: f64,
+    /// Persisted read-back and digest-validation seconds.
+    pub validation_wall_clock_seconds: f64,
+    /// Completion-fence publication seconds.
+    pub publication_wall_clock_seconds: f64,
+    /// Validation through a new reader: a database reopen or server reconnection.
+    pub fresh_reader_validation_wall_clock_seconds: f64,
+    /// Final physical storage and write-amplification measurement seconds.
+    pub storage_measurement_wall_clock_seconds: f64,
+    /// First persisted block height.
+    pub first_height: u32,
+    /// First persisted block hash in internal byte order.
+    pub first_hash_hex: String,
+    /// Last persisted block height.
+    pub tip_height: u32,
+    /// Last persisted block hash in internal byte order.
+    pub tip_hash_hex: String,
+    /// Logical reference-encoding bytes submitted to storage.
+    pub logical_fact_bytes: u64,
+    /// Final physical bytes owned by the candidate tables/store.
+    pub physical_storage_bytes: u64,
+    /// Ordered digest recomputed from persisted rows.
+    pub persisted_sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Engine-specific settings and physical write evidence.
+    pub storage: CanonicalBlockFactsStorageEvidence,
+    /// Peak resident-set-size reading for the benchmark client process.
+    ///
+    /// This includes the embedded database in the `RocksDB` arm and excludes
+    /// the separate database server in the `PostgreSQL` arm.
+    pub benchmark_client_peak_rss: PeakRss,
+    /// Storage implementation measured by this run.
+    pub storage_candidate: StorageCandidateIdentity,
+    /// Source revision of the measured binary, when supplied.
+    pub software_revision: Option<String>,
+    /// Campaign trial identity supplied by the operator, when available.
+    pub trial_id: Option<String>,
+    /// Declared fixture-cache treatment for this run, when available.
+    pub fixture_cache_policy: Option<FixtureCachePolicy>,
+    /// Wall-clock Unix timestamp captured before benchmark setup begins.
+    pub run_started_at_unix_millis: u64,
+    /// Wall-clock Unix timestamp captured after measured work completes.
+    pub run_completed_at_unix_millis: u64,
+    /// Stable operator label for the complete benchmark arm.
+    pub runner_id: Option<String>,
+    /// Aggregate CPU limit for the complete benchmark arm.
+    pub cpu_limit_cores: Option<f64>,
+    /// Aggregate memory limit for the complete benchmark arm.
+    pub memory_limit_bytes: Option<u64>,
+    /// Stable operator-defined storage performance class.
+    pub storage_class: Option<String>,
+    /// Immutable container image reference, when supplied.
+    pub image_reference: Option<String>,
+}
+
+/// Persisted fact-round-trip scalars. This is evidence for the fact aggregate
+/// only, not a chain epoch, query-readiness, reorg, or projection lifecycle.
+#[derive(Clone, Debug, Serialize)]
+pub struct CanonicalBlockFactsRoundTripSummary {
+    /// Exact diagnostic boundary this report drove.
+    pub scope: &'static str,
+    /// Prepare concurrency used while parsing fixture blocks.
+    pub block_prepare_concurrency: u32,
+    /// Total measured round-trip seconds.
+    pub wall_clock_seconds: f64,
+    /// Fixture metadata validation plus fresh backend and physical-schema initialization.
+    pub storage_initialization_wall_clock_seconds: f64,
+    /// Fixture read, parse, and reference-encoding seconds.
+    pub fact_preparation_wall_clock_seconds: f64,
+    /// Primary table or external-SST construction and ingestion seconds.
+    pub fact_persistence_wall_clock_seconds: f64,
+    /// Index construction performed after primary fact loading.
+    pub index_construction_wall_clock_seconds: f64,
+    /// Post-load storage optimization seconds.
+    pub storage_optimization_wall_clock_seconds: f64,
+    /// Persisted read-back and digest-validation seconds.
+    pub validation_wall_clock_seconds: f64,
+    /// Completion-fence publication seconds.
+    pub publication_wall_clock_seconds: f64,
+    /// Validation through a new reader: a database reopen or server reconnection.
+    pub fresh_reader_validation_wall_clock_seconds: f64,
+    /// Final physical storage and write-amplification measurement seconds.
+    pub storage_measurement_wall_clock_seconds: f64,
+    /// Wall-clock time not attributed to an explicitly measured stage.
+    pub unattributed_wall_clock_seconds: f64,
+    /// First persisted block height.
+    pub first_height: u32,
+    /// First persisted block hash in internal byte order.
+    pub first_hash_hex: String,
+    /// Last persisted block height.
+    pub tip_height: u32,
+    /// Last persisted block hash in internal byte order.
+    pub tip_hash_hex: String,
+    /// Persisted block count.
+    pub block_count: u64,
+    /// End-to-end persisted blocks per second.
+    pub blocks_per_second: f64,
+    /// Logical reference-encoding bytes submitted to storage.
+    pub logical_fact_bytes: u64,
+    /// Final physical bytes owned by the candidate tables/store.
+    pub physical_storage_bytes: u64,
+    /// Ordered digest recomputed from persisted rows.
+    pub persisted_sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Whether the persisted sequence equals the fixture capture oracle.
+    pub fixture_sequence_digest_match: bool,
+    /// Engine-specific settings and physical write evidence.
+    pub storage: CanonicalBlockFactsStorageEvidence,
+    /// Peak resident-set-size reading for the benchmark client process.
+    ///
+    /// This includes the embedded database in the `RocksDB` arm and excludes
+    /// the separate database server in the `PostgreSQL` arm.
+    pub benchmark_client_peak_rss: PeakRss,
+}
+
+/// Full report for one canonical-block-facts persisted round trip.
+#[derive(Clone, Debug, Serialize)]
+pub struct CanonicalBlockFactsRoundTripReport {
+    /// Machine-readable report schema version.
+    pub report_format_version: u32,
+    /// Build and source provenance.
+    pub provenance: ReportProvenance,
+    /// Fixture identity.
+    pub fixture: FixtureSummary,
+    /// Storage candidate measured by this invocation.
+    pub storage_candidate: StorageCandidateIdentity,
+    /// Fact-only round-trip evidence.
+    pub round_trip: CanonicalBlockFactsRoundTripSummary,
+}
+
+/// Current-schema fixture replay report.
+#[derive(Clone, Debug, Serialize)]
+pub struct CurrentSchemaFixtureReplayReport {
     /// Machine-readable report schema version.
     pub report_format_version: u32,
     /// Build and source provenance.
@@ -471,9 +814,9 @@ pub struct Report {
     /// Storage candidate measured by this invocation.
     pub storage_candidate: StorageCandidateIdentity,
     /// Acceptance results for boundaries driven by this command.
-    pub acceptance: AcceptanceSummary,
+    pub acceptance: CurrentSchemaFixtureReplayAcceptance,
     /// Replay-derived scalars.
-    pub replay: ReplaySummary,
+    pub replay: CurrentSchemaFixtureReplaySummary,
     /// Per-caller canonical-store read timing.
     pub store_reads: Vec<CallerReadStat>,
     /// Per-caller `multi_get` key accounting.
@@ -486,7 +829,95 @@ pub struct Report {
     pub rocksdb_tickers: Vec<TickerStat>,
 }
 
-impl Report {
+/// One versioned benchmark report with a closed, candidate-honest measurement
+/// shape.
+///
+/// The tagged variants deliberately prevent fact-only storage comparisons
+/// from serializing current-schema lifecycle acceptance or telemetry fields.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "measurement_kind", rename_all = "kebab-case")]
+pub enum BenchmarkReport {
+    /// Existing bulk-catchup replay into the projection-coupled schema.
+    CurrentSchemaFixtureReplay(Box<CurrentSchemaFixtureReplayReport>),
+    /// Persisted round trip of block-local canonical facts only.
+    CanonicalBlockFactsRoundTrip(Box<CanonicalBlockFactsRoundTripReport>),
+}
+
+impl From<CurrentSchemaFixtureReplayReport> for BenchmarkReport {
+    fn from(report: CurrentSchemaFixtureReplayReport) -> Self {
+        Self::CurrentSchemaFixtureReplay(Box::new(report))
+    }
+}
+
+impl From<CanonicalBlockFactsRoundTripReport> for BenchmarkReport {
+    fn from(report: CanonicalBlockFactsRoundTripReport) -> Self {
+        Self::CanonicalBlockFactsRoundTrip(Box::new(report))
+    }
+}
+
+impl BenchmarkReport {
+    /// Validates the evidence boundary owned by the selected measurement.
+    pub fn validate(&self) -> Result<(), BenchError> {
+        match self {
+            Self::CurrentSchemaFixtureReplay(report) => report.validate_acceptance(),
+            Self::CanonicalBlockFactsRoundTrip(report) => {
+                if !report.round_trip.fixture_sequence_digest_match {
+                    return Err(BenchError::canonical_fact_sequence_mismatch(
+                        "persisted sequence digest does not match the fixture capture oracle",
+                    ));
+                }
+                if report.round_trip.block_count != u64::from(report.fixture.block_count)
+                    || report.round_trip.first_height != report.fixture.from_height
+                    || report.round_trip.tip_height != report.fixture.to_height
+                    || report.round_trip.tip_hash_hex != report.fixture.tip_hash_hex
+                {
+                    return Err(BenchError::canonical_fact_sequence_mismatch(format!(
+                        "expected {} blocks over heights {}..={} ending at hash {}, observed {} blocks over heights {}..={} ending at hash {}",
+                        report.fixture.block_count,
+                        report.fixture.from_height,
+                        report.fixture.to_height,
+                        report.fixture.tip_hash_hex,
+                        report.round_trip.block_count,
+                        report.round_trip.first_height,
+                        report.round_trip.tip_height,
+                        report.round_trip.tip_hash_hex
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Validates telemetry coverage and the configured hard acceptance limit.
+    pub fn validate_acceptance(&self) -> Result<(), BenchError> {
+        let Self::CurrentSchemaFixtureReplay(report) = self else {
+            return Ok(());
+        };
+        report.validate_acceptance()
+    }
+
+    /// Returns the current-schema measurement when this is the oracle variant.
+    #[must_use]
+    pub const fn current_schema_fixture_replay(&self) -> Option<&CurrentSchemaFixtureReplayReport> {
+        match self {
+            Self::CurrentSchemaFixtureReplay(report) => Some(report),
+            Self::CanonicalBlockFactsRoundTrip(_) => None,
+        }
+    }
+
+    /// Returns the fact round-trip measurement when this is a fact-first arm.
+    #[must_use]
+    pub const fn canonical_block_facts_round_trip(
+        &self,
+    ) -> Option<&CanonicalBlockFactsRoundTripReport> {
+        match self {
+            Self::CurrentSchemaFixtureReplay(_) => None,
+            Self::CanonicalBlockFactsRoundTrip(report) => Some(report),
+        }
+    }
+}
+
+impl CurrentSchemaFixtureReplayReport {
     /// Validates telemetry coverage and the configured hard acceptance limit.
     pub fn validate_acceptance(&self) -> Result<(), BenchError> {
         if self
@@ -539,20 +970,26 @@ impl Report {
 
 /// Builds the report from direct measurements and the scraped exposition text.
 #[must_use]
-pub fn build_report(
+pub fn build_current_schema_fixture_replay_report(
     fixture: FixtureSummary,
-    measurements: &ReplayMeasurements,
+    measurements: &CurrentSchemaFixtureReplayMeasurements,
     exposition: Option<&str>,
-) -> Report {
+) -> CurrentSchemaFixtureReplayReport {
     let samples = exposition.map(parse_prometheus_samples).unwrap_or_default();
     let store_reads = aggregate_store_reads(&samples);
     let rocksdb_tickers = aggregate_tickers(&samples);
     let replay = build_replay_summary(measurements, &samples, &store_reads, &rocksdb_tickers);
-    Report {
+    CurrentSchemaFixtureReplayReport {
         report_format_version: REPORT_FORMAT_VERSION,
         provenance: ReportProvenance {
             benchmark_version: env!("CARGO_PKG_VERSION"),
             software_revision: measurements.software_revision.clone(),
+            run: BenchmarkRunProvenance {
+                trial_id: measurements.trial_id.clone(),
+                fixture_cache_policy: measurements.fixture_cache_policy,
+                started_at_unix_millis: measurements.run_started_at_unix_millis,
+                completed_at_unix_millis: measurements.run_completed_at_unix_millis,
+            },
             runner: RunnerProvenance {
                 id: measurements.runner_id.clone(),
                 cpu_limit_cores: measurements.cpu_limit_cores,
@@ -575,8 +1012,112 @@ pub fn build_report(
     }
 }
 
-fn build_acceptance_summary(measurements: &ReplayMeasurements) -> AcceptanceSummary {
-    AcceptanceSummary {
+/// Builds a fact-only persisted round-trip report.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the report builder keeps the versioned measurement-to-contract mapping explicit"
+)]
+pub fn build_canonical_block_facts_round_trip_report(
+    fixture: FixtureSummary,
+    measurements: CanonicalBlockFactsRoundTripMeasurements,
+) -> BenchmarkReport {
+    let block_count = measurements.persisted_sequence_digest.block_count;
+    let blocks_per_second = if measurements.wall_clock_seconds > 0.0 {
+        u64_to_f64(block_count) / measurements.wall_clock_seconds
+    } else {
+        0.0
+    };
+    let fixture_sequence_digest_match = block_count == u64::from(fixture.block_count)
+        && measurements.persisted_sequence_digest.block_digest_version
+            == fixture
+                .canonical_block_facts_digest_evidence
+                .block_digest_version
+        && measurements
+            .persisted_sequence_digest
+            .sequence_digest_version
+            == fixture
+                .canonical_block_facts_digest_evidence
+                .sequence_digest_version
+        && measurements.persisted_sequence_digest.sha256.as_str()
+            == fixture
+                .canonical_block_facts_digest_evidence
+                .sequence_digest_sha256
+                .as_str();
+    let provenance = ReportProvenance {
+        benchmark_version: env!("CARGO_PKG_VERSION"),
+        software_revision: measurements.software_revision,
+        run: BenchmarkRunProvenance {
+            trial_id: measurements.trial_id,
+            fixture_cache_policy: measurements.fixture_cache_policy,
+            started_at_unix_millis: measurements.run_started_at_unix_millis,
+            completed_at_unix_millis: measurements.run_completed_at_unix_millis,
+        },
+        runner: RunnerProvenance {
+            id: measurements.runner_id,
+            cpu_limit_cores: measurements.cpu_limit_cores,
+            memory_limit_bytes: measurements.memory_limit_bytes,
+            storage_class: measurements.storage_class,
+        },
+        image_reference: measurements.image_reference,
+        target_os: std::env::consts::OS,
+        target_arch: std::env::consts::ARCH,
+    };
+    let attributed_wall_clock_seconds = measurements.storage_initialization_wall_clock_seconds
+        + measurements.fact_preparation_wall_clock_seconds
+        + measurements.fact_persistence_wall_clock_seconds
+        + measurements.index_construction_wall_clock_seconds
+        + measurements.storage_optimization_wall_clock_seconds
+        + measurements.validation_wall_clock_seconds
+        + measurements.publication_wall_clock_seconds
+        + measurements.fresh_reader_validation_wall_clock_seconds
+        + measurements.storage_measurement_wall_clock_seconds;
+    let round_trip = CanonicalBlockFactsRoundTripSummary {
+        scope: "canonical-block-facts-fixture-round-trip",
+        block_prepare_concurrency: measurements.block_prepare_concurrency,
+        wall_clock_seconds: measurements.wall_clock_seconds,
+        storage_initialization_wall_clock_seconds: measurements
+            .storage_initialization_wall_clock_seconds,
+        fact_preparation_wall_clock_seconds: measurements.fact_preparation_wall_clock_seconds,
+        fact_persistence_wall_clock_seconds: measurements.fact_persistence_wall_clock_seconds,
+        index_construction_wall_clock_seconds: measurements.index_construction_wall_clock_seconds,
+        storage_optimization_wall_clock_seconds: measurements
+            .storage_optimization_wall_clock_seconds,
+        validation_wall_clock_seconds: measurements.validation_wall_clock_seconds,
+        publication_wall_clock_seconds: measurements.publication_wall_clock_seconds,
+        fresh_reader_validation_wall_clock_seconds: measurements
+            .fresh_reader_validation_wall_clock_seconds,
+        storage_measurement_wall_clock_seconds: measurements.storage_measurement_wall_clock_seconds,
+        unattributed_wall_clock_seconds: (measurements.wall_clock_seconds
+            - attributed_wall_clock_seconds)
+            .max(0.0),
+        first_height: measurements.first_height,
+        first_hash_hex: measurements.first_hash_hex,
+        tip_height: measurements.tip_height,
+        tip_hash_hex: measurements.tip_hash_hex,
+        block_count,
+        blocks_per_second,
+        logical_fact_bytes: measurements.logical_fact_bytes,
+        physical_storage_bytes: measurements.physical_storage_bytes,
+        persisted_sequence_digest: measurements.persisted_sequence_digest,
+        fixture_sequence_digest_match,
+        storage: measurements.storage,
+        benchmark_client_peak_rss: measurements.benchmark_client_peak_rss,
+    };
+    CanonicalBlockFactsRoundTripReport {
+        report_format_version: REPORT_FORMAT_VERSION,
+        provenance,
+        fixture,
+        storage_candidate: measurements.storage_candidate,
+        round_trip,
+    }
+    .into()
+}
+
+fn build_acceptance_summary(
+    measurements: &CurrentSchemaFixtureReplayMeasurements,
+) -> CurrentSchemaFixtureReplayAcceptance {
+    CurrentSchemaFixtureReplayAcceptance {
         canonical_fixture_replay: summarize_acceptance_measurement(
             "fixture-range",
             measurements.wall_clock_seconds,
@@ -586,11 +1127,11 @@ fn build_acceptance_summary(measurements: &ReplayMeasurements) -> AcceptanceSumm
 }
 
 fn build_replay_summary(
-    measurements: &ReplayMeasurements,
+    measurements: &CurrentSchemaFixtureReplayMeasurements,
     samples: &[MetricSample],
     store_reads: &[CallerReadStat],
     rocksdb_tickers: &[TickerStat],
-) -> ReplaySummary {
+) -> CurrentSchemaFixtureReplaySummary {
     let projection_compaction_bytes = measurements.projection_preset.and_then(|_| {
         ticker_reading(
             rocksdb_tickers,
@@ -630,7 +1171,7 @@ fn build_replay_summary(
     } else {
         0.0
     };
-    ReplaySummary {
+    CurrentSchemaFixtureReplaySummary {
         block_prepare_concurrency: measurements.block_prepare_concurrency,
         canonical_writer: measurements.canonical_writer,
         projection_preset: measurements.projection_preset,
@@ -900,11 +1441,24 @@ mod tests {
     use crate::{fixture::WorkloadDensity, rss::PEAK_RSS_SOURCE_UNAVAILABLE};
 
     use super::{
-        AcceptanceThresholds, CanonicalReplayWriterSettings, FixtureSummary, ReplayMeasurements,
-        RocksDbResourceBudgetSummary, StartingCanonicalState, StartingCanonicalStateKind,
-        StorageCandidateIdentity, aggregate_stage_durations, build_report,
-        parse_prometheus_samples,
+        AcceptanceThresholds, CanonicalBlockFactsRoundTripMeasurements,
+        CanonicalBlockFactsStorageEvidence, CanonicalFactSequenceDigestSummary,
+        CurrentSchemaFixtureReplayMeasurements, CurrentSchemaReplayWriterSettings,
+        FixtureCachePolicy, FixtureSummary, RocksDbResourceBudgetSummary, StartingCanonicalState,
+        StartingCanonicalStateKind, StorageCandidateIdentity, aggregate_stage_durations,
+        build_canonical_block_facts_round_trip_report, build_current_schema_fixture_replay_report,
+        is_valid_benchmark_trial_id, parse_prometheus_samples,
     };
+
+    #[test]
+    fn benchmark_trial_ids_are_filename_safe() {
+        for trial_id in ["trial-01", "A.2_warm", "9"] {
+            assert!(is_valid_benchmark_trial_id(trial_id), "{trial_id}");
+        }
+        for trial_id in ["", "-trial", "trial 01", "trial/01", "trialé"] {
+            assert!(!is_valid_benchmark_trial_id(trial_id), "{trial_id}");
+        }
+    }
 
     #[test]
     fn canonical_replay_reports_acceptance_provenance_and_current_schema_oracle() {
@@ -915,12 +1469,25 @@ mod tests {
         measurements.memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
         measurements.storage_class = Some("local-nvme".to_owned());
         measurements.image_reference = Some(format!("sha256:{}", "a".repeat(64)));
-        let report = build_report(fixture_summary(), &measurements, None);
+        measurements.trial_id = Some("trial-01".to_owned());
+        measurements.fixture_cache_policy = Some(FixtureCachePolicy::Warm);
+        let report =
+            build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
 
-        assert_eq!(report.report_format_version, 2);
+        assert_eq!(report.report_format_version, 3);
         assert_provenance_and_writer(&report);
-        assert_eq!(report.fixture.fixture_format_version, 2);
-        assert_eq!(report.fixture.artifact_schema_version, 18);
+        assert_eq!(report.provenance.run.trial_id.as_deref(), Some("trial-01"));
+        assert!(matches!(
+            report.provenance.run.fixture_cache_policy,
+            Some(FixtureCachePolicy::Warm)
+        ));
+        assert_eq!(report.provenance.run.started_at_unix_millis, 1_000);
+        assert_eq!(report.provenance.run.completed_at_unix_millis, 14_000);
+        assert_eq!(report.fixture.fixture_format_version, 3);
+        assert_eq!(
+            report.fixture.current_schema_oracle_artifact_schema_version,
+            18
+        );
         assert_eq!(report.fixture.tip_hash_hex, "abcd");
         assert_eq!(report.fixture.digest_sha256, "fixture-digest");
         assert_eq!(
@@ -972,7 +1539,21 @@ mod tests {
         );
     }
 
-    fn assert_provenance_and_writer(report: &super::Report) {
+    #[test]
+    fn current_schema_report_wrapper_serializes_the_measurement_kind()
+    -> Result<(), serde_json::Error> {
+        let report = build_current_schema_fixture_replay_report(
+            fixture_summary(),
+            &canonical_measurements(),
+            None,
+        );
+        let encoded = serde_json::to_value(super::BenchmarkReport::from(report))?;
+
+        assert_eq!(encoded["measurement_kind"], "current-schema-fixture-replay");
+        Ok(())
+    }
+
+    fn assert_provenance_and_writer(report: &super::CurrentSchemaFixtureReplayReport) {
         assert_eq!(report.storage_candidate.id, "rocksdb-current-schema-oracle");
         assert_eq!(report.storage_candidate.canonical_engine, "rocksdb");
         assert_eq!(
@@ -1016,7 +1597,11 @@ mod tests {
             Some(AcceptanceThresholds::try_from_seconds(10.0, 15.0)?);
         let exposition = "zinder_ingest_commit_duration_seconds_count 1\n\
             zinder_bench_telemetry_coverage_total{family=\"store_reads\"} 0\n";
-        let report = build_report(fixture_summary(), &measurements, Some(exposition));
+        let report = build_current_schema_fixture_replay_report(
+            fixture_summary(),
+            &measurements,
+            Some(exposition),
+        );
 
         let Some(thresholds) = report.acceptance.canonical_fixture_replay.thresholds else {
             return Err(crate::BenchError::invalid_argument(
@@ -1037,7 +1622,8 @@ mod tests {
         let mut measurements = canonical_measurements();
         measurements.canonical_fixture_replay_thresholds =
             Some(AcceptanceThresholds::try_from_seconds(10.0, 15.0)?);
-        let report = build_report(fixture_summary(), &measurements, None);
+        let report =
+            build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
 
         let Some(error) = report.validate_acceptance().err() else {
             return Err(crate::BenchError::invalid_argument(
@@ -1058,7 +1644,11 @@ mod tests {
         measurements.tip_hash_after_hex = Some("wrong-tip".to_owned());
         let exposition = "zinder_ingest_commit_duration_seconds_count 1\n\
             zinder_bench_telemetry_coverage_total{family=\"store_reads\"} 0\n";
-        let report = build_report(fixture_summary(), &measurements, Some(exposition));
+        let report = build_current_schema_fixture_replay_report(
+            fixture_summary(),
+            &measurements,
+            Some(exposition),
+        );
 
         let Some(error) = report.validate_acceptance().err() else {
             return Err(crate::BenchError::invalid_argument(
@@ -1088,7 +1678,8 @@ mod tests {
             measurements.storage_candidate =
                 StorageCandidateIdentity::rocksdb_current_schema_with_diagnostic_projections();
 
-            let report = build_report(fixture_summary(), &measurements, None);
+            let report =
+                build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
             let report_json = serde_json::to_value(&report)?;
 
             assert!(report_json.get("lifecycle").is_none());
@@ -1102,6 +1693,91 @@ mod tests {
                 report.storage_candidate.diagnostic_projection_engine,
                 Some("rocksdb")
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fact_round_trip_omits_unmeasured_contracts() -> Result<(), Box<dyn std::error::Error>> {
+        let report = build_canonical_block_facts_round_trip_report(
+            fixture_summary(),
+            CanonicalBlockFactsRoundTripMeasurements {
+                block_prepare_concurrency: 8,
+                wall_clock_seconds: 2.3,
+                storage_initialization_wall_clock_seconds: 0.1,
+                fact_preparation_wall_clock_seconds: 0.8,
+                fact_persistence_wall_clock_seconds: 0.7,
+                index_construction_wall_clock_seconds: 0.0,
+                storage_optimization_wall_clock_seconds: 0.0,
+                validation_wall_clock_seconds: 0.4,
+                publication_wall_clock_seconds: 0.1,
+                fresh_reader_validation_wall_clock_seconds: 0.1,
+                storage_measurement_wall_clock_seconds: 0.1,
+                first_height: 11,
+                first_hash_hex: "first-hash".to_owned(),
+                tip_height: 20,
+                tip_hash_hex: "abcd".to_owned(),
+                logical_fact_bytes: 4_096,
+                physical_storage_bytes: 8_192,
+                persisted_sequence_digest: CanonicalFactSequenceDigestSummary {
+                    block_digest_version: 1,
+                    sequence_digest_version: 1,
+                    block_count: 10,
+                    sha256: "persisted-digest".to_owned(),
+                },
+                storage: CanonicalBlockFactsStorageEvidence::RocksDb {
+                    storage_schema_version: 1,
+                    ingestion_mode: "external-sst",
+                    durability_mode: "external-sst-ingest-with-synchronous-completion-marker",
+                    database_io_mode: "buffered".to_owned(),
+                    external_sst_io_mode: "buffered",
+                    compression: "snappy",
+                    external_sst_bytes: 7_000,
+                    rocksdb_resource_budget: RocksDbResourceBudgetSummary {
+                        block_cache_bytes: 64 * 1024 * 1024,
+                        max_wal_bytes: 32 * 1024 * 1024,
+                        max_open_files: 128,
+                        write_buffer_bytes: 8 * 1024 * 1024,
+                        max_write_buffer_count: 2,
+                        max_background_jobs: 2,
+                        memtable_budget_bytes: 16 * 1024 * 1024,
+                        statistics_level: "tickers",
+                    },
+                },
+                benchmark_client_peak_rss: crate::rss::PeakRss {
+                    bytes: None,
+                    source: PEAK_RSS_SOURCE_UNAVAILABLE,
+                },
+                storage_candidate: StorageCandidateIdentity::rocksdb_fact_first(),
+                software_revision: None,
+                trial_id: Some("trial-01".to_owned()),
+                fixture_cache_policy: Some(FixtureCachePolicy::Warm),
+                run_started_at_unix_millis: 1_000,
+                run_completed_at_unix_millis: 4_000,
+                runner_id: None,
+                cpu_limit_cores: Some(8.0),
+                memory_limit_bytes: Some(16 * 1024 * 1024 * 1024),
+                storage_class: None,
+                image_reference: None,
+            },
+        );
+        report.validate()?;
+        let json = serde_json::to_value(&report)?;
+
+        assert_eq!(json["measurement_kind"], "canonical-block-facts-round-trip");
+        assert_eq!(json["storage_candidate"]["id"], "rocksdb-fact-first");
+        assert_eq!(json["round_trip"]["storage"]["engine"], "rocksdb");
+        assert_eq!(json["provenance"]["run"]["trial_id"], "trial-01");
+        assert_eq!(json["provenance"]["run"]["fixture_cache_policy"], "warm");
+        assert_eq!(json["provenance"]["run"]["started_at_unix_millis"], 1_000);
+        assert_eq!(json["provenance"]["run"]["completed_at_unix_millis"], 4_000);
+        assert!(
+            json["round_trip"]
+                .get("benchmark_client_peak_rss")
+                .is_some()
+        );
+        for omitted_field in ["acceptance", "replay", "lifecycle", "store_reads"] {
+            assert!(json.get(omitted_field).is_none(), "{omitted_field}");
         }
         Ok(())
     }
@@ -1125,8 +1801,15 @@ mod tests {
 
     fn fixture_summary() -> FixtureSummary {
         FixtureSummary {
-            fixture_format_version: 2,
-            artifact_schema_version: 18,
+            fixture_format_version: 3,
+            current_schema_oracle_artifact_schema_version: 18,
+            canonical_block_facts_digest_evidence:
+                crate::fixture::CanonicalBlockFactsDigestEvidence {
+                    block_digest_version: 1,
+                    sequence_digest_version: 1,
+                    block_count: 10,
+                    sequence_digest_sha256: "persisted-digest".to_owned(),
+                },
             tip_hash_hex: "abcd".to_owned(),
             digest_sha256: "fixture-digest".to_owned(),
             network: "zcash-regtest".to_owned(),
@@ -1141,10 +1824,10 @@ mod tests {
         }
     }
 
-    fn canonical_measurements() -> ReplayMeasurements {
-        ReplayMeasurements {
+    fn canonical_measurements() -> CurrentSchemaFixtureReplayMeasurements {
+        CurrentSchemaFixtureReplayMeasurements {
             block_prepare_concurrency: 8,
-            canonical_writer: CanonicalReplayWriterSettings {
+            canonical_writer: CurrentSchemaReplayWriterSettings {
                 store_schema_version: 13,
                 artifact_schema_version: 18,
                 sync_writes: true,
@@ -1185,6 +1868,10 @@ mod tests {
             },
             storage_candidate: StorageCandidateIdentity::rocksdb_current_schema_oracle(),
             software_revision: None,
+            trial_id: None,
+            fixture_cache_policy: None,
+            run_started_at_unix_millis: 1_000,
+            run_completed_at_unix_millis: 14_000,
             runner_id: None,
             cpu_limit_cores: None,
             memory_limit_bytes: None,
