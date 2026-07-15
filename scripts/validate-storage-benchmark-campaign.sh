@@ -94,7 +94,7 @@ validate_report() {
       type == "string"
       and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
       and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
-    .report_format_version == 4
+    .report_format_version == 1
     and .measurement_kind == "canonical-block-facts-round-trip"
     and .storage_candidate.id == $candidate
     and .storage_candidate.canonical_engine == $engine
@@ -103,12 +103,12 @@ validate_report() {
     and .storage_candidate.topology == $topology
     and .round_trip.scope == "canonical-block-facts-fixture-round-trip"
     and .round_trip.fixture_sequence_digest_match == true
-    and .round_trip.replay_format_version == 2
+    and .round_trip.replay_format_version == 1
     and .round_trip.semantic_replay_validated == true
-    and .fixture.fixture_format_version == 4
+    and .fixture.fixture_format_version == 1
     and (.fixture.current_schema_oracle_artifact_schema_version > 0)
     and (.fixture.digest_sha256 | lowercase_sha256)
-    and .fixture.canonical_block_facts_digest_evidence.block_digest_version == 2
+    and .fixture.canonical_block_facts_digest_evidence.block_digest_version == 1
     and .fixture.canonical_block_facts_digest_evidence.sequence_digest_version == 1
     and (.fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 | lowercase_sha256)
     and (.fixture.tip_hash_hex | lowercase_sha256)
@@ -182,7 +182,7 @@ validate_report() {
     jq -e '
       def nonblank: type == "string" and (length > 0);
       .round_trip.storage.engine == "rocksdb"
-      and .round_trip.storage.storage_schema_version == 2
+      and .round_trip.storage.storage_schema_version == 1
       and .round_trip.storage.ingestion_mode == "sorted-external-sst"
       and (.round_trip.storage.durability_mode | nonblank)
       and (.round_trip.storage.database_io_mode | nonblank)
@@ -212,7 +212,7 @@ validate_report() {
         and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
         and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
       .round_trip.storage.engine == "postgres"
-      and .round_trip.storage.storage_schema_version == 2
+      and .round_trip.storage.storage_schema_version == 1
       and .round_trip.storage.ingestion_mode == "binary-copy-single-load-transaction-with-deferred-index"
       and .round_trip.storage.tables_logged == true
       and .round_trip.storage.replay_envelope_compression == "lz4"

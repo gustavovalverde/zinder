@@ -31,7 +31,8 @@ use crate::{
 };
 
 const CANDIDATE_ID: &str = "postgres-fact-first";
-const SCHEMA_NAME: &str = "zinder_bench_postgres_canonical_facts";
+const CANONICAL_FACT_CONTRACT_IDENTITY: &str = "zinder-canonical-facts";
+const SCHEMA_NAME: &str = "zinder_bench_canonical_fact_store";
 
 type PostgresConnectionTask = JoinHandle<Result<(), tokio_postgres::Error>>;
 
@@ -41,9 +42,9 @@ pub const POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION: u16 = 1;
 pub const POSTGRES_REPLAY_ENVELOPE_COMPRESSION: &str = "lz4";
 
 const SCHEMA_SQL: &str = r"
-CREATE SCHEMA zinder_bench_postgres_canonical_facts;
+CREATE SCHEMA zinder_bench_canonical_fact_store;
 
-CREATE TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts (
+CREATE TABLE zinder_bench_canonical_fact_store.canonical_block_facts (
     height BIGINT NOT NULL,
     block_hash BYTEA NOT NULL,
     parent_hash BYTEA NOT NULL,
@@ -53,7 +54,7 @@ CREATE TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts (
     replay_envelope BYTEA COMPRESSION lz4 NOT NULL
 );
 
-CREATE TABLE zinder_bench_postgres_canonical_facts.round_trip_completion (
+CREATE TABLE zinder_bench_canonical_fact_store.round_trip_completion (
     singleton BOOLEAN PRIMARY KEY CHECK (singleton),
     physical_schema_version SMALLINT NOT NULL,
     fixture_format_version INTEGER NOT NULL,
@@ -69,12 +70,13 @@ CREATE TABLE zinder_bench_postgres_canonical_facts.round_trip_completion (
         CHECK (replay_format_version BETWEEN 1 AND 4294967295),
     sequence_digest_version SMALLINT NOT NULL,
     sequence_digest BYTEA NOT NULL CHECK (octet_length(sequence_digest) = 32),
-    logical_fact_bytes BIGINT NOT NULL
+    logical_fact_bytes BIGINT NOT NULL,
+    contract_identity TEXT NOT NULL CHECK (contract_identity = 'zinder-canonical-facts')
 );
 ";
 
 const COPY_SQL: &str = r"
-COPY zinder_bench_postgres_canonical_facts.canonical_block_facts (
+COPY zinder_bench_canonical_fact_store.canonical_block_facts (
     height,
     block_hash,
     parent_hash,
@@ -86,7 +88,7 @@ COPY zinder_bench_postgres_canonical_facts.canonical_block_facts (
 ";
 
 const FINALIZE_SCHEMA_SQL: &str = r"
-ALTER TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts
+ALTER TABLE zinder_bench_canonical_fact_store.canonical_block_facts
     ADD CONSTRAINT canonical_block_facts_shape_check CHECK (
         height BETWEEN 0 AND 4294967295
         AND octet_length(block_hash) = 32
@@ -96,16 +98,16 @@ ALTER TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts
         AND octet_length(fact_digest) = 32
         AND octet_length(replay_envelope) > 0
     ) NOT VALID;
-ALTER TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts
+ALTER TABLE zinder_bench_canonical_fact_store.canonical_block_facts
     VALIDATE CONSTRAINT canonical_block_facts_shape_check;
 CREATE UNIQUE INDEX canonical_block_facts_height_uq
-    ON zinder_bench_postgres_canonical_facts.canonical_block_facts (height);
-ALTER TABLE zinder_bench_postgres_canonical_facts.canonical_block_facts
+    ON zinder_bench_canonical_fact_store.canonical_block_facts (height);
+ALTER TABLE zinder_bench_canonical_fact_store.canonical_block_facts
     ADD CONSTRAINT canonical_block_facts_pkey
     PRIMARY KEY USING INDEX canonical_block_facts_height_uq;
 ";
 
-const ANALYZE_SQL: &str = "ANALYZE zinder_bench_postgres_canonical_facts.canonical_block_facts";
+const ANALYZE_SQL: &str = "ANALYZE zinder_bench_canonical_fact_store.canonical_block_facts";
 
 const READ_BACK_SQL: &str = r"
 SELECT
@@ -116,12 +118,12 @@ SELECT
     digest_version,
     fact_digest,
     replay_envelope
-FROM zinder_bench_postgres_canonical_facts.canonical_block_facts
+FROM zinder_bench_canonical_fact_store.canonical_block_facts
 ORDER BY height
 ";
 
 const INSERT_COMPLETION_SQL: &str = r"
-INSERT INTO zinder_bench_postgres_canonical_facts.round_trip_completion (
+INSERT INTO zinder_bench_canonical_fact_store.round_trip_completion (
     singleton,
     physical_schema_version,
     fixture_format_version,
@@ -136,9 +138,10 @@ INSERT INTO zinder_bench_postgres_canonical_facts.round_trip_completion (
     replay_format_version,
     sequence_digest_version,
     sequence_digest,
-    logical_fact_bytes
+    logical_fact_bytes,
+    contract_identity
 ) VALUES (
-    TRUE, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+    TRUE, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
 )
 ";
 
@@ -157,8 +160,9 @@ SELECT
     replay_format_version,
     sequence_digest_version,
     sequence_digest,
-    logical_fact_bytes
-FROM zinder_bench_postgres_canonical_facts.round_trip_completion
+    logical_fact_bytes,
+    contract_identity
+FROM zinder_bench_canonical_fact_store.round_trip_completion
 WHERE singleton = TRUE
 ";
 
@@ -192,15 +196,15 @@ SELECT
 const STORAGE_BYTES_SQL: &str = r"
 SELECT
     pg_table_size(
-        'zinder_bench_postgres_canonical_facts.canonical_block_facts'::regclass
+        'zinder_bench_canonical_fact_store.canonical_block_facts'::regclass
     )::BIGINT,
     pg_indexes_size(
-        'zinder_bench_postgres_canonical_facts.canonical_block_facts'::regclass
+        'zinder_bench_canonical_fact_store.canonical_block_facts'::regclass
     )::BIGINT,
     COALESCE(SUM(pg_total_relation_size(class.oid)), 0)::BIGINT
 FROM pg_class AS class
 JOIN pg_namespace AS namespace ON namespace.oid = class.relnamespace
-WHERE namespace.nspname = 'zinder_bench_postgres_canonical_facts'
+WHERE namespace.nspname = 'zinder_bench_canonical_fact_store'
   AND class.relkind = 'r'
 ";
 
@@ -832,6 +836,7 @@ async fn publish_completion(
                 &sequence_digest_version,
                 &sequence_digest,
                 &logical_fact_bytes,
+                &CANONICAL_FACT_CONTRACT_IDENTITY,
             ],
         )
         .await
@@ -863,6 +868,7 @@ struct CompletionRow {
     sequence_digest_version: u16,
     sequence_digest: [u8; 32],
     logical_fact_bytes: u64,
+    contract_identity: String,
 }
 
 async fn read_completion(client: &Client) -> Result<CompletionRow, BenchError> {
@@ -906,6 +912,7 @@ async fn read_completion(client: &Client) -> Result<CompletionRow, BenchError> {
             get_column(&row, 13, "logical_fact_bytes")?,
             "logical_fact_bytes",
         )?,
+        contract_identity: get_column(&row, 14, "contract_identity")?,
     })
 }
 
@@ -920,6 +927,7 @@ fn validate_completion(
         completion.physical_schema_version,
         "physical_schema_version",
     )? != POSTGRES_CANONICAL_FACT_STORAGE_SCHEMA_VERSION
+        || completion.contract_identity != CANONICAL_FACT_CONTRACT_IDENTITY
         || u32::try_from(completion.fixture_format_version).ok()
             != Some(manifest.fixture_format_version)
         || completion.fixture_digest_sha256 != fixture_digest

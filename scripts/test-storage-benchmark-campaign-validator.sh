@@ -24,7 +24,7 @@ write_report() {
     --argjson completed_at "$completed_at" '
     def rocksdb_storage: {
       engine: "rocksdb",
-      storage_schema_version: 2,
+      storage_schema_version: 1,
       ingestion_mode: "sorted-external-sst",
       durability_mode: "external-sst-ingest-with-synchronous-completion-marker",
       database_io_mode: "buffered",
@@ -44,7 +44,7 @@ write_report() {
     };
     def postgres_storage: {
       engine: "postgres",
-      storage_schema_version: 2,
+      storage_schema_version: 1,
       ingestion_mode: "binary-copy-single-load-transaction-with-deferred-index",
       tables_logged: true,
       replay_envelope_compression: "lz4",
@@ -86,7 +86,7 @@ write_report() {
     };
     ($candidate == "rocksdb-fact-first") as $is_rocksdb
     | {
-        report_format_version: 4,
+        report_format_version: 1,
         measurement_kind: "canonical-block-facts-round-trip",
         provenance: {
           benchmark_version: "0.1.0",
@@ -108,10 +108,10 @@ write_report() {
           target_arch: "x86_64"
         },
         fixture: {
-          fixture_format_version: 4,
+          fixture_format_version: 1,
           current_schema_oracle_artifact_schema_version: 18,
           canonical_block_facts_digest_evidence: {
-            block_digest_version: 2,
+            block_digest_version: 1,
             sequence_digest_version: 1,
             block_count: 10,
             sequence_digest_sha256: ("c" * 64)
@@ -155,13 +155,13 @@ write_report() {
           logical_fact_bytes: 4096,
           physical_storage_bytes: 8192,
           persisted_sequence_digest: {
-            block_digest_version: 2,
+            block_digest_version: 1,
             sequence_digest_version: 1,
             block_count: 10,
             sha256: ("c" * 64)
           },
           fixture_sequence_digest_match: true,
-          replay_format_version: 2,
+          replay_format_version: 1,
           semantic_replay_validated: true,
           storage: (if $is_rocksdb then rocksdb_storage else postgres_storage end),
           benchmark_client_peak_rss: {bytes: null, source: "unavailable"}
@@ -481,21 +481,21 @@ expect_failure "paired trial mismatch" "$trial_mismatch_campaign"
 
 wrong_version_campaign="$scratch_directory/wrong-version"
 cp -R "$valid_campaign" "$wrong_version_campaign"
-mutate_report "$wrong_version_campaign/rocksdb-fact-first-trial-02.json" '.report_format_version = 3'
+mutate_report "$wrong_version_campaign/rocksdb-fact-first-trial-02.json" '.report_format_version = 4'
 expect_failure "wrong report version" "$wrong_version_campaign"
 
 wrong_rocksdb_schema_campaign="$scratch_directory/wrong-rocksdb-schema"
 cp -R "$valid_campaign" "$wrong_rocksdb_schema_campaign"
 mutate_report \
   "$wrong_rocksdb_schema_campaign/rocksdb-fact-first-trial-01.json" \
-  '.round_trip.storage.storage_schema_version = 3'
+  '.round_trip.storage.storage_schema_version = 2'
 expect_failure "wrong RocksDB storage schema" "$wrong_rocksdb_schema_campaign"
 
 wrong_postgres_schema_campaign="$scratch_directory/wrong-postgres-schema"
 cp -R "$valid_campaign" "$wrong_postgres_schema_campaign"
 mutate_report \
   "$wrong_postgres_schema_campaign/postgres-fact-first-trial-01.json" \
-  '.round_trip.storage.storage_schema_version = 1'
+  '.round_trip.storage.storage_schema_version = 2'
 expect_failure "wrong PostgreSQL storage schema" "$wrong_postgres_schema_campaign"
 
 missing_replay_evidence_campaign="$scratch_directory/missing-replay-evidence"

@@ -32,10 +32,11 @@ use crate::{
 };
 
 const CANDIDATE_NAME: &str = "rocksdb-fact-first";
+const CANONICAL_FACT_CONTRACT_IDENTITY: &str = "zinder-canonical-facts";
 const CANONICAL_BLOCK_FACTS_COLUMN_FAMILY: &str = "canonical_block_facts";
 const STORAGE_CONTROL_COLUMN_FAMILY: &str = "storage_control";
 const COMPLETION_MARKER_KEY: &[u8] = b"canonical_fact_round_trip_complete";
-const ROW_MAGIC: [u8; 4] = *b"ZBCF";
+const ROW_MAGIC: [u8; 4] = *b"ZCF1";
 const COMPLETION_MARKER_FORMAT_VERSION: u16 = 1;
 
 /// Candidate-owned physical schema version for persisted canonical fact rows.
@@ -619,7 +620,9 @@ fn read_completion_marker(db: &DB) -> Result<CompletionMarker, BenchError> {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CompletionMarker {
+    contract_identity: String,
     marker_format_version: u16,
     storage_schema_version: u16,
     fixture_manifest_sha256: String,
@@ -642,6 +645,7 @@ impl CompletionMarker {
         validation: RocksDbCanonicalFactRoundTripValidation,
     ) -> Result<Self, BenchError> {
         Ok(Self {
+            contract_identity: CANONICAL_FACT_CONTRACT_IDENTITY.to_owned(),
             marker_format_version: COMPLETION_MARKER_FORMAT_VERSION,
             storage_schema_version: ROCKSDB_CANONICAL_FACT_STORAGE_SCHEMA_VERSION,
             fixture_manifest_sha256: manifest.digest_sha256()?,

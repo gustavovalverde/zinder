@@ -9,7 +9,7 @@ use crate::{
     TransparentInputFact, TransparentOutPoint, TransparentOutputFact, UnsupportedSection,
 };
 
-const BLOCK_DIGEST_DOMAIN: &[u8] = b"zinder:canonical-block-facts:sha256\0";
+const BLOCK_DIGEST_DOMAIN: &[u8] = b"zinder:canonical-block-facts:fact-only:sha256\0";
 const SEQUENCE_ITEM_DOMAIN: &[u8] = b"zinder:canonical-block-facts:ordered-items:sha256\0";
 const SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder:canonical-block-facts:ordered-sequence:sha256\0";
 
