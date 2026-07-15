@@ -12,6 +12,7 @@ mod block_artifact;
 mod block_header;
 mod block_id;
 mod canonical_block_facts;
+mod canonical_block_facts_replay;
 mod canonical_history;
 mod chain_epoch;
 mod chain_value_pools;
@@ -48,6 +49,12 @@ pub use canonical_block_facts::{
     CanonicalBlockFactsSequenceLengthOverflow, CanonicalTransactionFacts, PositionedCanonicalBlock,
     UnsupportedCanonicalBlockFactsDigestVersion,
     UnsupportedCanonicalBlockFactsSequenceDigestVersion,
+};
+pub use canonical_block_facts_replay::{
+    CanonicalBlockFactsReplay, CanonicalBlockFactsReplayDecodeError,
+    CanonicalBlockFactsReplayEncoding, CanonicalBlockFactsReplayFormatVersion,
+    UnsupportedCanonicalBlockFactsReplayFormatVersion, decode_canonical_block_facts_replay,
+    encode_canonical_block_facts_replay,
 };
 pub use canonical_history::{CanonicalHistoryBounds, CanonicalHistoryBoundsError};
 pub use chain_epoch::{
