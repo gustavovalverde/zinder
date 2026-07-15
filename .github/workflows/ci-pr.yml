@@ -130,6 +130,34 @@ jobs:
               --profile rocksdb \
               config >/dev/null
 
+      - name: Test deployment Compose contract
+        env:
+          ZINDER_INGEST_IMAGE: zinder-ingest:ci-proof
+          ZINDER_QUERY_IMAGE: zinder-query:ci-proof
+          ZINDER_EXPLORER_IMAGE: zinder-explorer:ci-proof
+          ZINDER_CANONICAL_VOLUME_NAME: zinder-ci-proof-canonical
+          ZINDER_PROMETHEUS_VOLUME_NAME: zinder-ci-proof-prometheus
+          ZINDER_GRAFANA_VOLUME_NAME: zinder-ci-proof-grafana
+          ZINDER_OBSERVABILITY_NETWORK_NAME: zinder-ci-proof-observability
+        run: |
+          docker compose \
+            --env-file deploy/.env.testnet \
+            -f deploy/docker-compose.yml \
+            --profile observability \
+            config --format json \
+          | jq -e '
+              .services["zinder-ingest"].command == ["--config", "/etc/zinder/config.toml"]
+              and .services["zinder-query"].command == ["--config", "/etc/zinder/config.toml"]
+              and .services["zinder-explorer"].command == ["--config", "/etc/zinder/config.toml"]
+              and .services["zinder-ingest"].image == "zinder-ingest:ci-proof"
+              and .services["zinder-query"].image == "zinder-query:ci-proof"
+              and .services["zinder-explorer"].image == "zinder-explorer:ci-proof"
+              and .volumes.data.name == "zinder-ci-proof-canonical"
+              and .volumes.prometheus.name == "zinder-ci-proof-prometheus"
+              and .volumes.grafana.name == "zinder-ci-proof-grafana"
+              and .networks.observability.name == "zinder-ci-proof-observability"
+            '
+
       - name: Test PostgreSQL resource observer chain
         env:
           ZINDER_BENCH_IMAGE: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
