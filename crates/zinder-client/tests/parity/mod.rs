@@ -15,6 +15,8 @@ use zinder_client::{
     TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_core::{ChainTipMetadata, SUBTREE_LEAF_COUNT};
+use zinder_derive::TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME;
+use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition};
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, StoreFixture, open_test_derive_store_for_canonical,
     sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
@@ -98,6 +100,18 @@ fn transparent_address_history_fixture() -> eyre::Result<TransparentAddressHisto
     let store_fixture = committed_store_fixture(&chain_fixture)?;
     let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     seed_transparent_address_transaction_history(&derive_store, std::slice::from_ref(&tx_history))?;
+    let projection_cursor = store_fixture
+        .chain_store()
+        .resolve_chain_event_stream_start(
+            &EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Tip,
+        )?
+        .cursor
+        .ok_or_else(|| eyre::eyre!("committed fixture must expose a live-tail cursor"))?;
+    derive_store.put_chain_event_cursor(
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+        projection_cursor.as_bytes(),
+    )?;
     Ok(TransparentAddressHistoryFixture {
         store_fixture,
         derive_store,
