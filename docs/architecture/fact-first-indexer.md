@@ -491,14 +491,14 @@ are ancestors of `main` or their rejected status is recorded here.
 - add benchmark fixtures for the transparent-input stress anchors, NU5
   boundary, heavy Sapling and Orchard anchors, and sandblasting end boundary.
 
-### 2. Introduce canonical schema vNext
+### 2. Introduce canonical schema version 1
 
-- retain the schema-19 RocksDB tracer that persists the independently
-  versioned `CanonicalBlockFacts` replay envelope atomically with each epoch;
+- promote the validated version-1 `CanonicalBlockFacts` and replay contracts
+  into the concrete RocksDB canonical store;
 - stop writing canonical address, live-output, and spent-output read models;
 - remove cross-block prevout reads from canonical preparation;
-- keep the existing canonical schema readable only for controlled export or
-  rebuild tooling; and
+- require the new `canonical` identity on a physically empty path and refuse
+  every previous store without mutation or export compatibility; and
 - validate the new schema from a fresh volume rather than attempting an
   in-place mainnet rewrite.
 
@@ -523,12 +523,12 @@ are ancestors of `main` or their rejected status is recorded here.
 - preserve Cipherscan-owned market, label, name, and product concerns at the
   compatibility edge.
 
-### 5. Validate the complete lifecycle
+### 5. Validate the version-1 lifecycle
 
 Acceptance is a fresh mainnet replay, not a synthetic microbenchmark alone:
 
-- canonical catchup crosses every workload anchor with legacy `zinder-derive`
-  replay and historical work closed;
+- canonical catchup crosses every workload anchor without legacy projection
+  execution or historical prevout state;
 - canonical throughput no longer correlates with store-backed historical
   prevout requests because that metric is zero in canonical ingest;
 - wallet replay crosses the transparent-input and sandblasting ranges without

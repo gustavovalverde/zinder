@@ -70,12 +70,12 @@ Every persisted contract introduced by this architecture starts at version 1:
 canonical RocksDB and PostgreSQL, wallet projection, explorer projection,
 canonical fact digest, replay envelope, backup manifest, fixture, benchmark
 report, and physical candidate schema. This is a clean identity reset, not a
-numeric rename. Each store records its domain identity (`canonical`, `wallet
-projection`, or `explorer projection`) and exact format version before any
-column family or table is created. A non-empty path without that identity, or
-with any version other than 1, is refused without mutation. Previous stores,
-backups, fixtures, and reports are intentionally unsupported and must be
-rebuilt or recaptured.
+numeric rename. Persisted domain identities are `canonical`, `wallet`,
+`explorer`, and `state-bundle`; each record carries its exact format version
+and network before any data column family or table is created. A non-empty path
+without the expected identity, or with any version other than 1, is refused
+without mutation. Previous stores, backups, fixtures, and reports are
+intentionally unsupported and must be rebuilt or recaptured.
 
 The current ingest path parses a source block's serialized header prefix first
 so bulk catchup can validate identity and parent links without deserializing
