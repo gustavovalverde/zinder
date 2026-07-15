@@ -42,8 +42,8 @@ pub use bulk_catchup::{
     run_bulk_catchup_with_store,
 };
 pub use canonical_construction::{
-    CanonicalConstructionConfig, CanonicalConstructionError, CanonicalReplayLoadOutcome,
-    load_fresh_canonical_block_replay,
+    CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
+    load_fresh_canonical_blocks,
 };
 pub use chain_ingest::{
     DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,

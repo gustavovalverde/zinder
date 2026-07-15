@@ -6,11 +6,17 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use prost::Message;
+use rust_rocksdb::{DB, Options};
 use tempfile::TempDir;
-use zinder_core::{BlockHeight, BlockId, Network};
-use zinder_ingest::{
-    CanonicalConstructionConfig, CanonicalConstructionError, load_fresh_canonical_block_replay,
+use zinder_core::{
+    BlockHeight, BlockId, ChainTipMetadata, Network, wire::encode_height_key_ascending,
 };
+use zinder_ingest::{
+    CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
+    load_fresh_canonical_blocks,
+};
+use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError,
@@ -21,7 +27,7 @@ use zinder_store::{
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-use super::fixture_block::fixture_source_block;
+use super::fixture_block::{fixture_ironwood_source_block, fixture_source_block};
 
 #[derive(Clone)]
 struct SingleBlockSource {
@@ -64,7 +70,130 @@ impl NodeSource for SingleBlockSource {
 }
 
 #[tokio::test]
-async fn canonical_replay_reaches_fixed_source_tip_without_wallet_state_writes()
+async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (temporary, store_path, outcome, expected_tip_metadata) =
+        load_ironwood_fixture(CanonicalStoreWorkload::Wallet).await?;
+    let CanonicalBlockLoadOutcome { builder, evidence } = outcome;
+
+    assert_eq!(evidence.block_count, 1);
+    assert_eq!(evidence.block_header_count, 1);
+    assert_eq!(evidence.block_hash_index_count, 1);
+    assert_eq!(evidence.block_replay_count, 1);
+    assert_eq!(evidence.compact_block_count, 1);
+    assert!(evidence.transaction_location_count > 0);
+    assert_eq!(
+        evidence.transaction_blob_count,
+        evidence.transaction_location_count
+    );
+    assert_eq!(evidence.block_blob_count, 0);
+    assert_eq!(evidence.tip_metadata, expected_tip_metadata);
+    drop(builder);
+
+    let compact_block = read_compact_block(&store_path, evidence.tip_height)?;
+    let compact_metadata = compact_block
+        .chain_metadata
+        .ok_or("persisted compact block must carry chain metadata")?;
+    assert_eq!(compact_metadata.sapling_commitment_tree_size, 11);
+    assert_eq!(compact_metadata.orchard_commitment_tree_size, 22);
+    assert_eq!(compact_metadata.ironwood_commitment_tree_size, 35);
+
+    let error = RocksDbCanonicalStore::open_ready(
+        &store_path,
+        Network::ZcashRegtest,
+        CanonicalStoreWorkload::Wallet,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or("block-local canonical construction must remain BUILDING")?;
+    assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
+    assert!(!temporary.path().join("derive").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn explorer_canonical_blocks_add_block_blob_retention()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temporary, _store_path, outcome, expected_tip_metadata) =
+        load_ironwood_fixture(CanonicalStoreWorkload::Explorer).await?;
+
+    assert_eq!(outcome.evidence.block_count, 1);
+    assert_eq!(outcome.evidence.block_blob_count, 1);
+    assert!(outcome.evidence.transaction_location_count > 0);
+    assert_eq!(
+        outcome.evidence.transaction_blob_count,
+        outcome.evidence.transaction_location_count
+    );
+    assert_eq!(outcome.evidence.tip_metadata, expected_tip_metadata);
+    Ok(())
+}
+
+async fn load_ironwood_fixture(
+    workload: CanonicalStoreWorkload,
+) -> Result<
+    (
+        TempDir,
+        std::path::PathBuf,
+        CanonicalBlockLoadOutcome,
+        ChainTipMetadata,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let source_block = fixture_ironwood_source_block()?;
+    let predecessor_height = source_block
+        .height
+        .value()
+        .checked_sub(1)
+        .map(BlockHeight::new)
+        .ok_or("fixture must have a predecessor")?;
+    let checkpoint = BlockId::new(predecessor_height, source_block.parent_hash);
+    let predecessor_tip_metadata = ChainTipMetadata::new(11, 22, 33);
+    let expected_tip_metadata = ChainTipMetadata::new(11, 22, 35);
+    let fixed_tip = BlockId::new(source_block.height, source_block.hash);
+    let build_plan = CanonicalStoreBuildPlan::checkpointed(
+        Network::ZcashRegtest,
+        checkpoint,
+        predecessor_tip_metadata,
+        fixed_tip,
+    )?;
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let builder = RocksDbCanonicalBuilder::create_fresh(
+        &store_path,
+        workload,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let source = SingleBlockSource {
+        block: source_block,
+        expected_predecessor: checkpoint,
+    };
+    let config = CanonicalConstructionConfig::for_local_tests(
+        Duration::from_secs(5),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
+    Ok((temporary, store_path, outcome, expected_tip_metadata))
+}
+
+fn read_compact_block(
+    store_path: &std::path::Path,
+    height: BlockHeight,
+) -> Result<CompactBlock, Box<dyn std::error::Error>> {
+    let column_families = DB::list_cf(&Options::default(), store_path)?;
+    let database =
+        DB::open_cf_for_read_only(&Options::default(), store_path, &column_families, false)?;
+    let compact_blocks = database
+        .cf_handle("compact_block")
+        .ok_or("fresh store must contain the compact-block column family")?;
+    let payload_bytes = database
+        .get_cf(&compact_blocks, encode_height_key_ascending(height))?
+        .ok_or("fresh store must contain the tip compact block")?;
+    Ok(CompactBlock::decode(payload_bytes.as_slice())?)
+}
+
+#[tokio::test]
+async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_block = fixture_source_block()?;
     assert_eq!(source_block.height, BlockHeight::new(1));
@@ -91,12 +220,19 @@ async fn canonical_replay_reaches_fixed_source_tip_without_wallet_state_writes()
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let outcome = load_fresh_canonical_block_replay(builder, &source, config).await?;
+    let outcome = load_fresh_canonical_blocks(builder, &source, config).await?;
     assert_eq!(outcome.builder.build_plan().build_tip(), fixed_tip);
     assert_eq!(outcome.evidence.block_count, 1);
     assert_eq!(outcome.evidence.tip_height, fixed_tip.height);
     assert_eq!(outcome.evidence.tip_hash, fixed_tip.hash);
-    assert!(outcome.evidence.logical_replay_bytes > 0);
+    assert_eq!(outcome.evidence.block_header_count, 1);
+    assert_eq!(outcome.evidence.block_replay_count, 1);
+    assert_eq!(outcome.evidence.compact_block_count, 1);
+    assert_eq!(
+        outcome.evidence.transaction_location_count,
+        outcome.evidence.transaction_blob_count
+    );
+    assert!(outcome.evidence.logical_bytes > 0);
     assert!(outcome.evidence.sst_file_bytes > 0);
     drop(outcome.builder);
 
@@ -107,7 +243,7 @@ async fn canonical_replay_reaches_fixed_source_tip_without_wallet_state_writes()
         RocksDbResourceBudget::for_local_tests(),
     )
     .err()
-    .ok_or("replay-only construction must remain BUILDING")?;
+    .ok_or("block-family construction must remain BUILDING")?;
     assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
 
     let column_families =
@@ -153,7 +289,7 @@ async fn canonical_construction_rejects_source_blocks_from_another_network()
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let error = load_fresh_canonical_block_replay(builder, &source, config)
+    let error = load_fresh_canonical_blocks(builder, &source, config)
         .await
         .err()
         .ok_or("wrong-network source block must be rejected")?;

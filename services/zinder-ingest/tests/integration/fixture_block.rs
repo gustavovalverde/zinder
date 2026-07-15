@@ -633,6 +633,13 @@ pub(super) fn fixture_source_block() -> Result<SourceBlock, Box<dyn Error>> {
     )
 }
 
+pub(super) fn fixture_ironwood_source_block() -> Result<SourceBlock, Box<dyn Error>> {
+    fixture_source_block_from(
+        Network::ZcashRegtest,
+        include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
+    )
+}
+
 fn fixture_source_block_from(
     network: Network,
     fixture_json: &str,

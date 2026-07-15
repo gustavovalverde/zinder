@@ -17,14 +17,21 @@ use futures_util::{
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use zinder_core::{BlockHeight, CanonicalBlockReplayEnvelope, Network, NetworkUpgradeActivations};
+use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations};
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{
-    CanonicalBlockReplayLoadEvidence, CanonicalStoreBuildError, CanonicalStoreError,
-    RocksDbCanonicalBuilder,
+    CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalStoreBuildError, CanonicalStoreError,
+    CanonicalStoreWorkload, RocksDbCanonicalBuilder,
 };
 
-use crate::{RawBlobPolicy, artifact_builder::prepare_canonical_block, chain_ingest::IngestError};
+use crate::{
+    RawBlobPolicy,
+    artifact_builder::{
+        CommitmentTreeSizes, PositionedCanonicalBlock, PreparedCanonicalBlock, RetainedRawBlobs,
+        position_canonical_block, prepare_canonical_block,
+    },
+    chain_ingest::IngestError,
+};
 use source_fetch::{
     CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
 };
@@ -50,7 +57,7 @@ pub struct CanonicalConstructionConfig {
     pub source_fetch_max_in_flight_bytes: NonZeroU64,
     /// Maximum canonical block preparations in flight.
     pub block_prepare_concurrency: NonZeroU32,
-    /// Aggregate byte watermark for block preparation and queued replay envelopes.
+    /// Aggregate byte watermark for block preparation and queued canonical blocks.
     pub block_prepare_memory_watermark_bytes: NonZeroU64,
     /// Node-discovered consensus upgrade activations used to parse transaction facts.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
@@ -117,43 +124,59 @@ pub enum CanonicalConstructionError {
         source_network: Network,
     },
     /// The blocking SST loader task could not complete.
-    #[error("canonical replay loader task failed: {reason}")]
+    #[error("canonical loader task failed: {reason}")]
     LoaderTaskFailed {
         /// Tokio blocking-task failure.
         reason: String,
     },
 }
 
-/// Validated result of loading canonical replay into a fresh unpublished store.
-pub struct CanonicalReplayLoadOutcome {
-    /// Exclusive builder retained for subsequent canonical family loads.
+/// Result of staging and ingesting block-local families into a fresh store.
+pub struct CanonicalBlockLoadOutcome {
+    /// Exclusive builder retained for subsequent source and publication families.
     pub builder: RocksDbCanonicalBuilder,
-    /// Exact persisted and cache-bypassing readback evidence for replay facts.
-    pub evidence: CanonicalBlockReplayLoadEvidence,
+    /// Prepared row counts and SST measurements accepted by `RocksDB`.
+    ///
+    /// Cache-bypassing family readback remains a separate prerequisite for
+    /// publishing this build as `READY`.
+    pub evidence: CanonicalBlockLoadEvidence,
 }
 
-/// Loads the replay family of one fresh canonical build from an ordered source pass.
+/// Loads every block-local canonical family from one ordered source pass.
 ///
-/// Source fetching and block-local preparation are asynchronous and bounded.
-/// A single blocking consumer owns the non-reopenable builder and feeds a
-/// fallible iterator into atomic SST ingestion. This replay-only tracer leaves
-/// the store in `BUILDING`; later construction stages must load and validate
-/// every remaining canonical family before publishing `READY`.
-pub async fn load_fresh_canonical_block_replay<Source>(
+/// Parallel preparation parses each source block exactly once. The blocking
+/// store consumer performs ordered commitment-tree positioning immediately
+/// before it fans the owned build block into the canonical column families.
+/// The store remains `BUILDING` until the remaining source-observed families
+/// and baseline publication records are loaded and validated.
+pub async fn load_fresh_canonical_blocks<Source>(
     builder: RocksDbCanonicalBuilder,
     source: &Source,
     config: CanonicalConstructionConfig,
-) -> Result<CanonicalReplayLoadOutcome, CanonicalConstructionError>
+) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError>
 where
     Source: NodeSource + Clone,
 {
     let build_plan = builder.build_plan();
+    let workload = builder.workload();
     validate_construction_network(build_plan.network(), &config)?;
-    let replay_queue_capacity = usize::try_from(config.block_prepare_concurrency.get())
+    let block_queue_capacity = usize::try_from(config.block_prepare_concurrency.get())
         .unwrap_or(usize::MAX)
         .max(1);
-    let prepared_replays = build_prepared_replay_stream(source, build_plan, &config);
-    drive_replay_loader(builder, prepared_replays, replay_queue_capacity).await
+    let prepared_blocks = build_prepared_block_stream(
+        source,
+        build_plan,
+        &config,
+        raw_blob_policy_for_workload(workload),
+    );
+    drive_block_loader(builder, prepared_blocks, block_queue_capacity).await
+}
+
+const fn raw_blob_policy_for_workload(workload: CanonicalStoreWorkload) -> RawBlobPolicy {
+    match workload {
+        CanonicalStoreWorkload::Wallet => RawBlobPolicy::Transactions,
+        CanonicalStoreWorkload::Explorer => RawBlobPolicy::All,
+    }
 }
 
 fn validate_construction_network(
@@ -261,11 +284,12 @@ fn admit_source_blocks(
     })
 }
 
-fn build_prepared_replay_stream<'source, Source>(
+fn build_prepared_block_stream<'source, Source>(
     source: &'source Source,
     build_plan: zinder_store::CanonicalStoreBuildPlan,
     config: &CanonicalConstructionConfig,
-) -> impl Stream<Item = Result<QueuedReplayEnvelope, CanonicalConstructionError>>
+    raw_blob_policy: RawBlobPolicy,
+) -> impl Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>>
 + Send
 + use<'source, Source>
 where
@@ -317,7 +341,7 @@ where
                 memory_permit,
             } = admitted_source_block?;
             let prepared = tokio::task::spawn_blocking(move || {
-                prepare_canonical_block(&source_block, &activations, RawBlobPolicy::None)
+                prepare_canonical_block(&source_block, &activations, raw_blob_policy)
                     .map_err(IngestError::from)
             })
             .await
@@ -327,53 +351,59 @@ where
                 },
             })?
             .map_err(|source| CanonicalConstructionError::Source { source })?;
-            Ok(QueuedReplayEnvelope::from_replay(
-                prepared.replay_envelope,
+            Ok(QueuedPreparedBlock {
+                prepared,
                 memory_permit,
-            ))
+            })
         }
     })
     .buffered(prepare_concurrency)
 }
 
-async fn drive_replay_loader<PreparedReplays>(
+struct QueuedPreparedBlock {
+    prepared: PreparedCanonicalBlock,
+    memory_permit: OwnedSemaphorePermit,
+}
+
+async fn drive_block_loader<PreparedBlocks>(
     builder: RocksDbCanonicalBuilder,
-    prepared_replays: PreparedReplays,
-    replay_queue_capacity: usize,
-) -> Result<CanonicalReplayLoadOutcome, CanonicalConstructionError>
+    prepared_blocks: PreparedBlocks,
+    block_queue_capacity: usize,
+) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError>
 where
-    PreparedReplays: Stream<Item = Result<QueuedReplayEnvelope, CanonicalConstructionError>> + Send,
+    PreparedBlocks: Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>> + Send,
 {
-    let (replay_sender, replay_receiver) = mpsc::channel(replay_queue_capacity);
+    let build_plan = builder.build_plan();
+    let (block_sender, block_receiver) = mpsc::channel(block_queue_capacity);
     let loader_task = tokio::task::spawn_blocking(move || {
         let mut builder = builder;
+        let mut build_blocks = CanonicalBuildBlockReceiver::new(
+            block_receiver,
+            CommitmentTreeSizes::from_tip_metadata(build_plan.history_predecessor_tip_metadata()),
+        );
         let evidence = builder
-            .bulk_load_block_replay(ReplayEnvelopeReceiver::new(replay_receiver))
+            .bulk_load_blocks(&mut build_blocks)
             .map_err(canonical_build_error)?;
-        Ok(CanonicalReplayLoadOutcome { builder, evidence })
+        drop(build_blocks);
+        Ok(CanonicalBlockLoadOutcome { builder, evidence })
     });
 
-    let mut prepared_replays = Box::pin(prepared_replays);
-    while let Some(prepared_replay) = prepared_replays.next().await {
-        match prepared_replay {
-            Ok(queued_replay) => {
-                if replay_sender.send(queued_replay).await.is_err() {
+    let mut prepared_blocks = Box::pin(prepared_blocks);
+    while let Some(prepared_block) = prepared_blocks.next().await {
+        match prepared_block {
+            Ok(queued_block) => {
+                if block_sender.send(Ok(queued_block)).await.is_err() {
                     break;
                 }
             }
             Err(source) => {
-                let _ = replay_sender
-                    .send(QueuedReplayEnvelope {
-                        replay_envelope: Err(source),
-                        memory_permit: None,
-                    })
-                    .await;
+                let _ = block_sender.send(Err(source)).await;
                 break;
             }
         }
     }
-    drop(prepared_replays);
-    drop(replay_sender);
+    drop(prepared_blocks);
+    drop(block_sender);
 
     loader_task
         .await
@@ -382,45 +412,69 @@ where
         })?
 }
 
-struct QueuedReplayEnvelope {
-    replay_envelope: Result<CanonicalBlockReplayEnvelope, CanonicalConstructionError>,
-    memory_permit: Option<OwnedSemaphorePermit>,
-}
-
-impl QueuedReplayEnvelope {
-    fn from_replay(
-        replay_envelope: CanonicalBlockReplayEnvelope,
-        memory_permit: OwnedSemaphorePermit,
-    ) -> Self {
-        Self {
-            replay_envelope: Ok(replay_envelope),
-            memory_permit: Some(memory_permit),
-        }
-    }
-}
-
-struct ReplayEnvelopeReceiver {
-    receiver: mpsc::Receiver<QueuedReplayEnvelope>,
+struct CanonicalBuildBlockReceiver {
+    receiver: mpsc::Receiver<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
     active_memory_permit: Option<OwnedSemaphorePermit>,
+    running_tree_sizes: CommitmentTreeSizes,
 }
 
-impl ReplayEnvelopeReceiver {
-    fn new(receiver: mpsc::Receiver<QueuedReplayEnvelope>) -> Self {
+impl CanonicalBuildBlockReceiver {
+    fn new(
+        receiver: mpsc::Receiver<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
+        running_tree_sizes: CommitmentTreeSizes,
+    ) -> Self {
         Self {
             receiver,
             active_memory_permit: None,
+            running_tree_sizes,
         }
     }
 }
 
-impl Iterator for ReplayEnvelopeReceiver {
-    type Item = Result<CanonicalBlockReplayEnvelope, CanonicalConstructionError>;
+impl Iterator for CanonicalBuildBlockReceiver {
+    type Item = Result<CanonicalBuildBlock, CanonicalConstructionError>;
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the received block's memory permit moves into queued_block and stays active through the store write"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         self.active_memory_permit = None;
-        let queued_replay = self.receiver.blocking_recv()?;
-        self.active_memory_permit = queued_replay.memory_permit;
-        Some(queued_replay.replay_envelope)
+        let received = self.receiver.blocking_recv()?;
+        let queued_block = match received {
+            Ok(queued_block) => queued_block,
+            Err(source) => return Some(Err(source)),
+        };
+        self.active_memory_permit = Some(queued_block.memory_permit);
+        Some(
+            position_canonical_block(queued_block.prepared, &mut self.running_tree_sizes)
+                .map(canonical_build_block)
+                .map_err(|source| CanonicalConstructionError::Source {
+                    source: IngestError::from(source),
+                }),
+        )
+    }
+}
+
+fn canonical_build_block(positioned: PositionedCanonicalBlock) -> CanonicalBuildBlock {
+    let PositionedCanonicalBlock {
+        facts,
+        replay_envelope,
+        retained_raw_blobs,
+        compact_block,
+        tip_metadata,
+    } = positioned;
+    let RetainedRawBlobs {
+        block_blob,
+        transaction_blobs,
+    } = retained_raw_blobs;
+    CanonicalBuildBlock {
+        facts,
+        replay_envelope,
+        compact_block,
+        tip_metadata,
+        transaction_blobs,
+        block_blob,
     }
 }
 
