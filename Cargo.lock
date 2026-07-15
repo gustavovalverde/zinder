@@ -5997,6 +5997,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinder-wallet-projection"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "zinder-core",
+]
+
+[[package]]
 name = "zip32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
