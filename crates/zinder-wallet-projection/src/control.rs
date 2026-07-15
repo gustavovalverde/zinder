@@ -121,6 +121,8 @@ pub struct WalletProjectionCheckpointReference {
     pub checkpoint_id: WalletProjectionCheckpointId,
     /// Exact source position represented by the checkpoint.
     pub position: WalletProjectionPosition,
+    /// Resumable canonical prefix admitted from the checkpoint manifest.
+    pub source_sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
 /// Starting state for a fresh wallet projection build.
@@ -351,9 +353,11 @@ fn encode_build_plan(
     match &plan.base {
         WalletProjectionBuildBase::CompleteHistory => bytes.push(1),
         WalletProjectionBuildBase::ZinderCheckpoint(checkpoint) => {
+            validate_checkpoint_reference(checkpoint)?;
             bytes.push(2);
             bytes.extend_from_slice(&checkpoint.checkpoint_id.as_bytes());
             encode_position(&checkpoint.position, bytes)?;
+            encode_source_sequence_digest(checkpoint.source_sequence_digest, bytes);
         }
     }
     encode_position(&plan.target, bytes)
@@ -395,15 +399,7 @@ fn encode_ready_evidence(
             .to_be_bytes(),
     );
     bytes.extend_from_slice(&evidence.coverage.last_projected_block.hash.as_bytes());
-    bytes.extend_from_slice(
-        &evidence
-            .source_sequence_digest
-            .version()
-            .value()
-            .to_be_bytes(),
-    );
-    bytes.extend_from_slice(&evidence.source_sequence_digest.block_count().to_be_bytes());
-    bytes.extend_from_slice(&evidence.source_sequence_digest.as_bytes());
+    encode_source_sequence_digest(evidence.source_sequence_digest, bytes);
     bytes.extend_from_slice(&evidence.projection_digest.as_bytes());
     let counts = evidence.row_counts;
     bytes.extend_from_slice(&counts.live_output_count.to_be_bytes());
@@ -438,6 +434,11 @@ fn validate_ready_evidence(
     if evidence.row_counts.live_output_count != evidence.utxo_summary.utxo_count {
         return Err(WalletProjectionContractError::ReadyUtxoCountMismatch);
     }
+    if evidence.source_sequence_digest.version().value()
+        != REQUIRED_CANONICAL_SEQUENCE_DIGEST_VERSION
+    {
+        return Err(WalletProjectionContractError::ReadySourceSequenceVersionMismatch);
+    }
     if evidence.source_sequence_digest.block_count()
         != u64::from(evidence.position.tip.height.value())
     {
@@ -447,6 +448,28 @@ fn validate_ready_evidence(
         return Err(WalletProjectionContractError::ReadyUtxoCommitmentSchemeMismatch);
     }
     Ok(())
+}
+
+fn validate_checkpoint_reference(
+    checkpoint: &WalletProjectionCheckpointReference,
+) -> Result<(), WalletProjectionContractError> {
+    if checkpoint.source_sequence_digest.version().value()
+        != REQUIRED_CANONICAL_SEQUENCE_DIGEST_VERSION
+    {
+        return Err(WalletProjectionContractError::CheckpointSourceSequenceVersionMismatch);
+    }
+    if checkpoint.source_sequence_digest.block_count()
+        != u64::from(checkpoint.position.tip.height.value())
+    {
+        return Err(WalletProjectionContractError::CheckpointSourceSequenceLengthMismatch);
+    }
+    Ok(())
+}
+
+fn encode_source_sequence_digest(digest: CanonicalBlockFactsSequenceDigest, bytes: &mut Vec<u8>) {
+    bytes.extend_from_slice(&digest.version().value().to_be_bytes());
+    bytes.extend_from_slice(&digest.block_count().to_be_bytes());
+    bytes.extend_from_slice(&digest.as_bytes());
 }
 
 #[cfg(test)]
@@ -552,6 +575,45 @@ mod tests {
                 "00000002",
                 "feff"
             )
+        );
+    }
+
+    #[test]
+    fn checkpoint_build_control_commits_to_resumable_source_prefix() {
+        let checkpoint_digest = sequence_digest(1);
+        let checkpoint = WalletProjectionCheckpointReference {
+            checkpoint_id: WalletProjectionCheckpointId::from_bytes([0x99; 32]),
+            position: sample_position(1),
+            source_sequence_digest: checkpoint_digest,
+        };
+        let control = sample_control(WalletProjectionBuildState::Building(
+            WalletProjectionBuildPlan::from_zinder_checkpoint(checkpoint, sample_position(2)),
+        ));
+        let encoded = control
+            .encode()
+            .unwrap_or_else(|error| unreachable!("valid checkpoint build control: {error}"));
+        let mut encoded_prefix = Vec::new();
+        encode_source_sequence_digest(checkpoint_digest, &mut encoded_prefix);
+        assert!(
+            encoded
+                .windows(encoded_prefix.len())
+                .any(|window| window == encoded_prefix)
+        );
+
+        let invalid_checkpoint = WalletProjectionCheckpointReference {
+            checkpoint_id: WalletProjectionCheckpointId::from_bytes([0x99; 32]),
+            position: sample_position(1),
+            source_sequence_digest: sequence_digest(0),
+        };
+        let invalid_control = sample_control(WalletProjectionBuildState::Building(
+            WalletProjectionBuildPlan::from_zinder_checkpoint(
+                invalid_checkpoint,
+                sample_position(2),
+            ),
+        ));
+        assert_eq!(
+            invalid_control.encode(),
+            Err(WalletProjectionContractError::CheckpointSourceSequenceLengthMismatch)
         );
     }
 

@@ -313,7 +313,7 @@ fn canonical_block_facts_digest_is_stable_and_content_sensitive() -> Result<(), 
     );
     assert_eq!(
         hex::encode(reference_sequence_digest.as_bytes()),
-        "190c5e61f0e1c7938fe64429c0cd30e6f62aa347b38f2d9d97925e7a273017c5"
+        "ed2a1aad9e6f996361f05f507b02f4ed8a7da714ad02ebaf81747cccea6f5170"
     );
 
     let mut repeated_builder = CanonicalBlockFactsSequenceDigestBuilder::new(

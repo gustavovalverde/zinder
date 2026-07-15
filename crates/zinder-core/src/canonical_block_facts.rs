@@ -219,11 +219,11 @@ impl CanonicalBlockFactsReferenceEncoding {
     }
 }
 
-/// Ordered digest of a complete canonical fact sequence.
+/// Resumable ordered digest of a canonical fact sequence.
 ///
-/// The digest commits to the item count and to each per-block digest's version
-/// and bytes in append order. It can therefore compare a storage candidate
-/// with a serial reference without retaining every block digest in memory.
+/// The digest is a SHA-256 hash-chain state that commits to each per-block
+/// digest's position, version, and bytes. A validated Zinder checkpoint can
+/// resume this state without replaying the checkpoint's complete prefix.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CanonicalBlockFactsSequenceDigest {
     version: CanonicalBlockFactsSequenceDigestVersion,
@@ -232,6 +232,24 @@ pub struct CanonicalBlockFactsSequenceDigest {
 }
 
 impl CanonicalBlockFactsSequenceDigest {
+    /// Reconstructs an admitted Zinder checkpoint prefix.
+    ///
+    /// The caller must first validate the enclosing store or checkpoint
+    /// identity, version, source anchor, block count, and integrity proof.
+    /// This constructor does not replay the prefix.
+    #[must_use]
+    pub const fn from_admitted_checkpoint_parts(
+        version: CanonicalBlockFactsSequenceDigestVersion,
+        block_count: u64,
+        bytes: [u8; 32],
+    ) -> Self {
+        Self {
+            version,
+            block_count,
+            bytes,
+        }
+    }
+
     /// Returns the ordered-sequence algorithm version committed by this digest.
     #[must_use]
     pub const fn version(self) -> CanonicalBlockFactsSequenceDigestVersion {
@@ -255,7 +273,7 @@ impl CanonicalBlockFactsSequenceDigest {
 #[derive(Clone, Debug)]
 pub struct CanonicalBlockFactsSequenceDigestBuilder {
     sequence_version: CanonicalBlockFactsSequenceDigestVersion,
-    ordered_item_hasher: Sha256,
+    sequence_digest: [u8; 32],
     block_count: u64,
 }
 
@@ -268,16 +286,26 @@ impl CanonicalBlockFactsSequenceDigestBuilder {
     /// Starts an empty ordered sequence digest using an explicit algorithm version.
     #[must_use]
     pub fn new(sequence_version: CanonicalBlockFactsSequenceDigestVersion) -> Self {
-        let mut ordered_item_hasher = Sha256::new();
-        match sequence_version {
-            CanonicalBlockFactsSequenceDigestVersion::V1 => {
-                ordered_item_hasher.update(SEQUENCE_ITEM_DOMAIN);
-            }
-        }
+        let sequence_digest = match sequence_version {
+            CanonicalBlockFactsSequenceDigestVersion::V1 => sha256_domain_and_bytes(
+                SEQUENCE_DIGEST_DOMAIN,
+                &sequence_version.value().to_le_bytes(),
+            ),
+        };
         Self {
             sequence_version,
-            ordered_item_hasher,
+            sequence_digest,
             block_count: 0,
+        }
+    }
+
+    /// Resumes appending after an admitted Zinder sequence checkpoint.
+    #[must_use]
+    pub const fn resume_from_prefix(prefix: CanonicalBlockFactsSequenceDigest) -> Self {
+        Self {
+            sequence_version: prefix.version,
+            sequence_digest: prefix.bytes,
+            block_count: prefix.block_count,
         }
     }
 
@@ -291,11 +319,12 @@ impl CanonicalBlockFactsSequenceDigestBuilder {
             .checked_add(1)
             .ok_or(CanonicalBlockFactsSequenceLengthOverflow)?;
         let CanonicalBlockFactsDigest { version, bytes } = digest;
-        let mut block_digest_encoding = TaggedFactsEncoder::new();
-        block_digest_encoding.field(1, &version.value().to_le_bytes());
-        block_digest_encoding.field(2, &bytes);
-        self.ordered_item_hasher
-            .update(block_digest_encoding.into_bytes());
+        let mut sequence_step = TaggedFactsEncoder::new();
+        sequence_step.field(1, &self.sequence_digest);
+        sequence_step.field(2, &next_block_count.to_le_bytes());
+        sequence_step.field(3, &version.value().to_le_bytes());
+        sequence_step.field(4, &bytes);
+        self.sequence_digest = sha256_domain_and_fields(SEQUENCE_ITEM_DOMAIN, sequence_step);
         self.block_count = next_block_count;
         Ok(())
     }
@@ -305,19 +334,13 @@ impl CanonicalBlockFactsSequenceDigestBuilder {
     pub fn finish(self) -> CanonicalBlockFactsSequenceDigest {
         let Self {
             sequence_version,
-            ordered_item_hasher,
+            sequence_digest,
             block_count,
         } = self;
-        let ordered_item_digest: [u8; 32] = ordered_item_hasher.finalize().into();
-        let mut sequence = TaggedFactsEncoder::new();
-        sequence.field(1, &sequence_version.value().to_le_bytes());
-        sequence.field(2, &block_count.to_le_bytes());
-        sequence.field(3, &ordered_item_digest);
-
         CanonicalBlockFactsSequenceDigest {
             version: sequence_version,
             block_count,
-            bytes: sha256_domain_and_fields(SEQUENCE_DIGEST_DOMAIN, sequence),
+            bytes: sequence_digest,
         }
     }
 }
@@ -733,8 +756,9 @@ impl TaggedFactsEncoder {
 mod tests {
     use super::{
         CanonicalBlockFacts, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
-        CanonicalBlockFactsReferenceEncoding, CanonicalBlockFactsSequenceDigestBuilder,
-        CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockFactsSequenceLengthOverflow,
+        CanonicalBlockFactsReferenceEncoding, CanonicalBlockFactsSequenceDigest,
+        CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+        CanonicalBlockFactsSequenceLengthOverflow,
     };
     use crate::{BlockHash, BlockHeaderArtifact, BlockHeight, SerializedBytesDigest};
 
@@ -804,6 +828,55 @@ mod tests {
             Err(CanonicalBlockFactsSequenceLengthOverflow)
         );
         assert_eq!(builder.finish(), before_append);
+    }
+
+    #[test]
+    fn sequence_digest_v1_matches_known_answers_and_resumes_at_every_split() {
+        let version = CanonicalBlockFactsSequenceDigestVersion::V1;
+        let first = CanonicalBlockFactsDigest::from_reference_encoding(
+            CanonicalBlockFactsDigestVersion::V1,
+            b"first",
+        );
+        let second = CanonicalBlockFactsDigest::from_reference_encoding(
+            CanonicalBlockFactsDigestVersion::V1,
+            b"second",
+        );
+        let digests = [first, second];
+        let mut known_answer_builder = CanonicalBlockFactsSequenceDigestBuilder::new(version);
+        assert_eq!(
+            hex::encode(known_answer_builder.clone().finish().as_bytes()),
+            "38f5f30dc6f68378a238c24b6e816bdf9c73783fdd07d6bd149dbfba41ecc3ca"
+        );
+        assert!(known_answer_builder.try_append(first).is_ok());
+        assert_eq!(
+            hex::encode(known_answer_builder.clone().finish().as_bytes()),
+            "7c6ba3c2a4c9742dfcd137cd0f4f67aada0595b59d53b366e34c3089e4845d92"
+        );
+        assert!(known_answer_builder.try_append(second).is_ok());
+        let complete_digest = known_answer_builder.finish();
+        assert_eq!(
+            hex::encode(complete_digest.as_bytes()),
+            "617127199fc8e94e21802af628b3680834442e4d9ad269bd3c0391851e4aac04"
+        );
+
+        for split in 0..=digests.len() {
+            let mut prefix_builder = CanonicalBlockFactsSequenceDigestBuilder::new(version);
+            for digest in &digests[..split] {
+                assert!(prefix_builder.try_append(*digest).is_ok());
+            }
+            let prefix = prefix_builder.finish();
+            let admitted_prefix = CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                prefix.version(),
+                prefix.block_count(),
+                prefix.as_bytes(),
+            );
+            let mut resumed =
+                CanonicalBlockFactsSequenceDigestBuilder::resume_from_prefix(admitted_prefix);
+            for digest in &digests[split..] {
+                assert!(resumed.try_append(*digest).is_ok());
+            }
+            assert_eq!(resumed.finish(), complete_digest);
+        }
     }
 
     fn sample_block_facts() -> CanonicalBlockFacts {

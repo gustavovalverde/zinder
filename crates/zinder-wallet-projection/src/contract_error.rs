@@ -54,6 +54,12 @@ pub enum WalletProjectionContractError {
     /// A checkpoint manifest captured an incomplete wallet store.
     #[error("wallet checkpoint requires a ready wallet control record")]
     CheckpointRequiresReadyControl,
+    /// A checkpoint prefix must use the canonical sequence digest admitted by v1.
+    #[error("wallet checkpoint source sequence digest must use version 1")]
+    CheckpointSourceSequenceVersionMismatch,
+    /// A checkpoint prefix must contain one digest for every projected height.
+    #[error("wallet checkpoint source sequence length does not match its projected tip")]
+    CheckpointSourceSequenceLengthMismatch,
     /// Ready evidence must cover complete history beginning at height one.
     #[error("wallet readiness coverage must begin at block height one")]
     ReadyCoverageMustBeginAtHeightOne,
@@ -72,6 +78,9 @@ pub enum WalletProjectionContractError {
     /// The source sequence must contain one digest for every projected height.
     #[error("wallet source sequence length does not match its projected tip")]
     ReadySourceSequenceLengthMismatch,
+    /// Version 1 accepts only canonical sequence digest version 1.
+    #[error("wallet source sequence digest must use version 1")]
+    ReadySourceSequenceVersionMismatch,
     /// Version 1 requires an `LtHash16` UTXO commitment.
     #[error("wallet readiness requires the LtHash16 UTXO commitment scheme")]
     ReadyUtxoCommitmentSchemeMismatch,
