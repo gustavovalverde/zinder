@@ -790,10 +790,12 @@ to pin the probe to a specific artifact height:
 scripts/native-grpc-smoke.sh 127.0.0.1:9069
 ```
 
-The script verifies the standalone `WalletQuery` capability baseline, exercises
-`LatestBlock`, both `BlockIdBySelector` arms (height + hash round-trip),
+The script verifies that every advertised `WalletQuery` capability is
+registered in the authoritative capability table and that each exercised RPC
+advertises its table-mapped capability. It then exercises `LatestBlock`, both
+`BlockIdBySelector` arms (height + hash round-trip),
 `BlockHeaderBySelector`, and asserts the `Transaction` NotFound mapping. Exit
-code zero is the contract; any drift fails CI.
+code zero is the contract; any drift fails the smoke.
 `wallet.address.transparent_balance_v1` is always advertised: the confirmed
 total reads the canonical unspent index, and the mempool overlay degrades to a
 zero delta when no ingest-control endpoint is wired.
@@ -821,7 +823,7 @@ the writer (per the conventions above). A transaction request carrying
 grpcurl -plaintext \
   -import-path crates/zinder-proto/proto \
   -proto crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto \
-  127.0.0.1:9069 zinder.v1.wallet.WalletQuery/ServerInfo | jq '.capabilities.capabilities'
+  127.0.0.1:9069 zinder.v1.wallet.WalletQuery/ServerInfo | jq '.info.common.capabilities'
 ```
 
 Expected entries (this list is the public contract; treat any drift as a
