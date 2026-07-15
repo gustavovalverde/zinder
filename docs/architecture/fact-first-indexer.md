@@ -40,7 +40,7 @@ fact-first runtime or the `postgres-scale-out` composition.
 | Full replay/header verifier | Landed and live-tested | All 4.17 million pinned testnet rows passed replay, header, and continuity checks |
 | PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
 | Clean physical schema identities | Landed | Canonical, wallet, and explorer contracts use identity-scoped version 1 and refuse prior layouts without migration or adoption |
-| Fresh RocksDB canonical builder | Landed and live-tested | A new `BUILDING` path fixes its workload, source range, checkpoint tree position, and build tip before bounded all-family ingestion |
+| Fresh RocksDB canonical builder | Landed and live-tested | A new `BUILDING` path fixes its workload, activation-table fingerprint, source range, checkpoint tree position, and build tip before bounded all-family ingestion |
 | One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
 | Independent wallet projector and store | Not implemented | Current `zinder-ingest` still owns legacy projection replay |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
@@ -189,7 +189,7 @@ The target canonical hot schema is:
 
 | Fact | Key | Purpose |
 | --- | --- | --- |
-| `store_control` | singleton | Canonical identity, schema version, network, workload, exact history predecessor and tree position, fixed build tip, cursor-authentication key, build state, visible epoch, and ordered digest |
+| `store_control` | singleton | Canonical identity, schema version, network, version-1 network-upgrade activation fingerprint, workload, exact history predecessor and tree position, fixed build tip, cursor-authentication key, build state, visible epoch, and ordered digest |
 | `block_header` | `height` | Small direct-read block identity, parent, time, header fields, and size |
 | `block_hash_index` | `block_hash` | Direct hash-to-height resolution without scanning or expanding replay facts |
 | `block_replay` | `height` | Ordered semantic block and transaction facts needed by every projection; excludes retention-dependent raw blobs |
@@ -205,8 +205,11 @@ The target canonical hot schema is:
 | `block_blob` | `height` | Compressed consensus block bytes for the `explorer` workload's raw-block capability |
 | `transaction_blob` | `(height, transaction_index)` | Source-ordered raw transaction bytes; `transaction_location` resolves a transaction ID to this position in 2 point reads |
 
-The store already has one immutable network identity, so version-1 physical
-keys do not repeat the network. `block_replay` replaces normalized transaction
+The store already has immutable network and node-discovered activation-table
+identities, so version-1 physical keys do not repeat either value. The
+activation fingerprint fixes the consensus interpretation used to parse every
+retained transaction and is checked against the construction configuration
+before source work starts. `block_replay` replaces normalized transaction
 facts, intrinsic-balance rows, block transaction indexes, transparent output
 indexes, spend facts, and their repair and retention state. Address state and
 analytics are projections. Raw rows are written only for the selected workload
@@ -216,13 +219,14 @@ Fresh construction has a separate lifecycle type from serving. A
 `RocksDbCanonicalBuilder` owns only a new `BUILDING` path; it cannot reopen or
 repair an existing path. `RocksDbCanonicalStore` admits only a fully validated
 `READY` path. Before any data family is created, `store_control` fixes the
-history predecessor, its 3 commitment-tree sizes, the first retained height,
-and the exact build-tip block identity. Complete-history builds persist the
-height-zero block hash with an empty tree position, while checkpointed builds
-persist the selected checkpoint and its node-observed tree sizes. This anchors
-the retained chain, seeds compact-block positioning without reprocessing prior
-history, and prevents source exhaustion from turning a contiguous prefix into
-an apparently complete build.
+network-upgrade activation fingerprint, history predecessor, its 3
+commitment-tree sizes, the first retained height, and the exact build-tip block
+identity. Complete-history builds persist the height-zero block hash with an
+empty tree position, while checkpointed builds persist the selected checkpoint
+and its node-observed tree sizes. This anchors the retained chain, seeds
+compact-block positioning without reprocessing prior history, and prevents
+source exhaustion from turning a contiguous prefix into an apparently complete
+build.
 
 Canonical block construction accepts a fallible ordered source stream. It
 validates each prepared block while fanning its owned values into the

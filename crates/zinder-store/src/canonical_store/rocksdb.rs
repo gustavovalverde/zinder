@@ -4,7 +4,7 @@ use rust_rocksdb::{
     Cache, ColumnFamilyDescriptor, DB, DBCompressionType, DEFAULT_COLUMN_FAMILY_NAME, IteratorMode,
     Options, WriteBatch, WriteOptions,
 };
-use zinder_core::{CanonicalHistoryBounds, Network};
+use zinder_core::{CanonicalHistoryBounds, Network, NetworkUpgradeActivationsFingerprint};
 
 use crate::{
     BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
@@ -57,6 +57,7 @@ pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 14] = [
 pub struct RocksDbCanonicalStore {
     bounded_open: BoundedRocksDbOpen,
     network: Network,
+    network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     workload: CanonicalStoreWorkload,
     history_bounds: CanonicalHistoryBounds,
     _cursor_auth_key: [u8; 32],
@@ -130,6 +131,9 @@ impl RocksDbCanonicalStore {
         Ok(Self {
             bounded_open,
             network: expected_network,
+            network_upgrade_activations_fingerprint: opened_control
+                .build_plan
+                .network_upgrade_activations_fingerprint(),
             workload: expected_workload,
             history_bounds: opened_control.build_plan.history_bounds(),
             _cursor_auth_key: opened_control.cursor_auth_key,
@@ -141,6 +145,14 @@ impl RocksDbCanonicalStore {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.network
+    }
+
+    /// Returns the admitted activation-table identity persisted by the store.
+    #[must_use]
+    pub const fn network_upgrade_activations_fingerprint(
+        &self,
+    ) -> NetworkUpgradeActivationsFingerprint {
+        self.network_upgrade_activations_fingerprint
     }
 
     /// Returns the immutable canonical workload persisted by the store.
@@ -356,13 +368,22 @@ fn validate_open_store_control(
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
-    use zinder_core::{BlockHash, BlockHeight, BlockId};
+    use zinder_core::{
+        BlockHash, BlockHeight, BlockId, NetworkUpgradeActivationsFingerprint,
+        NetworkUpgradeActivationsFingerprintVersion,
+    };
 
     use super::*;
     use crate::{
         CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildPlan,
         RocksDbCanonicalBuilder,
     };
+
+    const ACTIVATIONS_FINGERPRINT: NetworkUpgradeActivationsFingerprint =
+        NetworkUpgradeActivationsFingerprint::from_bytes(
+            NetworkUpgradeActivationsFingerprintVersion::V1,
+            [23; 32],
+        );
 
     #[test]
     fn building_layout_is_exact_and_not_servable() -> Result<(), Box<dyn std::error::Error>> {
@@ -375,6 +396,10 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(store.network(), Network::ZcashTestnet);
+        assert_eq!(
+            store.network_upgrade_activations_fingerprint(),
+            ACTIVATIONS_FINGERPRINT
+        );
         assert_eq!(store.workload(), CanonicalStoreWorkload::Explorer);
         assert_eq!(
             store.build_plan().history_bounds(),
@@ -562,6 +587,7 @@ mod tests {
     fn complete_build_plan() -> Result<CanonicalStoreBuildPlan, Box<dyn std::error::Error>> {
         Ok(CanonicalStoreBuildPlan::complete(
             Network::ZcashTestnet,
+            ACTIVATIONS_FINGERPRINT,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
         )?)
     }

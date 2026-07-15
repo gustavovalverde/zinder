@@ -1,6 +1,6 @@
 use std::{ffi::OsString, fs, path::PathBuf};
 
-use zinder_core::Network;
+use zinder_core::{Network, NetworkUpgradeActivationsFingerprint};
 
 use crate::{
     BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, open_bounded_rocksdb,
@@ -87,6 +87,14 @@ impl RocksDbCanonicalBuilder {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the immutable activation-table identity persisted by this build.
+    #[must_use]
+    pub const fn network_upgrade_activations_fingerprint(
+        &self,
+    ) -> NetworkUpgradeActivationsFingerprint {
+        self.build_plan.network_upgrade_activations_fingerprint()
     }
 
     /// Returns the exact predecessor-to-tip source range persisted by this build.
@@ -243,7 +251,8 @@ mod tests {
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
         CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
         CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds, CanonicalTransactionFacts,
-        ChainTipMetadata, CompactBlockArtifact, LockTime, PrivacyShape, SerializedBytesDigest,
+        ChainTipMetadata, CompactBlockArtifact, LockTime, NetworkUpgradeActivationsFingerprint,
+        NetworkUpgradeActivationsFingerprintVersion, PrivacyShape, SerializedBytesDigest,
         TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
         TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
         TransactionVersion, UnsupportedSection, encode_canonical_block_replay,
@@ -254,6 +263,12 @@ mod tests {
         block_load::canonical_block_families_are_empty, block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
         rocksdb::BLOCK_HASH_INDEX_COLUMN_FAMILY,
     };
+
+    const ACTIVATIONS_FINGERPRINT: NetworkUpgradeActivationsFingerprint =
+        NetworkUpgradeActivationsFingerprint::from_bytes(
+            NetworkUpgradeActivationsFingerprintVersion::V1,
+            [17; 32],
+        );
 
     #[test]
     fn builder_refuses_every_existing_path() -> Result<(), Box<dyn std::error::Error>> {
@@ -306,6 +321,7 @@ mod tests {
         let store_path = temporary.path().join("canonical");
         let build_plan = CanonicalStoreBuildPlan::complete(
             Network::ZcashTestnet,
+            ACTIVATIONS_FINGERPRINT,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -366,6 +382,7 @@ mod tests {
         let store_path = temporary.path().join("canonical");
         let build_plan = CanonicalStoreBuildPlan::complete(
             Network::ZcashTestnet,
+            ACTIVATIONS_FINGERPRINT,
             BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([2; 32])),
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -573,6 +590,7 @@ mod tests {
             None => complete_build_plan()?,
             Some(checkpoint) => CanonicalStoreBuildPlan::checkpointed(
                 Network::ZcashTestnet,
+                ACTIVATIONS_FINGERPRINT,
                 checkpoint,
                 zinder_core::ChainTipMetadata::new(1, 2, 3),
                 BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
@@ -589,6 +607,7 @@ mod tests {
     fn complete_build_plan() -> Result<CanonicalStoreBuildPlan, Box<dyn std::error::Error>> {
         Ok(CanonicalStoreBuildPlan::complete(
             Network::ZcashTestnet,
+            ACTIVATIONS_FINGERPRINT,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
         )?)
     }

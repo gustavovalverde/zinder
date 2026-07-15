@@ -16,7 +16,7 @@ use thiserror::Error;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
-    ChainTipMetadata,
+    ChainTipMetadata, NetworkUpgradeActivationsFingerprint,
 };
 
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
@@ -37,6 +37,7 @@ pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreBuildPlan {
     network: zinder_core::Network,
+    network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     history_bounds: zinder_core::CanonicalHistoryBounds,
     history_predecessor: BlockId,
     history_predecessor_tip_metadata: ChainTipMetadata,
@@ -47,10 +48,12 @@ impl CanonicalStoreBuildPlan {
     /// Builds a plan retaining every non-genesis block through `build_tip`.
     pub fn complete(
         network: zinder_core::Network,
+        network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
         build_tip: BlockId,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         Self::from_parts(
             network,
+            network_upgrade_activations_fingerprint,
             zinder_core::CanonicalHistoryBounds::complete(),
             BlockId::new(BlockHeight::new(0), network.genesis_hash()),
             ChainTipMetadata::empty(),
@@ -61,6 +64,7 @@ impl CanonicalStoreBuildPlan {
     /// Builds a plan retaining blocks immediately after `checkpoint` through `build_tip`.
     pub fn checkpointed(
         network: zinder_core::Network,
+        network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
         checkpoint: BlockId,
         checkpoint_tip_metadata: ChainTipMetadata,
         build_tip: BlockId,
@@ -69,6 +73,7 @@ impl CanonicalStoreBuildPlan {
             .map_err(|_| CanonicalStoreBuildPlanError::CheckpointHasNoSuccessor)?;
         Self::from_parts(
             network,
+            network_upgrade_activations_fingerprint,
             history_bounds,
             checkpoint,
             checkpoint_tip_metadata,
@@ -76,8 +81,13 @@ impl CanonicalStoreBuildPlan {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "decoding must reconstruct all six immutable canonical build identity fields explicitly"
+    )]
     pub(super) fn from_parts(
         network: zinder_core::Network,
+        network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
         history_bounds: zinder_core::CanonicalHistoryBounds,
         history_predecessor: BlockId,
         history_predecessor_tip_metadata: ChainTipMetadata,
@@ -108,6 +118,7 @@ impl CanonicalStoreBuildPlan {
         }
         Ok(Self {
             network,
+            network_upgrade_activations_fingerprint,
             history_bounds,
             history_predecessor,
             history_predecessor_tip_metadata,
@@ -119,6 +130,14 @@ impl CanonicalStoreBuildPlan {
     #[must_use]
     pub const fn network(self) -> zinder_core::Network {
         self.network
+    }
+
+    /// Returns the immutable node activation-table identity for this build.
+    #[must_use]
+    pub const fn network_upgrade_activations_fingerprint(
+        self,
+    ) -> NetworkUpgradeActivationsFingerprint {
+        self.network_upgrade_activations_fingerprint
     }
 
     /// Returns the durable boundary of intentionally retained history.
@@ -389,14 +408,25 @@ impl CanonicalStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zinder_core::NetworkUpgradeActivationsFingerprintVersion;
+
+    const ACTIVATIONS_FINGERPRINT: NetworkUpgradeActivationsFingerprint =
+        NetworkUpgradeActivationsFingerprint::from_bytes(
+            NetworkUpgradeActivationsFingerprintVersion::V1,
+            [7; 32],
+        );
 
     #[test]
     fn complete_build_plan_preserves_genesis_anchor_and_tip()
     -> Result<(), CanonicalStoreBuildPlanError> {
         let network = zinder_core::Network::ZcashTestnet;
         let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
-        let plan = CanonicalStoreBuildPlan::complete(network, build_tip)?;
+        let plan = CanonicalStoreBuildPlan::complete(network, ACTIVATIONS_FINGERPRINT, build_tip)?;
         assert_eq!(plan.network(), network);
+        assert_eq!(
+            plan.network_upgrade_activations_fingerprint(),
+            ACTIVATIONS_FINGERPRINT
+        );
         assert_eq!(
             plan.history_predecessor(),
             BlockId::new(BlockHeight::new(0), network.genesis_hash())
@@ -417,6 +447,7 @@ mod tests {
     fn build_plan_rejects_tip_before_retained_history() {
         let error = CanonicalStoreBuildPlan::complete(
             zinder_core::Network::ZcashRegtest,
+            ACTIVATIONS_FINGERPRINT,
             BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
         )
         .err();
@@ -433,6 +464,7 @@ mod tests {
     fn checkpointed_build_plan_rejects_height_ceiling() {
         let error = CanonicalStoreBuildPlan::checkpointed(
             zinder_core::Network::ZcashRegtest,
+            ACTIVATIONS_FINGERPRINT,
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
             ChainTipMetadata::new(1, 2, 3),
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
@@ -451,6 +483,7 @@ mod tests {
         let checkpoint_tip_metadata = ChainTipMetadata::new(11, 22, 33);
         let plan = CanonicalStoreBuildPlan::checkpointed(
             zinder_core::Network::ZcashTestnet,
+            ACTIVATIONS_FINGERPRINT,
             checkpoint,
             checkpoint_tip_metadata,
             BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
@@ -469,6 +502,7 @@ mod tests {
         let network = zinder_core::Network::ZcashTestnet;
         let error = CanonicalStoreBuildPlan::from_parts(
             network,
+            ACTIVATIONS_FINGERPRINT,
             zinder_core::CanonicalHistoryBounds::complete(),
             BlockId::new(BlockHeight::new(0), network.genesis_hash()),
             ChainTipMetadata::new(1, 0, 0),

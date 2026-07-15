@@ -2,6 +2,7 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion,
     CanonicalHistoryBounds, ChainEpochId, ChainTipMetadata, Network,
+    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
 };
 
 use super::{
@@ -16,12 +17,14 @@ const COMPLETE_HISTORY: u8 = 0;
 const CHECKPOINTED_HISTORY: u8 = 1;
 const WALLET_WORKLOAD: u8 = 1;
 const EXPLORER_WORKLOAD: u8 = 2;
+const ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH: usize = 2 + 32;
 const HISTORY_FIELDS_LENGTH: usize = 1 + 4 + 32 + 4 + 4 + 4;
 const BUILD_TIP_FIELDS_LENGTH: usize = 4 + 32;
 const READY_FIELDS_LENGTH: usize = 4 + 32 + 4 + 32 + 8 + 8 + 2 + 4 + 2 + 32 + 8;
 const STORE_CONTROL_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + 2
     + 4
+    + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
     + 1
     + HISTORY_FIELDS_LENGTH
     + BUILD_TIP_FIELDS_LENGTH
@@ -47,6 +50,9 @@ pub(super) fn encode_building_store_control(
     encoded.extend_from_slice(CANONICAL_STORE_IDENTITY.as_bytes());
     encoded.extend_from_slice(&CANONICAL_STORE_SCHEMA_VERSION.to_le_bytes());
     encoded.extend_from_slice(&build_plan.network().id().to_le_bytes());
+    let activations_fingerprint = build_plan.network_upgrade_activations_fingerprint();
+    encoded.extend_from_slice(&activations_fingerprint.version().value().to_le_bytes());
+    encoded.extend_from_slice(&activations_fingerprint.as_bytes());
     encoded.push(match workload {
         CanonicalStoreWorkload::Wallet => WALLET_WORKLOAD,
         CanonicalStoreWorkload::Explorer => EXPLORER_WORKLOAD,
@@ -121,6 +127,8 @@ pub(super) fn decode_store_control(
             format!("store control contains unknown network id {network_id}"),
         )
     })?;
+    let network_upgrade_activations_fingerprint =
+        decode_network_upgrade_activations_fingerprint(&mut decoder)?;
     let workload = match decoder.read_u8("workload")? {
         WALLET_WORKLOAD => CanonicalStoreWorkload::Wallet,
         EXPLORER_WORKLOAD => CanonicalStoreWorkload::Explorer,
@@ -139,6 +147,7 @@ pub(super) fn decode_store_control(
     );
     let build_plan = CanonicalStoreBuildPlan::from_parts(
         network,
+        network_upgrade_activations_fingerprint,
         history_bounds,
         history_predecessor,
         history_predecessor_tip_metadata,
@@ -169,6 +178,25 @@ pub(super) fn decode_store_control(
         cursor_auth_key,
         build_state,
     })
+}
+
+fn decode_network_upgrade_activations_fingerprint(
+    decoder: &mut Decoder<'_>,
+) -> Result<NetworkUpgradeActivationsFingerprint, CanonicalStoreError> {
+    let version = NetworkUpgradeActivationsFingerprintVersion::try_from(
+        decoder.read_u16("network upgrade activations fingerprint version")?,
+    )
+    .map_err(|source| CanonicalStoreError::admission(decoder.path, source.to_string()))?;
+    if version != NetworkUpgradeActivationsFingerprintVersion::V1 {
+        return Err(CanonicalStoreError::admission(
+            decoder.path,
+            "network upgrade activations fingerprint contract must be version 1",
+        ));
+    }
+    Ok(NetworkUpgradeActivationsFingerprint::from_bytes(
+        version,
+        decoder.read_array::<32>("network upgrade activations fingerprint")?,
+    ))
 }
 
 fn decode_history_bounds(
@@ -362,6 +390,11 @@ mod tests {
     use super::*;
 
     const CURSOR_AUTH_KEY: [u8; 32] = [7; 32];
+    const ACTIVATIONS_FINGERPRINT: NetworkUpgradeActivationsFingerprint =
+        NetworkUpgradeActivationsFingerprint::from_bytes(
+            NetworkUpgradeActivationsFingerprintVersion::V1,
+            [11; 32],
+        );
 
     #[test]
     fn building_control_round_trips_every_network() -> Result<(), Box<dyn std::error::Error>> {
@@ -433,6 +466,7 @@ mod tests {
         let ready_fields = CANONICAL_STORE_IDENTITY.len()
             + 2
             + 4
+            + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
             + 1
             + HISTORY_FIELDS_LENGTH
             + BUILD_TIP_FIELDS_LENGTH
@@ -474,6 +508,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the table enumerates each version-1 control field that must fail closed"
+    )]
     fn malformed_control_variants_fail_closed() -> Result<(), CanonicalStoreError> {
         let base = encode_building_store_control(
             CanonicalStoreWorkload::Explorer,
@@ -482,7 +520,9 @@ mod tests {
         );
         let identity_end = CANONICAL_STORE_IDENTITY.len();
         let network_start = identity_end + 2;
-        let workload_offset = network_start + 4;
+        let activations_fingerprint_version = network_start + 4;
+        let workload_offset =
+            activations_fingerprint_version + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH;
         let history_kind = workload_offset + 1;
         let predecessor_tree_sizes = history_kind + 1 + 4 + 32;
         let build_tip = history_kind + HISTORY_FIELDS_LENGTH;
@@ -505,6 +545,12 @@ mod tests {
                 encoded[network_start..network_start + 4]
                     .copy_from_slice(&Network::ZcashMainnet.id().to_le_bytes());
                 (encoded, "history predecessor")
+            },
+            {
+                let mut encoded = base.clone();
+                encoded[activations_fingerprint_version..activations_fingerprint_version + 2]
+                    .copy_from_slice(&2_u16.to_le_bytes());
+                (encoded, "activations fingerprint version 2")
             },
             {
                 let mut encoded = base.clone();
@@ -560,6 +606,8 @@ mod tests {
         encoded.extend_from_slice(CANONICAL_STORE_IDENTITY.as_bytes());
         encoded.extend_from_slice(&CANONICAL_STORE_SCHEMA_VERSION.to_le_bytes());
         encoded.extend_from_slice(&Network::ZcashTestnet.id().to_le_bytes());
+        encoded.extend_from_slice(&ACTIVATIONS_FINGERPRINT.version().value().to_le_bytes());
+        encoded.extend_from_slice(&ACTIVATIONS_FINGERPRINT.as_bytes());
         encoded.push(EXPLORER_WORKLOAD);
         encoded.push(COMPLETE_HISTORY);
         encoded.extend_from_slice(&0_u32.to_le_bytes());
@@ -615,6 +663,7 @@ mod tests {
     fn complete_build_plan(network: Network) -> CanonicalStoreBuildPlan {
         CanonicalStoreBuildPlan {
             network,
+            network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
             history_bounds: CanonicalHistoryBounds::complete(),
             history_predecessor: BlockId::new(BlockHeight::new(0), network.genesis_hash()),
             history_predecessor_tip_metadata: ChainTipMetadata::empty(),
@@ -628,6 +677,7 @@ mod tests {
     ) -> CanonicalStoreBuildPlan {
         CanonicalStoreBuildPlan {
             network: Network::ZcashTestnet,
+            network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
             history_bounds,
             history_predecessor: checkpoint,
             history_predecessor_tip_metadata: ChainTipMetadata::new(1, 2, 3),

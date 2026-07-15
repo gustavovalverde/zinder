@@ -17,7 +17,10 @@ use futures_util::{
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations};
+use zinder_core::{
+    BlockHeight, Network, NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
+    NetworkUpgradeActivationsFingerprintVersion,
+};
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{
     CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalStoreBuildError, CanonicalStoreError,
@@ -111,6 +114,16 @@ pub enum CanonicalConstructionError {
         /// Network advertised by the activation table.
         configured_network: Network,
     },
+    /// Configured upgrade activations differ from the immutable store identity.
+    #[error(
+        "canonical construction activation fingerprint {configured_fingerprint:?} does not match store identity {store_fingerprint:?}"
+    )]
+    NetworkUpgradeActivationsMismatch {
+        /// Fingerprint persisted before canonical source work begins.
+        store_fingerprint: NetworkUpgradeActivationsFingerprint,
+        /// Fingerprint derived from the construction activation table.
+        configured_fingerprint: NetworkUpgradeActivationsFingerprint,
+    },
     /// A source block is labeled for another network than the fresh store.
     #[error(
         "source block {height:?} uses {source_network:?}, expected canonical store network {store_network:?}"
@@ -159,7 +172,7 @@ where
 {
     let build_plan = builder.build_plan();
     let workload = builder.workload();
-    validate_construction_network(build_plan.network(), &config)?;
+    validate_construction_identity(build_plan, &config)?;
     let block_queue_capacity = usize::try_from(config.block_prepare_concurrency.get())
         .unwrap_or(usize::MAX)
         .max(1);
@@ -179,16 +192,29 @@ const fn raw_blob_policy_for_workload(workload: CanonicalStoreWorkload) -> RawBl
     }
 }
 
-fn validate_construction_network(
-    store_network: Network,
+fn validate_construction_identity(
+    build_plan: zinder_store::CanonicalStoreBuildPlan,
     config: &CanonicalConstructionConfig,
 ) -> Result<(), CanonicalConstructionError> {
+    let store_network = build_plan.network();
     let configured_network = config.network_upgrade_activations.network();
     if configured_network != store_network {
         return Err(CanonicalConstructionError::NetworkMismatch {
             store_network,
             configured_network,
         });
+    }
+    let store_fingerprint = build_plan.network_upgrade_activations_fingerprint();
+    let configured_fingerprint = config
+        .network_upgrade_activations
+        .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+    if configured_fingerprint != store_fingerprint {
+        return Err(
+            CanonicalConstructionError::NetworkUpgradeActivationsMismatch {
+                store_fingerprint,
+                configured_fingerprint,
+            },
+        );
     }
     Ok(())
 }
