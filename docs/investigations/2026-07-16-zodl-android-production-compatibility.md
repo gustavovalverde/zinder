@@ -3,7 +3,7 @@
 Status: physical-client serving and Sapling transaction lifecycle proven at fixed fact-first fences; production following and post-NU6.3 Orchard sending not certified
 Date: 2026-07-16
 Network: Zcash testnet
-Zinder integration base: `8a6f0d08bbede027bd068b93471a58be8e667441`
+Zinder integration base: `d96f0c617192fc24d38a5cb57f6caa0c2604a049`
 ZODL revision: `05cb52e89dc20ccc272ca589691067ac6c64e333`
 Zcash Android Wallet SDK revision: `ae884174523e3c25bb5fe9443f6807dd01f821dd`
 
@@ -24,7 +24,7 @@ This is client evidence at fixed authenticated fences, not public-operator certi
 
 The isolated Zinder worktree was seeded at `85d5c02094d8ca99163162e41a5b3fe35fd4f389` with a six-file RocksDB canonical-store diff containing 349 insertions and 79 deletions. Its binary diff SHA-256 was `cf2836c21645c5f96366251fd9d36dea6c7897be90e4a1605067bf3662c21c18`. The work was reviewed before use and later superseded by the authoritative runtime implementation. The compatibility branch is `feat/zodl-production-compatibility`, rebased onto the authoritative `feat/fact-first-runtime-cutover` commit shown above.
 
-The authoritative checkout was treated as read-only. It advanced during the physical test and was reconciled again at `8a6f0d08bbede027bd068b93471a58be8e667441`. At that final reconciliation point it contained user-owned, uncommitted changes in `services/zinder-bench/src/canonical_fixture_replay.rs` and `services/zinder-bench/tests/fixture_roundtrip.rs`. The binary diff SHA-256 was `3553b85c4e721297eb0844de3dedc911f3ff40c52e55eb8ade292476cc066ea2`. Those files were not modified, staged, cleaned, or committed by this investigation.
+The authoritative checkout was treated as read-only. It advanced during the physical test and was reconciled again at `d96f0c617192fc24d38a5cb57f6caa0c2604a049`. At that final reconciliation point it contained a user-owned, uncommitted change in `services/zinder-bench/src/main.rs`. The binary diff SHA-256 was `a2fbc7e765fce4602e6267ce8c6a6ee69bf09fe9a51bb8152b3c4aba806bae67`. That file was not modified, staged, cleaned, or committed by this investigation.
 
 The original ZODL checkout remained read-only at `05cb52e89dc20ccc272ca589691067ac6c64e333`. It retained the user-owned modified `app/src/zcashtestnetInternalDebug/AndroidManifest.xml` and untracked `docs/Local lightwalletd backend.md`. ZODL was built from a separate detached worktree containing only the Internal Debug manifest override and ignored local TLS files.
 
