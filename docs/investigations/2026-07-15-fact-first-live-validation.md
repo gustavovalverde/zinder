@@ -437,7 +437,7 @@ reorg, projection-following, readiness, and client-parity lifecycle.
 
 ## Deployment-profile comparability correction
 
-Status: prior semantic evidence retained; deployment throughput certification pending
+Status: deployment-profile full-tip lifecycle accepted
 Date: 2026-07-16
 
 The accepted lifecycle runs above used the lifecycle command's former implicit
@@ -460,5 +460,19 @@ pipeline overrides. The closed lifecycle no longer accepts those tuning flags,
 and its validator recomputes the reported limits from the recorded envelope.
 At the reference 10 GiB, 10-core, 64 MiB profile, the result is a 32 MiB target,
 64-block ceiling, 12 source requests, 160 MiB source and prepare watermarks,
-and 10 prepare slots. A new clean fixed-fence run is required before publishing
-an updated deployment-comparable sync time.
+and 10 prepare slots.
+
+The clean deployment-profile run reached a fixed testnet fence at height
+4,175,463. Canonical fetch and write completed in 412.026 seconds, canonical
+storage became ready after cold validation in 557.923 seconds, and wallet
+storage became ready in another 311.019 seconds. The complete lifecycle took
+868.942 seconds, or 14 minutes 28.942 seconds. Container memory peaked at
+5,960,953,856 bytes within the 10 GiB limit, while sampled allocated storage
+peaked at 18,133,065,728 bytes.
+
+The accepted report covers 4,175,463 blocks and 4,787,144 transactions. Its
+canonical and wallet fences match, both stores passed cold reopen validation,
+historical prevout reads remained zero, and wallet cold-validation random reads
+remained zero. This result certifies full-tip storage construction under the
+tracked resource profile; it does not certify continuous following, query
+serving, or downstream client behavior.
