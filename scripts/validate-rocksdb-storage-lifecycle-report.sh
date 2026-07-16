@@ -582,11 +582,9 @@ jq -e \
       .acceptance.canonical_storage_ready.wall_clock_seconds
       + .acceptance.wallet_storage_ready.wall_clock_seconds
     )
-    and (
-      .provenance.run.completed_at_unix_millis
-      - .provenance.run.started_at_unix_millis
-      + 1
-    ) >= (.phase_durations.total_seconds * 1000 | floor)
+    # Phase durations come from a monotonic clock. Unix timestamps are
+    # provenance and resource-correlation boundaries; wall-clock adjustments
+    # make arithmetic comparisons between those two clock domains invalid.
     and ($resource
       | exact_keys([
           "child_exit_status",

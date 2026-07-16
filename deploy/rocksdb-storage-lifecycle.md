@@ -136,8 +136,8 @@ hold:
   memory and temporary-file ceilings, both reorg suffixes remain within their
   memory ceiling, and historical prevout and cold-validation random reads are
   zero;
-- every phase duration and acceptance boundary is non-negative and ordered
-  within the complete report time window;
+- every monotonic phase duration and acceptance boundary is non-negative and
+  internally ordered;
 - the report carries the expected fixed tip, immutable image ID, full software
   revision, trial ID, runner envelope, and testnet source identity; and
 - the separate resource observer covers the whole report window with a private
@@ -145,7 +145,10 @@ hold:
   status, matching trial identity, and cgroup and process peaks independently
   within the declared memory limit. The validator does not order process
   `VmHWM` against cgroup `memory.peak` because their shared-page accounting is
-  not identical.
+  not identical. It also does not compare monotonic phase durations with Unix
+  timestamp deltas because wall-clock synchronization can move Unix time while
+  a run is active; Unix timestamps remain ordered provenance and
+  resource-correlation boundaries.
 
 This is a storage-construction acceptance boundary. Query serving, live
 following, and consumer-protocol parity require their own tests after these
