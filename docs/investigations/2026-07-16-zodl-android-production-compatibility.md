@@ -3,7 +3,7 @@
 Status: protocol inventory complete; client and public-operator compatibility not certified
 Date: 2026-07-16
 Network: Zcash testnet
-Zinder integration base: `85d5c02094d8ca99163162e41a5b3fe35fd4f389`
+Zinder integration base: `5226c50a5511c7e26b8aca889a7759d04462426d`
 ZODL revision: `05cb52e89dc20ccc272ca589691067ac6c64e333`
 Zcash Android Wallet SDK revision: `f386369ee82b5aa470ff61a55d2bb40e0d75fae7`
 
@@ -11,18 +11,20 @@ Zcash Android Wallet SDK revision: `f386369ee82b5aa470ff61a55d2bb40e0d75fae7`
 
 The pinned ZODL and SDK sources define a compatible lightwalletd protocol
 shape, and the current compatibility adapter implements that shape against the
-legacy runtime. The version-1 fact-first storage path is not yet connected to
-`zinder-ingest`, `zinder-query`, or `zinder-compat-lightwalletd`. It also lacks
-the production wallet projection follower and exact-fence readiness
-composition. Zinder therefore cannot yet be called ZODL-client-compatible or
-public-operator-compatible on the version-1 path.
+legacy runtime. Production `zinder-ingest` now constructs, reopens, and follows
+the version-1 canonical store without a legacy write path, but
+`zinder-query` and `zinder-compat-lightwalletd` remain on the legacy reader
+stack. The version-1 topology also lacks the production wallet projection
+follower and exact-fence readiness composition. Zinder therefore cannot yet be
+called ZODL-client-compatible or public-operator-compatible on the version-1
+path.
 
 | Claim | Decision | Evidence boundary |
 | --- | --- | --- |
 | Protocol-compatible | Scoped yes | Static ZODL and SDK call tracing matches implemented compatibility RPCs and repository contract tests. This does not prove a live version-1 service. |
 | Reference-parity-compatible | No | No exact-fence ZODL comparison against a trusted lightwalletd was possible because the production version-1 reader stack is absent. |
 | Client-compatible | No | The pinned APK built, installed, and launched, but no create, restore, scan, balance, history, or send flow reached a version-1 Zinder endpoint. |
-| Public-operator-compatible | No | The tracked Compose topology does not include the compatibility service or TLS, and the production services still open legacy stores. |
+| Public-operator-compatible | No | The canonical runtime Compose gate covers only `zinder-ingest`; it does not include the compatibility service or TLS, and the production query services still open legacy stores. |
 
 The accepted full-tip version-1 storage run remains storage-construction
 evidence only. It built 4,175,463 testnet blocks in 868.942 seconds, matched the
@@ -50,13 +52,17 @@ The binary starting diff contained 349 insertions and 79 deletions and had
 SHA-256
 `cf2836c21645c5f96366251fd9d36dea6c7897be90e4a1605067bf3662c21c18`.
 It was reviewed and validated before being committed. The compatibility work is
-on `feat/zodl-production-compatibility` with these reviewable commits:
+on `feat/zodl-production-compatibility`. The branch was reconciled onto the
+clean authoritative `feat/fact-first-runtime-cutover` revision
+`5226c50a5511c7e26b8aca889a7759d04462426d`; the authoritative runtime commit
+`2699bc3` superseded the isolated store commit, and the 4 ZODL-specific commits
+replayed without content changes. The behavior-relevant commits are:
 
 | Commit | Effect |
 | --- | --- |
-| `793cfd7` | Authenticates a live append's commitment-tree transition from the persisted frontier and rejects an unrelated checkpoint. |
-| `d1f648f` | Makes `GetLightdInfo.taddrSupport` fail closed when no wallet projection readiness reader is present. |
-| `e47ec81` | Makes the transparent UTXO acceptance fixture establish both required wallet projection fences before expecting `taddrSupport`. |
+| `2699bc3` | Authenticates live commitment-tree transitions and proves atomic old-or-new fence recovery with crash failpoints. |
+| `9b6f55e` | Makes `GetLightdInfo.taddrSupport` fail closed when no wallet projection readiness reader is present. |
+| `f2e495d` | Makes the transparent UTXO acceptance fixture establish both required wallet projection fences before expecting `taddrSupport`. |
 
 ### ZODL and SDK
 
@@ -176,15 +182,15 @@ servers.
 | --- | --- | --- |
 | Fresh canonical construction | Implemented on version 1 | Fixed-fence full-tip construction, validation, publication, and cold reopen are accepted. |
 | Fresh wallet projection construction | Implemented on version 1 | Fixed-fence wallet build, validation, publication, and cold reopen are accepted. |
-| Live canonical append | Implemented as a store operation, not as a production service | `commit_live_append` now authenticates the transition from the persisted frontier. `zinder-ingest` does not use it in production composition. |
+| Live canonical append | Implemented on version 1 | Production `zinder-ingest` hands a freshly published or reopened store to the continuous follower, which commits each connected block through the authenticated `commit_live_append` boundary. |
 | Live canonical reorg | Missing | No version-1 production reorg operation and service lifecycle are available. |
-| Canonical restart and resume | Unproven | Cold reopen is tested; a long-lived source follower does not reopen and resume version-1 state. |
+| Canonical restart and resume | Implemented for append-only following | The real testnet service recovered from source unavailability, resumed appends, and reopened the same authenticated epoch and event fence after process restart. Shallow and same-height reorg restart remains unproven. |
 | Wallet catch-up and following | Missing | The fixed builder publishes a wallet store. No independent authenticated event-cursor follower exists. |
 | Wallet reorg and restart | Missing | No production wallet follower can apply replacement epochs or resume from its exact fence. |
 | Query readers | Implemented as cold store reads, missing production adapters | `zinder-query` still opens `PrimaryChainStore`, `SecondaryChainStore`, and legacy derive state. |
 | Compatibility reader | Implemented only on legacy production state | The adapter RPC logic exists, but the binary does not open version-1 canonical and wallet stores. |
 | Exact-fence readiness | Missing in the version-1 topology | Legacy readiness can check both wallet projection cursors. The compatibility adapter now refuses `taddrSupport` when the readiness reader is absent. |
-| Compose service topology | Missing | `deploy/docker-compose.yml` has ingest, query, explorer, Prometheus, and Grafana. It has no compatibility service or TLS termination and does not select version-1 service composition. |
+| Compose service topology | Partial | `deploy/docker-compose.canonical-runtime-test.yml` certifies version-1 ingest against the existing Zebra network and a disposable Zinder volume. No version-1 wallet follower, query, compatibility, or TLS service is composed. |
 
 No request in this investigation was served from the version-1 store. This
 avoids turning a legacy fallback demonstration into a fact-first compatibility
@@ -221,8 +227,8 @@ compatibility smoke.
 The first runnable vertical slice is therefore:
 
 1. retain the existing Zebra container, chain volume, and cookie volume;
-2. start version-1 `zinder-ingest` from an empty Zinder-only volume and follow
-   the captured Zebra fence;
+2. start the implemented version-1 `zinder-ingest` runtime from an empty
+   Zinder-only volume and follow the captured Zebra fence;
 3. build and follow the independent version-1 wallet projection to that exact
    authenticated event fence;
 4. open production version-1 query and compatibility secondaries, with
@@ -230,9 +236,10 @@ The first runnable vertical slice is therefore:
 5. terminate TLS through the verified Caddy path; and
 6. validate `localhost:19443` from the already pinned and installable ZODL APK.
 
-Steps 2 through 4 do not exist in production composition, so a real Compose
-stack was not started and no Zinder data volume was deleted. Starting the
-legacy stack would violate the version-1 acceptance boundary.
+Step 2 now exists and has passed its separate real-service certification.
+Steps 3 and 4 remain absent from production composition, so no combined wallet
+serving stack was started and no Zinder data volume was deleted. Starting the
+legacy reader stack would violate the version-1 acceptance boundary.
 
 ## Clock definitions and instrumentation
 
