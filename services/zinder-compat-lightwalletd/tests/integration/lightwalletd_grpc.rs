@@ -181,6 +181,29 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn lightd_info_refuses_transparent_support_without_projection_readiness() -> eyre::Result<()>
+{
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_transparent_address_support();
+
+    let lightd_info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    assert!(!lightd_info.taddr_support);
+    Ok(())
+}
+
+#[tokio::test]
 async fn lightd_info_advertises_transparent_support_only_when_wallet_projections_cover_tip()
 -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;

@@ -829,7 +829,7 @@ where
                     .transparent_outpoint_spend
                     .covers(latest_block.height, required_cursor.as_ref())
         } else {
-            true
+            false
         };
 
         Ok(Response::new(lightd_info(
