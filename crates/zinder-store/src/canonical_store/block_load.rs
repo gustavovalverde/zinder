@@ -587,6 +587,39 @@ pub(super) fn read_persisted_tip_metadata(
     ))
 }
 
+pub(super) fn read_persisted_tip_checkpoint(
+    db: &DB,
+    tip: zinder_core::BlockId,
+) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
+    let family = db
+        .cf_handle(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
+        .ok_or_else(|| {
+            CanonicalStoreError::live_commit("tree_state_checkpoint column family is absent")
+        })?;
+    let encoded_checkpoint = db
+        .get_cf(&family, encode_block_position(tip.height))
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "read live append tip checkpoint",
+            source,
+        })?
+        .ok_or_else(|| {
+            CanonicalStoreError::live_commit(
+                "authenticated visible tip has no persisted tree-state checkpoint",
+            )
+        })?;
+    let (block_time_seconds, frontiers) = decode_tree_state_checkpoint(&encoded_checkpoint)
+        .map_err(|source| {
+            CanonicalStoreError::live_commit(format!(
+                "authenticated visible-tip checkpoint is invalid: {source}"
+            ))
+        })?;
+    Ok(CommitmentTreeCheckpoint::new(
+        tip,
+        block_time_seconds,
+        frontiers,
+    ))
+}
+
 fn validate_persisted_tree_state_checkpoints(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,

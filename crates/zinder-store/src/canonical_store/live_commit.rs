@@ -1,9 +1,13 @@
+use prost::Message;
 use rust_rocksdb::{DB, WriteBatch, WriteOptions};
 use zinder_core::{
-    BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
-    CanonicalBlockFactsSequenceDigestBuilder, ChainEpochId, SubtreeRootArtifact,
+    BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
+    CanonicalBlockFactsSequenceDigestBuilder, ChainEpochId, CommitmentTreeAccumulator,
+    CommitmentTreeCheckpoint, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
     UnixTimestampMillis,
 };
+use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 
 use super::{
     CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalStoreError,
@@ -11,13 +15,14 @@ use super::{
     block_load::{
         encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
         encode_block_position, encode_transaction_location, encode_transaction_position,
-        encode_tree_state_checkpoint, read_persisted_tip_metadata, validate_live_block,
+        encode_tree_state_checkpoint, read_persisted_tip_checkpoint, read_persisted_tip_metadata,
+        validate_live_block,
     },
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     control::encode_ready_store_control,
     publication::{
         column_family, encode_live_append_event, encode_live_chain_epoch, read_chain_epoch_tips,
-        validate_ready_publication, validate_settled_tip,
+        validate_live_append_publication, validate_settled_tip,
     },
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
@@ -100,6 +105,34 @@ impl CanonicalEventFence {
     }
 }
 
+/// Authenticated state required to prepare the next live canonical append.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalAppendAnchor {
+    event_fence: CanonicalEventFence,
+    settled_tip: BlockId,
+    tip_checkpoint: CommitmentTreeCheckpoint,
+}
+
+impl CanonicalAppendAnchor {
+    /// Returns the exact canonical fence this anchor authenticates.
+    #[must_use]
+    pub const fn event_fence(&self) -> CanonicalEventFence {
+        self.event_fence
+    }
+
+    /// Returns the current durable finality boundary.
+    #[must_use]
+    pub const fn settled_tip(&self) -> BlockId {
+        self.settled_tip
+    }
+
+    /// Returns the visible-tip commitment-tree checkpoint used to derive the next block.
+    #[must_use]
+    pub const fn tip_checkpoint(&self) -> &CommitmentTreeCheckpoint {
+        &self.tip_checkpoint
+    }
+}
+
 impl RocksDbCanonicalStore {
     /// Atomically appends one block-local canonical fact set and publishes its fence.
     ///
@@ -112,8 +145,9 @@ impl RocksDbCanonicalStore {
     pub fn commit_live_append(
         mut self,
         append: CanonicalLiveAppend,
+        network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<(Self, CanonicalEventFence), CanonicalStoreError> {
-        let prepared = PreparedLiveAppendCommit::new(&self, append)?;
+        let prepared = PreparedLiveAppendCommit::new(&self, append, network_upgrade_activations)?;
         let mut batch = WriteBatch::default();
         prepared
             .block_rows
@@ -132,6 +166,7 @@ impl RocksDbCanonicalStore {
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(false);
         write_options.set_sync(true);
+        abort_at_live_commit_failpoint("before_atomic_write");
         self.bounded_open
             .db
             .write_opt(&batch, &write_options)
@@ -141,12 +176,13 @@ impl RocksDbCanonicalStore {
                     source,
                 },
             )?;
-        validate_live_commit_readback(&self.bounded_open.db, &self.build_plan, &prepared).map_err(
-            |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
+        abort_at_live_commit_failpoint("after_atomic_write");
+        validate_live_commit_readback(&self.bounded_open.db, &prepared).map_err(|source| {
+            CanonicalStoreError::LiveCommitCompletedButUnverified {
                 path: self.bounded_open.db.path().to_path_buf(),
                 reason: source.to_string(),
-            },
-        )?;
+            }
+        })?;
         self.ready_evidence = prepared.ready_evidence;
         Ok((self, prepared.outcome))
     }
@@ -156,6 +192,31 @@ impl RocksDbCanonicalStore {
     pub fn event_fence(&self) -> CanonicalEventFence {
         event_fence_from_ready(self.ready_evidence)
     }
+
+    /// Reads the authenticated fence, settled tip, and exact visible-tip tree checkpoint.
+    pub fn append_anchor(&self) -> Result<CanonicalAppendAnchor, CanonicalStoreError> {
+        let event_fence = self.event_fence();
+        let (visible_tip, settled_tip) =
+            read_chain_epoch_tips(&self.bounded_open.db, event_fence.chain_epoch_id())?;
+        if visible_tip != event_fence.visible_tip() {
+            return Err(CanonicalStoreError::live_commit(
+                "persisted epoch no longer matches the admitted READY fence",
+            ));
+        }
+        let tip_checkpoint = read_persisted_tip_checkpoint(&self.bounded_open.db, visible_tip)?;
+        if tip_checkpoint.tip_metadata()
+            != read_persisted_tip_metadata(&self.bounded_open.db, visible_tip)?
+        {
+            return Err(CanonicalStoreError::live_commit(
+                "visible-tip checkpoint differs from persisted compact-block tree positions",
+            ));
+        }
+        Ok(CanonicalAppendAnchor {
+            event_fence,
+            settled_tip,
+            tip_checkpoint,
+        })
+    }
 }
 
 struct PreparedLiveAppendCommit {
@@ -164,6 +225,7 @@ struct PreparedLiveAppendCommit {
     encoded_event: Vec<u8>,
     encoded_control: Vec<u8>,
     ready_evidence: CanonicalStoreReadyEvidence,
+    previous_epoch_id: ChainEpochId,
     outcome: CanonicalEventFence,
 }
 
@@ -171,29 +233,32 @@ impl PreparedLiveAppendCommit {
     fn new(
         store: &RocksDbCanonicalStore,
         append: CanonicalLiveAppend,
+        network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<Self, CanonicalStoreError> {
-        if append.expected_fence != store.event_fence() {
+        if network_upgrade_activations.network() != store.network()
+            || network_upgrade_activations
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
+                != store.network_upgrade_activations_fingerprint()
+        {
+            return Err(CanonicalStoreError::live_commit(
+                "live append activation table differs from the admitted store identity",
+            ));
+        }
+        let anchor = store.append_anchor()?;
+        if append.expected_fence != anchor.event_fence() {
             return Err(CanonicalStoreError::live_commit(
                 "expected canonical event fence is stale",
             ));
         }
         validate_live_block(store.workload, &append.block)?;
         let visible_tip = validate_live_block_extension(store.ready_evidence, &append.block)?;
+        validate_live_checkpoint_transition(&anchor, &append.block, network_upgrade_activations)?;
         let tip_metadata = append.block.tip_metadata;
         let previous_epoch_id = store.ready_evidence.visible_epoch;
-        let (persisted_visible_tip, previous_settled_tip) =
-            read_chain_epoch_tips(&store.bounded_open.db, previous_epoch_id)?;
-        if persisted_visible_tip != store.ready_evidence.visible_tip {
-            return Err(CanonicalStoreError::live_commit(
-                "persisted epoch no longer matches the admitted READY fence",
-            ));
-        }
-        let previous_tip_metadata =
-            read_persisted_tip_metadata(&store.bounded_open.db, persisted_visible_tip)?;
         validate_live_settled_tip(
             &store.bounded_open.db,
             store.ready_evidence,
-            previous_settled_tip,
+            anchor.settled_tip(),
             append.settled_tip,
             visible_tip,
         )?;
@@ -219,7 +284,7 @@ impl PreparedLiveAppendCommit {
         Ok(Self {
             block_rows: PreparedLiveBlockRows::from_block(
                 append.block,
-                previous_tip_metadata,
+                anchor.tip_checkpoint().tip_metadata(),
                 append.subtree_roots,
             )?,
             encoded_epoch: encode_live_chain_epoch(
@@ -237,9 +302,96 @@ impl PreparedLiveAppendCommit {
             .to_vec(),
             encoded_control,
             ready_evidence,
+            previous_epoch_id,
             outcome: event_fence_from_ready(ready_evidence),
         })
     }
+}
+
+fn validate_live_checkpoint_transition(
+    anchor: &CanonicalAppendAnchor,
+    block: &CanonicalBuildBlock,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<(), CanonicalStoreError> {
+    let checkpoint = block.tree_state_checkpoint.as_ref().ok_or_else(|| {
+        CanonicalStoreError::live_commit("live append has no transition-tip tree checkpoint")
+    })?;
+    let compact = LightwalletdCompactBlock::decode(block.compact_block.payload_bytes.as_slice())
+        .map_err(|_| CanonicalStoreError::live_commit("live compact block is invalid protobuf"))?;
+    let mut sapling = Vec::new();
+    let mut orchard = Vec::new();
+    let mut ironwood = Vec::new();
+    for transaction in compact.vtx {
+        for output in transaction.outputs {
+            sapling.push(compact_commitment_bytes(
+                block.facts.block_header.height,
+                ShieldedProtocol::Sapling,
+                &output.cmu,
+            )?);
+        }
+        for action in transaction.actions {
+            orchard.push(compact_commitment_bytes(
+                block.facts.block_header.height,
+                ShieldedProtocol::Orchard,
+                &action.cmx,
+            )?);
+        }
+        for action in transaction.ironwood_actions {
+            ironwood.push(compact_commitment_bytes(
+                block.facts.block_header.height,
+                ShieldedProtocol::Ironwood,
+                &action.cmx,
+            )?);
+        }
+    }
+    let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+        anchor.tip_checkpoint.block_id.height,
+        &anchor.tip_checkpoint.frontiers,
+        network_upgrade_activations,
+    )
+    .map_err(|source| {
+        CanonicalStoreError::live_commit(format!(
+            "persisted visible-tip frontier cannot seed live following: {source}"
+        ))
+    })?;
+    accumulator
+        .append_block_commitments(
+            block.facts.block_header.height,
+            &sapling,
+            &orchard,
+            &ironwood,
+        )
+        .map_err(|source| {
+            CanonicalStoreError::live_commit(format!(
+                "live block commitments cannot advance the persisted frontier: {source}"
+            ))
+        })?;
+    let derived_frontiers = accumulator.validated_frontiers().map_err(|source| {
+        CanonicalStoreError::live_commit(format!(
+            "live block commitment frontiers cannot be authenticated: {source}"
+        ))
+    })?;
+    if accumulator.tip_metadata() != block.tip_metadata || derived_frontiers != checkpoint.frontiers
+    {
+        return Err(CanonicalStoreError::live_commit(
+            "live transition-tip checkpoint is not derived from the persisted frontier",
+        ));
+    }
+    Ok(())
+}
+
+fn compact_commitment_bytes(
+    height: BlockHeight,
+    protocol: ShieldedProtocol,
+    bytes: &[u8],
+) -> Result<[u8; 32], CanonicalStoreError> {
+    bytes.try_into().map_err(|_| {
+        CanonicalStoreError::live_commit(format!(
+            "block {} has a {protocol:?} commitment with {} bytes",
+            height.value(),
+            bytes.len()
+        ))
+    })
 }
 
 fn event_fence_from_ready(ready_evidence: CanonicalStoreReadyEvidence) -> CanonicalEventFence {
@@ -584,7 +736,6 @@ impl PreparedLiveRow {
 
 fn validate_live_commit_readback(
     db: &DB,
-    build_plan: &super::CanonicalStoreBuildPlan,
     prepared: &PreparedLiveAppendCommit,
 ) -> Result<(), CanonicalStoreError> {
     prepared.block_rows.validate_readback(db)?;
@@ -620,8 +771,18 @@ fn validate_live_commit_readback(
             "epoch, event, or READY control differs after atomic live write",
         ));
     }
-    validate_ready_publication(db, build_plan, prepared.ready_evidence)
+    validate_live_append_publication(db, prepared.ready_evidence, prepared.previous_epoch_id)
 }
+
+#[cfg(test)]
+fn abort_at_live_commit_failpoint(expected: &str) {
+    if std::env::var("ZINDER_TEST_CANONICAL_LIVE_COMMIT_FAILPOINT").as_deref() == Ok(expected) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+const fn abort_at_live_commit_failpoint(_expected: &str) {}
 
 #[cfg(test)]
 mod tests {

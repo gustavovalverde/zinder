@@ -28,7 +28,7 @@ use zinder_core::{
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::CanonicalReplayScan;
 pub use builder::RocksDbCanonicalBuilder;
-pub use live_commit::{CanonicalEventFence, CanonicalLiveAppend};
+pub use live_commit::{CanonicalAppendAnchor, CanonicalEventFence, CanonicalLiveAppend};
 pub use publication::{
     CanonicalBaselinePublication, PreparedCanonicalBaselinePublication,
     ValidatedRocksDbCanonicalBuild,

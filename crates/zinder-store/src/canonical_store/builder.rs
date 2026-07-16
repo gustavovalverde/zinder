@@ -342,6 +342,8 @@ mod tests {
 
     const PUBLICATION_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_FAILPOINT";
     const PUBLICATION_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_STORE_PATH";
+    const LIVE_COMMIT_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_COMMIT_FAILPOINT";
+    const LIVE_COMMIT_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_COMMIT_STORE_PATH";
 
     #[test]
     fn builder_refuses_every_existing_path() -> Result<(), Box<dyn std::error::Error>> {
@@ -440,7 +442,10 @@ mod tests {
         let source_tip = zinder_core::CommitmentTreeCheckpoint::new(
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
             2,
-            zinder_core::CommitmentTreeFrontiers::default(),
+            crate::canonical_store::test_checkpoint_frontiers(
+                &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+                BlockHeight::new(2),
+            ),
         );
         store.confirm_source_tip_checkpoint(&source_tip)?;
         assert!(store.is_source_tip_checkpoint_confirmed());
@@ -560,14 +565,19 @@ mod tests {
         let mut live_block = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
         add_tree_state_checkpoint(&mut live_block)?;
         let expected_fence = store.event_fence();
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
 
-        let (next_store, outcome) = store.commit_live_append(crate::CanonicalLiveAppend::new(
-            expected_fence,
-            live_block,
-            Vec::new(),
-            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-            zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
-        ))?;
+        let (next_store, outcome) = store.commit_live_append(
+            crate::CanonicalLiveAppend::new(
+                expected_fence,
+                live_block,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+            ),
+            &activations,
+        )?;
         store = next_store;
 
         assert_eq!(outcome.chain_epoch_id(), zinder_core::ChainEpochId::new(2));
@@ -578,7 +588,6 @@ mod tests {
             outcome.sequence_digest().as_bytes(),
             expected_fence.sequence_digest().as_bytes()
         );
-        assert_eq!(store.ready_evidence().visible_tip, outcome.visible_tip());
         drop(store);
 
         let reopened = RocksDbCanonicalStore::open_ready(
@@ -601,14 +610,16 @@ mod tests {
         let expected_fence = reopened.event_fence();
         let mut block_four = canonical_build_block(BlockHeight::new(4), [4; 32], [3; 32]);
         add_tree_state_checkpoint(&mut block_four)?;
-        let (store, second_outcome) =
-            reopened.commit_live_append(crate::CanonicalLiveAppend::new(
+        let (store, second_outcome) = reopened.commit_live_append(
+            crate::CanonicalLiveAppend::new(
                 expected_fence,
                 block_four,
                 Vec::new(),
                 BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
                 zinder_core::UnixTimestampMillis::new(1_750_000_002_000),
-            ))?;
+            ),
+            &activations,
+        )?;
         assert_eq!(second_outcome.chain_epoch_id(), ChainEpochId::new(3));
         assert_eq!(second_outcome.sequence_digest().block_count(), 4);
         drop(store);
@@ -629,6 +640,36 @@ mod tests {
     }
 
     #[test]
+    fn ready_store_append_anchor_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let expected_anchor = store.append_anchor()?;
+        assert_eq!(expected_anchor.event_fence(), store.event_fence());
+        assert_eq!(
+            expected_anchor.tip_checkpoint().block_id,
+            store.event_fence().visible_tip()
+        );
+        drop(store);
+
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(reopened.append_anchor()?, expected_anchor);
+        Ok(())
+    }
+
+    #[test]
     fn ready_store_rejects_incomplete_live_wallet_artifacts_without_advancing()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
@@ -640,14 +681,19 @@ mod tests {
         ))?;
         let store = validated.publish_baseline(publication)?;
         let expected_fence = store.event_fence();
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let error = store
-            .commit_live_append(crate::CanonicalLiveAppend::new(
-                expected_fence,
-                canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]),
-                Vec::new(),
-                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
-            ))
+            .commit_live_append(
+                crate::CanonicalLiveAppend::new(
+                    expected_fence,
+                    canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]),
+                    Vec::new(),
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+                ),
+                &activations,
+            )
             .err()
             .ok_or("a live tip without its tree state must be rejected")?;
         assert!(matches!(
@@ -671,13 +717,16 @@ mod tests {
             completing_block_height: BlockHeight::new(3),
         };
         let error = store
-            .commit_live_append(crate::CanonicalLiveAppend::new(
-                expected_fence,
-                block_three,
-                vec![unexpected_root],
-                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
-            ))
+            .commit_live_append(
+                crate::CanonicalLiveAppend::new(
+                    expected_fence,
+                    block_three,
+                    vec![unexpected_root],
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+                ),
+                &activations,
+            )
             .err()
             .ok_or("an unexpected live subtree root must be rejected")?;
         assert!(matches!(
@@ -717,17 +766,22 @@ mod tests {
         ))?;
         let store = validated.publish_baseline(publication)?;
         let expected_fence = store.event_fence();
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
 
         let mut disconnected_block = canonical_build_block(BlockHeight::new(3), [3; 32], [9; 32]);
         add_tree_state_checkpoint(&mut disconnected_block)?;
         let error = store
-            .commit_live_append(crate::CanonicalLiveAppend::new(
-                expected_fence,
-                disconnected_block,
-                Vec::new(),
-                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
-            ))
+            .commit_live_append(
+                crate::CanonicalLiveAppend::new(
+                    expected_fence,
+                    disconnected_block,
+                    Vec::new(),
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+                ),
+                &activations,
+            )
             .err()
             .ok_or("a disconnected live block must be rejected")?;
 
@@ -769,23 +823,31 @@ mod tests {
         let stale_fence = store.event_fence();
         let mut block_three = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
         add_tree_state_checkpoint(&mut block_three)?;
-        let (next_store, _) = store.commit_live_append(crate::CanonicalLiveAppend::new(
-            stale_fence,
-            block_three,
-            Vec::new(),
-            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-            zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
-        ))?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let (next_store, _) = store.commit_live_append(
+            crate::CanonicalLiveAppend::new(
+                stale_fence,
+                block_three,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+            ),
+            &activations,
+        )?;
         store = next_store;
 
         let error = store
-            .commit_live_append(crate::CanonicalLiveAppend::new(
-                stale_fence,
-                canonical_build_block(BlockHeight::new(4), [4; 32], [3; 32]),
-                Vec::new(),
-                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-                zinder_core::UnixTimestampMillis::new(1_750_000_002_000),
-            ))
+            .commit_live_append(
+                crate::CanonicalLiveAppend::new(
+                    stale_fence,
+                    canonical_build_block(BlockHeight::new(4), [4; 32], [3; 32]),
+                    Vec::new(),
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_002_000),
+                ),
+                &activations,
+            )
             .err()
             .ok_or("a stale canonical event fence must be rejected")?;
 
@@ -805,6 +867,122 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?
                 .len(),
             3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_store_rejects_live_checkpoint_not_derived_from_the_persisted_frontier()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let mut block = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
+        block.tree_state_checkpoint = Some(zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32])),
+            3,
+            zinder_core::CommitmentTreeFrontiers::default(),
+        ));
+        let expected_fence = store.event_fence();
+
+        let error = store
+            .commit_live_append(
+                crate::CanonicalLiveAppend::new(
+                    expected_fence,
+                    block,
+                    Vec::new(),
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+                ),
+                &activations,
+            )
+            .err()
+            .ok_or("an invented live frontier must be rejected")?;
+
+        assert!(matches!(
+            error,
+            CanonicalStoreError::LiveCommitRefused { .. }
+        ));
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reopened.event_fence().chain_epoch_id(),
+            ChainEpochId::new(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_commit_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(store_path) = env::var_os(LIVE_COMMIT_STORE_PATH_ENV) else {
+            return Ok(());
+        };
+        let store_path = Path::new(&store_path);
+        let validated = complete_loaded_builder(store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let mut block = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
+        add_tree_state_checkpoint(&mut block)?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let expected_fence = store.event_fence();
+        let _ = store.commit_live_append(
+            crate::CanonicalLiveAppend::new(
+                expected_fence,
+                block,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+            ),
+            &activations,
+        )?;
+        Err("live-commit failpoint did not abort the child process".into())
+    }
+
+    #[test]
+    fn live_commit_crashes_reopen_at_one_complete_atomic_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let before_path = temporary.path().join("before-atomic-write");
+        run_live_commit_crash_child(&before_path, "before_atomic_write")?;
+        let before = RocksDbCanonicalStore::open_ready(
+            &before_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(before.event_fence().chain_epoch_id(), ChainEpochId::new(1));
+        drop(before);
+
+        let after_path = temporary.path().join("after-atomic-write");
+        run_live_commit_crash_child(&after_path, "after_atomic_write")?;
+        let after = RocksDbCanonicalStore::open_ready(
+            &after_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(after.event_fence().chain_epoch_id(), ChainEpochId::new(2));
+        assert_eq!(after.event_fence().chain_event_sequence(), 2);
+        assert_eq!(
+            after.event_fence().visible_tip().height,
+            BlockHeight::new(3)
         );
         Ok(())
     }
@@ -1410,7 +1588,10 @@ mod tests {
         store.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
             2,
-            zinder_core::CommitmentTreeFrontiers::default(),
+            crate::canonical_store::test_checkpoint_frontiers(
+                &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+                BlockHeight::new(2),
+            ),
         ))?;
         Ok(store)
     }
@@ -1431,6 +1612,26 @@ mod tests {
             .status()?;
         if status.success() {
             return Err(format!("publication failpoint {failpoint} did not crash").into());
+        }
+        Ok(())
+    }
+
+    fn run_live_commit_crash_child(
+        store_path: &Path,
+        failpoint: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new(env::current_exe()?)
+            .arg("--exact")
+            .arg("canonical_store::builder::tests::live_commit_crash_child_process")
+            .arg("--nocapture")
+            .env(LIVE_COMMIT_STORE_PATH_ENV, store_path)
+            .env(LIVE_COMMIT_FAILPOINT_ENV, failpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            return Err(format!("live-commit failpoint {failpoint} did not crash").into());
         }
         Ok(())
     }
@@ -1625,12 +1826,14 @@ mod tests {
 
     fn add_tree_state_checkpoint(
         block: &mut crate::CanonicalBuildBlock,
-    ) -> Result<(), std::num::TryFromIntError> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let header = &block.facts.block_header;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         block.tree_state_checkpoint = Some(zinder_core::CommitmentTreeCheckpoint::new(
             BlockId::new(header.height, header.block_hash),
             u32::try_from(header.block_time)?,
-            zinder_core::CommitmentTreeFrontiers::default(),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, header.height),
         ));
         Ok(())
     }

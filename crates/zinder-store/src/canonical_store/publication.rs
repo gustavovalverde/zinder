@@ -378,6 +378,58 @@ pub(super) fn validate_ready_publication(
     validate_live_append_history(db, ready_evidence, baseline_epoch)
 }
 
+pub(super) fn validate_live_append_publication(
+    db: &DB,
+    ready_evidence: CanonicalStoreReadyEvidence,
+    previous_epoch_id: ChainEpochId,
+) -> Result<(), CanonicalStoreError> {
+    if ready_evidence.visible_event_sequence != ready_evidence.visible_epoch.value()
+        || ready_evidence.visible_epoch.value() != previous_epoch_id.value().saturating_add(1)
+    {
+        return Err(CanonicalStoreError::publication(
+            "READY live epoch and chain-event sequence must advance together",
+        ));
+    }
+    let previous_epoch = decode_chain_epoch(&read_family_row(
+        db,
+        CHAIN_EPOCH_COLUMN_FAMILY,
+        &previous_epoch_id.value().to_be_bytes(),
+    )?)?;
+    let current_epoch = decode_chain_epoch(&read_family_row(
+        db,
+        CHAIN_EPOCH_COLUMN_FAMILY,
+        &ready_evidence.visible_epoch.value().to_be_bytes(),
+    )?)?;
+    let current_event = decode_chain_event(&read_family_row(
+        db,
+        CHAIN_EVENT_COLUMN_FAMILY,
+        &ready_evidence.visible_event_sequence.to_be_bytes(),
+    )?)?;
+    let appended_height =
+        previous_epoch.visible_tip.height.next().ok_or_else(|| {
+            CanonicalStoreError::publication("live append height exceeds u32::MAX")
+        })?;
+    let appended_range = BlockHeightRange::inclusive(appended_height, appended_height);
+    validate_epoch_record(
+        db,
+        ready_evidence.first_retained_block.height,
+        ready_evidence.visible_tip,
+        current_epoch,
+    )?;
+    if current_epoch.visible_tip.height != appended_height
+        || current_event.kind != COMMITTED_EVENT
+        || current_event.resulting_epoch_id != ready_evidence.visible_epoch
+        || current_event.previous_epoch_id != previous_epoch_id.value()
+        || current_event.reverted_range.is_some()
+        || current_event.committed_range != appended_range
+    {
+        return Err(CanonicalStoreError::publication(
+            "READY live transition is not one valid version-1 append",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_first_retained_block(
     db: &DB,
     first_retained_block: BlockId,
