@@ -27,9 +27,9 @@ plans/
 observability/
 
 # Dockerfiles and deploy assets do not need to ship inside images, with the
-# exception of the single-container image's s6-overlay service definitions and
-# reference config. `deploy/Dockerfile` COPYs those files into the runtime image,
-# and the build fails when they are excluded from the build context.
+# exception of runtime entrypoints, the single-container image's s6-overlay
+# service definitions, and reference config. The Dockerfiles copy these files
+# into runtime images, and the build fails when they are excluded.
 **/Dockerfile
 **/Dockerfile.*
 deploy/
@@ -40,6 +40,7 @@ deploy/
 !deploy/single-container/config.example.explorer.toml
 !deploy/single-container/nginx.conf
 !deploy/capture-container-resource-evidence.sh
+!deploy/canonical-runtime-entrypoint
 
 # Test outputs.
 **/test-results/

@@ -228,6 +228,15 @@ ENTRYPOINT ["/init"]
 
 FROM zinder-ingest AS zinder-canonical-runtime
 
+COPY --chmod=0755 deploy/canonical-runtime-entrypoint \
+    /usr/local/bin/zinder-canonical-runtime-entrypoint
+
+# Railway volume mounts replace the ownership baked into the image. Start the
+# narrow ownership repair as root; the entrypoint immediately drops to zinder.
+USER root:root
+
+ENTRYPOINT ["zinder-canonical-runtime-entrypoint"]
+
 # Existing Railway services keep the bundled image by default. The canary's
 # dedicated config selects zinder-canonical-runtime through a service-scoped
 # RAILWAY_DOCKER_TARGET_STAGE build variable.
