@@ -182,8 +182,10 @@ struct ValidatedLifecycleArgs {
 pub(crate) async fn run_rocksdb_storage_lifecycle(
     args: RocksDbStorageLifecycleArgs,
 ) -> Result<RocksDbStorageLifecycleOutput, BenchError> {
-    let total_started = Instant::now();
+    // Capture wall-clock provenance first so its millisecond interval encloses
+    // the monotonic duration that the report claims as total runtime.
     let run_started_at_unix_millis = UnixTimestampMillis::now().value();
+    let total_started = Instant::now();
     let validated = args.validate()?;
     let canonical_resource_budget = RocksDbResourceBudget::canonical_writer_defaults();
     let wallet_resource_budget = RocksDbResourceBudget::derive_writer_defaults();
