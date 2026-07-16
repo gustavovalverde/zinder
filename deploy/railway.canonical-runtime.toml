@@ -1,5 +1,5 @@
 # Select this config file only on the isolated canary service and set
-# ZINDER_RAILWAY_IMAGE_STAGE=zinder-canonical-runtime on that service.
+# RAILWAY_DOCKER_TARGET_STAGE=zinder-canonical-runtime on that service.
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "deploy/Dockerfile.railway-nocache"

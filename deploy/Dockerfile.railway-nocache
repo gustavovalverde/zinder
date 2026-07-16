@@ -12,7 +12,7 @@
 
 ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
-ARG ZINDER_RAILWAY_IMAGE_STAGE=zinder-single-container
+ARG RAILWAY_DOCKER_TARGET_STAGE=zinder-single-container
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS zinder-build-base
 
@@ -230,5 +230,5 @@ FROM zinder-ingest AS zinder-canonical-runtime
 
 # Existing Railway services keep the bundled image by default. The canary's
 # dedicated config selects zinder-canonical-runtime through a service-scoped
-# ZINDER_RAILWAY_IMAGE_STAGE build variable.
-FROM ${ZINDER_RAILWAY_IMAGE_STAGE} AS zinder-railway-runtime
+# RAILWAY_DOCKER_TARGET_STAGE build variable.
+FROM ${RAILWAY_DOCKER_TARGET_STAGE} AS zinder-railway-runtime

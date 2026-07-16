@@ -96,7 +96,7 @@ evidence is captured.
 
 [`deploy/railway.canonical-runtime.toml`](../../deploy/railway.canonical-runtime.toml)
 is the isolated service config. Before deploying, the canary service must select
-that config file, set `ZINDER_RAILWAY_IMAGE_STAGE=zinder-canonical-runtime`,
+that config file, set `RAILWAY_DOCKER_TARGET_STAGE=zinder-canonical-runtime`,
 change `PORT` from 9099 to 9105, retain the mainnet Zebra endpoint and existing
 authentication variables, and attach a new empty canary-only Zinder volume at
 `/var/lib/zinder`. The prepared runtime uses the Wallet workload, has no
