@@ -40,6 +40,7 @@ path = "/var/lib/zinder/store"
 
 [ingest]
 source = "zebra-json-rpc"
+projection_preset = "wallet"
 reorg_window_blocks = 100
 
 [ingest.derive]

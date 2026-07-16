@@ -107,7 +107,7 @@ RUN apt-get update \
 
 RUN groupadd --system --gid 1000 zinder \
     && useradd --system --uid 1000 --gid zinder --home /var/lib/zinder --shell /usr/sbin/nologin zinder \
-    && mkdir -p /var/lib/zinder/store /var/lib/zinder/secondary /etc/zinder \
+    && mkdir -p /var/lib/zinder/secondary /etc/zinder \
     && chown -R zinder:zinder /var/lib/zinder /etc/zinder
 
 FROM zinder-runtime-base AS zinder-ingest
@@ -118,13 +118,12 @@ USER zinder:zinder
 WORKDIR /var/lib/zinder
 
 ENV ZINDER_OPS__LISTEN_ADDR=[::]:9105
-ENV ZINDER_INGEST_CONTROL__LISTEN_ADDR=[::]:9100
 ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
 
-EXPOSE 9100 9105
+EXPOSE 9105
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS http://localhost:9105/readyz || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:9105/healthz || exit 1
 
 ENTRYPOINT ["zinder-ingest"]
 
