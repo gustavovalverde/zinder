@@ -109,6 +109,32 @@ The application reached the create-or-restore onboarding screen without a
 fatal exception. No wallet seed was generated, entered, displayed, or recorded
 because the version-1 backend could not pass endpoint validation.
 
+### Physical phone endpoint validation
+
+The same APK was then installed as an in-place upgrade on a physical Pixel 10
+Pro running Android 16, API 36, with build fingerprint
+`google/blazer/blazer:16/CP1A.260505.005/15081906:user/release-keys`. The phone
+already had Internal Debug 3.4.0, version code 1685. `adb install -r` upgraded
+it to 3.7.2, version code 2076, in 5.09 seconds without uninstalling the
+application or clearing its existing data. A cold launch reached
+`MainActivity` in 1.115 seconds.
+
+An ADB reverse rule mapped device `localhost:19443` to the same host port. In
+the running application, Manual connection mode was selected and the custom
+endpoint was changed to `localhost:19443`. Saving the selection caused the
+real SDK client to call
+`/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo`. The phone accepted
+the bundled Caddy root and completed TLS with HTTP/2 and SNI `localhost`.
+
+The application then displayed `Invalid server endpoint` and reported that the
+endpoint switch failed. Its `LightWalletClient` log recorded
+`UNAVAILABLE: HTTP status code 502`, with Caddy identified in the response
+trailers. Caddy recorded the request from `grpc-java-okhttp/1.78.0` and failed
+to connect to its configured h2c upstream at `127.0.0.1:19067` because no
+process was listening. This proves the physical-device trust, tunnel, endpoint
+format, and `GetLightdInfo` path. It does not prove endpoint selection or any
+wallet synchronization result.
+
 ## ZODL and SDK RPC inventory
 
 Receive addresses, balances, and transaction history are not fetched as
