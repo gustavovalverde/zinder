@@ -311,3 +311,61 @@ stores into live ingest, projection following, and query serving, then prove
 reorg, restart, restore, and real wallet-client parity. PostgreSQL remains the
 separate `postgres-scale-out` implementation after the RocksDB runtime contract
 is stable; this evidence neither blocks nor certifies it.
+
+## Canonical readback optimization A/B
+
+Status: exact-fence optimization accepted
+Date: 2026-07-16
+Revision: `ee5d6713e6a37b85591db027a18f72a8ebfc7b32`
+Image: `sha256:b82b5c6a4cb9a0eefc31de20e3f9b0b01093531dbf8096ca48b80089d7c5a31d`
+Trial: `testnet-20260716-readback-opt`
+
+The canonical builder originally read every persisted replay and commitment
+tree family immediately after SST ingestion, then the cold publication gate
+read those families again. Cold publication also scanned replay rows three
+times to prove semantic sequence, raw family bytes, and the final `READY`
+evidence. The optimized path leaves the store in `BUILDING`, defers its only
+authoritative readback to cold publication, and proves replay semantics,
+sequence, count, and key-plus-value logical bytes in one checked pass. A
+post-load corruption test proves that invalid bytes still fail before `READY`.
+
+The comparison used fresh project-scoped canonical and wallet volumes, the
+same fixed height 4,175,080 and hash
+`96e1db9b5dc679f22775f93ca838a9066f04c2a50de5fa0eb035e2b5ebfe6600`,
+the same 10-core quota, and the same 10 GiB container limit on the 16 GB Docker
+Desktop VM. Both strict evidence validators passed.
+
+| Stage | Baseline | Optimized | Change |
+| --- | ---: | ---: | ---: |
+| Canonical source load and construction | 8m 24.66s | 5m 21.65s | -3m 03.01s |
+| Canonical cold validation | 2m 51.29s | 2m 18.81s | -32.47s |
+| Canonical storage ready | 11m 16.05s | 7m 40.57s | -3m 35.48s (-31.9%) |
+| Wallet canonical scan | 46.35s | 1m 32.61s | +46.26s |
+| Wallet storage ready | 4m 31.16s | 5m 02.60s | +31.44s (+11.6%) |
+| Complete storage lifecycle | 15m 47.21s | 12m 43.17s | -3m 04.04s (-19.4%) |
+
+The canonical sequence digest remained
+`57112f5254593b7c290be4d75a39337959bd0820ee18fa2174286de9bd1d2740`,
+and the wallet projection digest remained
+`3ac9577d7ca1e2372c25691e0224e3e93f2c0885aa71955459066ff488499d9a`.
+The optimized run rebuilt the same 4,175,080 blocks, 4,786,733 transactions,
+and all six wallet row counts. Zero historical prevout reads and zero random
+wallet validation reads remained enforced.
+
+The exact private-cgroup memory peak was 6,522,208,256 bytes, approximately
+6.07 GiB, and sampled allocated storage peaked at 18,073,034,752 bytes,
+approximately 16.83 GiB. The 25.6 MB increase from the baseline memory peak is
+not material relative to the 10 GiB limit.
+
+The wallet scan regression is a system-level cost of removing canonical
+readbacks, not a semantic regression. The likely explanation is colder
+canonical pages when wallet construction begins, because the optimized path no
+longer warms them through redundant validation. That explanation is an
+inference; a later campaign needs explicit cache telemetry to prove it. The
+end-to-end result remains 184.04 seconds faster.
+
+The next measured canonical target is density-only prefetch invalidation.
+Density feedback changes the preferred size of newly scheduled requests but
+does not make already bounded, non-overlapping requests invalid. Response-size
+splits must continue to cancel and replan speculative ranges. That change must
+be measured separately at the same fixed fence so its effect is attributable.

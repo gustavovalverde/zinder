@@ -33,9 +33,12 @@ fact-first runtime or the `postgres-scale-out` composition.
 
 The [version-1 RocksDB storage construction evidence](../investigations/2026-07-15-fact-first-live-validation.md#version-1-rocksdb-storage-construction)
 certifies fresh canonical and wallet storage construction through a fixed
-4.175-million-block testnet tip in 15 minutes 47.21 seconds. It proves the new
-bounded RocksDB construction and cold-admission path, not live following, query
-serving, restore, reorg execution, wallet-client parity, or PostgreSQL.
+4.175-million-block testnet tip. The baseline completed in 15 minutes 47.21
+seconds; an exact-fence [readback optimization A/B](../investigations/2026-07-15-fact-first-live-validation.md#canonical-readback-optimization-ab)
+reduced that to 12 minutes 43.17 seconds while preserving both semantic
+digests. It proves the new bounded RocksDB construction and cold-admission
+path, not live following, query serving, restore, reorg execution,
+wallet-client parity, or PostgreSQL.
 
 ## Implementation Status
 
@@ -46,7 +49,7 @@ serving, restore, reorg execution, wallet-client parity, or PostgreSQL.
 | Full replay/header verifier | Landed and live-tested | All 4.17 million pinned testnet rows passed replay, header, and continuity checks |
 | PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
 | Clean physical schema identities | Landed | Canonical, wallet, and explorer contracts use identity-scoped version 1 and refuse prior layouts without migration or adoption |
-| Fresh RocksDB canonical builder | Wallet construction live-certified | A new `BUILDING` path fixes its workload, activation fingerprint, source range, predecessor frontiers, and build tip. A clean testnet run loaded and cold-validated 4,175,080 blocks, then atomically published epoch 1, event 1, and `READY` at the fixed source fence |
+| Fresh RocksDB canonical builder | Wallet construction live-certified | A new `BUILDING` path fixes its workload, activation fingerprint, source range, predecessor frontiers, and build tip. The optimized clean testnet run loaded and cold-validated 4,175,080 blocks in 7 minutes 40.57 seconds, then atomically published epoch 1, event 1, and `READY` at the fixed source fence |
 | One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
 | Version-1 wallet row contracts and serial oracle | Landed | 6 query-owned row families, exact durable codecs, deterministic projection evidence, and bounded reorg undo are independent of the storage engine |
 | RocksDB wallet construction | Production loader landed and testnet storage-certified | A fresh identity-scoped version-1 store uses bounded external runs and ordered SST ingestion, moves from `BUILDING` through cold semantic validation to `READY`, and reproduces its exact canonical source fence after a final cold reopen. The full-tip testnet build used zero historical prevout and validation random reads |
