@@ -70,7 +70,7 @@ The bulk-catchup phase of the unified ingest loop ([ADR-0022](../adrs/0022-resou
 
 Tip-follow and reorg-ancestor traversal use `fetch_block_at` directly because random access at the live edge is the natural shape. Native streaming transports can satisfy the same `SourceChainUpdate` values behind `fetch_chain_segment` without changing canonical ingest.
 
-`tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality. The Zebra JSON-RPC adapter implements it as `getbestblockhash` followed by `getblockheader(best_hash, true)` so the height and hash come from the same observation.
+`tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality. The Zebra JSON-RPC adapter uses `getbestblockheightandhash`, which returns both fields from one node snapshot and avoids a cross-call reorg race.
 
 `fetch_chain_value_pools_at_tip()` returns `ChainValuePools { source_tip: BlockId, pools }`. The Zebra adapter decodes `blocks`, `bestblockhash`, and `valuePools` from one `getblockchaininfo` response, preserving the authoritative height/hash pair attached to those totals. Callers compare `source_tip` with a canonical chain identity before accepting the snapshot; height equality alone is insufficient across reorgs.
 
@@ -121,7 +121,7 @@ New capability names are added to `NodeCapability` when a real consumer reads th
 
 Capability discovery happens at startup in the `connect_node` phase. The probe is implementation-specific per backend:
 
-- **Zebra JSON-RPC**: call `rpc.discover` (Zebra v4.2+) and parse the OpenRPC method list. Canonical ingest requires `getblock`, `getbestblockhash`, `getblockheader`, and `z_getsubtreesbyindex`; missing required methods produce `NodeCapabilityMissing` and the readiness state advances no further than `node_capability_missing`. `z_gettreestate` enables checkpoint tree-state wallet capabilities but is not required for canonical catchup. The block-fetch and checkpoint paths use height-keyed `getblock`; `getblockhash` is not part of the source contract. Optional methods such as `sendrawtransaction` for broadcast and `getblockchaininfo` for `chain_value_pools` are advertised when present but are not required for canonical ingestion.
+- **Zebra JSON-RPC**: call `rpc.discover` and parse the OpenRPC method list. Canonical ingest requires `getblock`, `getbestblockheightandhash`, and `z_getsubtreesbyindex`; missing discovery or required methods produce `NodeCapabilityMissing` and the readiness state advances no further than `node_capability_missing`. `z_gettreestate` enables checkpoint tree-state wallet capabilities but is not required for canonical catchup. The block-fetch and checkpoint paths use height-keyed `getblock`; `getblockhash` and `getblockheader` are not part of the current source contract. Optional methods such as `sendrawtransaction` for broadcast and `getblockchaininfo` for `chain_value_pools` are advertised when present but are not required for canonical ingestion.
 - **Zebra indexer gRPC**: the mempool adapter detects feature presence by opening the configured gRPC stream. A block-streaming source and spending-transaction lookup capability are future extensions; they must add real `NodeCapability` variants and runtime wiring in the same change.
 - **zcashd JSON-RPC**: future. Capability probe via `getnetworkinfo` and method probing.
 
@@ -131,7 +131,6 @@ Startup validates required capabilities before ingestion mutates state. Missing 
 - `NodeUnavailable`
 - `SourceProtocolMismatch`
 - `BlockUnavailable`
-- `TipViewChanged` when Zebra invalidates the just-observed best hash before its header can be read; the adapter performs bounded fresh observations before returning it.
 - `TransactionBroadcastDisabled` for the no-op broadcaster path.
 
 Source errors describe what the upstream did; lifecycle decisions are owned by the writer loops, not by this boundary. `SourceError::upstream_classification()` returns a [`SourceFailureClass`](../adrs/0013-source-failure-recovery-topology.md) (`NodeUnreachable`, `UpstreamViewChanged`, `StreamDisconnected`, `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`) that the recovery primitive in `zinder-ingest` consumes to select backoff and populate the `node_unavailable` readiness payload. Every source-shaped failure is loop-recoverable; storage and reorg-window failures are the only ingest-exit paths.

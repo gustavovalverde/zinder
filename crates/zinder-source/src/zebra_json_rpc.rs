@@ -114,10 +114,6 @@ const JSON_RPC_INVALID_ENCODING_CODE: i32 = -22;
 const JSON_RPC_DUPLICATE_TRANSACTION_CODE: i32 = -27;
 /// JSON-RPC error code returned when a txid is not in mempool or main chain.
 const JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE: i32 = -5;
-/// Number of fresh tip observations after Zebra invalidates a just-observed tip hash.
-const TIP_VIEW_RETRY_COUNT: u8 = 2;
-/// Delay between fresh observations of Zebra's best-chain view.
-const TIP_VIEW_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// JSON-RPC error code for general transaction verification failures.
 ///
 /// Zebra collapses every mempool rejection into this code; the
@@ -387,37 +383,17 @@ impl ZebraJsonRpcSource {
     /// advertises plus [`NodeCapability::JsonRpc`] and
     /// [`NodeCapability::OpenRpcDiscovery`].
     ///
-    /// On probe failure (older Zebra without `rpc.discover`, transient
-    /// transport error), the cache falls back to the baseline capability set.
-    /// Operators that require strict capability discovery can pair this call
-    /// with a [`NodeCapabilities::supports`] check against
-    /// [`NodeCapability::OpenRpcDiscovery`].
+    /// Missing discovery fails closed because assuming a method set would let
+    /// startup accept a node that cannot satisfy the source contract.
     pub async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
-        let started_at = Instant::now();
-        let response_body = self
-            .client
-            .snapshot()
-            .request::<Value, _>("rpc.discover", ArrayParams::new())
-            .await;
-        record_json_rpc_client_result("rpc.discover", started_at, &response_body);
-        self.client.record_outcome(&jsonrpsee_transport_signal(
-            &response_body,
-            "rpc.discover",
-            self.max_response_bytes,
-        ));
-
-        let json_rpc_capabilities = match response_body {
-            Ok(openrpc_response) => parse_openrpc_capabilities(&openrpc_response),
-            Err(probe_error) => {
-                tracing::warn!(
-                    target: "zinder::source",
-                    event = "node_capability_probe_fallback",
-                    reason = %probe_error,
-                    "node does not expose rpc.discover; falling back to trusted defaults"
-                );
-                default_zebra_capabilities()
-            }
-        };
+        let openrpc_response: Value = self
+            .call_typed("rpc.discover", ArrayParams::new(), |_error| {
+                SourceError::NodeCapabilityMissing {
+                    capability: NodeCapability::OpenRpcDiscovery,
+                }
+            })
+            .await?;
+        let json_rpc_capabilities = parse_openrpc_capabilities(&openrpc_response);
 
         let probed_capabilities =
             with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
@@ -1031,51 +1007,17 @@ impl NodeSource for ZebraJsonRpcSource {
     }
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        let mut retries_remaining = TIP_VIEW_RETRY_COUNT;
-        loop {
-            let best_block_hash_hex: String = self
-                .call_typed("getbestblockhash", ArrayParams::new(), map_node_unavailable)
-                .await?;
-            let best_block_hash = decode_rpc_block_hash(&best_block_hash_hex)?;
-            let header = self
-                .call_typed(
-                    "getblockheader",
-                    positional_params([Value::from(best_block_hash_hex), Value::from(true)])?,
-                    |error| {
-                        if error.is_best_chain_view_changed() {
-                            SourceError::TipViewChanged {
-                                reason: error.message,
-                            }
-                        } else {
-                            map_node_unavailable(error)
-                        }
-                    },
-                )
-                .await;
-
-            let header: ZebraBlockHeader = match header {
-                Ok(header) => header,
-                Err(SourceError::TipViewChanged { reason }) => {
-                    if retries_remaining == 0 {
-                        return Err(SourceError::TipViewChanged { reason });
-                    }
-                    retries_remaining = retries_remaining.saturating_sub(1);
-                    tokio::time::sleep(TIP_VIEW_RETRY_DELAY).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if decode_rpc_block_hash(&header.hash)? != best_block_hash {
-                return Err(SourceError::SourceProtocolMismatch {
-                    reason: "best block header hash does not match tip hash",
-                });
-            }
-
-            return Ok(BlockId::new(
-                BlockHeight::new(header.height),
-                best_block_hash,
-            ));
-        }
+        let observed_tip: ZebraBestBlockHeightAndHash = self
+            .call_typed(
+                "getbestblockheightandhash",
+                ArrayParams::new(),
+                map_node_unavailable,
+            )
+            .await?;
+        Ok(BlockId::new(
+            BlockHeight::new(observed_tip.height),
+            BlockHash::from_bytes(observed_tip.hash),
+        ))
     }
 
     async fn fetch_subtree_roots(
@@ -1542,7 +1484,6 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::NodeUnavailable { .. }) => "node_unavailable",
         Some(SourceError::SourceResponseTooLarge { .. }) => "source_response_too_large",
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
-        Some(SourceError::TipViewChanged { .. }) => "tip_view_changed",
         Some(SourceError::BlockReorgDuringFetch { .. }) => "block_reorg_during_fetch",
         Some(SourceError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(SourceError::SourceProtocolMismatch { .. }) => "source_protocol_mismatch",
@@ -1606,7 +1547,7 @@ fn parse_openrpc_capabilities(openrpc_response: &Value) -> NodeCapabilities {
     if method_names.contains(&"getblock") {
         probed_capabilities.push(NodeCapability::SourceChainSegments);
     }
-    if openrpc_supports_all_methods(&method_names, &["getbestblockhash", "getblockheader"]) {
+    if method_names.contains(&"getbestblockheightandhash") {
         probed_capabilities.push(NodeCapability::TipId);
     }
     if method_names.contains(&"z_gettreestate") {
@@ -1633,12 +1574,6 @@ fn openrpc_method_names(openrpc_response: &Value) -> Vec<&str> {
         .flatten()
         .filter_map(|method| method.get("name").and_then(Value::as_str))
         .collect()
-}
-
-fn openrpc_supports_all_methods(method_names: &[&str], required_methods: &[&str]) -> bool {
-    required_methods
-        .iter()
-        .all(|required_method| method_names.contains(required_method))
 }
 
 /// Builds the `Authorization: Basic ...` header value from node credentials.
@@ -2059,14 +1994,6 @@ impl JsonRpcCallError {
             Some(code) if i32::try_from(code).ok() == Some(JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE)
         )
     }
-
-    /// Returns whether Zebra rejected a hash because its best-chain view
-    /// changed between `getbestblockhash` and `getblockheader`.
-    fn is_best_chain_view_changed(&self) -> bool {
-        self.message
-            .to_ascii_lowercase()
-            .contains("not in best chain")
-    }
 }
 
 impl From<ErrorObjectOwned> for JsonRpcCallError {
@@ -2135,9 +2062,9 @@ fn jsonrpsee_transport_signal<Response>(
 }
 
 #[derive(Deserialize)]
-struct ZebraBlockHeader {
-    hash: String,
+struct ZebraBestBlockHeightAndHash {
     height: u32,
+    hash: [u8; 32],
 }
 
 #[derive(Deserialize)]

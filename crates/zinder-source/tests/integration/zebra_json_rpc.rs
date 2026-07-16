@@ -86,13 +86,7 @@ async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre:
 async fn fetch_chain_update_after_start_emits_connected_block() -> eyre::Result<()> {
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
+        method("getbestblockheightandhash").reply(RpcReply::result(zebra_tip_response(&fixture)?)),
         method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
     ])?;
     let source = ZebraJsonRpcSource::new(
@@ -134,15 +128,9 @@ async fn fetch_chain_update_after_tip_cursor_returns_none() -> eyre::Result<()> 
         BlockHeight::new(1),
         decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
     );
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-    ])?;
+    let server =
+        JsonRpcTestServer::start([method("getbestblockheightandhash")
+            .reply(RpcReply::result(zebra_tip_response(&fixture)?))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -166,15 +154,9 @@ async fn fetch_chain_update_after_tip_cursor_returns_none() -> eyre::Result<()> 
 async fn fetch_chain_update_after_diverged_tip_emits_reverted_block() -> eyre::Result<()> {
     let fixture = fixture_block()?;
     let old_block_id = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([7; 32]));
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-    ])?;
+    let server =
+        JsonRpcTestServer::start([method("getbestblockheightandhash")
+            .reply(RpcReply::result(zebra_tip_response(&fixture)?))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -288,10 +270,12 @@ async fn missing_json_rpc_result_maps_to_protocol_mismatch() -> eyre::Result<()>
 
 #[tokio::test]
 async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
-    let server =
-        JsonRpcTestServer::start(
-            [method("getbestblockhash").reply(RpcReply::result(json!("00")))],
-        )?;
+    let server = JsonRpcTestServer::start([method("getbestblockheightandhash").reply(
+        RpcReply::result(json!({
+            "height": 1,
+            "hash": vec![0_u8; 32],
+        })),
+    )])?;
     let source = ZebraJsonRpcSource::with_options(
         Network::ZcashRegtest,
         server.url(),
@@ -313,7 +297,7 @@ async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
     assert!(matches!(
         error,
         SourceError::SourceResponseTooLarge {
-            operation: "getbestblockhash",
+            operation: "getbestblockheightandhash",
             max_response_bytes: 1,
         }
     ));
@@ -327,8 +311,9 @@ async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn http_503_marks_node_unavailable_retryable() -> eyre::Result<()> {
-    let server =
-        JsonRpcTestServer::start([method("getbestblockhash").reply(RpcReply::http_status(503))])?;
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(RpcReply::http_status(503))
+    ])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -354,9 +339,8 @@ async fn http_503_marks_node_unavailable_retryable() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn json_rpc_warming_up_error_marks_tip_node_unreachable() -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::error_with_code(-28, "node warming up"))
-    ])?;
+    let server = JsonRpcTestServer::start([method("getbestblockheightandhash")
+        .reply(RpcReply::error_with_code(-28, "node warming up"))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -381,17 +365,15 @@ async fn json_rpc_warming_up_error_marks_tip_node_unreachable() -> eyre::Result<
 }
 
 #[tokio::test]
-async fn tip_id_uses_header_height_from_observed_best_hash() -> eyre::Result<()> {
+async fn tip_id_uses_atomic_height_and_hash_observation() -> eyre::Result<()> {
     let fixture = fixture_block()?;
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
+    let expected_hash = decode_rpc_block_hash(string_field(&fixture, "hash")?)?;
+    let server = JsonRpcTestServer::start([method("getbestblockheightandhash").reply(
+        RpcReply::result(json!({
             "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-    ])?;
+            "hash": expected_hash.as_bytes(),
+        })),
+    )])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -402,94 +384,14 @@ async fn tip_id_uses_header_height_from_observed_best_hash() -> eyre::Result<()>
     let tip_id = source.tip_id().await?;
 
     assert_eq!(tip_id.height, BlockHeight::new(1));
+    assert_eq!(tip_id.hash, expected_hash);
+    let requests = server.requests()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "getbestblockheightandhash");
     assert_eq!(
-        tip_id.hash,
-        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
-    );
-    let methods_called: HashSet<String> =
-        server.requests()?.into_iter().map(|r| r.method).collect();
-    let expected: HashSet<String> = ["getbestblockhash", "getblockheader"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(methods_called, expected);
-    assert_eq!(
-        server.requests_for("getbestblockhash")?[0].params,
+        server.requests_for("getbestblockheightandhash")?[0].params,
         Value::Null
     );
-    assert_eq!(
-        server.requests_for("getblockheader")?[0].params,
-        json!([fixture["hash"], true])
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tip_id_reobserves_after_zebra_invalidates_the_observed_tip() -> eyre::Result<()> {
-    let fixture = fixture_block()?;
-    let stale_tip_hash = "ab".repeat(32);
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
-        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-    ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    let tip_id = source.tip_id().await?;
-
-    assert_eq!(tip_id.height, BlockHeight::new(1));
-    assert_eq!(
-        tip_id.hash,
-        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
-    );
-    assert_eq!(server.requests_for("getbestblockhash")?.len(), 2);
-    assert_eq!(server.requests_for("getblockheader")?.len(), 2);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tip_id_classifies_an_unstable_best_chain_view_as_recoverable() -> eyre::Result<()> {
-    let stale_tip_hash = "ab".repeat(32);
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
-        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
-        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
-        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
-        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
-        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
-    ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    let error = match source.tip_id().await {
-        Ok(tip_id) => return Err(eyre!("expected tip error, got {tip_id:?}")),
-        Err(error) => error,
-    };
-
-    assert!(matches!(error, SourceError::TipViewChanged { .. }));
-    assert_eq!(
-        error.upstream_classification(),
-        zinder_source::SourceFailureClass::UpstreamViewChanged,
-    );
-    assert_eq!(server.requests_for("getbestblockhash")?.len(), 3);
-    assert_eq!(server.requests_for("getblockheader")?.len(), 3);
 
     Ok(())
 }
@@ -1265,8 +1167,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
             "info": {"title": "Zebra", "version": "8.0.0"},
             "methods": [
                 {"name": "getblock"},
-                {"name": "getbestblockhash"},
-                {"name": "getblockheader"},
+                {"name": "getbestblockheightandhash"},
                 {"name": "z_gettreestate"},
                 {"name": "z_getsubtreesbyindex"},
                 {"name": "sendrawtransaction"},
@@ -1298,7 +1199,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn probe_capabilities_falls_back_when_method_not_found() -> eyre::Result<()> {
+async fn probe_capabilities_rejects_missing_openrpc_discovery() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([
         method("rpc.discover").reply(RpcReply::error_with_code(-32601, "Method not found"))
     ])?;
@@ -1309,26 +1210,33 @@ async fn probe_capabilities_falls_back_when_method_not_found() -> eyre::Result<(
         Duration::from_secs(5),
     )?;
 
-    let probed = source.probe_capabilities().await?;
+    let error = match source.probe_capabilities().await {
+        Ok(capabilities) => {
+            return Err(eyre::eyre!(
+                "a Zebra source without OpenRPC discovery must fail closed, got {capabilities:?}"
+            ));
+        }
+        Err(error) => error,
+    };
 
-    assert!(probed.supports(NodeCapability::JsonRpc));
-    assert!(!probed.supports(NodeCapability::OpenRpcDiscovery));
-    assert!(probed.supports(NodeCapability::BestChainBlocks));
-    assert!(probed.supports(NodeCapability::TipId));
-    assert!(probed.supports(NodeCapability::TreeState));
-    assert!(probed.supports(NodeCapability::SubtreeRoots));
-    assert!(probed.supports(NodeCapability::ChainValuePools));
+    assert!(matches!(
+        error,
+        SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::OpenRpcDiscovery,
+        }
+    ));
 
     Ok(())
 }
 
 #[tokio::test]
-async fn probe_capabilities_requires_tip_id_method_set() -> eyre::Result<()> {
+async fn probe_capabilities_requires_atomic_tip_method() -> eyre::Result<()> {
     let server =
         JsonRpcTestServer::start([method("rpc.discover").reply(RpcReply::result(json!({
             "openrpc": "1.3.2",
             "methods": [
                 {"name": "getbestblockhash"},
+                {"name": "getblockheader"},
                 {"name": "rpc.discover"},
             ],
         })))])?;
@@ -1358,8 +1266,7 @@ async fn probe_capabilities_keeps_only_advertised_capabilities_on_success() -> e
         JsonRpcTestServer::start([method("rpc.discover").reply(RpcReply::result(json!({
             "openrpc": "1.3.2",
             "methods": [
-                {"name": "getbestblockhash"},
-                {"name": "getblockheader"},
+                {"name": "getbestblockheightandhash"},
                 {"name": "rpc.discover"},
             ],
         })))])?;
@@ -2221,6 +2128,14 @@ fn fixture_block() -> eyre::Result<Value> {
         "../../../../services/zinder-ingest/tests/fixtures/z3-regtest-block-1.json"
     ))
     .map_err(|error| eyre!("failed to parse fixture block: {error}"))
+}
+
+fn zebra_tip_response(fixture: &Value) -> eyre::Result<Value> {
+    let hash = decode_rpc_block_hash(string_field(fixture, "hash")?)?;
+    Ok(json!({
+        "height": fixture["height"],
+        "hash": hash.as_bytes(),
+    }))
 }
 
 fn string_field<'fixture>(
