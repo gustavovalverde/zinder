@@ -329,11 +329,7 @@ struct QueuedUnaryRequest {
 }
 
 impl QueuedUnaryRequest {
-    fn new(
-        queued_requests: Arc<AtomicU64>,
-        source: &'static str,
-        method: &'static str,
-    ) -> Self {
+    fn new(queued_requests: Arc<AtomicU64>, source: &'static str, method: &'static str) -> Self {
         let queued = queued_requests.fetch_add(1, Ordering::Relaxed) + 1;
         metrics::gauge!("zinder_node_queued_requests", "source" => source, "method" => method)
             .set(u64_to_f64(queued));
