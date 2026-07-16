@@ -16,9 +16,9 @@ use zinder_core::{
     CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
     CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts, ChainTipMetadata,
     CompactBlockArtifact, NetworkUpgradeActivations, SerializedBytesDigest, ShieldedProtocol,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionIntrinsicValueBalancesArtifact,
-    TransactionLocation, TransparentOutPoint, TransparentOutputArtifact,
-    encode_canonical_block_replay,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
+    TransparentOutputArtifact, encode_canonical_block_replay,
     wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 use zinder_proto::compat::lightwalletd::{
@@ -139,6 +139,17 @@ pub enum CanonicalBlockConstructionError {
     /// Transaction index cannot be represented as `u32`.
     #[error("transaction index does not fit u32")]
     TransactionIndexOverflow,
+
+    /// Parsed transactions and prepared canonical facts lost their one-to-one order.
+    #[error(
+        "parsed transaction count {parsed_transaction_count} does not match canonical fact count {canonical_fact_count}"
+    )]
+    TransactionFactCountMismatch {
+        /// Transactions owned by the parsed consensus block.
+        parsed_transaction_count: usize,
+        /// Canonical fact rows prepared from that same block.
+        canonical_fact_count: usize,
+    },
 
     /// Parsing typed transaction facts failed.
     #[error("transaction fact parse failed: {reason}")]
@@ -332,10 +343,6 @@ pub fn prepare_canonical_block(
     measure_canonical_construction_stage("identity_validation", || {
         validate_parsed_block_identity(&parsed_block, source_block)
     })?;
-    let (compact_transactions, tree_size_additions) =
-        measure_canonical_construction_stage("compact_artifacts", || {
-            compact_transactions(&parsed_block)
-        })?;
     let prepared_transactions = measure_canonical_construction_stage("transaction_facts", || {
         prepare_canonical_transactions_from_parsed(
             &parsed_block,
@@ -344,6 +351,10 @@ pub fn prepare_canonical_block(
             raw_blob_policy,
         )
     })?;
+    let (compact_transactions, tree_size_additions) =
+        measure_canonical_construction_stage("compact_artifacts", || {
+            compact_transactions(&parsed_block, &prepared_transactions.facts)
+        })?;
     let (block_header_bytes, block_header) =
         measure_canonical_construction_stage("block_header_artifact", || {
             let block_header_bytes =
@@ -807,17 +818,32 @@ fn validate_parsed_block_identity(
 
 fn compact_transactions(
     parsed_block: &ZebraBlock,
+    canonical_transactions: &[CanonicalTransactionFacts],
 ) -> Result<(Vec<CompactTx>, CommitmentTreeSizes), CanonicalBlockConstructionError> {
+    if parsed_block.transactions.len() != canonical_transactions.len() {
+        return Err(
+            CanonicalBlockConstructionError::TransactionFactCountMismatch {
+                parsed_transaction_count: parsed_block.transactions.len(),
+                canonical_fact_count: canonical_transactions.len(),
+            },
+        );
+    }
     let mut compact_transactions = Vec::new();
     let mut tree_size_additions = CommitmentTreeSizes::default();
 
-    for (transaction_index, transaction) in parsed_block.transactions.iter().enumerate() {
-        let compact_transaction = compact_transaction(
+    for (transaction_index, (transaction, canonical_transaction)) in parsed_block
+        .transactions
+        .iter()
+        .zip(canonical_transactions)
+        .enumerate()
+    {
+        let compact_transaction = compact_transaction_with_transaction_id(
             u64::try_from(transaction_index).map_err(|_| {
                 CanonicalBlockConstructionError::CountOverflow {
                     field: "transaction index",
                 }
             })?,
+            canonical_transaction.public_facts.transaction_id,
             transaction.as_ref(),
         )?;
         tree_size_additions = tree_size_additions.checked_add(CommitmentTreeSizes {
@@ -846,9 +872,21 @@ pub(crate) fn compact_transaction(
     index: u64,
     transaction: &ZebraTransaction,
 ) -> Result<CompactTx, CanonicalBlockConstructionError> {
+    compact_transaction_with_transaction_id(
+        index,
+        TransactionId::from_bytes(transaction.hash().0),
+        transaction,
+    )
+}
+
+fn compact_transaction_with_transaction_id(
+    index: u64,
+    transaction_id: TransactionId,
+    transaction: &ZebraTransaction,
+) -> Result<CompactTx, CanonicalBlockConstructionError> {
     Ok(CompactTx {
         index,
-        txid: transaction.hash().0.to_vec(),
+        txid: transaction_id.as_bytes().to_vec(),
         fee: 0,
         spends: compact_sapling_spends(transaction),
         outputs: compact_sapling_outputs(transaction)?,

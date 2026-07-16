@@ -342,6 +342,7 @@ fn ironwood_canonical_block_facts_digest_matches_known_answer() -> Result<(), Bo
     )?;
     let block = build_positioned_block_for_test(&source_block)?;
     assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+    assert_compact_transaction_ids_match_canonical_facts(&block)?;
     let facts = block.facts;
 
     assert!(facts.transactions.len() > 1);
@@ -359,6 +360,30 @@ fn ironwood_canonical_block_facts_digest_matches_known_answer() -> Result<(), Bo
         "86cb193efe15992d994f9813e061d8f3b247fd86980d50a2585ee1137a0d3f70"
     );
 
+    Ok(())
+}
+
+fn assert_compact_transaction_ids_match_canonical_facts(
+    block: &PositionedCanonicalBlock,
+) -> Result<(), Box<dyn Error>> {
+    let compact_block = CompactBlock::decode(block.compact_block.payload_bytes.as_slice())?;
+    for compact_transaction in compact_block.vtx {
+        let transaction_index = usize::try_from(compact_transaction.index)?;
+        let transaction_facts = block
+            .facts
+            .transactions
+            .get(transaction_index)
+            .ok_or("compact transaction index is outside canonical facts")?;
+        assert_eq!(
+            compact_transaction.txid,
+            transaction_facts
+                .public_facts
+                .transaction_id
+                .as_bytes()
+                .to_vec(),
+            "compact transaction id must match the same-position canonical fact"
+        );
+    }
     Ok(())
 }
 
