@@ -142,7 +142,10 @@ hold:
   revision, trial ID, runner envelope, and testnet source identity; and
 - the separate resource observer covers the whole report window with a private
   cgroup-v2 namespace, exact memory sources, sampled storage, a zero child exit
-  status, matching trial identity, and peaks consistent with the report.
+  status, matching trial identity, and cgroup and process peaks independently
+  within the declared memory limit. The validator does not order process
+  `VmHWM` against cgroup `memory.peak` because their shared-page accounting is
+  not identical.
 
 This is a storage-construction acceptance boundary. Query serving, live
 following, and consumer-protocol parity require their own tests after these

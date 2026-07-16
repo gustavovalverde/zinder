@@ -564,6 +564,7 @@ jq -e \
     and (.benchmark_client_peak_rss
       | exact_keys(["bytes", "source"])
       and (.bytes | positive_integer)
+      and .bytes <= $report.provenance.runner.memory_limit_bytes
       and .source == "proc_status_vmhwm")
     and .acceptance.canonical_storage_ready.wall_clock_seconds >= (
       .phase_durations.source_discovery_seconds
@@ -621,7 +622,6 @@ jq -e \
       and (.sampled_memory_current_peak_bytes | positive_integer)
       and .sampled_memory_current_peak_bytes <= .peak_memory_bytes
       and .peak_memory_bytes <= $report.provenance.runner.memory_limit_bytes
-      and .peak_memory_bytes >= $report.benchmark_client_peak_rss.bytes
       and (.sampled_storage_peak_bytes | positive_integer)
       and .sampled_storage_peak_bytes >= (
         $report.canonical_storage_ready.physical_store_bytes
