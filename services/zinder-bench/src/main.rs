@@ -27,9 +27,13 @@ use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSour
 
 #[path = "canonical_fact_round_trip/command.rs"]
 mod fact_round_trip_command;
+mod rocksdb_canonical_fixture_replay;
 mod rocksdb_storage_lifecycle;
 
 use fact_round_trip_command::{CanonicalFactsRoundTripArgs, run_canonical_facts_round_trip};
+use rocksdb_canonical_fixture_replay::{
+    RocksDbCanonicalFixtureReplayArgs, run_rocksdb_canonical_fixture_replay,
+};
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
 
 const DEFAULT_FROM_HEIGHT: u32 = 150_000;
@@ -60,6 +64,9 @@ enum Command {
     CurrentSchemaReplay(CurrentSchemaReplayArgs),
     /// Persist and read back backend-neutral canonical block facts.
     CanonicalFactsRoundTrip(CanonicalFactsRoundTripArgs),
+    /// Replay an authenticated fixture into a fresh canonical-v1 `RocksDB` store.
+    #[command(name = "rocksdb-canonical-fixture-replay")]
+    RocksDbCanonicalFixtureReplay(RocksDbCanonicalFixtureReplayArgs),
     /// Build and cold-admit complete version-1 canonical and wallet stores.
     #[command(name = "rocksdb-storage-lifecycle")]
     RocksDbStorageLifecycle(RocksDbStorageLifecycleArgs),
@@ -271,6 +278,11 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::CurrentSchemaReplay(args) => run_current_schema_replay(args).await,
         Command::CanonicalFactsRoundTrip(args) => {
             let output = run_canonical_facts_round_trip(args).await?;
+            emit_report(&output.report, output.report_path.as_deref())?;
+            output.report.validate()
+        }
+        Command::RocksDbCanonicalFixtureReplay(args) => {
+            let output = run_rocksdb_canonical_fixture_replay(args).await?;
             emit_report(&output.report, output.report_path.as_deref())?;
             output.report.validate()
         }
@@ -555,6 +567,24 @@ mod tests {
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbStorageLifecycle(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_canonical_fixture_replay_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "rocksdb-canonical-fixture-replay",
+            "--fixture",
+            "fixture",
+            "--canonical-store",
+            "canonical",
+        ])?;
+
+        assert!(matches!(
+            cli.command,
+            Command::RocksDbCanonicalFixtureReplay(_)
+        ));
         Ok(())
     }
 

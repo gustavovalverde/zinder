@@ -69,6 +69,30 @@ and refuses to replace existing evidence. Optional source flags match
 `capture`: `--node-auth-cookie`, `--request-timeout-secs`, and
 `--max-response-bytes`.
 
+### Replay a fixture into canonical-v1 RocksDB
+
+Drive the production canonical-v1 construction, READY publication, independent
+cold reopen, and full replay scan against an authenticated fixture:
+
+```bash
+zinder-bench rocksdb-canonical-fixture-replay \
+  --fixture ./fixtures/mainnet-1730000-1734999 \
+  --canonical-store ./stores/mainnet-1730000-1734999 \
+  --report ./reports/mainnet-1730000-1734999.json
+```
+
+The canonical store path must be fresh and disjoint from the fixture. Defaults
+are derived from the established 10 CPU, 10 GiB, 64 MiB-response profile and
+use the canonical writer resource budget. Every `CanonicalPipelineLimits`
+field has an explicit positive override for controlled source-admission
+experiments, and `--source-segment-delay-millis` injects a fixed delay into each
+outer fixture segment response.
+
+This command certifies the exact captured bytes, replay-plan checkpoints,
+canonical READY fence, cold reopen, and full scan. It does not contact live
+Zebra and is not live-source, advancing-tip, restart, reorg, canary, or
+production certification.
+
 ## 2. Snapshot the starting store
 
 The replay needs a canonical store already populated up to `from_height - 1`, so

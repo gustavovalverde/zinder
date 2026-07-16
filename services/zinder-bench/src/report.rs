@@ -22,6 +22,10 @@ use crate::{
 pub const REPORT_FORMAT_VERSION: u32 = 1;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
+/// CPU envelope used to derive canonical fixture replay defaults.
+pub const CANONICAL_FIXTURE_REPLAY_PROFILE_CPU_CORES: u32 = 10;
+/// Memory envelope used to derive canonical fixture replay defaults.
+pub const CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Returns whether a container image identity is content addressed.
 #[must_use]
@@ -71,6 +75,8 @@ const SOURCE_SEGMENT_PREFETCH_DISCARDED_IN_FLIGHT_SEGMENTS_TOTAL: &str =
     "zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total";
 const SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_RESPONSE_BYTES_TOTAL: &str =
     "zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total";
+const BULK_PIPELINE_WATERMARK_BLOCKED_TOTAL: &str =
+    "zinder_ingest_bulk_pipeline_watermark_blocked_total";
 pub(crate) const TELEMETRY_COVERAGE_TOTAL: &str = "zinder_bench_telemetry_coverage_total";
 pub(crate) const STORE_READ_TELEMETRY_FAMILY: &str = "store_reads";
 const HEAD_OF_LINE_WAIT_SUM: &str = "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum";
@@ -285,6 +291,18 @@ impl StorageCandidateIdentity {
             topology: "rocksdb-single-host",
         }
     }
+
+    /// Identifies authenticated checkpointed fixture replay into canonical-v1 `RocksDB`.
+    #[must_use]
+    pub const fn rocksdb_canonical_fixture_replay() -> Self {
+        Self {
+            id: "rocksdb-canonical-fixture-replay",
+            canonical_engine: "rocksdb",
+            canonical_model: "version-1-canonical-facts",
+            diagnostic_projection_engine: None,
+            topology: "rocksdb-single-host",
+        }
+    }
 }
 
 /// Effective settings for the current-schema canonical replay writer.
@@ -303,7 +321,7 @@ pub struct CurrentSchemaReplayWriterSettings {
 }
 
 /// Serializable form of the effective `RocksDB` resource budget.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct RocksDbResourceBudgetSummary {
     /// Shared block-cache allocation.
     pub block_cache_bytes: u64,
@@ -661,10 +679,14 @@ pub struct SourceFetchAttributionSummary {
     pub discarded_in_flight_segment_count: u64,
     /// Exact payload bytes held by completed speculative segments at discard.
     pub discarded_completed_response_bytes: u64,
+    /// Source-fetch reservations rejected by the configured byte watermark.
+    pub source_watermark_blocked_count: u64,
+    /// Source-fetch watermark blocks per replay wall-clock second.
+    pub source_watermark_blocks_per_second: f64,
 }
 
 /// Digest evidence recomputed from persisted canonical fact encodings.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CanonicalFactSequenceDigestSummary {
     /// Per-block reference-encoding digest version.
     pub block_digest_version: u16,
@@ -935,6 +957,196 @@ pub struct CurrentSchemaFixtureReplayReport {
     pub stage_durations: Vec<StageDurationStat>,
     /// Exported `RocksDB` statistics tickers.
     pub rocksdb_tickers: Vec<TickerStat>,
+}
+
+/// Exact resource profile and effective limits used by one canonical-v1 fixture replay.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RocksDbCanonicalFixtureReplayResourceLimits {
+    /// CPU envelope from which default preparation concurrency was derived.
+    pub derived_for_cpu_limit_cores: u32,
+    /// Memory envelope from which default admission watermarks were derived.
+    pub derived_for_memory_limit_bytes: u64,
+    /// Per-operation source deadline.
+    pub request_timeout_seconds: u64,
+    /// Maximum accepted source response body.
+    pub max_response_bytes: u64,
+    /// Adaptive target for one source response.
+    pub source_segment_target_response_bytes: u64,
+    /// Maximum blocks requested in one source segment.
+    pub source_segment_max_blocks: u32,
+    /// Maximum concurrent source segment requests.
+    pub source_fetch_max_in_flight_requests: u32,
+    /// Aggregate in-flight source response watermark.
+    pub source_fetch_max_in_flight_bytes: u64,
+    /// Maximum canonical block preparations in flight.
+    pub block_prepare_concurrency: u32,
+    /// Aggregate canonical preparation memory watermark.
+    pub block_prepare_memory_watermark_bytes: u64,
+    /// Retained shallow-reorg depth used for baseline settlement.
+    pub supported_reorg_depth: u32,
+    /// Fixed delay applied to each outer fixture segment response.
+    pub source_segment_delay_millis: u64,
+    /// Canonical embedded-store writer and cold-reopen budget.
+    pub canonical_rocksdb: RocksDbResourceBudgetSummary,
+}
+
+/// Report-safe block and SST evidence from the production canonical-v1 loader.
+#[derive(Clone, Debug, Serialize)]
+pub struct RocksDbCanonicalFixtureSourceLoadSummary {
+    /// First retained block.
+    pub first_block: StorageLifecycleBlockId,
+    /// Parent hash of the first retained block, in canonical internal byte order.
+    pub first_parent_hash_hex: String,
+    /// Fixed source tip loaded into the store.
+    pub tip: StorageLifecycleBlockId,
+    /// Contiguous source blocks loaded.
+    pub block_count: u64,
+    /// Source transactions loaded.
+    pub transaction_count: u64,
+    /// Height-addressed header rows.
+    pub block_header_count: u64,
+    /// Hash-addressed block index rows.
+    pub block_hash_index_count: u64,
+    /// Height-addressed semantic replay rows.
+    pub block_replay_count: u64,
+    /// Height-addressed compact block rows.
+    pub compact_block_count: u64,
+    /// Transaction location rows.
+    pub transaction_location_count: u64,
+    /// Retained raw transaction rows.
+    pub transaction_blob_count: u64,
+    /// Raw block rows; wallet workload requires zero.
+    pub block_blob_count: u64,
+    /// Typed commitment-tree checkpoints, including the predecessor.
+    pub tree_state_checkpoint_count: u64,
+    /// Per-block final-root rows; wallet workload requires zero.
+    pub block_final_note_commitment_roots_count: u64,
+    /// Source-authenticated completed subtree roots.
+    pub subtree_root_count: u64,
+    /// Logical key-and-value bytes submitted to block SST writers.
+    pub logical_bytes: u64,
+    /// Physical bytes occupied by staged block SSTs.
+    pub sst_file_bytes: u64,
+    /// Staged block SST files ingested.
+    pub sst_file_count: u64,
+    /// Canonical replay-envelope contract admitted for every block.
+    pub replay_format_version: u32,
+    /// Ordered canonical fact digest loaded into the store.
+    pub sequence_digest: CanonicalFactSequenceDigestSummary,
+}
+
+/// Event fence authenticated by READY publication and independent cold reopen.
+#[derive(Clone, Debug, Serialize)]
+pub struct RocksDbCanonicalFixtureEventFenceSummary {
+    /// Visible chain epoch identifier.
+    pub chain_epoch_id: u64,
+    /// Durable chain-event sequence.
+    pub chain_event_sequence: u64,
+    /// Visible canonical tip.
+    pub visible_tip: StorageLifecycleBlockId,
+    /// Ordered canonical fact digest at the fence.
+    pub sequence_digest: CanonicalFactSequenceDigestSummary,
+}
+
+/// Canonical-v1 READY, cold-reopen, and full-scan evidence for a checkpointed fixture.
+#[derive(Clone, Debug, Serialize)]
+pub struct RocksDbCanonicalFixtureReadySummary {
+    /// Exact boundary certified by this report section.
+    pub scope: &'static str,
+    /// Persisted canonical workload.
+    pub workload: &'static str,
+    /// First retained canonical block.
+    pub first_retained_block: StorageLifecycleBlockId,
+    /// Visible fixed canonical tip.
+    pub visible_tip: StorageLifecycleBlockId,
+    /// Visible baseline epoch.
+    pub visible_epoch_id: u64,
+    /// Visible baseline event sequence.
+    pub visible_event_sequence: u64,
+    /// Contiguous READY block count.
+    pub visible_block_count: u64,
+    /// Canonical replay-envelope version.
+    pub replay_format_version: u32,
+    /// Ordered READY sequence digest.
+    pub sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Logical replay bytes authenticated by READY.
+    pub logical_replay_bytes: u64,
+    /// Settled baseline tip selected from the retained range.
+    pub settled_tip: StorageLifecycleBlockId,
+    /// Event fence read after the independent cold reopen.
+    pub event_fence: RocksDbCanonicalFixtureEventFenceSummary,
+    /// Whether the fixed-tip checkpoint was authenticated before publication.
+    pub source_tip_checkpoint_authenticated: bool,
+    /// Whether publication and cold reopen returned identical READY evidence.
+    pub published_and_reopened_ready_match: bool,
+    /// Whether cold-reopen READY and event-fence fields match exactly.
+    pub reopened_ready_and_event_fence_match: bool,
+    /// Cache-bypassing semantic replay rows authenticated after cold reopen.
+    pub full_scan_block_count: u64,
+}
+
+/// Direct measurements for one canonical-v1 fixture replay report.
+#[derive(Clone, Debug)]
+pub struct RocksDbCanonicalFixtureReplayMeasurements {
+    /// Fixture manifest digest bound into the admitted replay plan.
+    pub replay_plan_fixture_manifest_sha256: String,
+    /// Stable digest of the admitted canonical replay-plan sidecar.
+    pub replay_plan_digest_sha256: String,
+    /// Exact effective resource limits.
+    pub resource_limits: RocksDbCanonicalFixtureReplayResourceLimits,
+    /// Complete measured lifecycle seconds.
+    pub total_seconds: f64,
+    /// Block/SST/count evidence from the real canonical loader.
+    pub source_load: RocksDbCanonicalFixtureSourceLoadSummary,
+    /// READY and independent cold-reopen evidence.
+    pub canonical_ready: RocksDbCanonicalFixtureReadySummary,
+    /// Final bytes occupied by the cold-reopened canonical store directory.
+    pub physical_store_bytes: u64,
+    /// Peak resident set size for the embedded process.
+    pub benchmark_client_peak_rss: PeakRss,
+    /// Wall-clock timestamp captured before the command begins.
+    pub run_started_at_unix_millis: u64,
+    /// Wall-clock timestamp captured after the measured lifecycle.
+    pub run_completed_at_unix_millis: u64,
+}
+
+/// Authenticated checkpointed fixture replay into the real canonical-v1 store.
+#[derive(Clone, Debug, Serialize)]
+pub struct RocksDbCanonicalFixtureReplayReport {
+    /// Stable report contract identity.
+    pub contract_identity: String,
+    /// Machine-readable report schema version.
+    pub report_format_version: u32,
+    /// Build and run provenance.
+    pub provenance: ReportProvenance,
+    /// Fixture identity.
+    pub fixture: FixtureSummary,
+    /// Fixture manifest digest bound into the admitted replay plan.
+    pub replay_plan_fixture_manifest_sha256: String,
+    /// Stable digest of the admitted canonical replay-plan sidecar.
+    pub replay_plan_digest_sha256: String,
+    /// Concrete embedded storage candidate.
+    pub storage_candidate: StorageCandidateIdentity,
+    /// Exact effective resource limits.
+    pub resource_limits: RocksDbCanonicalFixtureReplayResourceLimits,
+    /// Complete measured lifecycle seconds.
+    pub total_seconds: f64,
+    /// End-to-end loaded blocks per second.
+    pub blocks_per_second: f64,
+    /// Block/SST/count evidence from the real canonical loader.
+    pub source_load: RocksDbCanonicalFixtureSourceLoadSummary,
+    /// READY and independent cold-reopen evidence.
+    pub canonical_ready: RocksDbCanonicalFixtureReadySummary,
+    /// Final bytes occupied by the cold-reopened canonical store directory.
+    pub physical_store_bytes: u64,
+    /// Source request, response, and adaptive-prefetch attribution.
+    pub source_fetch_attribution: Option<SourceFetchAttributionSummary>,
+    /// Per-stage bulk-pipeline head-of-line wait totals.
+    pub head_of_line_wait: Vec<StageWaitStat>,
+    /// Per-substage block preparation and canonical construction timing.
+    pub stage_durations: Vec<StageDurationStat>,
+    /// Peak resident set size for the embedded process.
+    pub benchmark_client_peak_rss: PeakRss,
 }
 
 /// Node source identity frozen before one storage lifecycle begins.
@@ -1308,6 +1520,9 @@ pub enum BenchmarkReport {
     CurrentSchemaFixtureReplay(Box<CurrentSchemaFixtureReplayReport>),
     /// Persisted round trip of block-local canonical facts only.
     CanonicalBlockFactsRoundTrip(Box<CanonicalBlockFactsRoundTripReport>),
+    /// Authenticated checkpointed fixture replay into canonical-v1 `RocksDB`.
+    #[serde(rename = "rocksdb-canonical-fixture-replay")]
+    RocksDbCanonicalFixtureReplay(Box<RocksDbCanonicalFixtureReplayReport>),
     /// Fixed-tip version-1 canonical and wallet `RocksDB` storage lifecycle.
     #[serde(rename = "rocksdb-storage-lifecycle")]
     RocksDbStorageLifecycle(Box<RocksDbStorageLifecycleReport>),
@@ -1328,6 +1543,12 @@ impl From<CanonicalBlockFactsRoundTripReport> for BenchmarkReport {
 impl From<RocksDbStorageLifecycleReport> for BenchmarkReport {
     fn from(report: RocksDbStorageLifecycleReport) -> Self {
         Self::RocksDbStorageLifecycle(Box::new(report))
+    }
+}
+
+impl From<RocksDbCanonicalFixtureReplayReport> for BenchmarkReport {
+    fn from(report: RocksDbCanonicalFixtureReplayReport) -> Self {
+        Self::RocksDbCanonicalFixtureReplay(Box::new(report))
     }
 }
 
@@ -1370,6 +1591,7 @@ impl BenchmarkReport {
                 }
                 Ok(())
             }
+            Self::RocksDbCanonicalFixtureReplay(report) => report.validate_evidence(),
             Self::RocksDbStorageLifecycle(report) => report.validate_acceptance(),
         }
     }
@@ -1381,6 +1603,10 @@ impl BenchmarkReport {
                 report.report_format_version,
             ),
             Self::CanonicalBlockFactsRoundTrip(report) => (
+                report.contract_identity.as_str(),
+                report.report_format_version,
+            ),
+            Self::RocksDbCanonicalFixtureReplay(report) => (
                 report.contract_identity.as_str(),
                 report.report_format_version,
             ),
@@ -1402,6 +1628,7 @@ impl BenchmarkReport {
         let fixture = match self {
             Self::CurrentSchemaFixtureReplay(report) => Some(&report.fixture),
             Self::CanonicalBlockFactsRoundTrip(report) => Some(&report.fixture),
+            Self::RocksDbCanonicalFixtureReplay(report) => Some(&report.fixture),
             Self::RocksDbStorageLifecycle(_) => None,
         };
         if let Some(fixture) = fixture {
@@ -1434,7 +1661,9 @@ impl BenchmarkReport {
     pub const fn current_schema_fixture_replay(&self) -> Option<&CurrentSchemaFixtureReplayReport> {
         match self {
             Self::CurrentSchemaFixtureReplay(report) => Some(report),
-            Self::CanonicalBlockFactsRoundTrip(_) | Self::RocksDbStorageLifecycle(_) => None,
+            Self::CanonicalBlockFactsRoundTrip(_)
+            | Self::RocksDbCanonicalFixtureReplay(_)
+            | Self::RocksDbStorageLifecycle(_) => None,
         }
     }
 
@@ -1444,7 +1673,9 @@ impl BenchmarkReport {
         &self,
     ) -> Option<&CanonicalBlockFactsRoundTripReport> {
         match self {
-            Self::CurrentSchemaFixtureReplay(_) | Self::RocksDbStorageLifecycle(_) => None,
+            Self::CurrentSchemaFixtureReplay(_)
+            | Self::RocksDbCanonicalFixtureReplay(_)
+            | Self::RocksDbStorageLifecycle(_) => None,
             Self::CanonicalBlockFactsRoundTrip(report) => Some(report),
         }
     }
@@ -1454,7 +1685,9 @@ impl BenchmarkReport {
     pub const fn rocksdb_storage_lifecycle(&self) -> Option<&RocksDbStorageLifecycleReport> {
         match self {
             Self::RocksDbStorageLifecycle(report) => Some(report),
-            Self::CurrentSchemaFixtureReplay(_) | Self::CanonicalBlockFactsRoundTrip(_) => None,
+            Self::CurrentSchemaFixtureReplay(_)
+            | Self::CanonicalBlockFactsRoundTrip(_)
+            | Self::RocksDbCanonicalFixtureReplay(_) => None,
         }
     }
 }
@@ -1508,6 +1741,163 @@ impl CurrentSchemaFixtureReplayReport {
         }
         Ok(())
     }
+}
+
+impl RocksDbCanonicalFixtureReplayReport {
+    /// Validates authenticated checkpointed fixture replay without claiming live-source certification.
+    pub fn validate_evidence(&self) -> Result<(), BenchError> {
+        validate_canonical_fixture_report_identity_and_resources(self)?;
+        validate_canonical_fixture_source_load(&self.fixture, &self.source_load)?;
+        validate_canonical_fixture_ready(&self.source_load, &self.canonical_ready)?;
+        validate_canonical_fixture_source_attribution(
+            self.source_load.block_count,
+            self.source_fetch_attribution,
+        )
+    }
+}
+
+fn validate_canonical_fixture_report_identity_and_resources(
+    report: &RocksDbCanonicalFixtureReplayReport,
+) -> Result<(), BenchError> {
+    if report.storage_candidate.id != "rocksdb-canonical-fixture-replay"
+        || report.storage_candidate.canonical_engine != "rocksdb"
+        || report.storage_candidate.canonical_model != "version-1-canonical-facts"
+        || report.storage_candidate.topology != "rocksdb-single-host"
+        || !is_lowercase_sha256(&report.replay_plan_digest_sha256)
+        || report.replay_plan_fixture_manifest_sha256 != report.fixture.digest_sha256
+        || !is_lowercase_sha256(&report.fixture.digest_sha256)
+    {
+        return Err(BenchError::report_format(
+            "canonical fixture replay identity or replay-plan binding is invalid",
+        ));
+    }
+    let limits = report.resource_limits;
+    if limits.derived_for_cpu_limit_cores != CANONICAL_FIXTURE_REPLAY_PROFILE_CPU_CORES
+        || limits.derived_for_memory_limit_bytes != CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES
+        || limits.request_timeout_seconds == 0
+        || limits.max_response_bytes == 0
+        || limits.source_segment_target_response_bytes == 0
+        || limits.source_segment_target_response_bytes > limits.max_response_bytes
+        || limits.source_segment_max_blocks == 0
+        || limits.source_fetch_max_in_flight_requests == 0
+        || limits.source_fetch_max_in_flight_bytes < limits.max_response_bytes
+        || limits.block_prepare_concurrency == 0
+        || limits.block_prepare_memory_watermark_bytes == 0
+        || limits.supported_reorg_depth == 0
+        || limits.canonical_rocksdb
+            != RocksDbResourceBudgetSummary::from(RocksDbResourceBudget::canonical_writer_defaults())
+        || !report.total_seconds.is_finite()
+        || report.total_seconds <= 0.0
+        || !report.blocks_per_second.is_finite()
+        || report.blocks_per_second <= 0.0
+        || report.physical_store_bytes == 0
+    {
+        return Err(BenchError::report_format(
+            "canonical fixture replay resources or timing are invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_fixture_source_load(
+    fixture: &FixtureSummary,
+    load: &RocksDbCanonicalFixtureSourceLoadSummary,
+) -> Result<(), BenchError> {
+    let expected_digest = &fixture.canonical_block_facts_digest_evidence;
+    if load.first_block.height != fixture.from_height
+        || load.tip.height != fixture.to_height
+        || load.tip.hash_hex != fixture.tip_hash_hex
+        || load.block_count != u64::from(fixture.block_count)
+        || load.block_count != expected_digest.block_count
+        || load.transaction_count != fixture.workload_density.transaction_count
+        || load.sequence_digest.block_digest_version != expected_digest.block_digest_version
+        || load.sequence_digest.sequence_digest_version != expected_digest.sequence_digest_version
+        || load.sequence_digest.block_count != expected_digest.block_count
+        || load.sequence_digest.sha256 != expected_digest.sequence_digest_sha256
+        || load.replay_format_version != CanonicalBlockReplayFormatVersion::CURRENT.value()
+    {
+        return Err(BenchError::acceptance_completion_mismatch(
+            "canonical fixture replay load range, tip, count, or digest differs from the fixture",
+        ));
+    }
+    if load.block_count == 0
+        || load.block_header_count != load.block_count
+        || load.block_hash_index_count != load.block_count
+        || load.block_replay_count != load.block_count
+        || load.compact_block_count != load.block_count
+        || load.transaction_location_count != load.transaction_count
+        || load.transaction_blob_count != load.transaction_count
+        || load.block_blob_count != 0
+        || load.block_final_note_commitment_roots_count != 0
+        || load.tree_state_checkpoint_count == 0
+        || load.logical_bytes == 0
+        || load.sst_file_bytes == 0
+        || load.sst_file_count == 0
+    {
+        return Err(BenchError::acceptance_completion_mismatch(
+            "canonical fixture replay block, SST, or family counts are incomplete",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_fixture_ready(
+    load: &RocksDbCanonicalFixtureSourceLoadSummary,
+    ready: &RocksDbCanonicalFixtureReadySummary,
+) -> Result<(), BenchError> {
+    let fence = &ready.event_fence;
+    if ready.scope != "canonical-v1-fixture-ready"
+        || ready.workload != "wallet"
+        || !ready.source_tip_checkpoint_authenticated
+        || !ready.published_and_reopened_ready_match
+        || !ready.reopened_ready_and_event_fence_match
+        || ready.first_retained_block != load.first_block
+        || ready.visible_tip != load.tip
+        || ready.visible_block_count != load.block_count
+        || ready.full_scan_block_count != load.block_count
+        || ready.visible_epoch_id != 1
+        || ready.visible_event_sequence != 1
+        || ready.replay_format_version != load.replay_format_version
+        || ready.sequence_digest != load.sequence_digest
+        || ready.logical_replay_bytes == 0
+        || fence.chain_epoch_id != ready.visible_epoch_id
+        || fence.chain_event_sequence != ready.visible_event_sequence
+        || fence.visible_tip != ready.visible_tip
+        || fence.sequence_digest != ready.sequence_digest
+        || ready.settled_tip.height < ready.first_retained_block.height
+        || ready.settled_tip.height > ready.visible_tip.height
+    {
+        return Err(BenchError::acceptance_completion_mismatch(
+            "canonical fixture replay READY, event fence, source-tip authentication, cold reopen, or full scan evidence does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_fixture_source_attribution(
+    block_count: u64,
+    source_fetch: Option<SourceFetchAttributionSummary>,
+) -> Result<(), BenchError> {
+    let source_fetch = source_fetch
+        .ok_or_else(|| BenchError::acceptance_telemetry_missing("source_fetch_attribution"))?;
+    if source_fetch.completed_segment_request_count == 0
+        || source_fetch.total_connected_blocks_returned < block_count
+        || source_fetch.total_response_payload_bytes == 0
+        || source_fetch.discarded_completed_response_bytes
+            > source_fetch.total_response_payload_bytes
+    {
+        return Err(BenchError::acceptance_completion_mismatch(
+            "canonical fixture replay source attribution does not cover the loaded fixture",
+        ));
+    }
+    Ok(())
+}
+
+fn is_lowercase_sha256(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 impl RocksDbStorageLifecycleReport {
@@ -1737,6 +2127,63 @@ pub fn build_current_schema_fixture_replay_report(
         stage_durations: aggregate_stage_durations(&samples),
         rocksdb_tickers,
     }
+}
+
+/// Builds the closed canonical-v1 checkpointed fixture replay report.
+#[must_use]
+pub fn build_rocksdb_canonical_fixture_replay_report(
+    fixture: FixtureSummary,
+    measurements: RocksDbCanonicalFixtureReplayMeasurements,
+    exposition: Option<&str>,
+) -> BenchmarkReport {
+    let samples = exposition.map(parse_prometheus_samples).unwrap_or_default();
+    let block_count = measurements.source_load.block_count;
+    let blocks_per_second = if measurements.total_seconds > 0.0 {
+        u64_to_f64(block_count) / measurements.total_seconds
+    } else {
+        0.0
+    };
+    RocksDbCanonicalFixtureReplayReport {
+        contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
+        report_format_version: REPORT_FORMAT_VERSION,
+        provenance: ReportProvenance {
+            benchmark_version: env!("CARGO_PKG_VERSION"),
+            software_revision: None,
+            run: BenchmarkRunProvenance {
+                trial_id: None,
+                fixture_cache_policy: None,
+                started_at_unix_millis: measurements.run_started_at_unix_millis,
+                completed_at_unix_millis: measurements.run_completed_at_unix_millis,
+            },
+            runner: RunnerProvenance {
+                id: None,
+                cpu_limit_cores: None,
+                memory_limit_bytes: None,
+                storage_class: None,
+            },
+            image_reference: None,
+            target_os: std::env::consts::OS,
+            target_arch: std::env::consts::ARCH,
+        },
+        fixture,
+        replay_plan_fixture_manifest_sha256: measurements.replay_plan_fixture_manifest_sha256,
+        replay_plan_digest_sha256: measurements.replay_plan_digest_sha256,
+        storage_candidate: StorageCandidateIdentity::rocksdb_canonical_fixture_replay(),
+        resource_limits: measurements.resource_limits,
+        total_seconds: measurements.total_seconds,
+        blocks_per_second,
+        source_load: measurements.source_load,
+        canonical_ready: measurements.canonical_ready,
+        physical_store_bytes: measurements.physical_store_bytes,
+        source_fetch_attribution: aggregate_source_fetch_attribution(
+            &samples,
+            measurements.total_seconds,
+        ),
+        head_of_line_wait: aggregate_head_of_line_wait(&samples),
+        stage_durations: aggregate_stage_durations(&samples),
+        benchmark_client_peak_rss: measurements.benchmark_client_peak_rss,
+    }
+    .into()
 }
 
 /// Builds the exact fixed-tip `RocksDB` storage lifecycle report.
@@ -2008,6 +2455,8 @@ fn aggregate_source_fetch_attribution(
         samples,
         SOURCE_SEGMENT_RESPONSE_PAYLOAD_BYTES_SUM,
     ));
+    let (source_watermark_blocked_count, source_watermark_blocks_per_second) =
+        source_watermark_attribution(samples, replay_wall_clock_seconds);
     let (completed_segment_requests_per_second, response_payload_bytes_per_second) =
         if replay_wall_clock_seconds > 0.0 {
             (
@@ -2039,7 +2488,27 @@ fn aggregate_source_fetch_attribution(
             samples,
             SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_RESPONSE_BYTES_TOTAL,
         )),
+        source_watermark_blocked_count,
+        source_watermark_blocks_per_second,
     })
+}
+
+fn source_watermark_attribution(
+    samples: &[MetricSample],
+    replay_wall_clock_seconds: f64,
+) -> (u64, f64) {
+    let blocked_count = sum_metric_by_label(
+        samples,
+        BULK_PIPELINE_WATERMARK_BLOCKED_TOTAL,
+        "stage",
+        "source_fetch",
+    );
+    let blocked_per_second = if replay_wall_clock_seconds > 0.0 {
+        u64_to_f64(blocked_count) / replay_wall_clock_seconds
+    } else {
+        0.0
+    };
+    (blocked_count, blocked_per_second)
 }
 
 fn sum_metric_by_label(
@@ -2328,10 +2797,14 @@ mod tests {
         AcceptanceThresholds, CanonicalBlockFactsRoundTripMeasurements,
         CanonicalBlockFactsStorageEvidence, CanonicalFactSequenceDigestSummary,
         CurrentSchemaFixtureReplayMeasurements, CurrentSchemaReplayWriterSettings,
-        FixtureCachePolicy, FixtureSummary, RocksDbResourceBudgetSummary, StartingCanonicalState,
-        StartingCanonicalStateKind, StorageCandidateIdentity, aggregate_stage_durations,
+        FixtureCachePolicy, FixtureSummary, RocksDbCanonicalFixtureEventFenceSummary,
+        RocksDbCanonicalFixtureReadySummary, RocksDbCanonicalFixtureReplayMeasurements,
+        RocksDbCanonicalFixtureReplayResourceLimits, RocksDbCanonicalFixtureSourceLoadSummary,
+        RocksDbResourceBudgetSummary, StartingCanonicalState, StartingCanonicalStateKind,
+        StorageCandidateIdentity, StorageLifecycleBlockId, aggregate_stage_durations,
         build_canonical_block_facts_round_trip_report, build_current_schema_fixture_replay_report,
-        is_valid_benchmark_trial_id, parse_prometheus_samples,
+        build_rocksdb_canonical_fixture_replay_report, is_valid_benchmark_trial_id,
+        parse_prometheus_samples,
     };
 
     #[test]
@@ -2378,7 +2851,7 @@ mod tests {
             18
         );
         assert_eq!(report.fixture.tip_hash_hex, "abcd");
-        assert_eq!(report.fixture.digest_sha256, "fixture-digest");
+        assert_eq!(report.fixture.digest_sha256, "b".repeat(64));
         assert_eq!(
             report.replay.starting_canonical_state.chain_epoch_id,
             Some(42)
@@ -2487,6 +2960,116 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
         assert_eq!(encoded["measurement_kind"], "current-schema-fixture-replay");
         assert_eq!(encoded["contract_identity"], "benchmark-report");
         assert_eq!(encoded["fixture"]["contract_identity"], "canonical-fixture");
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_canonical_fixture_report_serializes_and_validates_its_own_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let report = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+
+        report.validate()?;
+        let encoded = serde_json::to_value(&report)?;
+        assert_eq!(
+            encoded["measurement_kind"],
+            "rocksdb-canonical-fixture-replay"
+        );
+        assert_eq!(
+            encoded["storage_candidate"]["id"],
+            "rocksdb-canonical-fixture-replay"
+        );
+        assert!(encoded.get("wallet_storage_ready").is_none());
+        assert!(encoded.get("acceptance").is_none());
+        assert!(encoded.get("replay").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_canonical_fixture_report_rejects_mismatched_ready_and_tip_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut report = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut report else {
+            return Err("builder must return canonical fixture replay".into());
+        };
+        inner.canonical_ready.published_and_reopened_ready_match = false;
+        assert!(report.validate().is_err());
+
+        let mut report = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut report else {
+            return Err("builder must return canonical fixture replay".into());
+        };
+        inner.source_load.tip.hash_hex = "wrong-tip".to_owned();
+        assert!(report.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_canonical_fixture_report_aggregates_source_attribution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let report = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = report else {
+            return Err("expected canonical fixture replay report".into());
+        };
+        let source = inner
+            .source_fetch_attribution
+            .ok_or("source attribution must be present")?;
+
+        assert_eq!(source.completed_segment_request_count, 4);
+        assert_eq!(source.total_connected_blocks_returned, 12);
+        assert_eq!(source.total_response_payload_bytes, 120_000_000);
+        assert_eq!(source.density_restart_count, 3);
+        assert_eq!(source.response_too_large_restart_count, 2);
+        assert_eq!(source.discarded_completed_segment_count, 6);
+        assert_eq!(source.discarded_in_flight_segment_count, 11);
+        assert_eq!(source.discarded_completed_response_bytes, 100_000_000);
+        assert_eq!(source.source_watermark_blocked_count, 8);
+        assert!((source.source_watermark_blocks_per_second - 0.8).abs() < f64::EPSILON);
+        assert_eq!(inner.head_of_line_wait.len(), 1);
+        assert_eq!(inner.stage_durations.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_canonical_fixture_report_rejects_missing_or_impossible_source_attribution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let report = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            None,
+        );
+        assert!(report.validate().is_err());
+
+        let mut report = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut report else {
+            return Err("builder must return canonical fixture replay".into());
+        };
+        let source = inner
+            .source_fetch_attribution
+            .as_mut()
+            .ok_or("source attribution must be present")?;
+        source.discarded_completed_response_bytes =
+            source.total_response_payload_bytes.saturating_add(1);
+        assert!(report.validate().is_err());
         Ok(())
     }
 
@@ -2755,6 +3338,124 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
         assert!((stats[0].task_seconds - 1.5).abs() < f64::EPSILON);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one report fixture keeps all cross-field evidence visibly consistent"
+    )]
+    fn rocksdb_canonical_fixture_measurements() -> RocksDbCanonicalFixtureReplayMeasurements {
+        let sequence_digest = CanonicalFactSequenceDigestSummary {
+            block_digest_version: 1,
+            sequence_digest_version: 1,
+            block_count: 10,
+            sha256: "persisted-digest".to_owned(),
+        };
+        let first_block = StorageLifecycleBlockId {
+            height: 11,
+            hash_hex: "first-hash".to_owned(),
+        };
+        let visible_tip = StorageLifecycleBlockId {
+            height: 20,
+            hash_hex: "abcd".to_owned(),
+        };
+        RocksDbCanonicalFixtureReplayMeasurements {
+            replay_plan_fixture_manifest_sha256: "b".repeat(64),
+            replay_plan_digest_sha256: "a".repeat(64),
+            resource_limits: RocksDbCanonicalFixtureReplayResourceLimits {
+                derived_for_cpu_limit_cores: 10,
+                derived_for_memory_limit_bytes: 10 * 1024 * 1024 * 1024,
+                request_timeout_seconds: 30,
+                max_response_bytes: 64 * 1024 * 1024,
+                source_segment_target_response_bytes: 32 * 1024 * 1024,
+                source_segment_max_blocks: 64,
+                source_fetch_max_in_flight_requests: 12,
+                source_fetch_max_in_flight_bytes: 160 * 1024 * 1024,
+                block_prepare_concurrency: 10,
+                block_prepare_memory_watermark_bytes: 160 * 1024 * 1024,
+                supported_reorg_depth: 5,
+                source_segment_delay_millis: 0,
+                canonical_rocksdb: RocksDbResourceBudgetSummary::from(
+                    zinder_store::RocksDbResourceBudget::canonical_writer_defaults(),
+                ),
+            },
+            total_seconds: 10.0,
+            source_load: RocksDbCanonicalFixtureSourceLoadSummary {
+                first_block: first_block.clone(),
+                first_parent_hash_hex: "parent-hash".to_owned(),
+                tip: visible_tip.clone(),
+                block_count: 10,
+                transaction_count: 20,
+                block_header_count: 10,
+                block_hash_index_count: 10,
+                block_replay_count: 10,
+                compact_block_count: 10,
+                transaction_location_count: 20,
+                transaction_blob_count: 20,
+                block_blob_count: 0,
+                tree_state_checkpoint_count: 2,
+                block_final_note_commitment_roots_count: 0,
+                subtree_root_count: 0,
+                logical_bytes: 20_000,
+                sst_file_bytes: 10_000,
+                sst_file_count: 8,
+                replay_format_version: 1,
+                sequence_digest: sequence_digest.clone(),
+            },
+            canonical_ready: RocksDbCanonicalFixtureReadySummary {
+                scope: "canonical-v1-fixture-ready",
+                workload: "wallet",
+                first_retained_block: first_block,
+                visible_tip: visible_tip.clone(),
+                visible_epoch_id: 1,
+                visible_event_sequence: 1,
+                visible_block_count: 10,
+                replay_format_version: 1,
+                sequence_digest: sequence_digest.clone(),
+                logical_replay_bytes: 5_000,
+                settled_tip: StorageLifecycleBlockId {
+                    height: 15,
+                    hash_hex: "settled-hash".to_owned(),
+                },
+                event_fence: RocksDbCanonicalFixtureEventFenceSummary {
+                    chain_epoch_id: 1,
+                    chain_event_sequence: 1,
+                    visible_tip,
+                    sequence_digest,
+                },
+                source_tip_checkpoint_authenticated: true,
+                published_and_reopened_ready_match: true,
+                reopened_ready_and_event_fence_match: true,
+                full_scan_block_count: 10,
+            },
+            physical_store_bytes: 25_000,
+            benchmark_client_peak_rss: crate::rss::PeakRss {
+                bytes: None,
+                source: PEAK_RSS_SOURCE_UNAVAILABLE,
+            },
+            run_started_at_unix_millis: 1_000,
+            run_completed_at_unix_millis: 11_000,
+        }
+    }
+
+    fn canonical_fixture_source_exposition() -> &'static str {
+        "zinder_ingest_source_request_total{operation=\"fetch_chain_segment\",status=\"ok\",error_class=\"none\"} 4\n\
+zinder_ingest_source_request_duration_seconds_sum{operation=\"fetch_chain_segment\",status=\"ok\",error_class=\"none\"} 15.5\n\
+zinder_ingest_source_segment_connected_blocks_total 12\n\
+zinder_ingest_source_segment_response_payload_bytes_sum 120000000\n\
+zinder_ingest_source_segment_prefetch_restarts_total{reason=\"density\"} 3\n\
+zinder_ingest_source_segment_prefetch_restarts_total{reason=\"response_too_large\"} 2\n\
+zinder_ingest_source_segment_prefetch_discarded_completed_segments_total{reason=\"density\"} 5\n\
+zinder_ingest_source_segment_prefetch_discarded_completed_segments_total{reason=\"response_too_large\"} 1\n\
+zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total{reason=\"density\"} 7\n\
+zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total{reason=\"response_too_large\"} 4\n\
+zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{reason=\"density\"} 90000000\n\
+zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{reason=\"response_too_large\"} 10000000\n\
+zinder_ingest_bulk_pipeline_watermark_blocked_total{stage=\"source_fetch\"} 8\n\
+zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_count{stage=\"source_fetch\"} 2\n\
+zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum{stage=\"source_fetch\"} 4.5\n\
+zinder_ingest_canonical_block_construction_stage_duration_seconds_count{stage=\"block_parse\",status=\"ok\"} 10\n\
+zinder_ingest_canonical_block_construction_stage_duration_seconds_sum{stage=\"block_parse\",status=\"ok\"} 1.5\n"
+    }
+
     fn fixture_summary() -> FixtureSummary {
         FixtureSummary {
             contract_identity: crate::fixture::FIXTURE_CONTRACT_IDENTITY.to_owned(),
@@ -2768,13 +3469,14 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
                     sequence_digest_sha256: "persisted-digest".to_owned(),
                 },
             tip_hash_hex: "abcd".to_owned(),
-            digest_sha256: "fixture-digest".to_owned(),
+            digest_sha256: "b".repeat(64),
             network: "zcash-regtest".to_owned(),
             from_height: 11,
             to_height: 20,
             block_count: 10,
             workload_density: WorkloadDensity {
                 block_count: 10,
+                transaction_count: 20,
                 ..WorkloadDensity::default()
             },
             segment_count: 1,

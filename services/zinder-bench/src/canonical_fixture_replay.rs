@@ -144,8 +144,12 @@ pub struct CanonicalFixtureRocksDbReplayConfig {
 }
 
 /// Exact load, publication, and cold-reopen evidence from canonical-v1 replay.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalFixtureRocksDbReplayOutcome {
+    /// Fixture manifest digest bound into the exact admitted replay plan.
+    pub fixture_manifest_digest_sha256: String,
+    /// Stable digest of the exact replay plan admitted before source work.
+    pub replay_plan_digest_sha256: String,
     /// Block-family evidence accepted by the real canonical-v1 loader.
     pub block_load_evidence: CanonicalBlockLoadEvidence,
     /// Exact completed-subtree evidence accepted by the canonical-v1 loader.
@@ -278,6 +282,8 @@ impl NodeSource for CanonicalFixtureNodeSource {
 
 struct AdmittedCanonicalFixtureReplay {
     manifest: FixtureManifest,
+    fixture_manifest_digest_sha256: String,
+    replay_plan_digest_sha256: String,
     activations: Arc<NetworkUpgradeActivations>,
     fixture_source: CanonicalFixtureNodeSource,
     source_tip_checkpoint: CommitmentTreeCheckpoint,
@@ -338,6 +344,8 @@ fn admit_canonical_fixture_replay(
     let activations = manifest.activations_typed()?;
     let replay_plan =
         CanonicalFixtureReplayPlan::read(&config.fixture_directory, &manifest, &activations)?;
+    let replay_plan_digest_sha256 = replay_plan.digest_sha256()?;
+    let fixture_manifest_digest_sha256 = replay_plan.fixture_manifest_sha256.clone();
     let history_predecessor = replay_plan.history_predecessor_checkpoint()?;
     let source_tip_checkpoint = replay_plan.source_tip_checkpoint()?;
     let fixture_source = CanonicalFixtureNodeSource::from_admitted_plan(
@@ -360,6 +368,8 @@ fn admit_canonical_fixture_replay(
     )?;
     Ok(AdmittedCanonicalFixtureReplay {
         manifest,
+        fixture_manifest_digest_sha256,
+        replay_plan_digest_sha256,
         activations: Arc::new(activations),
         fixture_source,
         source_tip_checkpoint,
@@ -530,6 +540,8 @@ pub async fn replay_canonical_fixture_into_rocksdb(
     )?;
 
     Ok(CanonicalFixtureRocksDbReplayOutcome {
+        fixture_manifest_digest_sha256: admitted.fixture_manifest_digest_sha256,
+        replay_plan_digest_sha256: admitted.replay_plan_digest_sha256,
         block_load_evidence,
         subtree_root_load_evidence,
         source_tip_checkpoint_authenticated: true,
