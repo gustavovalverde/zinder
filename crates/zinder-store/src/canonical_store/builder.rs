@@ -543,6 +543,18 @@ mod tests {
             reopened.ready_evidence().visible_tip.hash,
             BlockHash::from_bytes([2; 32])
         );
+        let replayed_blocks = reopened
+            .scan_canonical_replay()?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(replayed_blocks.len(), 2);
+        assert_eq!(
+            replayed_blocks[0].facts().block_header.block_hash,
+            BlockHash::from_bytes([1; 32])
+        );
+        assert_eq!(
+            replayed_blocks[1].facts().block_header.block_hash,
+            BlockHash::from_bytes([2; 32])
+        );
         Ok(())
     }
     #[test]

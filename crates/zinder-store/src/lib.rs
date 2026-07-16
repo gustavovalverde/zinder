@@ -44,11 +44,11 @@ pub use block_value_pool_balances::BlockValuePoolBalancesStore;
 pub use canonical_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
     CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
-    CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
-    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence, PreparedCanonicalBaselinePublication,
-    RocksDbCanonicalBuilder, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
-    ValidatedRocksDbCanonicalBuild,
+    CanonicalReplayScan, CanonicalStoreBuildError, CanonicalStoreBuildPlan,
+    CanonicalStoreBuildPlanError, CanonicalStoreBuildState, CanonicalStoreError,
+    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence,
+    PreparedCanonicalBaselinePublication, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+    TREE_STATE_CHECKPOINT_STRIDE, ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;

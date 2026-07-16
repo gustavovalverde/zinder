@@ -17,7 +17,7 @@ use crate::{
 use super::{
     CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
     CanonicalStoreWorkload,
-    block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+    block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, CanonicalReplayScan},
     control::{DecodedStoreControl, decode_store_control, encode_building_store_control},
     publication::validate_ready_publication,
 };
@@ -205,6 +205,15 @@ impl RocksDbCanonicalStore {
     #[must_use]
     pub const fn ready_evidence(&self) -> CanonicalStoreReadyEvidence {
         self.ready_evidence
+    }
+
+    /// Scans the complete published canonical replay exactly once in height order.
+    ///
+    /// The scan bypasses the `RocksDB` block cache, decodes and authenticates every
+    /// replay row, and verifies the final count, tip, and ordered sequence digest
+    /// against the READY record before it terminates successfully.
+    pub fn scan_canonical_replay(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
+        CanonicalReplayScan::new(&self.bounded_open.db, self.ready_evidence)
     }
 
     /// Returns the filesystem I/O mode selected by the bounded `RocksDB` open.

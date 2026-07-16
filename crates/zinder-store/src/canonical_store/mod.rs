@@ -25,6 +25,7 @@ use zinder_core::{
 };
 
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
+pub use block_replay::CanonicalReplayScan;
 pub use builder::RocksDbCanonicalBuilder;
 pub use publication::{
     CanonicalBaselinePublication, PreparedCanonicalBaselinePublication,
