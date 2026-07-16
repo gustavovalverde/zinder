@@ -31,6 +31,12 @@ projection convergence, restart, sampled wallet-serving behavior, and the new
 fact contract across both physical drivers. It does not certify the target
 fact-first runtime or the `postgres-scale-out` composition.
 
+The [version-1 RocksDB storage construction evidence](../investigations/2026-07-15-fact-first-live-validation.md#version-1-rocksdb-storage-construction)
+certifies fresh canonical and wallet storage construction through a fixed
+4.175-million-block testnet tip in 15 minutes 47.21 seconds. It proves the new
+bounded RocksDB construction and cold-admission path, not live following, query
+serving, restore, reorg execution, wallet-client parity, or PostgreSQL.
+
 ## Implementation Status
 
 | Slice | Status | Evidence boundary |
@@ -40,14 +46,14 @@ fact-first runtime or the `postgres-scale-out` composition.
 | Full replay/header verifier | Landed and live-tested | All 4.17 million pinned testnet rows passed replay, header, and continuity checks |
 | PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
 | Clean physical schema identities | Landed | Canonical, wallet, and explorer contracts use identity-scoped version 1 and refuse prior layouts without migration or adoption |
-| Fresh RocksDB canonical builder | Wallet READY lifecycle implemented; block-family arm live-tested | A new `BUILDING` path fixes its workload, activation fingerprint, source range, predecessor frontiers, and build tip; Wallet publication flushes, closes, cold-reopens, validates every required family, then atomically writes epoch 1, event 1, and `READY`. Explorer remains blocked until daily value-pool evidence is implemented; neither complete lifecycle is live-certified yet |
+| Fresh RocksDB canonical builder | Wallet construction live-certified | A new `BUILDING` path fixes its workload, activation fingerprint, source range, predecessor frontiers, and build tip. A clean testnet run loaded and cold-validated 4,175,080 blocks, then atomically published epoch 1, event 1, and `READY` at the fixed source fence |
 | One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
 | Version-1 wallet row contracts and serial oracle | Landed | 6 query-owned row families, exact durable codecs, deterministic projection evidence, and bounded reorg undo are independent of the storage engine |
-| RocksDB wallet construction | Bounded correctness baseline landed | A fresh identity-scoped version-1 store moves from `BUILDING` through cold semantic validation to `READY` at an exact canonical source fence. Its current in-memory sort/merge tracer is deliberately bounded and is not the production full-chain loader or evidence for a mainnet speed claim |
+| RocksDB wallet construction | Production loader landed and testnet storage-certified | A fresh identity-scoped version-1 store uses bounded external runs and ordered SST ingestion, moves from `BUILDING` through cold semantic validation to `READY`, and reproduces its exact canonical source fence after a final cold reopen. The full-tip testnet build used zero historical prevout and validation random reads |
 | Shared RocksDB bulk-load mechanics | Landed | `zinder-rocksdb` owns bounded fixed-record runs, capped merge fan-in, strict ordered SST emission, and physical errors without owning a domain schema or publication lifecycle |
-| Production wallet bulk loader | In progress | Shared fixed-record sorting and ordered SST emission have landed. RocksDB still needs variable-record outpoint runs, the wallet merge/reduction, and six-family ingestion; Postgres still needs its concrete `COPY`, native join, and index-build path |
+| Production wallet bulk loader | RocksDB landed; PostgreSQL pending | Shared fixed- and variable-record runs, capped merge fan-in, wallet outpoint reduction, six-family SST ingestion, and bounded cold validation are implemented and full-tip tested. PostgreSQL still needs its concrete `COPY`, native join, and index-build path |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
-| Complete lifecycle certification | Not run | Fresh mainnet canonical, wallet construction, restore, reorg, and client parity gates remain open |
+| Complete lifecycle certification | RocksDB storage construction passed on testnet | Fresh canonical and wallet construction passed through a fixed full testnet tip under an exact Docker resource envelope. Live following, query serving, restore, reorg, client parity, mainnet, and the PostgreSQL topology remain open |
 
 ## Decision
 

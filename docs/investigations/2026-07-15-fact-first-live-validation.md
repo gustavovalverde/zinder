@@ -216,3 +216,98 @@ continues to be the working deployment using the legacy coupled schema.
 The next release claim must come from the new canonical schema plus the
 independent wallet projection lifecycle, not from extrapolating these
 measurements.
+
+## Version-1 RocksDB storage construction
+
+Status: storage construction certified; serving topology not yet certified
+Date: 2026-07-16
+Revision: `d102acb94ad03fcf518824f3d42f569888c7084d`
+Image: `sha256:057dd9a9536bf761a1e4da4ff0e4d7a2c0add8ee3c7d9c5b5a952f4f7942f90f`
+Trial: `testnet-20260716T053041Z`
+
+The clean version-1 `rocksdb-single-host` construction path rebuilt canonical
+and wallet storage from height 1 through testnet height 4,175,080 in 15 minutes
+47.21 seconds. Canonical storage reached `READY` in 11 minutes 16.05 seconds;
+the independent wallet projection then reached `READY` in 4 minutes 31.16
+seconds. Both stores passed semantic validation, publication, and a final cold
+reopen at the same authenticated canonical fence.
+
+The runner reused `z3-testnet-zebra-1`, its Docker network, and its read-only
+cookie volume. It deleted only project-scoped Zinder canonical and wallet
+volumes, and neither declared nor mounted Zebra's chain volume. Docker Desktop
+exposed 10 CPU cores and 16,747,839,488 bytes of memory. The lifecycle
+container had a 10-core quota and a 10 GiB memory limit; Zebra ran outside that
+cgroup and remained healthy.
+
+The host captured height 4,175,080 before starting the container. Zebra
+advanced to 4,175,081 before source discovery and to 4,175,113 before canonical
+loading ended. The build fence remained height 4,175,080 with hash
+`96e1db9b5dc679f22775f93ca838a9066f04c2a50de5fa0eb035e2b5ebfe6600`,
+so an advancing source could not move the acceptance range.
+
+| Stage | Time | Result |
+| --- | ---: | --- |
+| Canonical source load | 8m 24.66s | 4,175,080 blocks and 4,786,733 transactions persisted |
+| Canonical cold validation | 2m 51.29s | Every required canonical family admitted |
+| Canonical storage ready | 11m 16.05s | Epoch 1, event 1, and the exact fixed tip cold-reopened |
+| Wallet canonical scan | 46.35s | The same block and transaction counts observed |
+| Wallet outpoint sort and merge | 1m 38.29s | 14,135,328 outpoint events reduced |
+| Wallet secondary derivation | 21.28s | Address indexes and history constructed |
+| Wallet cold validation | 1m 44.98s | Primary and secondary relations independently compared |
+| Wallet storage ready | 4m 31.16s | Projection published at the canonical fence |
+| Complete storage lifecycle | 15m 47.21s | Final canonical and wallet cold reopen passed |
+
+The canonical source load averaged 8,273 blocks per second. Including full
+cold validation and admission, canonical construction averaged 6,176 blocks
+per second. The loader adapted segment size at dense testnet bands. The
+captured log contained 30 density restarts and 2 response-size restarts; those
+restarts discarded 422 completed speculative segments plus in-flight work.
+This did not break ordered construction, but it is the leading source-side
+tuning opportunity.
+
+The canonical store occupied 12,349,170,949 bytes. Its ordered sequence digest
+was `57112f5254593b7c290be4d75a39337959bd0820ee18fa2174286de9bd1d2740`.
+The 2,704,566,725-byte wallet store published projection digest
+`3ac9577d7ca1e2372c25691e0224e3e93f2c0885aa71955459066ff488499d9a`
+and contained:
+
+| Wallet family | Rows |
+| --- | ---: |
+| Transparent unspent outputs | 10,758,948 |
+| Unspent outputs by address | 10,758,948 |
+| Transparent spent outputs | 1,688,190 |
+| Address transactions | 12,935,247 |
+| Positive address balances | 337,252 |
+| Reorg undo blocks | 100 |
+
+Construction and cold validation performed zero historical prevout reads and
+zero random validation reads. The outpoint events fit in one 2.26 GB accounted
+run under a 4 GiB ceiling. The address-transaction sort used two initial runs
+and one merge pass under its 1 GiB ceiling; cold validation independently
+reproduced that bounded shape. The largest accounted reorg suffix was
+2,882,488 bytes under a 512 MiB ceiling.
+
+The exact private-cgroup memory peak was 6,496,649,216 bytes, approximately
+6.05 GiB. Process peak RSS was 3,752,452,096 bytes, approximately 3.49 GiB.
+Sampled allocated storage peaked at 18,114,859,008 bytes, approximately 16.87
+GiB, while stores and external-sort staging files coexisted. The strict
+validator pinned the image, revision, trial, resource profile, fixed tip,
+version-1 schemas, row relations, sorter ceilings, zero-random-read invariants,
+cold reopens, and full resource interval. Both the 10,000-block smoke and
+full-tip run passed.
+
+The measured bottlenecks are now explicit. Source loading consumed 504.66
+seconds, 53.3% of the lifecycle. Canonical cold validation consumed 171.29
+seconds, 18.1%. Wallet cold validation consumed 104.98 seconds, 11.1%, and the
+wallet outpoint merge consumed 95.00 seconds, 10.0%. Increasing sorter memory
+is not the important next change: the outpoint sort itself needed only 3.29
+seconds.
+
+The next pass should remove discarded source work and duplicated cold scans,
+then parallelize only independent validation or merge work whose ordering does
+not affect the version-1 contract. Every optimization must rerun the clean
+full-tip gate. The remaining topology certification must still wire these
+stores into live ingest, projection following, and query serving, then prove
+reorg, restart, restore, and real wallet-client parity. PostgreSQL remains the
+separate `postgres-scale-out` implementation after the RocksDB runtime contract
+is stable; this evidence neither blocks nor certifies it.
