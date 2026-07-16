@@ -622,7 +622,7 @@ jq -e \
       and .samples[-1].observed_at_unix_millis >= $report.provenance.run.completed_at_unix_millis
       and ([.samples[].memory_current_bytes] | max) == .sampled_memory_current_peak_bytes
       and ([.samples[].storage_bytes] | max) == .sampled_storage_peak_bytes))
-  '
+  ' \
   "$report_path" >/dev/null || fail \
   "report and container-resource evidence do not satisfy the closed version-1 contract"
 
