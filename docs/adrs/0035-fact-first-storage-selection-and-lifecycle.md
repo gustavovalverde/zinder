@@ -180,8 +180,10 @@ and durability settings are recorded with every result. At the approximately
 Chain growth does not weaken these targets silently. Benchmark reports record
 the exact source height and calculate the achieved average block rate. New
 production releases re-run the full lifecycle against the then-current tip.
-The current replay drivers do not execute this full lifecycle and therefore do
-not certify any target in this table.
+The current storage lifecycle driver certifies fresh canonical and wallet
+construction through cold publication. It does not certify continuous
+following, reorg recovery, query serving, snapshot restore, or client parity,
+so it cannot certify the complete topology targets in this table.
 
 The restore gate uses a certified, immutable snapshot fixture for each
 candidate. Its Zinder-owned manifest records the network, backend and schema
@@ -278,27 +280,46 @@ balance, missing row, or unqualified unavailable error.
    output, address, spend, repair, and retention state from canonical commits.
    Keep compact scan payloads, tree metadata, roots, and displaced-branch facts
    canonical until version-1 replay can reproduce them without source access.
-6. Implement RocksDB fresh canonical construction and live following over that
-   schema, then prove that canonical commits perform no cross-block wallet
-   lookup across the representative mainnet workload anchors. The store-side
-   atomic append boundary now exists with authenticated consecutive reopen;
-   shallow reorg, continuous source following, and the ingest cutover remain
-   part of this step.
+6. Cut `zinder-ingest` over to the version-1 `RocksDbCanonicalStore`. First
+   connect a freshly published or reopened `READY` store to continuous
+   append-only following through the atomic live-append boundary. Then add
+   atomic shallow and same-height reorg replacement, reorg-window enforcement,
+   and restart from the authenticated event fence. This cutover performs no
+   dual writes and retains no legacy serving fallback. Representative mainnet
+   workload anchors must keep cross-block wallet and historical prevout reads
+   at zero.
 7. Add the durable projection-build lease and anchor-aware event-pruning floor
-   before any inactive builder can be promoted.
-8. Implement the concrete RocksDB wallet projection builder, ordered follower,
-   and readiness verifier; add wallet construction and wallet-ready lifecycle
-   acceptance only with that real plane.
-9. Rewire query, client, compatibility, and downstream contracts in one
-   coordinated breaking change.
+   before any inactive builder can be promoted. Acquisition, renewal,
+   expiration, competing builders, crash recovery, and promotion all preserve
+   the pinned canonical epoch and chain-event anchor; event pruning cannot pass
+   the earliest valid lease anchor.
+8. Complete the RocksDB wallet lifecycle in dependency order: catch up from the
+   construction fence, follow canonical events in order, atomically commit
+   wallet rows plus reorg undo and source position, reverse applied transitions
+   during a reorg, and authenticate `wallet-ready` against the exact canonical
+   epoch, tip, event sequence, and replay digest. Height equality alone never
+   admits serving.
+9. Rewire query, native clients, lightwalletd compatibility, and downstream
+   contracts to the version-1 canonical and wallet stores in one coordinated
+   breaking change. After real-client parity passes, delete legacy canonical
+   wallet tables, historical prevout commit work, wallet `zinder-derive`
+   consumers, fallback reads, and obsolete configuration. Differential checks
+   remain test oracles instead of becoming a dual-write runtime.
 10. Move remaining explorer consumers and backfills to explorer-owned modules,
-    then delete the legacy `zinder-derive` path.
-11. Replace configuration, readiness, metrics, snapshot operations, testkit
-    fixtures, deployment manifests, and runbooks for the target
-    `rocksdb-single-host` composition.
-12. Prove the complete `rocksdb-single-host` lifecycle, including canonical
-    construction, wallet and explorer construction, live following, reorg,
-    restart, checkpoint, restore, and client parity.
+    cut explorer reads over to that plane, and delete the remaining legacy
+    `zinder-derive` path. Explorer construction does not delay `wallet-ready`,
+    but the legacy explorer plane cannot remain when `rocksdb-single-host` is
+    declared complete.
+11. Evolve configuration, readiness, metrics, snapshot operations, testkit
+    fixtures, Docker Compose manifests, and runbooks with steps 6 through 10,
+    then finalize the target `rocksdb-single-host` composition without legacy
+    modes or fallback serving.
+12. Prove the complete `rocksdb-single-host` lifecycle across representative
+    mainnet anchors, including dense transparent and Sandblast ranges. The gate
+    covers canonical, wallet, and explorer construction; advancing-tip
+    following; maximum-depth reorg; restart; same-volume secondary catch-up;
+    checkpoint and restore; projection lag; query serving; and native,
+    lightwalletd, Zallet, ZODL, Zally, and explorer client parity.
 13. Implement PostgreSQL canonical construction, live following, writer
     fencing, epoch-pinned read sessions, and the transactional event outbox.
 14. Implement the PostgreSQL wallet and explorer projections.
@@ -310,6 +331,20 @@ balance, missing row, or unqualified unavailable error.
 17. Build a blue-green production stack, validate it without traffic, catch up,
     switch traffic, retain the previous stack for a bounded rollback window,
     then delete the old storage paths and remaining compatibility baggage.
+
+Source attribution proceeds as a non-blocking diagnostic lane during steps 6
+through 12. The runtime reports RPC wait, response bytes, JSON and hexadecimal
+decoding, parsing, block preparation, admission backpressure, SST generation,
+and database loading separately. A captured-source comparison and injected
+round-trip-time trials determine whether transport is material. Zinder and
+Zebra gain a new binary historical-streaming protocol only if those results
+show that transport dominates while CPU, memory, and database capacity remain
+available.
+
+Construction-only micro-optimizations do not delay the runtime cutover unless
+they block a lifecycle gate. PostgreSQL remains diagnostic through step 12;
+production `postgres-scale-out` work starts only from the stable lifecycle and
+client contracts certified by `rocksdb-single-host`.
 
 Complete topology validation cannot precede the schema and projection
 lifecycles it is meant to validate. The RocksDB composition closes first so it
