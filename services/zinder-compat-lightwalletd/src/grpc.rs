@@ -26,9 +26,9 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi,
-    address_lookup_to_script_hash, status_from_query_error,
+    FactFirstWalletReadiness, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQueryApi, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition, MempoolEvent};
@@ -91,6 +91,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
     wallet_projection_reader: Option<Arc<dyn zinder_query::WalletProjectionReadApi>>,
+    fact_first_wallet_readiness: Option<FactFirstWalletReadiness>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
@@ -105,6 +106,10 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field(
                 "wallet_projection_reader",
                 &self.wallet_projection_reader.is_some(),
+            )
+            .field(
+                "fact_first_wallet_readiness",
+                &self.fact_first_wallet_readiness,
             )
             .field(
                 "network_upgrade_activations",
@@ -153,6 +158,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             mempool_surface: None,
             tip_change_watcher: None,
             wallet_projection_reader: None,
+            fact_first_wallet_readiness: None,
             network_upgrade_activations,
         }
     }
@@ -181,6 +187,16 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         wallet_projection_reader: Arc<dyn zinder_query::WalletProjectionReadApi>,
     ) -> Self {
         self.wallet_projection_reader = Some(wallet_projection_reader);
+        self
+    }
+
+    /// Supplies the exact position proven by fact-first store admission.
+    #[must_use]
+    pub const fn with_fact_first_wallet_readiness(
+        mut self,
+        readiness: FactFirstWalletReadiness,
+    ) -> Self {
+        self.fact_first_wallet_readiness = Some(readiness);
         self
     }
 
@@ -798,6 +814,9 @@ where
 
         let transparent_address_support = if !self.options.transparent_address_support {
             false
+        } else if let Some(readiness) = self.fact_first_wallet_readiness {
+            readiness.chain_epoch_id == latest_block.chain_epoch.id
+                && readiness.height >= latest_block.height
         } else if let Some(wallet_projection_reader) = &self.wallet_projection_reader {
             let required_cursor = self
                 .query_api

@@ -3,8 +3,9 @@
 use rust_rocksdb::{Direction, IteratorMode};
 use zinder_core::{
     ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, ChainEpoch,
-    ChainTipMetadata, CommitmentTreeCheckpoint, CompactBlockArtifact, TransactionBlobArtifact,
-    TransactionId, TransactionLocation, UnixTimestampMillis,
+    ChainTipMetadata, CommitmentTreeCheckpoint, CompactBlockArtifact, SubtreeRootArtifact,
+    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
+    UnixTimestampMillis,
 };
 
 use super::{
@@ -16,9 +17,10 @@ use super::{
     publication::column_family,
     rocksdb::{
         BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
+        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
+    subtree_load::{decode_subtree_root, encode_subtree_root_key},
 };
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
@@ -73,6 +75,24 @@ impl RocksDbCanonicalStore {
             header.block_hash,
             payload_bytes,
         )))
+    }
+
+    /// Reads an inclusive compact-block range in ascending height order.
+    pub fn compact_blocks_in_range(
+        &self,
+        range: zinder_core::BlockHeightRange,
+    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+        range
+            .into_iter()
+            .map(|height| {
+                self.compact_block_at(height)?.ok_or_else(|| {
+                    CanonicalStoreError::publication(format!(
+                        "compact block at height {} is absent",
+                        height.value()
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Reads the canonical location of one transaction.
@@ -134,6 +154,37 @@ impl RocksDbCanonicalStore {
             block_time_seconds,
             frontiers,
         )))
+    }
+
+    /// Reads the contiguous subtree-root rows requested by `range`.
+    pub fn subtree_roots(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
+        let family = column_family(&self.bounded_open.db, SUBTREE_ROOT_COLUMN_FAMILY)?;
+        range
+            .into_iter()
+            .map(|subtree_index| {
+                let probe = SubtreeRootArtifact::new(
+                    range.protocol,
+                    subtree_index,
+                    zinder_core::SubtreeRootHash::from_bytes([0; 32]),
+                    BlockHeight::new(0),
+                    BlockHash::from_bytes([0; 32]),
+                );
+                let key = encode_subtree_root_key(&probe);
+                self.bounded_open
+                    .db
+                    .get_cf(&family, key)
+                    .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                        operation: "subtree-root read",
+                        source,
+                    })?
+                    .map(|encoded| decode_subtree_root(&key, &encoded))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|roots| roots.into_iter().flatten().collect())
     }
 
     fn read_optional(

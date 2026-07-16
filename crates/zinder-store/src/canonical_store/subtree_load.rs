@@ -421,7 +421,7 @@ pub(super) fn encode_subtree_root_value(
     encoded_root
 }
 
-fn decode_subtree_root(
+pub(in crate::canonical_store) fn decode_subtree_root(
     key: &[u8],
     encoded_root: &[u8],
 ) -> Result<SubtreeRootArtifact, CanonicalStoreError> {

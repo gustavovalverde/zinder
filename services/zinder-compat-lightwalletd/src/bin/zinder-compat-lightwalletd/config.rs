@@ -23,6 +23,7 @@ use zinder_store::StoreError;
 pub(crate) struct LightwalletdConfig {
     pub(crate) network: Network,
     pub(crate) storage: ResolvedSecondaryStorage,
+    pub(crate) wallet_storage_path: PathBuf,
     pub(crate) ingest_control_addr: String,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
@@ -38,6 +39,7 @@ pub(crate) struct LightwalletdConfigOverrides {
     pub(crate) network: Option<String>,
     pub(crate) storage_path: Option<PathBuf>,
     pub(crate) secondary_path: Option<PathBuf>,
+    pub(crate) wallet_storage_path: Option<PathBuf>,
     pub(crate) ingest_control_addr: Option<String>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) listen_addr: Option<SocketAddr>,
@@ -56,6 +58,15 @@ pub(crate) enum LightwalletdConfigError {
 
     #[error(transparent)]
     DeriveStore(#[from] DeriveStoreError),
+
+    #[error(transparent)]
+    CanonicalStore(#[from] zinder_store::CanonicalStoreError),
+
+    #[error(transparent)]
+    WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
+
+    #[error(transparent)]
+    Query(#[from] zinder_query::QueryError),
 
     #[error("node source initialization failed: {0}")]
     Source(Box<zinder_source::SourceError>),
@@ -84,6 +95,7 @@ pub(crate) fn load_lightwalletd_config(
         .with_override_if("network.name", overrides.network)?
         .with_override_path_if("storage.path", overrides.storage_path)?
         .with_override_path_if("storage.secondary_path", overrides.secondary_path)?
+        .with_override_path_if("wallet.path", overrides.wallet_storage_path)?
         .with_override_if("ingest_control.addr", overrides.ingest_control_addr)?
         .with_override_path_if(
             "ingest_control.bearer_token_path",
@@ -118,6 +130,7 @@ struct LightwalletdRawConfig {
     network: NetworkSection,
     ops: OpsSection,
     storage: SecondaryStorageSection,
+    wallet: WalletSection,
     ingest_control: IngestControlSection,
     compat: CompatSection,
     node: NodeSection,
@@ -130,11 +143,18 @@ struct CompatSection {
     listen_addr: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct WalletSection {
+    path: Option<PathBuf>,
+}
+
 fn resolve_lightwalletd_config(
     config: LightwalletdRawConfig,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
     let network = config.network.resolve()?;
     let storage = resolve_secondary_storage(config.storage)?;
+    let wallet_storage_path = require_field(config.wallet.path, "wallet.path")?;
     let ResolvedIngestControlReader {
         addr: ingest_control_addr,
         bearer_token_path: ingest_control_bearer_token_path,
@@ -152,6 +172,7 @@ fn resolve_lightwalletd_config(
     Ok(LightwalletdConfig {
         network,
         storage,
+        wallet_storage_path,
         ingest_control_addr,
         ingest_control_bearer_token_path,
         ingest_control_bearer_token,
@@ -168,6 +189,7 @@ struct LightwalletdConfigToml {
     ops: OpsToml,
     security: SecurityToml,
     storage: SecondaryStorageToml,
+    wallet: WalletToml,
     ingest_control: IngestControlReaderToml,
     compat: CompatToml,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,6 +203,9 @@ impl LightwalletdConfigToml {
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             storage: SecondaryStorageToml::from_resolved(&config.storage),
+            wallet: WalletToml {
+                path: config.wallet_storage_path.clone(),
+            },
             ingest_control: IngestControlReaderToml::from_resolved(
                 config.ingest_control_addr.clone(),
                 config.ingest_control_bearer_token_path.as_deref(),
@@ -196,4 +221,9 @@ impl LightwalletdConfigToml {
 #[derive(Serialize)]
 struct CompatToml {
     listen_addr: String,
+}
+
+#[derive(Serialize)]
+struct WalletToml {
+    path: PathBuf,
 }

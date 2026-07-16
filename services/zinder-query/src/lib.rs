@@ -31,10 +31,12 @@ use zinder_store::{
     StreamCursorTokenV1,
 };
 
+mod fact_first;
 mod grpc;
 mod readiness_refresh;
 mod wallet_projection_read;
 
+pub use fact_first::{FactFirstWalletQuery, FactFirstWalletReadiness};
 pub use grpc::{
     ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
     address_lookup_to_script_hash, block_header_by_selector_response,
@@ -1852,6 +1854,8 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::Store(_)) => "store",
         Some(QueryError::DeriveStore(_)) => "derive_store",
         Some(QueryError::WalletProjectionRead { .. }) => "wallet_projection_read",
+        Some(QueryError::CanonicalStore(_)) => "canonical_store",
+        Some(QueryError::WalletStore(_)) => "wallet_store",
         Some(QueryError::Node(_)) => "node",
     }
 }
@@ -2346,6 +2350,14 @@ pub enum QueryError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// Version-1 canonical store returned a storage or admission failure.
+    #[error(transparent)]
+    CanonicalStore(#[from] zinder_store::CanonicalStoreError),
+
+    /// Version-1 wallet store returned a storage or admission failure.
+    #[error(transparent)]
+    WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
+
     /// Upstream node operation failed.
     #[error(transparent)]
     Node(#[from] SourceError),
@@ -2391,9 +2403,11 @@ impl zinder_proto::BoundaryError for QueryError {
                 ErrorReason::NodeCapabilityMissing
             }
             Self::Node(_) => ErrorReason::NodeUnavailable,
-            Self::DeriveStore(_) | Self::Store(_) | Self::WalletProjectionRead { .. } => {
-                ErrorReason::StorageUnavailable
-            }
+            Self::DeriveStore(_)
+            | Self::Store(_)
+            | Self::WalletProjectionRead { .. }
+            | Self::CanonicalStore(_)
+            | Self::WalletStore(_) => ErrorReason::StorageUnavailable,
         }
     }
 }
