@@ -841,13 +841,13 @@ impl CanonicalBuildBlockReceiver {
 }
 
 #[derive(Default)]
-struct CompactBlockCommitments {
-    sapling: Vec<[u8; 32]>,
-    orchard: Vec<[u8; 32]>,
-    ironwood: Vec<[u8; 32]>,
+pub(crate) struct CompactBlockCommitments {
+    pub(crate) sapling: Vec<[u8; 32]>,
+    pub(crate) orchard: Vec<[u8; 32]>,
+    pub(crate) ironwood: Vec<[u8; 32]>,
 }
 
-fn compact_block_commitments(
+pub(crate) fn compact_block_commitments(
     prepared: &PreparedCanonicalBlock,
 ) -> Result<CompactBlockCommitments, CanonicalConstructionError> {
     let height = prepared.facts.block_header.height;
@@ -892,7 +892,7 @@ fn compact_commitment_bytes(
         })
 }
 
-fn canonical_build_block(
+pub(crate) fn canonical_build_block(
     positioned: PositionedCanonicalBlock,
     tree_state_checkpoint: Option<CommitmentTreeCheckpoint>,
     block_final_note_commitment_roots: Option<zinder_core::BlockFinalNoteCommitmentRoots>,

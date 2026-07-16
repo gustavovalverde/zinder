@@ -117,7 +117,7 @@ const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_BATCH_BLOCKS: u32 = 10_000;
 const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
 const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
-const DEFAULT_PROJECTION_PRESET: ProjectionPreset = ProjectionPreset::Explorer;
+const DEFAULT_PROJECTION_PRESET: ProjectionPreset = ProjectionPreset::Wallet;
 
 /// Fully loaded command configuration for the unified `zinder-ingest`
 /// run (no subcommand and the `probe` subcommand both consume this).
@@ -269,6 +269,12 @@ pub(crate) enum IngestConfigError {
 
     #[error(transparent)]
     Ingest(#[from] IngestError),
+
+    #[error(transparent)]
+    CanonicalRuntime(#[from] zinder_ingest::CanonicalRuntimeError),
+
+    #[error("version-1 canonical runtime requires ingest.projection_preset=wallet")]
+    CanonicalRuntimeRequiresWallet,
 
     #[error(transparent)]
     CanonicalReplayVerification(

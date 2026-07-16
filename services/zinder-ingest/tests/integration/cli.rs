@@ -83,7 +83,7 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[ingest]"));
-    assert!(stdout.contains("projection_preset = \"explorer\""));
+    assert!(stdout.contains("projection_preset = \"wallet\""));
     assert!(stdout.contains("# effective_projection_identities = ["));
     assert!(stdout.contains("reorg_window_blocks = 100"));
     assert!(stdout.contains("[ingest.phases]"));

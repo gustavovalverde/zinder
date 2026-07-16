@@ -15,14 +15,15 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
+    CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalRuntimeConfig,
     DEFAULT_DERIVE_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
     DeriveStatusReader, HistoricalWorkGate, IngestControlGrpcAdapter, IngestError, IngestModifiers,
     MempoolIndex, MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind,
     ProjectionStartupInputs, ProjectionStartupPlan, ProjectionStartupSettings,
     RocksDbDeriveStatusReader, TipFollowSubsystems, TipFollowSubsystemsLauncher, classify_phase,
     current_chain_height, mempool_ready_channel,
-    open_primary_derive_store_for_canonical_with_projection_preset, run_ingest_loop,
-    run_mempool_orchestrator, spawn_chain_event_retention_task,
+    open_primary_derive_store_for_canonical_with_projection_preset, run_canonical_runtime,
+    run_ingest_loop, run_mempool_orchestrator, spawn_chain_event_retention_task,
     spawn_derive_replay_budget_metrics_task, spawn_mempool_event_retention_task,
     spawn_runtime_memory_metrics_task, spawn_transparent_retention_task,
     spawn_upstream_health_probe_task,
@@ -54,6 +55,7 @@ const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::JsonRpc,
     NodeCapability::BestChainBlocks,
     NodeCapability::TipId,
+    NodeCapability::TreeState,
     NodeCapability::SubtreeRoots,
 ];
 
@@ -341,24 +343,32 @@ async fn run_probe(
     let command_config = config::load_ingest_config(config_path, overrides)?;
     let loop_config = command_config.loop_config;
     let source = zebra_json_rpc_source_for_target(loop_config.node_source, &loop_config.node)?;
+    let activations = source
+        .discover_network_upgrade_activations("zinder-ingest-probe")
+        .await
+        .map_err(IngestError::from)?;
     let upstream_tip = source
         .tip_id()
         .await
         .map_err(IngestError::from)?
         .height
         .value();
-    let store = PrimaryChainStore::open(
+    let store = zinder_store::RocksDbCanonicalStore::open_ready(
         &loop_config.storage_path,
-        loop_config.canonical_store_options(),
+        &activations,
+        zinder_store::CanonicalStoreWorkload::Wallet,
+        loop_config.canonical_rocksdb_budget,
     )
-    .map_err(IngestError::from)?;
-    let store_tip = current_chain_height(&store);
+    .map_err(zinder_ingest::CanonicalRuntimeError::from)
+    .map_err(IngestConfigError::from)?;
+    let store_tip_height = store.event_fence().visible_tip().height.value();
+    let store_tip = Some(store_tip_height);
     let phase = classify_phase(
         store_tip,
         upstream_tip,
         loop_config.phases.catchup_threshold_blocks,
     );
-    let gap_blocks = i64::from(upstream_tip).saturating_sub(i64::from(store_tip.unwrap_or(0)));
+    let gap_blocks = i64::from(upstream_tip).saturating_sub(i64::from(store_tip_height));
     let upstream_health = match source.poll_upstream_health().await {
         Ok(snapshot) => format!("{}/{}", snapshot.source, snapshot.reason),
         Err(error) => format!("unavailable ({error})"),
@@ -373,11 +383,137 @@ async fn run_probe(
     Ok(())
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the unified-ingest startup composes the load_config, start_api, connect_node, check_schema, recover_state, open_storage, ingest_control, and ready phases in one auditable sequence; splitting them would obscure the failure ordering."
-)]
 async fn run_ingest(
+    config_path: Option<PathBuf>,
+    overrides: IngestConfigOverrides,
+) -> Result<(), IngestConfigError> {
+    let load_config_phase = StartupPhase::LoadConfig.start();
+    let mut command_config = config::load_ingest_config(config_path, overrides)?;
+    load_config_phase.complete();
+    if command_config.projection_preset != zinder_derive::ProjectionPreset::Wallet {
+        return Err(IngestConfigError::CanonicalRuntimeRequiresWallet);
+    }
+
+    let readiness = Readiness::default();
+    readiness.set_projection_workload("wallet", vec!["canonical-v1".to_owned()]);
+    let start_api_phase = StartupPhase::StartApi.start();
+    let ops_handle = spawn_ops_endpoint_for(
+        ServiceIdentifier::Ingest,
+        command_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(command_config.loop_config.node.network),
+        readiness.clone(),
+        zinder_proto::capabilities::always_on_capability_strings(
+            zinder_proto::capabilities::CapabilitySurface::Ingest,
+        ),
+    );
+
+    let connect_node_phase = StartupPhase::ConnectNode.start();
+    let source = zebra_json_rpc_source_for_target(
+        command_config.loop_config.node_source,
+        &command_config.loop_config.node,
+    )?;
+    connect_node_phase.complete();
+    let check_schema_phase = StartupPhase::CheckSchema.start();
+    ensure_node_capabilities(&source, &readiness).await?;
+    let network_upgrade_activations = source
+        .discover_network_upgrade_activations("zinder-ingest")
+        .await
+        .map_err(IngestError::from)?;
+    check_schema_phase.complete();
+
+    let recover_state_phase = StartupPhase::RecoverState.start();
+    resolve_wallet_serving_modifiers(&mut command_config, &network_upgrade_activations)?;
+    recover_state_phase.complete();
+    let cancel = CancellationToken::new();
+    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
+    let _upstream_health_probe_handle = spawn_upstream_health_probe_for(
+        &command_config.loop_config.node,
+        &source,
+        readiness.clone(),
+        cancel.clone(),
+    );
+    let memory_metrics_handle =
+        spawn_runtime_memory_metrics_task(DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, cancel.clone());
+    start_api_phase.complete();
+    StartupPhase::Ready.start().complete();
+
+    let runtime_config =
+        canonical_runtime_config(&command_config, Arc::clone(&network_upgrade_activations));
+    log_canonical_runtime_start(&command_config, &runtime_config);
+    let runtime_result = run_canonical_runtime(
+        &source,
+        network_upgrade_activations,
+        runtime_config,
+        &readiness,
+        &cancel,
+    )
+    .await;
+    cancel.cancel();
+    if let Err(join_error) = memory_metrics_handle.await {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "runtime_memory_metrics_join_failed",
+            error = %join_error,
+            "runtime memory metrics task failed during shutdown"
+        );
+    }
+    if let Some(handle) = ops_handle {
+        handle.shutdown().await;
+    }
+    runtime_result.map(drop).map_err(IngestConfigError::from)
+}
+
+fn canonical_runtime_config(
+    command_config: &IngestCommandConfig,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+) -> CanonicalRuntimeConfig {
+    CanonicalRuntimeConfig {
+        storage_path: command_config.loop_config.storage_path.clone(),
+        resource_budget: command_config.loop_config.canonical_rocksdb_budget,
+        construction: CanonicalConstructionConfig {
+            request_timeout: command_config.loop_config.node.request_timeout,
+            pipeline_limits: command_config.loop_config.bulk_catchup.pipeline_limits,
+            network_upgrade_activations,
+        },
+        checkpoint_height: command_config.loop_config.modifiers.checkpoint_height,
+        reorg_window_blocks: command_config.loop_config.reorg_window_blocks,
+        follow: CanonicalFollowConfig {
+            request_timeout: command_config.loop_config.node.request_timeout,
+            poll_interval: command_config.loop_config.tip_follow.poll_interval,
+            lag_threshold_blocks: command_config.loop_config.tip_follow.lag_threshold_blocks,
+            target_height: command_config.loop_config.modifiers.target_height,
+        },
+    }
+}
+
+fn log_canonical_runtime_start(
+    command_config: &IngestCommandConfig,
+    runtime_config: &CanonicalRuntimeConfig,
+) {
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "canonical_runtime_started",
+        network = encode_zinder_native_chain_name(command_config.loop_config.node.network),
+        storage_path = %runtime_config.storage_path.display(),
+        json_rpc_addr = command_config.loop_config.node.json_rpc_addr.as_str(),
+        workload = "wallet",
+        schema_version = zinder_store::CANONICAL_STORE_SCHEMA_VERSION,
+        reorg_window_blocks = runtime_config.reorg_window_blocks,
+        checkpoint_height = ?runtime_config.checkpoint_height.map(BlockHeight::value),
+        target_height = ?runtime_config.follow.target_height.map(BlockHeight::value),
+        historical_prevout_reads = 0_u64,
+        cross_block_wallet_reads = 0_u64,
+        "version-1 canonical runtime started without legacy storage composition"
+    );
+}
+
+#[allow(
+    dead_code,
+    clippy::too_many_lines,
+    reason = "the legacy composition remains source-only until later ADR-0035 slices rewire every query consumer; the default runtime has no selector or call path to it"
+)]
+async fn run_legacy_ingest_composition(
     config_path: Option<PathBuf>,
     overrides: IngestConfigOverrides,
 ) -> Result<(), IngestConfigError> {
@@ -1395,6 +1531,8 @@ fn ingest_config_error_class(error: Option<&IngestConfigError>) -> &'static str 
         None => "none",
         Some(IngestConfigError::Config(_)) => "config",
         Some(IngestConfigError::Ingest(_)) => "ingest",
+        Some(IngestConfigError::CanonicalRuntime(_)) => "canonical_runtime",
+        Some(IngestConfigError::CanonicalRuntimeRequiresWallet) => "canonical_runtime_workload",
         Some(IngestConfigError::CanonicalReplayVerification(_)) => "canonical_replay_verification",
         Some(IngestConfigError::IngestControlBind { .. }) => "ingest_control_bind",
         Some(IngestConfigError::IngestControlTransport { .. }) => "ingest_control_transport",
@@ -1471,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_capability_validation_accepts_missing_tree_state()
+    fn ingest_capability_validation_rejects_missing_tree_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let capabilities = NodeCapabilities::new([
             NodeCapability::JsonRpc,
@@ -1480,7 +1618,15 @@ mod tests {
             NodeCapability::SubtreeRoots,
         ])?;
 
-        require_ingest_node_capabilities(capabilities)?;
+        let error = require_ingest_node_capabilities(capabilities)
+            .err()
+            .ok_or("missing tree-state capability must be rejected")?;
+        assert!(matches!(
+            error,
+            zinder_source::SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::TreeState
+            }
+        ));
 
         Ok(())
     }

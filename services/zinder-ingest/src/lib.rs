@@ -9,6 +9,8 @@ pub mod bench_support;
 mod block_production_time_backfill;
 mod bulk_catchup;
 mod canonical_construction;
+mod canonical_follow;
+mod canonical_runtime;
 mod chain_ingest;
 mod commitment_root_backfill;
 mod conventional_fee_distribution_backfill;
@@ -46,6 +48,10 @@ pub use canonical_construction::{
     CanonicalPipelineLimits, CanonicalPipelineLimitsError, CanonicalSourceLoadOutcome,
     load_fresh_canonical, load_fresh_canonical_blocks, load_fresh_canonical_source_families,
 };
+pub use canonical_follow::{
+    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, follow_canonical_tip,
+};
+pub use canonical_runtime::{CanonicalRuntimeConfig, CanonicalRuntimeError, run_canonical_runtime};
 pub use chain_ingest::{
     DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, IngestError, NodeSourceKind,
