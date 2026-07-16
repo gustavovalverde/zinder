@@ -209,6 +209,7 @@ impl WalletProjectionSerialOracle {
         let block = BlockId::new(facts.block_header.height, facts.block_header.block_hash);
         self.validate_next_block(block, facts.block_header.parent_hash)?;
         let mut created_outpoints = Vec::new();
+        let mut created_outpoint_keys = BTreeSet::new();
         let mut spent_outpoints = Vec::new();
         let mut address_transaction_keys = Vec::new();
 
@@ -243,7 +244,9 @@ impl WalletProjectionSerialOracle {
                     key,
                     WalletSpentOutput::new(output, transaction_position, input.input_index),
                 );
-                spent_outpoints.push(key);
+                if !created_outpoint_keys.contains(&key) {
+                    spent_outpoints.push(key);
+                }
             }
 
             for (output_position, output) in transaction.transparent_outputs.iter().enumerate() {
@@ -269,6 +272,7 @@ impl WalletProjectionSerialOracle {
                 touched_addresses.insert(output.address_script_hash.as_bytes());
                 self.unspent_outputs.insert(key, unspent_output);
                 created_outpoints.push(key);
+                created_outpoint_keys.insert(key);
             }
 
             for address_bytes in touched_addresses {
@@ -519,6 +523,45 @@ mod tests {
         );
         assert_eq!(oracle.row_counts().reorg_undo_count, 1);
         assert!(oracle.projection_digest().is_ok());
+    }
+
+    #[test]
+    fn same_block_spend_is_deleted_but_not_restored_by_reorg_undo() {
+        let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
+        let creating_transaction = TransactionId::from_bytes([0xb1; 32]);
+        let spending_transaction = TransactionId::from_bytes([0xb2; 32]);
+        let same_block_outpoint = TransparentOutPoint::new(creating_transaction, 0);
+        let block = block_facts_with_transactions(
+            1,
+            [0x00; 32],
+            [0xc1; 32],
+            vec![
+                transaction_facts(
+                    creating_transaction,
+                    Vec::new(),
+                    vec![TransparentOutputFact::new(0, 7, [0x51], address)],
+                ),
+                transaction_facts(
+                    spending_transaction,
+                    vec![TransparentInputFact::new(0, same_block_outpoint)],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut oracle =
+            WalletProjectionSerialOracle::with_supported_reorg_depth(Network::ZcashRegtest, 1);
+
+        let undo = oracle
+            .apply_block(&block)
+            .unwrap_or_else(|error| unreachable!("valid same-block spend: {error}"));
+
+        assert_eq!(
+            undo.created_outpoints,
+            vec![WalletOutpointKey::new(same_block_outpoint)]
+        );
+        assert!(undo.spent_outpoints.is_empty());
+        assert!(oracle.find_unspent_output(same_block_outpoint).is_none());
+        assert!(oracle.find_spent_output(same_block_outpoint).is_some());
     }
 
     #[test]
