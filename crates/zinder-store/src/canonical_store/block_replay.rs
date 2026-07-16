@@ -177,6 +177,7 @@ pub(super) struct PersistedBlockReplayEvidence {
     pub(super) tip_height: BlockHeight,
     pub(super) tip_hash: BlockHash,
     pub(super) block_count: u64,
+    pub(super) logical_family_bytes: u64,
     pub(super) logical_replay_bytes: u64,
     pub(super) replay_format_version: CanonicalBlockReplayFormatVersion,
     pub(super) block_digest_version: CanonicalBlockFactsDigestVersion,
@@ -210,11 +211,21 @@ pub(super) fn validate_persisted_block_replays(
         let replay_bytes = u64::try_from(encoded_replay.len()).map_err(|_| {
             CanonicalStoreError::block_replay_sequence("replay byte length exceeds u64::MAX")
         })?;
+        let logical_family_bytes = key
+            .len()
+            .checked_add(encoded_replay.len())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                CanonicalStoreError::block_replay_sequence(
+                    "replay family key and value bytes exceed u64::MAX",
+                )
+            })?;
         let row = ReplaySequenceRow {
             height,
             block_hash: facts.block_header.block_hash,
             parent_hash: facts.block_header.parent_hash,
             reference_digest: replay.reference_digest(),
+            logical_family_bytes,
             replay_bytes,
         };
         match &mut sequence {
@@ -264,12 +275,15 @@ impl PersistedBlockReplayEvidence {
     pub(super) fn has_same_sequence(self, prepared: &CanonicalBlockLoadEvidence) -> bool {
         let replay_counts_match = self.block_count == prepared.block_count
             && prepared.block_count == prepared.block_replay_count;
+        let replay_logical_bytes_match =
+            self.logical_family_bytes == prepared.block_replay_logical_bytes;
         self.first_height == prepared.first_height
             && self.first_parent_hash == prepared.first_parent_hash
             && self.first_hash == prepared.first_hash
             && self.tip_height == prepared.tip_height
             && self.tip_hash == prepared.tip_hash
             && replay_counts_match
+            && replay_logical_bytes_match
             && self.replay_format_version == prepared.replay_format_version
             && self.block_digest_version == prepared.block_digest_version
             && self.sequence_digest_version == prepared.sequence_digest_version
@@ -290,6 +304,7 @@ struct ReplaySequence {
     tip_height: BlockHeight,
     tip_hash: BlockHash,
     block_count: u64,
+    logical_family_bytes: u64,
     logical_replay_bytes: u64,
     digest_builder: CanonicalBlockFactsSequenceDigestBuilder,
 }
@@ -300,6 +315,7 @@ struct ReplaySequenceRow {
     block_hash: BlockHash,
     parent_hash: BlockHash,
     reference_digest: CanonicalBlockFactsDigest,
+    logical_family_bytes: u64,
     replay_bytes: u64,
 }
 
@@ -318,6 +334,7 @@ impl ReplaySequence {
             tip_height: row.height,
             tip_hash: row.block_hash,
             block_count: 1,
+            logical_family_bytes: row.logical_family_bytes,
             logical_replay_bytes: row.replay_bytes,
             digest_builder,
         })
@@ -343,6 +360,14 @@ impl ReplaySequence {
         self.block_count = self.block_count.checked_add(1).ok_or_else(|| {
             CanonicalStoreError::block_replay_sequence("block count exceeds u64::MAX")
         })?;
+        self.logical_family_bytes = self
+            .logical_family_bytes
+            .checked_add(row.logical_family_bytes)
+            .ok_or_else(|| {
+                CanonicalStoreError::block_replay_sequence(
+                    "replay family logical byte count exceeds u64::MAX",
+                )
+            })?;
         self.logical_replay_bytes = self
             .logical_replay_bytes
             .checked_add(row.replay_bytes)
@@ -367,6 +392,7 @@ impl ReplaySequence {
             tip_height: self.tip_height,
             tip_hash: self.tip_hash,
             block_count: self.block_count,
+            logical_family_bytes: self.logical_family_bytes,
             logical_replay_bytes: self.logical_replay_bytes,
             replay_format_version: CanonicalBlockReplayFormatVersion::V1,
             block_digest_version: CanonicalBlockFactsDigestVersion::V1,

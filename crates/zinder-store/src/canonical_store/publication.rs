@@ -18,7 +18,7 @@ use super::{
         CanonicalBlockLoadEvidence, read_persisted_tip_metadata,
         validate_persisted_commitment_tree_families, validate_source_tip_checkpoint,
     },
-    block_replay::validate_persisted_block_replays,
+    block_replay::{PersistedBlockReplayEvidence, validate_persisted_block_replays},
     control::{DecodedStoreControl, decode_store_control, encode_ready_store_control},
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
@@ -190,7 +190,7 @@ impl PublicationContext {
             built_database_identity,
             &expected_control,
         )?;
-        validate_cold_block_families(
+        let replay_evidence = validate_cold_block_families(
             &bounded_open.db,
             self.workload,
             &self.build_plan,
@@ -212,7 +212,6 @@ impl PublicationContext {
             &self.block_evidence,
             &self.source_tip_checkpoint,
         )?;
-        let replay_evidence = validate_persisted_block_replays(&bounded_open.db)?;
         let ready_evidence = CanonicalStoreReadyEvidence {
             first_retained_block: BlockId::new(
                 replay_evidence.first_height,
@@ -500,7 +499,7 @@ fn validate_cold_block_families(
     workload: super::CanonicalStoreWorkload,
     build_plan: &super::CanonicalStoreBuildPlan,
     expected: &CanonicalBlockLoadEvidence,
-) -> Result<(), CanonicalStoreError> {
+) -> Result<PersistedBlockReplayEvidence, CanonicalStoreError> {
     let replay = validate_persisted_block_replays(db)?;
     if !replay.has_same_sequence(expected) {
         return Err(CanonicalStoreError::BlockLoadReadbackMismatch);
@@ -516,11 +515,6 @@ fn validate_cold_block_families(
             BLOCK_HASH_INDEX_COLUMN_FAMILY,
             expected.block_hash_index_count,
             expected.block_hash_index_logical_bytes,
-        ),
-        (
-            super::block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
-            expected.block_replay_count,
-            expected.block_replay_logical_bytes,
         ),
         (
             COMPACT_BLOCK_COLUMN_FAMILY,
@@ -570,7 +564,7 @@ fn validate_cold_block_families(
     ] {
         require_empty_family(db, name)?;
     }
-    Ok(())
+    Ok(replay)
 }
 
 fn validate_settled_tip(

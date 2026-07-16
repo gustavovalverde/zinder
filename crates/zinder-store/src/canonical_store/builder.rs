@@ -12,10 +12,8 @@ use super::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
         CanonicalBlockSstConfig, CanonicalBuildBlock, REVERSE_INDEX_SORT_MEMORY_BYTES,
         canonical_block_families_are_empty, ingest_canonical_block_ssts,
-        validate_persisted_commitment_tree_families, validate_source_tip_checkpoint,
-        write_canonical_block_ssts,
+        validate_source_tip_checkpoint, write_canonical_block_ssts,
     },
-    block_replay::validate_persisted_block_replays,
     rocksdb::{
         canonical_column_family_descriptors, canonical_data_options, canonical_store_path,
         create_fresh_directory, initialize_store_identity, validate_resource_budget,
@@ -159,16 +157,6 @@ impl RocksDbCanonicalBuilder {
         )?;
         validate_block_load_range(&self.build_plan, &prepared.evidence)?;
         let evidence = ingest_canonical_block_ssts(&self.bounded_open.db, prepared)?;
-        let persisted_replays = validate_persisted_block_replays(&self.bounded_open.db)?;
-        if !persisted_replays.has_same_sequence(&evidence) {
-            return Err(CanonicalStoreError::BlockLoadReadbackMismatch.into());
-        }
-        validate_persisted_commitment_tree_families(
-            &self.bounded_open.db,
-            self.workload,
-            &self.build_plan,
-            &evidence,
-        )?;
         staging.remove()?;
         self.canonical_block_evidence = Some(evidence);
         Ok(evidence)
@@ -343,7 +331,7 @@ mod tests {
     use super::*;
     use crate::canonical_store::{
         block_load::canonical_block_families_are_empty,
-        block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+        block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, validate_persisted_block_replays},
         control::{decode_store_control, encode_ready_store_control},
         rocksdb::{
             BLOCK_HASH_INDEX_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
@@ -555,6 +543,45 @@ mod tests {
             replayed_blocks[1].facts().block_header.block_hash,
             BlockHash::from_bytes([2; 32])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cold_validation_rejects_replay_corruption_after_bulk_load()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = complete_loaded_builder(&store_path)?;
+        let replay_family = store
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("block replay family should exist")?;
+        store.bounded_open.db.put_cf(
+            &replay_family,
+            zinder_core::wire::encode_height_key_ascending(BlockHeight::new(1)),
+            [0_u8],
+        )?;
+        drop(replay_family);
+
+        let error = store
+            .validate_for_publication()
+            .err()
+            .ok_or("cold publication must reject replay corruption")?;
+
+        assert!(matches!(
+            error,
+            CanonicalStoreError::BlockReplayInvalid { height: 1, .. }
+        ));
+        let error = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("corrupt BUILDING store must not open READY")?;
+        assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
         Ok(())
     }
     #[test]
