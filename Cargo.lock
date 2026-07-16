@@ -6012,6 +6012,7 @@ dependencies = [
  "tonic",
  "tracing",
  "zcash_primitives",
+ "zcash_protocol",
  "zebra-chain",
  "zinder-core",
  "zinder-proto",
