@@ -168,6 +168,12 @@ impl Default for ZebraJsonRpcSourceOptions {
 }
 
 impl ZebraJsonRpcSource {
+    /// Returns the network whose blocks this source decodes.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.network
+    }
+
     /// Returns the static baseline capability set Zebra JSON-RPC sources
     /// are assumed to support before runtime discovery runs.
     ///
@@ -1398,7 +1404,7 @@ fn batch_call_error_message(method: &str, error: &ErrorObject<'_>) -> String {
     format!("{method}: {}", error.message())
 }
 
-fn validate_source_block_links(blocks: &[SourceBlock]) -> Result<(), SourceError> {
+pub(crate) fn validate_source_block_links(blocks: &[SourceBlock]) -> Result<(), SourceError> {
     for pair in blocks.windows(2) {
         let [previous, current] = pair else {
             continue;

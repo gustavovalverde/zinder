@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_descriptor_set_path(&descriptor_set_path)
         .compile_protos(&native_proto_files, &include_dirs)?;
     tonic_prost_build::configure()
-        .build_server(false)
+        .build_server(true)
         .build_client(true)
         .compile_protos(&zebra_indexer_proto_files, &zebra_indexer_include_dirs)?;
 
