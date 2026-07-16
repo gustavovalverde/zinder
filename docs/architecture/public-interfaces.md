@@ -507,12 +507,8 @@ canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
 canonical_batch_max_estimated_write_bytes = 536870912
 canonical_batch_min_blocks_before_estimated_write_close = 100
-source_segment_max_blocks = 64
-source_segment_target_response_bytes = 33554432
-source_fetch_max_in_flight_requests = 20
-source_fetch_max_in_flight_bytes = 671088640
-block_prepare_concurrency = 16
-block_prepare_memory_watermark_bytes = 536870912
+# Source and prepare limits derive from container memory, logical CPUs, and
+# node.max_response_bytes. Explicit fields are diagnostic overrides.
 commit_reassembly_max_queued_artifact_bytes = 536870912
 
 [ingest.tip_follow]
@@ -627,12 +623,12 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_max_artifact_bytes` | Canonical artifact bytes accumulated before closing a bulk-catchup batch. Defaults to 536870912. |
 | `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes` | Estimated canonical write bytes accumulated before closing a bulk-catchup batch. Defaults to 536870912. |
 | `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close` | Minimum blocks accumulated before estimated write bytes can close a bulk-catchup batch. Single oversized blocks can still close immediately. Defaults to 100. |
-| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_max_blocks` | Hard ceiling on connected blocks requested from the source in one bulk-catchup segment. The byte-density controller may request fewer. Defaults to 64. |
-| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_target_response_bytes` | Target source response bytes for adaptive segment sizing. Defaults to 33554432. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_max_blocks` | Diagnostic override for the hard ceiling on connected blocks requested from the source in one segment. The resource-resolved default is 64. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_target_response_bytes` | Diagnostic override for adaptive response sizing. The default is `min(node.max_response_bytes, 33554432)`. |
 | `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_requests` | Maximum concurrent source segment requests. Defaults to 12. |
-| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Admission watermark for predicted active source responses plus measured completed reassembly. Measured responses can temporarily exceed it; the absolute active bound is request concurrency times node.max_response_bytes. Must be greater than or equal to node.max_response_bytes. Defaults to 402653184. |
-| `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_concurrency` | Parallel canonical block-prepare slots. Defaults to `min(available_parallelism(), 16)`. |
-| `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_memory_watermark_bytes` | Admission watermark over conservative prepare peaks, ordered prevout resolution, recent-output cache entries, and resident commit-preparation handoff data. One oversized block or a larger measured result may exceed the watermark; further prepare admission pauses until reservations fall below it. Defaults to 536870912. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Diagnostic override for predicted active source responses plus measured completed reassembly. The default is `max(node.max_response_bytes, clamp(container_memory / 64, 134217728, 402653184))`. |
+| `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_concurrency` | Diagnostic override for parallel canonical block-prepare slots. The default is `min(available_parallelism(), 16)`. |
+| `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_memory_watermark_bytes` | Diagnostic override for the prepare and resident-handoff admission watermark. The default is `clamp(container_memory / 64, 134217728, 536870912)`. |
 | `ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes` | Maximum safe-tip artifact bytes that can accumulate while the previous bulk-catchup batch is attaching metadata, committing, or flushing. Defaults to 536870912. |
 | `ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.derive.replay_batch_blocks` | Maximum block contexts hydrated and dispatched in one derive replay write. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__DERIVE__REPLAY_POLICY` | zinder-ingest | Optional | `ingest.derive.replay_policy` | Derive replay pressure policy. `canonical-first` pauses rebuildable derive replay under memory pressure so canonical ingest keeps the process budget. `continuous` replays retained chain events whenever they are available while the writer is at tip; during bulk catch-up the canonical-phase gate pauses replay regardless of policy. Defaults to `canonical-first`. |

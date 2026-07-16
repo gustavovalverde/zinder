@@ -20,7 +20,7 @@ use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block};
 #[cfg(test)]
 use crate::canonical_construction::source_fetch::SourceSegmentPlan;
 use crate::canonical_construction::{
-    source_fetch::SourceSegmentSizer, watermark::record_stage_duration,
+    CanonicalPipelineLimits, source_fetch::SourceSegmentSizer, watermark::record_stage_duration,
 };
 use crate::chain_ingest::{
     IngestError, NodeSourceKind, canonical_writer_store_options, current_unix_millis,
@@ -76,32 +76,8 @@ pub struct BulkCatchupRunConfig {
     pub canonical_batch_max_estimated_write_bytes: NonZeroU64,
     /// Minimum batch size before estimated write bytes can close the batch.
     pub canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32,
-    /// Maximum connected blocks requested from the source adapter in one
-    /// bounded bulk-catchup segment.
-    ///
-    /// Zebra JSON-RPC batches the segment into one JSON-RPC request containing
-    /// raw `getblock` calls. Checkpoint tree state is fetched separately for
-    /// committed epoch tips. Future streaming sources can satisfy the same
-    /// boundary without changing canonical ingest.
-    /// Operator-tunable via `ingest.bulk_catchup.source_segment_max_blocks`.
-    pub source_segment_max_blocks: NonZeroU32,
-    /// Target JSON-RPC response body size for adaptive source segments.
-    pub source_segment_target_response_bytes: NonZeroU64,
-    /// Maximum concurrent source segment requests.
-    pub source_fetch_max_in_flight_requests: NonZeroU32,
-    /// Maximum reserved response bytes across source segment requests.
-    pub source_fetch_max_in_flight_bytes: NonZeroU64,
-    /// Number of parallel `prepare_canonical_block` invocations kept in flight on the
-    /// Tokio blocking pool. Per-block construction is CPU-bound (block
-    /// deserialization, per-tx canonical re-serialization, compact-block
-    /// proto encoding, per-output `SHA256(script_pub_key)`); parallelism
-    /// scales nearly linearly with cores up to the commit-batch boundary.
-    /// Operator-tunable via `ingest.bulk_catchup.block_prepare_concurrency`.
-    /// See [ADR-0021](../../../../docs/adrs/0021-parallel-block-derivation.md).
-    pub block_prepare_concurrency: NonZeroU32,
-    /// Admission watermark for prepare peak estimates, ordered prevout
-    /// resolution, and resident commit-preparation handoff data.
-    pub block_prepare_memory_watermark_bytes: NonZeroU64,
+    /// Shared source-fetch and block-preparation limits.
+    pub pipeline_limits: CanonicalPipelineLimits,
     /// Maximum safe-tip artifact bytes that can accumulate while the previous
     /// batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
@@ -177,8 +153,8 @@ impl BulkCatchupFlushState {
     ) -> Arc<Mutex<SourceSegmentSizer>> {
         Arc::clone(self.source_segment_sizer.get_or_insert_with(|| {
             Arc::new(Mutex::new(SourceSegmentSizer::new(
-                config.source_segment_max_blocks,
-                config.source_segment_target_response_bytes,
+                config.pipeline_limits.source_segment_max_blocks,
+                config.pipeline_limits.source_segment_target_response_bytes,
                 Arc::clone(&config.network_upgrade_activations),
                 from_height,
             )))
@@ -489,21 +465,29 @@ where
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
-    let block_prepare_concurrency = config.block_prepare_concurrency.get() as usize;
+    let block_prepare_concurrency = config.pipeline_limits.block_prepare_concurrency.get() as usize;
     let block_prepare_stream = build_block_prepare_stream(
         run.source,
         BulkCatchupBlockPrepareStreamConfig {
             request_timeout,
             from_height: bulk_catchup_start.from_height,
             to_height: config.to_height,
-            max_response_bytes: config.node.max_response_bytes,
-            target_response_payload_bytes: config.source_segment_target_response_bytes,
-            source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
-            source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
+            max_response_bytes: config.pipeline_limits.max_response_bytes,
+            target_response_payload_bytes: config
+                .pipeline_limits
+                .source_segment_target_response_bytes,
+            source_fetch_max_in_flight_requests: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_requests,
+            source_fetch_max_in_flight_bytes: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes,
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, bulk_catchup_start.from_height),
             block_prepare_concurrency,
-            block_prepare_memory_watermark_bytes: config.block_prepare_memory_watermark_bytes,
+            block_prepare_memory_watermark_bytes: config
+                .pipeline_limits
+                .block_prepare_memory_watermark_bytes,
             store: run.store.clone(),
         },
         move |source_block| {
@@ -615,7 +599,7 @@ where
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
-    let block_prepare_concurrency = config.block_prepare_concurrency.get() as usize;
+    let block_prepare_concurrency = config.pipeline_limits.block_prepare_concurrency.get() as usize;
     let mut flush_state = BulkCatchupFlushState::default();
     let block_prepare_stream = build_block_prepare_stream(
         source,
@@ -623,14 +607,22 @@ where
             request_timeout,
             from_height: bulk_catchup_start.from_height,
             to_height: config.to_height,
-            max_response_bytes: config.node.max_response_bytes,
-            target_response_payload_bytes: config.source_segment_target_response_bytes,
-            source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
-            source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
+            max_response_bytes: config.pipeline_limits.max_response_bytes,
+            target_response_payload_bytes: config
+                .pipeline_limits
+                .source_segment_target_response_bytes,
+            source_fetch_max_in_flight_requests: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_requests,
+            source_fetch_max_in_flight_bytes: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes,
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, bulk_catchup_start.from_height),
             block_prepare_concurrency,
-            block_prepare_memory_watermark_bytes: config.block_prepare_memory_watermark_bytes,
+            block_prepare_memory_watermark_bytes: config
+                .pipeline_limits
+                .block_prepare_memory_watermark_bytes,
             store: store.clone(),
         },
         move |source_block| {
@@ -2038,7 +2030,7 @@ mod tests {
             events: Arc::clone(&recorded_events),
         };
         let mut config = test_bulk_catchup_run_config(&storage_path, 1, 4, 2, false)?;
-        config.block_prepare_concurrency =
+        config.pipeline_limits.block_prepare_concurrency =
             NonZeroU32::new(1).ok_or("invalid prepare concurrency")?;
         let funding_transaction_id = TransactionId::from_bytes([0x51; 32]);
         let spent_outpoint = TransparentOutPoint::new(funding_transaction_id, 0);
@@ -2530,18 +2522,21 @@ mod tests {
                 crate::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
             )
             .ok_or("invalid test estimated write close floor")?,
-            source_segment_max_blocks: NonZeroU32::new(4)
-                .ok_or("invalid test source segment blocks")?,
-            source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-                .ok_or("invalid test source segment target bytes")?,
-            source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-                .ok_or("invalid test source fetch requests")?,
-            source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-                .ok_or("invalid test source fetch bytes")?,
-            block_prepare_concurrency: NonZeroU32::new(4)
-                .ok_or("invalid test prepare concurrency")?,
-            block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
-                .ok_or("invalid test block prepare artifact bytes")?,
+            pipeline_limits: CanonicalPipelineLimits {
+                max_response_bytes: zinder_source::DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+                source_segment_max_blocks: NonZeroU32::new(4)
+                    .ok_or("invalid test source segment blocks")?,
+                source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid test source segment target bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid test source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                    .ok_or("invalid test source fetch bytes")?,
+                block_prepare_concurrency: NonZeroU32::new(4)
+                    .ok_or("invalid test prepare concurrency")?,
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                    .ok_or("invalid test block prepare artifact bytes")?,
+            },
             commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or("invalid test commit reassembly bytes")?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,

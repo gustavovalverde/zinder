@@ -45,9 +45,9 @@ use crate::bulk_catchup::{
 use crate::chain_ingest::validate_writer_store_contract;
 use crate::memory_pressure::wait_for_bulk_catchup_memory_headroom;
 use crate::{
-    BulkCatchupRunConfig, CommitmentRootBackfillConfig, IngestError, MempoolReadyGate,
-    NodeSourceKind, RawBlobPolicy, TipFollowConfig, classify_phase, current_chain_height,
-    tip_follow_with_primary_store,
+    BulkCatchupRunConfig, CanonicalPipelineLimits, CommitmentRootBackfillConfig, IngestError,
+    MempoolReadyGate, NodeSourceKind, RawBlobPolicy, TipFollowConfig, classify_phase,
+    current_chain_height, tip_follow_with_primary_store,
 };
 
 /// Backoff applied when the source's `tip_id()` call fails at the unified
@@ -269,19 +269,8 @@ pub struct BulkCatchupConfig {
     pub canonical_batch_max_estimated_write_bytes: NonZeroU64,
     /// Minimum batch size before estimated write bytes can close the batch.
     pub canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32,
-    /// Maximum connected blocks requested from the source in one segment.
-    pub source_segment_max_blocks: NonZeroU32,
-    /// Target source response bytes for adaptive segment sizing.
-    pub source_segment_target_response_bytes: NonZeroU64,
-    /// Maximum concurrent source segment fetches.
-    pub source_fetch_max_in_flight_requests: NonZeroU32,
-    /// Maximum reserved response bytes across source fetches.
-    pub source_fetch_max_in_flight_bytes: NonZeroU64,
-    /// Parallel canonical block-prepare slots.
-    pub block_prepare_concurrency: NonZeroU32,
-    /// Admission watermark for active prepare peak estimates and completed
-    /// resident block data.
-    pub block_prepare_memory_watermark_bytes: NonZeroU64,
+    /// Shared source-fetch and block-preparation limits.
+    pub pipeline_limits: CanonicalPipelineLimits,
     /// Maximum safe-tip artifact bytes allowed to queue while the previous
     /// canonical batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
@@ -677,18 +666,7 @@ fn build_bulk_catchup_batch_config(
         canonical_batch_min_blocks_before_estimated_write_close: config
             .bulk_catchup
             .canonical_batch_min_blocks_before_estimated_write_close,
-        source_segment_max_blocks: config.bulk_catchup.source_segment_max_blocks,
-        source_segment_target_response_bytes: config
-            .bulk_catchup
-            .source_segment_target_response_bytes,
-        source_fetch_max_in_flight_requests: config
-            .bulk_catchup
-            .source_fetch_max_in_flight_requests,
-        source_fetch_max_in_flight_bytes: config.bulk_catchup.source_fetch_max_in_flight_bytes,
-        block_prepare_concurrency: config.bulk_catchup.block_prepare_concurrency,
-        block_prepare_memory_watermark_bytes: config
-            .bulk_catchup
-            .block_prepare_memory_watermark_bytes,
+        pipeline_limits: config.bulk_catchup.pipeline_limits,
         commit_reassembly_max_queued_artifact_bytes: config
             .bulk_catchup
             .commit_reassembly_max_queued_artifact_bytes,
@@ -809,18 +787,22 @@ mod tests {
                     crate::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
                 )
                 .ok_or("invalid estimated write close floor")?,
-                source_segment_max_blocks: NonZeroU32::new(128)
-                    .ok_or("invalid source segment blocks")?,
-                source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
-                    .ok_or("invalid source target bytes")?,
-                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-                    .ok_or("invalid source fetch requests")?,
-                source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
-                    .ok_or("invalid source fetch bytes")?,
-                block_prepare_concurrency: NonZeroU32::new(4)
-                    .ok_or("invalid block prepare slots")?,
-                block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
-                    .ok_or("invalid block prepare artifact bytes")?,
+                pipeline_limits: CanonicalPipelineLimits {
+                    max_response_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                        .ok_or("invalid maximum response bytes")?,
+                    source_segment_max_blocks: NonZeroU32::new(128)
+                        .ok_or("invalid source segment blocks")?,
+                    source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
+                        .ok_or("invalid source target bytes")?,
+                    source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                        .ok_or("invalid source fetch requests")?,
+                    source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
+                        .ok_or("invalid source fetch bytes")?,
+                    block_prepare_concurrency: NonZeroU32::new(4)
+                        .ok_or("invalid block prepare slots")?,
+                    block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                        .ok_or("invalid block prepare artifact bytes")?,
+                },
                 commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                     .ok_or("invalid commit reassembly bytes")?,
                 flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,

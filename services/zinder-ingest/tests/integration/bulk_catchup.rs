@@ -24,8 +24,9 @@ use zinder_derive::{
     decode_stored_record,
 };
 use zinder_ingest::{
-    BulkCatchupRunConfig, DeriveReplayPolicy, IngestDeriveConfig, NodeSourceKind,
-    catch_up_derive_store_to_canonical, run_bulk_catchup, run_bulk_catchup_until_complete,
+    BulkCatchupRunConfig, CanonicalPipelineLimits, DeriveReplayPolicy, IngestDeriveConfig,
+    NodeSourceKind, catch_up_derive_store_to_canonical, run_bulk_catchup,
+    run_bulk_catchup_until_complete,
 };
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
@@ -39,6 +40,21 @@ use zinder_store::{
     PrimaryChainStore, RawBlobRetention,
 };
 use zinder_testkit::{one_leaf_sapling_frontier, sample_regtest_upgrade_activations};
+
+fn test_pipeline_limits() -> CanonicalPipelineLimits {
+    CanonicalPipelineLimits {
+        max_response_bytes: DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+        source_segment_max_blocks: NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),
+        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
+        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        block_prepare_concurrency: NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),
+        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+    }
+}
 
 fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
     Ok(zinder_derive::DeriveStore::open(
@@ -109,18 +125,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        source_segment_max_blocks: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        block_prepare_concurrency: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
+        pipeline_limits: test_pipeline_limits(),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -232,18 +237,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        source_segment_max_blocks: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        block_prepare_concurrency: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
+        pipeline_limits: test_pipeline_limits(),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -414,18 +408,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_valid_nonzero_checkpoint() -> 
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        source_segment_max_blocks: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        block_prepare_concurrency: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
+        pipeline_limits: test_pipeline_limits(),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -492,18 +475,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        source_segment_max_blocks: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        block_prepare_concurrency: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
+        pipeline_limits: test_pipeline_limits(),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,

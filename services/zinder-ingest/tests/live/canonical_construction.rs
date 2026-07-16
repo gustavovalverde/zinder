@@ -17,7 +17,9 @@ use zinder_core::{
     CanonicalBlockReplayFormatVersion, Network, NetworkUpgradeActivations,
     wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name},
 };
-use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical_blocks};
+use zinder_ingest::{
+    CanonicalConstructionConfig, CanonicalPipelineLimits, load_fresh_canonical_blocks,
+};
 use zinder_source::NodeSource;
 use zinder_store::{
     CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
@@ -116,23 +118,25 @@ fn live_construction_config(
 ) -> Result<CanonicalConstructionConfig> {
     Ok(CanonicalConstructionConfig {
         request_timeout: env.target.request_timeout,
-        max_response_bytes: env.target.max_response_bytes,
-        source_segment_target_response_bytes: NonZeroU64::new(
-            env.target.max_response_bytes.get().min(12 * MIB),
-        )
-        .ok_or_else(|| eyre!("invalid source response target"))?,
-        source_segment_max_blocks: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source segment bound"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source request bound"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(
-            env.target.max_response_bytes.get().max(64 * MIB),
-        )
-        .ok_or_else(|| eyre!("invalid source-fetch byte watermark"))?,
-        block_prepare_concurrency: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid prepare concurrency"))?,
-        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * MIB)
-            .ok_or_else(|| eyre!("invalid prepare byte watermark"))?,
+        pipeline_limits: CanonicalPipelineLimits {
+            max_response_bytes: env.target.max_response_bytes,
+            source_segment_target_response_bytes: NonZeroU64::new(
+                env.target.max_response_bytes.get().min(12 * MIB),
+            )
+            .ok_or_else(|| eyre!("invalid source response target"))?,
+            source_segment_max_blocks: NonZeroU32::new(8)
+                .ok_or_else(|| eyre!("invalid source segment bound"))?,
+            source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                .ok_or_else(|| eyre!("invalid source request bound"))?,
+            source_fetch_max_in_flight_bytes: NonZeroU64::new(
+                env.target.max_response_bytes.get().max(64 * MIB),
+            )
+            .ok_or_else(|| eyre!("invalid source-fetch byte watermark"))?,
+            block_prepare_concurrency: NonZeroU32::new(8)
+                .ok_or_else(|| eyre!("invalid prepare concurrency"))?,
+            block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * MIB)
+                .ok_or_else(|| eyre!("invalid prepare byte watermark"))?,
+        },
         network_upgrade_activations: activations,
     })
 }

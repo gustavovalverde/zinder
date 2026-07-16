@@ -28,7 +28,7 @@ use zinder_core::{
     NetworkUpgradeActivationsFingerprintVersion, UnixTimestampMillis,
     wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name},
 };
-use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical};
+use zinder_ingest::{CanonicalConstructionConfig, CanonicalPipelineLimits, load_fresh_canonical};
 use zinder_source::{
     CookieSource, NodeAuth, NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
@@ -46,13 +46,7 @@ use zinder_wallet_rocksdb::{
 };
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
-const DEFAULT_MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
-const DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
-const DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 1_000;
-const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 16;
-const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 512 * 1024 * 1024;
-const DEFAULT_BLOCK_PREPARE_CONCURRENCY: u32 = 16;
-const DEFAULT_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
 
 // These ceilings intentionally describe the measured production build, not a
@@ -91,24 +85,6 @@ pub(crate) struct RocksDbStorageLifecycleArgs {
     /// Maximum accepted source response body.
     #[arg(long, default_value_t = DEFAULT_MAX_RESPONSE_BYTES)]
     max_response_bytes: u64,
-    /// Adaptive target for one source segment response.
-    #[arg(long, default_value_t = DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES)]
-    source_segment_target_response_bytes: u64,
-    /// Maximum blocks requested in one source segment.
-    #[arg(long, default_value_t = DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS)]
-    source_segment_max_blocks: u32,
-    /// Maximum concurrent source-segment requests.
-    #[arg(long, default_value_t = DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS)]
-    source_fetch_max_in_flight_requests: u32,
-    /// Aggregate byte watermark for in-flight source responses.
-    #[arg(long, default_value_t = DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES)]
-    source_fetch_max_in_flight_bytes: u64,
-    /// Maximum canonical block preparations in flight.
-    #[arg(long, default_value_t = DEFAULT_BLOCK_PREPARE_CONCURRENCY)]
-    block_prepare_concurrency: u32,
-    /// Aggregate byte watermark for canonical block preparation.
-    #[arg(long, default_value_t = DEFAULT_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES)]
-    block_prepare_memory_watermark_bytes: u64,
     /// Number of exact-tip wallet undo rows retained for reorg handling.
     #[arg(long, default_value_t = DEFAULT_SUPPORTED_REORG_DEPTH)]
     supported_reorg_depth: u32,
@@ -123,10 +99,10 @@ pub(crate) struct RocksDbStorageLifecycleArgs {
     runner_id: Option<String>,
     /// CPU limit applied to the benchmark container, in logical cores.
     #[arg(long = "cpu-limit-cores")]
-    cpu_limit_cores: Option<f64>,
+    cpu_limit_cores: f64,
     /// Memory limit applied to the benchmark container, in bytes.
     #[arg(long = "memory-limit-bytes")]
-    memory_limit_bytes: Option<u64>,
+    memory_limit_bytes: u64,
     /// Stable operator-defined storage performance class.
     #[arg(long = "storage-class")]
     storage_class: Option<String>,
@@ -162,13 +138,7 @@ struct ValidatedLifecycleArgs {
     wallet_store: PathBuf,
     fixed_tip_height: Option<BlockHeight>,
     request_timeout: Duration,
-    max_response_bytes: NonZeroU64,
-    source_segment_target_response_bytes: NonZeroU64,
-    source_segment_max_blocks: NonZeroU32,
-    source_fetch_max_in_flight_requests: NonZeroU32,
-    source_fetch_max_in_flight_bytes: NonZeroU64,
-    block_prepare_concurrency: NonZeroU32,
-    block_prepare_memory_watermark_bytes: NonZeroU64,
+    pipeline_limits: CanonicalPipelineLimits,
     supported_reorg_depth: u32,
     canonical_storage_ready_thresholds: Option<AcceptanceThresholds>,
     wallet_storage_ready_thresholds: Option<AcceptanceThresholds>,
@@ -203,7 +173,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         node_auth,
         ZebraJsonRpcSourceOptions {
             request_timeout: validated.request_timeout,
-            max_response_bytes: validated.max_response_bytes,
+            max_response_bytes: validated.pipeline_limits.max_response_bytes,
             broadcast_timeout: None,
         },
     )?;
@@ -263,13 +233,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &source,
         &CanonicalConstructionConfig {
             request_timeout: validated.request_timeout,
-            max_response_bytes: validated.max_response_bytes,
-            source_segment_target_response_bytes: validated.source_segment_target_response_bytes,
-            source_segment_max_blocks: validated.source_segment_max_blocks,
-            source_fetch_max_in_flight_requests: validated.source_fetch_max_in_flight_requests,
-            source_fetch_max_in_flight_bytes: validated.source_fetch_max_in_flight_bytes,
-            block_prepare_concurrency: validated.block_prepare_concurrency,
-            block_prepare_memory_watermark_bytes: validated.block_prepare_memory_watermark_bytes,
+            pipeline_limits: validated.pipeline_limits,
             network_upgrade_activations: network_upgrade_activations.clone(),
         },
     )
@@ -381,8 +345,8 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
             },
             runner: RunnerProvenance {
                 id: args.runner_id,
-                cpu_limit_cores: args.cpu_limit_cores,
-                memory_limit_bytes: args.memory_limit_bytes,
+                cpu_limit_cores: Some(args.cpu_limit_cores),
+                memory_limit_bytes: Some(args.memory_limit_bytes),
                 storage_class: args.storage_class,
             },
             image_reference: args.image_reference,
@@ -413,17 +377,23 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         },
         resource_limits: StorageLifecycleResourceLimits {
             request_timeout_seconds: validated.request_timeout.as_secs(),
-            max_response_bytes: validated.max_response_bytes.get(),
+            max_response_bytes: validated.pipeline_limits.max_response_bytes.get(),
             source_segment_target_response_bytes: validated
+                .pipeline_limits
                 .source_segment_target_response_bytes
                 .get(),
-            source_segment_max_blocks: validated.source_segment_max_blocks.get(),
+            source_segment_max_blocks: validated.pipeline_limits.source_segment_max_blocks.get(),
             source_fetch_max_in_flight_requests: validated
+                .pipeline_limits
                 .source_fetch_max_in_flight_requests
                 .get(),
-            source_fetch_max_in_flight_bytes: validated.source_fetch_max_in_flight_bytes.get(),
-            block_prepare_concurrency: validated.block_prepare_concurrency.get(),
+            source_fetch_max_in_flight_bytes: validated
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes
+                .get(),
+            block_prepare_concurrency: validated.pipeline_limits.block_prepare_concurrency.get(),
             block_prepare_memory_watermark_bytes: validated
+                .pipeline_limits
                 .block_prepare_memory_watermark_bytes
                 .get(),
             canonical_rocksdb: RocksDbResourceBudgetSummary::from(canonical_resource_budget),
@@ -502,8 +472,8 @@ impl RocksDbStorageLifecycleArgs {
                 "--trial-id must start with an ASCII alphanumeric character and contain only ASCII alphanumeric characters, '.', '_', or '-'",
             ));
         }
-        validate_positive_f64(self.cpu_limit_cores, "--cpu-limit-cores")?;
-        validate_positive_u64(self.memory_limit_bytes, "--memory-limit-bytes")?;
+        validate_positive_f64(Some(self.cpu_limit_cores), "--cpu-limit-cores")?;
+        validate_positive_u64(Some(self.memory_limit_bytes), "--memory-limit-bytes")?;
         if self
             .image_reference
             .as_deref()
@@ -513,6 +483,15 @@ impl RocksDbStorageLifecycleArgs {
                 "--image-reference must be a sha256 image ID or digest-pinned image reference",
             ));
         }
+        let max_response_bytes =
+            require_nonzero_u64(self.max_response_bytes, "max-response-bytes")?;
+        let memory_limit_bytes =
+            require_nonzero_u64(self.memory_limit_bytes, "memory-limit-bytes")?;
+        let pipeline_limits = CanonicalPipelineLimits::resolve(
+            Some(memory_limit_bytes),
+            logical_core_count_from_limit(self.cpu_limit_cores),
+            max_response_bytes,
+        );
         Ok(ValidatedLifecycleArgs {
             network,
             canonical_store,
@@ -521,31 +500,7 @@ impl RocksDbStorageLifecycleArgs {
             request_timeout: Duration::from_secs(
                 require_nonzero_u64(self.request_timeout_seconds, "request-timeout-secs")?.get(),
             ),
-            max_response_bytes: require_nonzero_u64(self.max_response_bytes, "max-response-bytes")?,
-            source_segment_target_response_bytes: require_nonzero_u64(
-                self.source_segment_target_response_bytes,
-                "source-segment-target-response-bytes",
-            )?,
-            source_segment_max_blocks: require_nonzero_u32(
-                self.source_segment_max_blocks,
-                "source-segment-max-blocks",
-            )?,
-            source_fetch_max_in_flight_requests: require_nonzero_u32(
-                self.source_fetch_max_in_flight_requests,
-                "source-fetch-max-in-flight-requests",
-            )?,
-            source_fetch_max_in_flight_bytes: require_nonzero_u64(
-                self.source_fetch_max_in_flight_bytes,
-                "source-fetch-max-in-flight-bytes",
-            )?,
-            block_prepare_concurrency: require_nonzero_u32(
-                self.block_prepare_concurrency,
-                "block-prepare-concurrency",
-            )?,
-            block_prepare_memory_watermark_bytes: require_nonzero_u64(
-                self.block_prepare_memory_watermark_bytes,
-                "block-prepare-memory-watermark-bytes",
-            )?,
+            pipeline_limits,
             supported_reorg_depth: self.supported_reorg_depth,
             canonical_storage_ready_thresholds: acceptance_thresholds(
                 self.canonical_storage_ready_target_seconds,
@@ -787,14 +742,19 @@ fn acceptance_thresholds(
     }
 }
 
-fn require_nonzero_u32(candidate: u32, flag: &str) -> Result<NonZeroU32, BenchError> {
-    NonZeroU32::new(candidate)
-        .ok_or_else(|| BenchError::invalid_argument(format!("--{flag} must be greater than zero")))
-}
-
 fn require_nonzero_u64(candidate: u64, flag: &str) -> Result<NonZeroU64, BenchError> {
     NonZeroU64::new(candidate)
         .ok_or_else(|| BenchError::invalid_argument(format!("--{flag} must be greater than zero")))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the positive finite CPU limit is rounded up and capped to u32 before conversion"
+)]
+fn logical_core_count_from_limit(cpu_limit_cores: f64) -> NonZeroU32 {
+    let logical_core_count = cpu_limit_cores.ceil().min(f64::from(u32::MAX)) as u32;
+    NonZeroU32::new(logical_core_count).unwrap_or(NonZeroU32::MIN)
 }
 
 fn validate_positive_f64(candidate: Option<f64>, flag: &str) -> Result<(), BenchError> {
@@ -860,6 +820,10 @@ mod tests {
             "canonical",
             "--wallet-store",
             "wallet",
+            "--cpu-limit-cores",
+            "10",
+            "--memory-limit-bytes",
+            "10737418240",
         ]
     }
 
@@ -872,27 +836,46 @@ mod tests {
             "--request-timeout-secs",
             "60",
             "--max-response-bytes",
-            "268435456",
-            "--source-segment-target-response-bytes",
-            "8388608",
-            "--source-segment-max-blocks",
-            "1000",
-            "--source-fetch-max-in-flight-requests",
-            "16",
-            "--source-fetch-max-in-flight-bytes",
-            "536870912",
-            "--block-prepare-concurrency",
-            "16",
-            "--block-prepare-memory-watermark-bytes",
-            "536870912",
+            "67108864",
             "--supported-reorg-depth",
             "100",
         ]);
         let cli = TestCli::try_parse_from(argv)?;
 
+        let validated = cli.args.validate()?;
+        assert_eq!(validated.fixed_tip_height, Some(BlockHeight::new(42)));
         assert_eq!(
-            cli.args.validate()?.fixed_tip_height,
-            Some(BlockHeight::new(42))
+            validated.pipeline_limits.max_response_bytes.get(),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            validated
+                .pipeline_limits
+                .source_segment_target_response_bytes
+                .get(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            validated.pipeline_limits.source_segment_max_blocks.get(),
+            64
+        );
+        assert_eq!(
+            validated
+                .pipeline_limits
+                .source_fetch_max_in_flight_requests
+                .get(),
+            12
+        );
+        assert_eq!(
+            validated
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes
+                .get(),
+            160 * 1024 * 1024
+        );
+        assert_eq!(
+            validated.pipeline_limits.block_prepare_concurrency.get(),
+            10
         );
         Ok(())
     }

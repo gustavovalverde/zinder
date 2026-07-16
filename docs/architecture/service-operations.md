@@ -523,12 +523,8 @@ canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
 canonical_batch_max_estimated_write_bytes = 536870912
 canonical_batch_min_blocks_before_estimated_write_close = 100
-source_segment_max_blocks = 64
-source_segment_target_response_bytes = 33554432
-source_fetch_max_in_flight_requests = 20
-source_fetch_max_in_flight_bytes = 671088640
-block_prepare_concurrency = 16
-block_prepare_memory_watermark_bytes = 536870912
+# Source and prepare limits derive from container memory, logical CPUs, and
+# node.max_response_bytes. Explicit fields are diagnostic overrides.
 commit_reassembly_max_queued_artifact_bytes = 536870912
 
 [ingest.tip_follow]
@@ -552,7 +548,7 @@ listen_addr = "127.0.0.1:9100"
 ```
 
 `source_segment_max_blocks` is a hard ceiling, not the steady-state request size.
-Bulk catch-up targets 75% of `node.max_response_bytes`, records source-segment
+Bulk catch-up targets `min(node.max_response_bytes, 32 MiB)`, records source-segment
 payload bytes, shrinks the next request after oversized responses or dense
 payload samples, grows back after sustained success, carries learned density
 across bulk commit batches, and resets density when the node-advertised

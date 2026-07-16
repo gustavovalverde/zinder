@@ -38,14 +38,16 @@ separate source call, `fetch_tree_state_for_block(block_id)`, and JSON-RPC
 adapters reject a tree-state response whose height or hash does not match the
 requested block.
 
-Bulk catchup uses byte-watermarked source fetch config:
+Fresh canonical construction and bulk catchup both consume one
+`CanonicalPipelineLimits` value. The runtime resolves it from the container
+memory budget, logical CPU count, and `node.max_response_bytes`:
 
 - `source_segment_max_blocks = 64`
-- `source_segment_target_response_bytes = 33554432`
+- `source_segment_target_response_bytes = min(node.max_response_bytes, 33554432)`
 - `source_fetch_max_in_flight_requests = 12`
-- `source_fetch_max_in_flight_bytes = 402653184`
+- `source_fetch_max_in_flight_bytes = max(node.max_response_bytes, clamp(memory / 64, 128 MiB, 384 MiB))`
 - `block_prepare_concurrency = min(available_parallelism, 16)`
-- `block_prepare_memory_watermark_bytes = 536870912`
+- `block_prepare_memory_watermark_bytes = clamp(memory / 64, 128 MiB, 512 MiB)`
 - `commit_reassembly_max_queued_artifact_bytes = 536870912`
 - `canonical_batch_max_blocks = 1000`
 - `canonical_batch_max_artifact_bytes = 536870912`
@@ -146,13 +148,18 @@ SIGTERM from the container runtime).
 The queue-cap defaults now derive from the container memory budget at
 startup. `services/zinder-ingest/src/memory_pressure.rs` exposes
 `container_memory_budget_bytes()`, which returns `memory.high` (preferred)
-or `memory.max` from cgroup v2; `services/zinder-ingest/src/config.rs`
-computes each queue cap as `container_budget / 64`, clamped to
-`[128 MiB, original fallback]`. On a 24 GiB Railway container each queue
-shrinks from 512 MiB to 384 MiB; on dev hosts without cgroup the
-fallback constants apply unchanged.
+or `memory.max` from cgroup v2. `CanonicalPipelineLimits` owns the source and
+prepare policy; runtime configuration retains the commit-reassembly and
+canonical-write bounds. Each resource-aware bound uses
+`container_budget / 64`, clamped to `[128 MiB, original fallback]`. On a
+10 GiB container the source and prepare watermarks are both 160 MiB. On a
+24 GiB container they are 384 MiB; on dev hosts without cgroup the fallback
+constants apply.
 
 The `ZINDER_INGEST__BULK_CATCHUP__*_BYTES` env-var overrides still take
-precedence over the auto-derived default. No new env var, no new ADR.
-The mechanism reuses the existing `RuntimeMemorySnapshot` sampler that
-already feeds the derive-replay backpressure ratios.
+precedence over the auto-derived default. They are diagnostic overrides: the
+tracked deployment examples omit them so the deployed runtime and the closed
+storage-lifecycle certification resolve the same resource profile. The closed
+lifecycle command does not accept independent source or prepare tuning flags;
+its report validator recomputes the expected profile from the recorded CPU,
+memory, and node response limits.

@@ -14,6 +14,7 @@ network="${ZINDER_NETWORK:-zcash-testnet}"
 tip_height="${ZINDER_STORAGE_LIFECYCLE_TIP_HEIGHT:-}"
 cpu_limit_cores="${ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES:-10}"
 memory_limit_bytes="${ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES:-10737418240}"
+node_max_response_bytes="${ZINDER_NODE_MAX_RESPONSE_BYTES:-67108864}"
 
 fail() {
   echo >&2 "RocksDB storage lifecycle refused to run: $*"
@@ -38,6 +39,8 @@ jq -en --argjson value "$cpu_limit_cores" '$value > 0' >/dev/null || fail \
   "ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES must be greater than zero"
 [[ "$memory_limit_bytes" =~ ^[1-9][0-9]*$ ]] || fail \
   "ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES must be a positive integer"
+[[ "$node_max_response_bytes" =~ ^[1-9][0-9]*$ ]] || fail \
+  "ZINDER_NODE_MAX_RESPONSE_BYTES must be a positive integer"
 docker_cpu_capacity="$(docker info --format '{{.NCPU}}')" || fail \
   "could not inspect Docker's CPU capacity"
 docker_memory_capacity_bytes="$(docker info --format '{{.MemTotal}}')" || fail \
@@ -114,6 +117,7 @@ export ZINDER_STORAGE_LIFECYCLE_RUNNER_ID="$runner_id"
 export ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS="$storage_class"
 export ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES="$cpu_limit_cores"
 export ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES="$memory_limit_bytes"
+export ZINDER_NODE_MAX_RESPONSE_BYTES="$node_max_response_bytes"
 export ZINDER_SOURCE_NETWORK_NAME="$source_network"
 export ZINDER_SOURCE_COOKIE_VOLUME_NAME="$source_cookie_volume"
 
@@ -129,6 +133,7 @@ jq -e \
   --arg cpu_limit_cores_text "$cpu_limit_cores" \
   --argjson cpu_limit_cores "$cpu_limit_cores" \
   --arg memory_limit_bytes "$memory_limit_bytes" \
+  --arg node_max_response_bytes "$node_max_response_bytes" \
   --arg runner_id "$runner_id" \
   --arg storage_class "$storage_class" '
   def command_argument($flag):
@@ -199,6 +204,7 @@ jq -e \
       and command_argument("--tip-height") == $tip_height
       and command_argument("--cpu-limit-cores") == $cpu_limit_cores_text
       and command_argument("--memory-limit-bytes") == $memory_limit_bytes
+      and command_argument("--max-response-bytes") == $node_max_response_bytes
       and command_argument("--runner-id") == $runner_id
       and command_argument("--storage-class") == $storage_class
       and command_argument("--canonical-store")
@@ -206,7 +212,7 @@ jq -e \
       and command_argument("--wallet-store") == "/var/lib/zinder/wallet-state/wallet"
       and command_argument("--report")
         == "/var/lib/zinder-evidence/rocksdb-storage-lifecycle.json"
-      and all(.command[]; test("^--(start-height|schema-version|store-version)$") | not))
+      and all(.command[]; test("^--(start-height|schema-version|store-version|source-segment-target-response-bytes|source-segment-max-blocks|source-fetch-max-in-flight-requests|source-fetch-max-in-flight-bytes|block-prepare-concurrency|block-prepare-memory-watermark-bytes)$") | not))
 ' <<<"$compose_config" >/dev/null || fail \
   "Compose topology differs from the closed storage lifecycle contract"
 

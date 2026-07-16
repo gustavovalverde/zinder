@@ -33,7 +33,8 @@ use zinder_core::{
     BlockHeight, BlockHeightRange, Network, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_ingest::{
-    BulkCatchupRunConfig, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, NodeSourceKind, TipFollowConfig,
+    BulkCatchupRunConfig, CanonicalPipelineLimits, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
+    NodeSourceKind, TipFollowConfig,
 };
 use zinder_proto::{
     compat::lightwalletd::{
@@ -121,15 +122,18 @@ pub(crate) fn live_bulk_catchup_run_config(
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .unwrap_or(NonZeroU32::MIN),
-        source_segment_max_blocks: SOURCE_SEGMENT_MAX_BLOCKS,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .unwrap_or(NonZeroU64::MIN),
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .unwrap_or(NonZeroU64::MIN),
-        block_prepare_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
-        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .unwrap_or(NonZeroU64::MIN),
+        pipeline_limits: CanonicalPipelineLimits {
+            max_response_bytes: env.target.max_response_bytes,
+            source_segment_max_blocks: SOURCE_SEGMENT_MAX_BLOCKS,
+            source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+            source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
+            source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+            block_prepare_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
+            block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+        },
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
         flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),

@@ -425,6 +425,10 @@ mod tests {
             "canonical",
             "--wallet-store",
             "wallet",
+            "--cpu-limit-cores",
+            "10",
+            "--memory-limit-bytes",
+            "10737418240",
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbStorageLifecycle(_)));

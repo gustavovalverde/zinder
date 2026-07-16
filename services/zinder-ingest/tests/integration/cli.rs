@@ -1095,7 +1095,7 @@ fn source_fetch_byte_budget_below_max_response_fails_before_storage_creation()
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.bulk_catchup.source_fetch_max_in_flight_bytes must be greater than or equal to node.max_response_bytes"
+            "invalid ingest.bulk_catchup pipeline limits: source fetch watermark 33554432 is below maximum response 67108864"
         ),
         "{stderr}"
     );

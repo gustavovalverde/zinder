@@ -28,9 +28,9 @@ use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHash, BlockHeight, BlockId, Network, ShieldedProtocol, SubtreeRootIndex};
 use zinder_ingest::{
-    BulkCatchupConfig, DeriveReplayPolicy, IngestDeriveConfig, IngestLoopConfig, IngestModifiers,
-    NodeSourceKind, PhasesConfig, TipFollowPhaseConfig, TipFollowSubsystems,
-    TipFollowSubsystemsLauncher, run_ingest_loop,
+    BulkCatchupConfig, CanonicalPipelineLimits, DeriveReplayPolicy, IngestDeriveConfig,
+    IngestLoopConfig, IngestModifiers, NodeSourceKind, PhasesConfig, TipFollowPhaseConfig,
+    TipFollowSubsystems, TipFollowSubsystemsLauncher, run_ingest_loop,
 };
 use zinder_runtime::{IngestPhase, Readiness};
 use zinder_source::{
@@ -255,16 +255,19 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
                 zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
             )
             .ok_or_else(|| eyre!("nonzero"))?,
-            source_segment_max_blocks: NonZeroU32::new(128).ok_or_else(|| eyre!("nonzero"))?,
-            source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
-                .ok_or_else(|| eyre!("nonzero"))?,
-            source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-                .ok_or_else(|| eyre!("nonzero"))?,
-            source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
-                .ok_or_else(|| eyre!("nonzero"))?,
-            block_prepare_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
-            block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
-                .ok_or_else(|| eyre!("nonzero"))?,
+            pipeline_limits: CanonicalPipelineLimits {
+                max_response_bytes: DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+                source_segment_max_blocks: NonZeroU32::new(128).ok_or_else(|| eyre!("nonzero"))?,
+                source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
+                    .ok_or_else(|| eyre!("nonzero"))?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or_else(|| eyre!("nonzero"))?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
+                    .ok_or_else(|| eyre!("nonzero"))?,
+                block_prepare_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                    .ok_or_else(|| eyre!("nonzero"))?,
+            },
             commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("nonzero"))?,

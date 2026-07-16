@@ -89,9 +89,11 @@ limit above Docker's advertised capacity before it creates any containers.
 Override `ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES`,
 `ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES`, and
 `ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS` together when comparing another
-machine or deployment class. Source concurrency and byte-watermark variables
-are exposed for measured tuning; every report records the effective limits,
-and the validator requires them to match the requested Compose envelope.
+machine or deployment class. The lifecycle derives source concurrency,
+source/prepare watermarks, and prepare concurrency from that envelope plus
+`ZINDER_NODE_MAX_RESPONSE_BYTES`; independent pipeline tuning is intentionally
+not part of this certification command. Every report records the resolved
+limits, and the validator recomputes them from the requested Compose envelope.
 The CPU value is a container quota, not an exclusive reservation; Zebra shares
 the Docker engine and remains outside the measured lifecycle cgroup.
 

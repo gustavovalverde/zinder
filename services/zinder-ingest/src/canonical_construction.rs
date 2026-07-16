@@ -45,12 +45,23 @@ use source_fetch::{
 const CANONICAL_PREPARE_MEMORY_UNIT_BYTES: u64 = 1_024;
 const CANONICAL_PREPARE_RAW_BLOCK_MULTIPLIER: u64 = 16;
 const CANONICAL_PREPARE_FIXED_BYTES: u64 = 64 * 1_024;
+const MIB: u64 = 1_024 * 1_024;
+const DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 32 * MIB;
+const DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 64;
+const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
+const FALLBACK_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 384 * MIB;
+const FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 512 * MIB;
+const MIN_PIPELINE_MEMORY_WATERMARK_BYTES: u64 = 128 * MIB;
+const PIPELINE_MEMORY_BUDGET_DIVISOR: u64 = 64;
+const BLOCK_PREPARE_CONCURRENCY_CEILING: u32 = 16;
 
-/// Bounded source-fetch and preparation settings for fresh canonical construction.
-#[derive(Clone, Debug)]
-pub struct CanonicalConstructionConfig {
-    /// Timeout applied to one upstream source request.
-    pub request_timeout: Duration,
+/// Shared source-fetch and block-preparation limits for canonical ingestion.
+///
+/// Fresh store construction and incremental bulk catchup both consume this
+/// value so runtime resource resolution cannot silently produce two pipeline
+/// shapes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalPipelineLimits {
     /// Maximum bytes accepted from one source response.
     pub max_response_bytes: NonZeroU64,
     /// Adaptive target for one source response payload.
@@ -65,6 +76,115 @@ pub struct CanonicalConstructionConfig {
     pub block_prepare_concurrency: NonZeroU32,
     /// Aggregate byte watermark for block preparation and queued canonical blocks.
     pub block_prepare_memory_watermark_bytes: NonZeroU64,
+}
+
+impl CanonicalPipelineLimits {
+    /// Resolves canonical pipeline limits from the runtime resource envelope.
+    #[must_use]
+    pub fn resolve(
+        memory_budget_bytes: Option<NonZeroU64>,
+        logical_core_count: NonZeroU32,
+        max_response_bytes: NonZeroU64,
+    ) -> Self {
+        let source_fetch_max_in_flight_bytes = pipeline_memory_watermark(
+            memory_budget_bytes,
+            FALLBACK_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES,
+        )
+        .max(max_response_bytes);
+        Self {
+            max_response_bytes,
+            source_segment_target_response_bytes: NonZeroU64::new(
+                max_response_bytes
+                    .get()
+                    .min(DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES),
+            )
+            .unwrap_or(NonZeroU64::MIN),
+            source_segment_max_blocks: NonZeroU32::new(DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS)
+                .unwrap_or(NonZeroU32::MIN),
+            source_fetch_max_in_flight_requests: NonZeroU32::new(
+                DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS,
+            )
+            .unwrap_or(NonZeroU32::MIN),
+            source_fetch_max_in_flight_bytes,
+            block_prepare_concurrency: NonZeroU32::new(
+                logical_core_count
+                    .get()
+                    .min(BLOCK_PREPARE_CONCURRENCY_CEILING),
+            )
+            .unwrap_or(NonZeroU32::MIN),
+            block_prepare_memory_watermark_bytes: pipeline_memory_watermark(
+                memory_budget_bytes,
+                FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES,
+            ),
+        }
+    }
+
+    /// Returns these explicit limits after validating their cross-field invariants.
+    pub fn validate(self) -> Result<Self, CanonicalPipelineLimitsError> {
+        if self.source_segment_target_response_bytes > self.max_response_bytes {
+            return Err(
+                CanonicalPipelineLimitsError::SourceTargetExceedsResponseLimit {
+                    source_segment_target_response_bytes: self.source_segment_target_response_bytes,
+                    max_response_bytes: self.max_response_bytes,
+                },
+            );
+        }
+        if self.source_fetch_max_in_flight_bytes < self.max_response_bytes {
+            return Err(
+                CanonicalPipelineLimitsError::SourceWatermarkBelowResponseLimit {
+                    source_fetch_max_in_flight_bytes: self.source_fetch_max_in_flight_bytes,
+                    max_response_bytes: self.max_response_bytes,
+                },
+            );
+        }
+        Ok(self)
+    }
+}
+
+/// Invalid explicitly configured canonical pipeline limits.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CanonicalPipelineLimitsError {
+    /// The adaptive response target is larger than the node response cap.
+    #[error(
+        "source segment target {source_segment_target_response_bytes} exceeds maximum response {max_response_bytes}"
+    )]
+    SourceTargetExceedsResponseLimit {
+        /// Configured adaptive response target.
+        source_segment_target_response_bytes: NonZeroU64,
+        /// Maximum response accepted from the node.
+        max_response_bytes: NonZeroU64,
+    },
+    /// One legal node response would exceed the entire source-fetch watermark.
+    #[error(
+        "source fetch watermark {source_fetch_max_in_flight_bytes} is below maximum response {max_response_bytes}"
+    )]
+    SourceWatermarkBelowResponseLimit {
+        /// Aggregate source-fetch byte watermark.
+        source_fetch_max_in_flight_bytes: NonZeroU64,
+        /// Maximum response accepted from the node.
+        max_response_bytes: NonZeroU64,
+    },
+}
+
+fn pipeline_memory_watermark(
+    memory_budget_bytes: Option<NonZeroU64>,
+    fallback_bytes: u64,
+) -> NonZeroU64 {
+    let bytes = memory_budget_bytes.map_or(fallback_bytes, |memory_budget_bytes| {
+        (memory_budget_bytes.get() / PIPELINE_MEMORY_BUDGET_DIVISOR)
+            .clamp(MIN_PIPELINE_MEMORY_WATERMARK_BYTES, fallback_bytes)
+    });
+    NonZeroU64::new(bytes).unwrap_or(NonZeroU64::MIN)
+}
+
+/// Bounded source-fetch and preparation settings for fresh canonical construction.
+#[derive(Clone, Debug)]
+pub struct CanonicalConstructionConfig {
+    /// Timeout applied to one upstream source request.
+    pub request_timeout: Duration,
+    /// Shared source-fetch and block-preparation limits.
+    pub pipeline_limits: CanonicalPipelineLimits,
     /// Node-discovered consensus upgrade activations used to parse transaction facts.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
@@ -78,16 +198,18 @@ impl CanonicalConstructionConfig {
     ) -> Self {
         Self {
             request_timeout,
-            max_response_bytes: NonZeroU64::new(16 * 1_024 * 1_024).unwrap_or(NonZeroU64::MIN),
-            source_segment_target_response_bytes: NonZeroU64::new(8 * 1_024 * 1_024)
-                .unwrap_or(NonZeroU64::MIN),
-            source_segment_max_blocks: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
-            source_fetch_max_in_flight_requests: NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
-            source_fetch_max_in_flight_bytes: NonZeroU64::new(32 * 1_024 * 1_024)
-                .unwrap_or(NonZeroU64::MIN),
-            block_prepare_concurrency: NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
-            block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1_024 * 1_024)
-                .unwrap_or(NonZeroU64::MIN),
+            pipeline_limits: CanonicalPipelineLimits {
+                max_response_bytes: NonZeroU64::new(16 * MIB).unwrap_or(NonZeroU64::MIN),
+                source_segment_target_response_bytes: NonZeroU64::new(8 * MIB)
+                    .unwrap_or(NonZeroU64::MIN),
+                source_segment_max_blocks: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
+                source_fetch_max_in_flight_requests: NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(32 * MIB)
+                    .unwrap_or(NonZeroU64::MIN),
+                block_prepare_concurrency: NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * MIB)
+                    .unwrap_or(NonZeroU64::MIN),
+            },
             network_upgrade_activations,
         }
     }
@@ -227,9 +349,10 @@ where
     let build_plan = builder.build_plan().clone();
     let workload = builder.workload();
     validate_construction_identity(&build_plan, config)?;
-    let block_queue_capacity = usize::try_from(config.block_prepare_concurrency.get())
-        .unwrap_or(usize::MAX)
-        .max(1);
+    let block_queue_capacity =
+        usize::try_from(config.pipeline_limits.block_prepare_concurrency.get())
+            .unwrap_or(usize::MAX)
+            .max(1);
     let prepared_blocks = build_prepared_block_stream(
         source,
         &build_plan,
@@ -465,8 +588,8 @@ where
 {
     let first_height = build_plan.history_bounds().first_available_height();
     let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
-        config.source_segment_max_blocks,
-        config.source_segment_target_response_bytes,
+        config.pipeline_limits.source_segment_max_blocks,
+        config.pipeline_limits.source_segment_target_response_bytes,
         Arc::clone(&config.network_upgrade_activations),
         first_height,
     )));
@@ -477,23 +600,34 @@ where
             history_predecessor: Some(build_plan.history_predecessor().block_id),
             from_height: first_height,
             to_height: build_plan.build_tip().height,
-            max_response_bytes: config.max_response_bytes,
-            target_response_payload_bytes: config.source_segment_target_response_bytes,
-            source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
-            source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
+            max_response_bytes: config.pipeline_limits.max_response_bytes,
+            target_response_payload_bytes: config
+                .pipeline_limits
+                .source_segment_target_response_bytes,
+            source_fetch_max_in_flight_requests: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_requests,
+            source_fetch_max_in_flight_bytes: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes,
             source_segment_sizer,
         },
     )
     .boxed();
 
-    let prepare_memory_permits =
-        memory_permit_count(config.block_prepare_memory_watermark_bytes.get());
+    let prepare_memory_permits = memory_permit_count(
+        config
+            .pipeline_limits
+            .block_prepare_memory_watermark_bytes
+            .get(),
+    );
     let prepare_memory = Arc::new(Semaphore::new(
         usize::try_from(prepare_memory_permits).unwrap_or(usize::MAX),
     ));
-    let prepare_concurrency = usize::try_from(config.block_prepare_concurrency.get())
-        .unwrap_or(usize::MAX)
-        .max(1);
+    let prepare_concurrency =
+        usize::try_from(config.pipeline_limits.block_prepare_concurrency.get())
+            .unwrap_or(usize::MAX)
+            .max(1);
     let activations = Arc::clone(&config.network_upgrade_activations);
     admit_source_blocks(
         source_chunks,
@@ -810,4 +944,29 @@ fn memory_permits_for_block(raw_block_capacity: usize, available_permits: u32) -
         .saturating_mul(CANONICAL_PREPARE_RAW_BLOCK_MULTIPLIER)
         .saturating_add(CANONICAL_PREPARE_FIXED_BYTES);
     memory_permit_count(estimated_bytes).min(available_permits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CanonicalPipelineLimits;
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    const MIB: u64 = 1_024 * 1_024;
+
+    #[test]
+    fn pipeline_limits_resolve_from_runtime_resources() {
+        let limits = CanonicalPipelineLimits::resolve(
+            NonZeroU64::new(10 * 1_024 * MIB),
+            NonZeroU32::new(10).unwrap_or(NonZeroU32::MIN),
+            NonZeroU64::new(64 * MIB).unwrap_or(NonZeroU64::MIN),
+        );
+
+        assert_eq!(limits.max_response_bytes.get(), 64 * MIB);
+        assert_eq!(limits.source_segment_target_response_bytes.get(), 32 * MIB);
+        assert_eq!(limits.source_segment_max_blocks.get(), 64);
+        assert_eq!(limits.source_fetch_max_in_flight_requests.get(), 12);
+        assert_eq!(limits.source_fetch_max_in_flight_bytes.get(), 160 * MIB);
+        assert_eq!(limits.block_prepare_concurrency.get(), 10);
+        assert_eq!(limits.block_prepare_memory_watermark_bytes.get(), 160 * MIB);
+    }
 }

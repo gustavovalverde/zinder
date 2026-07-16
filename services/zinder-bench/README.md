@@ -187,11 +187,18 @@ zinder-bench rocksdb-storage-lifecycle \
   --canonical-store ./state/canonical \
   --wallet-store ./state/wallet \
   --tip-height 4174755 \
-  --source-fetch-max-in-flight-requests 16 \
-  --block-prepare-concurrency 16 \
+  --cpu-limit-cores 10 \
+  --memory-limit-bytes 10737418240 \
+  --max-response-bytes 67108864 \
   --supported-reorg-depth 100 \
   --report ./rocksdb-storage-lifecycle.json
 ```
+
+The closed lifecycle derives its source and block-preparation limits from the
+declared CPU and memory envelope plus `--max-response-bytes`; it does not accept
+independent pipeline tuning flags. The report validator recomputes those limits
+before accepting evidence. Diagnostic parameter sweeps belong to the captured
+fixture replay command.
 
 The report exposes two independent acceptance measurements:
 

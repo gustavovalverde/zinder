@@ -68,6 +68,8 @@ jq -e \
     nonnegative_integer and . > 0;
   def positive_number:
     type == "number" and . > 0;
+  def clamp($value; $minimum; $maximum):
+    [$maximum, ([$minimum, $value] | max)] | min;
   def duration:
     type == "number" and . >= 0;
   def hex_bytes($bytes):
@@ -370,6 +372,22 @@ jq -e \
         .wallet_sst_target_logical_bytes,
         .wallet_max_accounted_reorg_undo_bytes
       ] | all(.[]; positive_integer))
+      and .source_segment_target_response_bytes == ([.max_response_bytes, 33554432] | min)
+      and .source_segment_max_blocks == 64
+      and .source_fetch_max_in_flight_requests == 12
+      and .source_fetch_max_in_flight_bytes == ([
+        .max_response_bytes,
+        clamp((($report.provenance.runner.memory_limit_bytes / 64) | floor); 134217728; 402653184)
+      ] | max)
+      and .block_prepare_concurrency == ([
+        16,
+        ($report.provenance.runner.cpu_limit_cores | ceil)
+      ] | min)
+      and .block_prepare_memory_watermark_bytes == clamp(
+        (($report.provenance.runner.memory_limit_bytes / 64) | floor);
+        134217728;
+        536870912
+      )
       and (.canonical_rocksdb | resource_budget)
       and (.wallet_rocksdb | resource_budget))
     and (.acceptance

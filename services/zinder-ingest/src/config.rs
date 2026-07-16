@@ -20,8 +20,9 @@ use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_derive::ProjectionPreset;
 use zinder_ingest::{
-    BulkCatchupConfig, ChainEventRetentionConfig, CommitmentRootBackfillConfig,
-    ConventionalFeeDistributionBackfillConfig, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    BulkCatchupConfig, CanonicalPipelineLimits, ChainEventRetentionConfig,
+    CommitmentRootBackfillConfig, ConventionalFeeDistributionBackfillConfig,
+    DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, DeriveReplayPolicy, IngestDeriveConfig, IngestError,
     IngestLoopConfig, IngestModifiers, MempoolEventRetentionWorkerConfig, NodeSourceKind,
@@ -50,26 +51,14 @@ use crate::cli::parse::{
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
 const DEFAULT_CANONICAL_BATCH_MAX_BLOCKS: u32 = 1_000;
 const DEFAULT_CANONICAL_BATCH_MAX_ARTIFACT_BYTES: u64 = 536_870_912;
-const DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 64;
-const DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 33_554_432;
-const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
-
-// Bulk-catchup pipeline queue caps fall through to these constants when
-// the container memory budget can't be detected (dev hosts, macOS, older
-// Linux without cgroup v2). On a container runtime (Railway, Fly, ECS,
-// k8s, plain Docker) the actual defaults come from `default_pipeline_queue_bytes`,
-// which sizes each queue as `container_memory / PIPELINE_QUEUE_DIVISOR`
-// so the total in-flight watermark budget stays well under the kernel's
-// memory.max. Operator env-var overrides
-// (`ZINDER_INGEST__BULK_CATCHUP__*_BYTES`) still win when set. See
-// [ADR-0022](../../../docs/adrs/0022-resource-budgeted-bulk-catchup.md).
-const FALLBACK_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 402_653_184; // 384 MiB
-const FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 536_870_912; // 512 MiB
 const FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 536_870_912; // 512 MiB
 
 // Floor and divisor for the container-aware default. The divisor
 // expresses how thinly the pipeline carves up the container's memory
-// budget: at `/ 64` the four queues together claim ~6% of the
+// budget. Source-fetch and preparation limits use the same policy through
+// `CanonicalPipelineLimits`; this helper remains for the canonical write and
+// commit-reassembly bounds owned by the runtime configuration.
+// At `/ 64` each bound claims about 1.6% of the
 // container, leaving the remaining ~94% for RocksDB working set,
 // per-batch write-batch amplification, allocator overhead beyond the
 // pipeline's admission estimates, in-flight commit futures, and the
@@ -104,7 +93,6 @@ const DEFAULT_DERIVE_STARTUP_HANDOFF_LAG_BLOCKS: u32 = 1_000;
 const DEFAULT_DERIVE_REPLAY_MEMORY_DEGRADE_RATIO: f64 = 0.90;
 const DEFAULT_DERIVE_REPLAY_MEMORY_PAUSE_RATIO: f64 = 0.99;
 const DEFAULT_DERIVE_REPLAY_MEMORY_RESUME_RATIO: f64 = 0.80;
-const BLOCK_PREPARE_CONCURRENCY_CEILING: u32 = 16;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
 const DEFAULT_COMMITMENT_ROOT_BACKFILL_ENABLED: bool = true;
@@ -339,30 +327,6 @@ pub(crate) fn load_ingest_config(
         .with_default(
             "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
             DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
-        )?
-        .with_default(
-            "ingest.bulk_catchup.source_segment_max_blocks",
-            DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS,
-        )?
-        .with_default(
-            "ingest.bulk_catchup.source_segment_target_response_bytes",
-            DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES,
-        )?
-        .with_default(
-            "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
-            DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS,
-        )?
-        .with_default(
-            "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
-            default_pipeline_queue_bytes(FALLBACK_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES),
-        )?
-        .with_default(
-            "ingest.bulk_catchup.block_prepare_concurrency",
-            default_block_prepare_concurrency(),
-        )?
-        .with_default(
-            "ingest.bulk_catchup.block_prepare_memory_watermark_bytes",
-            default_pipeline_queue_bytes(FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES),
         )?
         .with_default(
             "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
@@ -902,6 +866,25 @@ fn optional_nonzero_u64_config(
         .transpose()
 }
 
+fn optional_nonzero_u32_config(
+    amount: Option<u32>,
+    path: &'static str,
+) -> Result<Option<NonZeroU32>, ConfigError> {
+    amount
+        .map(|amount| {
+            NonZeroU32::new(amount)
+                .ok_or_else(|| ConfigError::invalid(format!("{path} must be greater than zero")))
+        })
+        .transpose()
+}
+
+fn available_logical_core_count() -> NonZeroU32 {
+    let logical_core_count =
+        std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
+    NonZeroU32::new(u32::try_from(logical_core_count).unwrap_or(u32::MAX))
+        .unwrap_or(NonZeroU32::MIN)
+}
+
 fn ratio_config(amount: Option<f64>, path: &'static str) -> Result<f64, ConfigError> {
     let amount = require_field(amount, path)?;
     if amount > 0.0 && amount <= 1.0 {
@@ -918,6 +901,12 @@ fn ratio_config(amount: Option<f64>, path: &'static str) -> Result<f64, ConfigEr
 )]
 fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
+    let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
+    let resolved_pipeline_limits = CanonicalPipelineLimits::resolve(
+        container_memory_budget_bytes().and_then(NonZeroU64::new),
+        available_logical_core_count(),
+        node_target.max_response_bytes,
+    );
     let projection_preset_text = require_field(
         config.ingest.projection_preset.clone(),
         "ingest.projection_preset",
@@ -985,34 +974,24 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .into());
     }
 
-    let source_segment_max_blocks_raw = require_field(
+    let source_segment_max_blocks = optional_nonzero_u32_config(
         config.ingest.bulk_catchup.source_segment_max_blocks,
         "ingest.bulk_catchup.source_segment_max_blocks",
-    )?;
-    let source_segment_max_blocks =
-        NonZeroU32::new(source_segment_max_blocks_raw).ok_or_else(|| {
-            ConfigError::invalid(
-                "ingest.bulk_catchup.source_segment_max_blocks must be greater than zero",
-            )
-        })?;
-
-    let block_prepare_concurrency_raw = require_field(
+    )?
+    .unwrap_or(resolved_pipeline_limits.source_segment_max_blocks);
+    let block_prepare_concurrency = optional_nonzero_u32_config(
         config.ingest.bulk_catchup.block_prepare_concurrency,
         "ingest.bulk_catchup.block_prepare_concurrency",
-    )?;
-    let block_prepare_concurrency =
-        NonZeroU32::new(block_prepare_concurrency_raw).ok_or_else(|| {
-            ConfigError::invalid(
-                "ingest.bulk_catchup.block_prepare_concurrency must be greater than zero",
-            )
-        })?;
-    let block_prepare_memory_watermark_bytes = nonzero_u64_config(
+    )?
+    .unwrap_or(resolved_pipeline_limits.block_prepare_concurrency);
+    let block_prepare_memory_watermark_bytes = optional_nonzero_u64_config(
         config
             .ingest
             .bulk_catchup
             .block_prepare_memory_watermark_bytes,
         "ingest.bulk_catchup.block_prepare_memory_watermark_bytes",
-    )?;
+    )?
+    .unwrap_or(resolved_pipeline_limits.block_prepare_memory_watermark_bytes);
     let commit_reassembly_max_queued_artifact_bytes = nonzero_u64_config(
         config
             .ingest
@@ -1021,24 +1000,42 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
     )?;
 
-    let source_segment_target_response_bytes = nonzero_u64_config(
+    let source_segment_target_response_bytes = optional_nonzero_u64_config(
         config
             .ingest
             .bulk_catchup
             .source_segment_target_response_bytes,
         "ingest.bulk_catchup.source_segment_target_response_bytes",
-    )?;
-    let source_fetch_max_in_flight_requests = nonzero_u32_config(
+    )?
+    .unwrap_or(resolved_pipeline_limits.source_segment_target_response_bytes);
+    let source_fetch_max_in_flight_requests = optional_nonzero_u32_config(
         config
             .ingest
             .bulk_catchup
             .source_fetch_max_in_flight_requests,
         "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
-    )?;
-    let source_fetch_max_in_flight_bytes = nonzero_u64_config(
+    )?
+    .unwrap_or(resolved_pipeline_limits.source_fetch_max_in_flight_requests);
+    let source_fetch_max_in_flight_bytes = optional_nonzero_u64_config(
         config.ingest.bulk_catchup.source_fetch_max_in_flight_bytes,
         "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
-    )?;
+    )?
+    .unwrap_or(resolved_pipeline_limits.source_fetch_max_in_flight_bytes);
+    let pipeline_limits = CanonicalPipelineLimits {
+        max_response_bytes: node_target.max_response_bytes,
+        source_segment_target_response_bytes,
+        source_segment_max_blocks,
+        source_fetch_max_in_flight_requests,
+        source_fetch_max_in_flight_bytes,
+        block_prepare_concurrency,
+        block_prepare_memory_watermark_bytes,
+    }
+    .validate()
+    .map_err(|error| {
+        ConfigError::invalid(format!(
+            "invalid ingest.bulk_catchup pipeline limits: {error}"
+        ))
+    })?;
 
     let replay_batch_blocks_raw = require_field(
         config.ingest.derive.batch_blocks,
@@ -1246,20 +1243,6 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         allow_public_bind,
     )?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
-    if source_segment_target_response_bytes > node_target.max_response_bytes {
-        return Err(ConfigError::invalid(
-            "ingest.bulk_catchup.source_segment_target_response_bytes must not exceed node.max_response_bytes",
-        )
-        .into());
-    }
-    if source_fetch_max_in_flight_bytes.get() < node_target.max_response_bytes.get() {
-        return Err(ConfigError::invalid(
-            "ingest.bulk_catchup.source_fetch_max_in_flight_bytes must be greater than or equal to node.max_response_bytes",
-        )
-        .into());
-    }
-
     let modifiers = IngestModifiers {
         target_height: config.ingest.modifiers.target_height.map(BlockHeight::new),
         checkpoint_height: config
@@ -1298,12 +1281,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             canonical_batch_max_artifact_bytes,
             canonical_batch_max_estimated_write_bytes,
             canonical_batch_min_blocks_before_estimated_write_close,
-            source_segment_max_blocks,
-            source_segment_target_response_bytes,
-            source_fetch_max_in_flight_requests,
-            source_fetch_max_in_flight_bytes,
-            block_prepare_concurrency,
-            block_prepare_memory_watermark_bytes,
+            pipeline_limits,
             commit_reassembly_max_queued_artifact_bytes,
             flush_interval_epochs,
         },
@@ -1521,26 +1499,32 @@ impl RedactedIngestConfigToml {
                         .get(),
                     source_segment_max_blocks: loop_config
                         .bulk_catchup
+                        .pipeline_limits
                         .source_segment_max_blocks
                         .get(),
                     source_segment_target_response_bytes: loop_config
                         .bulk_catchup
+                        .pipeline_limits
                         .source_segment_target_response_bytes
                         .get(),
                     source_fetch_max_in_flight_requests: loop_config
                         .bulk_catchup
+                        .pipeline_limits
                         .source_fetch_max_in_flight_requests
                         .get(),
                     source_fetch_max_in_flight_bytes: loop_config
                         .bulk_catchup
+                        .pipeline_limits
                         .source_fetch_max_in_flight_bytes
                         .get(),
                     block_prepare_concurrency: loop_config
                         .bulk_catchup
+                        .pipeline_limits
                         .block_prepare_concurrency
                         .get(),
                     block_prepare_memory_watermark_bytes: loop_config
                         .bulk_catchup
+                        .pipeline_limits
                         .block_prepare_memory_watermark_bytes
                         .get(),
                     commit_reassembly_max_queued_artifact_bytes: loop_config
@@ -1720,14 +1704,6 @@ struct IngestBulkCatchupToml {
     flush_interval_epochs: u32,
 }
 
-/// Computes the default block-prepare concurrency from available logical cores.
-fn default_block_prepare_concurrency() -> u32 {
-    let logical_cores =
-        u32::try_from(std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get))
-            .unwrap_or(8);
-    logical_cores.clamp(1, BLOCK_PREPARE_CONCURRENCY_CEILING)
-}
-
 #[derive(Serialize)]
 struct IngestTipFollowToml {
     poll_interval_ms: u64,
@@ -1765,7 +1741,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_falls_back_when_cgroup_absent() {
-        let fallback = FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES;
+        let fallback = FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES;
         assert_eq!(
             default_pipeline_queue_bytes_from_budget(None, fallback),
             fallback,
@@ -1775,7 +1751,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_caps_at_fallback_on_fat_containers() {
-        let fallback = FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES;
+        let fallback = FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES;
         // 64 GiB container -> raw computation would give 1 GiB per queue,
         // but the fallback caps at the previously hand-tuned 512 MiB.
         let result = default_pipeline_queue_bytes_from_budget(Some(64 * ONE_GIB), fallback);
@@ -1784,7 +1760,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_shrinks_for_railway_sized_containers() {
-        let fallback = FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES;
+        let fallback = FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES;
         // The Railway zinder-mainnet incident: 24 GiB container cap,
         // OOM at the 512 MiB default. Container-aware default must
         // be smaller than the fallback to prevent recurrence.
@@ -1798,7 +1774,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_floors_at_min_for_tight_containers() {
-        let fallback = FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES;
+        let fallback = FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES;
         // 4 GiB container -> raw computation gives 64 MiB per queue,
         // smaller than a single mainnet block can produce. Floor at
         // 128 MiB so the pipeline can always make forward progress.

@@ -434,3 +434,31 @@ wallet cold validation at 92.04 seconds, and wallet outpoint merge at 79.84
 seconds, but those benchmark-only opportunities are deferred until the shipped
 ingest, query, and compatibility services complete the version-1 live append,
 reorg, projection-following, readiness, and client-parity lifecycle.
+
+## Deployment-profile comparability correction
+
+Status: prior semantic evidence retained; deployment throughput certification pending
+Date: 2026-07-16
+
+The accepted lifecycle runs above used the lifecycle command's former implicit
+source profile: a 256 MiB maximum response, 8 MiB response target, 1,000-block
+segment ceiling, 16 source requests, and 512 MiB source and prepare watermarks.
+The tracked deployment instead used a 64 MiB response cap, 32 MiB target,
+64-block ceiling, and a different set of request and memory overrides. The
+strict validator proved that each reported limit was positive, but did not
+prove that the lifecycle and deployment profiles matched.
+
+The semantic conclusions remain accepted: the fixed fence, canonical and
+wallet digests, row counts, cold reopen checks, and resource measurements all
+describe the completed run. The 12m10.63 result is not deployment-profile
+throughput certification and must not be used as one.
+
+Fresh construction and runtime bulk catchup now consume one
+`CanonicalPipelineLimits` value resolved from memory, logical CPUs, and the
+node response cap. The tracked deployment examples no longer carry independent
+pipeline overrides. The closed lifecycle no longer accepts those tuning flags,
+and its validator recomputes the reported limits from the recorded envelope.
+At the reference 10 GiB, 10-core, 64 MiB profile, the result is a 32 MiB target,
+64-block ceiling, 12 source requests, 160 MiB source and prepare watermarks,
+and 10 prepare slots. A new clean fixed-fence run is required before publishing
+an updated deployment-comparable sync time.
