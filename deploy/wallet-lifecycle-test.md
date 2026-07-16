@@ -1,9 +1,11 @@
 # Wallet Lifecycle Test
 
-This setup is the acceptance boundary for a clean version-1 Wallet deployment.
-It certifies both retained topologies against an already-synchronized Zebra:
-`rocksdb-single-host` and `postgres-scale-out`. The harness starts with fresh,
-project-scoped Zinder storage, but preserves and reuses Zebra's chain state.
+This setup is the acceptance boundary for clean version-1 fixed-tip
+construction and restart. It certifies both retained topologies against an
+already-synchronized Zebra: `rocksdb-single-host` and `postgres-scale-out`.
+The harness starts with fresh, project-scoped Zinder storage, but preserves and
+reuses Zebra's chain state. Continuous following and reorg recovery require a
+separate live-commit gate before either topology is deployment-ready.
 
 The harness is intentionally blocked until the image contains
 `/usr/local/bin/zinder-wallet-lifecycle` contract version 1. A benchmark driver,
@@ -37,16 +39,25 @@ rejects a report unless it proves all of the following:
   exceed 100 blocks, and every active pool has a complete subtree-root range;
 - one three-operation atomic publication updates READY and creates epoch 1 and
   chain-event sequence 1;
-- wallet derivation covers that exact epoch and tip;
-- a fresh reader passes latest-block, compact-block, transaction, tree-state,
-  and subtree-root probes through the public `WalletQuery` surface; and
+- wallet derivation covers that exact epoch and tip through a one-pass
+  sort/merge build with zero historical predecessor reads, no missing or
+  duplicate outpoints, exact output-state counts, and a reproducible UTXO
+  commitment;
+- a fresh reader passes canonical probes plus output, spend, unspent-output,
+  address-UTXO, address-transaction, multi-address balance, UTXO-summary, and
+  exact wallet-position-fence probes through the public `WalletQuery` surface,
+  plus lightwalletd transparent transaction, balance, and UTXO methods; and
 - a new process reopens the same READY canonical and wallet state after restart.
 
 Every phase records elapsed seconds and its domain counts, including canonical
 blocks and bytes, commitment-tree checkpoints, active pools, subtree roots,
-publication records, wallet transactions, and query requests. The report also
-binds the fixed tip, ordered sequence digest, software revision, and image
-reference. The validator accepts no partial or degraded result.
+publication records, wallet transactions, transparent inputs and outputs,
+final wallet-family rows, UTXO state, and query requests. Wallet timing is
+split into replay scan, outpoint sort, output/spend merge, address sort, family
+load, fresh-reader validation, and READY publication. The report also binds the
+fixed tip, canonical sequence digest, wallet projection digest, software
+revision, and image reference. The validator accepts no partial or degraded
+result.
 
 ## Run
 
@@ -84,12 +95,16 @@ docker compose \
 
 ## Current implementation blockers
 
-The current repository cannot yet create a valid report. Canonical construction
-now loads exact subtree ranges and authenticates its fixed-tip frontier, but the
-missing production boundaries are fresh-reader validation and atomic READY
-publication, the wallet version-1 materializer and query cutover, concrete
-PostgreSQL canonical and wallet stores, and the certifier binary that composes
-those paths. The existing PostgreSQL code is a diagnostic round-trip driver,
-not the `postgres-scale-out` lifecycle. These are hard gates: the runner checks
-for the certifier contract before deleting project state, and the report
-validator independently rejects any omitted phase.
+The current repository cannot yet create a valid report. RocksDB canonical
+construction now loads exact subtree ranges, authenticates its fixed-tip
+frontier, cold-reopens every required family, and atomically publishes epoch 1,
+event 1, and READY. The missing production boundaries are the wallet version-1
+sort/merge materializer and query cutover, an atomic canonical live-commit API
+that updates every required family across append, safe-tip advance, and bounded
+reorgs, concrete PostgreSQL canonical and wallet stores, and the certifier
+binary that composes those paths. The existing PostgreSQL code is a diagnostic
+round-trip driver, not the `postgres-scale-out` lifecycle. These are hard
+gates: the runner checks for the certifier contract before deleting project
+state, and the report validator independently rejects any omitted fixed-tip
+phase. A later deployment gate must exercise append, safe-tip advance, bounded
+reorg, and restart through the atomic live-commit boundary.

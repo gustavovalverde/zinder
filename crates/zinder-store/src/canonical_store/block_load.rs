@@ -549,6 +549,43 @@ pub(super) fn validate_source_tip_checkpoint(
     Ok(())
 }
 
+pub(super) fn read_persisted_tip_metadata(
+    db: &DB,
+    tip: zinder_core::BlockId,
+) -> Result<ChainTipMetadata, CanonicalStoreError> {
+    let family = db.cf_handle(COMPACT_BLOCK_COLUMN_FAMILY).ok_or_else(|| {
+        CanonicalStoreError::block_load_sequence("compact_block column family is absent")
+    })?;
+    let encoded_compact_block = db
+        .get_cf(&family, encode_block_position(tip.height))
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "read published tip compact block",
+            source,
+        })?
+        .ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence("published tip compact block is absent")
+        })?;
+    let compact =
+        LightwalletdCompactBlock::decode(encoded_compact_block.as_slice()).map_err(|_| {
+            CanonicalStoreError::block_load_sequence(
+                "published tip compact block is invalid protobuf",
+            )
+        })?;
+    let metadata = compact.chain_metadata.ok_or_else(|| {
+        CanonicalStoreError::block_load_sequence("published tip compact block has no metadata")
+    })?;
+    if compact.height != u64::from(tip.height.value()) || compact.hash != tip.hash.as_bytes() {
+        return Err(CanonicalStoreError::block_load_sequence(
+            "published tip compact block has the wrong canonical identity",
+        ));
+    }
+    Ok(ChainTipMetadata::new(
+        metadata.sapling_commitment_tree_size,
+        metadata.orchard_commitment_tree_size,
+        metadata.ironwood_commitment_tree_size,
+    ))
+}
+
 fn validate_persisted_tree_state_checkpoints(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,

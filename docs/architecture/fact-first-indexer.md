@@ -40,7 +40,7 @@ fact-first runtime or the `postgres-scale-out` composition.
 | Full replay/header verifier | Landed and live-tested | All 4.17 million pinned testnet rows passed replay, header, and continuity checks |
 | PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
 | Clean physical schema identities | Landed | Canonical, wallet, and explorer contracts use identity-scoped version 1 and refuse prior layouts without migration or adoption |
-| Fresh RocksDB canonical builder | Block-family arm live-tested | A new `BUILDING` path fixes its workload, complete activation-table fingerprint, source range, exact checkpoint frontiers, and build tip; the remaining canonical families still block `READY` |
+| Fresh RocksDB canonical builder | Wallet READY lifecycle implemented; block-family arm live-tested | A new `BUILDING` path fixes its workload, activation fingerprint, source range, predecessor frontiers, and build tip; Wallet publication flushes, closes, cold-reopens, validates every required family, then atomically writes epoch 1, event 1, and `READY`. Explorer remains blocked until daily value-pool evidence is implemented; neither complete lifecycle is live-certified yet |
 | One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
 | Independent wallet projector and store | Not implemented | Current `zinder-ingest` still owns legacy projection replay |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
@@ -240,16 +240,35 @@ and block payloads never enter the sort. Every family is staged before RocksDB
 ingestion begins, and the store remains `BUILDING` throughout, so a partial
 ingestion is never servable.
 
-Before returning the builder, one cache-bypassing replay pass decodes every
-persisted semantic row and validates version-1 replay and digest contracts,
-height keys, parent linkage, the fixed tip, and the ordered sequence digest.
-Prepared per-family counts and byte evidence are matched to persisted SST
-metadata and sampled cross-family identities before `READY`; exhaustive raw
-payload scrubbing is a separate background integrity operation rather than a
-second sync-time scan. Any source error, leftover staging directory, populated
-`BUILDING` family, or post-ingestion mismatch requires deletion of the
-incomplete build. Version 1 does not define resume, adoption, repair, or a
-replay-only construction route.
+The block and subtree loaders perform immediate readback but cannot publish the
+store. Publication first requires source-authenticated block families, exact
+subtree-root ranges, and a final fixed-tip commitment-tree checkpoint. It then
+flushes every column family, synchronizes the WAL, records the RocksDB database
+identity, destroys the builder and its caches, and admits the same database
+through a new `ExistingPrimary` open. The cold reader decodes every replay row,
+rechecks per-family row counts and logical bytes, validates commitment-tree and
+subtree-root sequences, and compares the source checkpoint again. A mismatch
+leaves the path `BUILDING` and requires deletion of the entire build.
+
+Only the resulting validation type can publish the baseline. It accepts an
+explicit settled block rather than treating the visible tip as final, verifies
+that block against the cold canonical header family, and writes exactly three
+records in one WAL-backed synchronous batch: chain epoch 1, committed event 1,
+and the `READY` control record. While epoch 1 is visible, serving admission
+requires those three records and the retained canonical families to agree.
+The current implementation admits only this baseline state. It rejects any
+later epoch or visible tip until one atomic live-commit API can update every
+required family, displaced reorg facts, epoch, event, and `READY` together.
+This fail-closed boundary prevents a partial raw database mutation from being
+mistaken for a valid live transition. Version-1 event bytes already encode
+reverted-range presence explicitly and preserve anchored empty committed
+ranges, but the codec alone does not claim live-tail support. Child-process
+crash tests prove that flush, close, cold-validation, and pre-write crashes
+remain `BUILDING` with no epoch/event rows, while a crash immediately after the
+synced batch reopens with all three publication records. Version 1 does not
+define resume, adoption, repair, migration, or a replay-only construction
+route; exhaustive raw-payload scrubbing remains a background integrity
+operation rather than another sync-time pass.
 
 The release-mode Docker tracer measured the same Wallet construction path
 against a local Zebra testnet node on 2026-07-15. The elapsed load includes SST
@@ -577,14 +596,22 @@ are ancestors of `main` or their rejected status is recorded here.
 
 ### 3. Build the wallet state machine
 
-- acquire and renew a durable `ProjectionBuildLease` whose anchor event is a
-  hard floor for chain-event pruning until catch-up or expiry;
-- create the live-output, address, spent-output, history, undo, cursor, and
-  coverage tables in the wallet projection database;
-- replay ordered block facts in cost-bounded batches;
-- use one deduplicated lookup against the live set per replay window;
-- prove same-height reorg fencing, restart recovery, and bounded rollback; and
-- move transparent `WalletQuery` reads behind the projection readiness fence.
+- give the wallet store its own fresh identity-scoped schema version 1 instead
+  of renumbering or admitting legacy derive-store bytes;
+- scan canonical replay once, externally sort created outputs and spends by
+  outpoint, merge them without historical point reads, then sort address
+  transactions and reduce balances and the UTXO commitment;
+- load only final rows through RocksDB SST ingestion or PostgreSQL binary
+  `COPY` followed by backend-native index construction;
+- require `historical_prevout_read_count == 0` and differential equality with
+  the serial wallet oracle before publication;
+- retain only the bounded undo data required by the configured reorg window,
+  then implement live apply and reverse-order undo as a separate algorithm;
+- cut every transparent `WalletQuery` read to the wallet store, remove
+  query-time catchup and canonical/derive fallbacks, and fail explicitly when
+  the wallet position is not ready or trails canonical; and
+- prove same-height replacement, restart recovery, cross-backend parity, and
+  direct wallet query behavior before declaring the lifecycle complete.
 
 ### 4. Separate explorer projections
 

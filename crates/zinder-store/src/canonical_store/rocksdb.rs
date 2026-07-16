@@ -19,22 +19,23 @@ use super::{
     CanonicalStoreWorkload,
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     control::{DecodedStoreControl, decode_store_control, encode_building_store_control},
+    publication::validate_ready_publication,
 };
 
 pub(super) const STORE_CONTROL_KEY: &[u8] = b"store_control";
 pub(super) const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
 pub(super) const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
-const DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY: &str = "daily_value_pool_balance";
+pub(super) const DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY: &str = "daily_value_pool_balance";
 pub(super) const TRANSACTION_LOCATION_COLUMN_FAMILY: &str = "transaction_location";
 pub(super) const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
 pub(super) const TREE_STATE_CHECKPOINT_COLUMN_FAMILY: &str = "tree_state_checkpoint";
 pub(super) const BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str =
     "block_final_note_commitment_roots";
 pub(super) const SUBTREE_ROOT_COLUMN_FAMILY: &str = "subtree_root";
-const CHAIN_EPOCH_COLUMN_FAMILY: &str = "chain_epoch";
-const CHAIN_EVENT_COLUMN_FAMILY: &str = "chain_event";
-const MEMPOOL_EVENT_COLUMN_FAMILY: &str = "mempool_event";
-const DISPLACED_BLOCK_FACTS_COLUMN_FAMILY: &str = "displaced_block_facts";
+pub(super) const CHAIN_EPOCH_COLUMN_FAMILY: &str = "chain_epoch";
+pub(super) const CHAIN_EVENT_COLUMN_FAMILY: &str = "chain_event";
+pub(super) const MEMPOOL_EVENT_COLUMN_FAMILY: &str = "mempool_event";
+pub(super) const DISPLACED_BLOCK_FACTS_COLUMN_FAMILY: &str = "displaced_block_facts";
 pub(super) const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
 pub(super) const TRANSACTION_BLOB_COLUMN_FAMILY: &str = "transaction_blob";
 
@@ -69,6 +70,22 @@ pub struct RocksDbCanonicalStore {
 }
 
 impl RocksDbCanonicalStore {
+    pub(super) fn from_published(
+        bounded_open: BoundedRocksDbOpen,
+        workload: CanonicalStoreWorkload,
+        build_plan: super::CanonicalStoreBuildPlan,
+        cursor_auth_key: [u8; 32],
+        ready_evidence: CanonicalStoreReadyEvidence,
+    ) -> Self {
+        Self {
+            bounded_open,
+            workload,
+            build_plan,
+            _cursor_auth_key: cursor_auth_key,
+            ready_evidence,
+        }
+    }
+
     /// Opens an existing READY version-1 canonical store after exact admission.
     ///
     /// Admission validates the complete column-family set, singleton control
@@ -142,6 +159,7 @@ impl RocksDbCanonicalStore {
             ));
         }
         let build_plan = opened_control.build_plan;
+        validate_ready_publication(&bounded_open.db, &build_plan, opened_ready_evidence)?;
         Ok(Self {
             bounded_open,
             workload: expected_workload,
@@ -288,7 +306,7 @@ pub(super) fn initialize_store_identity(
         })
 }
 
-fn admit_existing_store(
+pub(super) fn admit_existing_store(
     path: &Path,
     expected_network: Network,
     expected_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
@@ -338,7 +356,7 @@ fn validate_exact_column_families(
     Ok(())
 }
 
-fn validate_open_store_control(
+pub(super) fn validate_open_store_control(
     db: &DB,
     path: &Path,
     expected_network: Network,

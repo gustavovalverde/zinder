@@ -79,18 +79,51 @@ jq -e --arg topology "$topology" '
   and (phase("wallet_derivation").covered_tip_height == .fixed_tip.height)
   and (phase("wallet_derivation").block_count == phase("canonical_build").block_count)
   and (phase("wallet_derivation").transaction_count | positive_integer)
+  and (phase("wallet_derivation").transparent_input_count | nonnegative_number)
+  and (phase("wallet_derivation").transparent_output_count | nonnegative_number)
+  and (phase("wallet_derivation").historical_prevout_read_count == 0)
+  and (phase("wallet_derivation").missing_predecessor_count == 0)
+  and (phase("wallet_derivation").duplicate_output_count == 0)
+  and (phase("wallet_derivation").duplicate_spend_count == 0)
+  and (phase("wallet_derivation").unspent_output_count + phase("wallet_derivation").spent_output_count == phase("wallet_derivation").transparent_output_count)
+  and (phase("wallet_derivation").unspent_output_count == phase("wallet_derivation").unspent_output_by_address_count)
+  and (phase("wallet_derivation").unspent_output_count == phase("wallet_derivation").utxo_count)
+  and (phase("wallet_derivation").utxo_total_value_zat | nonnegative_number)
+  and (phase("wallet_derivation").utxo_commitment_hex | lowercase_sha256)
+  and (phase("wallet_derivation").source_sequence_digest_sha256 == .ordered_sequence_digest_sha256)
+  and (phase("wallet_derivation").projection_digest_sha256 | lowercase_sha256)
+  and ([
+    phase("wallet_derivation").replay_scan_elapsed_seconds,
+    phase("wallet_derivation").outpoint_sort_elapsed_seconds,
+    phase("wallet_derivation").output_spend_merge_elapsed_seconds,
+    phase("wallet_derivation").address_sort_elapsed_seconds,
+    phase("wallet_derivation").family_load_elapsed_seconds,
+    phase("wallet_derivation").reopen_validation_elapsed_seconds,
+    phase("wallet_derivation").ready_publication_elapsed_seconds
+  ] | all(nonnegative_number))
   and (phase("fresh_reader_query_smoke").fresh_reader == true)
   and (phase("fresh_reader_query_smoke").ready_epoch_id == 1)
   and (phase("fresh_reader_query_smoke").wallet_covered_epoch_id == 1)
   and (phase("fresh_reader_query_smoke").latest_block_height == .fixed_tip.height)
-  and (phase("fresh_reader_query_smoke").request_count >= 5)
+  and (phase("fresh_reader_query_smoke").request_count >= 16)
   and (
     [
       "latest_block",
       "compact_block_range",
       "transaction",
       "tree_state_checkpoint",
-      "subtree_roots"
+      "subtree_roots",
+      "output_by_outpoint",
+      "spend_by_outpoint",
+      "unspent_by_outpoint",
+      "unspent_outputs_by_address",
+      "address_transactions",
+      "multi_address_balance",
+      "utxo_set_summary",
+      "wallet_position_fence",
+      "lightwalletd_taddress_txids",
+      "lightwalletd_taddress_balance",
+      "lightwalletd_address_utxos"
     ] - [phase("fresh_reader_query_smoke").successful_probes[]]
     | length == 0
   )
@@ -116,6 +149,27 @@ jq -e --arg topology "$topology" --slurpfile certification "$certification_repor
   and .canonical_ready_reopened == true
   and .wallet_coverage_reopened == true
   and .query_smoke_passed == true
+  and (
+    [
+      "latest_block",
+      "compact_block_range",
+      "transaction",
+      "tree_state_checkpoint",
+      "subtree_roots",
+      "output_by_outpoint",
+      "spend_by_outpoint",
+      "unspent_by_outpoint",
+      "unspent_outputs_by_address",
+      "address_transactions",
+      "multi_address_balance",
+      "utxo_set_summary",
+      "wallet_position_fence",
+      "lightwalletd_taddress_txids",
+      "lightwalletd_taddress_balance",
+      "lightwalletd_address_utxos"
+    ] - [.successful_probes[]]
+    | length == 0
+  )
   and (.ready_epoch_id == 1)
   and (.wallet_covered_epoch_id == 1)
   and (.latest_block_height == $certification[0].fixed_tip.height)

@@ -1,6 +1,7 @@
 use std::num::NonZeroU32;
 
-use rust_rocksdb::{DB, IteratorMode, WriteBatch};
+use rust_rocksdb::{DB, IteratorMode, ReadOptions, WriteBatch};
+use sha2::{Digest, Sha256};
 use zinder_core::{
     BlockHash, BlockHeight, ChainTipMetadata, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
@@ -14,6 +15,7 @@ use super::{
 
 const SUBTREE_ROOT_KEY_LEN: usize = 1 + 4;
 const SUBTREE_ROOT_VALUE_LEN: usize = 32 + 4 + 32;
+const SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder.canonical.subtree-root-sequence.v1\0";
 type EncodedSubtreeRoot = ([u8; SUBTREE_ROOT_KEY_LEN], [u8; SUBTREE_ROOT_VALUE_LEN]);
 
 /// Source-authenticated subtree-root fields before canonical block identity is attached.
@@ -36,6 +38,8 @@ pub struct CanonicalSubtreeRootLoadEvidence {
     pub subtree_root_count: u64,
     /// Total key and value bytes written to the subtree-root family.
     pub subtree_root_logical_bytes: u64,
+    /// Version-1 SHA-256 digest of every exact persisted key and value in order.
+    pub subtree_root_sequence_digest: [u8; 32],
 }
 
 pub(super) fn required_subtree_root_ranges(
@@ -112,10 +116,102 @@ pub(super) fn load_subtree_roots(
         .ok_or_else(|| {
             CanonicalStoreError::subtree_root_sequence("subtree-root logical bytes exceed u64::MAX")
         })?;
+    let subtree_root_sequence_digest = digest_subtree_root_rows(&expected_rows);
     Ok(CanonicalSubtreeRootLoadEvidence {
         subtree_root_count,
         subtree_root_logical_bytes,
+        subtree_root_sequence_digest,
     })
+}
+
+pub(super) fn validate_persisted_subtree_root_family(
+    db: &DB,
+    build_plan: &CanonicalStoreBuildPlan,
+    block_evidence: &CanonicalBlockLoadEvidence,
+) -> Result<CanonicalSubtreeRootLoadEvidence, CanonicalStoreError> {
+    let family = subtree_root_family(db)?;
+    let required_ranges = required_subtree_root_ranges(
+        build_plan.history_predecessor().tip_metadata(),
+        block_evidence.tip_metadata,
+    )?;
+    let mut iteration_options = ReadOptions::default();
+    iteration_options.fill_cache(false);
+    iteration_options.set_readahead_size(2 * 1024 * 1024);
+    let mut persisted_rows = db.raw_iterator_cf_opt(&family, iteration_options);
+    persisted_rows.seek_to_first();
+    let mut header_read_options = ReadOptions::default();
+    header_read_options.fill_cache(false);
+    let mut digest = Sha256::new();
+    digest.update(SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN);
+    let mut subtree_root_count = 0_u64;
+    let mut subtree_root_logical_bytes = 0_u64;
+    for range in required_ranges {
+        let mut previous_completion_height = None;
+        for expected_index in range {
+            let (key, encoded_root) = persisted_rows
+                .item()
+                .ok_or(CanonicalStoreError::SubtreeRootReadbackMismatch)?;
+            let artifact = decode_subtree_root(key, encoded_root)?;
+            if artifact.protocol != range.protocol
+                || artifact.subtree_index != expected_index
+                || previous_completion_height
+                    .is_some_and(|previous| artifact.completing_block_height < previous)
+                || artifact.completing_block_height
+                    < build_plan.history_bounds().first_available_height()
+                || artifact.completing_block_height > build_plan.build_tip().height
+                || retained_block_hash_with_options(
+                    db,
+                    artifact.completing_block_height,
+                    &header_read_options,
+                )? != artifact.completing_block_hash
+            {
+                return Err(CanonicalStoreError::SubtreeRootReadbackMismatch);
+            }
+            digest.update(key.as_ref());
+            digest.update(encoded_root.as_ref());
+            subtree_root_count = subtree_root_count.checked_add(1).ok_or_else(|| {
+                CanonicalStoreError::subtree_root_sequence("subtree-root count exceeds u64::MAX")
+            })?;
+            let row_bytes = u64::try_from(key.len() + encoded_root.len()).map_err(|_| {
+                CanonicalStoreError::subtree_root_sequence(
+                    "subtree-root row length exceeds u64::MAX",
+                )
+            })?;
+            subtree_root_logical_bytes = subtree_root_logical_bytes
+                .checked_add(row_bytes)
+                .ok_or_else(|| {
+                    CanonicalStoreError::subtree_root_sequence(
+                        "subtree-root logical bytes exceed u64::MAX",
+                    )
+                })?;
+            previous_completion_height = Some(artifact.completing_block_height);
+            persisted_rows.next();
+        }
+    }
+    if persisted_rows.valid() {
+        return Err(CanonicalStoreError::SubtreeRootReadbackMismatch);
+    }
+    persisted_rows
+        .status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "subtree-root publication readback",
+            source,
+        })?;
+    Ok(CanonicalSubtreeRootLoadEvidence {
+        subtree_root_count,
+        subtree_root_logical_bytes,
+        subtree_root_sequence_digest: digest.finalize().into(),
+    })
+}
+
+fn digest_subtree_root_rows(rows: &[EncodedSubtreeRoot]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN);
+    for (key, encoded_root) in rows {
+        digest.update(key);
+        digest.update(encoded_root);
+    }
+    digest.finalize().into()
 }
 
 struct SubtreeRootStager<'db, SourceRows> {
@@ -267,12 +363,23 @@ fn subtree_root_family(
     })
 }
 
-fn retained_block_hash(db: &DB, height: BlockHeight) -> Result<BlockHash, CanonicalStoreError> {
+pub(super) fn retained_block_hash(
+    db: &DB,
+    height: BlockHeight,
+) -> Result<BlockHash, CanonicalStoreError> {
+    retained_block_hash_with_options(db, height, &ReadOptions::default())
+}
+
+fn retained_block_hash_with_options(
+    db: &DB,
+    height: BlockHeight,
+    read_options: &ReadOptions,
+) -> Result<BlockHash, CanonicalStoreError> {
     let family = db.cf_handle(BLOCK_HEADER_COLUMN_FAMILY).ok_or_else(|| {
         CanonicalStoreError::subtree_root_sequence("block_header column family is absent")
     })?;
     let encoded_header = db
-        .get_cf(&family, encode_block_position(height))
+        .get_cf_opt(&family, encode_block_position(height), read_options)
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
             operation: "read subtree completing block header",
             source,

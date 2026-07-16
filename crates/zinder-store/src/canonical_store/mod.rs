@@ -8,6 +8,7 @@ mod block_load;
 mod block_replay;
 mod builder;
 mod control;
+mod publication;
 mod rocksdb;
 mod subtree_load;
 
@@ -15,7 +16,7 @@ use std::{io, path::PathBuf};
 
 use thiserror::Error;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
+    BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
     CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
     MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, NetworkUpgradeActivations,
@@ -25,6 +26,10 @@ use zinder_core::{
 
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use builder::RocksDbCanonicalBuilder;
+pub use publication::{
+    CanonicalBaselinePublication, PreparedCanonicalBaselinePublication,
+    ValidatedRocksDbCanonicalBuild,
+};
 pub use rocksdb::RocksDbCanonicalStore;
 pub use subtree_load::{CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence};
 
@@ -346,28 +351,26 @@ pub enum CanonicalStoreBuildState {
 /// Validation evidence that makes a constructed canonical store visible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreReadyEvidence {
-    /// First retained block height.
-    pub first_height: BlockHeight,
-    /// First retained block hash in Zinder's internal byte order.
-    pub first_hash: BlockHash,
-    /// Visible tip height.
-    pub tip_height: BlockHeight,
-    /// Visible tip hash in Zinder's internal byte order.
-    pub tip_hash: BlockHash,
-    /// Baseline visible epoch identifier.
+    /// First retained canonical block.
+    pub first_retained_block: BlockId,
+    /// Current visible canonical tip.
+    pub visible_tip: BlockId,
+    /// Current visible epoch identifier.
     pub visible_epoch: ChainEpochId,
-    /// Number of contiguous retained blocks.
-    pub block_count: u64,
+    /// Latest durable chain-event sequence that produced `visible_epoch`.
+    pub visible_event_sequence: u64,
+    /// Number of contiguous blocks authenticated in the baseline build.
+    pub baseline_block_count: u64,
     /// Canonical block-fact digest contract.
     pub block_digest_version: CanonicalBlockFactsDigestVersion,
     /// Canonical replay-envelope contract.
     pub replay_format_version: CanonicalBlockReplayFormatVersion,
     /// Ordered sequence-digest contract.
     pub sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
-    /// Ordered sequence digest bytes.
-    pub sequence_digest: [u8; 32],
-    /// Total semantic replay-envelope bytes.
-    pub logical_fact_bytes: u64,
+    /// Ordered digest of the baseline build's fact sequence.
+    pub baseline_sequence_digest: [u8; 32],
+    /// Total semantic replay-envelope bytes in the baseline build.
+    pub baseline_logical_fact_bytes: u64,
 }
 
 /// Failure to create or admit a clean canonical store.
@@ -506,6 +509,34 @@ pub enum CanonicalStoreError {
         /// Exact identity, time, or frontier mismatch.
         reason: String,
     },
+
+    /// A fresh canonical build is incomplete or changed during cold validation.
+    #[error("canonical publication refused: {reason}")]
+    PublicationRefused {
+        /// Exact missing prerequisite or validation mismatch.
+        reason: String,
+    },
+
+    /// The atomic write returned an error, so admission must determine whether it committed.
+    #[error("canonical publication write outcome is unknown for {path:?}")]
+    PublicationWriteOutcomeUnknown {
+        /// Store path that must be reopened through normal admission.
+        path: PathBuf,
+        /// Underlying atomic write failure.
+        #[source]
+        source: rust_rocksdb::Error,
+    },
+
+    /// The atomic write committed but its immediate readback could not certify it.
+    #[error(
+        "canonical publication committed but immediate verification failed for {path:?}: {reason}"
+    )]
+    PublicationCommittedButUnverified {
+        /// Store path that must be reopened through normal admission.
+        path: PathBuf,
+        /// Immediate verification failure.
+        reason: String,
+    },
 }
 
 impl CanonicalStoreError {
@@ -543,6 +574,12 @@ impl CanonicalStoreError {
 
     fn source_tip_checkpoint(reason: impl Into<String>) -> Self {
         Self::SourceTipCheckpointMismatch {
+            reason: reason.into(),
+        }
+    }
+
+    fn publication(reason: impl Into<String>) -> Self {
+        Self::PublicationRefused {
             reason: reason.into(),
         }
     }
@@ -600,7 +637,7 @@ pub(crate) fn test_checkpoint_frontiers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zinder_core::{CommitmentTreeFrontier, Network};
+    use zinder_core::{BlockHash, CommitmentTreeFrontier, Network};
 
     #[test]
     fn complete_build_plan_preserves_genesis_anchor_and_tip()

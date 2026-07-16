@@ -33,14 +33,14 @@ use super::{
 pub struct RocksDbCanonicalBuilder {
     pub(super) store_path: PathBuf,
     pub(super) bounded_open: BoundedRocksDbOpen,
-    resource_budget: RocksDbResourceBudget,
-    network: Network,
-    workload: CanonicalStoreWorkload,
-    build_plan: CanonicalStoreBuildPlan,
-    canonical_block_evidence: Option<CanonicalBlockLoadEvidence>,
-    subtree_root_evidence: Option<CanonicalSubtreeRootLoadEvidence>,
-    confirmed_source_tip_checkpoint: Option<zinder_core::CommitmentTreeCheckpoint>,
-    _cursor_auth_key: [u8; 32],
+    pub(super) resource_budget: RocksDbResourceBudget,
+    pub(super) network: Network,
+    pub(super) workload: CanonicalStoreWorkload,
+    pub(super) build_plan: CanonicalStoreBuildPlan,
+    pub(super) canonical_block_evidence: Option<CanonicalBlockLoadEvidence>,
+    pub(super) subtree_root_evidence: Option<CanonicalSubtreeRootLoadEvidence>,
+    pub(super) confirmed_source_tip_checkpoint: Option<zinder_core::CommitmentTreeCheckpoint>,
+    pub(super) cursor_auth_key: [u8; 32],
 }
 
 impl RocksDbCanonicalBuilder {
@@ -82,7 +82,7 @@ impl RocksDbCanonicalBuilder {
             canonical_block_evidence: None,
             subtree_root_evidence: None,
             confirmed_source_tip_checkpoint: None,
-            _cursor_auth_key: cursor_auth_key,
+            cursor_auth_key,
         })
     }
 
@@ -320,9 +320,14 @@ impl Drop for FreshCanonicalBlockStaging {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        env,
+        path::Path,
+        process::{Command, Stdio},
+    };
 
     use prost::Message;
+    use rust_rocksdb::DB;
     use tempfile::TempDir;
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
@@ -337,9 +342,18 @@ mod tests {
 
     use super::*;
     use crate::canonical_store::{
-        block_load::canonical_block_families_are_empty, block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
-        rocksdb::BLOCK_HASH_INDEX_COLUMN_FAMILY,
+        block_load::canonical_block_families_are_empty,
+        block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+        control::{decode_store_control, encode_ready_store_control},
+        rocksdb::{
+            BLOCK_HASH_INDEX_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
+            CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY, STORE_CONTROL_KEY,
+        },
     };
+    use crate::{CanonicalStoreBuildState, RocksDbCanonicalStore};
+
+    const PUBLICATION_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_FAILPOINT";
+    const PUBLICATION_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_STORE_PATH";
 
     #[test]
     fn builder_refuses_every_existing_path() -> Result<(), Box<dyn std::error::Error>> {
@@ -446,6 +460,265 @@ mod tests {
             store.load_subtree_roots(std::iter::empty()),
             Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn publication_requires_every_authenticated_build_phase()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
+
+        let error = store
+            .validate_for_publication()
+            .err()
+            .ok_or("an empty BUILDING store must not validate")?;
+
+        assert!(matches!(
+            error,
+            CanonicalStoreError::PublicationRefused { .. }
+        ));
+        let error = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("failed validation must leave the store BUILDING")?;
+        assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn explorer_publication_waits_for_required_daily_family_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store = RocksDbCanonicalBuilder::create_fresh(
+            temporary.path().join("explorer"),
+            CanonicalStoreWorkload::Explorer,
+            complete_build_plan()?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+
+        let error = store
+            .validate_for_publication()
+            .err()
+            .ok_or("explorer READY must require daily value-pool evidence")?;
+
+        assert!(error.to_string().contains("daily value-pool evidence"));
+        Ok(())
+    }
+
+    #[test]
+    fn cold_validation_publishes_and_reopens_exact_baseline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = complete_loaded_builder(&store_path)?;
+
+        let validated = store.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let published = validated.publish_baseline(publication)?;
+
+        assert_eq!(published.ready_evidence().visible_epoch.value(), 1);
+        assert_eq!(published.ready_evidence().baseline_block_count, 2);
+        assert_eq!(
+            published.ready_evidence().visible_tip.height,
+            BlockHeight::new(2)
+        );
+        drop(published);
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(reopened.ready_evidence().visible_epoch.value(), 1);
+        assert_eq!(
+            reopened.ready_evidence().visible_tip.hash,
+            BlockHash::from_bytes([2; 32])
+        );
+        Ok(())
+    }
+    #[test]
+    fn publication_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(store_path) = env::var_os(PUBLICATION_STORE_PATH_ENV) else {
+            return Ok(());
+        };
+        let store_path = Path::new(&store_path);
+        let validated = complete_loaded_builder(store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let _published = validated.publish_baseline(publication)?;
+        Err("publication failpoint did not abort the child process".into())
+    }
+
+    #[test]
+    fn publication_crashes_preserve_the_atomic_build_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        for failpoint in [
+            "after_flush",
+            "after_builder_drop",
+            "after_cold_validation",
+            "before_atomic_write",
+        ] {
+            let store_path = temporary.path().join(failpoint);
+            run_publication_crash_child(&store_path, failpoint)?;
+            assert_building_without_baseline(&store_path)?;
+        }
+
+        let committed_path = temporary.path().join("after_atomic_write");
+        run_publication_crash_child(&committed_path, "after_atomic_write")?;
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &committed_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(reopened.ready_evidence().visible_epoch.value(), 1);
+        assert_eq!(reopened.ready_evidence().visible_event_sequence, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ready_open_rejects_missing_atomic_baseline_member() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = complete_loaded_builder(&store_path)?;
+        let validated = store.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let published = validated.publish_baseline(publication)?;
+        drop(published);
+
+        let column_families = DB::list_cf(&rust_rocksdb::Options::default(), &store_path)?;
+        assert_eq!(
+            column_families.len(),
+            CANONICAL_DATA_COLUMN_FAMILIES.len() + 1
+        );
+        let db = DB::open_cf(
+            &rust_rocksdb::Options::default(),
+            &store_path,
+            &column_families,
+        )?;
+        let event_family = db
+            .cf_handle(CHAIN_EVENT_COLUMN_FAMILY)
+            .ok_or("chain event family must exist")?;
+        db.delete_cf(&event_family, 1_u64.to_be_bytes())?;
+        drop(event_family);
+        db.flush_wal(true)?;
+        drop(db);
+
+        let error = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("READY without event 1 must fail admission")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreError::PublicationRefused { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn ready_open_rejects_wrong_first_retained_block_hash() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        drop(validated.publish_baseline(publication)?);
+
+        let column_families = DB::list_cf(&rust_rocksdb::Options::default(), &store_path)?;
+        let db = DB::open_cf(
+            &rust_rocksdb::Options::default(),
+            &store_path,
+            &column_families,
+        )?;
+        let encoded_control = db
+            .get(STORE_CONTROL_KEY)?
+            .ok_or("READY control must exist")?;
+        let decoded_control = decode_store_control(&store_path, &encoded_control)?;
+        let CanonicalStoreBuildState::Ready(mut wrong_evidence) = decoded_control.build_state
+        else {
+            return Err("published control must be READY".into());
+        };
+        wrong_evidence.first_retained_block =
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([9; 32]));
+        db.put(
+            STORE_CONTROL_KEY,
+            encode_ready_store_control(
+                decoded_control.workload,
+                &decoded_control.build_plan,
+                decoded_control.cursor_auth_key,
+                wrong_evidence,
+            )?,
+        )?;
+        db.flush_wal(true)?;
+        drop(db);
+
+        let error = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("wrong first retained block hash must fail admission")?;
+        assert!(error.to_string().contains("first retained block"));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_baseline_input_can_be_corrected_without_rebuilding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = complete_loaded_builder(&store_path)?;
+
+        let validated = store.validate_for_publication()?;
+        let error = validated
+            .prepare_baseline(crate::CanonicalBaselinePublication::new(
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([9; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+            ))
+            .err()
+            .ok_or("a settled tip with the wrong hash must be rejected")?;
+
+        assert!(matches!(
+            error,
+            CanonicalStoreError::PublicationRefused { .. }
+        ));
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let published = validated.publish_baseline(publication)?;
+        drop(published);
+        RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
         Ok(())
     }
 
@@ -817,6 +1090,81 @@ mod tests {
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?)
+    }
+
+    fn complete_loaded_builder(
+        path: &Path,
+    ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
+        let mut store = create_building_store(path, CanonicalHistoryBounds::complete())?;
+        let first = canonical_build_block(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        let mut tip = canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32]);
+        add_tree_state_checkpoint(&mut tip)?;
+        store.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok(tip)])?;
+        store.load_subtree_roots(std::iter::empty())?;
+        store.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            2,
+            zinder_core::CommitmentTreeFrontiers::default(),
+        ))?;
+        Ok(store)
+    }
+
+    fn run_publication_crash_child(
+        store_path: &Path,
+        failpoint: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new(env::current_exe()?)
+            .arg("--exact")
+            .arg("canonical_store::builder::tests::publication_crash_child_process")
+            .arg("--nocapture")
+            .env(PUBLICATION_STORE_PATH_ENV, store_path)
+            .env(PUBLICATION_FAILPOINT_ENV, failpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            return Err(format!("publication failpoint {failpoint} did not crash").into());
+        }
+        Ok(())
+    }
+
+    fn assert_building_without_baseline(
+        store_path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = RocksDbCanonicalStore::open_ready(
+            store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("pre-publication crash must not open READY")?;
+        if !matches!(error, CanonicalStoreError::StoreNotReady { .. }) {
+            return Err(error.into());
+        }
+        let column_families = DB::list_cf(&rust_rocksdb::Options::default(), store_path)?;
+        let db = DB::open_cf_for_read_only(
+            &rust_rocksdb::Options::default(),
+            store_path,
+            &column_families,
+            false,
+        )?;
+        for name in [CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY] {
+            let family = db.cf_handle(name).ok_or("baseline family must exist")?;
+            if db
+                .iterator_cf(&family, rust_rocksdb::IteratorMode::Start)
+                .next()
+                .is_some()
+            {
+                return Err(format!("{name} must remain empty before atomic publication").into());
+            }
+        }
+        Ok(())
     }
 
     fn complete_build_plan() -> Result<CanonicalStoreBuildPlan, Box<dyn std::error::Error>> {

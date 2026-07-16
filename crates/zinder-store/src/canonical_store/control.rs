@@ -24,7 +24,7 @@ const FRONTIER_PRESENT: u8 = 1;
 const ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH: usize = 2 + 32;
 const HISTORY_FIXED_FIELDS_LENGTH: usize = 1 + 4 + 32 + 4 + 3;
 const BUILD_TIP_FIELDS_LENGTH: usize = 4 + 32;
-const READY_FIELDS_LENGTH: usize = 4 + 32 + 4 + 32 + 8 + 8 + 2 + 4 + 2 + 32 + 8;
+const READY_FIELDS_LENGTH: usize = 4 + 32 + 4 + 32 + 8 + 8 + 8 + 2 + 4 + 2 + 32 + 8;
 const STORE_CONTROL_MINIMUM_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + 2
     + 4
@@ -46,6 +46,46 @@ pub(super) struct DecodedStoreControl {
 }
 
 pub(super) fn encode_building_store_control(
+    workload: CanonicalStoreWorkload,
+    build_plan: &CanonicalStoreBuildPlan,
+    cursor_auth_key: [u8; 32],
+) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
+    let mut encoded = encode_store_control_prefix(workload, build_plan, cursor_auth_key)?;
+    encoded.push(BUILDING_STATE);
+    encoded.resize(encoded.len() + READY_FIELDS_LENGTH, 0);
+    Ok(encoded)
+}
+
+pub(super) fn encode_ready_store_control(
+    workload: CanonicalStoreWorkload,
+    build_plan: &CanonicalStoreBuildPlan,
+    cursor_auth_key: [u8; 32],
+    ready_evidence: CanonicalStoreReadyEvidence,
+) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
+    let mut encoded = encode_store_control_prefix(workload, build_plan, cursor_auth_key)?;
+    encoded.push(READY_STATE);
+    encoded.extend_from_slice(
+        &ready_evidence
+            .first_retained_block
+            .height
+            .value()
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&ready_evidence.first_retained_block.hash.as_bytes());
+    encoded.extend_from_slice(&ready_evidence.visible_tip.height.value().to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.visible_tip.hash.as_bytes());
+    encoded.extend_from_slice(&ready_evidence.visible_epoch.value().to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.visible_event_sequence.to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.baseline_block_count.to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.block_digest_version.value().to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.replay_format_version.value().to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.sequence_digest_version.value().to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.baseline_sequence_digest);
+    encoded.extend_from_slice(&ready_evidence.baseline_logical_fact_bytes.to_le_bytes());
+    Ok(encoded)
+}
+
+fn encode_store_control_prefix(
     workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
@@ -90,8 +130,6 @@ pub(super) fn encode_building_store_control(
     encoded.extend_from_slice(&build_plan.build_tip().height.value().to_le_bytes());
     encoded.extend_from_slice(&build_plan.build_tip().hash.as_bytes());
     encoded.extend_from_slice(&cursor_auth_key);
-    encoded.push(BUILDING_STATE);
-    encoded.resize(encoded.len() + READY_FIELDS_LENGTH, 0);
     Ok(encoded)
 }
 
@@ -326,10 +364,11 @@ impl<'encoded> Decoder<'encoded> {
     ) -> Result<CanonicalStoreReadyEvidence, CanonicalStoreError> {
         let first_height = self.read_u32("first height")?;
         let first_hash = self.read_array::<32>("first hash")?;
-        let tip_height = self.read_u32("tip height")?;
-        let tip_hash = self.read_array::<32>("tip hash")?;
+        let visible_tip_height = self.read_u32("visible tip height")?;
+        let visible_tip_hash = self.read_array::<32>("visible tip hash")?;
         let visible_epoch = self.read_u64("visible epoch")?;
-        let block_count = self.read_u64("block count")?;
+        let visible_event_sequence = self.read_u64("visible event sequence")?;
+        let baseline_block_count = self.read_u64("baseline block count")?;
         let block_digest_version =
             CanonicalBlockFactsDigestVersion::try_from(self.read_u16("block digest version")?)
                 .map_err(|source| CanonicalStoreError::admission(self.path, source.to_string()))?;
@@ -340,25 +379,28 @@ impl<'encoded> Decoder<'encoded> {
             self.read_u16("sequence digest version")?,
         )
         .map_err(|source| CanonicalStoreError::admission(self.path, source.to_string()))?;
-        let sequence_digest = self.read_array::<32>("sequence digest")?;
-        let logical_fact_bytes = self.read_u64("logical fact bytes")?;
+        let baseline_sequence_digest = self.read_array::<32>("baseline sequence digest")?;
+        let baseline_logical_fact_bytes = self.read_u64("baseline logical fact bytes")?;
 
-        let expected_block_count = tip_height
+        let expected_block_count = build_tip
+            .height
+            .value()
             .checked_sub(first_height)
             .map(u64::from)
             .and_then(|height_span| height_span.checked_add(1));
         if first_height != history_bounds.first_available_height().value()
-            || tip_height != build_tip.height.value()
-            || tip_hash != build_tip.hash.as_bytes()
-            || visible_epoch == 0
-            || expected_block_count != Some(block_count)
+            || visible_tip_height != build_tip.height.value()
+            || visible_tip_hash != build_tip.hash.as_bytes()
+            || visible_epoch != 1
+            || visible_event_sequence != 1
+            || expected_block_count != Some(baseline_block_count)
         {
             return Err(CanonicalStoreError::admission(
                 self.path,
                 "ready store control has an invalid chain position",
             ));
         }
-        if logical_fact_bytes == 0 {
+        if baseline_logical_fact_bytes == 0 {
             return Err(CanonicalStoreError::admission(
                 self.path,
                 "ready store control is missing validation evidence",
@@ -374,17 +416,22 @@ impl<'encoded> Decoder<'encoded> {
             ));
         }
         Ok(CanonicalStoreReadyEvidence {
-            first_height: BlockHeight::new(first_height),
-            first_hash: BlockHash::from_bytes(first_hash),
-            tip_height: BlockHeight::new(tip_height),
-            tip_hash: BlockHash::from_bytes(tip_hash),
+            first_retained_block: BlockId::new(
+                BlockHeight::new(first_height),
+                BlockHash::from_bytes(first_hash),
+            ),
+            visible_tip: BlockId::new(
+                BlockHeight::new(visible_tip_height),
+                BlockHash::from_bytes(visible_tip_hash),
+            ),
             visible_epoch: ChainEpochId::new(visible_epoch),
-            block_count,
+            visible_event_sequence,
+            baseline_block_count,
             block_digest_version,
             replay_format_version,
             sequence_digest_version,
-            sequence_digest,
-            logical_fact_bytes,
+            baseline_sequence_digest,
+            baseline_logical_fact_bytes,
         })
     }
 
@@ -530,6 +577,18 @@ mod tests {
         let encoded = valid_ready_control();
         let decoded_ready = decode_store_control(Path::new("canonical"), &encoded)?;
         assert_eq!(decoded_ready, expected_ready_control());
+        let CanonicalStoreBuildState::Ready(ready_evidence) = decoded_ready.build_state else {
+            return Err("ready fixture decoded as BUILDING".into());
+        };
+        assert_eq!(
+            encode_ready_store_control(
+                decoded_ready.workload,
+                &decoded_ready.build_plan,
+                decoded_ready.cursor_auth_key,
+                ready_evidence,
+            )?,
+            encoded
+        );
 
         let building_plan = complete_build_plan(Network::ZcashTestnet);
         let building_control = encode_building_store_control(
@@ -552,12 +611,14 @@ mod tests {
         let visible_epoch = ready_fields + 4 + 32 + 4 + 32;
         let mut changed_epoch = encoded.clone();
         changed_epoch[visible_epoch..visible_epoch + 8].copy_from_slice(&2_u64.to_le_bytes());
-        assert_ne!(
-            decode_store_control(Path::new("canonical"), &changed_epoch)?,
-            decoded_ready
-        );
+        assert!(decode_store_control(Path::new("canonical"), &changed_epoch).is_err());
 
-        let block_count = visible_epoch + 8;
+        let visible_event_sequence = visible_epoch + 8;
+        let mut missing_event_sequence = encoded.clone();
+        missing_event_sequence[visible_event_sequence..visible_event_sequence + 8].fill(0);
+        assert!(decode_store_control(Path::new("canonical"), &missing_event_sequence).is_err());
+
+        let block_count = visible_event_sequence + 8;
         let mut wrong_count = encoded.clone();
         wrong_count[block_count..block_count + 8].copy_from_slice(&1_u64.to_le_bytes());
         let error = decode_store_control(Path::new("canonical"), &wrong_count)
@@ -738,6 +799,7 @@ mod tests {
         encoded.extend_from_slice(&2_u32.to_le_bytes());
         encoded.extend_from_slice(&[2; 32]);
         encoded.extend_from_slice(&1_u64.to_le_bytes());
+        encoded.extend_from_slice(&1_u64.to_le_bytes());
         encoded.extend_from_slice(&2_u64.to_le_bytes());
         encoded.extend_from_slice(&CanonicalBlockFactsDigestVersion::V1.value().to_le_bytes());
         encoded.extend_from_slice(&CanonicalBlockReplayFormatVersion::V1.value().to_le_bytes());
@@ -759,17 +821,19 @@ mod tests {
             build_plan: complete_build_plan(Network::ZcashTestnet),
             cursor_auth_key: CURSOR_AUTH_KEY,
             build_state: CanonicalStoreBuildState::Ready(CanonicalStoreReadyEvidence {
-                first_height: BlockHeight::new(1),
-                first_hash: BlockHash::from_bytes([1; 32]),
-                tip_height: BlockHeight::new(2),
-                tip_hash: BlockHash::from_bytes([2; 32]),
+                first_retained_block: BlockId::new(
+                    BlockHeight::new(1),
+                    BlockHash::from_bytes([1; 32]),
+                ),
+                visible_tip: BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
                 visible_epoch: ChainEpochId::new(1),
-                block_count: 2,
+                visible_event_sequence: 1,
+                baseline_block_count: 2,
                 block_digest_version: CanonicalBlockFactsDigestVersion::V1,
                 replay_format_version: CanonicalBlockReplayFormatVersion::V1,
                 sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
-                sequence_digest: [3; 32],
-                logical_fact_bytes: 1,
+                baseline_sequence_digest: [3; 32],
+                baseline_logical_fact_bytes: 1,
             }),
         }
     }
