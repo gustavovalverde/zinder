@@ -12,6 +12,8 @@ source_cookie_volume="${ZINDER_SOURCE_COOKIE_VOLUME_NAME:-z3-testnet-cookie}"
 source_chain_volume="${ZINDER_SOURCE_CHAIN_VOLUME_NAME:-z3-testnet-chain}"
 network="${ZINDER_NETWORK:-zcash-testnet}"
 tip_height="${ZINDER_STORAGE_LIFECYCLE_TIP_HEIGHT:-}"
+cpu_limit_cores="${ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES:-10}"
+memory_limit_bytes="${ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES:-10737418240}"
 
 fail() {
   echo >&2 "RocksDB storage lifecycle refused to run: $*"
@@ -30,6 +32,27 @@ for required_command in docker jq; do
   command -v "$required_command" >/dev/null 2>&1 || fail "$required_command is required"
 done
 docker compose version >/dev/null 2>&1 || fail "Docker Compose is required"
+[[ "$cpu_limit_cores" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail \
+  "ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES must be a positive number"
+jq -en --argjson value "$cpu_limit_cores" '$value > 0' >/dev/null || fail \
+  "ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES must be greater than zero"
+[[ "$memory_limit_bytes" =~ ^[1-9][0-9]*$ ]] || fail \
+  "ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES must be a positive integer"
+docker_cpu_capacity="$(docker info --format '{{.NCPU}}')" || fail \
+  "could not inspect Docker's CPU capacity"
+docker_memory_capacity_bytes="$(docker info --format '{{.MemTotal}}')" || fail \
+  "could not inspect Docker's memory capacity"
+[[ "$docker_cpu_capacity" =~ ^[1-9][0-9]*$ ]] || fail \
+  "Docker reported a malformed CPU capacity: $docker_cpu_capacity"
+[[ "$docker_memory_capacity_bytes" =~ ^[1-9][0-9]*$ ]] || fail \
+  "Docker reported a malformed memory capacity: $docker_memory_capacity_bytes"
+jq -en \
+  --argjson requested "$cpu_limit_cores" \
+  --argjson capacity "$docker_cpu_capacity" \
+  '$requested <= $capacity' >/dev/null || fail \
+  "CPU limit $cpu_limit_cores exceeds Docker's $docker_cpu_capacity available cores"
+[[ "$memory_limit_bytes" -le "$docker_memory_capacity_bytes" ]] || fail \
+  "memory limit $memory_limit_bytes exceeds Docker's $docker_memory_capacity_bytes available bytes"
 docker network inspect "$source_network" >/dev/null 2>&1 || fail \
   "source network does not exist: $source_network"
 docker volume inspect "$source_cookie_volume" >/dev/null 2>&1 || fail \
@@ -67,7 +90,7 @@ if [[ -z "${ZINDER_STORAGE_LIFECYCLE_SOFTWARE_REVISION:-}" ]] \
 fi
 software_revision="${ZINDER_STORAGE_LIFECYCLE_SOFTWARE_REVISION:-$(git -C "$repository_root" rev-parse HEAD)}"
 trial_id="${ZINDER_STORAGE_LIFECYCLE_TRIAL_ID:-testnet-$(date -u +%Y%m%dT%H%M%SZ)}"
-runner_id="${ZINDER_STORAGE_LIFECYCLE_RUNNER_ID:-local-docker-desktop-12cpu-32gib}"
+runner_id="${ZINDER_STORAGE_LIFECYCLE_RUNNER_ID:-local-docker-desktop}"
 storage_class="${ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS:-docker-desktop-local-volume}"
 
 [[ "$software_revision" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || fail \
@@ -89,6 +112,8 @@ export ZINDER_STORAGE_LIFECYCLE_UID="${ZINDER_STORAGE_LIFECYCLE_UID:-$(id -u)}"
 export ZINDER_STORAGE_LIFECYCLE_GID="${ZINDER_STORAGE_LIFECYCLE_GID:-$(id -g)}"
 export ZINDER_STORAGE_LIFECYCLE_RUNNER_ID="$runner_id"
 export ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS="$storage_class"
+export ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES="$cpu_limit_cores"
+export ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES="$memory_limit_bytes"
 export ZINDER_SOURCE_NETWORK_NAME="$source_network"
 export ZINDER_SOURCE_COOKIE_VOLUME_NAME="$source_cookie_volume"
 
@@ -100,7 +125,12 @@ jq -e \
   --arg source_cookie "$source_cookie_volume" \
   --arg evidence_path "$evidence_path" \
   --arg image "$resolved_image_id" \
-  --arg tip_height "$tip_height" '
+  --arg tip_height "$tip_height" \
+  --arg cpu_limit_cores_text "$cpu_limit_cores" \
+  --argjson cpu_limit_cores "$cpu_limit_cores" \
+  --arg memory_limit_bytes "$memory_limit_bytes" \
+  --arg runner_id "$runner_id" \
+  --arg storage_class "$storage_class" '
   def command_argument($flag):
     (.command | index($flag)) as $argument_index
     | if $argument_index == null then null else .command[$argument_index + 1] end;
@@ -128,6 +158,8 @@ jq -e \
     | .image == $image
       and .read_only == true
       and .cgroup == "private"
+      and .cpus == $cpu_limit_cores
+      and .mem_limit == $memory_limit_bytes
       and .init == true
       and .restart == "no"
       and (.networks | keys) == ["source"]
@@ -165,6 +197,10 @@ jq -e \
       and .environment.ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE == "true"
       and .command[0] == "rocksdb-storage-lifecycle"
       and command_argument("--tip-height") == $tip_height
+      and command_argument("--cpu-limit-cores") == $cpu_limit_cores_text
+      and command_argument("--memory-limit-bytes") == $memory_limit_bytes
+      and command_argument("--runner-id") == $runner_id
+      and command_argument("--storage-class") == $storage_class
       and command_argument("--canonical-store")
         == "/var/lib/zinder/canonical-state/canonical"
       and command_argument("--wallet-store") == "/var/lib/zinder/wallet-state/wallet"
@@ -209,7 +245,11 @@ find "$evidence_path" -mindepth 1 -maxdepth 1 -type f \
   "$resolved_image_id" \
   "$software_revision" \
   "$trial_id" \
-  "$network"
+  "$network" \
+  "$cpu_limit_cores" \
+  "$memory_limit_bytes" \
+  "$runner_id" \
+  "$storage_class"
 
 echo "RocksDB storage lifecycle passed"
 echo "report: $evidence_path/rocksdb-storage-lifecycle.json"

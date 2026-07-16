@@ -8,11 +8,11 @@ fail() {
 
 usage() {
   echo >&2 \
-    "usage: $0 REPORT RESOURCE_EVIDENCE EXPECTED_TIP EXPECTED_IMAGE EXPECTED_REVISION EXPECTED_TRIAL EXPECTED_NETWORK"
+    "usage: $0 REPORT RESOURCE_EVIDENCE EXPECTED_TIP EXPECTED_IMAGE EXPECTED_REVISION EXPECTED_TRIAL EXPECTED_NETWORK EXPECTED_CPU_LIMIT_CORES EXPECTED_MEMORY_LIMIT_BYTES EXPECTED_RUNNER_ID EXPECTED_STORAGE_CLASS"
   exit 2
 }
 
-[[ "$#" -eq 7 ]] || usage
+[[ "$#" -eq 11 ]] || usage
 
 report_path="$1"
 resource_evidence_path="$2"
@@ -21,6 +21,10 @@ expected_image_reference="$4"
 expected_software_revision="$5"
 expected_trial_id="$6"
 expected_network="$7"
+expected_cpu_limit_cores="$8"
+expected_memory_limit_bytes="$9"
+expected_runner_id="${10}"
+expected_storage_class="${11}"
 
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 for evidence_file in "$report_path" "$resource_evidence_path"; do
@@ -37,6 +41,14 @@ done
   "expected trial ID is not a valid evidence identifier"
 [[ "$expected_network" == "zcash-testnet" ]] || fail \
   "this validator accepts only the testnet lifecycle contract"
+[[ "$expected_cpu_limit_cores" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail \
+  "expected CPU limit must be a positive number"
+[[ "$expected_memory_limit_bytes" =~ ^[1-9][0-9]*$ ]] || fail \
+  "expected memory limit must be a positive integer"
+[[ "$expected_runner_id" =~ ^[[:alnum:]][[:alnum:]._-]*$ ]] || fail \
+  "expected runner ID is not a valid evidence identifier"
+[[ "$expected_storage_class" =~ ^[[:alnum:]][[:alnum:]._-]*$ ]] || fail \
+  "expected storage class is not a valid evidence identifier"
 
 jq -e \
   --slurpfile resources "$resource_evidence_path" \
@@ -44,7 +56,11 @@ jq -e \
   --arg expected_image_reference "$expected_image_reference" \
   --arg expected_software_revision "$expected_software_revision" \
   --arg expected_trial_id "$expected_trial_id" \
-  --arg expected_network "$expected_network" '
+  --arg expected_network "$expected_network" \
+  --argjson expected_cpu_limit_cores "$expected_cpu_limit_cores" \
+  --argjson expected_memory_limit_bytes "$expected_memory_limit_bytes" \
+  --arg expected_runner_id "$expected_runner_id" \
+  --arg expected_storage_class "$expected_storage_class" '
   def exact_keys($expected): (keys | sort) == ($expected | sort);
   def nonnegative_integer:
     type == "number" and . >= 0 and . == floor;
@@ -56,8 +72,6 @@ jq -e \
     type == "number" and . >= 0;
   def hex_bytes($bytes):
     type == "string" and length == ($bytes * 2) and test("^[0-9a-f]+$");
-  def evidence_id:
-    type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$");
   def utc_timestamp:
     type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
   def block_id:
@@ -278,10 +292,12 @@ jq -e \
         and .completed_at_unix_millis >= .started_at_unix_millis)
       and (.runner
         | exact_keys(["cpu_limit_cores", "id", "memory_limit_bytes", "storage_class"])
-        and (.id | evidence_id)
+        and .id == $expected_runner_id
         and (.cpu_limit_cores | positive_number)
+        and .cpu_limit_cores == $expected_cpu_limit_cores
         and (.memory_limit_bytes | positive_integer)
-        and (.storage_class | evidence_id)))
+        and .memory_limit_bytes == $expected_memory_limit_bytes
+        and .storage_class == $expected_storage_class))
     and (.source
       | exact_keys([
           "family",

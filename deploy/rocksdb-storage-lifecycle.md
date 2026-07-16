@@ -83,11 +83,17 @@ jq '{
 }' .tmp/rocksdb-storage-lifecycle-evidence/rocksdb-storage-lifecycle.json
 ```
 
-The default local envelope is 12 CPUs and 32 GiB of memory. Override
-`ZINDER_STORAGE_LIFECYCLE_CPUS`, `ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES`,
-and `ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS` together when comparing another
+The default local envelope is 10 CPU cores and 10 GiB of memory, leaving Docker
+Desktop headroom on the reference development machine. The runner refuses a
+limit above Docker's advertised capacity before it creates any containers.
+Override `ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES`,
+`ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES`, and
+`ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS` together when comparing another
 machine or deployment class. Source concurrency and byte-watermark variables
-are exposed for measured tuning; every report records the effective limits.
+are exposed for measured tuning; every report records the effective limits,
+and the validator requires them to match the requested Compose envelope.
+The CPU value is a container quota, not an exclusive reservation; Zebra shares
+the Docker engine and remains outside the measured lifecycle cgroup.
 
 ## State lifecycle
 

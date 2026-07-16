@@ -58,11 +58,11 @@ const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
 // These ceilings intentionally describe the measured production build, not a
 // hidden unbounded allocation. Sorters use their limits independently and the
 // cold validator runs after sorting has released its memory.
-const WALLET_OUTPOINT_SORT_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 2 * 1024 * 1024 * 1024;
+const WALLET_OUTPOINT_SORT_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 1024 * 1024 * 1024;
 const WALLET_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 64 * 1024 * 1024 * 1024;
 const WALLET_SST_TARGET_LOGICAL_BYTES: u64 = 128 * 1024 * 1024;
-const WALLET_ACCOUNTED_REORG_UNDO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const WALLET_ACCOUNTED_REORG_UNDO_BYTES: u64 = 512 * 1024 * 1024;
 
 /// CLI contract for a clean complete-history `RocksDB` storage lifecycle.
 #[derive(Args)]

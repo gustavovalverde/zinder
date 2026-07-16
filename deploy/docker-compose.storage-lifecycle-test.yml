@@ -36,8 +36,8 @@ services:
     read_only: true
     restart: "no"
     cgroup: private
-    cpus: ${ZINDER_STORAGE_LIFECYCLE_CPUS:-12.0}
-    mem_limit: ${ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES:-34359738368}
+    cpus: ${ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES:?set the measured CPU limit in cores}
+    mem_limit: ${ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES:?set the measured memory limit in bytes}
     depends_on:
       state-init:
         condition: service_completed_successfully
@@ -120,9 +120,9 @@ services:
       - --runner-id
       - ${ZINDER_STORAGE_LIFECYCLE_RUNNER_ID:?set the stable host and resource profile identity}
       - --cpu-limit-cores
-      - ${ZINDER_STORAGE_LIFECYCLE_CPUS:-12.0}
+      - ${ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES}
       - --memory-limit-bytes
-      - ${ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES:-34359738368}
+      - ${ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES}
       - --storage-class
       - ${ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS:?set the measured storage class}
       - --image-reference
