@@ -342,6 +342,51 @@ before the Sandblasting range. A defensible complete ETA must stratify stable
 prepared-block and cgroup-CPU deltas by chain era, including a new window around
 height 1.7 million, and then add the final loading and cold-validation phases.
 
+### Dense candidate window
+
+The canary reached the dense range without a restart. A 558.7-second window
+from `17:42:15Z` through `17:51:33Z` covered prepared blocks 1,708,132 through
+1,729,470.
+
+| Measurement | Dense-window result |
+| --- | ---: |
+| Prepared throughput | 38.2 blocks/s |
+| Source-connected throughput | 38.9 blocks/s |
+| Successful source requests | 1.41 requests/s |
+| Response payload | 26.6 MB/s |
+| Average source request | 2.07 s |
+| Average response width | 27.7 blocks |
+| Source-watermark blocks | 0.95/s |
+| Cgroup CPU | 3.41 cores average |
+| CPU per prepared block | 89.2 ms |
+| Memory | 1.30–1.38 GB; 1.46 GB peak |
+| Mounted-filesystem growth | 55.98 GB to 63.71 GB |
+
+The segment target contracted from 31 blocks to 10. The final 106-second
+interval completed only 0.52 requests per second, delivered 13.1 MB/s, and
+prepared 16.9 blocks per second while average request latency reached 5.82
+seconds. CPU was 96.4% user time across the full window, but the container used
+only 3.41 of 10 cores and recorded no throttling. Memory stayed below 15% of
+the limit, and the filesystem retained approximately 427 GB of free space.
+
+Retention behaved as designed: 40 density adjustments caused zero density
+restarts and zero density-triggered discards. They retained 336 in-flight and
+21 completed segment observations, including 588.84 MB of completed responses.
+Oversized responses remained the explicit waste source, causing three
+restarts, 25 in-flight discards, five completed-segment discards, and 180.47 MB
+of discarded completed payload.
+
+At 38.2 blocks per second, the remaining Sandblasting band would take about
+3.25 hours, and the remaining fixed-fence range would take about 12.25 hours if
+the same density persisted. The observed dense rate is 24.8 times below the
+zero-to-tip one-hour target, 3.44 times below the rate needed to give
+Sandblasting the entire hour, and 6.89 times below a 30-minute dense-band
+budget. The candidate fixes discard-on-density amplification, but it does not
+make this era sub-hour-capable. The active bottleneck is still the
+source/admission lane, amplified by response-size variance and the remaining
+oversized-response replans; CPU, memory, throttling, and disk capacity are not
+the limiting resources in this window.
+
 ## Remaining acceptance boundaries
 
 The current canary must finish construction, cold-open the authenticated READY
@@ -354,11 +399,11 @@ cutover, checkpoint restore, dense-range completion evidence, and real-client
 parity remain separate gates. This result is not a claim that
 `rocksdb-single-host`, the Railway canary, or production is certified.
 
-The authenticated dense replay admits the retention candidate and
-402,653,184-byte source budget to the isolated Railway canary. That deployment
-must begin from fresh canary Zinder state because an incomplete construction is
-not a published restart fence. Canary evidence must compare the same dense
-range, record exact source and resource telemetry, and continue far enough to
-produce a defensible full-sync ETA. The local single-run comparison is not
-production configuration certification, and the live certification build is
-not a production traffic experiment.
+The authenticated dense replay admitted the retention candidate and
+402,653,184-byte source budget to the isolated Railway canary. The fresh canary
+confirmed retention behavior and the remaining source/admission limit at the
+live dense boundary. It must still complete construction and cold validation
+before the full end-to-end ETA and resource high-water marks are known. The
+local single-run comparison and partial live construction are not production
+configuration certification, and the canary is not a production traffic
+experiment.
