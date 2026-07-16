@@ -166,6 +166,7 @@ fn recover_staged_store(
     config: &CanonicalRuntimeConfig,
 ) -> Result<Option<RocksDbCanonicalStore>, CanonicalRuntimeError> {
     if !path_exists(staging_path)? {
+        discard_unpublished_block_load_staging(staging_path)?;
         return Ok(None);
     }
     if remove_empty_construction_staging(staging_path)? {
@@ -217,6 +218,7 @@ fn remove_empty_construction_staging(
     {
         return Ok(false);
     }
+    discard_unpublished_block_load_staging(staging_path)?;
     std::fs::remove_dir(staging_path).map_err(|source| CanonicalRuntimeError::PathUnavailable {
         path: staging_path.to_path_buf(),
         source,
@@ -231,6 +233,7 @@ fn remove_empty_construction_staging(
 }
 
 fn remove_unpublished_staging(staging_path: &std::path::Path) -> Result<(), CanonicalRuntimeError> {
+    discard_unpublished_block_load_staging(staging_path)?;
     std::fs::remove_dir_all(staging_path).map_err(|source| {
         CanonicalRuntimeError::PathUnavailable {
             path: staging_path.to_path_buf(),
@@ -243,6 +246,20 @@ fn remove_unpublished_staging(staging_path: &std::path::Path) -> Result<(), Cano
         staging_path = %staging_path.display(),
         "removed an unpublished runtime-owned construction staging directory"
     );
+    Ok(())
+}
+
+fn discard_unpublished_block_load_staging(
+    staging_path: &std::path::Path,
+) -> Result<(), CanonicalRuntimeError> {
+    if RocksDbCanonicalBuilder::discard_unpublished_block_load_staging(staging_path)? {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "canonical_unpublished_block_load_staging_discarded",
+            canonical_build_path = %staging_path.display(),
+            "discarded unpublished runtime-owned canonical block-load staging"
+        );
+    }
     Ok(())
 }
 
@@ -397,7 +414,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::remove_empty_construction_staging;
+    use super::{
+        discard_unpublished_block_load_staging, remove_empty_construction_staging,
+        remove_unpublished_staging,
+    };
 
     #[test]
     fn empty_construction_staging_is_removed() -> Result<(), Box<dyn Error>> {
@@ -419,6 +439,46 @@ mod tests {
 
         assert!(!remove_empty_construction_staging(&staging_path)?);
         assert!(staging_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unpublished_construction_removes_block_load_staging() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let staging_path = tempdir.path().join("store.building");
+        let block_load_staging_path = tempdir.path().join("store.building.block-load-staging");
+        std::fs::create_dir(&staging_path)?;
+        std::fs::create_dir(&block_load_staging_path)?;
+        std::fs::write(block_load_staging_path.join("partial.sst"), b"partial")?;
+
+        remove_unpublished_staging(&staging_path)?;
+
+        assert!(!staging_path.exists());
+        assert!(!block_load_staging_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn orphaned_block_load_staging_is_discarded() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let staging_path = tempdir.path().join("store.building");
+        let block_load_staging_path = tempdir.path().join("store.building.block-load-staging");
+        std::fs::create_dir(&block_load_staging_path)?;
+        std::fs::write(block_load_staging_path.join("partial.sst"), b"partial")?;
+
+        discard_unpublished_block_load_staging(&staging_path)?;
+
+        assert!(!staging_path.exists());
+        assert!(!block_load_staging_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_block_load_staging_is_accepted() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+
+        discard_unpublished_block_load_staging(&tempdir.path().join("store.building"))?;
+
         Ok(())
     }
 }

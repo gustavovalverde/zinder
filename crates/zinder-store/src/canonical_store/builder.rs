@@ -84,6 +84,26 @@ impl RocksDbCanonicalBuilder {
         })
     }
 
+    /// Discards the deterministic block-load staging sibling for a build that
+    /// the caller has already proved is unpublished.
+    ///
+    /// This operation must not be used to infer whether a build is safe to
+    /// discard. Runtime admission owns that decision; the store owns the
+    /// staging-path contract and filesystem error mapping.
+    pub fn discard_unpublished_block_load_staging(
+        store_path: impl AsRef<std::path::Path>,
+    ) -> Result<bool, CanonicalStoreError> {
+        let staging_path = canonical_block_staging_path(store_path.as_ref());
+        match fs::remove_dir_all(&staging_path) {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(CanonicalStoreError::PathUnavailable {
+                path: staging_path,
+                source,
+            }),
+        }
+    }
+
     /// Returns the immutable network persisted by this build.
     #[must_use]
     pub const fn network(&self) -> Network {
@@ -357,6 +377,26 @@ mod tests {
         .err()
         .ok_or("existing path should be rejected")?;
         assert!(matches!(error, CanonicalStoreError::PathNotFresh { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn unpublished_block_load_staging_discard_preserves_build_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical.building");
+        let marker_path = store_path.join("CURRENT");
+        let block_load_staging_path = canonical_block_staging_path(&store_path);
+        std::fs::create_dir(&store_path)?;
+        std::fs::write(&marker_path, b"MANIFEST-000001\n")?;
+        std::fs::create_dir(&block_load_staging_path)?;
+        std::fs::write(block_load_staging_path.join("partial.sst"), b"partial")?;
+
+        assert!(RocksDbCanonicalBuilder::discard_unpublished_block_load_staging(&store_path)?);
+        assert!(store_path.exists());
+        assert_eq!(std::fs::read(marker_path)?, b"MANIFEST-000001\n");
+        assert!(!block_load_staging_path.exists());
+        assert!(!RocksDbCanonicalBuilder::discard_unpublished_block_load_staging(&store_path)?);
         Ok(())
     }
 
