@@ -592,6 +592,23 @@ impl From<zinder_rocksdb::BulkLoadError> for CanonicalStoreError {
             zinder_rocksdb::BulkLoadError::InvalidInput { reason } => {
                 Self::block_load_sequence(reason)
             }
+            zinder_rocksdb::BulkLoadError::AccountedMemoryLimit {
+                limit_bytes,
+                required_bytes,
+            } => Self::block_load_sequence(format!(
+                "bulk-load records require {required_bytes} accounted bytes, limit is {limit_bytes}"
+            )),
+            zinder_rocksdb::BulkLoadError::TemporaryFileLimit {
+                limit_bytes,
+                required_bytes,
+            } => Self::block_load_sequence(format!(
+                "bulk-load runs require {required_bytes} temporary bytes, limit is {limit_bytes}"
+            )),
+            zinder_rocksdb::BulkLoadError::MemoryAllocation { operation, source } => {
+                Self::block_load_sequence(format!(
+                    "bulk-load {operation} allocation failed: {source}"
+                ))
+            }
             zinder_rocksdb::BulkLoadError::PathUnavailable { path, source } => {
                 Self::PathUnavailable { path, source }
             }

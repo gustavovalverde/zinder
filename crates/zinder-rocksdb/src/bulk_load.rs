@@ -11,7 +11,13 @@ use std::{
 use rust_rocksdb::{Options, SstFileWriter};
 use thiserror::Error;
 
-const MAX_MERGE_FAN_IN: usize = 64;
+mod variable_value_sort;
+
+pub use variable_value_sort::{
+    SortedVariableValues, VariableValueRecord, VariableValueSortEvidence, VariableValueSorter,
+};
+
+pub(super) const MAX_MERGE_FAN_IN: usize = 64;
 
 /// Failure while staging opaque ordered records for `RocksDB` ingestion.
 #[derive(Debug, Error)]
@@ -21,6 +27,35 @@ pub enum BulkLoadError {
     InvalidInput {
         /// Stable description of the rejected invariant.
         reason: String,
+    },
+    /// One in-memory record or run would cross its accounted byte ceiling.
+    #[error(
+        "RocksDB bulk-load records require at least {required_bytes} accounted bytes, limit is {limit_bytes}"
+    )]
+    AccountedMemoryLimit {
+        /// Caller-supplied accounted byte ceiling.
+        limit_bytes: u64,
+        /// Minimum accounted bytes required by the refused operation.
+        required_bytes: u64,
+    },
+    /// Run creation or merging would cross the temporary-file byte ceiling.
+    #[error(
+        "RocksDB bulk-load runs require at least {required_bytes} temporary bytes, limit is {limit_bytes}"
+    )]
+    TemporaryFileLimit {
+        /// Caller-supplied temporary-file byte ceiling.
+        limit_bytes: u64,
+        /// Peak temporary bytes required by the refused operation.
+        required_bytes: u64,
+    },
+    /// A bounded staging allocation could not be reserved.
+    #[error("RocksDB bulk-load {operation} allocation failed")]
+    MemoryAllocation {
+        /// Stable allocation label.
+        operation: &'static str,
+        /// Underlying fallible-reservation error.
+        #[source]
+        source: std::collections::TryReserveError,
     },
     /// A staging path could not be read, written, or removed.
     #[error("RocksDB bulk-load path is unavailable: {path}")]

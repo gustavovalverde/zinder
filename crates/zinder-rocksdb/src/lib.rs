@@ -6,5 +6,6 @@
 mod bulk_load;
 
 pub use bulk_load::{
-    BulkLoadError, FixedRecordSorter, OrderedSstWriter, SstFileSet, fixed_record_capacity,
+    BulkLoadError, FixedRecordSorter, OrderedSstWriter, SortedVariableValues, SstFileSet,
+    VariableValueRecord, VariableValueSortEvidence, VariableValueSorter, fixed_record_capacity,
 };
