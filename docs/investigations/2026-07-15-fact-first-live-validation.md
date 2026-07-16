@@ -369,3 +369,68 @@ Density feedback changes the preferred size of newly scheduled requests but
 does not make already bounded, non-overlapping requests invalid. Response-size
 splits must continue to cancel and replan speculative ranges. That change must
 be measured separately at the same fixed fence so its effect is attributable.
+
+## Density-only prefetch retention A/B
+
+Status: accepted as work-efficiency cleanup; elapsed-time gain not demonstrated
+Date: 2026-07-16
+Revision: `e1c5a2769643708a79b8ea5d9e71ab5b2bb822aa`
+Image: `sha256:bd8c8f53066fce107af95a10c9489f73852400b827a3fc7eb489d648c2bc77e3`
+Trial: `testnet-20260716-density-final`
+
+Density statistics target efficient response sizes; they do not invalidate an
+already bounded, contiguous source range. The source scheduler now retains
+completed and in-flight ranges after density-only shrinkage and applies the
+smaller plan at the unscheduled frontier. A response that actually exceeds the
+hard transport cap still records a split, cancels speculative old-size ranges,
+and replans them. Tests prove a completed old range, an in-flight old range,
+adapted tail ranges, exact ordered output, and the separate response-split
+cancellation path.
+
+The final clean run used the same fixed height, hash, 10-core quota, and 10 GiB
+container limit as both preceding runs. Its captured log recorded zero density
+restarts and two response-size restarts. The baseline log recorded 30 density
+restarts and two response-size restarts, with 422 completed segments discarded
+by all restarts plus in-flight work.
+
+| Stage | Readback-only run | Density-retention run | Change |
+| --- | ---: | ---: | ---: |
+| Canonical source load and construction | 5m 21.65s | 5m 22.45s | +0.80s |
+| Canonical cold validation | 2m 18.81s | 2m 33.32s | +14.51s |
+| Canonical storage ready | 7m 40.57s | 7m 55.89s | +15.33s |
+| Wallet canonical scan | 1m 32.61s | 56.42s | -36.19s |
+| Wallet cold validation | 1m 44.32s | 1m 32.04s | -12.28s |
+| Wallet storage ready | 5m 02.60s | 4m 14.73s | -47.87s |
+| Complete storage lifecycle | 12m 43.17s | 12m 10.63s | -32.54s |
+
+The source-load difference is 0.25% and does not demonstrate a speed
+improvement. The larger wallet and validation movement occurred after source
+fetch ended and cannot be attributed to the scheduler change. Local Docker
+storage and cache variance remain the likely explanation, but cache telemetry
+was not captured, so this is an inference. The result supports retaining the
+change for lower upstream work and a cleaner control contract, not advertising
+another throughput gain.
+
+The final run reproduced canonical sequence digest
+`57112f5254593b7c290be4d75a39337959bd0820ee18fa2174286de9bd1d2740`
+and wallet projection digest
+`3ac9577d7ca1e2372c25691e0224e3e93f2c0885aa71955459066ff488499d9a`.
+It rebuilt the same 4,175,080 blocks, 4,786,733 transactions, and wallet row
+counts, with zero historical prevout reads and zero random wallet validation
+reads. The exact private-cgroup peak was 6,503,325,696 bytes, approximately
+6.06 GiB, and sampled allocated storage peaked at 18,082,258,944 bytes,
+approximately 16.84 GiB.
+
+An earlier density-retention attempt completed both stores and produced the
+same semantic digests, but the strict validator rejected its timing provenance:
+the monotonic total exceeded the recorded wall-clock interval by 14
+milliseconds because the benchmark started the monotonic clock first. That
+evidence is not accepted. Revision `e1c5a27` records wall-clock start before
+the measured interval; a fresh 10,000-block smoke and this full-tip run both
+passed the unchanged closed validator.
+
+The next speed work should target the remaining measured costs, not add source
+knobs: canonical cold validation took 153.32 seconds, wallet cold validation
+took 92.04 seconds, and wallet outpoint merge took 79.84 seconds. Any bounded
+parallel validation must preserve ordered replay and report cache state so
+local-volume variance cannot be mistaken for an algorithmic gain.

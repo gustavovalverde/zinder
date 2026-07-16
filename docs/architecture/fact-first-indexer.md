@@ -36,9 +36,12 @@ certifies fresh canonical and wallet storage construction through a fixed
 4.175-million-block testnet tip. The baseline completed in 15 minutes 47.21
 seconds; an exact-fence [readback optimization A/B](../investigations/2026-07-15-fact-first-live-validation.md#canonical-readback-optimization-ab)
 reduced that to 12 minutes 43.17 seconds while preserving both semantic
-digests. It proves the new bounded RocksDB construction and cold-admission
-path, not live following, query serving, restore, reorg execution,
-wallet-client parity, or PostgreSQL.
+digests. A subsequent accepted repetition with density-only prefetch retention
+completed in 12 minutes 10.63 seconds, but its source phase was effectively
+tied; that change removes wasted node work rather than establishing another
+sync-speed gain. The evidence proves the new bounded RocksDB construction and
+cold-admission path, not live following, query serving, restore, reorg
+execution, wallet-client parity, or PostgreSQL.
 
 ## Implementation Status
 
