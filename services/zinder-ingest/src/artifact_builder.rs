@@ -598,12 +598,17 @@ fn prepare_canonical_transactions_from_parsed(
 ) -> Result<PreparedCanonicalTransactions, CanonicalBlockConstructionError> {
     let mut transactions = Vec::with_capacity(parsed_block.transactions.len());
     let mut transaction_blobs = Vec::new();
-    let mut transaction_byte_offset = first_transaction_byte_offset(parsed_block, source_block)?;
+    let (mut transaction_byte_offset, serialized_transaction_sizes_bytes) =
+        transaction_byte_layout(parsed_block, source_block)?;
 
-    for (tx_index_in_block, transaction) in parsed_block.transactions.iter().enumerate() {
+    for ((tx_index_in_block, transaction), serialized_size) in parsed_block
+        .transactions
+        .iter()
+        .enumerate()
+        .zip(serialized_transaction_sizes_bytes)
+    {
         let tx_index_in_block = u32::try_from(tx_index_in_block)
             .map_err(|_| CanonicalBlockConstructionError::TransactionIndexOverflow)?;
-        let serialized_size = transaction.zcash_serialized_size();
         let raw_transaction_bytes = take_transaction_bytes(
             &source_block.raw_block_bytes,
             &mut transaction_byte_offset,
@@ -658,30 +663,37 @@ fn prepare_canonical_transactions_from_parsed(
     })
 }
 
-fn first_transaction_byte_offset(
+fn transaction_byte_layout(
     parsed_block: &ZebraBlock,
     source_block: &SourceBlock,
-) -> Result<usize, CanonicalBlockConstructionError> {
-    let total_transaction_byte_count = parsed_block
-        .transactions
-        .iter()
-        .try_fold(0usize, |total, transaction| {
-            total.checked_add(transaction.zcash_serialized_size())
-        })
+) -> Result<(usize, Vec<usize>), CanonicalBlockConstructionError> {
+    let mut serialized_transaction_sizes_bytes =
+        Vec::with_capacity(parsed_block.transactions.len());
+    let mut total_transaction_bytes = 0usize;
+    for transaction in &parsed_block.transactions {
+        let serialized_size_bytes = transaction.zcash_serialized_size();
+        total_transaction_bytes = total_transaction_bytes
+            .checked_add(serialized_size_bytes)
+            .ok_or(
+                CanonicalBlockConstructionError::TransactionByteRangeMismatch {
+                    block_byte_count: source_block.raw_block_bytes.len(),
+                },
+            )?;
+        serialized_transaction_sizes_bytes.push(serialized_size_bytes);
+    }
+    let first_transaction_byte_offset = source_block
+        .raw_block_bytes
+        .len()
+        .checked_sub(total_transaction_bytes)
         .ok_or(
             CanonicalBlockConstructionError::TransactionByteRangeMismatch {
                 block_byte_count: source_block.raw_block_bytes.len(),
             },
         )?;
-    source_block
-        .raw_block_bytes
-        .len()
-        .checked_sub(total_transaction_byte_count)
-        .ok_or(
-            CanonicalBlockConstructionError::TransactionByteRangeMismatch {
-                block_byte_count: source_block.raw_block_bytes.len(),
-            },
-        )
+    Ok((
+        first_transaction_byte_offset,
+        serialized_transaction_sizes_bytes,
+    ))
 }
 
 fn take_transaction_bytes<'a>(
