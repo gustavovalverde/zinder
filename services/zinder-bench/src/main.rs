@@ -12,7 +12,9 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zinder_bench::{
     BenchError,
+    canonical_fixture_replay::capture_canonical_fixture_replay_plan,
     capture::{CaptureConfig, capture_fixed_range},
+    fixture::FixtureManifest,
     recorder::install_recorder,
     replay::{ProjectionReplayScope, ReplayConfig, replay_fixture},
     report::{AcceptanceThresholds, BenchmarkReport, FixtureCachePolicy},
@@ -21,7 +23,7 @@ use zinder_core::{
     BlockHeight, Network, UnixTimestampMillis, wire::decode_zinder_native_chain_name,
 };
 use zinder_derive::ProjectionPreset;
-use zinder_source::{CookieSource, NodeAuth};
+use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
 #[path = "canonical_fact_round_trip/command.rs"]
 mod fact_round_trip_command;
@@ -50,6 +52,9 @@ struct Cli {
 enum Command {
     /// Capture raw source payloads for a block range into a fixture directory.
     Capture(CaptureArgs),
+    /// Capture predecessor and fixed-tip checkpoints for canonical fixture replay.
+    #[command(name = "capture-canonical-fixture-checkpoints")]
+    CaptureCanonicalFixtureCheckpoints(CaptureCanonicalFixtureCheckpointsArgs),
     /// Replay the current projection-coupled schema over a captured fixture.
     CurrentSchemaReplay(CurrentSchemaReplayArgs),
     /// Persist and read back backend-neutral canonical block facts.
@@ -91,6 +96,28 @@ struct CaptureArgs {
     /// Destination fixture directory.
     #[arg(long = "out")]
     out: PathBuf,
+}
+
+#[derive(Args)]
+struct CaptureCanonicalFixtureCheckpointsArgs {
+    /// Existing captured fixture directory to augment.
+    #[arg(long)]
+    fixture: PathBuf,
+    /// Network name, such as zcash-mainnet.
+    #[arg(long)]
+    network: String,
+    /// Zebra JSON-RPC base URL.
+    #[arg(long = "json-rpc-addr")]
+    json_rpc_addr: String,
+    /// Optional node cookie file path.
+    #[arg(long = "node-auth-cookie")]
+    node_auth_cookie: Option<PathBuf>,
+    /// Per-request source timeout in seconds.
+    #[arg(long = "request-timeout-secs", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
+    request_timeout_secs: u64,
+    /// Maximum JSON-RPC response body size in bytes.
+    #[arg(long = "max-response-bytes", default_value_t = DEFAULT_MAX_RESPONSE_BYTES)]
+    max_response_bytes: u64,
 }
 
 #[derive(Args)]
@@ -231,6 +258,9 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), BenchError> {
     match cli.command {
         Command::Capture(args) => run_capture(args).await,
+        Command::CaptureCanonicalFixtureCheckpoints(args) => {
+            run_capture_canonical_fixture_checkpoints(args).await
+        }
         Command::CurrentSchemaReplay(args) => run_current_schema_replay(args).await,
         Command::CanonicalFactsRoundTrip(args) => {
             let output = run_canonical_facts_round_trip(args).await?;
@@ -243,6 +273,45 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             output.report.validate()
         }
     }
+}
+
+async fn run_capture_canonical_fixture_checkpoints(
+    args: CaptureCanonicalFixtureCheckpointsArgs,
+) -> Result<(), BenchError> {
+    let network = parse_network(&args.network)?;
+    let manifest = FixtureManifest::read(&args.fixture)?;
+    if manifest.network_typed()? != network {
+        return Err(BenchError::invalid_argument(
+            "--network does not match the captured fixture network",
+        ));
+    }
+    let node_auth = args.node_auth_cookie.map_or(NodeAuth::None, |path| {
+        NodeAuth::Cookie(CookieSource::File(path))
+    });
+    let source = ZebraJsonRpcSource::with_options(
+        network,
+        &args.json_rpc_addr,
+        node_auth,
+        ZebraJsonRpcSourceOptions {
+            request_timeout: Duration::from_secs(args.request_timeout_secs),
+            max_response_bytes: require_nonzero_u64(args.max_response_bytes, "max-response-bytes")?,
+            broadcast_timeout: None,
+        },
+    )?;
+    let activations = source
+        .discover_network_upgrade_activations("zinder-bench")
+        .await?;
+    let replay_plan =
+        capture_canonical_fixture_replay_plan(&args.fixture, &source, &activations).await?;
+    tracing::info!(
+        target: "zinder::bench",
+        event = "canonical_fixture_checkpoints_captured",
+        fixture_manifest_sha256 = replay_plan.fixture_manifest_sha256,
+        predecessor_height = replay_plan.history_predecessor.block_id.height,
+        source_tip_height = replay_plan.source_tip_checkpoint.block_id.height,
+        "canonical fixture checkpoints captured"
+    );
+    Ok(())
 }
 
 async fn run_capture(args: CaptureArgs) -> Result<(), BenchError> {
@@ -478,6 +547,27 @@ mod tests {
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbStorageLifecycle(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_canonical_fixture_checkpoints_command_spelling_is_stable()
+    -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "capture-canonical-fixture-checkpoints",
+            "--fixture",
+            "fixture",
+            "--network",
+            "zcash-mainnet",
+            "--json-rpc-addr",
+            "http://zebra:8232",
+        ])?;
+
+        assert!(matches!(
+            cli.command,
+            Command::CaptureCanonicalFixtureCheckpoints(_)
+        ));
         Ok(())
     }
 

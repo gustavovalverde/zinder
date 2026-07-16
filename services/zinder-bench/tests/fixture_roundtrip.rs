@@ -3,18 +3,31 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{fs::OpenOptions, io::Write, num::NonZeroU32, time::Duration};
+use std::{fs::OpenOptions, io::Write, num::NonZeroU32, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use eyre::{Result, eyre};
+use parking_lot::Mutex;
 use serde_json::Value;
 use tempfile::tempdir;
-use zinder_bench::capture::measure_fixture_blocks;
 use zinder_bench::fixture::{
-    ActivationRecord, FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION, FixtureManifest,
-    FixtureNodeSource, SegmentDescriptor, SubtreeRootSet, read_segment_blocks, write_segment,
+    ActivationRecord, CanonicalBlockFactsDigestEvidence, FIXTURE_CONTRACT_IDENTITY,
+    FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource, SegmentDescriptor, SubtreeRootSet,
+    WorkloadDensity, read_segment_blocks, write_segment,
 };
-use zinder_core::{BlockHeight, Network, wire::encode_zinder_native_chain_name};
-use zinder_source::{NodeSource, SourceBlock, SourceChainCursor, SourceChainSegmentLimits};
+use zinder_bench::{
+    canonical_fixture_replay::{CanonicalFixtureReplayPlan, capture_canonical_fixture_replay_plan},
+    capture::measure_fixture_blocks,
+};
+use zinder_core::{
+    BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
+    CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, ShieldedProtocol,
+    wire::encode_zinder_native_chain_name,
+};
+use zinder_source::{
+    NodeCapabilities, NodeSource, SourceBlock, SourceChainCursor, SourceChainSegmentLimits,
+    SourceError,
+};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 const REGTEST_BLOCK_1: &str =
@@ -60,6 +73,60 @@ struct RegtestFixtureCase {
     manifest: FixtureManifest,
 }
 
+#[derive(Clone)]
+struct CheckpointSource {
+    checkpoints: Arc<[CommitmentTreeCheckpoint]>,
+    requested_heights: Arc<Mutex<Vec<BlockHeight>>>,
+}
+
+impl CheckpointSource {
+    fn new(checkpoints: impl Into<Arc<[CommitmentTreeCheckpoint]>>) -> Self {
+        Self {
+            checkpoints: checkpoints.into(),
+            requested_heights: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl NodeSource for CheckpointSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        NodeCapabilities::default()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        Err(SourceError::BlockUnavailable {
+            height,
+            reason: "checkpoint source serves only tree state".to_owned(),
+        })
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        _network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.requested_heights.lock().push(height);
+        self.checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.block_id.height == height)
+            .cloned()
+            .ok_or_else(|| SourceError::BlockUnavailable {
+                height,
+                reason: "checkpoint source has no tree state at this height".to_owned(),
+            })
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        self.checkpoints
+            .last()
+            .map(|checkpoint| checkpoint.block_id)
+            .ok_or_else(|| SourceError::NodeUnavailable {
+                reason: "checkpoint source is empty".to_owned(),
+            })
+    }
+}
+
 fn write_regtest_fixture() -> Result<RegtestFixtureCase> {
     let block = load_regtest_block(REGTEST_BLOCK_603)?;
     let directory = tempdir()?;
@@ -90,6 +157,301 @@ fn write_regtest_fixture() -> Result<RegtestFixtureCase> {
         descriptor,
         manifest,
     })
+}
+
+fn checkpoint_frontiers_at(height: BlockHeight) -> CommitmentTreeFrontiers {
+    CommitmentTreeFrontiers::from_validated_parts(
+        Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+        Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+        (height.value() >= 603).then(|| CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
+    )
+}
+
+fn fixture_checkpoint_source(
+    fixture: &RegtestFixtureCase,
+) -> (
+    CheckpointSource,
+    CommitmentTreeCheckpoint,
+    CommitmentTreeCheckpoint,
+) {
+    let predecessor_height = BlockHeight::new(fixture.manifest.from_height - 1);
+    let predecessor = CommitmentTreeCheckpoint::new(
+        BlockId::new(predecessor_height, fixture.block.parent_hash),
+        fixture.block.block_time_seconds.saturating_sub(1),
+        checkpoint_frontiers_at(predecessor_height),
+    );
+    let fixed_tip = CommitmentTreeCheckpoint::new(
+        BlockId::new(fixture.block.height, fixture.block.hash),
+        fixture.block.block_time_seconds,
+        checkpoint_frontiers_at(fixture.block.height),
+    );
+    let source = CheckpointSource::new(vec![predecessor.clone(), fixed_tip.clone()]);
+    (source, predecessor, fixed_tip)
+}
+
+#[tokio::test]
+async fn canonical_replay_plan_captures_digest_bound_predecessor_and_tip_checkpoints() -> Result<()>
+{
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let predecessor_height = BlockHeight::new(fixture.manifest.from_height - 1);
+    let (source, predecessor, fixed_tip) = fixture_checkpoint_source(&fixture);
+    let manifest_path = fixture.directory.path().join("manifest.json");
+    let original_manifest_bytes = std::fs::read(&manifest_path)?;
+
+    let captured =
+        capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations)
+            .await?;
+    let admitted = CanonicalFixtureReplayPlan::read(
+        fixture.directory.path(),
+        &fixture.manifest,
+        &activations,
+    )?;
+
+    assert_eq!(
+        source.requested_heights.lock().as_slice(),
+        [predecessor_height, fixture.block.height]
+    );
+    assert_eq!(captured, admitted);
+    assert_eq!(admitted.history_predecessor_checkpoint()?, predecessor);
+    assert_eq!(admitted.source_tip_checkpoint()?, fixed_tip);
+    assert_eq!(admitted.digest_sha256()?.len(), 64);
+    assert_eq!(std::fs::read(manifest_path)?, original_manifest_bytes);
+
+    let sidecar =
+        std::fs::read_to_string(fixture.directory.path().join("canonical-replay-plan.json"))?;
+    assert!(!sidecar.contains("tree_size"));
+    assert!(sidecar.contains("final_root_hex"));
+    assert!(sidecar.contains("final_state_hex"));
+    let encoded_plan: Value = serde_json::from_str(&sidecar)?;
+    assert_eq!(
+        encoded_plan["contract_identity"],
+        "canonical-fixture-replay-plan"
+    );
+    assert_eq!(encoded_plan["format_version"], 1);
+    assert_eq!(
+        encoded_plan["network_upgrade_activations_fingerprint_version"],
+        1
+    );
+    assert!(
+        encoded_plan
+            .get("canonical_replay_plan_format_version")
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_checkpoint_capture_preserves_existing_sidecar_bytes() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (source, _, _) = fixture_checkpoint_source(&fixture);
+    capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations).await?;
+    let sidecar_path = fixture.directory.path().join("canonical-replay-plan.json");
+    let captured_bytes = std::fs::read(&sidecar_path)?;
+    let second_source = source.clone();
+
+    let second_capture = capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &second_source,
+        &activations,
+    )
+    .await;
+
+    let error = second_capture.err().ok_or_else(|| {
+        eyre!("canonical fixture checkpoint capture must refuse an existing sidecar")
+    })?;
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(std::fs::read(sidecar_path)?, captured_bytes);
+    assert_eq!(second_source.requested_heights.lock().len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_replay_plan_rejects_a_different_manifest_digest() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (source, _, _) = fixture_checkpoint_source(&fixture);
+    capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations).await?;
+    let sidecar_path = fixture.directory.path().join("canonical-replay-plan.json");
+    let mut encoded_plan: Value = serde_json::from_slice(&std::fs::read(&sidecar_path)?)?;
+    encoded_plan["fixture_manifest_sha256"] = Value::String("00".repeat(32));
+    std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&encoded_plan)?)?;
+
+    let error =
+        CanonicalFixtureReplayPlan::read(fixture.directory.path(), &fixture.manifest, &activations)
+            .err()
+            .ok_or_else(|| eyre!("a replay plan bound to another manifest must be rejected"))?;
+
+    assert!(error.to_string().contains("manifest SHA-256"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_checkpoint_capture_rejects_a_different_activation_fingerprint()
+-> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let (source, _, _) = fixture_checkpoint_source(&fixture);
+    let mismatched_activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+
+    let error = capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &source,
+        &mismatched_activations,
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("checkpoint capture must reject a different activation table"))?;
+
+    assert!(error.to_string().contains("activation fingerprint"));
+    assert!(source.requested_heights.lock().is_empty());
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join("canonical-replay-plan.json")
+            .exists()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_replay_plan_rejects_a_malformed_frontier() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (source, _, _) = fixture_checkpoint_source(&fixture);
+    capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations).await?;
+    let sidecar_path = fixture.directory.path().join("canonical-replay-plan.json");
+    let mut encoded_plan: Value = serde_json::from_slice(&std::fs::read(&sidecar_path)?)?;
+    encoded_plan["source_tip_checkpoint"]["frontiers"]["sapling"]["final_state_hex"] =
+        Value::String("00".to_owned());
+    std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&encoded_plan)?)?;
+
+    let error =
+        CanonicalFixtureReplayPlan::read(fixture.directory.path(), &fixture.manifest, &activations)
+            .err()
+            .ok_or_else(|| eyre!("a malformed canonical finalState must be rejected"))?;
+
+    assert!(
+        error
+            .to_string()
+            .contains("invalid source tip checkpoint Sapling frontier")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_checkpoint_capture_rejects_a_disconnected_predecessor() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (_, mut predecessor, fixed_tip) = fixture_checkpoint_source(&fixture);
+    predecessor.block_id = BlockId::new(
+        predecessor.block_id.height,
+        BlockHash::from_bytes([0x42; 32]),
+    );
+    let source = CheckpointSource::new(vec![predecessor, fixed_tip]);
+
+    let error =
+        capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations)
+            .await
+            .err()
+            .ok_or_else(|| {
+                eyre!("a checkpoint disconnected from the first block must be rejected")
+            })?;
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not link to fixture first block")
+    );
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join("canonical-replay-plan.json")
+            .exists()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_checkpoint_capture_rejects_a_wrong_source_tip() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (_, predecessor, mut fixed_tip) = fixture_checkpoint_source(&fixture);
+    fixed_tip.block_id = BlockId::new(fixed_tip.block_id.height, BlockHash::from_bytes([0x24; 32]));
+    let source = CheckpointSource::new(vec![predecessor, fixed_tip]);
+
+    let error =
+        capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations)
+            .await
+            .err()
+            .ok_or_else(|| eyre!("a checkpoint different from the fixture tip must be rejected"))?;
+
+    assert!(error.to_string().contains("and manifest tip"));
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join("canonical-replay-plan.json")
+            .exists()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_checkpoint_capture_rejects_disconnected_segment_boundaries_before_rpc()
+-> Result<()> {
+    let first_block = load_regtest_block(REGTEST_BLOCK_603)?;
+    let second_block = SourceBlock::from_raw_block_bytes(
+        Network::ZcashRegtest,
+        BlockHeight::new(604),
+        first_block.raw_block_bytes.clone(),
+    )?;
+    let directory = tempdir()?;
+    let first_segment = write_segment(directory.path(), 0, &[first_block])?;
+    let second_segment = write_segment(directory.path(), 1, std::slice::from_ref(&second_block))?;
+    let manifest = FixtureManifest {
+        contract_identity: FIXTURE_CONTRACT_IDENTITY.to_owned(),
+        fixture_format_version: FIXTURE_FORMAT_VERSION,
+        network: encode_zinder_native_chain_name(Network::ZcashRegtest).to_owned(),
+        from_height: 603,
+        to_height: 604,
+        block_count: 2,
+        workload_density: WorkloadDensity {
+            block_count: 2,
+            ..WorkloadDensity::default()
+        },
+        current_schema_oracle_artifact_schema_version:
+            zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence {
+            block_digest_version: zinder_core::CanonicalBlockFactsDigestVersion::CURRENT.value(),
+            sequence_digest_version: zinder_core::CanonicalBlockFactsSequenceDigestVersion::CURRENT
+                .value(),
+            block_count: 2,
+            sequence_digest_sha256: "00".repeat(32),
+        },
+        tip_hash_hex: hex::encode(second_block.hash.as_bytes()),
+        network_upgrade_activations: regtest_activation_records(),
+        segments: vec![first_segment, second_segment],
+        subtree_roots: SubtreeRootSet::default(),
+    };
+    manifest.write(directory.path())?;
+    let source = CheckpointSource::new(Vec::<CommitmentTreeCheckpoint>::new());
+
+    let error = capture_canonical_fixture_replay_plan(
+        directory.path(),
+        &source,
+        &sample_regtest_upgrade_activations(),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("disconnected fixture segments must fail admission"))?;
+
+    assert!(error.to_string().contains("not an ordered connected pair"));
+    assert!(source.requested_heights.lock().is_empty());
+    assert!(!directory.path().join("canonical-replay-plan.json").exists());
+    Ok(())
 }
 
 #[test]

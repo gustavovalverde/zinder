@@ -10,6 +10,7 @@
 //! services.
 
 pub mod canonical_fact_round_trip;
+pub mod canonical_fixture_replay;
 pub mod capture;
 pub mod error;
 pub mod fixture;

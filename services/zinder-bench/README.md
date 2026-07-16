@@ -45,6 +45,29 @@ version 1 records the versioned `CanonicalBlockFacts` block-digest and
 ordered sequence-digest evidence used by both fact-first arms. Workload totals
 and per-block maxima let reviewers detect burst-dominated ranges.
 
+### Capture canonical fixture checkpoints
+
+Version-1 canonical replay also needs authenticated tree state immediately
+before the fixture and at its fixed tip. Augment an existing fixture while the
+same range remains on Zebra's best chain:
+
+```bash
+zinder-bench capture-canonical-fixture-checkpoints \
+  --fixture ./fixtures/mainnet-150k-200k \
+  --network zcash-mainnet \
+  --json-rpc-addr http://127.0.0.1:8232
+```
+
+The command admits the manifest, activation fingerprint, every segment digest,
+and every parent link before requesting 2 `z_gettreestate` checkpoints. It
+writes `canonical-replay-plan.json`, which binds the predecessor and fixed-tip
+frontiers to the exact manifest SHA-256. Each frontier stores Zebra's
+`finalRoot` byte order and canonical `finalState` bytes; replay derives the tree
+size when it decodes those bytes. The command publishes the sidecar atomically
+and refuses to replace existing evidence. Optional source flags match
+`capture`: `--node-auth-cookie`, `--request-timeout-secs`, and
+`--max-response-bytes`.
+
 ## 2. Snapshot the starting store
 
 The replay needs a canonical store already populated up to `from_height - 1`, so
