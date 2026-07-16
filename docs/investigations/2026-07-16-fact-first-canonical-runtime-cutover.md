@@ -4,7 +4,7 @@ Status: local append-only real-service certification; Railway mainnet constructi
 Date: 2026-07-16
 Local certified revision: `ced54ba4f6df1954b132b93ac93f2bc177be4976`
 Local certified image: `sha256:e5db272e2c6ae80d21b620d99d6474e9bf6d0a8549275cbd41bbd23b33dfe093`
-Railway canary revision: `7f3d0eb25ace6e070a0de9958f6f2a1994af8649`
+Railway canary revision: `45fc285fd13e5764648e323ccf38db5d52a16b1a`
 Networks: Zcash testnet locally; Zcash mainnet in the Railway canary
 
 The shipped `zinder-ingest` composition now opens or freshly constructs the
@@ -112,7 +112,7 @@ traffic, Zebra state, or non-canary volume changed.
 | Ownership repair | The canonical entrypoint recursively assigned `/var/lib/zinder` to UID/GID 1000, set `NoNewPrivs: 1`, and execed `zinder-ingest` as process 1 with no permitted or effective Linux capabilities |
 | Active construction | Deployment `5c20998c-cda0-4e01-aea8-cec7babe66a3` started fresh mainnet construction at fixed tip 3,414,286 with direct RocksDB I/O |
 
-The active deployment uses
+The baseline deployment used
 [`deploy/railway.canonical-runtime.toml`](../../deploy/railway.canonical-runtime.toml),
 `RAILWAY_DOCKER_TARGET_STAGE=zinder-canonical-runtime`, and `PORT=9105`. Its
 Railway image digest is
@@ -123,7 +123,7 @@ The deployment has 10 CPUs, 10,000,000,000 bytes of memory, one EU West
 replica, zero overlap, 30 seconds of draining, and `/healthz` with a 300-second
 timeout. `/readyz` remains the exact canonical-fence gate.
 
-### Construction in progress
+### Baseline dense-range construction
 
 The service started construction at `2026-07-16T11:59:11.729682Z`. Prometheus
 reported `up=1`, `syncing=1`, and `ready=0`; `/readyz` returned HTTP 503 with
@@ -175,9 +175,9 @@ because each shrink cancels and refetches every later speculative range. The
 five-minute construction rate fell to 5.85 blocks per second in this range. A
 straight-line extrapolation would put the remaining construction near 80 hours
 if that density persisted, but that is a diagnostic bound rather than a
-completion forecast because block density changes by era. The active build
-remains intact so later evidence can distinguish this range from the complete
-mainnet lifecycle.
+completion forecast because block density changes by era. The baseline remains
+preserved as deployment, log, and metrics evidence. Its canary-only Zinder
+state was later wiped for the retention candidate.
 
 ## Authenticated dense mainnet replay
 
@@ -274,6 +274,73 @@ amplification remains below 5%, the remaining delayed-source ceiling should be
 tested against a captured Zebra response stream. If the existing JSON request
 contract then saturates below the target, the evidence supports a pipelined or
 binary historical-range source rather than another watermark increase.
+
+## Railway retention candidate
+
+Status: fresh construction in progress; sub-hour target not met
+Revision: `45fc285fd13e5764648e323ccf38db5d52a16b1a`
+Deployment: `cbe95970-fbcd-4a62-bbc9-fe74be3ea291`
+Railway image: `sha256:96e60b9486eae2a85eb1181453603942d216efe92b17f071df97b32635c0260d`
+
+The baseline deployment evidence was preserved before the canary cycle. The
+first retention-candidate deployment,
+`41371ae2-07c0-4893-ba15-e4131cfc6a9c`, found an orphaned
+`/var/lib/zinder/store.building.block-load-staging` sibling left by the
+interrupted unpublished build and failed closed. The exact canary-only Zinder
+volume was then wiped. Railway restored the prior healthy image, which began
+another unpublished construction. The runtime cleanup contract now removes
+the store-owned sibling only after admission proves that the build is
+unpublished. Deployment `cbe95970-fbcd-4a62-bbc9-fe74be3ea291` exercised the
+recovery path, logged both the sibling discard and unpublished-build restart,
+and began fresh construction at `2026-07-16T17:19:12.504685Z` with a fixed tip
+of 3,414,542. Zebra state, production Zinder state, and production traffic
+remained outside the mutation scope.
+
+The deployment uses the retention planner and a 402,653,184-byte source
+watermark under the same 12-request, 10-CPU, and 10 GB container limits. The
+real service advertised `canonical-v1`, reported zero historical-prevout and
+cross-block-wallet reads, passed `/healthz`, and remained correctly unavailable
+on `/readyz` while its store was unpublished. The fixed readiness lag is not a
+construction progress metric. The best available progress proxy is the
+`block_replay` preparation-stage count, which advances once per block-local
+artifact preparation but is not a durable canonical fence.
+
+Five samples from `17:25:26Z` through `17:29:42Z` produced the following
+construction window:
+
+| Measurement | First sample | Final sample | Window result |
+| --- | ---: | ---: | ---: |
+| Prepared blocks | 255,237 | 401,567 | 571.60 blocks/s |
+| Source-connected blocks | 256,680 | 402,936 | 571.31 blocks/s |
+| Successful source requests | 4,205 | 6,545 | 9.14 requests/s |
+| Response payload | 19.23 GB | 34.85 GB | 61.03 MB/s |
+| Cgroup CPU | 905.67 CPU-s | 1,586.23 CPU-s | 2.66 vCPU average |
+| Cgroup memory high-water | 659.05 MB | 815.43 MB | 815.43 MB maximum |
+| Mounted-filesystem usage | 18.17 GB | 31.90 GB | 13.73 GB growth |
+
+The CPU delta was 680.56 CPU-seconds for 146,330 prepared blocks, or 4.65
+milliseconds per prepared block in this early range. The cgroup recorded no CPU
+throttling. Queue depth stayed between nine and twelve requests, active fetches
+stayed between three and nine, and memory remained below 8% of the container
+limit. Density adjustments retained an additional 378.42 MB of completed
+prefetch during the window. Oversized-response replanning still discarded
+124.52 MB, so response-cap handling remains a smaller refetch source.
+
+Railway's volume series was not usable for this window: one 30-second sample
+jumped from 25.72 GB to 170.51 GB while the mounted filesystem reported 18.17
+GB through 31.90 GB. The in-container filesystem is the construction high-water
+authority until that backend series is reconciled. The observed 53.65 MB/s
+staging growth must not be extrapolated linearly because external-SST loading
+and RocksDB compaction are not linear.
+
+At the final sample, 3,012,976 blocks remained in the inclusive fixed range.
+Holding the 571.60-block-per-second preparation rate would require about 1 hour
+28 minutes more before database loading, validation, publication, and cold
+reopen. A zero-to-fence one-hour build requires 948.48 blocks per second. This
+candidate therefore does not demonstrate sub-hour mainnet construction even
+before the Sandblasting range. A defensible complete ETA must stratify stable
+prepared-block and cgroup-CPU deltas by chain era, including a new window around
+height 1.7 million, and then add the final loading and cold-validation phases.
 
 ## Remaining acceptance boundaries
 
