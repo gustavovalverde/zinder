@@ -971,6 +971,8 @@ where
     record_ingest_source_outcome("fetch_chain_segment", started_at, &source_outcome);
     if let Ok(segment) = &source_outcome {
         let stats = segment.stats();
+        metrics::counter!("zinder_ingest_source_segment_connected_blocks_total")
+            .increment(u64::from(stats.connected_blocks()));
         metrics::histogram!("zinder_ingest_source_segment_max_blocks")
             .record(usize_to_u32_saturating(segment.len()));
         metrics::histogram!("zinder_ingest_source_segment_response_payload_bytes")

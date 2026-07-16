@@ -57,6 +57,20 @@ const ROCKSDB_COMPACT_WRITE_BYTES: &str = "rocksdb.compact.write.bytes";
 const PROJECTION_STORE_METRIC_ROLE: &str = "derive_primary";
 const COMMIT_DURATION_COUNT: &str = "zinder_ingest_commit_duration_seconds_count";
 const COMMIT_FALLBACK_CALLER: &str = "commit_fallback";
+const SOURCE_REQUEST_TOTAL: &str = "zinder_ingest_source_request_total";
+const SOURCE_REQUEST_DURATION_SUM: &str = "zinder_ingest_source_request_duration_seconds_sum";
+const SOURCE_SEGMENT_CONNECTED_BLOCKS_TOTAL: &str =
+    "zinder_ingest_source_segment_connected_blocks_total";
+const SOURCE_SEGMENT_RESPONSE_PAYLOAD_BYTES_SUM: &str =
+    "zinder_ingest_source_segment_response_payload_bytes_sum";
+const SOURCE_SEGMENT_PREFETCH_RESTARTS_TOTAL: &str =
+    "zinder_ingest_source_segment_prefetch_restarts_total";
+const SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_SEGMENTS_TOTAL: &str =
+    "zinder_ingest_source_segment_prefetch_discarded_completed_segments_total";
+const SOURCE_SEGMENT_PREFETCH_DISCARDED_IN_FLIGHT_SEGMENTS_TOTAL: &str =
+    "zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total";
+const SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_RESPONSE_BYTES_TOTAL: &str =
+    "zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total";
 pub(crate) const TELEMETRY_COVERAGE_TOTAL: &str = "zinder_bench_telemetry_coverage_total";
 pub(crate) const STORE_READ_TELEMETRY_FAMILY: &str = "store_reads";
 const HEAD_OF_LINE_WAIT_SUM: &str = "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum";
@@ -598,6 +612,9 @@ pub struct CurrentSchemaFixtureReplaySummary {
     pub blocks_per_second: f64,
     /// Commit-fallback read calls when store-read telemetry was covered.
     pub commit_fallback_reads: Option<u64>,
+    /// Source request, response, and adaptive-prefetch attribution, when the
+    /// in-process metrics recorder observed completed segment requests.
+    pub source_fetch_attribution: Option<SourceFetchAttributionSummary>,
     /// Wall-clock seconds spent constructing projections, when driven.
     pub projection_build_wall_clock_seconds: Option<f64>,
     /// Total rows across the selected consumers' owned column families.
@@ -614,6 +631,36 @@ pub struct CurrentSchemaFixtureReplaySummary {
     pub projection_store_reopen_seconds: Option<f64>,
     /// Peak resident-set-size reading.
     pub peak_rss: PeakRss,
+}
+
+/// Source-lane evidence aggregated for one successful fixture replay.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct SourceFetchAttributionSummary {
+    /// Successfully completed source-segment requests.
+    pub completed_segment_request_count: u64,
+    /// Total connected blocks returned, including responses later discarded
+    /// and fetched again.
+    pub total_connected_blocks_returned: u64,
+    /// Total adapter-observed response payload bytes, including responses
+    /// later discarded and fetched again.
+    pub total_response_payload_bytes: u64,
+    /// Completed source-segment requests per replay wall-clock second.
+    pub completed_segment_requests_per_second: f64,
+    /// Response payload bytes per replay wall-clock second.
+    pub response_payload_bytes_per_second: f64,
+    /// Cumulative concurrent-task seconds spent awaiting completed segment
+    /// requests. This can exceed replay wall-clock time.
+    pub cumulative_fetch_chain_segment_task_seconds: f64,
+    /// Adaptive prefetch restarts caused by dense response sizing.
+    pub density_restart_count: u64,
+    /// Adaptive prefetch restarts caused by oversized responses.
+    pub response_too_large_restart_count: u64,
+    /// Already-completed speculative segments discarded across restarts.
+    pub discarded_completed_segment_count: u64,
+    /// Still-in-flight speculative segments discarded across restarts.
+    pub discarded_in_flight_segment_count: u64,
+    /// Exact payload bytes held by completed speculative segments at discard.
+    pub discarded_completed_response_bytes: u64,
 }
 
 /// Digest evidence recomputed from persisted canonical fact encodings.
@@ -1896,6 +1943,10 @@ fn build_replay_summary(
         epochs_committed,
         blocks_per_second,
         commit_fallback_reads,
+        source_fetch_attribution: aggregate_source_fetch_attribution(
+            samples,
+            measurements.wall_clock_seconds,
+        ),
         projection_build_wall_clock_seconds: measurements.projection_build_wall_clock_seconds,
         projection_row_count: measurements.projection_row_count,
         projection_event_cursor_at_tip: measurements.projection_event_cursor_at_tip,
@@ -1905,6 +1956,105 @@ fn build_replay_summary(
         projection_store_reopen_seconds: measurements.projection_store_reopen_seconds,
         peak_rss: measurements.peak_rss,
     }
+}
+
+fn aggregate_source_fetch_attribution(
+    samples: &[MetricSample],
+    replay_wall_clock_seconds: f64,
+) -> Option<SourceFetchAttributionSummary> {
+    let completed_segment_request_count = samples
+        .iter()
+        .filter(|sample| {
+            sample.name == SOURCE_REQUEST_TOTAL
+                && sample.label("operation") == Some("fetch_chain_segment")
+                && sample.label("status") == Some("ok")
+        })
+        .map(|sample| round_to_u64(sample.reading))
+        .sum::<u64>();
+    let has_completed_segment_request_telemetry = samples.iter().any(|sample| {
+        sample.name == SOURCE_REQUEST_TOTAL
+            && sample.label("operation") == Some("fetch_chain_segment")
+            && sample.label("status") == Some("ok")
+    });
+    if !has_completed_segment_request_telemetry {
+        return None;
+    }
+
+    let cumulative_fetch_chain_segment_task_seconds = samples
+        .iter()
+        .filter(|sample| {
+            sample.name == SOURCE_REQUEST_DURATION_SUM
+                && sample.label("operation") == Some("fetch_chain_segment")
+                && sample.label("status") == Some("ok")
+        })
+        .map(|sample| sample.reading)
+        .sum();
+    let density_restart_count = sum_metric_by_label(
+        samples,
+        SOURCE_SEGMENT_PREFETCH_RESTARTS_TOTAL,
+        "reason",
+        "density",
+    );
+    let response_too_large_restart_count = sum_metric_by_label(
+        samples,
+        SOURCE_SEGMENT_PREFETCH_RESTARTS_TOTAL,
+        "reason",
+        "response_too_large",
+    );
+
+    let total_connected_blocks_returned =
+        round_to_u64(sum_by_name(samples, SOURCE_SEGMENT_CONNECTED_BLOCKS_TOTAL));
+    let total_response_payload_bytes = round_to_u64(sum_by_name(
+        samples,
+        SOURCE_SEGMENT_RESPONSE_PAYLOAD_BYTES_SUM,
+    ));
+    let (completed_segment_requests_per_second, response_payload_bytes_per_second) =
+        if replay_wall_clock_seconds > 0.0 {
+            (
+                u64_to_f64(completed_segment_request_count) / replay_wall_clock_seconds,
+                u64_to_f64(total_response_payload_bytes) / replay_wall_clock_seconds,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+    Some(SourceFetchAttributionSummary {
+        completed_segment_request_count,
+        total_connected_blocks_returned,
+        total_response_payload_bytes,
+        completed_segment_requests_per_second,
+        response_payload_bytes_per_second,
+        cumulative_fetch_chain_segment_task_seconds,
+        density_restart_count,
+        response_too_large_restart_count,
+        discarded_completed_segment_count: round_to_u64(sum_by_name(
+            samples,
+            SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_SEGMENTS_TOTAL,
+        )),
+        discarded_in_flight_segment_count: round_to_u64(sum_by_name(
+            samples,
+            SOURCE_SEGMENT_PREFETCH_DISCARDED_IN_FLIGHT_SEGMENTS_TOTAL,
+        )),
+        discarded_completed_response_bytes: round_to_u64(sum_by_name(
+            samples,
+            SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_RESPONSE_BYTES_TOTAL,
+        )),
+    })
+}
+
+fn sum_metric_by_label(
+    samples: &[MetricSample],
+    metric_name: &str,
+    label_name: &str,
+    label_value: &str,
+) -> u64 {
+    samples
+        .iter()
+        .filter(|sample| {
+            sample.name == metric_name && sample.label(label_name) == Some(label_value)
+        })
+        .map(|sample| round_to_u64(sample.reading))
+        .sum()
 }
 
 fn summarize_acceptance_measurement(
@@ -2276,6 +2426,52 @@ mod tests {
                 .thresholds
                 .is_none()
         );
+    }
+
+    #[test]
+    fn canonical_replay_aggregates_source_fetch_attribution() -> Result<(), crate::BenchError> {
+        let exposition = "\
+zinder_ingest_source_request_total{operation=\"fetch_chain_segment\",status=\"ok\",error_class=\"none\"} 4
+zinder_ingest_source_request_duration_seconds_sum{operation=\"fetch_chain_segment\",status=\"ok\",error_class=\"none\"} 15.5
+zinder_ingest_source_segment_connected_blocks_total 52
+zinder_ingest_source_segment_response_payload_bytes_sum 120000000
+zinder_ingest_source_segment_prefetch_restarts_total{reason=\"density\"} 3
+zinder_ingest_source_segment_prefetch_restarts_total{reason=\"response_too_large\"} 2
+zinder_ingest_source_segment_prefetch_discarded_completed_segments_total{reason=\"density\"} 5
+zinder_ingest_source_segment_prefetch_discarded_completed_segments_total{reason=\"response_too_large\"} 1
+zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total{reason=\"density\"} 7
+zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total{reason=\"response_too_large\"} 4
+zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{reason=\"density\"} 90000000
+zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{reason=\"response_too_large\"} 10000000
+";
+
+        let report = build_current_schema_fixture_replay_report(
+            fixture_summary(),
+            &canonical_measurements(),
+            Some(exposition),
+        );
+
+        let source_fetch = report.replay.source_fetch_attribution.ok_or_else(|| {
+            crate::BenchError::invalid_argument(
+                "source request telemetry should produce attribution",
+            )
+        })?;
+        assert_eq!(source_fetch.completed_segment_request_count, 4);
+        assert_eq!(source_fetch.total_connected_blocks_returned, 52);
+        assert_eq!(source_fetch.total_response_payload_bytes, 120_000_000);
+        assert!((source_fetch.completed_segment_requests_per_second - 0.32).abs() < f64::EPSILON);
+        assert!(
+            (source_fetch.response_payload_bytes_per_second - 9_600_000.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (source_fetch.cumulative_fetch_chain_segment_task_seconds - 15.5).abs() < f64::EPSILON
+        );
+        assert_eq!(source_fetch.density_restart_count, 3);
+        assert_eq!(source_fetch.response_too_large_restart_count, 2);
+        assert_eq!(source_fetch.discarded_completed_segment_count, 6);
+        assert_eq!(source_fetch.discarded_in_flight_segment_count, 11);
+        assert_eq!(source_fetch.discarded_completed_response_bytes, 100_000_000);
+        Ok(())
     }
 
     #[test]

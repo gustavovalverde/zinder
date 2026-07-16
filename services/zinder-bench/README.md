@@ -398,6 +398,16 @@ component diagnostics in the external resource artifacts.
   `replay.block_prepare_memory_watermark_bytes`, and
   `replay.source_segment_delay_millis`: the exact source-planner, admission,
   preparation, and deterministic delay settings used by the run.
+- `replay.source_fetch_attribution`: completed segment requests, request and
+  payload rates over replay wall time, cumulative concurrent request-task
+  seconds, adaptive restart counts, and speculative discard totals. Total
+  connected blocks and response payload bytes include completed responses that
+  the adaptive planner later discarded and fetched again. The completed
+  response bytes discarded on restart are exact for responses already held in
+  the reorder buffer, but they are only a lower bound on wasted network work
+  because canceled in-flight requests do not expose trustworthy actual bytes.
+  The object is `null` when no metrics recorder covered completed segment
+  requests.
 - `replay.starting_canonical_state`: the opened store's `chain_epoch_id`, tip
   height, RPC-order tip hash, artifact schema version, checkpoint-manifest
   SHA-256, and `empty`, `checkpoint`, or `unverified-clone` provenance kind.

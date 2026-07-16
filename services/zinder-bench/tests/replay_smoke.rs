@@ -545,6 +545,17 @@ async fn thresholded_genesis_replay_accepts_a_proven_empty_start_without_manifes
         report.replay.starting_canonical_state.tip_hash_rpc_hex,
         None
     );
+    let source_fetch = report
+        .replay
+        .source_fetch_attribution
+        .as_ref()
+        .ok_or_else(|| eyre!("replay report must include source-fetch attribution"))?;
+    assert!(source_fetch.completed_segment_request_count >= 1);
+    assert!(source_fetch.total_connected_blocks_returned >= 1);
+    assert!(source_fetch.total_response_payload_bytes > 0);
+    assert!(source_fetch.completed_segment_requests_per_second > 0.0);
+    assert!(source_fetch.response_payload_bytes_per_second > 0.0);
+    assert!(source_fetch.cumulative_fetch_chain_segment_task_seconds >= 0.0);
     report.validate_acceptance()?;
     Ok(())
 }

@@ -354,8 +354,7 @@ fn restart_future_source_prefetch<Source>(
     state: &mut SourceBlockStreamState<'_, Source>,
     reason: SourceSegmentPrefetchRestartReason,
 ) {
-    let discarded_in_flight = state.in_flight_segments.len();
-    let discarded_completed = state.completed_segments.len();
+    let discard_accounting = source_prefetch_discard_accounting(state);
     state.in_flight_segments = FuturesUnordered::new();
     state.completed_segments.clear();
     state.completed_segment_bytes = 0;
@@ -366,15 +365,48 @@ fn restart_future_source_prefetch<Source>(
         "reason" => reason.metric_label()
     )
     .increment(1);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_discarded_completed_segments_total",
+        "reason" => reason.metric_label()
+    )
+    .increment(discard_accounting.completed_segment_count);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total",
+        "reason" => reason.metric_label()
+    )
+    .increment(discard_accounting.in_flight_segment_count);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total",
+        "reason" => reason.metric_label()
+    )
+    .increment(discard_accounting.completed_response_bytes);
     tracing::info!(
         event = "source_segment_prefetch_restarted",
         reason = reason.metric_label(),
         next_fetch_height = ?state.next_fetch_height,
-        discarded_in_flight,
-        discarded_completed,
+        discarded_in_flight_segments = discard_accounting.in_flight_segment_count,
+        discarded_completed_segments = discard_accounting.completed_segment_count,
+        discarded_completed_response_bytes = discard_accounting.completed_response_bytes,
         "discarded stale source prefetches after ordered segment feedback"
     );
     record_source_fetch_queue_state(state);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourcePrefetchDiscardAccounting {
+    completed_segment_count: u64,
+    in_flight_segment_count: u64,
+    completed_response_bytes: u64,
+}
+
+fn source_prefetch_discard_accounting<Source>(
+    state: &SourceBlockStreamState<'_, Source>,
+) -> SourcePrefetchDiscardAccounting {
+    SourcePrefetchDiscardAccounting {
+        completed_segment_count: usize_to_u64_saturating(state.completed_segments.len()),
+        in_flight_segment_count: usize_to_u64_saturating(state.in_flight_segments.len()),
+        completed_response_bytes: state.completed_segment_bytes,
+    }
 }
 
 fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, Source>) {
@@ -872,6 +904,10 @@ fn usize_to_u32_saturating(amount: usize) -> u32 {
     u32::try_from(amount).unwrap_or(u32::MAX)
 }
 
+fn usize_to_u64_saturating(amount: usize) -> u64 {
+    u64::try_from(amount).unwrap_or(u64::MAX)
+}
+
 fn record_source_segment_sizer_state(
     current_blocks: NonZeroU32,
     max_blocks: NonZeroU32,
@@ -905,4 +941,103 @@ fn record_source_segment_sizer_adjustment(
 )]
 fn u64_to_f64(sample: u64) -> f64 {
     sample as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        num::{NonZeroU32, NonZeroU64},
+        sync::Arc,
+    };
+
+    use futures_util::{FutureExt, future, stream::FuturesUnordered};
+    use parking_lot::Mutex;
+    use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations};
+    use zinder_source::SourceChainSegment;
+
+    use super::{
+        CANONICAL_STAGE_SOURCE_FETCH, PrefetchedSourceSegment, SourceBlockStreamState,
+        SourceSegmentPrefetchRestartReason, SourceSegmentSizer, restart_future_source_prefetch,
+        source_prefetch_discard_accounting,
+    };
+    use crate::canonical_construction::watermark::ByteWatermark;
+
+    #[test]
+    fn source_prefetch_restart_accounts_exact_completed_response_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = ();
+        let source_fetch_watermark = ByteWatermark::new(
+            CANONICAL_STAGE_SOURCE_FETCH,
+            NonZeroU64::new(100).unwrap_or(NonZeroU64::MIN),
+        );
+        let first_reservation = source_fetch_watermark
+            .try_reserve(10)
+            .ok_or("first test reservation should fit")?;
+        let second_reservation = source_fetch_watermark
+            .try_reserve(20)
+            .ok_or("second test reservation should fit")?;
+        let mut completed_segments = BTreeMap::new();
+        completed_segments.insert(
+            BlockHeight::new(3),
+            PrefetchedSourceSegment {
+                start_height: BlockHeight::new(3),
+                max_connected_blocks: NonZeroU32::MIN,
+                segment: SourceChainSegment::default(),
+                queued_response_bytes: 10,
+                feedback_action: None,
+                reservation: first_reservation,
+            },
+        );
+        completed_segments.insert(
+            BlockHeight::new(4),
+            PrefetchedSourceSegment {
+                start_height: BlockHeight::new(4),
+                max_connected_blocks: NonZeroU32::MIN,
+                segment: SourceChainSegment::default(),
+                queued_response_bytes: 20,
+                feedback_action: None,
+                reservation: second_reservation,
+            },
+        );
+        let in_flight_segments = FuturesUnordered::new();
+        in_flight_segments
+            .push(future::pending::<Result<PrefetchedSourceSegment, crate::IngestError>>().boxed());
+        let mut state = SourceBlockStreamState {
+            source: &source,
+            request_timeout: std::time::Duration::from_secs(1),
+            history_predecessor: None,
+            from_height: BlockHeight::new(1),
+            to_height: BlockHeight::new(8),
+            source_segment_sizer: Arc::new(Mutex::new(SourceSegmentSizer::new(
+                NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
+                NonZeroU64::new(32).unwrap_or(NonZeroU64::MIN),
+                Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+                BlockHeight::new(1),
+            ))),
+            max_response_bytes: NonZeroU64::new(64).unwrap_or(NonZeroU64::MIN),
+            target_response_payload_bytes: NonZeroU64::new(32).unwrap_or(NonZeroU64::MIN),
+            source_fetch_max_in_flight_requests: NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),
+            source_fetch_watermark,
+            completed_segment_bytes: 30,
+            source_head_of_line_started_at: None,
+            next_fetch_height: Some(BlockHeight::new(5)),
+            next_emit_height: Some(BlockHeight::new(3)),
+            in_flight_segments,
+            completed_segments,
+            last_connected_block_id: None,
+        };
+
+        let accounting = source_prefetch_discard_accounting(&state);
+
+        assert_eq!(accounting.completed_segment_count, 2);
+        assert_eq!(accounting.in_flight_segment_count, 1);
+        assert_eq!(accounting.completed_response_bytes, 30);
+        restart_future_source_prefetch(&mut state, SourceSegmentPrefetchRestartReason::Density);
+        assert!(state.completed_segments.is_empty());
+        assert!(state.in_flight_segments.is_empty());
+        assert_eq!(state.completed_segment_bytes, 0);
+        assert_eq!(state.next_fetch_height, Some(BlockHeight::new(3)));
+        Ok(())
+    }
 }
