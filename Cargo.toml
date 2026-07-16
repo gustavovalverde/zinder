@@ -4,6 +4,7 @@ members = [
     "crates/zinder-client",
     "crates/zinder-derive",
     "crates/zinder-proto",
+    "crates/zinder-rocksdb",
     "crates/zinder-runtime",
     "crates/zinder-source",
     "crates/zinder-store",
@@ -84,6 +85,7 @@ zinder-derive = { path = "crates/zinder-derive" }
 zinder-explorer = { path = "services/zinder-explorer" }
 zinder-ingest = { path = "services/zinder-ingest" }
 zinder-proto = { path = "crates/zinder-proto" }
+zinder-rocksdb = { path = "crates/zinder-rocksdb" }
 zinder-query = { path = "services/zinder-query" }
 zinder-runtime = { path = "crates/zinder-runtime" }
 zinder-source = { path = "crates/zinder-source" }

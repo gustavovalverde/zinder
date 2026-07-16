@@ -44,7 +44,8 @@ fact-first runtime or the `postgres-scale-out` composition.
 | One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
 | Version-1 wallet row contracts and serial oracle | Landed | 6 query-owned row families, exact durable codecs, deterministic projection evidence, and bounded reorg undo are independent of the storage engine |
 | RocksDB wallet construction | Bounded correctness baseline landed | A fresh identity-scoped version-1 store moves from `BUILDING` through cold semantic validation to `READY` at an exact canonical source fence. Its current in-memory sort/merge tracer is deliberately bounded and is not the production full-chain loader or evidence for a mainnet speed claim |
-| Production wallet bulk loader | Not implemented | RocksDB still needs disk-backed variable-record outpoint runs, derived fixed-record runs, and SST ingestion; Postgres still needs its concrete `COPY`, native join, and index-build path |
+| Shared RocksDB bulk-load mechanics | Landed | `zinder-rocksdb` owns bounded fixed-record runs, capped merge fan-in, strict ordered SST emission, and physical errors without owning a domain schema or publication lifecycle |
+| Production wallet bulk loader | In progress | Shared fixed-record sorting and ordered SST emission have landed. RocksDB still needs variable-record outpoint runs, the wallet merge/reduction, and six-family ingestion; Postgres still needs its concrete `COPY`, native join, and index-build path |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
 | Complete lifecycle certification | Not run | Fresh mainnet canonical, wallet construction, restore, reorg, and client parity gates remain open |
 
@@ -238,9 +239,11 @@ validates each prepared block while fanning its owned values into the
 workload's direct and reverse-index families. Height- and position-ordered
 families rotate bounded SST files directly; the two random-key indexes use
 bounded fixed-record sort runs with a capped merge fan-in, so raw transaction
-and block payloads never enter the sort. Every family is staged before RocksDB
-ingestion begins, and the store remains `BUILDING` throughout, so a partial
-ingestion is never servable.
+and block payloads never enter the sort. The RocksDB-specific run and SST
+mechanics live in `zinder-rocksdb`; canonical key codecs, family assignment,
+ingestion, and readiness remain in `zinder-store`. Every family is staged
+before RocksDB ingestion begins, and the store remains `BUILDING` throughout,
+so a partial ingestion is never servable.
 
 The block and subtree loaders perform immediate readback but cannot publish the
 store. Publication first requires source-authenticated block families, exact

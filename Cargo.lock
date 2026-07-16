@@ -5878,6 +5878,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinder-rocksdb"
+version = "0.1.0"
+dependencies = [
+ "rust-rocksdb",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "zinder-runtime"
 version = "0.1.0"
 dependencies = [
@@ -5967,6 +5976,7 @@ dependencies = [
  "tracing",
  "zinder-core",
  "zinder-proto",
+ "zinder-rocksdb",
 ]
 
 [[package]]

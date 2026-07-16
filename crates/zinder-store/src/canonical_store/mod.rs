@@ -586,6 +586,22 @@ impl CanonicalStoreError {
     }
 }
 
+impl From<zinder_rocksdb::BulkLoadError> for CanonicalStoreError {
+    fn from(source: zinder_rocksdb::BulkLoadError) -> Self {
+        match source {
+            zinder_rocksdb::BulkLoadError::InvalidInput { reason } => {
+                Self::block_load_sequence(reason)
+            }
+            zinder_rocksdb::BulkLoadError::PathUnavailable { path, source } => {
+                Self::PathUnavailable { path, source }
+            }
+            zinder_rocksdb::BulkLoadError::RocksDbOperation { operation, source } => {
+                Self::RocksDbOperation { operation, source }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_network_upgrade_activations(
     network: zinder_core::Network,

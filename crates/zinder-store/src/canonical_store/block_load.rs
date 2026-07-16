@@ -1,6 +1,4 @@
 mod codec;
-mod fixed_record_sort;
-mod ordered_sst;
 
 use std::path::{Path, PathBuf};
 
@@ -15,16 +13,13 @@ use zinder_core::{
     TransactionBlobArtifact,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
+use zinder_rocksdb::{FixedRecordSorter, OrderedSstWriter, SstFileSet, fixed_record_capacity};
 
-use self::{
-    codec::{
-        BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN,
-        decode_block_final_note_commitment_roots, decode_tree_state_checkpoint,
-        encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
-        encode_transaction_location, encode_transaction_position, encode_tree_state_checkpoint,
-    },
-    fixed_record_sort::{FixedRecordSorter, record_capacity},
-    ordered_sst::{OrderedSstSet, SstArtifacts},
+use self::codec::{
+    BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN,
+    decode_block_final_note_commitment_roots, decode_tree_state_checkpoint,
+    encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
+    encode_transaction_location, encode_transaction_position, encode_tree_state_checkpoint,
 };
 
 pub(super) use self::codec::{BLOCK_HEADER_VALUE_LEN, encode_block_position};
@@ -177,13 +172,13 @@ pub(super) fn write_canonical_block_ssts<SourceError>(
 
 struct CanonicalBlockSstStager<'options> {
     config: CanonicalBlockSstConfig<'options>,
-    header_writer: OrderedSstSet<'options>,
-    replay_writer: OrderedSstSet<'options>,
-    compact_writer: OrderedSstSet<'options>,
-    transaction_blob_writer: OrderedSstSet<'options>,
-    block_blob_writer: OrderedSstSet<'options>,
-    tree_state_checkpoint_writer: OrderedSstSet<'options>,
-    block_final_note_commitment_roots_writer: OrderedSstSet<'options>,
+    header_writer: OrderedSstWriter<'options>,
+    replay_writer: OrderedSstWriter<'options>,
+    compact_writer: OrderedSstWriter<'options>,
+    transaction_blob_writer: OrderedSstWriter<'options>,
+    block_blob_writer: OrderedSstWriter<'options>,
+    tree_state_checkpoint_writer: OrderedSstWriter<'options>,
+    block_final_note_commitment_roots_writer: OrderedSstWriter<'options>,
     block_hash_sorter: FixedRecordSorter<BLOCK_HASH_INDEX_RECORD_LEN>,
     transaction_location_sorter: FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
     sequence: Option<BlockSequence>,
@@ -197,12 +192,13 @@ impl<'options> CanonicalBlockSstStager<'options> {
                 "SST target logical bytes must be greater than zero",
             ));
         }
-        let block_hash_capacity =
-            record_capacity::<BLOCK_HASH_INDEX_RECORD_LEN>(config.reverse_index_sort_memory_bytes)?;
-        let transaction_location_capacity = record_capacity::<TRANSACTION_LOCATION_RECORD_LEN>(
+        let block_hash_capacity = fixed_record_capacity::<BLOCK_HASH_INDEX_RECORD_LEN>(
             config.reverse_index_sort_memory_bytes,
         )?;
-        let mut tree_state_checkpoint_writer = config.ordered_writer("tree-state-checkpoint");
+        let transaction_location_capacity = fixed_record_capacity::<TRANSACTION_LOCATION_RECORD_LEN>(
+            config.reverse_index_sort_memory_bytes,
+        )?;
+        let mut tree_state_checkpoint_writer = config.ordered_writer("tree-state-checkpoint")?;
         let predecessor = config.build_plan.history_predecessor();
         let predecessor_key = encode_block_position(predecessor.block_id.height);
         let predecessor_value =
@@ -211,24 +207,24 @@ impl<'options> CanonicalBlockSstStager<'options> {
         let predecessor_checkpoint_logical_bytes =
             checked_row_bytes(predecessor_key.len(), predecessor_value.len())?;
         Ok(Self {
-            header_writer: config.ordered_writer("block-header"),
-            replay_writer: config.ordered_writer("block-replay"),
-            compact_writer: config.ordered_writer("compact-block"),
-            transaction_blob_writer: config.ordered_writer("transaction-blob"),
-            block_blob_writer: config.ordered_writer("block-blob"),
+            header_writer: config.ordered_writer("block-header")?,
+            replay_writer: config.ordered_writer("block-replay")?,
+            compact_writer: config.ordered_writer("compact-block")?,
+            transaction_blob_writer: config.ordered_writer("transaction-blob")?,
+            block_blob_writer: config.ordered_writer("block-blob")?,
             tree_state_checkpoint_writer,
             block_final_note_commitment_roots_writer: config
-                .ordered_writer("block-final-note-commitment-roots"),
+                .ordered_writer("block-final-note-commitment-roots")?,
             block_hash_sorter: FixedRecordSorter::new(
                 config.staging_path,
                 "block-hash-index",
                 block_hash_capacity,
-            ),
+            )?,
             transaction_location_sorter: FixedRecordSorter::new(
                 config.staging_path,
                 "transaction-location",
                 transaction_location_capacity,
-            ),
+            )?,
             config,
             sequence: None,
             predecessor_checkpoint_logical_bytes,
@@ -288,26 +284,29 @@ impl<'options> CanonicalBlockSstStager<'options> {
 }
 
 impl<'options> CanonicalBlockSstConfig<'options> {
-    fn ordered_writer(self, prefix: &'static str) -> OrderedSstSet<'options> {
-        OrderedSstSet::new(
+    fn ordered_writer(
+        self,
+        artifact_label: &'static str,
+    ) -> Result<OrderedSstWriter<'options>, CanonicalStoreError> {
+        Ok(OrderedSstWriter::new(
             self.staging_path,
-            prefix,
+            artifact_label,
             self.options,
             self.sst_target_logical_bytes,
-        )
+        )?)
     }
 }
 
 struct CanonicalBlockSstArtifacts {
-    header: SstArtifacts,
-    block_hash: SstArtifacts,
-    replay: SstArtifacts,
-    compact: SstArtifacts,
-    transaction_location: SstArtifacts,
-    transaction_blob: SstArtifacts,
-    block_blob: SstArtifacts,
-    tree_state_checkpoint: SstArtifacts,
-    block_final_note_commitment_roots: SstArtifacts,
+    header: SstFileSet,
+    block_hash: SstFileSet,
+    replay: SstFileSet,
+    compact: SstFileSet,
+    transaction_location: SstFileSet,
+    transaction_blob: SstFileSet,
+    block_blob: SstFileSet,
+    tree_state_checkpoint: SstFileSet,
+    block_final_note_commitment_roots: SstFileSet,
 }
 
 fn prepare_canonical_block_load(
@@ -376,13 +375,13 @@ fn prepare_canonical_block_load(
 )]
 fn write_build_block(
     block: CanonicalBuildBlock,
-    header_writer: &mut OrderedSstSet<'_>,
-    replay_writer: &mut OrderedSstSet<'_>,
-    compact_writer: &mut OrderedSstSet<'_>,
-    transaction_blob_writer: &mut OrderedSstSet<'_>,
-    block_blob_writer: &mut OrderedSstSet<'_>,
-    tree_state_checkpoint_writer: &mut OrderedSstSet<'_>,
-    block_final_note_commitment_roots_writer: &mut OrderedSstSet<'_>,
+    header_writer: &mut OrderedSstWriter<'_>,
+    replay_writer: &mut OrderedSstWriter<'_>,
+    compact_writer: &mut OrderedSstWriter<'_>,
+    transaction_blob_writer: &mut OrderedSstWriter<'_>,
+    block_blob_writer: &mut OrderedSstWriter<'_>,
+    tree_state_checkpoint_writer: &mut OrderedSstWriter<'_>,
+    block_final_note_commitment_roots_writer: &mut OrderedSstWriter<'_>,
     block_hash_sorter: &mut FixedRecordSorter<BLOCK_HASH_INDEX_RECORD_LEN>,
     transaction_location_sorter: &mut FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
 ) -> Result<(), CanonicalStoreError> {
