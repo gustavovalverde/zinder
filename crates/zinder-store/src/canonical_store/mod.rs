@@ -10,6 +10,7 @@ mod builder;
 mod control;
 mod live_commit;
 mod publication;
+mod reader;
 mod rocksdb;
 mod subtree_load;
 

@@ -17,13 +17,13 @@ use zinder_rocksdb::{FixedRecordSorter, OrderedSstWriter, SstFileSet, fixed_reco
 
 use self::codec::{
     BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN,
-    decode_block_final_note_commitment_roots, decode_tree_state_checkpoint,
+    decode_block_final_note_commitment_roots,
 };
 
 pub(super) use self::codec::{
-    BLOCK_HEADER_VALUE_LEN, encode_block_final_note_commitment_roots, encode_block_hash_location,
-    encode_block_header, encode_block_position, encode_transaction_location,
-    encode_transaction_position, encode_tree_state_checkpoint,
+    BLOCK_HEADER_VALUE_LEN, decode_tree_state_checkpoint, encode_block_final_note_commitment_roots,
+    encode_block_hash_location, encode_block_header, encode_block_position,
+    encode_transaction_location, encode_transaction_position, encode_tree_state_checkpoint,
 };
 
 use super::{
