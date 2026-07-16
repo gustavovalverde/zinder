@@ -6032,6 +6032,7 @@ dependencies = [
  "thiserror 2.0.18",
  "zinder-core",
  "zinder-proto",
+ "zinder-rocksdb",
  "zinder-store",
  "zinder-wallet-projection",
 ]

@@ -5,7 +5,7 @@ compile_error!("Zinder supports only 32-bit and 64-bit pointer-width targets.");
 
 mod build;
 mod error;
-mod sort_merge;
+mod projection_load;
 mod store;
 
 pub use build::{

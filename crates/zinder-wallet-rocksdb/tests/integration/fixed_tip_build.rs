@@ -37,11 +37,18 @@ fn fixed_tip_build_matches_exact_version_one_wallet_contract()
         &canonical_store,
         temporary.path().join("wallet"),
         RocksDbWalletBuildOptions {
+            max_secondary_sort_memory_bytes_per_sorter: 128,
             supported_reorg_depth: 2,
             ..RocksDbWalletBuildOptions::for_local_tests()
         },
     )?;
 
+    assert!(
+        !temporary
+            .path()
+            .join("wallet.projection-load-staging")
+            .exists()
+    );
     assert_report(&outcome);
     assert_store(&outcome, &fixture)?;
     let expected_source = outcome.report.canonical_source_identity();
@@ -117,13 +124,37 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
     assert_eq!(outcome.report.staged_spend_count, 2);
     assert_eq!(outcome.report.historical_prevout_read_count, 0);
     assert!(outcome.report.logical_row_bytes > 0);
-    assert!(outcome.report.write_batch_count > 0);
-    assert!(outcome.report.peak_accounted_validation_relation_bytes > 0);
+    assert!(outcome.report.sst_file_count > 0);
+    assert!(outcome.report.sst_file_bytes > 0);
     assert!(
-        outcome.report.peak_accounted_validation_relation_bytes
-            <= outcome.report.max_accounted_validation_relation_bytes
+        outcome
+            .report
+            .cold_validation_address_index_sort
+            .initial_run_count
+            > 1
     );
-    assert_eq!(outcome.report.cold_validation_random_read_count, 6);
+    assert!(
+        outcome
+            .report
+            .cold_validation_address_transaction_sort
+            .initial_run_count
+            > 1
+    );
+    assert!(
+        outcome
+            .report
+            .cold_validation_peak_accounted_reorg_undo_bytes
+            > 0
+    );
+    assert!(
+        outcome
+            .report
+            .cold_validation_peak_accounted_reorg_undo_bytes
+            <= outcome
+                .report
+                .cold_validation_max_accounted_reorg_undo_bytes
+    );
+    assert_eq!(outcome.report.cold_validation_random_read_count, 0);
     let phases = outcome.report.phase_durations;
     let measured_phase_total = phases.store_initialization
         + phases.canonical_scan

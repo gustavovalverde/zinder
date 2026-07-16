@@ -1,11 +1,14 @@
 //! Fresh wallet construction from one authenticated canonical replay scan.
 
 use std::{
-    path::Path,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use zinder_core::CanonicalBlockFactsSequenceDigest;
+use zinder_rocksdb::VariableValueSortEvidence;
 use zinder_store::{RocksDbCanonicalStore, RocksDbResourceBudget};
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionDigest, WalletProjectionFamilyRowCounts,
@@ -14,27 +17,25 @@ use zinder_wallet_projection::{
 
 use crate::{
     RocksDbWalletError, RocksDbWalletStore,
-    sort_merge::{WalletSortMergeError, prepare_wallet_projection},
-    store::RocksDbWalletBuilder,
+    projection_load::{PreparedWalletProjectionLoad, ProjectionLoadConfig, write_projection_ssts},
+    store::{RocksDbWalletBuilder, WalletColdValidationConfig},
 };
 
-/// Explicit resource limits for the bounded in-memory wallet build tracer.
-///
-/// This tracer proves the complete logical and physical lifecycle on bounded
-/// histories. It fails before its accounted preparation limit instead of
-/// silently growing to full-chain memory. Mainnet construction will replace
-/// the preparation stage with disk-backed external runs while preserving this
-/// store and publication contract.
+/// Explicit resource limits for one production external wallet build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RocksDbWalletBuildOptions {
     /// Bounded resources applied to the wallet `RocksDB` instance.
     pub resource_budget: RocksDbResourceBudget,
-    /// Hard ceiling for explicitly accounted preparation rows and payloads.
-    pub max_accounted_preparation_bytes: u64,
-    /// Hard ceiling for explicitly accounted retained relationship keys and values.
-    pub max_accounted_validation_relation_bytes: u64,
-    /// Hard logical key-and-value byte ceiling for one WAL-free write batch.
-    pub max_write_batch_bytes: u64,
+    /// Accounted memory ceiling for the outpoint event sorter.
+    pub max_outpoint_sort_memory_bytes: u64,
+    /// Accounted memory ceiling applied independently to each secondary sorter.
+    pub max_secondary_sort_memory_bytes_per_sorter: u64,
+    /// Temporary-run byte ceiling applied independently to each external sorter.
+    pub max_temporary_file_bytes_per_sorter: u64,
+    /// Target logical key-and-value bytes per generated SST file.
+    pub sst_target_logical_bytes: u64,
+    /// Accounted memory ceiling for the retained reorg-undo suffix.
+    pub max_accounted_reorg_undo_bytes: u64,
     /// Number of exact tip undo records retained for reorg handling.
     pub supported_reorg_depth: u32,
 }
@@ -45,9 +46,11 @@ impl RocksDbWalletBuildOptions {
     pub const fn for_local_tests() -> Self {
         Self {
             resource_budget: RocksDbResourceBudget::for_local_tests(),
-            max_accounted_preparation_bytes: 16 * 1024 * 1024,
-            max_accounted_validation_relation_bytes: 16 * 1024 * 1024,
-            max_write_batch_bytes: 1024 * 1024,
+            max_outpoint_sort_memory_bytes: 16 * 1024 * 1024,
+            max_secondary_sort_memory_bytes_per_sorter: 16 * 1024 * 1024,
+            max_temporary_file_bytes_per_sorter: 256 * 1024 * 1024,
+            sst_target_logical_bytes: 1024 * 1024,
+            max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
             supported_reorg_depth: 100,
         }
     }
@@ -60,15 +63,15 @@ pub struct WalletBuildPhaseDurations {
     pub store_initialization: Duration,
     /// Authenticated canonical replay scan and event staging.
     pub canonical_scan: Duration,
-    /// Sorting and duplicate validation of output and spend events.
+    /// External run finalization and merge for outpoint events.
     pub outpoint_sort: Duration,
-    /// Ordered output/spend merge into current and historical output state.
+    /// Ordered output/spend merge and primary-family SST writes.
     pub outpoint_merge: Duration,
-    /// Address, balance, and retained-undo row derivation.
+    /// Secondary sorting, deduplication, balances, history, and retained undo.
     pub secondary_row_derivation: Duration,
-    /// UTXO summary, row counts, and deterministic projection digest.
+    /// Row-count and interleavable version-1 digest finalization.
     pub logical_evidence: Duration,
-    /// Bounded WAL-free writes of all six logical families.
+    /// External SST ingestion into the unpublished BUILDING store.
     pub row_load: Duration,
     /// Blocking flush, close, and cold BUILDING reopen.
     pub flush_and_cold_reopen: Duration,
@@ -95,7 +98,7 @@ pub struct RocksDbWalletBuildReport {
     pub utxo_summary: WalletUtxoSetSummary,
     /// Canonical blocks consumed by the single replay scan.
     pub scanned_block_count: u64,
-    /// Canonical transactions inspected during preparation.
+    /// Canonical transactions inspected by the replay scan.
     pub scanned_transaction_count: u64,
     /// Transparent outputs staged for the outpoint merge.
     pub staged_output_count: u64,
@@ -103,18 +106,30 @@ pub struct RocksDbWalletBuildReport {
     pub staged_spend_count: u64,
     /// Historical canonical-store prevout reads; version 1 requires zero.
     pub historical_prevout_read_count: u64,
-    /// Highest explicitly accounted preparation footprint.
-    pub peak_accounted_preparation_bytes: u64,
-    /// Caller-supplied preparation ceiling used by this build.
-    pub max_accounted_preparation_bytes: u64,
-    /// Highest explicitly accounted retained relationship key and value bytes.
-    pub peak_accounted_validation_relation_bytes: u64,
-    /// Caller-supplied ceiling for the accounted retained relationship bytes.
-    pub max_accounted_validation_relation_bytes: u64,
-    /// Logical durable key and value bytes written to `RocksDB`.
+    /// Exact bounded-work evidence for the outpoint event sorter.
+    pub outpoint_sort: VariableValueSortEvidence,
+    /// Exact bounded-work evidence for the address-unspent secondary sorter.
+    pub address_index_sort: VariableValueSortEvidence,
+    /// Exact bounded-work evidence for the address-history secondary sorter.
+    pub address_transaction_sort: VariableValueSortEvidence,
+    /// Highest explicitly accounted retained reorg-undo footprint.
+    pub peak_accounted_reorg_undo_bytes: u64,
+    /// Caller-supplied retained reorg-undo ceiling.
+    pub max_accounted_reorg_undo_bytes: u64,
+    /// Exact bounded-work evidence for the cold-validation address-index sorter.
+    pub cold_validation_address_index_sort: VariableValueSortEvidence,
+    /// Exact bounded-work evidence for the cold-validation address-history sorter.
+    pub cold_validation_address_transaction_sort: VariableValueSortEvidence,
+    /// Highest accounted cold-validation reorg-undo suffix footprint.
+    pub cold_validation_peak_accounted_reorg_undo_bytes: u64,
+    /// Caller-supplied cold-validation reorg-undo suffix ceiling.
+    pub cold_validation_max_accounted_reorg_undo_bytes: u64,
+    /// Logical durable key and value bytes emitted across all six families.
     pub logical_row_bytes: u64,
-    /// Number of bounded WAL-free data write batches.
-    pub write_batch_count: u64,
+    /// Physical bytes occupied by all generated SST files before ingestion.
+    pub sst_file_bytes: u64,
+    /// Number of generated SST files ingested into the BUILDING store.
+    pub sst_file_count: u64,
     /// Random point reads performed by cold cross-family validation.
     pub cold_validation_random_read_count: u64,
     /// Phase-level wall-clock timings.
@@ -139,11 +154,12 @@ pub struct RocksDbWalletBuildOutcome {
 
 /// Builds and publishes a fresh version-1 wallet store at one canonical fence.
 ///
-/// The target path must not exist. Any failure after initialization deliberately
-/// leaves a non-queryable BUILDING store for diagnosis and explicit cleanup.
+/// The target path and its deterministic sibling staging path must not exist.
+/// Any failure leaves only a non-queryable BUILDING target; staging artifacts
+/// owned by this invocation are removed on every return path.
 #[allow(
     clippy::too_many_lines,
-    reason = "the public orchestrator keeps phase timing and report evidence in one visible order"
+    reason = "the public orchestrator keeps phase timing and publication evidence in one order"
 )]
 pub fn build_wallet_from_canonical(
     canonical_store: &RocksDbCanonicalStore,
@@ -151,6 +167,8 @@ pub fn build_wallet_from_canonical(
     options: RocksDbWalletBuildOptions,
 ) -> Result<RocksDbWalletBuildOutcome, RocksDbWalletError> {
     let total_started = Instant::now();
+    let wallet_path = wallet_path.as_ref();
+    let staging = FreshWalletProjectionStaging::create(projection_staging_path(wallet_path))?;
     let canonical_ready = canonical_store.ready_evidence();
     let source_position = WalletProjectionSourcePosition::new(
         canonical_ready.visible_epoch,
@@ -168,20 +186,25 @@ pub fn build_wallet_from_canonical(
     )?;
     let store_initialization = phase_started.elapsed();
 
-    let prepared = prepare_wallet_projection(
-        canonical_store.network(),
-        options.supported_reorg_depth,
-        options.max_accounted_preparation_bytes,
+    let data_options = builder.data_options();
+    let mut prepared = write_projection_ssts(
+        ProjectionLoadConfig {
+            staging_path: staging.path(),
+            options: &data_options,
+            network: canonical_store.network(),
+            supported_reorg_depth: options.supported_reorg_depth,
+            max_outpoint_sort_memory_bytes: options.max_outpoint_sort_memory_bytes,
+            max_secondary_sort_memory_bytes_per_sorter: options
+                .max_secondary_sort_memory_bytes_per_sorter,
+            max_temporary_file_bytes_per_sorter: options.max_temporary_file_bytes_per_sorter,
+            sst_target_logical_bytes: options.sst_target_logical_bytes,
+            max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
+        },
         canonical_store
             .scan_canonical_replay()
             .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?,
-    )
-    .map_err(map_sort_merge_error)?;
+    )?;
     validate_canonical_fence(&prepared, canonical_ready)?;
-
-    let phase_started = Instant::now();
-    let load_evidence = builder.load_prepared(&prepared, options.max_write_batch_bytes)?;
-    let row_load = phase_started.elapsed();
 
     let ready_evidence = WalletProjectionReadyEvidence {
         source_position,
@@ -190,6 +213,18 @@ pub fn build_wallet_from_canonical(
         row_counts: prepared.row_counts,
         utxo_summary: prepared.utxo_summary.clone(),
     };
+    let counters = prepared.counters;
+    let load_durations = prepared.phase_durations;
+    let outpoint_sort = prepared.outpoint_sort_evidence;
+    let address_index_sort = prepared.address_index_sort_evidence;
+    let address_transaction_sort = prepared.address_transaction_sort_evidence;
+    let logical_row_bytes = prepared.logical_row_bytes;
+    let sst_file_bytes = prepared.sst_file_bytes;
+    let sst_file_count = prepared.sst_file_count;
+
+    let phase_started = Instant::now();
+    builder.ingest_projection_ssts(&mut prepared)?;
+    let row_load = phase_started.elapsed();
 
     let phase_started = Instant::now();
     let cold_build = builder.reopen_for_validation()?;
@@ -198,18 +233,21 @@ pub fn build_wallet_from_canonical(
     let phase_started = Instant::now();
     let validated = cold_build.validate_rows(
         ready_evidence,
-        options.max_accounted_validation_relation_bytes,
+        WalletColdValidationConfig {
+            staging_path: staging.path(),
+            max_sort_memory_bytes_per_sorter: options.max_secondary_sort_memory_bytes_per_sorter,
+            max_temporary_file_bytes_per_sorter: options.max_temporary_file_bytes_per_sorter,
+            max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
+        },
     )?;
     let cold_validation = phase_started.elapsed();
-
     let validation_evidence = validated.validation_evidence();
+    staging.remove()?;
+
     let phase_started = Instant::now();
     let store = validated.publish_ready()?;
     let ready_publication = phase_started.elapsed();
     let total = total_started.elapsed();
-
-    let counters = prepared.counters;
-    let preparation_durations = prepared.phase_durations;
     let report = RocksDbWalletBuildReport {
         source_position,
         source_sequence_digest: prepared.source_sequence_digest,
@@ -221,20 +259,28 @@ pub fn build_wallet_from_canonical(
         staged_output_count: counters.staged_output_count,
         staged_spend_count: counters.staged_spend_count,
         historical_prevout_read_count: counters.historical_prevout_read_count,
-        peak_accounted_preparation_bytes: counters.peak_accounted_bytes,
-        max_accounted_preparation_bytes: counters.max_accounted_bytes,
-        peak_accounted_validation_relation_bytes: validation_evidence.peak_accounted_bytes,
-        max_accounted_validation_relation_bytes: options.max_accounted_validation_relation_bytes,
-        logical_row_bytes: load_evidence.logical_row_bytes,
-        write_batch_count: load_evidence.write_batch_count,
+        outpoint_sort,
+        address_index_sort,
+        address_transaction_sort,
+        peak_accounted_reorg_undo_bytes: counters.peak_accounted_reorg_undo_bytes,
+        max_accounted_reorg_undo_bytes: counters.max_accounted_reorg_undo_bytes,
+        cold_validation_address_index_sort: validation_evidence.address_index_sort,
+        cold_validation_address_transaction_sort: validation_evidence.address_transaction_sort,
+        cold_validation_peak_accounted_reorg_undo_bytes: validation_evidence
+            .peak_accounted_reorg_undo_bytes,
+        cold_validation_max_accounted_reorg_undo_bytes: validation_evidence
+            .max_accounted_reorg_undo_bytes,
+        logical_row_bytes,
+        sst_file_bytes,
+        sst_file_count,
         cold_validation_random_read_count: validation_evidence.random_read_count,
         phase_durations: WalletBuildPhaseDurations {
             store_initialization,
-            canonical_scan: preparation_durations.canonical_scan,
-            outpoint_sort: preparation_durations.outpoint_sort,
-            outpoint_merge: preparation_durations.outpoint_merge,
-            secondary_row_derivation: preparation_durations.secondary_row_derivation,
-            logical_evidence: preparation_durations.logical_evidence,
+            canonical_scan: load_durations.canonical_scan,
+            outpoint_sort: load_durations.outpoint_sort,
+            outpoint_merge: load_durations.outpoint_merge,
+            secondary_row_derivation: load_durations.secondary_row_derivation,
+            logical_evidence: load_durations.logical_evidence,
             row_load,
             flush_and_cold_reopen,
             cold_validation,
@@ -246,7 +292,7 @@ pub fn build_wallet_from_canonical(
 }
 
 fn validate_canonical_fence(
-    prepared: &crate::sort_merge::PreparedWalletProjection,
+    prepared: &PreparedWalletProjectionLoad,
     ready: zinder_store::CanonicalStoreReadyEvidence,
 ) -> Result<(), RocksDbWalletError> {
     let expected_sequence_digest =
@@ -278,21 +324,63 @@ fn validate_canonical_fence(
     Ok(())
 }
 
-fn map_sort_merge_error(error: WalletSortMergeError) -> RocksDbWalletError {
-    match error {
-        WalletSortMergeError::Contract(source) => RocksDbWalletError::Contract(source),
-        WalletSortMergeError::EmptyCanonicalHistory => RocksDbWalletError::EmptyCanonicalHistory,
-        WalletSortMergeError::SourceSequenceLength(source) => source.into(),
-        WalletSortMergeError::CanonicalScan(source) => {
-            RocksDbWalletError::CanonicalReplay { source }
+fn projection_staging_path(wallet_path: &Path) -> PathBuf {
+    let file_name = wallet_path.file_name().unwrap_or(wallet_path.as_os_str());
+    let mut staging_file_name = OsString::from(file_name);
+    staging_file_name.push(".projection-load-staging");
+    wallet_path.with_file_name(staging_file_name)
+}
+
+struct FreshWalletProjectionStaging {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl FreshWalletProjectionStaging {
+    fn create(path: PathBuf) -> Result<Self, RocksDbWalletError> {
+        match fs::create_dir(&path) {
+            Ok(()) => Ok(Self {
+                path,
+                remove_on_drop: true,
+            }),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(RocksDbWalletError::ProjectionStagingPathNotFresh { path })
+            }
+            Err(source) => Err(RocksDbWalletError::PathUnavailable { path, source }),
         }
-        WalletSortMergeError::AccountedMemoryLimit {
-            limit_bytes,
-            required_bytes,
-        } => RocksDbWalletError::AccountedMemoryLimit {
-            limit_bytes,
-            required_bytes,
-        },
-        WalletSortMergeError::CounterOverflow => RocksDbWalletError::BuildCounterOverflow,
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn remove(mut self) -> Result<(), RocksDbWalletError> {
+        fs::remove_dir_all(&self.path).map_err(|source| RocksDbWalletError::PathUnavailable {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.remove_on_drop = false;
+        Ok(())
+    }
+}
+
+impl Drop for FreshWalletProjectionStaging {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_staging_path_is_a_sibling_for_trailing_separators() {
+        assert_eq!(
+            projection_staging_path(Path::new("/var/lib/zinder/wallet/")),
+            Path::new("/var/lib/zinder/wallet.projection-load-staging")
+        );
     }
 }

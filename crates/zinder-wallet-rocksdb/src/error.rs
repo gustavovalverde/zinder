@@ -4,6 +4,7 @@ use std::{io, path::PathBuf};
 
 use thiserror::Error;
 use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network};
+use zinder_rocksdb::BulkLoadError;
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionContractError};
 
@@ -24,26 +25,19 @@ pub enum RocksDbWalletError {
     /// The canonical fact sequence exceeded the version-1 count domain.
     #[error(transparent)]
     SourceSequenceLength(#[from] CanonicalBlockFactsSequenceLengthOverflow),
-    /// Accounted in-memory preparation would exceed the explicit tracer limit.
+    /// Retained reorg undo state would exceed its explicit accounted-memory limit.
     #[error(
-        "wallet projection preparation requires at least {required_bytes} accounted bytes, limit is {limit_bytes}"
+        "wallet reorg undo requires at least {required_bytes} accounted bytes, limit is {limit_bytes}"
     )]
-    AccountedMemoryLimit {
+    AccountedReorgUndoMemoryLimit {
         /// Caller-supplied hard limit.
         limit_bytes: u64,
         /// Minimum accounted bytes needed by the refused operation.
         required_bytes: u64,
     },
-    /// Accounted retained relationship keys and values would exceed their explicit limit.
-    #[error(
-        "wallet cold semantic validation relationships require at least {required_bytes} accounted bytes, limit is {limit_bytes}"
-    )]
-    AccountedValidationRelationMemoryLimit {
-        /// Caller-supplied hard limit.
-        limit_bytes: u64,
-        /// Minimum accounted bytes needed by the refused operation.
-        required_bytes: u64,
-    },
+    /// External sorting or ordered SST construction failed.
+    #[error(transparent)]
+    BulkLoad(#[from] BulkLoadError),
     /// A build counter exceeded the version-1 report domain.
     #[error("wallet projection build counter exceeds u64::MAX")]
     BuildCounterOverflow,
@@ -57,6 +51,14 @@ pub enum RocksDbWalletError {
     #[error("wallet RocksDB build target is not fresh: {path}")]
     PathNotFresh {
         /// Rejected build path.
+        path: PathBuf,
+    },
+    /// A deterministic sibling projection-load staging path already exists.
+    #[error(
+        "wallet projection staging path already exists and requires full build cleanup: {path}"
+    )]
+    ProjectionStagingPathNotFresh {
+        /// Existing staging path preserved without repair or adoption.
         path: PathBuf,
     },
     /// The wallet store path could not be created or resolved.
@@ -74,22 +76,12 @@ pub enum RocksDbWalletError {
         /// Rejected budget invariant.
         reason: &'static str,
     },
-    /// A bounded load cannot make progress with a zero-byte batch ceiling.
-    #[error("wallet RocksDB load batch limit must be greater than zero")]
-    ZeroLoadBatchLimit,
-    /// One logical row cannot fit within the explicit bounded batch ceiling.
-    #[error("wallet RocksDB {family} row requires {row_bytes} bytes, batch limit is {limit_bytes}")]
-    RowExceedsLoadBatchLimit {
-        /// Row family being loaded.
-        family: &'static str,
-        /// Logical durable key and value bytes.
-        row_bytes: u64,
-        /// Caller-supplied batch ceiling.
-        limit_bytes: u64,
-    },
-    /// Logical row-byte or batch accounting exceeded `u64::MAX`.
-    #[error("wallet RocksDB load accounting exceeds u64::MAX")]
-    LoadAccountingOverflow,
+    /// Logical row, SST byte, or file accounting exceeded `u64::MAX`.
+    #[error("wallet RocksDB projection load accounting exceeds u64::MAX")]
+    ProjectionLoadAccountingOverflow,
+    /// Equal address-history keys carried conflicting transaction identities.
+    #[error("canonical facts produce conflicting values for one address-transaction key")]
+    AddressTransactionConflict,
     /// A concrete `RocksDB` operation failed.
     #[error("wallet RocksDB {operation} failed: {source}")]
     RocksDbOperation {
