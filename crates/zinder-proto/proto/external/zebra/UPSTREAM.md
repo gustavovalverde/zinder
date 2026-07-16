@@ -2,8 +2,8 @@
 
 `indexer.proto` is vendored from [zcash/zebra](https://github.com/ZcashFoundation/zebra)
 at the commit recorded in `COMMIT`. Zinder's source layer consumes the
-`zebra.indexer.rpc.Indexer` service to receive streaming mempool change
-notifications when an upstream Zebra is built with `--features indexer`.
+`zebra.indexer.rpc.Indexer` service to receive streaming notifications and
+fetch raw best-chain block bytes by height.
 
 ## Updating
 
@@ -15,10 +15,9 @@ notifications when an upstream Zebra is built with `--features indexer`.
 
 ## Boundary
 
-Zinder's source adapter (`crates/zinder-source/src/zebra_indexer_mempool.rs`)
-consumes the generated `zebra.indexer.rpc.Indexer` client. The adapter
-hydrates `MempoolChange::ADDED` observations with raw transaction bytes
-from Zebra's JSON-RPC `getrawtransaction` endpoint before yielding a typed
-`MempoolSourceEvent`. The adapter does not re-export Zebra's generated
-types across the source boundary; the public `MempoolSourceEvent` carries
-only Zinder-owned vocabulary.
+Zinder's source adapters consume the generated `zebra.indexer.rpc.Indexer`
+client. Mempool observations are hydrated through JSON-RPC before becoming
+typed `MempoolSourceEvent` values. Historical block responses become typed
+`SourceBlock` values only after their raw header and display-order response
+hash agree. The adapters do not re-export Zebra's generated types across the
+source boundary.
