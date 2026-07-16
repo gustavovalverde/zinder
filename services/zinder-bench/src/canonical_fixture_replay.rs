@@ -3,21 +3,29 @@
 use std::{
     fs::{File, OpenOptions},
     io::Write,
+    num::NonZeroU32,
     path::Path,
+    time::Duration,
 };
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
     CommitmentTreeFrontier, CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
-    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
+    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange,
 };
-use zinder_source::{NodeSource, SourceBlock};
+use zinder_source::{
+    NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
+    SourceError, SourceSubtreeRoots,
+};
 
 use crate::{
     error::BenchError,
-    fixture::{FixtureManifest, read_segment_blocks},
+    fixture::{FixtureManifest, FixtureNodeSource, read_segment_blocks},
 };
 
 /// Digest-bound checkpoint sidecar written beside a version-1 fixture manifest.
@@ -90,6 +98,115 @@ pub struct CanonicalFixtureReplayFrontierRecord {
     pub final_root_hex: String,
     /// Canonical Zebra `finalState` bytes, lowercase hex-encoded.
     pub final_state_hex: String,
+}
+
+/// Fixture source authorized by one admitted canonical replay plan.
+///
+/// This source delegates captured blocks and subtree roots while serving only
+/// the plan's authenticated predecessor and fixed-tip checkpoints. It does not
+/// advertise or implement general tree-state lookup.
+#[derive(Clone)]
+pub struct CanonicalFixtureNodeSource {
+    fixture_source: FixtureNodeSource,
+    history_predecessor: CommitmentTreeCheckpoint,
+    source_tip_checkpoint: CommitmentTreeCheckpoint,
+    activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+}
+
+impl CanonicalFixtureNodeSource {
+    /// Opens a fixture source after admitting its replay plan and activation table.
+    pub fn open(fixture_directory: &Path, manifest: &FixtureManifest) -> Result<Self, BenchError> {
+        Self::open_with_segment_delay(fixture_directory, manifest, Duration::ZERO)
+    }
+
+    /// Opens an admitted fixture source and delays each outer segment response.
+    pub fn open_with_segment_delay(
+        fixture_directory: &Path,
+        manifest: &FixtureManifest,
+        segment_response_delay: Duration,
+    ) -> Result<Self, BenchError> {
+        let activations = manifest.activations_typed()?;
+        let replay_plan =
+            CanonicalFixtureReplayPlan::read(fixture_directory, manifest, &activations)?;
+        let fixture_source = FixtureNodeSource::open_with_segment_delay(
+            fixture_directory,
+            manifest,
+            segment_response_delay,
+        )?;
+        Ok(Self {
+            fixture_source,
+            history_predecessor: replay_plan.history_predecessor_checkpoint()?,
+            source_tip_checkpoint: replay_plan.source_tip_checkpoint()?,
+            activations_fingerprint: activations
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+        })
+    }
+}
+
+#[async_trait]
+impl NodeSource for CanonicalFixtureNodeSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        self.fixture_source.capabilities()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        self.fixture_source.fetch_block_at(height).await
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        self.fixture_source.fetch_chain_segment(limits).await
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        let requested_fingerprint = network_upgrade_activations
+            .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+        if requested_fingerprint != self.activations_fingerprint {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "checkpoint activation table does not match the canonical fixture replay plan",
+            });
+        }
+        if height == self.history_predecessor.block_id.height {
+            return Ok(self.history_predecessor.clone());
+        }
+        if height == self.source_tip_checkpoint.block_id.height {
+            return Ok(self.source_tip_checkpoint.clone());
+        }
+        Err(SourceError::BlockUnavailable {
+            height,
+            reason:
+                "canonical fixture replay plan serves only its history predecessor and fixed tip"
+                    .to_owned(),
+        })
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        self.fixture_source.tip_id().await
+    }
+
+    async fn fetch_subtree_roots(
+        &self,
+        protocol: ShieldedProtocol,
+        start_index: SubtreeRootIndex,
+        max_entries: NonZeroU32,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        self.fixture_source
+            .fetch_subtree_roots(protocol, start_index, max_entries)
+            .await
+    }
+
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        self.fixture_source.fetch_subtree_root_range(range).await
+    }
 }
 
 /// Captures the predecessor and fixed-tip checkpoints for one admitted fixture.

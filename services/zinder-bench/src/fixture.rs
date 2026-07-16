@@ -18,7 +18,7 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, ConsensusBranchId, Network, NetworkUpgradeActivation,
     NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
-    wire::decode_zinder_native_chain_name,
+    SubtreeRootRange, wire::decode_zinder_native_chain_name,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceBlockHeader,
@@ -1097,5 +1097,37 @@ impl NodeSource for FixtureNodeSource {
             .min(all_roots.len());
         let slice = all_roots.get(start..end).unwrap_or(&[]).to_vec();
         Ok(SourceSubtreeRoots::new(protocol, start_index, slice))
+    }
+
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        let subtree_roots = self
+            .fetch_subtree_roots(range.protocol, range.start_index, range.max_entries)
+            .await?;
+        let expected_count = usize::try_from(range.max_entries.get()).unwrap_or(usize::MAX);
+        let has_exact_indices = subtree_roots
+            .subtree_roots
+            .iter()
+            .zip(range)
+            .all(|(subtree_root, expected_index)| subtree_root.subtree_index == expected_index);
+        if subtree_roots.protocol != range.protocol
+            || subtree_roots.start_index != range.start_index
+            || subtree_roots.subtree_roots.len() != expected_count
+            || !has_exact_indices
+        {
+            return Err(SourceError::SubtreeRootsUnavailable {
+                protocol: range.protocol,
+                start_index: range.start_index,
+                reason: format!(
+                    "expected {} contiguous subtree roots, got {}",
+                    range.max_entries,
+                    subtree_roots.subtree_roots.len()
+                ),
+            });
+        }
+
+        Ok(subtree_roots)
     }
 }

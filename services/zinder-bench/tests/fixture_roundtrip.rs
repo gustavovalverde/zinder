@@ -12,21 +12,24 @@ use serde_json::Value;
 use tempfile::tempdir;
 use zinder_bench::fixture::{
     ActivationRecord, CanonicalBlockFactsDigestEvidence, FIXTURE_CONTRACT_IDENTITY,
-    FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource, SegmentDescriptor, SubtreeRootSet,
-    WorkloadDensity, read_segment_blocks, write_segment,
+    FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource, SegmentDescriptor,
+    SubtreeRootRecord, SubtreeRootSet, WorkloadDensity, read_segment_blocks, write_segment,
 };
 use zinder_bench::{
-    canonical_fixture_replay::{CanonicalFixtureReplayPlan, capture_canonical_fixture_replay_plan},
+    canonical_fixture_replay::{
+        CanonicalFixtureNodeSource, CanonicalFixtureReplayPlan,
+        capture_canonical_fixture_replay_plan,
+    },
     capture::measure_fixture_blocks,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
     CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, ShieldedProtocol,
-    wire::encode_zinder_native_chain_name,
+    SubtreeRootIndex, SubtreeRootRange, wire::encode_zinder_native_chain_name,
 };
 use zinder_source::{
-    NodeCapabilities, NodeSource, SourceBlock, SourceChainCursor, SourceChainSegmentLimits,
-    SourceError,
+    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainCursor,
+    SourceChainSegmentLimits, SourceError,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
@@ -196,6 +199,14 @@ fn write_repeated_payload_fixture() -> Result<RegtestFixtureCase> {
     Ok(fixture)
 }
 
+fn subtree_root_record(index: u32, root_byte: u8) -> SubtreeRootRecord {
+    SubtreeRootRecord {
+        index,
+        root_hash_hex: hex::encode([root_byte; 32]),
+        completing_height: 603,
+    }
+}
+
 fn checkpoint_frontiers_at(height: BlockHeight) -> CommitmentTreeFrontiers {
     CommitmentTreeFrontiers::from_validated_parts(
         Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
@@ -275,6 +286,92 @@ async fn canonical_replay_plan_captures_digest_bound_predecessor_and_tip_checkpo
             .get("canonical_replay_plan_format_version")
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_source_serves_only_the_admitted_boundary_checkpoints() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, predecessor, fixed_tip) = fixture_checkpoint_source(&fixture);
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+
+    let source = CanonicalFixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+
+    assert_eq!(
+        source
+            .fetch_chain_checkpoint(predecessor.block_id.height, &activations)
+            .await?,
+        predecessor
+    );
+    assert_eq!(
+        source
+            .fetch_chain_checkpoint(fixed_tip.block_id.height, &activations)
+            .await?,
+        fixed_tip
+    );
+    assert!(!source.capabilities().supports(NodeCapability::TreeState));
+    assert!(matches!(
+        source.fetch_tree_state_for_block(fixed_tip.block_id).await,
+        Err(SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::TreeState,
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_source_rejects_a_different_activation_fingerprint() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, predecessor, _) = fixture_checkpoint_source(&fixture);
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    let source = CanonicalFixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+    let mismatched_activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+
+    let outcome = source
+        .fetch_chain_checkpoint(predecessor.block_id.height, &mismatched_activations)
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_source_rejects_an_unrelated_checkpoint_height() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, _, _) = fixture_checkpoint_source(&fixture);
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    let source = CanonicalFixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+    let unrelated_height = BlockHeight::new(fixture.manifest.from_height.saturating_sub(2));
+
+    let outcome = source
+        .fetch_chain_checkpoint(unrelated_height, &activations)
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::BlockUnavailable { height, .. }) if height == unrelated_height
+    ));
     Ok(())
 }
 
@@ -722,6 +819,90 @@ async fn fixture_source_splits_oversized_multi_block_responses() -> Result<()> {
         one_block_payload_bytes.saturating_mul(4)
     );
     assert_eq!(segment.stats().split_count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fixture_source_serves_complete_exact_subtree_root_ranges() -> Result<()> {
+    let mut fixture = write_regtest_fixture()?;
+    fixture.manifest.subtree_roots.sapling = (0..=5)
+        .map(|index| subtree_root_record(index, 0x11))
+        .collect();
+    let source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+    let range = SubtreeRootRange::new(
+        ShieldedProtocol::Sapling,
+        SubtreeRootIndex::new(4),
+        NonZeroU32::new(2).ok_or_else(|| eyre!("two must be non-zero"))?,
+    );
+
+    let subtree_roots = source.fetch_subtree_root_range(range).await?;
+
+    assert_eq!(subtree_roots.protocol, ShieldedProtocol::Sapling);
+    assert_eq!(subtree_roots.start_index, SubtreeRootIndex::new(4));
+    assert_eq!(subtree_roots.subtree_roots.len(), 2);
+    assert_eq!(
+        subtree_roots.subtree_roots[0].subtree_index,
+        SubtreeRootIndex::new(4)
+    );
+    assert_eq!(
+        subtree_roots.subtree_roots[1].subtree_index,
+        SubtreeRootIndex::new(5)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fixture_source_rejects_short_missing_or_disconnected_exact_subtree_ranges() -> Result<()> {
+    let mut fixture = write_regtest_fixture()?;
+    fixture.manifest.subtree_roots.sapling = (0..=5)
+        .map(|index| subtree_root_record(index, 0x11))
+        .collect();
+    let source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+    let short_range = SubtreeRootRange::new(
+        ShieldedProtocol::Sapling,
+        SubtreeRootIndex::new(4),
+        NonZeroU32::new(3).ok_or_else(|| eyre!("three must be non-zero"))?,
+    );
+    let missing_range = SubtreeRootRange::new(
+        ShieldedProtocol::Sapling,
+        SubtreeRootIndex::new(6),
+        NonZeroU32::MIN,
+    );
+
+    assert!(matches!(
+        source.fetch_subtree_root_range(short_range).await,
+        Err(SourceError::SubtreeRootsUnavailable {
+            protocol: ShieldedProtocol::Sapling,
+            start_index,
+            ..
+        }) if start_index == SubtreeRootIndex::new(4)
+    ));
+    assert!(matches!(
+        source.fetch_subtree_root_range(missing_range).await,
+        Err(SourceError::SubtreeRootsUnavailable {
+            protocol: ShieldedProtocol::Sapling,
+            start_index,
+            ..
+        }) if start_index == SubtreeRootIndex::new(6)
+    ));
+
+    fixture.manifest.subtree_roots.sapling[5] = subtree_root_record(6, 0x33);
+    let disconnected_source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+    let disconnected_range = SubtreeRootRange::new(
+        ShieldedProtocol::Sapling,
+        SubtreeRootIndex::new(4),
+        NonZeroU32::new(2).ok_or_else(|| eyre!("two must be non-zero"))?,
+    );
+    assert!(matches!(
+        disconnected_source
+            .fetch_subtree_root_range(disconnected_range)
+            .await,
+        Err(SourceError::SubtreeRootsUnavailable {
+            protocol: ShieldedProtocol::Sapling,
+            start_index,
+            ..
+        }) if start_index == SubtreeRootIndex::new(4)
+    ));
     Ok(())
 }
 
