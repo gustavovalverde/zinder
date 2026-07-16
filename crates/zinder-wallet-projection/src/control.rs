@@ -36,6 +36,45 @@ impl WalletProjectionSourcePosition {
     }
 }
 
+/// Exact authenticated canonical source a READY wallet projection represents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalletCanonicalSourceIdentity {
+    source_position: WalletProjectionSourcePosition,
+    source_sequence_digest: CanonicalBlockFactsSequenceDigest,
+}
+
+impl WalletCanonicalSourceIdentity {
+    /// Creates an expected source identity from an authenticated canonical fence.
+    #[must_use]
+    pub const fn new(
+        source_position: WalletProjectionSourcePosition,
+        source_sequence_digest: CanonicalBlockFactsSequenceDigest,
+    ) -> Self {
+        Self {
+            source_position,
+            source_sequence_digest,
+        }
+    }
+
+    /// Extracts the serving identity committed by READY evidence.
+    #[must_use]
+    pub const fn from_ready_evidence(evidence: &WalletProjectionReadyEvidence) -> Self {
+        Self::new(evidence.source_position, evidence.source_sequence_digest)
+    }
+
+    /// Returns the exact epoch, tip, and event sequence represented by the source.
+    #[must_use]
+    pub const fn source_position(self) -> WalletProjectionSourcePosition {
+        self.source_position
+    }
+
+    /// Returns the authenticated ordered canonical-facts digest through the source tip.
+    #[must_use]
+    pub const fn source_sequence_digest(self) -> CanonicalBlockFactsSequenceDigest {
+        self.source_sequence_digest
+    }
+}
+
 /// Immutable plan recorded before a wallet projection build starts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalletProjectionBuildPlan {

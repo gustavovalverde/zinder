@@ -41,10 +41,10 @@ pub enum WalletProjectionContractError {
         /// Durable value being decoded.
         field: &'static str,
     },
-    /// A durable list repeats a key that must be unique.
-    #[error("{field} contains a duplicate key")]
-    DurableDuplicateKey {
-        /// Durable list being decoded.
+    /// A durable list is not in strict canonical key order.
+    #[error("{field} keys must be strictly increasing")]
+    DurableKeyOrder {
+        /// Durable list whose ordering was invalid.
         field: &'static str,
     },
     /// A durable identity marker does not match the version-1 contract.

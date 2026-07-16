@@ -15,9 +15,9 @@ mod serial_oracle;
 
 pub use contract_error::WalletProjectionContractError;
 pub use control::{
-    WalletProjectionBuildPlan, WalletProjectionBuildState, WalletProjectionDigest,
-    WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
-    WalletStoreControl, WalletUtxoSetSummary,
+    WalletCanonicalSourceIdentity, WalletProjectionBuildPlan, WalletProjectionBuildState,
+    WalletProjectionDigest, WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
+    WalletProjectionSourcePosition, WalletStoreControl, WalletUtxoSetSummary,
 };
 pub use digest::{WalletProjectionDigestBuilder, WalletProjectionRowFamily};
 pub use rows::{

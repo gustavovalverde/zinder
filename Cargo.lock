@@ -6013,6 +6013,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinder-wallet-rocksdb"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "rust-rocksdb",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zinder-core",
+ "zinder-proto",
+ "zinder-store",
+ "zinder-wallet-projection",
+]
+
+[[package]]
 name = "zip32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

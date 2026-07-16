@@ -1,6 +1,6 @@
 # Fact-First Indexer Architecture
 
-Status: Accepted migration target
+Status: Accepted version-1 implementation target
 
 Zinder will make the canonical chain available first, build the wallet serving
 model second, and build optional explorer analytics last. The canonical writer
@@ -42,7 +42,9 @@ fact-first runtime or the `postgres-scale-out` composition.
 | Clean physical schema identities | Landed | Canonical, wallet, and explorer contracts use identity-scoped version 1 and refuse prior layouts without migration or adoption |
 | Fresh RocksDB canonical builder | Wallet READY lifecycle implemented; block-family arm live-tested | A new `BUILDING` path fixes its workload, activation fingerprint, source range, predecessor frontiers, and build tip; Wallet publication flushes, closes, cold-reopens, validates every required family, then atomically writes epoch 1, event 1, and `READY`. Explorer remains blocked until daily value-pool evidence is implemented; neither complete lifecycle is live-certified yet |
 | One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
-| Independent wallet projector and store | Not implemented | Current `zinder-ingest` still owns legacy projection replay |
+| Version-1 wallet row contracts and serial oracle | Landed | 6 query-owned row families, exact durable codecs, deterministic projection evidence, and bounded reorg undo are independent of the storage engine |
+| RocksDB wallet construction | Bounded correctness baseline landed | A fresh identity-scoped version-1 store moves from `BUILDING` through cold semantic validation to `READY` at an exact canonical source fence. Its current in-memory sort/merge tracer is deliberately bounded and is not the production full-chain loader or evidence for a mainnet speed claim |
+| Production wallet bulk loader | Not implemented | RocksDB still needs disk-backed variable-record outpoint runs, derived fixed-record runs, and SST ingestion; Postgres still needs its concrete `COPY`, native join, and index-build path |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
 | Complete lifecycle certification | Not run | Fresh mainnet canonical, wallet construction, restore, reorg, and client parity gates remain open |
 
@@ -412,13 +414,40 @@ as soon as another product is added.
 ## Wallet Projection Contract
 
 Fresh wallet construction and live following use different algorithms. The
-builder streams canonical replay once, emits created-output and spent-outpoint
-records into bounded sorted runs, merge-joins them by outpoint, and bulk-loads
-the final unspent-output set, durable spent-output rows, address transactions, balances,
-and commitment. RocksDB uses external SST ingestion; PostgreSQL uses binary
-`COPY` into an unpublished schema followed by deferred index construction. The
-builder validates the result, catches up the short chain-event tail, and only
-then publishes `wallet-ready`.
+landed RocksDB construction baseline starts only from an admitted canonical
+`READY` store, fixes that store's exact epoch, tip, event sequence, and replay
+sequence digest as its source fence, and creates a physically fresh wallet path
+in `BUILDING`. It consumes the authenticated canonical replay stream once,
+resolves created outputs and spends by an in-memory sort/merge, and writes 6
+query-owned families: unspent outputs, address-ordered unspent outputs, spent
+outputs, address transactions, address balances, and bounded reorg undo. The
+tracer has an explicit preparation-memory ceiling and fails closed when the
+fixture exceeds it. It is a correctness and lifecycle baseline for bounded
+histories, not the production full-chain implementation and not evidence for a
+mainnet sync-speed claim.
+
+The production RocksDB builder preserves the same row contracts and source
+fence while replacing only the preparation and load mechanics. One
+authenticated replay scan emits variable-record outpoint events into bounded
+external runs. A merge by outpoint produces final unspent and spent rows plus
+fixed-record runs for address state, address transactions, balances, and undo;
+secondary merges then create the 6 ordered SST families. RocksDB ingests those
+families while the store remains `BUILDING`, flushes and closes the database,
+cold-reopens it without the construction caches, validates every row family and
+reconstructs index, balance, history, and undo relationships under an explicit
+memory ceiling, validates aggregate evidence against the source fence, and only
+then publishes `READY`. The differential contract suite separately compares
+the optimized derivation with the serial oracle. No construction step performs
+a historical canonical prevout point read, and no partial run or partially
+ingested family is queryable.
+
+Postgres implements the same construction outcome through its own physical
+algorithm: binary `COPY` into unpublished version-1 tables, native SQL joins
+and reductions, deferred constraint and index builds, cold validation, and one
+transactional readiness publication. Cross-engine equality lives at the typed
+wallet row contracts, deterministic projection digest, UTXO summary, and
+serial oracle. It does not live in a generic database adapter, shared key/value
+transaction, or emulation of RocksDB SST mechanics in SQL.
 
 Live following is one ordered transparent-state machine over canonical replay
 facts. For each bounded block window it:
@@ -449,8 +478,13 @@ height. A single unusually dense block is allowed to form a batch by itself.
 Wallet reads fail closed unless the projection source position exactly matches
 the pinned canonical epoch, tip, and event sequence. A matching height alone is
 insufficient because a same-height reorg can replace every relevant row.
+Serving admission also validates the canonical replay sequence digest, so a
+store cannot reopen against a different same-position fact stream.
 Capabilities advertise only after the wallet identity and complete source
-position match.
+fence match. Exact point reads remain exact, while address histories and UTXO
+lists use bounded, cursor-based pagination over their durable key order; no
+query may materialize an unbounded result set or treat a truncated page as
+complete.
 
 ## Explorer Projection Contract
 
@@ -575,7 +609,7 @@ integration line is fast-forwarded onto `main` so the retained history stays
 linear. Obsolete local branches and worktrees are deleted only after their tips
 are ancestors of `main` or their rejected status is recorded here.
 
-## Migration Plan
+## Implementation Plan
 
 ### 1. Consolidate and lock contracts
 

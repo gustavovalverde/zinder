@@ -291,6 +291,9 @@ impl WalletProjectionSerialOracle {
         }
 
         self.last_projected_block = Some(block);
+        created_outpoints.sort_unstable();
+        spent_outpoints.sort_unstable();
+        address_transaction_keys.sort_unstable();
         let undo = WalletReorgUndo {
             block,
             created_outpoints,
@@ -329,11 +332,13 @@ impl WalletProjectionSerialOracle {
         &mut self,
         output: &WalletUnspentOutput,
     ) -> Result<(), WalletProjectionContractError> {
-        let address = output.address_script_hash.as_bytes();
-        let balance = self.balance_by_address.entry(address).or_default();
-        *balance = balance
-            .checked_add(output.value_zat)
-            .ok_or(WalletProjectionContractError::AddressBalanceOverflow)?;
+        if output.value_zat > 0 {
+            let address = output.address_script_hash.as_bytes();
+            let balance = self.balance_by_address.entry(address).or_default();
+            *balance = balance
+                .checked_add(output.value_zat)
+                .ok_or(WalletProjectionContractError::AddressBalanceOverflow)?;
+        }
         self.utxo_count = self
             .utxo_count
             .checked_add(1)
@@ -351,16 +356,18 @@ impl WalletProjectionSerialOracle {
         &mut self,
         output: &WalletUnspentOutput,
     ) -> Result<(), WalletProjectionContractError> {
-        let address = output.address_script_hash.as_bytes();
-        let balance = self
-            .balance_by_address
-            .get_mut(&address)
-            .ok_or(WalletProjectionContractError::AddressBalanceUnderflow)?;
-        *balance = balance
-            .checked_sub(output.value_zat)
-            .ok_or(WalletProjectionContractError::AddressBalanceUnderflow)?;
-        if *balance == 0 {
-            self.balance_by_address.remove(&address);
+        if output.value_zat > 0 {
+            let address = output.address_script_hash.as_bytes();
+            let balance = self
+                .balance_by_address
+                .get_mut(&address)
+                .ok_or(WalletProjectionContractError::AddressBalanceUnderflow)?;
+            *balance = balance
+                .checked_sub(output.value_zat)
+                .ok_or(WalletProjectionContractError::AddressBalanceUnderflow)?;
+            if *balance == 0 {
+                self.balance_by_address.remove(&address);
+            }
         }
         self.utxo_count = self
             .utxo_count
@@ -523,6 +530,75 @@ mod tests {
         );
         assert_eq!(oracle.row_counts().reorg_undo_count, 1);
         assert!(oracle.projection_digest().is_ok());
+    }
+
+    #[test]
+    fn zero_value_utxo_does_not_create_an_address_balance_row() {
+        let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
+        let transaction = TransactionId::from_bytes([0xb1; 32]);
+        let outpoint = TransparentOutPoint::new(transaction, 0);
+        let block = block_facts(
+            1,
+            [0x00; 32],
+            [0xc1; 32],
+            transaction_facts(
+                transaction,
+                Vec::new(),
+                vec![TransparentOutputFact::new(0, 0, [0x51], address)],
+            ),
+        );
+        let mut oracle = WalletProjectionSerialOracle::new(Network::ZcashRegtest);
+
+        oracle
+            .apply_block(&block)
+            .unwrap_or_else(|error| unreachable!("valid zero-value output: {error}"));
+
+        assert!(oracle.find_unspent_output(outpoint).is_some());
+        assert_eq!(oracle.address_balance(address), 0);
+        assert_eq!(oracle.row_counts().transparent_unspent_output_count, 1);
+        assert_eq!(
+            oracle
+                .row_counts()
+                .transparent_unspent_output_by_address_count,
+            1
+        );
+        assert_eq!(oracle.row_counts().transparent_address_balance_count, 0);
+        assert_eq!(oracle.utxo_summary().utxo_count, 1);
+        assert_eq!(oracle.utxo_summary().total_value_zat, 0);
+    }
+
+    #[test]
+    fn mixed_zero_and_positive_utxos_create_one_positive_balance_row() {
+        let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
+        let transaction = TransactionId::from_bytes([0xb1; 32]);
+        let zero_outpoint = TransparentOutPoint::new(transaction, 0);
+        let positive_outpoint = TransparentOutPoint::new(transaction, 1);
+        let block = block_facts(
+            1,
+            [0x00; 32],
+            [0xc1; 32],
+            transaction_facts(
+                transaction,
+                Vec::new(),
+                vec![
+                    TransparentOutputFact::new(0, 0, [0x51], address),
+                    TransparentOutputFact::new(1, 7, [0x52], address),
+                ],
+            ),
+        );
+        let mut oracle = WalletProjectionSerialOracle::new(Network::ZcashRegtest);
+
+        oracle
+            .apply_block(&block)
+            .unwrap_or_else(|error| unreachable!("valid mixed-value outputs: {error}"));
+
+        assert!(oracle.find_unspent_output(zero_outpoint).is_some());
+        assert!(oracle.find_unspent_output(positive_outpoint).is_some());
+        assert_eq!(oracle.address_balance(address), 7);
+        assert_eq!(oracle.row_counts().transparent_unspent_output_count, 2);
+        assert_eq!(oracle.row_counts().transparent_address_balance_count, 1);
+        assert_eq!(oracle.utxo_summary().utxo_count, 2);
+        assert_eq!(oracle.utxo_summary().total_value_zat, 7);
     }
 
     #[test]

@@ -9,6 +9,7 @@ members = [
     "crates/zinder-store",
     "crates/zinder-testkit",
     "crates/zinder-wallet-projection",
+    "crates/zinder-wallet-rocksdb",
     "services/zinder-bench",
     "services/zinder-compat-lightwalletd",
     "services/zinder-compat-cipherscan",
@@ -89,6 +90,7 @@ zinder-source = { path = "crates/zinder-source" }
 zinder-store = { path = "crates/zinder-store" }
 zinder-testkit = { path = "crates/zinder-testkit" }
 zinder-wallet-projection = { path = "crates/zinder-wallet-projection" }
+zinder-wallet-rocksdb = { path = "crates/zinder-wallet-rocksdb" }
 
 [patch.crates-io]
 # `bip32 0.6.0-pre.1` pins prerelease RustCrypto 0.13 packages that Cargo

@@ -1,7 +1,5 @@
 //! Exact version-1 wallet projection query rows and durable byte layouts.
 
-use std::collections::BTreeSet;
-
 use zinder_core::wire::UtxoSetCommitmentElement;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, Network, TransactionId, TransparentAddressScriptHash,
@@ -562,9 +560,9 @@ impl WalletReorgUndo {
 
     /// Encodes the exact version-1 undo value.
     pub fn encode_value(&self) -> Result<Vec<u8>, WalletProjectionContractError> {
-        validate_unique_keys(&self.created_outpoints, "reorg_undo created outpoint list")?;
-        validate_unique_keys(&self.spent_outpoints, "reorg_undo spent outpoint list")?;
-        validate_unique_keys(
+        validate_strict_key_order(&self.created_outpoints, "reorg_undo created outpoint list")?;
+        validate_strict_key_order(&self.spent_outpoints, "reorg_undo spent outpoint list")?;
+        validate_strict_key_order(
             &self.address_transaction_keys,
             "reorg_undo address transaction list",
         )?;
@@ -640,15 +638,12 @@ fn fixed_array<const LEN: usize>(
     )
 }
 
-fn validate_unique_keys<Key: Copy + Ord>(
+fn validate_strict_key_order<Key: Ord>(
     keys: &[Key],
     field: &'static str,
 ) -> Result<(), WalletProjectionContractError> {
-    let mut unique = BTreeSet::new();
-    for key in keys {
-        if !unique.insert(*key) {
-            return Err(WalletProjectionContractError::DurableDuplicateKey { field });
-        }
+    if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(WalletProjectionContractError::DurableKeyOrder { field });
     }
     Ok(())
 }
@@ -687,14 +682,11 @@ fn decode_outpoint_list(
         return Err(WalletProjectionContractError::DurableLengthPrefixMismatch { field });
     };
     let mut keys = Vec::with_capacity(count);
-    let mut unique = BTreeSet::new();
     for encoded_outpoint in list_bytes.chunks_exact(OUTPOINT_KEY_LEN) {
         let key = WalletOutpointKey::decode(encoded_outpoint)?;
-        if !unique.insert(key) {
-            return Err(WalletProjectionContractError::DurableDuplicateKey { field });
-        }
         keys.push(key);
     }
+    validate_strict_key_order(&keys, field)?;
     *offset = end;
     Ok(keys)
 }
@@ -715,14 +707,11 @@ fn decode_address_transaction_list(
         return Err(WalletProjectionContractError::DurableLengthPrefixMismatch { field });
     };
     let mut keys = Vec::with_capacity(count);
-    let mut unique = BTreeSet::new();
     for encoded_address_transaction in list_bytes.chunks_exact(ADDRESS_TRANSACTION_KEY_LEN) {
         let key = WalletAddressTransactionKey::decode(encoded_address_transaction)?;
-        if !unique.insert(key) {
-            return Err(WalletProjectionContractError::DurableDuplicateKey { field });
-        }
         keys.push(key);
     }
+    validate_strict_key_order(&keys, field)?;
     *offset = end;
     Ok(keys)
 }
@@ -993,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_row_decoders_reject_truncation_trailing_bytes_and_duplicate_undo_keys()
+    fn wallet_row_decoders_reject_truncation_trailing_bytes_and_noncanonical_undo_keys()
     -> Result<(), WalletProjectionContractError> {
         let output = sample_unspent_output();
         let outpoint_key = WalletOutpointKey::new(output.outpoint);
@@ -1021,8 +1010,29 @@ mod tests {
         };
         assert!(matches!(
             undo.encode_value(),
-            Err(WalletProjectionContractError::DurableDuplicateKey { .. })
+            Err(WalletProjectionContractError::DurableKeyOrder { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn reorg_undo_requires_strict_key_order() {
+        let output = sample_unspent_output();
+        let lower_key = WalletOutpointKey::new(output.outpoint);
+        let higher_key = WalletOutpointKey::new(TransparentOutPoint::new(
+            TransactionId::from_bytes([0x22; 32]),
+            0,
+        ));
+        let undo = WalletReorgUndo {
+            block: output.created_at.block,
+            created_outpoints: vec![higher_key, lower_key],
+            spent_outpoints: Vec::new(),
+            address_transaction_keys: Vec::new(),
+        };
+
+        assert!(matches!(
+            undo.encode_value(),
+            Err(WalletProjectionContractError::DurableKeyOrder { .. })
+        ));
     }
 }
