@@ -110,7 +110,7 @@ where
         if let Some(prefetched_segment) = pop_next_completed_source_segment(state) {
             let PrefetchedSourceSegment {
                 segment,
-                prefetch_restart_reason,
+                feedback_action,
                 reservation,
                 ..
             } = prefetched_segment;
@@ -123,7 +123,7 @@ where
                 Ok(source_block_chunk) => source_block_chunk,
                 Err(error) => return Some(Err(error)),
             };
-            if let Some(reason) = prefetch_restart_reason {
+            if let Some(reason) = feedback_action {
                 restart_future_source_prefetch(state, reason);
             }
             return Some(Ok(source_block_chunk));
@@ -137,11 +137,10 @@ where
             }
             None => return None,
         };
-        prefetched_segment.prefetch_restart_reason =
-            state.source_segment_sizer.lock().record_segment(
-                prefetched_segment.start_height,
-                prefetched_segment.segment.stats(),
-            );
+        prefetched_segment.feedback_action = state.source_segment_sizer.lock().record_segment(
+            prefetched_segment.start_height,
+            prefetched_segment.segment.stats(),
+        );
         if let Err(error) = insert_completed_source_segment(state, prefetched_segment) {
             return Some(Err(error));
         }
@@ -233,7 +232,7 @@ struct PrefetchedSourceSegment {
     max_connected_blocks: NonZeroU32,
     segment: SourceChainSegment,
     queued_response_bytes: u64,
-    prefetch_restart_reason: Option<SourceSegmentPrefetchRestartReason>,
+    feedback_action: Option<SourceSegmentPrefetchRestartReason>,
     reservation: ByteReservation,
 }
 
@@ -278,7 +277,7 @@ where
             max_connected_blocks,
             segment,
             queued_response_bytes,
-            prefetch_restart_reason: None,
+            feedback_action: None,
             reservation,
         })
     });
@@ -538,12 +537,14 @@ pub(crate) enum SourceSegmentPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SourceSegmentPrefetchRestartReason {
     ResponseTooLarge,
+    Density,
 }
 
 impl SourceSegmentPrefetchRestartReason {
     const fn metric_label(self) -> &'static str {
         match self {
             Self::ResponseTooLarge => "response_too_large",
+            Self::Density => "density",
         }
     }
 }
@@ -681,20 +682,21 @@ impl SourceSegmentSizer {
             self.max_blocks,
             self.target_response_payload_bytes,
         );
-        let prefetch_restart_reason = (self.current_blocks < previous_blocks
-            && stats.split_count() > 0)
-            .then_some(SourceSegmentPrefetchRestartReason::ResponseTooLarge);
-        if previous_blocks != self.current_blocks {
-            let reason = if let Some(prefetch_restart_reason) = prefetch_restart_reason {
-                prefetch_restart_reason.metric_label()
-            } else if self.current_blocks < previous_blocks {
-                "density"
+        let feedback_action = if self.current_blocks < previous_blocks {
+            if stats.split_count() > 0 {
+                Some(SourceSegmentPrefetchRestartReason::ResponseTooLarge)
             } else {
-                "success"
-            };
+                Some(SourceSegmentPrefetchRestartReason::Density)
+            }
+        } else {
+            None
+        };
+        if previous_blocks != self.current_blocks {
+            let reason =
+                feedback_action.map_or("success", |feedback_action| feedback_action.metric_label());
             record_source_segment_sizer_adjustment(reason, previous_blocks, self.current_blocks);
         }
-        prefetch_restart_reason
+        feedback_action
     }
 
     fn record_density_sample(&mut self, stats: SourceChainSegmentStats) {

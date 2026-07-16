@@ -1065,30 +1065,6 @@ mod tests {
     }
 
     #[test]
-    fn source_segment_sizer_density_shrink_does_not_restart_prefetch() -> Result<(), Box<dyn Error>>
-    {
-        let mut sizer = SourceSegmentSizer::new(
-            NonZeroU32::new(32).ok_or("invalid max segment blocks")?,
-            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid target bytes")?,
-            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
-            BlockHeight::new(1),
-        );
-
-        let restart_reason = sizer.record_segment(
-            BlockHeight::new(1),
-            SourceChainSegmentStats::from_response_payload_bytes(32 * 1024 * 1024)
-                .with_connected_blocks(32),
-        );
-
-        assert_eq!(restart_reason, None);
-        assert_eq!(
-            sizer.blocks_for_remaining_range(BlockHeight::new(33), BlockHeight::new(100)),
-            NonZeroU32::new(12)
-        );
-        Ok(())
-    }
-
-    #[test]
     fn source_segment_sizer_waits_for_initial_density_feedback() -> Result<(), Box<dyn Error>> {
         let mut sizer = SourceSegmentSizer::new(
             NonZeroU32::new(32).ok_or("invalid max segment blocks")?,
@@ -1626,11 +1602,10 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let requested_segments = Arc::new(Mutex::new(Vec::new()));
         let completed_segments = Arc::new(Mutex::new(Vec::new()));
-        let source = AdaptiveHeadSegmentSource {
+        let source = SplitHeadSegmentSource {
             requested_segments: Arc::clone(&requested_segments),
             completed_segments: Arc::clone(&completed_segments),
             network: Network::ZcashRegtest,
-            head_feedback: HeadSegmentFeedback::ResponseSplit,
         };
         let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
             NonZeroU32::new(2).ok_or("invalid segment blocks")?,
@@ -1689,80 +1664,6 @@ mod tests {
             "expected the stale prefetched range to be cancelled before completion; completions: {completed_segments:?}"
         );
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_fetch_keeps_scheduled_ranges_after_ordered_density_shrink()
-    -> Result<(), Box<dyn Error>> {
-        let requested_segments = Arc::new(Mutex::new(Vec::new()));
-        let completed_segments = Arc::new(Mutex::new(Vec::new()));
-        let source = AdaptiveHeadSegmentSource {
-            requested_segments: Arc::clone(&requested_segments),
-            completed_segments: Arc::clone(&completed_segments),
-            network: Network::ZcashRegtest,
-            head_feedback: HeadSegmentFeedback::Density,
-        };
-        let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
-            NonZeroU32::new(2).ok_or("invalid segment blocks")?,
-            NonZeroU64::new(12 * 1024 * 1024).ok_or("invalid segment target bytes")?,
-            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
-            BlockHeight::new(1),
-        )));
-        // Admit one future range before the head segment reports a density
-        // that reduces only subsequently scheduled ranges.
-        source_segment_sizer.lock().record_segment(
-            BlockHeight::new(1),
-            SourceChainSegmentStats::from_response_payload_bytes(4 * 1024 * 1024)
-                .with_connected_blocks(2),
-        );
-        let (_store_tempdir, store) = test_primary_chain_store("density-prefetch-keep-store")?;
-        let block_prepare_stream = build_block_prepare_stream(
-            &source,
-            BulkCatchupBlockPrepareStreamConfig {
-                request_timeout: Duration::from_secs(30),
-                from_height: BlockHeight::new(1),
-                to_height: BlockHeight::new(8),
-                max_response_bytes: NonZeroU64::new(16 * 1024 * 1024)
-                    .ok_or("invalid max response bytes")?,
-                target_response_payload_bytes: NonZeroU64::new(12 * 1024 * 1024)
-                    .ok_or("invalid target response bytes")?,
-                source_fetch_max_in_flight_requests: NonZeroU32::new(2)
-                    .ok_or("invalid source fetch requests")?,
-                source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-                    .ok_or("invalid source fetch bytes")?,
-                source_segment_sizer,
-                block_prepare_concurrency: 2,
-                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
-                    .ok_or("invalid block prepare artifact bytes")?,
-                store,
-            },
-            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
-        );
-        futures_util::pin_mut!(block_prepare_stream);
-        let mut observed_heights = Vec::new();
-        while let Some(chunk_result) = block_prepare_stream.next().await {
-            for prepared in chunk_result? {
-                observed_heights.push(prepared.prepared.facts.block_header.height.value());
-            }
-        }
-
-        assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let mut requested_segments = requested_segments.lock().clone();
-        requested_segments.sort_unstable();
-        assert_eq!(
-            requested_segments,
-            vec![
-                (BlockHeight::new(1), 2),
-                (BlockHeight::new(3), 2),
-                (BlockHeight::new(5), 2),
-                (BlockHeight::new(7), 1),
-                (BlockHeight::new(8), 1),
-            ]
-        );
-        let mut completed_segments = completed_segments.lock().clone();
-        completed_segments.sort_unstable();
-        assert_eq!(completed_segments, requested_segments);
         Ok(())
     }
 
@@ -2814,17 +2715,10 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct AdaptiveHeadSegmentSource {
+    struct SplitHeadSegmentSource {
         requested_segments: Arc<Mutex<Vec<(BlockHeight, u32)>>>,
         completed_segments: Arc<Mutex<Vec<(BlockHeight, u32)>>>,
         network: Network,
-        head_feedback: HeadSegmentFeedback,
-    }
-
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum HeadSegmentFeedback {
-        Density,
-        ResponseSplit,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2929,7 +2823,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl NodeSource for AdaptiveHeadSegmentSource {
+    impl NodeSource for SplitHeadSegmentSource {
         fn capabilities(&self) -> NodeCapabilities {
             ZebraJsonRpcSource::baseline_capabilities()
         }
@@ -2946,20 +2840,11 @@ mod tests {
                 .lock()
                 .push((start_height, max_connected_blocks));
 
-            match (self.head_feedback, start_height.value()) {
-                (HeadSegmentFeedback::Density, 1) => {
-                    tokio::time::sleep(Duration::from_millis(80)).await;
-                }
-                (HeadSegmentFeedback::Density, 3) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                (_, start_height) if start_height != 1 && max_connected_blocks == 2 => {
-                    // Keep future requests active until the ordered head
-                    // feedback decides whether their planned ranges require
-                    // refetch.
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                _ => {}
+            if start_height != BlockHeight::new(1) && max_connected_blocks == 2 {
+                // These are the stale prefetches admitted before the split
+                // feedback from height 1. The stream must abort them before
+                // they can complete.
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
 
             self.completed_segments
@@ -2981,13 +2866,9 @@ mod tests {
                 blocks.push(test_source_block(self.network, height));
                 next_height = height.next();
             }
-            let stats = if start_height == BlockHeight::new(1)
-                && self.head_feedback == HeadSegmentFeedback::ResponseSplit
-            {
+            let stats = if start_height == BlockHeight::new(1) {
                 SourceChainSegmentStats::from_response_payload_bytes(20 * 1024 * 1024)
                     .with_added_splits(1)
-            } else if start_height == BlockHeight::new(1) {
-                SourceChainSegmentStats::from_response_payload_bytes(14 * 1024 * 1024)
             } else {
                 SourceChainSegmentStats::from_response_payload_bytes(4 * 1024 * 1024)
             };
