@@ -280,7 +280,10 @@ balance, missing row, or unqualified unavailable error.
    canonical until version-1 replay can reproduce them without source access.
 6. Implement RocksDB fresh canonical construction and live following over that
    schema, then prove that canonical commits perform no cross-block wallet
-   lookup across the representative mainnet workload anchors.
+   lookup across the representative mainnet workload anchors. The store-side
+   atomic append boundary now exists with authenticated consecutive reopen;
+   shallow reorg, continuous source following, and the ingest cutover remain
+   part of this step.
 7. Add the durable projection-build lease and anchor-aware event-pruning floor
    before any inactive builder can be promoted.
 8. Implement the concrete RocksDB wallet projection builder, ordered follower,
