@@ -54,6 +54,15 @@ fn load_regtest_block(fixture_json: &str) -> Result<SourceBlock> {
     )?)
 }
 
+fn raw_block_hex_length(fixture_json: &str) -> Result<u64> {
+    let fixture: Value = serde_json::from_str(fixture_json)?;
+    let raw_block_hex = fixture
+        .get("raw_block_hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("fixture raw_block_hex must be a string"))?;
+    Ok(u64::try_from(raw_block_hex.len())?)
+}
+
 fn regtest_activation_records() -> Vec<ActivationRecord> {
     sample_regtest_upgrade_activations()
         .activations()
@@ -157,6 +166,34 @@ fn write_regtest_fixture() -> Result<RegtestFixtureCase> {
         descriptor,
         manifest,
     })
+}
+
+fn write_repeated_payload_fixture() -> Result<RegtestFixtureCase> {
+    let mut fixture = write_regtest_fixture()?;
+    let mut blocks = vec![fixture.block.clone()];
+    for offset in 1..4 {
+        blocks.push(SourceBlock::new(
+            zinder_source::SourceBlockHeader {
+                network: Network::ZcashRegtest,
+                height: BlockHeight::new(603 + offset),
+                hash: fixture.block.hash,
+                parent_hash: fixture.block.hash,
+                block_time_seconds: fixture.block.block_time_seconds.saturating_add(offset),
+            },
+            fixture.block.raw_block_bytes.clone(),
+        ));
+    }
+    let descriptor = write_segment(fixture.directory.path(), 0, &blocks)?;
+    fixture.descriptor = descriptor.clone();
+    fixture.manifest.to_height = 606;
+    fixture.manifest.block_count = 4;
+    fixture.manifest.workload_density.block_count = 4;
+    fixture
+        .manifest
+        .canonical_block_facts_digest_evidence
+        .block_count = 4;
+    fixture.manifest.segments = vec![descriptor];
+    Ok(fixture)
 }
 
 fn checkpoint_frontiers_at(height: BlockHeight) -> CommitmentTreeFrontiers {
@@ -586,18 +623,19 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
 
 #[tokio::test(start_paused = true)]
 async fn fixture_source_delays_each_segment_response_by_the_configured_duration() -> Result<()> {
-    let fixture = write_regtest_fixture()?;
+    let fixture = write_repeated_payload_fixture()?;
     let source_segment_delay = Duration::from_millis(250);
     let source = FixtureNodeSource::open_with_segment_delay(
         fixture.directory.path(),
         &fixture.manifest,
         source_segment_delay,
     )?;
+    let one_block_payload_bytes = raw_block_hex_length(REGTEST_BLOCK_603)?;
     let segment_limits = SourceChainSegmentLimits::new(
         SourceChainCursor::before_height(BlockHeight::new(603)),
-        NonZeroU32::MIN,
+        NonZeroU32::new(4).ok_or_else(|| eyre!("four must be non-zero"))?,
         u64::MAX,
-        u64::MAX,
+        one_block_payload_bytes,
     );
 
     let segment_fetch =
@@ -611,7 +649,79 @@ async fn fixture_source_delays_each_segment_response_by_the_configured_duration(
 
     tokio::time::advance(Duration::from_millis(1)).await;
     let segment = segment_fetch.await??;
-    assert_eq!(segment.stats().connected_blocks(), 1);
+    assert_eq!(segment.stats().connected_blocks(), 4);
+    assert_eq!(segment.stats().split_count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fixture_source_reports_zebra_json_hex_payload_bytes() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+    let segment = source
+        .fetch_chain_segment(SourceChainSegmentLimits::new(
+            SourceChainCursor::before_height(BlockHeight::new(603)),
+            NonZeroU32::MIN,
+            u64::MAX,
+            u64::MAX,
+        ))
+        .await?;
+
+    assert_eq!(
+        segment.stats().response_payload_bytes(),
+        raw_block_hex_length(REGTEST_BLOCK_603)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fixture_source_rejects_a_single_block_above_the_response_limit() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+    let max_response_bytes = raw_block_hex_length(REGTEST_BLOCK_603)?.saturating_sub(1);
+
+    let error = source
+        .fetch_chain_segment(SourceChainSegmentLimits::new(
+            SourceChainCursor::before_height(BlockHeight::new(603)),
+            NonZeroU32::MIN,
+            u64::MAX,
+            max_response_bytes,
+        ))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a single oversized fixture block must fail closed"))?;
+
+    assert!(matches!(
+        error,
+        SourceError::SourceResponseTooLarge {
+            operation: "batch_getblock",
+            max_response_bytes: actual_limit,
+        } if actual_limit == max_response_bytes
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fixture_source_splits_oversized_multi_block_responses() -> Result<()> {
+    let fixture = write_repeated_payload_fixture()?;
+    let source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
+    let one_block_payload_bytes = raw_block_hex_length(REGTEST_BLOCK_603)?;
+
+    let segment = source
+        .fetch_chain_segment(SourceChainSegmentLimits::new(
+            SourceChainCursor::before_height(BlockHeight::new(603)),
+            NonZeroU32::new(4).ok_or_else(|| eyre!("four must be non-zero"))?,
+            u64::MAX,
+            one_block_payload_bytes,
+        ))
+        .await?;
+
+    assert_eq!(segment.stats().connected_blocks(), 4);
+    assert_eq!(
+        segment.stats().response_payload_bytes(),
+        one_block_payload_bytes.saturating_mul(4)
+    );
+    assert_eq!(segment.stats().split_count(), 3);
     Ok(())
 }
 

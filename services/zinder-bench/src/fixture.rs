@@ -22,8 +22,8 @@ use zinder_core::{
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceBlockHeader,
-    SourceChainSegment, SourceChainSegmentLimits, SourceChainUpdate, SourceError,
-    SourceSubtreeRoot, SourceSubtreeRoots, block_header_info_from_raw_block_bytes,
+    SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
+    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, block_header_info_from_raw_block_bytes,
 };
 
 use crate::error::BenchError;
@@ -924,6 +924,82 @@ impl FixtureNodeSource {
         }
         Ok(blocks)
     }
+
+    fn json_hex_payload_bytes(
+        &self,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+    ) -> Result<u64, SourceError> {
+        let mut response_payload_bytes = 0_u64;
+        let mut height = Some(start_height);
+        while let Some(current) = height {
+            if current > end_height {
+                break;
+            }
+            let location = self.locations.get(&current.value()).ok_or_else(|| {
+                SourceError::BlockUnavailable {
+                    height: current,
+                    reason: "fixture does not contain this height".to_owned(),
+                }
+            })?;
+            response_payload_bytes = response_payload_bytes
+                .saturating_add(u64::from(location.byte_len).saturating_mul(2));
+            height = current.next();
+        }
+        Ok(response_payload_bytes)
+    }
+
+    async fn read_connected_blocks_with_response_limit(
+        &self,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+        max_response_bytes: u64,
+    ) -> Result<(Vec<SourceBlock>, SourceChainSegmentStats), SourceError> {
+        let mut pending = vec![(start_height, end_height)];
+        let mut blocks = Vec::new();
+        let mut stats = SourceChainSegmentStats::default();
+
+        while let Some((range_start, range_end)) = pending.pop() {
+            let response_payload_bytes = self.json_hex_payload_bytes(range_start, range_end)?;
+            if response_payload_bytes > max_response_bytes {
+                let Some(((left_start, left_end), (right_start, right_end))) =
+                    split_fixture_height_range(range_start, range_end)
+                else {
+                    return Err(SourceError::SourceResponseTooLarge {
+                        operation: "batch_getblock",
+                        max_response_bytes,
+                    });
+                };
+                stats = stats.with_added_splits(1);
+                pending.push((right_start, right_end));
+                pending.push((left_start, left_end));
+                continue;
+            }
+
+            let mut range_blocks = self.read_connected_blocks(range_start, range_end).await?;
+            stats = stats.with_added_response_payload_bytes(response_payload_bytes);
+            blocks.append(&mut range_blocks);
+        }
+
+        Ok((blocks, stats))
+    }
+}
+
+type FixtureHeightRange = (BlockHeight, BlockHeight);
+
+fn split_fixture_height_range(
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+) -> Option<(FixtureHeightRange, FixtureHeightRange)> {
+    if start_height >= end_height {
+        return None;
+    }
+    let midpoint = start_height
+        .value()
+        .saturating_add(end_height.value().saturating_sub(start_height.value()) / 2);
+    let left_end = BlockHeight::new(midpoint);
+    let right_start = left_end.next()?;
+    Some(((start_height, left_end), (right_start, end_height)))
 }
 
 #[async_trait]
@@ -976,7 +1052,13 @@ impl NodeSource for FixtureNodeSource {
                 .saturating_add(limits.max_connected_blocks.get().saturating_sub(1))
                 .min(self.tip.height.value()),
         );
-        let blocks = self.read_connected_blocks(start_height, end_height).await?;
+        let (blocks, stats) = self
+            .read_connected_blocks_with_response_limit(
+                start_height,
+                end_height,
+                limits.max_response_bytes,
+            )
+            .await?;
         if let Some(expected_parent_hash) = expected_parent_hash
             && blocks
                 .first()
@@ -993,7 +1075,9 @@ impl NodeSource for FixtureNodeSource {
                 )),
             ]));
         }
-        Ok(SourceChainSegment::connected_blocks(blocks))
+        Ok(SourceChainSegment::connected_blocks_with_stats(
+            blocks, stats,
+        ))
     }
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
