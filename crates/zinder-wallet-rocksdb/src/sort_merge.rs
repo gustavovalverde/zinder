@@ -404,8 +404,7 @@ where
         address_balances: &address_balances,
         reorg_undo: &reorg_undo,
     };
-    let row_counts = row_counts(rows)?;
-    let projection_digest = projection_digest(rows, row_counts)?;
+    let (row_counts, projection_digest) = projection_row_evidence(rows)?;
     let logical_evidence = phase_started.elapsed();
     let counters = WalletSortMergeCounters {
         scanned_block_count,
@@ -759,67 +758,54 @@ struct ProjectionRows<'rows> {
     reorg_undo: &'rows [WalletReorgUndo],
 }
 
-fn row_counts(
+fn projection_row_evidence(
     rows: ProjectionRows<'_>,
-) -> Result<WalletProjectionFamilyRowCounts, WalletSortMergeError> {
-    Ok(WalletProjectionFamilyRowCounts {
-        transparent_unspent_output_count: count(rows.unspent_outputs.len())?,
-        transparent_unspent_output_by_address_count: count(rows.unspent_output_by_address.len())?,
-        transparent_spent_output_count: count(rows.spent_outputs.len())?,
-        transparent_address_transaction_count: count(rows.address_transactions.len())?,
-        transparent_address_balance_count: count(rows.address_balances.len())?,
-        reorg_undo_count: count(rows.reorg_undo.len())?,
-    })
-}
-
-fn projection_digest(
-    rows: ProjectionRows<'_>,
-    row_counts: WalletProjectionFamilyRowCounts,
-) -> Result<WalletProjectionDigest, WalletSortMergeError> {
+) -> Result<(WalletProjectionFamilyRowCounts, WalletProjectionDigest), WalletSortMergeError> {
     let mut digest = WalletProjectionDigestBuilder::new();
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentUnspentOutput,
-        row_counts.transparent_unspent_output_count,
-    )?;
     for (key, output) in rows.unspent_outputs {
-        digest.append_row(key.as_bytes(), &output.encode_value()?)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentUnspentOutput,
+            key.as_bytes(),
+            &output.encode_value()?,
+        )?;
     }
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
-        row_counts.transparent_unspent_output_by_address_count,
-    )?;
     for key in rows.unspent_output_by_address {
-        digest.append_row(key.as_bytes(), &[])?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+            key.as_bytes(),
+            &[],
+        )?;
     }
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentSpentOutput,
-        row_counts.transparent_spent_output_count,
-    )?;
     for (key, output) in rows.spent_outputs {
-        digest.append_row(key.as_bytes(), &output.encode_value()?)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentSpentOutput,
+            key.as_bytes(),
+            &output.encode_value()?,
+        )?;
     }
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentAddressTransaction,
-        row_counts.transparent_address_transaction_count,
-    )?;
     for transaction in rows.address_transactions {
-        digest.append_row(transaction.key.as_bytes(), &transaction.encode_value())?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentAddressTransaction,
+            transaction.key.as_bytes(),
+            &transaction.encode_value(),
+        )?;
     }
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentAddressBalance,
-        row_counts.transparent_address_balance_count,
-    )?;
     for balance in rows.address_balances {
-        digest.append_row(&balance.encode_key(), &balance.encode_value())?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentAddressBalance,
+            &balance.encode_key(),
+            &balance.encode_value(),
+        )?;
     }
-    digest.begin_family(
-        WalletProjectionRowFamily::ReorgUndo,
-        row_counts.reorg_undo_count,
-    )?;
     for undo in rows.reorg_undo {
-        digest.append_row(&undo.encode_key(), &undo.encode_value()?)?;
+        digest.append_row(
+            WalletProjectionRowFamily::ReorgUndo,
+            &undo.encode_key(),
+            &undo.encode_value()?,
+        )?;
     }
-    Ok(digest.finish()?)
+    let row_counts = digest.row_counts();
+    Ok((row_counts, digest.finish()))
 }
 
 fn increment(counter: u64) -> Result<u64, WalletSortMergeError> {

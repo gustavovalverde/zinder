@@ -92,7 +92,10 @@ impl WalletProjectionBuildPlan {
     }
 }
 
-/// SHA-256 commitment to every version-1 wallet projection row in key order.
+/// SHA-256 commitment to every version-1 wallet projection row.
+///
+/// Families are committed in fixed contract order. Rows within each family are
+/// committed in strict durable-key order.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WalletProjectionDigest([u8; 32]);
 

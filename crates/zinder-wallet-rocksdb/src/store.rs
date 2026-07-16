@@ -1222,8 +1222,10 @@ fn validate_ready_rows(
         evidence.source_position.tip,
         &relations.undo_by_height,
     )?;
-    let observed_digest = digest.finish()?;
-    if observed_digest != evidence.projection_digest
+    let observed_row_counts = digest.row_counts();
+    let observed_digest = digest.finish();
+    if observed_row_counts != evidence.row_counts
+        || observed_digest != evidence.projection_digest
         || (WalletUtxoSetSummary {
             utxo_count,
             total_value_zat,
@@ -1246,10 +1248,6 @@ fn validate_unspent_rows(
 ) -> Result<(u64, u64, zinder_core::TransparentUtxoSetCommitment), RocksDbWalletError> {
     use zinder_core::wire::UtxoSetCommitmentElement;
 
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentUnspentOutput,
-        expected_count,
-    )?;
     let family = column_family(bounded_open, TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY)?;
     let mut count = 0u64;
     let mut total_value_zat = 0u64;
@@ -1264,7 +1262,11 @@ fn validate_unspent_rows(
         let key = WalletOutpointKey::decode(&key_bytes)?;
         let output = WalletUnspentOutput::decode_value(key, &value_bytes)?;
         relations.observe_output(&output)?;
-        digest.append_row(&key_bytes, &value_bytes)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentUnspentOutput,
+            &key_bytes,
+            &value_bytes,
+        )?;
         count = count
             .checked_add(1)
             .ok_or(RocksDbWalletError::AdmissionChanged {
@@ -1297,10 +1299,6 @@ fn validate_address_unspent_rows(
     expected_count: u64,
     relations: &mut ExpectedWalletRelations,
 ) -> Result<Vec<WalletAddressBalance>, RocksDbWalletError> {
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
-        expected_count,
-    )?;
     let address_family = column_family(
         bounded_open,
         TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
@@ -1343,7 +1341,11 @@ fn validate_address_unspent_rows(
                 reason: "address unspent value total overflow",
             },
         )?;
-        digest.append_row(&key_bytes, &value_bytes)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+            &key_bytes,
+            &value_bytes,
+        )?;
         count = count
             .checked_add(1)
             .ok_or(RocksDbWalletError::AdmissionChanged {
@@ -1426,10 +1428,6 @@ fn validate_spent_rows(
     expected_count: u64,
     relations: &mut ExpectedWalletRelations,
 ) -> Result<(), RocksDbWalletError> {
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentSpentOutput,
-        expected_count,
-    )?;
     let family = column_family(bounded_open, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY)?;
     let unspent_family = column_family(bounded_open, TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY)?;
     let mut count = 0u64;
@@ -1458,7 +1456,11 @@ fn validate_spent_rows(
             });
         }
         relations.observe_spent_output(&spent)?;
-        digest.append_row(&key_bytes, &encoded_value)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentSpentOutput,
+            &key_bytes,
+            &encoded_value,
+        )?;
         count = count
             .checked_add(1)
             .ok_or(RocksDbWalletError::AdmissionChanged {
@@ -1479,10 +1481,6 @@ fn validate_address_transaction_rows(
     expected_count: u64,
     expected_transactions: &BTreeMap<WalletAddressTransactionKey, WalletAddressTransaction>,
 ) -> Result<(), RocksDbWalletError> {
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentAddressTransaction,
-        expected_count,
-    )?;
     let family = column_family(bounded_open, TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY)?;
     let mut expected = expected_transactions.iter();
     let mut count = 0u64;
@@ -1506,7 +1504,11 @@ fn validate_address_transaction_rows(
                 reason: "address transaction rows differ from output create/spend effects",
             });
         }
-        digest.append_row(&key_bytes, &encoded_value)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentAddressTransaction,
+            &key_bytes,
+            &encoded_value,
+        )?;
         count = count
             .checked_add(1)
             .ok_or(RocksDbWalletError::AdmissionChanged {
@@ -1527,10 +1529,6 @@ fn validate_address_balance_rows(
     expected_count: u64,
     expected_balances: &[WalletAddressBalance],
 ) -> Result<(), RocksDbWalletError> {
-    digest.begin_family(
-        WalletProjectionRowFamily::TransparentAddressBalance,
-        expected_count,
-    )?;
     let family = column_family(bounded_open, TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY)?;
     let mut expected = expected_balances.iter();
     let mut count = 0u64;
@@ -1553,7 +1551,11 @@ fn validate_address_balance_rows(
                 reason: "address balance rows differ from indexed unspent-output sums",
             });
         }
-        digest.append_row(&key, &encoded_value)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentAddressBalance,
+            &key,
+            &encoded_value,
+        )?;
         count = count
             .checked_add(1)
             .ok_or(RocksDbWalletError::AdmissionChanged {
@@ -1575,7 +1577,6 @@ fn validate_reorg_undo_rows(
     ready_tip: zinder_core::BlockId,
     expected_by_height: &BTreeMap<u32, ExpectedUndoEffects>,
 ) -> Result<(), RocksDbWalletError> {
-    digest.begin_family(WalletProjectionRowFamily::ReorgUndo, expected_count)?;
     let family = column_family(bounded_open, REORG_UNDO_COLUMN_FAMILY)?;
     let first_height = u64::from(ready_tip.height.value())
         .checked_sub(expected_count)
@@ -1630,7 +1631,7 @@ fn validate_reorg_undo_rows(
                 reason: "reorg undo row differs from reconstructed wallet block effects",
             });
         }
-        digest.append_row(&key, &encoded_value)?;
+        digest.append_row(WalletProjectionRowFamily::ReorgUndo, &key, &encoded_value)?;
         count = count
             .checked_add(1)
             .ok_or(RocksDbWalletError::AdmissionChanged {
@@ -1755,29 +1756,37 @@ mod tests {
     {
         let mut digest = WalletProjectionDigestBuilder::new();
         let unspent_key = WalletOutpointKey::new(unspent.outpoint);
-        digest.begin_family(WalletProjectionRowFamily::TransparentUnspentOutput, 1)?;
-        digest.append_row(unspent_key.as_bytes(), &unspent.encode_value()?)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentUnspentOutput,
+            unspent_key.as_bytes(),
+            &unspent.encode_value()?,
+        )?;
         let address_key = WalletAddressUnspentOutputKey::new(unspent);
-        digest.begin_family(
+        digest.append_row(
             WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
-            1,
+            address_key.as_bytes(),
+            &[],
         )?;
-        digest.append_row(address_key.as_bytes(), &[])?;
         let spent_key = WalletOutpointKey::new(spent.output.outpoint);
-        digest.begin_family(WalletProjectionRowFamily::TransparentSpentOutput, 1)?;
-        digest.append_row(spent_key.as_bytes(), &spent.encode_value()?)?;
-        let address_transactions = expected_address_transactions(unspent, Some(spent));
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentAddressTransaction,
-            u64::try_from(address_transactions.len()).unwrap_or(u64::MAX),
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentSpentOutput,
+            spent_key.as_bytes(),
+            &spent.encode_value()?,
         )?;
+        let address_transactions = expected_address_transactions(unspent, Some(spent));
         for transaction in address_transactions {
-            digest.append_row(transaction.key.as_bytes(), &transaction.encode_value())?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentAddressTransaction,
+                transaction.key.as_bytes(),
+                &transaction.encode_value(),
+            )?;
         }
-        digest.begin_family(WalletProjectionRowFamily::TransparentAddressBalance, 1)?;
-        digest.append_row(&balance.encode_key(), &balance.encode_value())?;
-        digest.begin_family(WalletProjectionRowFamily::ReorgUndo, 0)?;
-        digest.finish()
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentAddressBalance,
+            &balance.encode_key(),
+            &balance.encode_value(),
+        )?;
+        Ok(digest.finish())
     }
 
     fn ready_evidence(
@@ -1868,21 +1877,24 @@ mod tests {
         let unspent_key = WalletOutpointKey::new(unspent.outpoint);
         let address_key = WalletAddressUnspentOutputKey::new(unspent);
         let mut digest = WalletProjectionDigestBuilder::new();
-        digest.begin_family(WalletProjectionRowFamily::TransparentUnspentOutput, 1)?;
-        digest.append_row(unspent_key.as_bytes(), &unspent.encode_value()?)?;
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
-            1,
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentUnspentOutput,
+            unspent_key.as_bytes(),
+            &unspent.encode_value()?,
         )?;
-        digest.append_row(address_key.as_bytes(), &[])?;
-        digest.begin_family(WalletProjectionRowFamily::TransparentSpentOutput, 0)?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+            address_key.as_bytes(),
+            &[],
+        )?;
         let address_transactions = expected_address_transactions(unspent, None);
-        digest.begin_family(WalletProjectionRowFamily::TransparentAddressTransaction, 1)?;
         for transaction in address_transactions {
-            digest.append_row(transaction.key.as_bytes(), &transaction.encode_value())?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentAddressTransaction,
+                transaction.key.as_bytes(),
+                &transaction.encode_value(),
+            )?;
         }
-        digest.begin_family(WalletProjectionRowFamily::TransparentAddressBalance, 0)?;
-        digest.begin_family(WalletProjectionRowFamily::ReorgUndo, 0)?;
 
         let mut commitment = TransparentUtxoSetCommitment::empty();
         commitment.insert(&UtxoSetCommitmentElement {
@@ -1895,7 +1907,7 @@ mod tests {
         Ok(WalletProjectionReadyEvidence {
             source_position: source_position(),
             source_sequence_digest: source_identity().source_sequence_digest(),
-            projection_digest: digest.finish()?,
+            projection_digest: digest.finish(),
             row_counts: WalletProjectionFamilyRowCounts {
                 transparent_unspent_output_count: 1,
                 transparent_unspent_output_by_address_count: 1,
@@ -1986,72 +1998,55 @@ mod tests {
         }
     }
 
-    fn test_row_count(length: usize) -> u64 {
-        u64::try_from(length).unwrap_or(u64::MAX)
-    }
-
     fn refresh_prepared_evidence(
         prepared: &mut PreparedWalletProjection,
         evidence: &mut WalletProjectionReadyEvidence,
     ) -> Result<(), zinder_wallet_projection::WalletProjectionContractError> {
-        prepared.row_counts = WalletProjectionFamilyRowCounts {
-            transparent_unspent_output_count: test_row_count(prepared.unspent_outputs.len()),
-            transparent_unspent_output_by_address_count: test_row_count(
-                prepared.unspent_output_by_address.len(),
-            ),
-            transparent_spent_output_count: test_row_count(prepared.spent_outputs.len()),
-            transparent_address_transaction_count: test_row_count(
-                prepared.address_transactions.len(),
-            ),
-            transparent_address_balance_count: test_row_count(prepared.address_balances.len()),
-            reorg_undo_count: test_row_count(prepared.reorg_undo.len()),
-        };
         let mut digest = WalletProjectionDigestBuilder::new();
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentUnspentOutput,
-            prepared.row_counts.transparent_unspent_output_count,
-        )?;
         for (key, output) in &prepared.unspent_outputs {
-            digest.append_row(key.as_bytes(), &output.encode_value()?)?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentUnspentOutput,
+                key.as_bytes(),
+                &output.encode_value()?,
+            )?;
         }
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
-            prepared
-                .row_counts
-                .transparent_unspent_output_by_address_count,
-        )?;
         for key in &prepared.unspent_output_by_address {
-            digest.append_row(key.as_bytes(), &[])?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+                key.as_bytes(),
+                &[],
+            )?;
         }
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentSpentOutput,
-            prepared.row_counts.transparent_spent_output_count,
-        )?;
         for (key, output) in &prepared.spent_outputs {
-            digest.append_row(key.as_bytes(), &output.encode_value()?)?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentSpentOutput,
+                key.as_bytes(),
+                &output.encode_value()?,
+            )?;
         }
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentAddressTransaction,
-            prepared.row_counts.transparent_address_transaction_count,
-        )?;
         for transaction in &prepared.address_transactions {
-            digest.append_row(transaction.key.as_bytes(), &transaction.encode_value())?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentAddressTransaction,
+                transaction.key.as_bytes(),
+                &transaction.encode_value(),
+            )?;
         }
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentAddressBalance,
-            prepared.row_counts.transparent_address_balance_count,
-        )?;
         for balance in &prepared.address_balances {
-            digest.append_row(&balance.encode_key(), &balance.encode_value())?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentAddressBalance,
+                &balance.encode_key(),
+                &balance.encode_value(),
+            )?;
         }
-        digest.begin_family(
-            WalletProjectionRowFamily::ReorgUndo,
-            prepared.row_counts.reorg_undo_count,
-        )?;
         for undo in &prepared.reorg_undo {
-            digest.append_row(&undo.encode_key(), &undo.encode_value()?)?;
+            digest.append_row(
+                WalletProjectionRowFamily::ReorgUndo,
+                &undo.encode_key(),
+                &undo.encode_value()?,
+            )?;
         }
-        prepared.projection_digest = digest.finish()?;
+        prepared.row_counts = digest.row_counts();
+        prepared.projection_digest = digest.finish();
         evidence.row_counts = prepared.row_counts;
         evidence.projection_digest = prepared.projection_digest;
         Ok(())

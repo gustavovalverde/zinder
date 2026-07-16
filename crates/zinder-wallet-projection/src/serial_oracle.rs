@@ -140,15 +140,14 @@ impl WalletProjectionSerialOracle {
     pub fn projection_digest(
         &self,
     ) -> Result<WalletProjectionDigest, WalletProjectionContractError> {
-        let row_counts = self.row_counts();
         let mut digest = WalletProjectionDigestBuilder::new();
 
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentUnspentOutput,
-            row_counts.transparent_unspent_output_count,
-        )?;
         for (key, output) in &self.unspent_outputs {
-            digest.append_row(key.as_bytes(), &output.encode_value()?)?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentUnspentOutput,
+                key.as_bytes(),
+                &output.encode_value()?,
+            )?;
         }
 
         let unspent_output_address_keys: BTreeSet<_> = self
@@ -156,46 +155,46 @@ impl WalletProjectionSerialOracle {
             .values()
             .map(WalletAddressUnspentOutputKey::new)
             .collect();
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
-            row_counts.transparent_unspent_output_by_address_count,
-        )?;
         for address_key in unspent_output_address_keys {
-            digest.append_row(address_key.as_bytes(), &[])?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+                address_key.as_bytes(),
+                &[],
+            )?;
         }
 
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentSpentOutput,
-            row_counts.transparent_spent_output_count,
-        )?;
         for (key, output) in &self.spent_outputs {
-            digest.append_row(key.as_bytes(), &output.encode_value()?)?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentSpentOutput,
+                key.as_bytes(),
+                &output.encode_value()?,
+            )?;
         }
 
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentAddressTransaction,
-            row_counts.transparent_address_transaction_count,
-        )?;
         for (key, entry) in &self.address_transactions {
-            digest.append_row(key.as_bytes(), &entry.encode_value())?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentAddressTransaction,
+                key.as_bytes(),
+                &entry.encode_value(),
+            )?;
         }
 
-        digest.begin_family(
-            WalletProjectionRowFamily::TransparentAddressBalance,
-            row_counts.transparent_address_balance_count,
-        )?;
         for (address_script_hash, balance_zat) in &self.balance_by_address {
-            digest.append_row(address_script_hash, &balance_zat.to_be_bytes())?;
+            digest.append_row(
+                WalletProjectionRowFamily::TransparentAddressBalance,
+                address_script_hash,
+                &balance_zat.to_be_bytes(),
+            )?;
         }
 
-        digest.begin_family(
-            WalletProjectionRowFamily::ReorgUndo,
-            row_counts.reorg_undo_count,
-        )?;
         for (height, undo) in &self.reorg_undo {
-            digest.append_row(&height.value().to_be_bytes(), &undo.encode_value()?)?;
+            digest.append_row(
+                WalletProjectionRowFamily::ReorgUndo,
+                &height.value().to_be_bytes(),
+                &undo.encode_value()?,
+            )?;
         }
-        digest.finish()
+        Ok(digest.finish())
     }
 
     #[allow(
@@ -695,7 +694,7 @@ mod tests {
                     .unwrap_or_else(|error| unreachable!("valid ordering digest: {error}"))
                     .as_bytes()
             ),
-            "e627b201a47a62f6784a9627547afb4e7ea5ac39d5ef1ccf2cc9f96e2518c8a1"
+            "d61ad1aa11ebeafadf370d0a5f55940c13f13da9f9d66a7f51d58e9c65d75a0c"
         );
     }
 

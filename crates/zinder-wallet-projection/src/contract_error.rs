@@ -73,23 +73,12 @@ pub enum WalletProjectionContractError {
         /// Durable record being decoded.
         field: &'static str,
     },
-    /// Projection digest families were supplied outside the fixed v1 order.
-    #[error("wallet projection digest expected family {expected}, observed {actual}")]
-    ProjectionDigestFamilyOrder {
-        /// Next required numeric family tag.
-        expected: u8,
-        /// Supplied numeric family tag.
-        actual: u8,
-    },
-    /// A projection digest family received too few or too many rows.
-    #[error("wallet projection digest family row count does not match its declaration")]
-    ProjectionDigestRowCountMismatch,
     /// Projection digest rows are not strictly ordered by durable key.
     #[error("wallet projection digest row keys must be strictly increasing")]
     ProjectionDigestKeyOrder,
-    /// Projection digest finalization occurred before all v1 families were framed.
-    #[error("wallet projection digest is missing one or more version-1 families")]
-    ProjectionDigestIncomplete,
+    /// A projection digest family contains more than `u64::MAX` rows.
+    #[error("wallet projection digest family row count exceeds u64::MAX")]
+    ProjectionDigestRowCountOverflow,
     /// A canonical block does not extend the oracle's current tip.
     #[error("canonical block does not extend the wallet projection serial oracle")]
     NonContiguousBlock,
