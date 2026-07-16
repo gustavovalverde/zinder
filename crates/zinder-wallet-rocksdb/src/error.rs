@@ -34,11 +34,11 @@ pub enum RocksDbWalletError {
         /// Minimum accounted bytes needed by the refused operation.
         required_bytes: u64,
     },
-    /// Accounted cold-validation state would exceed its explicit limit.
+    /// Accounted retained relationship keys and values would exceed their explicit limit.
     #[error(
-        "wallet cold semantic validation requires at least {required_bytes} accounted bytes, limit is {limit_bytes}"
+        "wallet cold semantic validation relationships require at least {required_bytes} accounted bytes, limit is {limit_bytes}"
     )]
-    AccountedValidationMemoryLimit {
+    AccountedValidationRelationMemoryLimit {
         /// Caller-supplied hard limit.
         limit_bytes: u64,
         /// Minimum accounted bytes needed by the refused operation.

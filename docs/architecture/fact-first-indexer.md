@@ -435,11 +435,12 @@ secondary merges then create the 6 ordered SST families. RocksDB ingests those
 families while the store remains `BUILDING`, flushes and closes the database,
 cold-reopens it without the construction caches, validates every row family and
 reconstructs index, balance, history, and undo relationships under an explicit
-memory ceiling, validates aggregate evidence against the source fence, and only
-then publishes `READY`. The differential contract suite separately compares
-the optimized derivation with the serial oracle. No construction step performs
-a historical canonical prevout point read, and no partial run or partially
-ingested family is queryable.
+ceiling for accounted retained relationship key and value bytes, validates
+aggregate evidence against the source fence, and only then publishes `READY`.
+The differential contract suite separately compares the optimized derivation
+with the serial oracle. No construction step performs a historical canonical
+prevout point read, and no partial run or partially ingested family is
+queryable.
 
 Postgres implements the same construction outcome through its own physical
 algorithm: binary `COPY` into unpublished version-1 tables, native SQL joins

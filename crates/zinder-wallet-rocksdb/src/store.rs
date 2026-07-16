@@ -425,7 +425,7 @@ impl ColdRocksDbWalletBuild {
     pub(crate) fn validate_rows(
         self,
         ready_evidence: WalletProjectionReadyEvidence,
-        max_accounted_validation_bytes: u64,
+        max_accounted_validation_relation_bytes: u64,
     ) -> Result<ValidatedRocksDbWalletBuild, RocksDbWalletError> {
         let WalletProjectionBuildState::Building(plan) = &self.control.build_state else {
             return Err(RocksDbWalletError::AdmissionChanged {
@@ -441,7 +441,7 @@ impl ColdRocksDbWalletBuild {
             &self.bounded_open,
             self.control.network,
             &ready_evidence,
-            max_accounted_validation_bytes,
+            max_accounted_validation_relation_bytes,
         )?;
         Ok(ValidatedRocksDbWalletBuild {
             bounded_open: self.bounded_open,
@@ -933,13 +933,13 @@ struct ExpectedUndoEffects {
 }
 
 #[derive(Debug)]
-struct AccountedValidationMemory {
+struct AccountedValidationRelationMemory {
     limit: u64,
     current: u64,
     peak: u64,
 }
 
-impl AccountedValidationMemory {
+impl AccountedValidationRelationMemory {
     const fn new(limit: u64) -> Self {
         Self {
             limit,
@@ -955,7 +955,7 @@ impl AccountedValidationMemory {
             .checked_add(bytes)
             .ok_or(RocksDbWalletError::LoadAccountingOverflow)?;
         if required_bytes > self.limit {
-            return Err(RocksDbWalletError::AccountedValidationMemoryLimit {
+            return Err(RocksDbWalletError::AccountedValidationRelationMemoryLimit {
                 limit_bytes: self.limit,
                 required_bytes,
             });
@@ -966,11 +966,32 @@ impl AccountedValidationMemory {
     }
 }
 
+#[allow(
+    clippy::set_contains_or_insert,
+    reason = "the retained-key budget must be admitted only for absent keys and before insertion"
+)]
+fn insert_accounted_relation_key<Key: Ord>(
+    keys: &mut BTreeSet<Key>,
+    key: Key,
+    memory: &mut AccountedValidationRelationMemory,
+) -> Result<(), RocksDbWalletError> {
+    if keys.contains(&key) {
+        return Ok(());
+    }
+    memory.reserve(size_of::<Key>())?;
+    if !keys.insert(key) {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "validation relationship key changed during single-threaded admission",
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ExpectedWalletRelations {
     address_transactions: BTreeMap<WalletAddressTransactionKey, WalletAddressTransaction>,
     undo_by_height: BTreeMap<u32, ExpectedUndoEffects>,
-    memory: AccountedValidationMemory,
+    memory: AccountedValidationRelationMemory,
     random_read_count: u64,
 }
 
@@ -983,7 +1004,7 @@ impl ExpectedWalletRelations {
         let mut relations = Self {
             address_transactions: BTreeMap::new(),
             undo_by_height: BTreeMap::new(),
-            memory: AccountedValidationMemory::new(max_accounted_bytes),
+            memory: AccountedValidationRelationMemory::new(max_accounted_bytes),
             random_read_count: 0,
         };
         let first_height = u64::from(ready_tip.height.value())
@@ -1022,9 +1043,10 @@ impl ExpectedWalletRelations {
         &mut self,
         spent: &WalletSpentOutput,
     ) -> Result<(), RocksDbWalletError> {
+        validate_spent_position(spent)?;
         self.observe_output(&spent.output)?;
         self.observe_address_transaction(spent.output.address_script_hash, spent.spent_at)?;
-        if spent.output.created_at.block.height != spent.spent_at.block.height {
+        if spent.output.created_at.block != spent.spent_at.block {
             self.observe_undo_spent(spent)?;
         }
         Ok(())
@@ -1059,10 +1081,11 @@ impl ExpectedWalletRelations {
         }
         if let Some(undo) = self.undo_by_height.get_mut(&position.block.height.value()) {
             remember_undo_block(undo, position.block)?;
-            if undo.address_transaction_keys.insert(key) {
-                self.memory
-                    .reserve(size_of::<WalletAddressTransactionKey>())?;
-            }
+            insert_accounted_relation_key(
+                &mut undo.address_transaction_keys,
+                key,
+                &mut self.memory,
+            )?;
         }
         Ok(())
     }
@@ -1079,9 +1102,7 @@ impl ExpectedWalletRelations {
         };
         remember_undo_block(undo, output.created_at.block)?;
         let key = WalletOutpointKey::new(output.outpoint);
-        if undo.created_outpoints.insert(key) {
-            self.memory.reserve(size_of::<WalletOutpointKey>())?;
-        }
+        insert_accounted_relation_key(&mut undo.created_outpoints, key, &mut self.memory)?;
         Ok(())
     }
 
@@ -1094,9 +1115,7 @@ impl ExpectedWalletRelations {
         };
         remember_undo_block(undo, spent.spent_at.block)?;
         let key = WalletOutpointKey::new(spent.output.outpoint);
-        if undo.spent_outpoints.insert(key) {
-            self.memory.reserve(size_of::<WalletOutpointKey>())?;
-        }
+        insert_accounted_relation_key(&mut undo.spent_outpoints, key, &mut self.memory)?;
         Ok(())
     }
 
@@ -1118,6 +1137,21 @@ impl ExpectedWalletRelations {
     }
 }
 
+fn validate_spent_position(spent: &WalletSpentOutput) -> Result<(), RocksDbWalletError> {
+    let created = spent.output.created_at;
+    let consumed = spent.spent_at;
+    if created.block.height.value() > consumed.block.height.value()
+        || (created.block.height == consumed.block.height
+            && (created.block != consumed.block
+                || created.tx_index_in_block >= consumed.tx_index_in_block))
+    {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "spent output does not follow its exact canonical creation position",
+        });
+    }
+    Ok(())
+}
+
 fn remember_undo_block(
     undo: &mut ExpectedUndoEffects,
     block: zinder_core::BlockId,
@@ -1135,13 +1169,19 @@ fn validate_ready_rows(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
     evidence: &WalletProjectionReadyEvidence,
-    max_accounted_validation_bytes: u64,
+    max_accounted_validation_relation_bytes: u64,
 ) -> Result<WalletColdValidationEvidence, RocksDbWalletError> {
     let counts = evidence.row_counts;
+    if counts.transparent_unspent_output_count != counts.transparent_unspent_output_by_address_count
+    {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "address unspent index does not exactly cover every primary unspent output",
+        });
+    }
     let mut relations = ExpectedWalletRelations::new(
         evidence.source_position.tip,
         counts.reorg_undo_count,
-        max_accounted_validation_bytes,
+        max_accounted_validation_relation_bytes,
     )?;
     let mut digest = WalletProjectionDigestBuilder::new();
     let (utxo_count, total_value_zat, commitment) = validate_unspent_rows(
@@ -1367,7 +1407,7 @@ fn append_expected_balance(
     balances: &mut Vec<WalletAddressBalance>,
     address_script_hash: TransparentAddressScriptHash,
     balance_zat: u64,
-    memory: &mut AccountedValidationMemory,
+    memory: &mut AccountedValidationRelationMemory,
 ) -> Result<(), RocksDbWalletError> {
     if balance_zat == 0 {
         return Ok(());
@@ -1391,6 +1431,7 @@ fn validate_spent_rows(
         expected_count,
     )?;
     let family = column_family(bounded_open, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY)?;
+    let unspent_family = column_family(bounded_open, TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY)?;
     let mut count = 0u64;
     for row in
         bounded_open
@@ -1403,6 +1444,19 @@ fn validate_spent_rows(
             WalletOutpointKey::decode(&key_bytes)?,
             &encoded_value,
         )?;
+        relations.record_random_read()?;
+        if bounded_open
+            .db
+            .get_cf_opt(&unspent_family, &key_bytes, &validation_read_options())
+            .map_err(|source| {
+                RocksDbWalletError::rocksdb("spent/unspent disjointness validation lookup", source)
+            })?
+            .is_some()
+        {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "one outpoint appears in both unspent and spent output families",
+            });
+        }
         relations.observe_spent_output(&spent)?;
         digest.append_row(&key_bytes, &encoded_value)?;
         count = count
@@ -1895,9 +1949,41 @@ mod tests {
     #[derive(Clone, Copy)]
     enum SemanticTamper {
         OrphanAddressIndex,
+        MissingAddressIndex,
+        OverlappingOutputState,
+        DifferentBlockAtSameHeight,
+        NonForwardSameBlockSpend,
         IncorrectBalance,
         MissingAddressTransaction,
         IncorrectUndo,
+    }
+
+    impl SemanticTamper {
+        const fn expected_reason(self) -> &'static str {
+            match self {
+                Self::OrphanAddressIndex => {
+                    "address unspent index references a missing primary output"
+                }
+                Self::MissingAddressIndex => {
+                    "address unspent index does not exactly cover every primary unspent output"
+                }
+                Self::OverlappingOutputState => {
+                    "one outpoint appears in both unspent and spent output families"
+                }
+                Self::DifferentBlockAtSameHeight | Self::NonForwardSameBlockSpend => {
+                    "spent output does not follow its exact canonical creation position"
+                }
+                Self::IncorrectBalance => {
+                    "address balance rows differ from indexed unspent-output sums"
+                }
+                Self::MissingAddressTransaction => {
+                    "address transaction rows do not exactly cover output create/spend effects"
+                }
+                Self::IncorrectUndo => {
+                    "reorg undo row differs from reconstructed wallet block effects"
+                }
+            }
+        }
     }
 
     fn test_row_count(length: usize) -> u64 {
@@ -1982,6 +2068,52 @@ mod tests {
                 prepared.unspent_output_by_address =
                     vec![WalletAddressUnspentOutputKey::new(&orphan)];
             }
+            SemanticTamper::MissingAddressIndex => {
+                prepared.unspent_output_by_address.clear();
+            }
+            SemanticTamper::OverlappingOutputState => {
+                let output = prepared.unspent_outputs[0].1.clone();
+                let spent = WalletSpentOutput::new(
+                    output.clone(),
+                    WalletTransactionPosition::new(
+                        TransactionId::from_bytes([0x55; 32]),
+                        1,
+                        output.created_at.block,
+                    ),
+                    0,
+                );
+                prepared
+                    .spent_outputs
+                    .push((WalletOutpointKey::new(output.outpoint), spent));
+                prepared.spent_outputs.sort_unstable_by_key(|(key, _)| *key);
+            }
+            SemanticTamper::DifferentBlockAtSameHeight => {
+                let spent = prepared.spent_outputs[0].1.clone();
+                prepared.spent_outputs[0].1 = WalletSpentOutput::new(
+                    spent.output,
+                    WalletTransactionPosition::new(
+                        spent.spent_at.transaction_id,
+                        spent.spent_at.tx_index_in_block,
+                        BlockId::new(
+                            spent.spent_at.block.height,
+                            BlockHash::from_bytes([0xaa; 32]),
+                        ),
+                    ),
+                    spent.input_index,
+                );
+            }
+            SemanticTamper::NonForwardSameBlockSpend => {
+                let spent = prepared.spent_outputs[0].1.clone();
+                prepared.spent_outputs[0].1 = WalletSpentOutput::new(
+                    spent.output.clone(),
+                    WalletTransactionPosition::new(
+                        spent.spent_at.transaction_id,
+                        spent.output.created_at.tx_index_in_block,
+                        spent.output.created_at.block,
+                    ),
+                    spent.input_index,
+                );
+            }
             SemanticTamper::IncorrectBalance => {
                 prepared.address_balances[0].balance_zat = prepared.address_balances[0]
                     .balance_zat
@@ -2046,6 +2178,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         for (index, tamper) in [
             SemanticTamper::OrphanAddressIndex,
+            SemanticTamper::MissingAddressIndex,
+            SemanticTamper::OverlappingOutputState,
+            SemanticTamper::DifferentBlockAtSameHeight,
+            SemanticTamper::NonForwardSameBlockSpend,
             SemanticTamper::IncorrectBalance,
             SemanticTamper::MissingAddressTransaction,
             SemanticTamper::IncorrectUndo,
@@ -2082,13 +2218,72 @@ mod tests {
                 RocksDbResourceBudget::for_local_tests(),
             )?;
             builder.load_prepared(&prepared, 1024 * 1024)?;
-            assert!(matches!(
-                builder
-                    .reopen_for_validation()?
-                    .validate_rows(evidence, TEST_VALIDATION_MEMORY_LIMIT),
-                Err(RocksDbWalletError::AdmissionChanged { .. })
-            ));
+            let result = builder
+                .reopen_for_validation()?
+                .validate_rows(evidence, TEST_VALIDATION_MEMORY_LIMIT);
+            let Err(error) = result else {
+                return Err("semantically tampered wallet store was admitted".into());
+            };
+            let RocksDbWalletError::AdmissionChanged { reason } = error else {
+                return Err(std::io::Error::other(error.to_string()).into());
+            };
+            assert_eq!(reason, tamper.expected_reason());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn relationship_memory_admission_precedes_undo_set_insertion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let admitted_bytes = size_of::<(u32, ExpectedUndoEffects)>()
+            .checked_add(size_of::<(
+                WalletAddressTransactionKey,
+                WalletAddressTransaction,
+            )>())
+            .ok_or("test relationship memory overflow")?;
+        let memory_limit = u64::try_from(admitted_bytes)?;
+        let mut relations = ExpectedWalletRelations::new(source_position().tip, 1, memory_limit)?;
+        let output = sample_output(0x22, 12_345)?;
+
+        assert!(matches!(
+            relations.observe_output(&output),
+            Err(RocksDbWalletError::AccountedValidationRelationMemoryLimit { .. })
+        ));
+        let undo = relations
+            .undo_by_height
+            .get(&source_position().tip.height.value())
+            .ok_or("test undo relationship disappeared")?;
+        assert!(undo.address_transaction_keys.is_empty());
+        assert!(undo.created_outpoints.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_relationship_keys_need_no_additional_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let admitted_bytes = size_of::<(u32, ExpectedUndoEffects)>()
+            .checked_add(size_of::<(
+                WalletAddressTransactionKey,
+                WalletAddressTransaction,
+            )>())
+            .and_then(|bytes| bytes.checked_add(size_of::<WalletAddressTransactionKey>()))
+            .and_then(|bytes| bytes.checked_add(size_of::<WalletOutpointKey>()))
+            .ok_or("test relationship memory overflow")?;
+        let memory_limit = u64::try_from(admitted_bytes)?;
+        let mut relations = ExpectedWalletRelations::new(source_position().tip, 1, memory_limit)?;
+        let output = sample_output(0x22, 12_345)?;
+
+        relations.observe_output(&output)?;
+        relations.observe_output(&output)?;
+
+        let undo = relations
+            .undo_by_height
+            .get(&source_position().tip.height.value())
+            .ok_or("test undo relationship disappeared")?;
+        assert_eq!(undo.address_transaction_keys.len(), 1);
+        assert_eq!(undo.created_outpoints.len(), 1);
+        assert_eq!(relations.memory.current, memory_limit);
+        assert_eq!(relations.memory.peak, memory_limit);
         Ok(())
     }
 
@@ -2125,7 +2320,7 @@ mod tests {
 
         assert!(matches!(
             builder.reopen_for_validation()?.validate_rows(evidence, 0),
-            Err(RocksDbWalletError::AccountedValidationMemoryLimit { .. })
+            Err(RocksDbWalletError::AccountedValidationRelationMemoryLimit { .. })
         ));
         Ok(())
     }

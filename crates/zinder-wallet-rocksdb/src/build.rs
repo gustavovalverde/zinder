@@ -31,8 +31,8 @@ pub struct RocksDbWalletBuildOptions {
     pub resource_budget: RocksDbResourceBudget,
     /// Hard ceiling for explicitly accounted preparation rows and payloads.
     pub max_accounted_preparation_bytes: u64,
-    /// Hard ceiling for independently reconstructed cold-validation state.
-    pub max_accounted_validation_bytes: u64,
+    /// Hard ceiling for explicitly accounted retained relationship keys and values.
+    pub max_accounted_validation_relation_bytes: u64,
     /// Hard logical key-and-value byte ceiling for one WAL-free write batch.
     pub max_write_batch_bytes: u64,
     /// Number of exact tip undo records retained for reorg handling.
@@ -46,7 +46,7 @@ impl RocksDbWalletBuildOptions {
         Self {
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             max_accounted_preparation_bytes: 16 * 1024 * 1024,
-            max_accounted_validation_bytes: 16 * 1024 * 1024,
+            max_accounted_validation_relation_bytes: 16 * 1024 * 1024,
             max_write_batch_bytes: 1024 * 1024,
             supported_reorg_depth: 100,
         }
@@ -107,10 +107,10 @@ pub struct RocksDbWalletBuildReport {
     pub peak_accounted_preparation_bytes: u64,
     /// Caller-supplied preparation ceiling used by this build.
     pub max_accounted_preparation_bytes: u64,
-    /// Highest explicitly accounted cold semantic-validation footprint.
-    pub peak_accounted_validation_bytes: u64,
-    /// Caller-supplied cold semantic-validation ceiling.
-    pub max_accounted_validation_bytes: u64,
+    /// Highest explicitly accounted retained relationship key and value bytes.
+    pub peak_accounted_validation_relation_bytes: u64,
+    /// Caller-supplied ceiling for the accounted retained relationship bytes.
+    pub max_accounted_validation_relation_bytes: u64,
     /// Logical durable key and value bytes written to `RocksDB`.
     pub logical_row_bytes: u64,
     /// Number of bounded WAL-free data write batches.
@@ -196,8 +196,10 @@ pub fn build_wallet_from_canonical(
     let flush_and_cold_reopen = phase_started.elapsed();
 
     let phase_started = Instant::now();
-    let validated =
-        cold_build.validate_rows(ready_evidence, options.max_accounted_validation_bytes)?;
+    let validated = cold_build.validate_rows(
+        ready_evidence,
+        options.max_accounted_validation_relation_bytes,
+    )?;
     let cold_validation = phase_started.elapsed();
 
     let validation_evidence = validated.validation_evidence();
@@ -221,8 +223,8 @@ pub fn build_wallet_from_canonical(
         historical_prevout_read_count: counters.historical_prevout_read_count,
         peak_accounted_preparation_bytes: counters.peak_accounted_bytes,
         max_accounted_preparation_bytes: counters.max_accounted_bytes,
-        peak_accounted_validation_bytes: validation_evidence.peak_accounted_bytes,
-        max_accounted_validation_bytes: options.max_accounted_validation_bytes,
+        peak_accounted_validation_relation_bytes: validation_evidence.peak_accounted_bytes,
+        max_accounted_validation_relation_bytes: options.max_accounted_validation_relation_bytes,
         logical_row_bytes: load_evidence.logical_row_bytes,
         write_batch_count: load_evidence.write_batch_count,
         cold_validation_random_read_count: validation_evidence.random_read_count,

@@ -118,12 +118,12 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
     assert_eq!(outcome.report.historical_prevout_read_count, 0);
     assert!(outcome.report.logical_row_bytes > 0);
     assert!(outcome.report.write_batch_count > 0);
-    assert!(outcome.report.peak_accounted_validation_bytes > 0);
+    assert!(outcome.report.peak_accounted_validation_relation_bytes > 0);
     assert!(
-        outcome.report.peak_accounted_validation_bytes
-            <= outcome.report.max_accounted_validation_bytes
+        outcome.report.peak_accounted_validation_relation_bytes
+            <= outcome.report.max_accounted_validation_relation_bytes
     );
-    assert_eq!(outcome.report.cold_validation_random_read_count, 4);
+    assert_eq!(outcome.report.cold_validation_random_read_count, 6);
     let phases = outcome.report.phase_durations;
     let measured_phase_total = phases.store_initialization
         + phases.canonical_scan
