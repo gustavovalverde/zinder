@@ -8,9 +8,7 @@
 use zebra_chain::{
     parameters::NetworkUpgrade as ZebraNetworkUpgrade,
     serialization::ZcashDeserializeInto,
-    transaction::{
-        AuthDigest as ZebraAuthDigest, Transaction as ZebraTransaction, WtxId as ZebraWtxId,
-    },
+    transaction::{Transaction as ZebraTransaction, WtxId as ZebraWtxId},
     transparent::Input as ZebraTransparentInput,
 };
 use zinder_core::{
@@ -214,12 +212,10 @@ fn transaction_public_facts(
         vec![UnsupportedSection::FutureVersionHeader]
     };
     let consensus_branch_id = resolve_consensus_branch_id(transaction, mined_height, activations);
-    let auth_digest = extract_auth_digest(transaction);
-    let wtxid = extract_wtxid(transaction);
+    let (transaction_id, auth_digest, wtxid) = transaction_identifiers(transaction);
     let lock_time = extract_lock_time(transaction);
     let expiry_height = extract_expiry_height(transaction);
     let size_bytes = u32::try_from(serialized_size).unwrap_or(u32::MAX);
-    let transaction_id = TransactionId::from_bytes(transaction.hash().0);
     let privacy_shape = classify_privacy_shape(counts, is_coinbase, version);
 
     TransactionPublicFacts {
@@ -322,16 +318,25 @@ pub fn transaction_component_counts(transaction: &ZebraTransaction) -> Transacti
     }
 }
 
-fn extract_auth_digest(transaction: &ZebraTransaction) -> Option<AuthDigest> {
-    transaction
-        .auth_digest()
-        .map(|digest: ZebraAuthDigest| AuthDigest::from_bytes(digest.0))
-}
-
-fn extract_wtxid(transaction: &ZebraTransaction) -> Option<Wtxid> {
-    transaction.network_upgrade()?;
-    let zebra_wtxid: ZebraWtxId = ZebraWtxId::from(transaction);
-    Some(Wtxid::from_bytes(zebra_wtxid.as_bytes()))
+fn transaction_identifiers(
+    transaction: &ZebraTransaction,
+) -> (TransactionId, Option<AuthDigest>, Option<Wtxid>) {
+    match transaction {
+        ZebraTransaction::V1 { .. }
+        | ZebraTransaction::V2 { .. }
+        | ZebraTransaction::V3 { .. }
+        | ZebraTransaction::V4 { .. } => {
+            (TransactionId::from_bytes(transaction.hash().0), None, None)
+        }
+        ZebraTransaction::V5 { .. } | ZebraTransaction::V6 { .. } => {
+            let zebra_wtxid = ZebraWtxId::from(transaction);
+            (
+                TransactionId::from_bytes(zebra_wtxid.id.0),
+                Some(AuthDigest::from_bytes(zebra_wtxid.auth_digest.0)),
+                Some(Wtxid::from_bytes(zebra_wtxid.as_bytes())),
+            )
+        }
+    }
 }
 
 fn extract_lock_time(transaction: &ZebraTransaction) -> LockTime {
@@ -384,17 +389,22 @@ mod tests {
         block::Height as ZebraHeight,
         parameters::NetworkUpgrade,
         serialization::ZcashSerialize,
-        transaction::{LockTime as ZebraLockTime, Transaction as ZebraTransaction},
+        transaction::{
+            LockTime as ZebraLockTime, Transaction as ZebraTransaction, WtxId as ZebraWtxId,
+        },
     };
-    use zinder_core::{Network, NetworkUpgradeActivations, TransactionIntrinsicValueBalances};
+    use zinder_core::{
+        AuthDigest, Network, NetworkUpgradeActivations, TransactionId,
+        TransactionIntrinsicValueBalances, Wtxid,
+    };
 
     use super::{
-        SourceError, parse_transaction_public_fact_set, sum_sprout_joinsplit_balances_zat,
-        transaction_public_fact_set_from_parsed,
+        SourceError, TransactionPublicFactSet, parse_transaction_public_fact_set,
+        sum_sprout_joinsplit_balances_zat, transaction_public_fact_set_from_parsed,
     };
 
     #[test]
-    fn parsed_v1_through_v6_transactions_expose_zero_intrinsic_balances()
+    fn parsed_v1_through_v6_transactions_preserve_balances_and_identifiers()
     -> Result<(), Box<dyn std::error::Error>> {
         let transactions = [
             ZebraTransaction::V1 {
@@ -459,9 +469,38 @@ mod tests {
                 TransactionIntrinsicValueBalances::default()
             );
             assert_eq!(parsed_fact_set, fact_set);
+            assert_transaction_identifiers_match_zebra(&transaction, &fact_set);
         }
 
         Ok(())
+    }
+
+    fn assert_transaction_identifiers_match_zebra(
+        transaction: &ZebraTransaction,
+        fact_set: &TransactionPublicFactSet,
+    ) {
+        if transaction.network_upgrade().is_some() {
+            let zebra_wtxid = ZebraWtxId::from(transaction);
+            assert_eq!(
+                fact_set.public_facts.transaction_id,
+                TransactionId::from_bytes(zebra_wtxid.id.0)
+            );
+            assert_eq!(
+                fact_set.public_facts.auth_digest,
+                Some(AuthDigest::from_bytes(zebra_wtxid.auth_digest.0))
+            );
+            assert_eq!(
+                fact_set.public_facts.wtxid,
+                Some(Wtxid::from_bytes(zebra_wtxid.as_bytes()))
+            );
+        } else {
+            assert_eq!(
+                fact_set.public_facts.transaction_id,
+                TransactionId::from_bytes(transaction.hash().0)
+            );
+            assert_eq!(fact_set.public_facts.auth_digest, None);
+            assert_eq!(fact_set.public_facts.wtxid, None);
+        }
     }
 
     #[test]
