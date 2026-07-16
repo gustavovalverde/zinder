@@ -3,6 +3,7 @@
 use std::{
     fs::OpenOptions,
     io::Write,
+    net::SocketAddr,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     process::ExitCode,
@@ -13,6 +14,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use zinder_bench::{
     BenchError,
     canonical_fixture_replay::capture_canonical_fixture_replay_plan,
+    canonical_fixture_transport_server::{
+        CanonicalFixtureTransportServerConfig, run_canonical_fixture_transport_server,
+    },
     capture::{CaptureConfig, capture_fixed_range},
     fixture::FixtureManifest,
     recorder::install_recorder,
@@ -67,9 +71,34 @@ enum Command {
     /// Replay an authenticated fixture into a fresh canonical-v1 `RocksDB` store.
     #[command(name = "rocksdb-canonical-fixture-replay")]
     RocksDbCanonicalFixtureReplay(RocksDbCanonicalFixtureReplayArgs),
+    /// Serve an immutable canonical fixture through JSON-RPC and indexer gRPC.
+    #[command(name = "serve-canonical-fixture-transports")]
+    ServeCanonicalFixtureTransports(ServeCanonicalFixtureTransportsArgs),
     /// Build and cold-admit complete version-1 canonical and wallet stores.
     #[command(name = "rocksdb-storage-lifecycle")]
     RocksDbStorageLifecycle(RocksDbStorageLifecycleArgs),
+}
+
+#[derive(Args)]
+struct ServeCanonicalFixtureTransportsArgs {
+    /// Directory containing the immutable fixture manifest and segments.
+    #[arg(long)]
+    fixture: PathBuf,
+    /// Local JSON-RPC listener for the current batched source.
+    #[arg(long, default_value = "127.0.0.1:19432")]
+    json_rpc_listen_addr: SocketAddr,
+    /// Local Zebra indexer gRPC listener for unary `GetBlock`.
+    #[arg(long, default_value = "127.0.0.1:19430")]
+    indexer_grpc_listen_addr: SocketAddr,
+    /// Fixed delay per JSON request or batch and per unary gRPC call.
+    #[arg(long, default_value_t = 0)]
+    response_delay_millis: u64,
+    /// Maximum JSON-RPC or protobuf response bytes.
+    #[arg(long, default_value_t = DEFAULT_MAX_RESPONSE_BYTES)]
+    max_response_bytes: u64,
+    /// Write the shutdown report to this path instead of stdout.
+    #[arg(long)]
+    report: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -285,6 +314,27 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             let output = run_rocksdb_canonical_fixture_replay(args).await?;
             emit_report(&output.report, output.report_path.as_deref())?;
             output.report.validate()
+        }
+        Command::ServeCanonicalFixtureTransports(args) => {
+            let max_response_bytes = u32::try_from(args.max_response_bytes).map_err(|_| {
+                BenchError::invalid_argument("--max-response-bytes must fit in u32")
+            })?;
+            let report =
+                run_canonical_fixture_transport_server(CanonicalFixtureTransportServerConfig {
+                    fixture_directory: args.fixture,
+                    json_rpc_listen_addr: args.json_rpc_listen_addr,
+                    indexer_grpc_listen_addr: args.indexer_grpc_listen_addr,
+                    response_delay: Duration::from_millis(args.response_delay_millis),
+                    max_response_bytes,
+                })
+                .await?;
+            let encoded = serde_json::to_vec_pretty(&report)?;
+            if let Some(path) = args.report.as_deref() {
+                create_report_file(path, &encoded)?;
+            } else {
+                write_report_to_stdout(&encoded);
+            }
+            Ok(())
         }
         Command::RocksDbStorageLifecycle(args) => {
             let output = run_rocksdb_storage_lifecycle(args).await?;

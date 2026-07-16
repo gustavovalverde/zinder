@@ -979,6 +979,12 @@ pub struct CurrentSchemaFixtureReplayReport {
 /// Exact resource profile and effective limits used by one canonical-v1 fixture replay.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct RocksDbCanonicalFixtureReplayResourceLimits {
+    /// Concrete block transport admitted for this replay.
+    pub block_source: &'static str,
+    /// Server-side delay recorded as transport experiment provenance.
+    pub injected_response_delay_millis: u64,
+    /// Global actual unary `GetBlock` limit, when gRPC is selected.
+    pub indexer_get_block_max_in_flight_requests: Option<u32>,
     /// CPU envelope from which default preparation concurrency was derived.
     pub derived_for_cpu_limit_cores: u32,
     /// Memory envelope from which default admission watermarks were derived.
@@ -3420,6 +3426,9 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
             replay_plan_fixture_manifest_sha256: "b".repeat(64),
             replay_plan_digest_sha256: "a".repeat(64),
             resource_limits: RocksDbCanonicalFixtureReplayResourceLimits {
+                block_source: "fixture",
+                injected_response_delay_millis: 0,
+                indexer_get_block_max_in_flight_requests: None,
                 derived_for_cpu_limit_cores: 10,
                 derived_for_memory_limit_bytes: 10 * 1024 * 1024 * 1024,
                 request_timeout_seconds: 30,

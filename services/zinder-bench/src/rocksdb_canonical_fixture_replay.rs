@@ -7,12 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use zinder_bench::{
     BenchError,
     canonical_fixture_replay::{
         CanonicalFixtureRocksDbReplayConfig, CanonicalFixtureRocksDbReplayOutcome,
-        replay_canonical_fixture_into_rocksdb,
+        replay_canonical_fixture_into_rocksdb, replay_canonical_fixture_transport_into_rocksdb,
     },
     fixture::FixtureManifest,
     recorder::install_recorder,
@@ -28,11 +28,33 @@ use zinder_bench::{
 };
 use zinder_core::{BlockId, UnixTimestampMillis};
 use zinder_ingest::CanonicalPipelineLimits;
+use zinder_source::{
+    NodeAuth, ZebraIndexerBlockSource, ZebraIndexerBlockSourceOptions, ZebraIndexerSourceTarget,
+    ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+};
 use zinder_store::{CanonicalStoreReadyEvidence, RocksDbResourceBudget};
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
+const DEFAULT_INDEXER_GET_BLOCK_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CanonicalFixtureBlockSource {
+    Fixture,
+    ZebraJsonRpc,
+    ZebraIndexerGrpc,
+}
+
+impl CanonicalFixtureBlockSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Fixture => "fixture",
+            Self::ZebraJsonRpc => "zebra-json-rpc",
+            Self::ZebraIndexerGrpc => "zebra-indexer-grpc",
+        }
+    }
+}
 
 /// CLI contract for authenticated canonical-v1 fixture replay.
 #[derive(Args)]
@@ -43,6 +65,21 @@ pub(crate) struct RocksDbCanonicalFixtureReplayArgs {
     /// Fresh destination for the canonical-v1 store.
     #[arg(long = "canonical-store")]
     canonical_store: PathBuf,
+    /// Concrete raw-block source. Transport sources are fixture-authenticated.
+    #[arg(long, value_enum, default_value_t = CanonicalFixtureBlockSource::Fixture)]
+    block_source: CanonicalFixtureBlockSource,
+    /// JSON-RPC endpoint for the current batched block source and gRPC control facts.
+    #[arg(long)]
+    json_rpc_addr: Option<String>,
+    /// Zebra indexer gRPC endpoint for unary historical `GetBlock`.
+    #[arg(long)]
+    indexer_grpc_addr: Option<String>,
+    /// Global actual unary `GetBlock` request limit.
+    #[arg(long)]
+    indexer_get_block_max_in_flight_requests: Option<u32>,
+    /// Injected server response delay recorded as experiment provenance.
+    #[arg(long, default_value_t = 0)]
+    injected_response_delay_millis: u64,
     /// Per-operation source timeout in seconds.
     #[arg(long = "request-timeout-secs", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECONDS)]
     request_timeout_seconds: u64,
@@ -91,6 +128,17 @@ struct ValidatedReplayArgs {
     pipeline_limits: CanonicalPipelineLimits,
     supported_reorg_depth: u32,
     source_segment_delay: Duration,
+    block_source: CanonicalFixtureBlockSource,
+    json_rpc_addr: Option<String>,
+    indexer_grpc_addr: Option<String>,
+    indexer_get_block_max_in_flight_requests: Option<NonZeroU32>,
+    injected_response_delay_millis: u64,
+}
+
+struct ValidatedBlockSourceArgs {
+    json_rpc_addr: Option<String>,
+    indexer_grpc_addr: Option<String>,
+    indexer_get_block_max_in_flight_requests: Option<NonZeroU32>,
 }
 
 struct MeasuredReplay {
@@ -113,7 +161,7 @@ pub(crate) async fn run_rocksdb_canonical_fixture_replay(
     let resource_budget = RocksDbResourceBudget::canonical_writer_defaults();
     let metrics_handle = install_recorder()?;
     let replay_started = Instant::now();
-    let outcome = replay_canonical_fixture_into_rocksdb(CanonicalFixtureRocksDbReplayConfig {
+    let replay_config = CanonicalFixtureRocksDbReplayConfig {
         fixture_directory: validated.fixture.clone(),
         canonical_store_path: validated.canonical_store.clone(),
         request_timeout: validated.request_timeout,
@@ -121,8 +169,8 @@ pub(crate) async fn run_rocksdb_canonical_fixture_replay(
         resource_budget,
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay: validated.source_segment_delay,
-    })
-    .await?;
+    };
+    let outcome = replay_with_block_source(&validated, &manifest, replay_config).await?;
     let total_seconds = replay_started.elapsed().as_secs_f64();
     let physical_store_bytes = directory_bytes(&validated.canonical_store)?;
     let run_completed_at_unix_millis = UnixTimestampMillis::now().value();
@@ -185,6 +233,7 @@ impl RocksDbCanonicalFixtureReplayArgs {
                 "canonical fixture replay pipeline limits are invalid: {source}"
             ))
         })?;
+        let block_source_args = validate_block_source_args(self)?;
         Ok(ValidatedReplayArgs {
             fixture,
             canonical_store,
@@ -192,8 +241,142 @@ impl RocksDbCanonicalFixtureReplayArgs {
             pipeline_limits,
             supported_reorg_depth: supported_reorg_depth.get(),
             source_segment_delay: Duration::from_millis(self.source_segment_delay_millis),
+            block_source: self.block_source,
+            json_rpc_addr: block_source_args.json_rpc_addr,
+            indexer_grpc_addr: block_source_args.indexer_grpc_addr,
+            indexer_get_block_max_in_flight_requests: block_source_args
+                .indexer_get_block_max_in_flight_requests,
+            injected_response_delay_millis: self.injected_response_delay_millis,
         })
     }
+}
+
+fn validate_block_source_args(
+    args: &RocksDbCanonicalFixtureReplayArgs,
+) -> Result<ValidatedBlockSourceArgs, BenchError> {
+    if args.block_source != CanonicalFixtureBlockSource::Fixture
+        && args.source_segment_delay_millis != 0
+    {
+        return Err(BenchError::invalid_argument(
+            "--source-segment-delay-millis is only valid with --block-source fixture",
+        ));
+    }
+    match args.block_source {
+        CanonicalFixtureBlockSource::Fixture => {
+            if args.json_rpc_addr.is_some()
+                || args.indexer_grpc_addr.is_some()
+                || args.indexer_get_block_max_in_flight_requests.is_some()
+                || args.injected_response_delay_millis != 0
+            {
+                return Err(BenchError::invalid_argument(
+                    "fixture block source does not accept transport endpoint, concurrency, or injected-delay flags",
+                ));
+            }
+            Ok(ValidatedBlockSourceArgs {
+                json_rpc_addr: None,
+                indexer_grpc_addr: None,
+                indexer_get_block_max_in_flight_requests: None,
+            })
+        }
+        CanonicalFixtureBlockSource::ZebraJsonRpc => {
+            let json_rpc_addr = args.json_rpc_addr.clone().ok_or_else(|| {
+                BenchError::invalid_argument(
+                    "--block-source zebra-json-rpc requires --json-rpc-addr",
+                )
+            })?;
+            if args.indexer_grpc_addr.is_some()
+                || args.indexer_get_block_max_in_flight_requests.is_some()
+            {
+                return Err(BenchError::invalid_argument(
+                    "zebra-json-rpc block source does not accept indexer flags",
+                ));
+            }
+            Ok(ValidatedBlockSourceArgs {
+                json_rpc_addr: Some(json_rpc_addr),
+                indexer_grpc_addr: None,
+                indexer_get_block_max_in_flight_requests: None,
+            })
+        }
+        CanonicalFixtureBlockSource::ZebraIndexerGrpc => {
+            let json_rpc_addr = args.json_rpc_addr.clone().ok_or_else(|| {
+                BenchError::invalid_argument(
+                    "--block-source zebra-indexer-grpc requires --json-rpc-addr",
+                )
+            })?;
+            let indexer_grpc_addr = args.indexer_grpc_addr.clone().ok_or_else(|| {
+                BenchError::invalid_argument(
+                    "--block-source zebra-indexer-grpc requires --indexer-grpc-addr",
+                )
+            })?;
+            let max_in_flight = require_nonzero_u32(
+                args.indexer_get_block_max_in_flight_requests
+                    .unwrap_or(DEFAULT_INDEXER_GET_BLOCK_MAX_IN_FLIGHT_REQUESTS),
+                "indexer-get-block-max-in-flight-requests",
+            )?;
+            Ok(ValidatedBlockSourceArgs {
+                json_rpc_addr: Some(json_rpc_addr),
+                indexer_grpc_addr: Some(indexer_grpc_addr),
+                indexer_get_block_max_in_flight_requests: Some(max_in_flight),
+            })
+        }
+    }
+}
+
+async fn replay_with_block_source(
+    validated: &ValidatedReplayArgs,
+    manifest: &FixtureManifest,
+    config: CanonicalFixtureRocksDbReplayConfig,
+) -> Result<CanonicalFixtureRocksDbReplayOutcome, BenchError> {
+    match validated.block_source {
+        CanonicalFixtureBlockSource::Fixture => replay_canonical_fixture_into_rocksdb(config).await,
+        CanonicalFixtureBlockSource::ZebraJsonRpc => {
+            let source = json_rpc_source(validated, manifest)?;
+            replay_canonical_fixture_transport_into_rocksdb(config, source).await
+        }
+        CanonicalFixtureBlockSource::ZebraIndexerGrpc => {
+            let control_plane = json_rpc_source(validated, manifest)?;
+            let endpoint = validated.indexer_grpc_addr.clone().ok_or_else(|| {
+                BenchError::invalid_argument("validated gRPC source is missing its endpoint")
+            })?;
+            let max_in_flight_requests = validated
+                .indexer_get_block_max_in_flight_requests
+                .ok_or_else(|| {
+                    BenchError::invalid_argument(
+                        "validated gRPC source is missing its request limit",
+                    )
+                })?;
+            let source = ZebraIndexerBlockSource::connect(
+                ZebraIndexerSourceTarget::new(endpoint),
+                control_plane,
+                ZebraIndexerBlockSourceOptions {
+                    connect_timeout: validated.request_timeout,
+                    request_timeout: validated.request_timeout,
+                    max_in_flight_requests,
+                },
+            )
+            .await?;
+            replay_canonical_fixture_transport_into_rocksdb(config, source).await
+        }
+    }
+}
+
+fn json_rpc_source(
+    validated: &ValidatedReplayArgs,
+    manifest: &FixtureManifest,
+) -> Result<ZebraJsonRpcSource, BenchError> {
+    let json_rpc_addr = validated.json_rpc_addr.clone().ok_or_else(|| {
+        BenchError::invalid_argument("validated transport source is missing its JSON-RPC endpoint")
+    })?;
+    Ok(ZebraJsonRpcSource::with_options(
+        manifest.network_typed()?,
+        json_rpc_addr,
+        NodeAuth::None,
+        ZebraJsonRpcSourceOptions {
+            request_timeout: validated.request_timeout,
+            max_response_bytes: validated.pipeline_limits.max_response_bytes,
+            broadcast_timeout: None,
+        },
+    )?)
 }
 
 fn apply_pipeline_overrides(
@@ -252,6 +435,11 @@ fn resource_limits(
     resource_budget: RocksDbResourceBudget,
 ) -> RocksDbCanonicalFixtureReplayResourceLimits {
     RocksDbCanonicalFixtureReplayResourceLimits {
+        block_source: validated.block_source.label(),
+        injected_response_delay_millis: validated.injected_response_delay_millis,
+        indexer_get_block_max_in_flight_requests: validated
+            .indexer_get_block_max_in_flight_requests
+            .map(NonZeroU32::get),
         derived_for_cpu_limit_cores: CANONICAL_FIXTURE_REPLAY_PROFILE_CPU_CORES,
         derived_for_memory_limit_bytes: CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES,
         request_timeout_seconds: validated.request_timeout.as_secs(),
@@ -531,6 +719,51 @@ mod tests {
                 error.to_string().contains("must be greater than zero"),
                 "{flag}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_block_source_requires_both_endpoints_and_defaults_to_twelve_unary_calls()
+    -> Result<(), Box<dyn Error>> {
+        let cli = TestCli::try_parse_from(arguments(&[
+            "--block-source",
+            "zebra-indexer-grpc",
+            "--json-rpc-addr",
+            "http://transport:19432",
+            "--indexer-grpc-addr",
+            "http://transport:19430",
+            "--injected-response-delay-millis",
+            "2070",
+        ]))?;
+        let validated = cli.replay.validate()?;
+
+        assert_eq!(
+            validated
+                .indexer_get_block_max_in_flight_requests
+                .ok_or("validated indexer source must have a request limit")?
+                .get(),
+            12
+        );
+        assert_eq!(validated.injected_response_delay_millis, 2_070);
+        Ok(())
+    }
+
+    #[test]
+    fn block_source_specific_flags_fail_closed() -> Result<(), Box<dyn Error>> {
+        for extra in [
+            vec!["--json-rpc-addr", "http://transport:19432"],
+            vec!["--injected-response-delay-millis", "2070"],
+            vec!["--block-source", "zebra-json-rpc"],
+            vec![
+                "--block-source",
+                "zebra-indexer-grpc",
+                "--json-rpc-addr",
+                "http://transport:19432",
+            ],
+        ] {
+            let cli = TestCli::try_parse_from(arguments(&extra))?;
+            assert!(cli.replay.validate().is_err(), "accepted {extra:?}");
         }
         Ok(())
     }

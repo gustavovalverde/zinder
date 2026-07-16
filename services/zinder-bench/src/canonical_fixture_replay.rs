@@ -10,6 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::{FutureExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{
@@ -122,6 +123,101 @@ pub struct CanonicalFixtureNodeSource {
     history_predecessor: CommitmentTreeCheckpoint,
     source_tip_checkpoint: CommitmentTreeCheckpoint,
     activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+}
+
+/// Transport source guarded by byte-for-byte fixture authentication.
+///
+/// Block bytes and atomic tip observations come from `transport_source`.
+/// Checkpoints and subtree roots remain bound to the admitted fixture replay
+/// plan. Every returned block is compared with the immutable fixture before
+/// canonical construction can observe it.
+#[derive(Clone)]
+struct FixtureAuthenticatedBlockSource<S> {
+    fixture_source: CanonicalFixtureNodeSource,
+    transport_source: S,
+}
+
+impl<S> FixtureAuthenticatedBlockSource<S> {
+    const fn new(fixture_source: CanonicalFixtureNodeSource, transport_source: S) -> Self {
+        Self {
+            fixture_source,
+            transport_source,
+        }
+    }
+
+    async fn authenticate_block(&self, block: &SourceBlock) -> Result<(), SourceError>
+    where
+        S: NodeSource,
+    {
+        let expected = self.fixture_source.fetch_block_at(block.height).await?;
+        if block != &expected {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "transport block differs from the admitted canonical fixture",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<S> NodeSource for FixtureAuthenticatedBlockSource<S>
+where
+    S: NodeSource,
+{
+    fn capabilities(&self) -> NodeCapabilities {
+        self.fixture_source.capabilities()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        let block = self.transport_source.fetch_block_at(height).await?;
+        self.authenticate_block(&block).await?;
+        Ok(block)
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        let segment = self.transport_source.fetch_chain_segment(limits).await?;
+        for update in segment.updates() {
+            if let zinder_source::SourceChainUpdate::ConnectedBlock { block, .. } = update {
+                self.authenticate_block(block).await?;
+            }
+        }
+        Ok(segment)
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.fixture_source
+            .fetch_chain_checkpoint(height, network_upgrade_activations)
+            .await
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        self.transport_source.tip_id().await
+    }
+
+    async fn fetch_subtree_roots(
+        &self,
+        protocol: ShieldedProtocol,
+        start_index: SubtreeRootIndex,
+        max_entries: NonZeroU32,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        self.fixture_source
+            .fetch_subtree_roots(protocol, start_index, max_entries)
+            .await
+    }
+
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        self.fixture_source.fetch_subtree_root_range(range).await
+    }
 }
 
 /// Explicit inputs for one authenticated fixture replay into canonical-v1 `RocksDB`.
@@ -496,14 +592,49 @@ fn certify_reopened_canonical_fixture(
 }
 
 /// Replays one authenticated fixture through the production canonical-v1 build lifecycle.
-pub async fn replay_canonical_fixture_into_rocksdb(
+#[must_use = "the canonical fixture replay future must be awaited"]
+pub fn replay_canonical_fixture_into_rocksdb(
     config: CanonicalFixtureRocksDbReplayConfig,
+) -> BoxFuture<'static, Result<CanonicalFixtureRocksDbReplayOutcome, BenchError>> {
+    async move {
+        let pipeline_limits = validate_rocksdb_replay_config(&config)?;
+        let admitted = admit_canonical_fixture_replay(&config)?;
+        let fixture_source = admitted.fixture_source.clone();
+        replay_admitted_canonical_fixture(config, pipeline_limits, admitted, &fixture_source).await
+    }
+    .boxed()
+}
+
+/// Replays an authenticated fixture through an explicit block transport.
+///
+/// This benchmark-only seam byte-compares transport blocks with the admitted
+/// fixture before invoking the production canonical-v1 loader. It does not
+/// alter the shipped ingest source selection and does not provide fallback.
+#[must_use = "the transport-authenticated canonical fixture replay future must be awaited"]
+pub fn replay_canonical_fixture_transport_into_rocksdb<S: NodeSource + Clone>(
+    config: CanonicalFixtureRocksDbReplayConfig,
+    transport_source: S,
+) -> BoxFuture<'static, Result<CanonicalFixtureRocksDbReplayOutcome, BenchError>> {
+    async move {
+        let pipeline_limits = validate_rocksdb_replay_config(&config)?;
+        let admitted = admit_canonical_fixture_replay(&config)?;
+        let authenticated_source =
+            FixtureAuthenticatedBlockSource::new(admitted.fixture_source.clone(), transport_source);
+        replay_admitted_canonical_fixture(config, pipeline_limits, admitted, &authenticated_source)
+            .await
+    }
+    .boxed()
+}
+
+async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
+    config: CanonicalFixtureRocksDbReplayConfig,
+    pipeline_limits: CanonicalPipelineLimits,
+    admitted: AdmittedCanonicalFixtureReplay,
+    source: &S,
 ) -> Result<CanonicalFixtureRocksDbReplayOutcome, BenchError> {
-    let pipeline_limits = validate_rocksdb_replay_config(&config)?;
-    let admitted = admit_canonical_fixture_replay(&config)?;
     let canonical_load = load_fresh_canonical(
         admitted.builder,
-        &admitted.fixture_source,
+        source,
         &CanonicalConstructionConfig {
             request_timeout: config.request_timeout,
             pipeline_limits,
