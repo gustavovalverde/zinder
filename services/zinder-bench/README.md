@@ -167,7 +167,50 @@ the accepted hard boundary. Choose a new report path for every run.
 
 Omit `--report` to print the JSON to stdout (progress logs go to stderr).
 
-## 4. Compare canonical-fact storage engines
+## 4. Measure a complete RocksDB storage lifecycle
+
+`rocksdb-storage-lifecycle` builds two fresh version-1 stores from an existing
+Zebra. It freezes one source tip, retains every non-genesis canonical block,
+publishes and cold-admits canonical READY, derives the wallet store from the
+authenticated canonical replay, then cold-admits both stores and compares
+their source fences.
+
+Both store paths and their deterministic sibling staging paths must be absent.
+The optional `--tip-height` must not exceed the node tip observed at startup;
+when omitted, the first observed tip is used.
+
+```bash
+zinder-bench rocksdb-storage-lifecycle \
+  --network zcash-testnet \
+  --json-rpc-addr http://127.0.0.1:18232 \
+  --node-auth-cookie /var/run/zebra-auth/.cookie \
+  --canonical-store ./state/canonical \
+  --wallet-store ./state/wallet \
+  --tip-height 4174755 \
+  --source-fetch-max-in-flight-requests 16 \
+  --block-prepare-concurrency 16 \
+  --supported-reorg-depth 100 \
+  --report ./rocksdb-storage-lifecycle.json
+```
+
+The report exposes two independent acceptance measurements:
+
+- `canonical_storage_ready` covers source discovery, complete-history
+  canonical construction, READY publication, and an independent cold reopen;
+- `wallet_storage_ready` covers wallet derivation after canonical readiness
+  and the final cold admission of both stores.
+
+Optional target and hard-limit pairs are
+`--canonical-storage-ready-target-secs` with
+`--canonical-storage-ready-hard-limit-secs`, and
+`--wallet-storage-ready-target-secs` with
+`--wallet-storage-ready-hard-limit-secs`. The report contains the fixed source
+fence, all version-1 contract identities, effective source and RocksDB limits,
+phase durations, row and digest evidence, external-sort evidence, physical
+bytes, and peak process RSS. It certifies storage readiness only; it does not
+claim query compatibility, service startup, live following, or reorg execution.
+
+## 5. Compare canonical-fact storage engines
 
 The fact-first commands parse the same fixture into the same complete
 `CanonicalBlockFacts` values. Each engine writes the same independently

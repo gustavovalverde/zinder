@@ -245,6 +245,18 @@ impl StorageCandidateIdentity {
             topology: "postgres-scale-out",
         }
     }
+
+    /// Identifies the single-host version-1 canonical and wallet storage lifecycle.
+    #[must_use]
+    pub const fn rocksdb_storage_lifecycle() -> Self {
+        Self {
+            id: "rocksdb-storage-lifecycle",
+            canonical_engine: "rocksdb",
+            canonical_model: "version-1-canonical-facts",
+            diagnostic_projection_engine: None,
+            topology: "rocksdb-single-host",
+        }
+    }
 }
 
 /// Effective settings for the current-schema canonical replay writer.
@@ -850,6 +862,365 @@ pub struct CurrentSchemaFixtureReplayReport {
     pub rocksdb_tickers: Vec<TickerStat>,
 }
 
+/// Node source identity frozen before one storage lifecycle begins.
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageLifecycleSourceSummary {
+    /// Concrete source adapter family used by the measurement.
+    pub family: &'static str,
+    /// Network name in Zinder-native encoding.
+    pub network: String,
+    /// Number of node-advertised consensus upgrade activations.
+    pub network_upgrade_activation_count: usize,
+    /// Activation-table fingerprint algorithm version.
+    pub network_upgrade_activations_fingerprint_version: u16,
+    /// Domain-separated activation-table fingerprint.
+    pub network_upgrade_activations_fingerprint_hex: String,
+    /// Node tip observed before selecting the fixed build tip.
+    pub source_tip_at_freeze: StorageLifecycleBlockId,
+    /// Exact immutable tip authenticated by canonical construction.
+    pub fixed_build_tip: StorageLifecycleBlockId,
+    /// Node tip observed after canonical source-family loading completed.
+    pub source_tip_after_canonical_load: StorageLifecycleBlockId,
+}
+
+/// Report-safe block identity using Zinder's canonical internal hash order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StorageLifecycleBlockId {
+    /// Block height.
+    pub height: u32,
+    /// Block hash in canonical internal byte order.
+    pub hash_hex: String,
+}
+
+/// Fixed version-1 identities exercised by the lifecycle command.
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageLifecycleContractSummary {
+    /// Canonical store contract identity.
+    pub canonical_store_identity: &'static str,
+    /// Canonical physical schema version.
+    pub canonical_store_schema_version: u16,
+    /// Wallet store contract identity.
+    pub wallet_store_identity: &'static str,
+    /// Wallet physical schema version.
+    pub wallet_store_schema_version: u16,
+    /// Wallet projection schema version.
+    pub wallet_projection_schema_version: u16,
+    /// Wallet row-value encoding version.
+    pub wallet_value_encoding_version: u16,
+}
+
+/// Exact source-pipeline and embedded-store ceilings used by one run.
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageLifecycleResourceLimits {
+    /// Per-request source deadline.
+    pub request_timeout_seconds: u64,
+    /// Maximum accepted source response body.
+    pub max_response_bytes: u64,
+    /// Adaptive target for one source segment response.
+    pub source_segment_target_response_bytes: u64,
+    /// Maximum blocks requested in one source segment.
+    pub source_segment_max_blocks: u32,
+    /// Maximum concurrent source segment requests.
+    pub source_fetch_max_in_flight_requests: u32,
+    /// Aggregate in-flight source response watermark.
+    pub source_fetch_max_in_flight_bytes: u64,
+    /// Maximum canonical block preparations in flight.
+    pub block_prepare_concurrency: u32,
+    /// Aggregate canonical preparation memory watermark.
+    pub block_prepare_memory_watermark_bytes: u64,
+    /// Canonical embedded-store resource budget.
+    pub canonical_rocksdb: RocksDbResourceBudgetSummary,
+    /// Wallet embedded-store resource budget.
+    pub wallet_rocksdb: RocksDbResourceBudgetSummary,
+    /// Retained wallet reorg depth.
+    pub supported_reorg_depth: u32,
+    /// Wallet outpoint event sort memory ceiling.
+    pub wallet_max_outpoint_sort_memory_bytes: u64,
+    /// Per-sorter wallet secondary-index sort memory ceiling.
+    pub wallet_max_secondary_sort_memory_bytes_per_sorter: u64,
+    /// Per-sorter wallet external-sort temporary-file ceiling.
+    pub wallet_max_temporary_file_bytes_per_sorter: u64,
+    /// Target logical bytes for one wallet SST file.
+    pub wallet_sst_target_logical_bytes: u64,
+    /// Wallet build's accounted reorg-undo memory ceiling.
+    pub wallet_max_accounted_reorg_undo_bytes: u64,
+}
+
+/// Acceptance results for the two storage readiness boundaries this command owns.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RocksDbStorageLifecycleAcceptance {
+    /// Canonical version-1 READY plus cold admission.
+    pub canonical_storage_ready: AcceptanceMeasurementSummary,
+    /// Wallet version-1 READY plus final cold canonical/wallet fence admission.
+    pub wallet_storage_ready: AcceptanceMeasurementSummary,
+}
+
+/// Direct wall-clock durations for the complete storage lifecycle.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct StorageLifecyclePhaseDurations {
+    /// Source creation, activation discovery, tip freeze, and genesis identity fetch.
+    pub source_discovery_seconds: f64,
+    /// Fresh canonical store identity and BUILDING publication.
+    pub canonical_store_initialization_seconds: f64,
+    /// Canonical source fetch, preparation, SST ingestion, source-family load, and tip authentication.
+    pub canonical_source_load_seconds: f64,
+    /// Canonical flush, cold reopen, and full semantic validation.
+    pub canonical_cold_validation_seconds: f64,
+    /// Atomic epoch-1, event-1, and READY publication.
+    pub canonical_ready_publication_seconds: f64,
+    /// Independent cold admission before wallet construction.
+    pub canonical_cold_reopen_seconds: f64,
+    /// Complete public wallet build call through READY publication.
+    pub wallet_build_seconds: f64,
+    /// Final independent cold admission of both stores and fence comparison.
+    pub final_cold_reopen_seconds: f64,
+    /// Entire command through the final admitted storage fences.
+    pub total_seconds: f64,
+}
+
+/// Canonical version-1 durable evidence after publication and cold admission.
+#[derive(Clone, Debug, Serialize)]
+pub struct CanonicalStorageReadySummary {
+    /// Exact boundary certified by this section.
+    pub scope: &'static str,
+    /// Persisted workload contract.
+    pub workload: &'static str,
+    /// First retained canonical block.
+    pub first_retained_block: StorageLifecycleBlockId,
+    /// Visible fixed canonical tip.
+    pub visible_tip: StorageLifecycleBlockId,
+    /// Fixed baseline epoch identifier.
+    pub visible_epoch_id: u64,
+    /// Fixed baseline event sequence.
+    pub visible_event_sequence: u64,
+    /// Contiguous source block count.
+    pub block_count: u64,
+    /// Parsed source transaction count.
+    pub transaction_count: u64,
+    /// Source-authenticated completed subtree-root count.
+    pub subtree_root_count: u64,
+    /// Canonical semantic replay format version.
+    pub replay_format_version: u32,
+    /// Ordered canonical fact digest evidence.
+    pub sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Logical semantic replay bytes authenticated by READY.
+    pub logical_replay_bytes: u64,
+    /// Total logical key-and-value bytes submitted to canonical SST writers.
+    pub logical_storage_bytes: u64,
+    /// Physical staged SST bytes ingested by `RocksDB`.
+    pub sst_file_bytes: u64,
+    /// Number of staged SST files ingested by `RocksDB`.
+    pub sst_file_count: u64,
+    /// Final bytes owned below the canonical store path.
+    pub physical_store_bytes: u64,
+    /// Database filesystem I/O mode selected by `RocksDB`.
+    pub database_io_mode: String,
+    /// Whether exact final checkpoint authentication completed before publication.
+    pub source_tip_checkpoint_authenticated: bool,
+    /// Whether a new process-equivalent open admitted the exact READY evidence.
+    pub cold_reopen_evidence_match: bool,
+}
+
+/// Version-1 wallet row counts rendered without coupling report consumers to Rust types.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct WalletStorageRowCounts {
+    /// Current transparent output rows.
+    pub transparent_unspent_output_count: u64,
+    /// Address-to-current-output index rows.
+    pub transparent_unspent_output_by_address_count: u64,
+    /// Historical spent output rows.
+    pub transparent_spent_output_count: u64,
+    /// Address transaction-history rows.
+    pub transparent_address_transaction_count: u64,
+    /// Non-zero address-balance rows.
+    pub transparent_address_balance_count: u64,
+    /// Retained reorg undo rows.
+    pub reorg_undo_count: u64,
+}
+
+/// Current transparent UTXO aggregate admitted with wallet READY.
+#[derive(Clone, Debug, Serialize)]
+pub struct WalletStorageUtxoSummary {
+    /// Current unspent output count.
+    pub utxo_count: u64,
+    /// Current transparent unspent value in zatoshis.
+    pub total_value_zat: u64,
+    /// Commitment scheme name.
+    pub commitment_scheme: &'static str,
+    /// Exact full accumulator bytes.
+    pub commitment_accumulator_hex: String,
+    /// Display digest of the full accumulator.
+    pub commitment_display_digest_hex: String,
+}
+
+/// Evidence from one bounded fixed-key, variable-value external sorter.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct WalletVariableValueSortEvidence {
+    /// Records admitted to this sorter.
+    pub record_count: u64,
+    /// Initial sorted run count emitted before merge passes.
+    pub initial_run_count: u64,
+    /// Bounded-fan-in merge passes completed.
+    pub merge_pass_count: u64,
+    /// Peak explicitly accounted sort memory.
+    pub peak_accounted_sort_memory_bytes: u64,
+    /// Caller-supplied accounted sort memory ceiling.
+    pub max_accounted_sort_memory_bytes: u64,
+    /// Peak temporary-file bytes present during construction.
+    pub peak_temporary_file_bytes: u64,
+    /// Caller-supplied temporary-file ceiling.
+    pub max_temporary_file_bytes: u64,
+    /// Bytes in the final merged run before its consumer removes it.
+    pub final_run_file_bytes: u64,
+}
+
+/// External sorting and SST evidence from the wallet build.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct WalletStorageConstructionEvidence {
+    /// Output and spend events sorted by transparent outpoint.
+    pub outpoint_sort: WalletVariableValueSortEvidence,
+    /// Current output rows sorted by address and outpoint.
+    pub address_index_sort: WalletVariableValueSortEvidence,
+    /// Address history rows sorted by address and canonical position.
+    pub address_transaction_sort: WalletVariableValueSortEvidence,
+    /// Expected address-index rows externally sorted during cold validation.
+    pub cold_validation_address_index_sort: WalletVariableValueSortEvidence,
+    /// Expected address-history rows externally sorted during cold validation.
+    pub cold_validation_address_transaction_sort: WalletVariableValueSortEvidence,
+    /// Peak accounted memory retained for bounded reorg undo rows.
+    pub peak_accounted_reorg_undo_bytes: u64,
+    /// Caller-supplied reorg undo memory ceiling.
+    pub max_accounted_reorg_undo_bytes: u64,
+    /// Peak accounted reorg-undo suffix memory during cold validation.
+    pub cold_validation_peak_accounted_reorg_undo_bytes: u64,
+    /// Caller-supplied cold-validation reorg-undo memory ceiling.
+    pub cold_validation_max_accounted_reorg_undo_bytes: u64,
+    /// Random `RocksDB` point reads during cold validation; version 1 requires zero.
+    pub cold_validation_random_read_count: u64,
+    /// Logical wallet row bytes submitted to SST writers.
+    pub logical_row_bytes: u64,
+    /// Physical wallet SST bytes ingested by `RocksDB`.
+    pub sst_file_bytes: u64,
+    /// Wallet SST files ingested by `RocksDB`.
+    pub sst_file_count: u64,
+}
+
+/// Public wallet builder phase durations copied into report-safe seconds.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct WalletStoragePhaseDurations {
+    /// Fresh wallet store initialization.
+    pub store_initialization_seconds: f64,
+    /// Authenticated canonical replay scan.
+    pub canonical_scan_seconds: f64,
+    /// External outpoint run finalization and merge.
+    pub outpoint_sort_seconds: f64,
+    /// Ordered output/spend merge and primary-family SST writes.
+    pub outpoint_merge_seconds: f64,
+    /// Secondary sorting, balances, history, and retained undo derivation.
+    pub secondary_row_derivation_seconds: f64,
+    /// Row-count and version-1 projection-digest finalization.
+    pub logical_evidence_seconds: f64,
+    /// External SST ingestion into the unpublished wallet store.
+    pub row_load_seconds: f64,
+    /// Flush, close, and BUILDING cold reopen.
+    pub flush_and_cold_reopen_seconds: f64,
+    /// Full cold semantic validation.
+    pub cold_validation_seconds: f64,
+    /// Synchronous READY publication.
+    pub ready_publication_seconds: f64,
+    /// Complete wallet build duration.
+    pub total_seconds: f64,
+}
+
+/// Wallet version-1 durable evidence after publication and cold admission.
+#[derive(Clone, Debug, Serialize)]
+pub struct WalletStorageReadySummary {
+    /// Exact boundary certified by this section.
+    pub scope: &'static str,
+    /// Canonical source epoch represented by the projection.
+    pub source_epoch_id: u64,
+    /// Canonical source tip represented by the projection.
+    pub source_tip: StorageLifecycleBlockId,
+    /// Canonical source event represented by the projection.
+    pub source_event_sequence: u64,
+    /// Ordered canonical sequence digest represented by the projection.
+    pub source_sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Digest of every durable wallet row.
+    pub projection_digest_hex: String,
+    /// Exact durable row counts by wallet family.
+    pub row_counts: WalletStorageRowCounts,
+    /// Current transparent UTXO aggregate.
+    pub utxo_summary: WalletStorageUtxoSummary,
+    /// Canonical blocks consumed by the wallet builder.
+    pub scanned_block_count: u64,
+    /// Canonical transactions consumed by the wallet builder.
+    pub scanned_transaction_count: u64,
+    /// Historical canonical prevout reads; version 1 requires zero.
+    pub historical_prevout_read_count: u64,
+    /// External sorting and SST construction evidence.
+    pub construction: WalletStorageConstructionEvidence,
+    /// Detailed public builder phase durations.
+    pub phase_durations: WalletStoragePhaseDurations,
+    /// Final bytes owned below the wallet store path.
+    pub physical_store_bytes: u64,
+    /// Whether a new process-equivalent open admitted the exact READY evidence.
+    pub cold_reopen_evidence_match: bool,
+    /// Whether the admitted wallet source fence equals the admitted canonical READY fence.
+    pub canonical_fence_match: bool,
+}
+
+/// Measurements assembled by the `RocksDB` fixed-tip lifecycle command.
+#[derive(Clone, Debug)]
+pub struct RocksDbStorageLifecycleMeasurements {
+    /// Build and runner provenance.
+    pub provenance: ReportProvenance,
+    /// Frozen node source identity.
+    pub source: StorageLifecycleSourceSummary,
+    /// Fixed version-1 contracts.
+    pub contracts: StorageLifecycleContractSummary,
+    /// Exact resource ceilings.
+    pub resource_limits: StorageLifecycleResourceLimits,
+    /// Direct acceptance measurements.
+    pub acceptance: RocksDbStorageLifecycleAcceptance,
+    /// Phase-level duration evidence.
+    pub phase_durations: StorageLifecyclePhaseDurations,
+    /// Canonical READY evidence.
+    pub canonical_storage_ready: CanonicalStorageReadySummary,
+    /// Wallet READY evidence.
+    pub wallet_storage_ready: WalletStorageReadySummary,
+    /// Peak resident-set-size reading for the embedded lifecycle process.
+    pub benchmark_client_peak_rss: PeakRss,
+}
+
+/// Complete `RocksDB` fixed-tip canonical and wallet storage certification.
+#[derive(Clone, Debug, Serialize)]
+pub struct RocksDbStorageLifecycleReport {
+    /// Stable report contract identity.
+    pub contract_identity: String,
+    /// Machine-readable report schema version.
+    pub report_format_version: u32,
+    /// Build and runner provenance.
+    pub provenance: ReportProvenance,
+    /// Concrete embedded storage candidate.
+    pub storage_candidate: StorageCandidateIdentity,
+    /// Frozen node source identity.
+    pub source: StorageLifecycleSourceSummary,
+    /// Fixed version-1 contracts.
+    pub contracts: StorageLifecycleContractSummary,
+    /// Exact resource ceilings.
+    pub resource_limits: StorageLifecycleResourceLimits,
+    /// Acceptance for only the two storage readiness boundaries.
+    pub acceptance: RocksDbStorageLifecycleAcceptance,
+    /// Phase-level duration evidence.
+    pub phase_durations: StorageLifecyclePhaseDurations,
+    /// Canonical READY evidence.
+    pub canonical_storage_ready: CanonicalStorageReadySummary,
+    /// Wallet READY evidence.
+    pub wallet_storage_ready: WalletStorageReadySummary,
+    /// Peak resident-set-size reading for the embedded lifecycle process.
+    pub benchmark_client_peak_rss: PeakRss,
+}
+
 /// One versioned benchmark report with a closed, candidate-honest measurement
 /// shape.
 ///
@@ -862,6 +1233,9 @@ pub enum BenchmarkReport {
     CurrentSchemaFixtureReplay(Box<CurrentSchemaFixtureReplayReport>),
     /// Persisted round trip of block-local canonical facts only.
     CanonicalBlockFactsRoundTrip(Box<CanonicalBlockFactsRoundTripReport>),
+    /// Fixed-tip version-1 canonical and wallet `RocksDB` storage lifecycle.
+    #[serde(rename = "rocksdb-storage-lifecycle")]
+    RocksDbStorageLifecycle(Box<RocksDbStorageLifecycleReport>),
 }
 
 impl From<CurrentSchemaFixtureReplayReport> for BenchmarkReport {
@@ -873,6 +1247,12 @@ impl From<CurrentSchemaFixtureReplayReport> for BenchmarkReport {
 impl From<CanonicalBlockFactsRoundTripReport> for BenchmarkReport {
     fn from(report: CanonicalBlockFactsRoundTripReport) -> Self {
         Self::CanonicalBlockFactsRoundTrip(Box::new(report))
+    }
+}
+
+impl From<RocksDbStorageLifecycleReport> for BenchmarkReport {
+    fn from(report: RocksDbStorageLifecycleReport) -> Self {
+        Self::RocksDbStorageLifecycle(Box::new(report))
     }
 }
 
@@ -915,20 +1295,23 @@ impl BenchmarkReport {
                 }
                 Ok(())
             }
+            Self::RocksDbStorageLifecycle(report) => report.validate_acceptance(),
         }
     }
 
     fn validate_contract_identity(&self) -> Result<(), BenchError> {
-        let (contract_identity, report_format_version, fixture) = match self {
+        let (contract_identity, report_format_version) = match self {
             Self::CurrentSchemaFixtureReplay(report) => (
                 report.contract_identity.as_str(),
                 report.report_format_version,
-                &report.fixture,
             ),
             Self::CanonicalBlockFactsRoundTrip(report) => (
                 report.contract_identity.as_str(),
                 report.report_format_version,
-                &report.fixture,
+            ),
+            Self::RocksDbStorageLifecycle(report) => (
+                report.contract_identity.as_str(),
+                report.report_format_version,
             ),
         };
         if contract_identity != REPORT_CONTRACT_IDENTITY {
@@ -941,17 +1324,24 @@ impl BenchmarkReport {
                 "report format version {report_format_version} does not match {REPORT_FORMAT_VERSION}"
             )));
         }
-        if fixture.contract_identity != FIXTURE_CONTRACT_IDENTITY {
-            return Err(BenchError::report_format(format!(
-                "fixture contract identity {:?} does not match {FIXTURE_CONTRACT_IDENTITY:?}",
-                fixture.contract_identity
-            )));
-        }
-        if fixture.fixture_format_version != FIXTURE_FORMAT_VERSION {
-            return Err(BenchError::report_format(format!(
-                "fixture format version {} does not match {FIXTURE_FORMAT_VERSION}",
-                fixture.fixture_format_version
-            )));
+        let fixture = match self {
+            Self::CurrentSchemaFixtureReplay(report) => Some(&report.fixture),
+            Self::CanonicalBlockFactsRoundTrip(report) => Some(&report.fixture),
+            Self::RocksDbStorageLifecycle(_) => None,
+        };
+        if let Some(fixture) = fixture {
+            if fixture.contract_identity != FIXTURE_CONTRACT_IDENTITY {
+                return Err(BenchError::report_format(format!(
+                    "fixture contract identity {:?} does not match {FIXTURE_CONTRACT_IDENTITY:?}",
+                    fixture.contract_identity
+                )));
+            }
+            if fixture.fixture_format_version != FIXTURE_FORMAT_VERSION {
+                return Err(BenchError::report_format(format!(
+                    "fixture format version {} does not match {FIXTURE_FORMAT_VERSION}",
+                    fixture.fixture_format_version
+                )));
+            }
         }
         Ok(())
     }
@@ -969,7 +1359,7 @@ impl BenchmarkReport {
     pub const fn current_schema_fixture_replay(&self) -> Option<&CurrentSchemaFixtureReplayReport> {
         match self {
             Self::CurrentSchemaFixtureReplay(report) => Some(report),
-            Self::CanonicalBlockFactsRoundTrip(_) => None,
+            Self::CanonicalBlockFactsRoundTrip(_) | Self::RocksDbStorageLifecycle(_) => None,
         }
     }
 
@@ -979,8 +1369,17 @@ impl BenchmarkReport {
         &self,
     ) -> Option<&CanonicalBlockFactsRoundTripReport> {
         match self {
-            Self::CurrentSchemaFixtureReplay(_) => None,
+            Self::CurrentSchemaFixtureReplay(_) | Self::RocksDbStorageLifecycle(_) => None,
             Self::CanonicalBlockFactsRoundTrip(report) => Some(report),
+        }
+    }
+
+    /// Returns the `RocksDB` storage lifecycle measurement when present.
+    #[must_use]
+    pub const fn rocksdb_storage_lifecycle(&self) -> Option<&RocksDbStorageLifecycleReport> {
+        match self {
+            Self::RocksDbStorageLifecycle(report) => Some(report),
+            Self::CurrentSchemaFixtureReplay(_) | Self::CanonicalBlockFactsRoundTrip(_) => None,
         }
     }
 }
@@ -1036,6 +1435,190 @@ impl CurrentSchemaFixtureReplayReport {
     }
 }
 
+impl RocksDbStorageLifecycleReport {
+    /// Validates the exact version-1 storage fences and configured hard limits.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed report contract validates every storage fence and resource ceiling together"
+    )]
+    pub fn validate_acceptance(&self) -> Result<(), BenchError> {
+        let canonical = &self.canonical_storage_ready;
+        let wallet = &self.wallet_storage_ready;
+        if self.storage_candidate.id != "rocksdb-storage-lifecycle"
+            || self.storage_candidate.canonical_engine != "rocksdb"
+            || self.storage_candidate.topology != "rocksdb-single-host"
+        {
+            return Err(BenchError::report_format(
+                "storage lifecycle candidate identity is not the RocksDB single-host contract",
+            ));
+        }
+        if self.contracts.canonical_store_identity != zinder_store::CANONICAL_STORE_IDENTITY
+            || self.contracts.canonical_store_schema_version
+                != zinder_store::CANONICAL_STORE_SCHEMA_VERSION
+            || self.contracts.canonical_store_schema_version != 1
+            || self.contracts.wallet_store_identity != "wallet-projection"
+            || self.contracts.wallet_store_schema_version
+                != zinder_wallet_rocksdb::WALLET_ROCKSDB_SCHEMA_VERSION
+            || self.contracts.wallet_store_schema_version != 1
+            || self.contracts.wallet_projection_schema_version
+                != zinder_wallet_projection::WALLET_PROJECTION_SCHEMA_VERSION
+            || self.contracts.wallet_projection_schema_version != 1
+            || self.contracts.wallet_value_encoding_version
+                != zinder_wallet_projection::WALLET_PROJECTION_VALUE_ENCODING_VERSION
+            || self.contracts.wallet_value_encoding_version != 1
+        {
+            return Err(BenchError::report_format(
+                "storage lifecycle report does not carry the current fixed version-1 contracts",
+            ));
+        }
+        if canonical.scope != "canonical-storage-ready"
+            || wallet.scope != "wallet-storage-ready"
+            || self.acceptance.canonical_storage_ready.scope != "canonical-storage-ready"
+            || self.acceptance.wallet_storage_ready.scope != "wallet-storage-ready"
+        {
+            return Err(BenchError::report_format(
+                "storage lifecycle report contains an unowned acceptance boundary",
+            ));
+        }
+        if canonical.first_retained_block.height != 1
+            || canonical.visible_epoch_id != 1
+            || canonical.visible_event_sequence != 1
+            || canonical.replay_format_version != 1
+            || canonical.sequence_digest.block_digest_version != 1
+            || canonical.sequence_digest.sequence_digest_version != 1
+            || canonical.block_count == 0
+            || canonical.block_count != canonical.sequence_digest.block_count
+            || !canonical.source_tip_checkpoint_authenticated
+            || !canonical.cold_reopen_evidence_match
+        {
+            return Err(BenchError::acceptance_completion_mismatch(
+                "canonical storage did not prove a complete version-1 READY baseline",
+            ));
+        }
+        if self.source.fixed_build_tip != canonical.visible_tip
+            || self.source.fixed_build_tip.height == 0
+            || self.source.network_upgrade_activations_fingerprint_version != 1
+            || wallet.source_tip != canonical.visible_tip
+            || wallet.source_epoch_id != canonical.visible_epoch_id
+            || wallet.source_event_sequence != canonical.visible_event_sequence
+            || wallet.source_sequence_digest.block_digest_version
+                != canonical.sequence_digest.block_digest_version
+            || wallet.source_sequence_digest.sequence_digest_version
+                != canonical.sequence_digest.sequence_digest_version
+            || wallet.source_sequence_digest.block_count != canonical.sequence_digest.block_count
+            || wallet.source_sequence_digest.sha256 != canonical.sequence_digest.sha256
+            || wallet.scanned_block_count != canonical.block_count
+            || wallet.historical_prevout_read_count != 0
+            || wallet.construction.cold_validation_random_read_count != 0
+            || wallet.utxo_summary.utxo_count != wallet.row_counts.transparent_unspent_output_count
+            || wallet.utxo_summary.commitment_scheme != "lthash16"
+            || !wallet.cold_reopen_evidence_match
+            || !wallet.canonical_fence_match
+        {
+            return Err(BenchError::acceptance_completion_mismatch(
+                "wallet storage READY evidence does not match the admitted canonical fence",
+            ));
+        }
+        for (role, sort, expected_memory) in [
+            (
+                "outpoint build",
+                wallet.construction.outpoint_sort,
+                self.resource_limits.wallet_max_outpoint_sort_memory_bytes,
+            ),
+            (
+                "address-index build",
+                wallet.construction.address_index_sort,
+                self.resource_limits
+                    .wallet_max_secondary_sort_memory_bytes_per_sorter,
+            ),
+            (
+                "address-transaction build",
+                wallet.construction.address_transaction_sort,
+                self.resource_limits
+                    .wallet_max_secondary_sort_memory_bytes_per_sorter,
+            ),
+            (
+                "address-index cold validation",
+                wallet.construction.cold_validation_address_index_sort,
+                self.resource_limits
+                    .wallet_max_secondary_sort_memory_bytes_per_sorter,
+            ),
+            (
+                "address-transaction cold validation",
+                wallet.construction.cold_validation_address_transaction_sort,
+                self.resource_limits
+                    .wallet_max_secondary_sort_memory_bytes_per_sorter,
+            ),
+        ] {
+            validate_wallet_sort_evidence(
+                role,
+                sort,
+                expected_memory,
+                self.resource_limits
+                    .wallet_max_temporary_file_bytes_per_sorter,
+            )?;
+        }
+        if wallet.construction.max_accounted_reorg_undo_bytes
+            != self.resource_limits.wallet_max_accounted_reorg_undo_bytes
+            || wallet.construction.peak_accounted_reorg_undo_bytes
+                > wallet.construction.max_accounted_reorg_undo_bytes
+            || wallet
+                .construction
+                .cold_validation_max_accounted_reorg_undo_bytes
+                != self.resource_limits.wallet_max_accounted_reorg_undo_bytes
+            || wallet
+                .construction
+                .cold_validation_peak_accounted_reorg_undo_bytes
+                > wallet
+                    .construction
+                    .cold_validation_max_accounted_reorg_undo_bytes
+        {
+            return Err(BenchError::acceptance_completion_mismatch(
+                "wallet reorg-undo construction exceeded or misstated its configured memory ceiling",
+            ));
+        }
+        for (boundary, measurement) in [
+            (
+                "canonical_storage_ready",
+                self.acceptance.canonical_storage_ready,
+            ),
+            ("wallet_storage_ready", self.acceptance.wallet_storage_ready),
+        ] {
+            if !measurement.wall_clock_seconds.is_finite() || measurement.wall_clock_seconds < 0.0 {
+                return Err(BenchError::report_format(format!(
+                    "{boundary} duration must be finite and non-negative"
+                )));
+            }
+            if measurement
+                .thresholds
+                .is_some_and(|thresholds| !thresholds.hard_limit_met)
+            {
+                return Err(BenchError::acceptance_hard_limit_missed(boundary));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_wallet_sort_evidence(
+    role: &str,
+    evidence: WalletVariableValueSortEvidence,
+    expected_memory_bytes: u64,
+    expected_temporary_file_bytes: u64,
+) -> Result<(), BenchError> {
+    if evidence.max_accounted_sort_memory_bytes != expected_memory_bytes
+        || evidence.peak_accounted_sort_memory_bytes > evidence.max_accounted_sort_memory_bytes
+        || evidence.max_temporary_file_bytes != expected_temporary_file_bytes
+        || evidence.peak_temporary_file_bytes > evidence.max_temporary_file_bytes
+        || evidence.final_run_file_bytes > evidence.max_temporary_file_bytes
+    {
+        return Err(BenchError::acceptance_completion_mismatch(format!(
+            "wallet {role} evidence exceeded or misstated its configured ceiling"
+        )));
+    }
+    Ok(())
+}
+
 /// Builds the report from direct measurements and the scraped exposition text.
 #[must_use]
 pub fn build_current_schema_fixture_replay_report(
@@ -1079,6 +1662,28 @@ pub fn build_current_schema_fixture_replay_report(
         stage_durations: aggregate_stage_durations(&samples),
         rocksdb_tickers,
     }
+}
+
+/// Builds the exact fixed-tip `RocksDB` storage lifecycle report.
+#[must_use]
+pub fn build_rocksdb_storage_lifecycle_report(
+    measurements: RocksDbStorageLifecycleMeasurements,
+) -> BenchmarkReport {
+    RocksDbStorageLifecycleReport {
+        contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
+        report_format_version: REPORT_FORMAT_VERSION,
+        provenance: measurements.provenance,
+        storage_candidate: StorageCandidateIdentity::rocksdb_storage_lifecycle(),
+        source: measurements.source,
+        contracts: measurements.contracts,
+        resource_limits: measurements.resource_limits,
+        acceptance: measurements.acceptance,
+        phase_durations: measurements.phase_durations,
+        canonical_storage_ready: measurements.canonical_storage_ready,
+        wallet_storage_ready: measurements.wallet_storage_ready,
+        benchmark_client_peak_rss: measurements.benchmark_client_peak_rss,
+    }
+    .into()
 }
 
 /// Builds a fact-only persisted round-trip report.
@@ -1281,6 +1886,28 @@ fn summarize_acceptance_measurement(
             target_met: wall_clock_seconds <= thresholds.target_seconds,
             hard_limit_met: wall_clock_seconds <= thresholds.hard_limit_seconds,
         }),
+    }
+}
+
+/// Evaluates the two acceptance boundaries owned by the storage lifecycle command.
+#[must_use]
+pub fn summarize_rocksdb_storage_lifecycle_acceptance(
+    canonical_storage_ready_seconds: f64,
+    canonical_thresholds: Option<AcceptanceThresholds>,
+    wallet_storage_ready_seconds: f64,
+    wallet_thresholds: Option<AcceptanceThresholds>,
+) -> RocksDbStorageLifecycleAcceptance {
+    RocksDbStorageLifecycleAcceptance {
+        canonical_storage_ready: summarize_acceptance_measurement(
+            "canonical-storage-ready",
+            canonical_storage_ready_seconds,
+            canonical_thresholds,
+        ),
+        wallet_storage_ready: summarize_acceptance_measurement(
+            "wallet-storage-ready",
+            wallet_storage_ready_seconds,
+            wallet_thresholds,
+        ),
     }
 }
 

@@ -84,6 +84,34 @@ pub enum BenchError {
         #[source]
         source: zinder_store::StoreError,
     },
+    /// Fresh version-1 canonical construction failed.
+    #[error("canonical storage lifecycle construction error: {source}")]
+    CanonicalConstruction {
+        /// Underlying construction failure.
+        #[source]
+        source: zinder_ingest::CanonicalConstructionError,
+    },
+    /// A version-1 canonical store could not be created, published, or admitted.
+    #[error("canonical storage lifecycle error: {source}")]
+    CanonicalStorage {
+        /// Underlying canonical store failure.
+        #[source]
+        source: zinder_store::CanonicalStoreError,
+    },
+    /// A fixed canonical construction plan was invalid.
+    #[error("canonical storage lifecycle build plan error: {source}")]
+    CanonicalBuildPlan {
+        /// Underlying plan validation failure.
+        #[source]
+        source: zinder_store::CanonicalStoreBuildPlanError,
+    },
+    /// Version-1 wallet construction or admission failed.
+    #[error("wallet storage lifecycle error: {source}")]
+    WalletStorage {
+        /// Underlying wallet storage failure.
+        #[source]
+        source: zinder_wallet_rocksdb::RocksDbWalletError,
+    },
     /// A projection-store operation failed while constructing projections.
     #[error("projection store error: {source}")]
     Projection {
@@ -164,6 +192,30 @@ impl From<zinder_ingest::IngestError> for BenchError {
 impl From<zinder_store::StoreError> for BenchError {
     fn from(source: zinder_store::StoreError) -> Self {
         Self::Store { source }
+    }
+}
+
+impl From<zinder_ingest::CanonicalConstructionError> for BenchError {
+    fn from(source: zinder_ingest::CanonicalConstructionError) -> Self {
+        Self::CanonicalConstruction { source }
+    }
+}
+
+impl From<zinder_store::CanonicalStoreError> for BenchError {
+    fn from(source: zinder_store::CanonicalStoreError) -> Self {
+        Self::CanonicalStorage { source }
+    }
+}
+
+impl From<zinder_store::CanonicalStoreBuildPlanError> for BenchError {
+    fn from(source: zinder_store::CanonicalStoreBuildPlanError) -> Self {
+        Self::CanonicalBuildPlan { source }
+    }
+}
+
+impl From<zinder_wallet_rocksdb::RocksDbWalletError> for BenchError {
+    fn from(source: zinder_wallet_rocksdb::RocksDbWalletError) -> Self {
+        Self::WalletStorage { source }
     }
 }
 

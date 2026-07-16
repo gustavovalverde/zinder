@@ -5621,9 +5621,12 @@ dependencies = [
  "zinder-core",
  "zinder-derive",
  "zinder-ingest",
+ "zinder-rocksdb",
  "zinder-source",
  "zinder-store",
  "zinder-testkit",
+ "zinder-wallet-projection",
+ "zinder-wallet-rocksdb",
 ]
 
 [[package]]

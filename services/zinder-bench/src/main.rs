@@ -25,8 +25,10 @@ use zinder_source::{CookieSource, NodeAuth};
 
 #[path = "canonical_fact_round_trip/command.rs"]
 mod fact_round_trip_command;
+mod rocksdb_storage_lifecycle;
 
 use fact_round_trip_command::{CanonicalFactsRoundTripArgs, run_canonical_facts_round_trip};
+use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
 
 const DEFAULT_FROM_HEIGHT: u32 = 150_000;
 const DEFAULT_TO_HEIGHT: u32 = 200_000;
@@ -52,6 +54,9 @@ enum Command {
     CurrentSchemaReplay(CurrentSchemaReplayArgs),
     /// Persist and read back backend-neutral canonical block facts.
     CanonicalFactsRoundTrip(CanonicalFactsRoundTripArgs),
+    /// Build and cold-admit complete version-1 canonical and wallet stores.
+    #[command(name = "rocksdb-storage-lifecycle")]
+    RocksDbStorageLifecycle(RocksDbStorageLifecycleArgs),
 }
 
 #[derive(Args)]
@@ -208,6 +213,11 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::CurrentSchemaReplay(args) => run_current_schema_replay(args).await,
         Command::CanonicalFactsRoundTrip(args) => {
             let output = run_canonical_facts_round_trip(args).await?;
+            emit_report(&output.report, output.report_path.as_deref())?;
+            output.report.validate()
+        }
+        Command::RocksDbStorageLifecycle(args) => {
+            let output = run_rocksdb_storage_lifecycle(args).await?;
             emit_report(&output.report, output.report_path.as_deref())?;
             output.report.validate()
         }
@@ -400,6 +410,25 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn rocksdb_storage_lifecycle_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "rocksdb-storage-lifecycle",
+            "--network",
+            "zcash-testnet",
+            "--json-rpc-addr",
+            "http://zebra:18232",
+            "--canonical-store",
+            "canonical",
+            "--wallet-store",
+            "wallet",
+        ])?;
+
+        assert!(matches!(cli.command, Command::RocksDbStorageLifecycle(_)));
+        Ok(())
     }
 
     #[test]
