@@ -168,6 +168,9 @@ fn recover_staged_store(
     if !path_exists(staging_path)? {
         return Ok(None);
     }
+    if remove_empty_construction_staging(staging_path)? {
+        return Ok(None);
+    }
     match RocksDbCanonicalStore::open_ready(
         staging_path,
         network_upgrade_activations,
@@ -192,6 +195,39 @@ fn recover_staged_store(
         }
         Err(source) => Err(source.into()),
     }
+}
+
+fn remove_empty_construction_staging(
+    staging_path: &std::path::Path,
+) -> Result<bool, CanonicalRuntimeError> {
+    let mut entries = std::fs::read_dir(staging_path).map_err(|source| {
+        CanonicalRuntimeError::PathUnavailable {
+            path: staging_path.to_path_buf(),
+            source,
+        }
+    })?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|source| CanonicalRuntimeError::PathUnavailable {
+            path: staging_path.to_path_buf(),
+            source,
+        })?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    std::fs::remove_dir(staging_path).map_err(|source| CanonicalRuntimeError::PathUnavailable {
+        path: staging_path.to_path_buf(),
+        source,
+    })?;
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "canonical_empty_construction_staging_removed",
+        staging_path = %staging_path.display(),
+        "removed an empty runtime-owned construction staging directory"
+    );
+    Ok(true)
 }
 
 fn remove_unpublished_staging(staging_path: &std::path::Path) -> Result<(), CanonicalRuntimeError> {
@@ -353,4 +389,36 @@ fn install_staged_store(
             source,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use tempfile::tempdir;
+
+    use super::remove_empty_construction_staging;
+
+    #[test]
+    fn empty_construction_staging_is_removed() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let staging_path = tempdir.path().join("store.building");
+        std::fs::create_dir(&staging_path)?;
+
+        assert!(remove_empty_construction_staging(&staging_path)?);
+        assert!(!staging_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn populated_construction_staging_is_preserved() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let staging_path = tempdir.path().join("store.building");
+        std::fs::create_dir(&staging_path)?;
+        std::fs::write(staging_path.join("CURRENT"), b"MANIFEST-000001\n")?;
+
+        assert!(!remove_empty_construction_staging(&staging_path)?);
+        assert!(staging_path.exists());
+        Ok(())
+    }
 }
