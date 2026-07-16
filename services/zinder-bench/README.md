@@ -35,7 +35,8 @@ zinder-bench capture \
 
 Optional flags: `--node-auth-cookie <path>` for cookie auth, `--segment-blocks`
 (blocks per segment file, default 1000), `--fetch-concurrency` (default 16),
-`--request-timeout-secs`, `--max-response-bytes`.
+`--prepare-concurrency` (default 10), `--request-timeout-secs`,
+`--max-response-bytes`.
 
 The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
 `manifest.json` recording the network, range, consensus activations,

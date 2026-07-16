@@ -36,6 +36,7 @@ const DEFAULT_FROM_HEIGHT: u32 = 150_000;
 const DEFAULT_TO_HEIGHT: u32 = 200_000;
 const DEFAULT_SEGMENT_BLOCKS: u32 = 1_000;
 const DEFAULT_FETCH_CONCURRENCY: u32 = 16;
+const DEFAULT_CAPTURE_PREPARE_CONCURRENCY: u32 = 10;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_BLOCK_PREPARE_CONCURRENCY: u32 = 16;
@@ -87,6 +88,12 @@ struct CaptureArgs {
     /// Concurrent block fetches issued against the node.
     #[arg(long = "fetch-concurrency", default_value_t = DEFAULT_FETCH_CONCURRENCY)]
     fetch_concurrency: u32,
+    /// Concurrent block-local preparations used to measure captured blocks.
+    #[arg(
+        long = "prepare-concurrency",
+        default_value_t = DEFAULT_CAPTURE_PREPARE_CONCURRENCY
+    )]
+    prepare_concurrency: u32,
     /// Per-request source timeout in seconds.
     #[arg(long = "request-timeout-secs", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
     request_timeout_secs: u64,
@@ -327,6 +334,7 @@ async fn run_capture(args: CaptureArgs) -> Result<(), BenchError> {
         to_height: BlockHeight::new(args.to_height),
         segment_blocks: require_nonzero_u32(args.segment_blocks, "segment-blocks")?,
         fetch_concurrency: require_nonzero_u32(args.fetch_concurrency, "fetch-concurrency")?,
+        prepare_concurrency: require_nonzero_u32(args.prepare_concurrency, "prepare-concurrency")?,
         request_timeout: Duration::from_secs(args.request_timeout_secs),
         max_response_bytes: require_nonzero_u64(args.max_response_bytes, "max-response-bytes")?,
         output_directory: args.out,
@@ -646,6 +654,52 @@ mod tests {
         assert_eq!(args.source_fetch_max_in_flight_bytes, Some(156_249_984));
         assert_eq!(args.block_prepare_memory_watermark_bytes, Some(156_249_984));
         assert_eq!(args.source_segment_delay_millis, 250);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_rejects_zero_prepare_concurrency_before_source_io()
+    -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "capture",
+            "--network",
+            "zcash-mainnet",
+            "--json-rpc-addr",
+            "http://zebra.invalid:8232",
+            "--prepare-concurrency",
+            "0",
+            "--out",
+            "fixture",
+        ])?;
+
+        let Some(error) = super::run(cli).await.err() else {
+            return Err("zero capture preparation concurrency must be rejected".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid argument: --prepare-concurrency must be greater than zero"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capture_defaults_prepare_concurrency_to_cpu_envelope() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "capture",
+            "--network",
+            "zcash-mainnet",
+            "--json-rpc-addr",
+            "http://zebra:8232",
+            "--out",
+            "fixture",
+        ])?;
+        let Command::Capture(args) = cli.command else {
+            return Err("expected capture command".into());
+        };
+
+        assert_eq!(args.prepare_concurrency, 10);
         Ok(())
     }
 

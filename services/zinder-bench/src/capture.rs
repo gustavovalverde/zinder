@@ -2,9 +2,11 @@
 //! write them into a deterministic fixture directory.
 
 use std::{
+    future::Future,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use futures_util::StreamExt as _;
@@ -48,6 +50,8 @@ pub struct CaptureConfig {
     pub segment_blocks: NonZeroU32,
     /// Concurrent block fetches issued against the node.
     pub fetch_concurrency: NonZeroU32,
+    /// Concurrent block-local preparations used to measure captured blocks.
+    pub prepare_concurrency: NonZeroU32,
     /// Per-request source timeout.
     pub request_timeout: Duration,
     /// Maximum JSON-RPC response body size.
@@ -146,6 +150,11 @@ pub struct FixtureBlockMeasurements {
     block_digests: Vec<CanonicalBlockFactsDigest>,
 }
 
+struct FixtureBlockMeasurement {
+    workload_density: WorkloadDensity,
+    block_digest: CanonicalBlockFactsDigest,
+}
+
 impl FixtureBlockMeasurements {
     /// Builds constant-size digest evidence for exactly these measured blocks.
     pub fn canonical_block_facts_digest_evidence(
@@ -169,11 +178,22 @@ async fn capture_segments(
         CanonicalBlockFactsSequenceDigestVersion::CURRENT,
     );
     while segment_from <= config.to_height.value() {
+        let segment_started = Instant::now();
         let segment_to = segment_end_height(segment_from, config.segment_blocks, config.to_height);
-        let blocks =
+        let fetch_started = Instant::now();
+        let blocks: Arc<[SourceBlock]> =
             fetch_segment_blocks(source, segment_from, segment_to, config.fetch_concurrency)
-                .await?;
-        let measurements = measure_fixture_blocks(&blocks, activations)?;
+                .await?
+                .into();
+        let fetch_seconds = fetch_started.elapsed().as_secs_f64();
+        let prepare_started = Instant::now();
+        let measurements = measure_fixture_blocks_bounded(
+            Arc::clone(&blocks),
+            activations,
+            config.prepare_concurrency,
+        )
+        .await?;
+        let prepare_seconds = prepare_started.elapsed().as_secs_f64();
         workload_density.merge(measurements.workload_density);
         for digest in measurements.block_digests {
             append_sequence_digest(&mut sequence_builder, digest)?;
@@ -183,7 +203,9 @@ async fn capture_segments(
         {
             tip_hash_hex = hex::encode(last.hash.as_bytes());
         }
+        let segment_write_started = Instant::now();
         let descriptor = write_segment(&config.output_directory, segment_index, &blocks)?;
+        let segment_write_seconds = segment_write_started.elapsed().as_secs_f64();
         tracing::info!(
             target: "zinder::bench",
             event = "segment_captured",
@@ -191,6 +213,11 @@ async fn capture_segments(
             from_height = descriptor.from_height,
             to_height = descriptor.to_height,
             block_count = descriptor.block_count,
+            fetch_seconds,
+            prepare_seconds,
+            segment_write_seconds,
+            segment_seconds = segment_started.elapsed().as_secs_f64(),
+            prepare_concurrency = config.prepare_concurrency.get(),
             "captured source segment"
         );
         segments.push(descriptor);
@@ -215,69 +242,110 @@ pub fn measure_fixture_blocks(
     let mut density = WorkloadDensity::default();
     let mut block_digests = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let prepared = prepare_canonical_block(block, activations, RawBlobPolicy::None)?;
-        let transaction_count = u32::try_from(prepared.facts.transactions.len()).map_err(|_| {
-            BenchError::fixture_format("block transaction count exceeds u32".to_owned())
-        })?;
-        let transparent_input_count = prepared
-            .facts
-            .transactions
-            .iter()
-            .map(|transaction| transaction.transparent_inputs.len())
-            .sum::<usize>();
-        let transparent_input_count = u32::try_from(transparent_input_count).map_err(|_| {
-            BenchError::fixture_format("block transparent input count exceeds u32".to_owned())
-        })?;
-        let transparent_output_count = u32::try_from(
-            prepared
-                .facts
-                .transactions
-                .iter()
-                .map(|transaction| transaction.transparent_outputs.len())
-                .sum::<usize>(),
-        )
-        .map_err(|_| {
-            BenchError::fixture_format("block transparent output count exceeds u32".to_owned())
-        })?;
-        let raw_block_bytes = u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX);
-
-        density.block_count = density.block_count.saturating_add(1);
-        density.raw_block_bytes = density.raw_block_bytes.saturating_add(raw_block_bytes);
-        density.transaction_count = density
-            .transaction_count
-            .saturating_add(u64::from(transaction_count));
-        density.transparent_input_count = density
-            .transparent_input_count
-            .saturating_add(u64::from(transparent_input_count));
-        density.transparent_output_count = density
-            .transparent_output_count
-            .saturating_add(u64::from(transparent_output_count));
-        if transparent_input_count > 0 {
-            density.blocks_with_transparent_inputs =
-                density.blocks_with_transparent_inputs.saturating_add(1);
-        }
-        if transparent_output_count > 0 {
-            density.blocks_with_transparent_outputs =
-                density.blocks_with_transparent_outputs.saturating_add(1);
-        }
-        density.max_raw_block_bytes_per_block =
-            density.max_raw_block_bytes_per_block.max(raw_block_bytes);
-        density.max_transactions_per_block =
-            density.max_transactions_per_block.max(transaction_count);
-        density.max_transparent_inputs_per_block = density
-            .max_transparent_inputs_per_block
-            .max(transparent_input_count);
-        density.max_transparent_outputs_per_block = density
-            .max_transparent_outputs_per_block
-            .max(transparent_output_count);
-        let reference_encoding = prepared
-            .facts
-            .reference_encoding(CanonicalBlockFactsDigestVersion::CURRENT);
-        block_digests.push(reference_encoding.digest());
+        let measurement = measure_fixture_block(block, activations)?;
+        density.merge(measurement.workload_density);
+        block_digests.push(measurement.block_digest);
     }
     Ok(FixtureBlockMeasurements {
         workload_density: density,
         block_digests,
+    })
+}
+
+/// Parses captured blocks concurrently while preserving their source order in
+/// the canonical-fact sequence digest.
+async fn measure_fixture_blocks_bounded(
+    blocks: Arc<[SourceBlock]>,
+    activations: &NetworkUpgradeActivations,
+    prepare_concurrency: NonZeroU32,
+) -> Result<FixtureBlockMeasurements, BenchError> {
+    let activations = Arc::new(activations.clone());
+    let block_count = blocks.len();
+    let tasks = (0..block_count).map(|block_index| {
+        let blocks = Arc::clone(&blocks);
+        let activations = Arc::clone(&activations);
+        async move {
+            tokio::task::spawn_blocking(move || {
+                measure_fixture_block(&blocks[block_index], &activations)
+            })
+            .await
+            .map_err(|source| BenchError::canonical_fact_preparation_task(source.to_string()))?
+        }
+    });
+    collect_fixture_block_measurements(tasks, prepare_concurrency, block_count).await
+}
+
+async fn collect_fixture_block_measurements<F>(
+    tasks: impl IntoIterator<Item = F>,
+    prepare_concurrency: NonZeroU32,
+    block_count: usize,
+) -> Result<FixtureBlockMeasurements, BenchError>
+where
+    F: Future<Output = Result<FixtureBlockMeasurement, BenchError>>,
+{
+    let concurrency = usize::try_from(prepare_concurrency.get()).unwrap_or(usize::MAX);
+    let outcomes = futures_util::stream::iter(tasks).buffered(concurrency);
+    futures_util::pin_mut!(outcomes);
+    let mut workload_density = WorkloadDensity::default();
+    let mut block_digests = Vec::with_capacity(block_count);
+    while let Some(measurement) = outcomes.next().await {
+        let measurement = measurement?;
+        workload_density.merge(measurement.workload_density);
+        block_digests.push(measurement.block_digest);
+    }
+    Ok(FixtureBlockMeasurements {
+        workload_density,
+        block_digests,
+    })
+}
+
+fn measure_fixture_block(
+    block: &SourceBlock,
+    activations: &NetworkUpgradeActivations,
+) -> Result<FixtureBlockMeasurement, BenchError> {
+    let prepared = prepare_canonical_block(block, activations, RawBlobPolicy::None)?;
+    let transaction_count = u32::try_from(prepared.facts.transactions.len()).map_err(|_| {
+        BenchError::fixture_format("block transaction count exceeds u32".to_owned())
+    })?;
+    let transparent_input_count = prepared
+        .facts
+        .transactions
+        .iter()
+        .map(|transaction| transaction.transparent_inputs.len())
+        .sum::<usize>();
+    let transparent_input_count = u32::try_from(transparent_input_count).map_err(|_| {
+        BenchError::fixture_format("block transparent input count exceeds u32".to_owned())
+    })?;
+    let transparent_output_count = u32::try_from(
+        prepared
+            .facts
+            .transactions
+            .iter()
+            .map(|transaction| transaction.transparent_outputs.len())
+            .sum::<usize>(),
+    )
+    .map_err(|_| {
+        BenchError::fixture_format("block transparent output count exceeds u32".to_owned())
+    })?;
+    let raw_block_bytes = u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX);
+    let reference_encoding = prepared
+        .facts
+        .reference_encoding(CanonicalBlockFactsDigestVersion::CURRENT);
+    Ok(FixtureBlockMeasurement {
+        workload_density: WorkloadDensity {
+            block_count: 1,
+            raw_block_bytes,
+            transaction_count: u64::from(transaction_count),
+            transparent_input_count: u64::from(transparent_input_count),
+            transparent_output_count: u64::from(transparent_output_count),
+            blocks_with_transparent_inputs: u32::from(transparent_input_count > 0),
+            blocks_with_transparent_outputs: u32::from(transparent_output_count > 0),
+            max_raw_block_bytes_per_block: raw_block_bytes,
+            max_transactions_per_block: transaction_count,
+            max_transparent_inputs_per_block: transparent_input_count,
+            max_transparent_outputs_per_block: transparent_output_count,
+        },
+        block_digest: reference_encoding.digest(),
     })
 }
 
@@ -383,4 +451,115 @@ async fn capture_subtree_roots(
         }
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, num::NonZeroU32, sync::Arc};
+
+    use serde_json::Value;
+    use zinder_core::{
+        BlockHeight, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion, Network,
+    };
+    use zinder_source::SourceBlock;
+    use zinder_testkit::sample_regtest_upgrade_activations;
+
+    use super::{
+        FixtureBlockMeasurement, collect_fixture_block_measurements, measure_fixture_blocks,
+        measure_fixture_blocks_bounded,
+    };
+
+    const REGTEST_BLOCK_1: &str =
+        include_str!("../../zinder-ingest/tests/fixtures/z3-regtest-block-1.json");
+    const REGTEST_BLOCK_603: &str =
+        include_str!("../../zinder-ingest/tests/fixtures/z3-regtest-ironwood-block-603.json");
+
+    #[tokio::test]
+    async fn bounded_measurements_equal_serial_measurements() -> Result<(), Box<dyn Error>> {
+        let blocks = vec![
+            source_block(REGTEST_BLOCK_1)?,
+            source_block(REGTEST_BLOCK_603)?,
+        ];
+        let activations = sample_regtest_upgrade_activations();
+        let serial = measure_fixture_blocks(&blocks, &activations)?;
+        let concurrency = NonZeroU32::new(2).ok_or("2 must be non-zero")?;
+
+        let bounded =
+            measure_fixture_blocks_bounded(Arc::from(blocks), &activations, concurrency).await?;
+
+        assert_eq!(bounded, serial);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_measurements_preserve_input_order_after_out_of_order_completion()
+    -> Result<(), Box<dyn Error>> {
+        let (completion_sender, mut completion_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task_completion_sender = completion_sender.clone();
+        let tasks =
+            [(0_u8, 30_u64), (1, 1), (2, 10)]
+                .into_iter()
+                .map(move |(index, delay_millis)| {
+                    let completion_sender = task_completion_sender.clone();
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_millis)).await;
+                        completion_sender.send(index).map_err(|source| {
+                            crate::BenchError::invalid_argument(source.to_string())
+                        })?;
+                        Ok(FixtureBlockMeasurement {
+                            workload_density: crate::fixture::WorkloadDensity {
+                                block_count: 1,
+                                raw_block_bytes: u64::from(index) + 1,
+                                ..crate::fixture::WorkloadDensity::default()
+                            },
+                            block_digest: digest_for_index(index),
+                        })
+                    }
+                });
+        drop(completion_sender);
+        let concurrency = NonZeroU32::new(3).ok_or("3 must be non-zero")?;
+
+        let measurements = collect_fixture_block_measurements(tasks, concurrency, 3).await?;
+        let mut completion_order = Vec::new();
+        while let Some(index) = completion_receiver.recv().await {
+            completion_order.push(index);
+        }
+
+        assert_eq!(completion_order, [1, 2, 0]);
+        assert_eq!(
+            measurements.block_digests,
+            [
+                digest_for_index(0),
+                digest_for_index(1),
+                digest_for_index(2)
+            ]
+        );
+        assert_eq!(measurements.workload_density.raw_block_bytes, 6);
+        Ok(())
+    }
+
+    fn digest_for_index(index: u8) -> CanonicalBlockFactsDigest {
+        CanonicalBlockFactsDigest::from_reference_encoding(
+            CanonicalBlockFactsDigestVersion::CURRENT,
+            &[index],
+        )
+    }
+
+    fn source_block(encoded_fixture: &str) -> Result<SourceBlock, Box<dyn Error>> {
+        let fixture: Value = serde_json::from_str(encoded_fixture)?;
+        let height = fixture
+            .get("height")
+            .and_then(Value::as_u64)
+            .and_then(|height| u32::try_from(height).ok())
+            .ok_or("fixture height must fit in u32")?;
+        let raw_block_hex = fixture
+            .get("raw_block_hex")
+            .and_then(Value::as_str)
+            .ok_or("fixture raw_block_hex must be a string")?;
+        Ok(SourceBlock::from_raw_block_bytes(
+            Network::ZcashRegtest,
+            BlockHeight::new(height),
+            hex::decode(raw_block_hex)?,
+        )?)
+    }
 }
