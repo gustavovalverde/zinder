@@ -286,6 +286,33 @@ docker compose -p zinder-canonical-live-test \
   down -v
 ```
 
+### Complete RocksDB storage lifecycle
+
+The canonical tracer above proves a bounded source-to-SST range but
+deliberately leaves the store `BUILDING`. Use the dedicated
+[RocksDB storage lifecycle harness](../../deploy/rocksdb-storage-lifecycle.md)
+to measure a fresh complete-history canonical store through `READY`, then build
+and cold-admit the version-1 wallet store at the same fixed Zebra tip. The
+harness reports canonical and wallet times separately and captures exact peak
+container memory plus sampled peak disk usage.
+
+Run a small fixed-tip smoke before a current-tip measurement. Both runs reuse
+Zebra's synchronized chain state but delete all project-scoped Zinder state:
+
+```bash
+docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench:local .
+
+ZINDER_STORAGE_LIFECYCLE_TIP_HEIGHT=10000 \
+ZINDER_STORAGE_LIFECYCLE_PROJECT_NAME=zinder-storage-lifecycle-smoke \
+ZINDER_STORAGE_LIFECYCLE_EVIDENCE_PATH="$PWD/.tmp/rocksdb-storage-lifecycle-smoke" \
+  scripts/run-rocksdb-storage-lifecycle.sh
+
+scripts/run-rocksdb-storage-lifecycle.sh
+```
+
+This certifies only canonical and wallet storage readiness. Query serving,
+continuous tip following, and executed reorg recovery remain separate gates.
+
 ## T3: Live mainnet (operator-hosted Zebra)
 
 Local mainnet runs are supported against an operator-hosted Zebra:
