@@ -77,6 +77,12 @@ const SOURCE_SEGMENT_PREFETCH_DISCARDED_IN_FLIGHT_SEGMENTS_TOTAL: &str =
     "zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total";
 const SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_RESPONSE_BYTES_TOTAL: &str =
     "zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total";
+const SOURCE_SEGMENT_PREFETCH_RETAINED_COMPLETED_SEGMENTS_TOTAL: &str =
+    "zinder_ingest_source_segment_prefetch_retained_completed_segments_total";
+const SOURCE_SEGMENT_PREFETCH_RETAINED_IN_FLIGHT_SEGMENTS_TOTAL: &str =
+    "zinder_ingest_source_segment_prefetch_retained_in_flight_segments_total";
+const SOURCE_SEGMENT_PREFETCH_RETAINED_COMPLETED_RESPONSE_BYTES_TOTAL: &str =
+    "zinder_ingest_source_segment_prefetch_retained_completed_response_bytes_total";
 const BULK_PIPELINE_WATERMARK_BLOCKED_TOTAL: &str =
     "zinder_ingest_bulk_pipeline_watermark_blocked_total";
 pub(crate) const TELEMETRY_COVERAGE_TOTAL: &str = "zinder_bench_telemetry_coverage_total";
@@ -684,6 +690,12 @@ pub struct SourceFetchAttributionSummary {
     pub discarded_in_flight_segment_count: u64,
     /// Exact payload bytes held by completed speculative segments at discard.
     pub discarded_completed_response_bytes: u64,
+    /// Completed speculative segments retained after density adjustments.
+    pub retained_completed_segment_count: u64,
+    /// In-flight speculative segments retained after density adjustments.
+    pub retained_in_flight_segment_count: u64,
+    /// Completed response bytes retained after density adjustments.
+    pub retained_completed_response_bytes: u64,
     /// Source-fetch reservations rejected by the configured byte watermark.
     pub source_watermark_blocked_count: u64,
     /// Source-fetch watermark blocks per replay wall-clock second.
@@ -2452,6 +2464,11 @@ fn aggregate_source_fetch_attribution(
     ));
     let (source_watermark_blocked_count, source_watermark_blocks_per_second) =
         source_watermark_attribution(samples, replay_wall_clock_seconds);
+    let (
+        retained_completed_segment_count,
+        retained_in_flight_segment_count,
+        retained_completed_response_bytes,
+    ) = source_retention_attribution(samples);
     let (completed_segment_requests_per_second, response_payload_bytes_per_second) =
         if replay_wall_clock_seconds > 0.0 {
             (
@@ -2484,9 +2501,29 @@ fn aggregate_source_fetch_attribution(
             samples,
             SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_RESPONSE_BYTES_TOTAL,
         )),
+        retained_completed_segment_count,
+        retained_in_flight_segment_count,
+        retained_completed_response_bytes,
         source_watermark_blocked_count,
         source_watermark_blocks_per_second,
     })
+}
+
+fn source_retention_attribution(samples: &[MetricSample]) -> (u64, u64, u64) {
+    (
+        round_to_u64(sum_by_name(
+            samples,
+            SOURCE_SEGMENT_PREFETCH_RETAINED_COMPLETED_SEGMENTS_TOTAL,
+        )),
+        round_to_u64(sum_by_name(
+            samples,
+            SOURCE_SEGMENT_PREFETCH_RETAINED_IN_FLIGHT_SEGMENTS_TOTAL,
+        )),
+        round_to_u64(sum_by_name(
+            samples,
+            SOURCE_SEGMENT_PREFETCH_RETAINED_COMPLETED_RESPONSE_BYTES_TOTAL,
+        )),
+    )
 }
 
 fn source_sizing_attribution(samples: &[MetricSample]) -> (u64, u64, u64) {
@@ -3057,6 +3094,9 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
         assert_eq!(source.discarded_completed_segment_count, 6);
         assert_eq!(source.discarded_in_flight_segment_count, 11);
         assert_eq!(source.discarded_completed_response_bytes, 100_000_000);
+        assert_eq!(source.retained_completed_segment_count, 9);
+        assert_eq!(source.retained_in_flight_segment_count, 13);
+        assert_eq!(source.retained_completed_response_bytes, 110_000_000);
         assert_eq!(source.source_watermark_blocked_count, 8);
         assert!((source.source_watermark_blocks_per_second - 0.8).abs() < f64::EPSILON);
         assert_eq!(inner.head_of_line_wait.len(), 1);
@@ -3469,6 +3509,9 @@ zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total{reason=
 zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total{reason=\"response_too_large\"} 4\n\
 zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{reason=\"density\"} 90000000\n\
 zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{reason=\"response_too_large\"} 10000000\n\
+zinder_ingest_source_segment_prefetch_retained_completed_segments_total{reason=\"density\"} 9\n\
+zinder_ingest_source_segment_prefetch_retained_in_flight_segments_total{reason=\"density\"} 13\n\
+zinder_ingest_source_segment_prefetch_retained_completed_response_bytes_total{reason=\"density\"} 110000000\n\
 zinder_ingest_bulk_pipeline_watermark_blocked_total{stage=\"source_fetch\"} 8\n\
 zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_count{stage=\"source_fetch\"} 2\n\
 zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum{stage=\"source_fetch\"} 4.5\n\
