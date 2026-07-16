@@ -404,7 +404,7 @@ pub enum CanonicalStoreError {
     },
 
     /// A filesystem operation failed.
-    #[error("canonical store path {path:?} is unavailable")]
+    #[error("canonical store path {path:?} is unavailable: {source}")]
     PathUnavailable {
         /// Path being accessed.
         path: PathBuf,

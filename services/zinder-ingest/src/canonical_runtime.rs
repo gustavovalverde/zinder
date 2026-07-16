@@ -40,7 +40,7 @@ pub struct CanonicalRuntimeConfig {
 #[non_exhaustive]
 pub enum CanonicalRuntimeError {
     /// The configured store path could not be inspected.
-    #[error("canonical runtime path {path:?} is unavailable")]
+    #[error("canonical runtime path {path:?} is unavailable: {source}")]
     PathUnavailable {
         /// Path being inspected or changed.
         path: PathBuf,
