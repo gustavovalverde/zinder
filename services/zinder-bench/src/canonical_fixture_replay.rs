@@ -4,7 +4,8 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     num::NonZeroU32,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -16,11 +17,21 @@ use zinder_core::{
     CommitmentTreeFrontier, CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
     NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
     NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange,
+    SubtreeRootRange, UnixTimestampMillis,
+};
+use zinder_ingest::{
+    CanonicalConstructionConfig, CanonicalPipelineLimits, CanonicalSourceLoadOutcome,
+    load_fresh_canonical,
 };
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceSubtreeRoots,
+};
+use zinder_store::{
+    CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalEventFence,
+    CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalSubtreeRootLoadEvidence, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 
 use crate::{
@@ -113,6 +124,46 @@ pub struct CanonicalFixtureNodeSource {
     activations_fingerprint: NetworkUpgradeActivationsFingerprint,
 }
 
+/// Explicit inputs for one authenticated fixture replay into canonical-v1 `RocksDB`.
+#[derive(Clone, Debug)]
+pub struct CanonicalFixtureRocksDbReplayConfig {
+    /// Directory containing the admitted fixture manifest, segments, and replay plan.
+    pub fixture_directory: PathBuf,
+    /// Fresh destination for the canonical-v1 store.
+    pub canonical_store_path: PathBuf,
+    /// Deadline applied to each source operation in canonical construction.
+    pub request_timeout: Duration,
+    /// Validated source-fetch and block-preparation limits.
+    pub pipeline_limits: CanonicalPipelineLimits,
+    /// Explicit bounded `RocksDB` writer and cold-reopen budget.
+    pub resource_budget: RocksDbResourceBudget,
+    /// Retained shallow-reorg depth used to select the baseline settled tip.
+    pub supported_reorg_depth: u32,
+    /// Optional fixed delay applied once per outer fixture segment response.
+    pub source_segment_delay: Duration,
+}
+
+/// Exact load, publication, and cold-reopen evidence from canonical-v1 replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalFixtureRocksDbReplayOutcome {
+    /// Block-family evidence accepted by the real canonical-v1 loader.
+    pub block_load_evidence: CanonicalBlockLoadEvidence,
+    /// Exact completed-subtree evidence accepted by the canonical-v1 loader.
+    pub subtree_root_load_evidence: CanonicalSubtreeRootLoadEvidence,
+    /// Whether the loaded fixed tip was authenticated against the admitted source checkpoint.
+    pub source_tip_checkpoint_authenticated: bool,
+    /// Retained baseline tip selected from the configured reorg depth.
+    pub settled_tip: BlockId,
+    /// Event fence authenticated identically at publication and cold reopen.
+    pub event_fence: CanonicalEventFence,
+    /// Number of cache-bypassing canonical replay rows authenticated after cold reopen.
+    pub replayed_block_count: u64,
+    /// READY evidence returned immediately after atomic baseline publication.
+    pub published_ready_evidence: CanonicalStoreReadyEvidence,
+    /// READY evidence returned by an independent cold reopen.
+    pub reopened_ready_evidence: CanonicalStoreReadyEvidence,
+}
+
 impl CanonicalFixtureNodeSource {
     /// Opens a fixture source after admitting its replay plan and activation table.
     pub fn open(fixture_directory: &Path, manifest: &FixtureManifest) -> Result<Self, BenchError> {
@@ -128,6 +179,22 @@ impl CanonicalFixtureNodeSource {
         let activations = manifest.activations_typed()?;
         let replay_plan =
             CanonicalFixtureReplayPlan::read(fixture_directory, manifest, &activations)?;
+        Self::from_admitted_plan(
+            fixture_directory,
+            manifest,
+            &activations,
+            &replay_plan,
+            segment_response_delay,
+        )
+    }
+
+    fn from_admitted_plan(
+        fixture_directory: &Path,
+        manifest: &FixtureManifest,
+        activations: &NetworkUpgradeActivations,
+        replay_plan: &CanonicalFixtureReplayPlan,
+        segment_response_delay: Duration,
+    ) -> Result<Self, BenchError> {
         let fixture_source = FixtureNodeSource::open_with_segment_delay(
             fixture_directory,
             manifest,
@@ -207,6 +274,289 @@ impl NodeSource for CanonicalFixtureNodeSource {
     ) -> Result<SourceSubtreeRoots, SourceError> {
         self.fixture_source.fetch_subtree_root_range(range).await
     }
+}
+
+struct AdmittedCanonicalFixtureReplay {
+    manifest: FixtureManifest,
+    activations: Arc<NetworkUpgradeActivations>,
+    fixture_source: CanonicalFixtureNodeSource,
+    source_tip_checkpoint: CommitmentTreeCheckpoint,
+    builder: RocksDbCanonicalBuilder,
+}
+
+#[derive(Clone, Copy)]
+struct PublishedCanonicalFixtureEvidence {
+    ready: CanonicalStoreReadyEvidence,
+    event_fence: CanonicalEventFence,
+}
+
+#[derive(Clone, Copy)]
+struct ReopenedCanonicalFixtureEvidence {
+    ready: CanonicalStoreReadyEvidence,
+    event_fence: CanonicalEventFence,
+    replayed_block_count: u64,
+}
+
+struct CanonicalFixtureColdReopenExpectation<'a> {
+    activations: &'a NetworkUpgradeActivations,
+    source_tip_checkpoint: &'a CommitmentTreeCheckpoint,
+    settled_tip: BlockId,
+    block_count: u64,
+    published: PublishedCanonicalFixtureEvidence,
+}
+
+fn validate_rocksdb_replay_config(
+    config: &CanonicalFixtureRocksDbReplayConfig,
+) -> Result<CanonicalPipelineLimits, BenchError> {
+    if config.supported_reorg_depth == 0 {
+        return Err(BenchError::invalid_argument(
+            "supported_reorg_depth must be greater than zero for canonical fixture replay",
+        ));
+    }
+    if config.request_timeout == Duration::ZERO {
+        return Err(BenchError::invalid_argument(
+            "request_timeout must be greater than zero for canonical fixture replay",
+        ));
+    }
+    let pipeline_limits = config.pipeline_limits.validate().map_err(|source| {
+        BenchError::invalid_argument(format!(
+            "canonical fixture replay pipeline limits are invalid: {source}"
+        ))
+    })?;
+    config.resource_budget.validate().map_err(|reason| {
+        BenchError::invalid_argument(format!(
+            "canonical fixture replay RocksDB resource budget is invalid: {reason}"
+        ))
+    })?;
+    Ok(pipeline_limits)
+}
+
+fn admit_canonical_fixture_replay(
+    config: &CanonicalFixtureRocksDbReplayConfig,
+) -> Result<AdmittedCanonicalFixtureReplay, BenchError> {
+    let manifest = FixtureManifest::read(&config.fixture_directory)?;
+    let activations = manifest.activations_typed()?;
+    let replay_plan =
+        CanonicalFixtureReplayPlan::read(&config.fixture_directory, &manifest, &activations)?;
+    let history_predecessor = replay_plan.history_predecessor_checkpoint()?;
+    let source_tip_checkpoint = replay_plan.source_tip_checkpoint()?;
+    let fixture_source = CanonicalFixtureNodeSource::from_admitted_plan(
+        &config.fixture_directory,
+        &manifest,
+        &activations,
+        &replay_plan,
+        config.source_segment_delay,
+    )?;
+    let build_plan = CanonicalStoreBuildPlan::checkpointed(
+        &activations,
+        history_predecessor,
+        manifest.tip_id()?,
+    )?;
+    let builder = RocksDbCanonicalBuilder::create_fresh(
+        &config.canonical_store_path,
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        config.resource_budget,
+    )?;
+    Ok(AdmittedCanonicalFixtureReplay {
+        manifest,
+        activations: Arc::new(activations),
+        fixture_source,
+        source_tip_checkpoint,
+        builder,
+    })
+}
+
+fn authenticate_canonical_fixture_load(
+    canonical_load: &CanonicalSourceLoadOutcome,
+    manifest: &FixtureManifest,
+    source_tip_checkpoint: &CommitmentTreeCheckpoint,
+) -> Result<(), BenchError> {
+    if !canonical_load.builder.is_source_tip_checkpoint_confirmed() {
+        return Err(BenchError::fixture_format(
+            "canonical fixture replay completed without authenticating the fixed-tip checkpoint",
+        ));
+    }
+    if source_tip_checkpoint.block_id
+        != BlockId::new(
+            canonical_load.block_evidence.tip_height,
+            canonical_load.block_evidence.tip_hash,
+        )
+    {
+        return Err(BenchError::fixture_format(
+            "canonical fixture replay load tip differs from the admitted source checkpoint",
+        ));
+    }
+    validate_block_load_evidence(&canonical_load.block_evidence, manifest)
+}
+
+async fn derive_settled_tip(
+    fixture_source: &CanonicalFixtureNodeSource,
+    block_load_evidence: &CanonicalBlockLoadEvidence,
+    supported_reorg_depth: u32,
+) -> Result<BlockId, BenchError> {
+    let settled_height = BlockHeight::new(
+        block_load_evidence
+            .tip_height
+            .value()
+            .saturating_sub(supported_reorg_depth)
+            .max(block_load_evidence.first_height.value()),
+    );
+    if settled_height == block_load_evidence.tip_height {
+        return Ok(BlockId::new(
+            block_load_evidence.tip_height,
+            block_load_evidence.tip_hash,
+        ));
+    }
+    let settled_block = fixture_source.fetch_block_at(settled_height).await?;
+    Ok(BlockId::new(settled_height, settled_block.hash))
+}
+
+fn publish_canonical_fixture(
+    builder: RocksDbCanonicalBuilder,
+    settled_tip: BlockId,
+) -> Result<PublishedCanonicalFixtureEvidence, BenchError> {
+    let validated = builder.validate_for_publication()?;
+    let prepared_publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+        settled_tip,
+        UnixTimestampMillis::now(),
+    ))?;
+    let published_store = validated.publish_baseline(prepared_publication)?;
+    Ok(PublishedCanonicalFixtureEvidence {
+        ready: published_store.ready_evidence(),
+        event_fence: published_store.event_fence(),
+    })
+}
+
+fn certify_reopened_canonical_fixture(
+    config: &CanonicalFixtureRocksDbReplayConfig,
+    expected: &CanonicalFixtureColdReopenExpectation<'_>,
+) -> Result<ReopenedCanonicalFixtureEvidence, BenchError> {
+    let reopened_store = RocksDbCanonicalStore::open_ready(
+        &config.canonical_store_path,
+        expected.activations,
+        CanonicalStoreWorkload::Wallet,
+        config.resource_budget,
+    )?;
+    let ready = reopened_store.ready_evidence();
+    if ready != expected.published.ready {
+        return Err(BenchError::fixture_format(
+            "canonical fixture replay cold-reopen READY evidence differs from publication",
+        ));
+    }
+    let event_fence = reopened_store.event_fence();
+    if event_fence != expected.published.event_fence {
+        return Err(BenchError::fixture_format(
+            "canonical fixture replay cold-reopen event fence differs from publication",
+        ));
+    }
+    let append_anchor = reopened_store.append_anchor()?;
+    if append_anchor.event_fence() != event_fence
+        || append_anchor.tip_checkpoint() != expected.source_tip_checkpoint
+    {
+        return Err(BenchError::fixture_format(
+            "canonical fixture replay cold-reopen append anchor differs from the admitted fixed-tip checkpoint",
+        ));
+    }
+    if append_anchor.settled_tip() != expected.settled_tip {
+        return Err(BenchError::fixture_format(
+            "canonical fixture replay cold-reopen append anchor differs from the derived settled tip",
+        ));
+    }
+    let mut replayed_block_count = 0_u64;
+    for replay in reopened_store.scan_canonical_replay()? {
+        replay?;
+        replayed_block_count = replayed_block_count.checked_add(1).ok_or_else(|| {
+            BenchError::fixture_format(
+                "canonical fixture replay cold-reopen scan count exceeds u64::MAX",
+            )
+        })?;
+    }
+    if replayed_block_count != expected.block_count {
+        return Err(BenchError::fixture_format(format!(
+            "canonical fixture replay cold-reopen scan observed {replayed_block_count} blocks, expected {}",
+            expected.block_count
+        )));
+    }
+    Ok(ReopenedCanonicalFixtureEvidence {
+        ready,
+        event_fence,
+        replayed_block_count,
+    })
+}
+
+/// Replays one authenticated fixture through the production canonical-v1 build lifecycle.
+pub async fn replay_canonical_fixture_into_rocksdb(
+    config: CanonicalFixtureRocksDbReplayConfig,
+) -> Result<CanonicalFixtureRocksDbReplayOutcome, BenchError> {
+    let pipeline_limits = validate_rocksdb_replay_config(&config)?;
+    let admitted = admit_canonical_fixture_replay(&config)?;
+    let canonical_load = load_fresh_canonical(
+        admitted.builder,
+        &admitted.fixture_source,
+        &CanonicalConstructionConfig {
+            request_timeout: config.request_timeout,
+            pipeline_limits,
+            network_upgrade_activations: Arc::clone(&admitted.activations),
+        },
+    )
+    .await?;
+    authenticate_canonical_fixture_load(
+        &canonical_load,
+        &admitted.manifest,
+        &admitted.source_tip_checkpoint,
+    )?;
+    let block_load_evidence = canonical_load.block_evidence;
+    let subtree_root_load_evidence = canonical_load.subtree_root_evidence;
+    let settled_tip = derive_settled_tip(
+        &admitted.fixture_source,
+        &block_load_evidence,
+        config.supported_reorg_depth,
+    )
+    .await?;
+    let published = publish_canonical_fixture(canonical_load.builder, settled_tip)?;
+    let reopened = certify_reopened_canonical_fixture(
+        &config,
+        &CanonicalFixtureColdReopenExpectation {
+            activations: admitted.activations.as_ref(),
+            source_tip_checkpoint: &admitted.source_tip_checkpoint,
+            settled_tip,
+            block_count: admitted
+                .manifest
+                .canonical_block_facts_digest_evidence
+                .block_count,
+            published,
+        },
+    )?;
+
+    Ok(CanonicalFixtureRocksDbReplayOutcome {
+        block_load_evidence,
+        subtree_root_load_evidence,
+        source_tip_checkpoint_authenticated: true,
+        settled_tip,
+        event_fence: reopened.event_fence,
+        replayed_block_count: reopened.replayed_block_count,
+        published_ready_evidence: published.ready,
+        reopened_ready_evidence: reopened.ready,
+    })
+}
+
+fn validate_block_load_evidence(
+    block_load_evidence: &CanonicalBlockLoadEvidence,
+    manifest: &FixtureManifest,
+) -> Result<(), BenchError> {
+    let expected = &manifest.canonical_block_facts_digest_evidence;
+    if block_load_evidence.block_digest_version.value() != expected.block_digest_version
+        || block_load_evidence.sequence_digest_version.value() != expected.sequence_digest_version
+        || block_load_evidence.block_count != expected.block_count
+        || hex::encode(block_load_evidence.sequence_digest.as_bytes())
+            != expected.sequence_digest_sha256
+    {
+        return Err(BenchError::fixture_format(
+            "canonical fixture replay block load evidence differs from the manifest digest evidence",
+        ));
+    }
+    Ok(())
 }
 
 /// Captures the predecessor and fixed-tip checkpoints for one admitted fixture.

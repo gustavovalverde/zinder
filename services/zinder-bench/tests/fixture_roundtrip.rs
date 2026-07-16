@@ -18,18 +18,23 @@ use zinder_bench::fixture::{
 use zinder_bench::{
     canonical_fixture_replay::{
         CanonicalFixtureNodeSource, CanonicalFixtureReplayPlan,
-        capture_canonical_fixture_replay_plan,
+        CanonicalFixtureRocksDbReplayConfig, CanonicalFixtureRocksDbReplayOutcome,
+        capture_canonical_fixture_replay_plan, replay_canonical_fixture_into_rocksdb,
     },
     capture::measure_fixture_blocks,
 };
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
-    CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, ShieldedProtocol,
-    SubtreeRootIndex, SubtreeRootRange, wire::encode_zinder_native_chain_name,
+    BlockHash, BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
+    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, wire::encode_zinder_native_chain_name,
 };
+use zinder_ingest::{CanonicalConstructionConfig, RawBlobPolicy, prepare_canonical_block};
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainCursor,
     SourceChainSegmentLimits, SourceError,
+};
+use zinder_store::{
+    CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
@@ -237,6 +242,213 @@ fn fixture_checkpoint_source(
     (source, predecessor, fixed_tip)
 }
 
+fn fixture_construction_checkpoint_source(
+    fixture: &RegtestFixtureCase,
+) -> Result<(
+    CheckpointSource,
+    CommitmentTreeCheckpoint,
+    CommitmentTreeCheckpoint,
+)> {
+    let (_, predecessor, _) = fixture_checkpoint_source(fixture);
+    let activations = sample_regtest_upgrade_activations();
+    let prepared = prepare_canonical_block(&fixture.block, &activations, RawBlobPolicy::None)?;
+    let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+        predecessor.block_id.height,
+        &predecessor.frontiers,
+        &activations,
+    )?;
+    let mut sapling_commitments = Vec::new();
+    let mut orchard_commitments = Vec::new();
+    let mut ironwood_commitments = Vec::new();
+    for transaction in &prepared.partial_compact_block.vtx {
+        for output in &transaction.outputs {
+            sapling_commitments.push(
+                output
+                    .cmu
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| eyre!("fixture Sapling commitment must contain 32 bytes"))?,
+            );
+        }
+        for action in &transaction.actions {
+            orchard_commitments.push(
+                action
+                    .cmx
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| eyre!("fixture Orchard commitment must contain 32 bytes"))?,
+            );
+        }
+        for action in &transaction.ironwood_actions {
+            ironwood_commitments.push(
+                action
+                    .cmx
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| eyre!("fixture Ironwood commitment must contain 32 bytes"))?,
+            );
+        }
+    }
+    accumulator.append_block_commitments(
+        fixture.block.height,
+        &sapling_commitments,
+        &orchard_commitments,
+        &ironwood_commitments,
+    )?;
+    let fixed_tip = CommitmentTreeCheckpoint::new(
+        BlockId::new(fixture.block.height, fixture.block.hash),
+        fixture.block.block_time_seconds,
+        accumulator.validated_frontiers()?,
+    );
+    let source = CheckpointSource::new(vec![predecessor.clone(), fixed_tip.clone()]);
+    Ok((source, predecessor, fixed_tip))
+}
+
+fn canonical_fixture_rocksdb_replay_config(
+    fixture_directory: &std::path::Path,
+    canonical_store_path: &std::path::Path,
+) -> CanonicalFixtureRocksDbReplayConfig {
+    let construction = CanonicalConstructionConfig::for_local_tests(
+        Duration::from_secs(5),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    CanonicalFixtureRocksDbReplayConfig {
+        fixture_directory: fixture_directory.to_path_buf(),
+        canonical_store_path: canonical_store_path.to_path_buf(),
+        request_timeout: construction.request_timeout,
+        pipeline_limits: construction.pipeline_limits,
+        resource_budget: RocksDbResourceBudget::for_local_tests(),
+        supported_reorg_depth: 1,
+        source_segment_delay: Duration::ZERO,
+    }
+}
+
+fn assert_canonical_fixture_load_evidence(
+    outcome: &CanonicalFixtureRocksDbReplayOutcome,
+    fixture: &RegtestFixtureCase,
+    predecessor: &CommitmentTreeCheckpoint,
+    fixed_tip: &CommitmentTreeCheckpoint,
+) {
+    assert_eq!(
+        outcome.block_load_evidence.first_height,
+        fixture.block.height
+    );
+    assert_eq!(outcome.block_load_evidence.first_hash, fixture.block.hash);
+    assert_eq!(
+        outcome.block_load_evidence.first_parent_hash,
+        predecessor.block_id.hash
+    );
+    assert_eq!(
+        BlockId::new(
+            outcome.block_load_evidence.tip_height,
+            outcome.block_load_evidence.tip_hash,
+        ),
+        fixed_tip.block_id
+    );
+    assert_eq!(
+        outcome.block_load_evidence.block_count,
+        fixture
+            .manifest
+            .canonical_block_facts_digest_evidence
+            .block_count
+    );
+    assert_eq!(outcome.subtree_root_load_evidence.subtree_root_count, 0);
+    assert!(outcome.source_tip_checkpoint_authenticated);
+    assert_eq!(outcome.settled_tip, fixed_tip.block_id);
+}
+
+fn assert_canonical_fixture_ready_evidence(
+    outcome: &CanonicalFixtureRocksDbReplayOutcome,
+    fixture: &RegtestFixtureCase,
+    fixed_tip: &CommitmentTreeCheckpoint,
+) -> Result<()> {
+    let expected_digest_evidence = &fixture.manifest.canonical_block_facts_digest_evidence;
+    let expected_sequence_digest: [u8; 32] =
+        hex::decode(&expected_digest_evidence.sequence_digest_sha256)?
+            .try_into()
+            .map_err(|_| eyre!("fixture sequence digest must contain 32 bytes"))?;
+    assert_eq!(outcome.event_fence.visible_tip(), fixed_tip.block_id);
+    assert_eq!(outcome.event_fence.chain_epoch_id().value(), 1);
+    assert_eq!(outcome.event_fence.chain_event_sequence(), 1);
+    assert_eq!(
+        outcome.replayed_block_count,
+        expected_digest_evidence.block_count
+    );
+    assert_eq!(
+        outcome.published_ready_evidence,
+        outcome.reopened_ready_evidence
+    );
+    assert_eq!(
+        outcome.published_ready_evidence.first_retained_block,
+        BlockId::new(fixture.block.height, fixture.block.hash)
+    );
+    assert_eq!(
+        outcome.published_ready_evidence.visible_tip,
+        fixed_tip.block_id
+    );
+    assert_eq!(outcome.published_ready_evidence.visible_epoch.value(), 1);
+    assert_eq!(outcome.published_ready_evidence.visible_event_sequence, 1);
+    assert_eq!(
+        outcome.published_ready_evidence.visible_block_count,
+        expected_digest_evidence.block_count
+    );
+    assert_eq!(
+        outcome
+            .published_ready_evidence
+            .block_digest_version
+            .value(),
+        expected_digest_evidence.block_digest_version
+    );
+    assert_eq!(
+        outcome
+            .published_ready_evidence
+            .sequence_digest_version
+            .value(),
+        expected_digest_evidence.sequence_digest_version
+    );
+    assert_eq!(
+        outcome.published_ready_evidence.visible_sequence_digest,
+        expected_sequence_digest
+    );
+    Ok(())
+}
+
+fn assert_no_legacy_canonical_families(canonical_store_path: &std::path::Path) -> Result<()> {
+    let column_families =
+        rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), canonical_store_path)?;
+    for legacy_or_derive_family in [
+        "storage_control",
+        "block_transaction_index",
+        "transaction_facts",
+        "transaction_intrinsic_value_balances",
+        "tree_state",
+        "final_note_commitment_roots",
+        "block_value_pool_balances",
+        "address_output_index",
+        "transparent_output",
+        "transparent_output_block_index",
+        "transparent_spend_fact",
+        "transparent_spend_fact_block_index",
+        "reorg_window",
+        "displaced_block",
+        "chain_event_cursor",
+        "mempool_event_cursor",
+        "consumer_metadata",
+    ] {
+        assert!(
+            !column_families
+                .iter()
+                .any(|family| family == legacy_or_derive_family),
+            "canonical v1 store must not create legacy or derive family {legacy_or_derive_family}"
+        );
+    }
+    assert!(
+        !zinder_derive::DeriveStore::path_for_canonical(canonical_store_path).exists(),
+        "canonical-v1 fixture replay must not create a derive store"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn canonical_replay_plan_captures_digest_bound_predecessor_and_tip_checkpoints() -> Result<()>
 {
@@ -371,6 +583,185 @@ async fn canonical_fixture_source_rejects_an_unrelated_checkpoint_height() -> Re
     assert!(matches!(
         outcome,
         Err(SourceError::BlockUnavailable { height, .. }) if height == unrelated_height
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_rocksdb_replay_publishes_and_cold_reopens_ready() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, predecessor, fixed_tip) =
+        fixture_construction_checkpoint_source(&fixture)?;
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    let output_directory = tempdir()?;
+    let canonical_store_path = output_directory.path().join("canonical");
+    let config =
+        canonical_fixture_rocksdb_replay_config(fixture.directory.path(), &canonical_store_path);
+
+    let outcome = replay_canonical_fixture_into_rocksdb(config).await?;
+
+    assert_canonical_fixture_load_evidence(&outcome, &fixture, &predecessor, &fixed_tip);
+    assert_canonical_fixture_ready_evidence(&outcome, &fixture, &fixed_tip)?;
+    assert_no_legacy_canonical_families(&canonical_store_path)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_rocksdb_replay_preserves_an_existing_store_path() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, _, _) = fixture_checkpoint_source(&fixture);
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    let output_directory = tempdir()?;
+    let canonical_store_path = output_directory.path().join("canonical");
+    std::fs::create_dir(&canonical_store_path)?;
+    let sentinel_path = canonical_store_path.join("sentinel");
+    std::fs::write(&sentinel_path, b"preserve-existing-store")?;
+    let config =
+        canonical_fixture_rocksdb_replay_config(fixture.directory.path(), &canonical_store_path);
+
+    let error = replay_canonical_fixture_into_rocksdb(config)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("an existing canonical path must be rejected"))?;
+
+    assert!(error.to_string().contains("requires a fresh path"));
+    assert_eq!(std::fs::read(&sentinel_path)?, b"preserve-existing-store");
+    assert_eq!(std::fs::read_dir(&canonical_store_path)?.count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_rocksdb_replay_leaves_a_mismatched_tip_checkpoint_unpublished()
+-> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (_, predecessor, mut fixed_tip) = fixture_construction_checkpoint_source(&fixture)?;
+    fixed_tip.block_time_seconds = fixed_tip.block_time_seconds.saturating_add(1);
+    let checkpoint_source = CheckpointSource::new(vec![predecessor, fixed_tip]);
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    let output_directory = tempdir()?;
+    let canonical_store_path = output_directory.path().join("canonical");
+    let config =
+        canonical_fixture_rocksdb_replay_config(fixture.directory.path(), &canonical_store_path);
+
+    let error = replay_canonical_fixture_into_rocksdb(config)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a mismatched fixed-tip checkpoint must fail construction"))?;
+
+    assert!(error.to_string().contains("fixed-tip checkpoint differs"));
+    let open_error = RocksDbCanonicalStore::open_ready(
+        &canonical_store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or_else(|| eyre!("a failed source authentication must not publish READY"))?;
+    assert!(matches!(
+        open_error,
+        CanonicalStoreError::StoreNotReady { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_rocksdb_replay_rejects_zero_supported_reorg_depth() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let output_directory = tempdir()?;
+    let canonical_store_path = output_directory.path().join("canonical");
+    let mut config =
+        canonical_fixture_rocksdb_replay_config(fixture.directory.path(), &canonical_store_path);
+    config.supported_reorg_depth = 0;
+
+    let error = replay_canonical_fixture_into_rocksdb(config)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("zero supported reorg depth must be rejected"))?;
+
+    assert!(error.to_string().contains("supported_reorg_depth"));
+    assert!(!canonical_store_path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_rocksdb_replay_rejects_a_zero_request_timeout() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let output_directory = tempdir()?;
+    let canonical_store_path = output_directory.path().join("canonical");
+    let mut config =
+        canonical_fixture_rocksdb_replay_config(fixture.directory.path(), &canonical_store_path);
+    config.request_timeout = Duration::ZERO;
+
+    let error = replay_canonical_fixture_into_rocksdb(config)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a zero request timeout must be rejected"))?;
+
+    assert!(error.to_string().contains("request_timeout"));
+    assert!(!canonical_store_path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_fixture_rocksdb_replay_leaves_manifest_digest_drift_unpublished() -> Result<()> {
+    let mut fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, _, _) = fixture_construction_checkpoint_source(&fixture)?;
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    fixture
+        .manifest
+        .canonical_block_facts_digest_evidence
+        .sequence_digest_sha256 = "00".repeat(32);
+    fixture.manifest.write(fixture.directory.path())?;
+    let sidecar_path = fixture.directory.path().join("canonical-replay-plan.json");
+    let mut encoded_plan: Value = serde_json::from_slice(&std::fs::read(&sidecar_path)?)?;
+    encoded_plan["fixture_manifest_sha256"] = Value::String(fixture.manifest.digest_sha256()?);
+    std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&encoded_plan)?)?;
+    let output_directory = tempdir()?;
+    let canonical_store_path = output_directory.path().join("canonical");
+    let config =
+        canonical_fixture_rocksdb_replay_config(fixture.directory.path(), &canonical_store_path);
+
+    let error = replay_canonical_fixture_into_rocksdb(config)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("manifest digest drift must fail canonical publication"))?;
+
+    assert!(error.to_string().contains("block load evidence differs"));
+    let open_error = RocksDbCanonicalStore::open_ready(
+        &canonical_store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or_else(|| eyre!("manifest digest drift must leave canonical READY unpublished"))?;
+    assert!(matches!(
+        open_error,
+        CanonicalStoreError::StoreNotReady { .. }
     ));
     Ok(())
 }
