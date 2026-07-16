@@ -43,6 +43,14 @@ scheduler complexity. The evidence proves the new bounded RocksDB construction
 and cold-admission path, not live following, query serving, restore, reorg
 execution, wallet-client parity, or PostgreSQL.
 
+The [version-1 canonical runtime evidence](../investigations/2026-07-16-fact-first-canonical-runtime-cutover.md)
+certifies the append-only half of the ingest cutover in the real service
+container. A checkpointed fresh store handed directly to the follower advanced
+its epoch, event sequence, tip, and digest together, recovered from a source
+outage, and reopened the authenticated fence after restart. Shallow reorg,
+wallet following, query serving, the Railway canary, and production remain
+uncertified.
+
 ## Implementation Status
 
 | Slice | Status | Evidence boundary |
@@ -53,14 +61,14 @@ execution, wallet-client parity, or PostgreSQL.
 | PostgreSQL fact-store driver | Diagnostic only | Direct `tokio-postgres` driver persists and freshly reads the same captured fact stream |
 | Clean physical schema identities | Landed | Canonical, wallet, and explorer contracts use identity-scoped version 1 and refuse prior layouts without migration or adoption |
 | Fresh RocksDB canonical builder | Wallet construction live-certified | A new `BUILDING` path fixes its workload, activation fingerprint, source range, predecessor frontiers, and build tip. The optimized clean testnet run loaded and cold-validated 4,175,080 blocks in 7 minutes 40.57 seconds, then atomically published epoch 1, event 1, and `READY` at the fixed source fence |
-| Version-1 atomic live canonical append | Store boundary landed; runtime cutover pending | `RocksDbCanonicalStore` consumes one admitted fence, validates the next block plus its tip tree state and newly completed subtree roots, and writes every block-local row, epoch, event, sequence digest, and READY control record in one synced batch. Exact readback and reopen authenticate consecutive appends. Shallow reorg, continuous source following, and ingest rewiring remain open |
+| Version-1 atomic live canonical append | Append-only ingest runtime locally certified | `zinder-ingest` opens or freshly constructs the Wallet canonical store, follows atomic Zebra tip observations, and commits through one authenticated consuming transition. Exact readback, source-outage recovery, and restart passed in the real service container with zero cross-block wallet and historical prevout reads. Shallow and same-height reorg replacement remains open |
 | One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
 | Version-1 wallet row contracts and serial oracle | Landed | 6 query-owned row families, exact durable codecs, deterministic projection evidence, and bounded reorg undo are independent of the storage engine |
 | RocksDB wallet construction | Production loader landed and testnet storage-certified | A fresh identity-scoped version-1 store uses bounded external runs and ordered SST ingestion, moves from `BUILDING` through cold semantic validation to `READY`, and reproduces its exact canonical source fence after a final cold reopen. The full-tip testnet build used zero historical prevout and validation random reads |
 | Shared RocksDB bulk-load mechanics | Landed | `zinder-rocksdb` owns bounded fixed-record runs, capped merge fan-in, strict ordered SST emission, and physical errors without owning a domain schema or publication lifecycle |
 | Production wallet bulk loader | RocksDB landed; PostgreSQL pending | Shared fixed- and variable-record runs, capped merge fan-in, wallet outpoint reduction, six-family SST ingestion, and bounded cold validation are implemented and full-tip tested. PostgreSQL still needs its concrete `COPY`, native join, and index-build path |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
-| Complete lifecycle certification | RocksDB storage construction passed on testnet | Fresh canonical and wallet construction passed through a fixed full testnet tip under an exact Docker resource envelope. Live following, query serving, restore, reorg, client parity, mainnet, and the PostgreSQL topology remain open |
+| Complete lifecycle certification | RocksDB storage construction and append-only service following passed on testnet | Full fixed-tip canonical and wallet construction passed under an exact Docker resource envelope. A separate real-service tracer proved checkpointed construction, append-only following, source recovery, and restart. Query serving, restore, reorg, client parity, mainnet, Railway, and the PostgreSQL topology remain open |
 
 ## Decision
 
@@ -399,6 +407,17 @@ source segment
   -> position only ordered commitment-tree metadata
   -> atomically commit ChainEpoch plus ChainEvent
 ```
+
+The first production runtime slice implements that contract one block at a
+time. It reads an authenticated append anchor containing the current event
+fence, settled tip, and exact commitment-tree checkpoint; observes Zebra's tip
+atomically; fetches the next block plus its source checkpoint and newly
+completed subtree roots; derives the next typed frontiers locally; and consumes
+the writer handle in `commit_live_append`. A source failure happens before the
+commit and can reuse the still-certain handle. Any store error ends the writer
+lane, and the process must return through cold `READY` admission before writing
+again. A parent mismatch is a typed reorg-required failure until the next slice
+adds atomic replacement.
 
 The canonical commit must not read a projection database. It may resolve facts
 created earlier in the same block or preparation window from memory only when

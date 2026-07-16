@@ -288,6 +288,12 @@ balance, missing row, or unqualified unavailable error.
    dual writes and retains no legacy serving fallback. Representative mainnet
    workload anchors must keep cross-block wallet and historical prevout reads
    at zero.
+   The append-only half of this step is implemented and locally certified in
+   the real `zinder-ingest` container on testnet. A checkpointed fresh store
+   published `READY`, followed an advancing Zebra tip, recovered from source
+   unavailability, and reopened its authenticated fence after restart with both
+   forbidden-read counters at zero. Atomic shallow and same-height reorg
+   replacement remains the next separately reviewed slice.
 7. Add the durable projection-build lease and anchor-aware event-pruning floor
    before any inactive builder can be promoted. Acquisition, renewal,
    expiration, competing builders, crash recovery, and promotion all preserve

@@ -153,3 +153,8 @@ hold:
 This is a storage-construction acceptance boundary. Query serving, live
 following, and consumer-protocol parity require their own tests after these
 stores are admitted.
+
+Run the separate [version-1 canonical runtime tracer](../docs/runbooks/testing.md#version-1-canonical-runtime-tracer)
+to certify the real `zinder-ingest` composition, append-only following, source
+recovery, and authenticated restart. That gate does not turn this construction
+report into service or topology certification.

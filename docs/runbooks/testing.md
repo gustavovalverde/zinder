@@ -313,6 +313,60 @@ scripts/run-rocksdb-storage-lifecycle.sh
 This certifies only canonical and wallet storage readiness. Query serving,
 continuous tip following, and executed reorg recovery remain separate gates.
 
+### Version-1 canonical runtime tracer
+
+Use the dedicated runtime topology after the storage lifecycle gate. It starts
+the actual `zinder-ingest` binary, gives it one disposable Zinder volume, joins
+the existing Zebra network, and mounts only Zebra's authentication cookie
+read-only. It enforces the established 10-CPU, 10-GiB envelope. `/healthz` is
+the container liveness check; the operator must poll `/readyz` separately and
+record the authenticated canonical fence.
+
+Choose a fixed source-authenticated predecessor below the current Zebra tip and
+pin the locally reviewed image by immutable ID:
+
+```bash
+docker build -f deploy/Dockerfile \
+  --target zinder-ingest \
+  -t zinder-ingest:canonical-runtime-local .
+
+image_id=$(docker image inspect \
+  zinder-ingest:canonical-runtime-local \
+  --format '{{.Id}}')
+
+ZINDER_CANONICAL_RUNTIME_IMAGE="$image_id" \
+ZINDER_CANONICAL_RUNTIME_CHECKPOINT_HEIGHT=<height> \
+  docker compose \
+    -f deploy/docker-compose.canonical-runtime-test.yml \
+    up -d zinder-ingest
+```
+
+Acceptance requires a fresh `canonical.building` path to publish and cold-open
+epoch 1 and event 1, then at least one natural Zebra advance to increment the
+tip, epoch, event sequence, and digest together. Restart the service and require
+the same fence to reopen before accepting further appends. A reversible source
+outage may be tested by disconnecting only the ingest container from the source
+network; readiness must become `node_unavailable`, the fence must remain
+unchanged, and reconnecting must restore following. Never stop Zebra or mount,
+delete, or modify its chain volume for this gate.
+
+Record the image ID, checkpoint and fixed build fence, each appended fence,
+readiness payloads, resource limit and observations, volume mounts, and these
+metrics:
+
+- `zinder_ingest_canonical_chain_epoch`;
+- `zinder_ingest_canonical_chain_event_sequence`;
+- `zinder_ingest_canonical_tip_height`;
+- `zinder_ingest_canonical_lag_blocks`;
+- `zinder_ingest_canonical_historical_prevout_reads_total`; and
+- `zinder_ingest_canonical_cross_block_wallet_reads_total`.
+
+This tracer certifies append-only service composition, not full-chain
+construction performance, reorg replacement, wallet readiness, query serving,
+client parity, or Railway behavior. Preserve its project-scoped volume until
+the evidence has been reviewed. Remove it only with the Compose project name
+and without `external` Zebra resources in the command scope.
+
 ## T3: Live mainnet (operator-hosted Zebra)
 
 Local mainnet runs are supported against an operator-hosted Zebra:
