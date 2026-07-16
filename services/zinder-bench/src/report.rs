@@ -69,6 +69,8 @@ const SOURCE_SEGMENT_RESPONSE_PAYLOAD_BYTES_SUM: &str =
     "zinder_ingest_source_segment_response_payload_bytes_sum";
 const SOURCE_SEGMENT_PREFETCH_RESTARTS_TOTAL: &str =
     "zinder_ingest_source_segment_prefetch_restarts_total";
+const SOURCE_SEGMENT_SIZING_ADJUSTMENT_TOTAL: &str =
+    "zinder_ingest_source_segment_sizing_adjustment_total";
 const SOURCE_SEGMENT_PREFETCH_DISCARDED_COMPLETED_SEGMENTS_TOTAL: &str =
     "zinder_ingest_source_segment_prefetch_discarded_completed_segments_total";
 const SOURCE_SEGMENT_PREFETCH_DISCARDED_IN_FLIGHT_SEGMENTS_TOTAL: &str =
@@ -671,6 +673,9 @@ pub struct SourceFetchAttributionSummary {
     pub cumulative_fetch_chain_segment_task_seconds: f64,
     /// Adaptive prefetch restarts caused by dense response sizing.
     pub density_restart_count: u64,
+    /// Segment-size reductions caused by dense response sizing, including
+    /// adjustments that retain already-valid speculative work.
+    pub density_sizing_adjustment_count: u64,
     /// Adaptive prefetch restarts caused by oversized responses.
     pub response_too_large_restart_count: u64,
     /// Already-completed speculative segments discarded across restarts.
@@ -2436,18 +2441,8 @@ fn aggregate_source_fetch_attribution(
         })
         .map(|sample| sample.reading)
         .sum();
-    let density_restart_count = sum_metric_by_label(
-        samples,
-        SOURCE_SEGMENT_PREFETCH_RESTARTS_TOTAL,
-        "reason",
-        "density",
-    );
-    let response_too_large_restart_count = sum_metric_by_label(
-        samples,
-        SOURCE_SEGMENT_PREFETCH_RESTARTS_TOTAL,
-        "reason",
-        "response_too_large",
-    );
+    let (density_restart_count, density_sizing_adjustment_count, response_too_large_restart_count) =
+        source_sizing_attribution(samples);
 
     let total_connected_blocks_returned =
         round_to_u64(sum_by_name(samples, SOURCE_SEGMENT_CONNECTED_BLOCKS_TOTAL));
@@ -2475,6 +2470,7 @@ fn aggregate_source_fetch_attribution(
         response_payload_bytes_per_second,
         cumulative_fetch_chain_segment_task_seconds,
         density_restart_count,
+        density_sizing_adjustment_count,
         response_too_large_restart_count,
         discarded_completed_segment_count: round_to_u64(sum_by_name(
             samples,
@@ -2491,6 +2487,28 @@ fn aggregate_source_fetch_attribution(
         source_watermark_blocked_count,
         source_watermark_blocks_per_second,
     })
+}
+
+fn source_sizing_attribution(samples: &[MetricSample]) -> (u64, u64, u64) {
+    let density_restarts = sum_metric_by_label(
+        samples,
+        SOURCE_SEGMENT_PREFETCH_RESTARTS_TOTAL,
+        "reason",
+        "density",
+    );
+    let density_adjustments = sum_metric_by_label(
+        samples,
+        SOURCE_SEGMENT_SIZING_ADJUSTMENT_TOTAL,
+        "reason",
+        "density",
+    );
+    let oversized_restarts = sum_metric_by_label(
+        samples,
+        SOURCE_SEGMENT_PREFETCH_RESTARTS_TOTAL,
+        "reason",
+        "response_too_large",
+    );
+    (density_restarts, density_adjustments, oversized_restarts)
 }
 
 fn source_watermark_attribution(
@@ -3034,6 +3052,7 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
         assert_eq!(source.total_connected_blocks_returned, 12);
         assert_eq!(source.total_response_payload_bytes, 120_000_000);
         assert_eq!(source.density_restart_count, 3);
+        assert_eq!(source.density_sizing_adjustment_count, 7);
         assert_eq!(source.response_too_large_restart_count, 2);
         assert_eq!(source.discarded_completed_segment_count, 6);
         assert_eq!(source.discarded_in_flight_segment_count, 11);
@@ -3443,6 +3462,7 @@ zinder_ingest_source_segment_connected_blocks_total 12\n\
 zinder_ingest_source_segment_response_payload_bytes_sum 120000000\n\
 zinder_ingest_source_segment_prefetch_restarts_total{reason=\"density\"} 3\n\
 zinder_ingest_source_segment_prefetch_restarts_total{reason=\"response_too_large\"} 2\n\
+zinder_ingest_source_segment_sizing_adjustment_total{reason=\"density\"} 7\n\
 zinder_ingest_source_segment_prefetch_discarded_completed_segments_total{reason=\"density\"} 5\n\
 zinder_ingest_source_segment_prefetch_discarded_completed_segments_total{reason=\"response_too_large\"} 1\n\
 zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total{reason=\"density\"} 7\n\
