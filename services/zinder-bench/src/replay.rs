@@ -2,10 +2,10 @@
 //! fixture and a cloned canonical store, then assemble a report.
 
 use std::{
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use zinder_core::{ChainEpoch, UnixTimestampMillis, wire::encode_rpc_block_hash_hex};
 use zinder_derive::{DeriveStore, ProjectionPreset, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME};
 use zinder_ingest::{
-    RawBlobPolicy,
+    CanonicalPipelineLimits, RawBlobPolicy,
     bench_support::{BenchBulkCatchupParams, bench_bulk_catchup_run_config, bench_derive_config},
     bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical,
     open_primary_derive_store_for_canonical_with_projection_preset, run_bulk_catchup_with_store,
@@ -48,6 +48,20 @@ pub struct ReplayConfig {
     pub store_path: PathBuf,
     /// Prepare concurrency to run with (the primary sweep knob).
     pub block_prepare_concurrency: NonZeroU32,
+    /// Optional maximum source-segment response-size override.
+    pub max_response_bytes: Option<NonZeroU64>,
+    /// Optional maximum connected blocks per source segment override.
+    pub source_segment_max_blocks: Option<NonZeroU32>,
+    /// Optional adaptive source-segment response target override.
+    pub source_segment_target_response_bytes: Option<NonZeroU64>,
+    /// Optional concurrent source-segment request-count override.
+    pub source_fetch_max_in_flight_requests: Option<NonZeroU32>,
+    /// Optional source-response admission watermark override.
+    pub source_fetch_max_in_flight_bytes: Option<NonZeroU64>,
+    /// Optional canonical block-preparation memory watermark override.
+    pub block_prepare_memory_watermark_bytes: Option<NonZeroU64>,
+    /// Deterministic delay applied to each captured source-segment response.
+    pub source_segment_delay_millis: u64,
     /// Optional canonical block-cache override in bytes (the cache-size knob).
     pub canonical_block_cache_bytes: Option<u64>,
     /// Projection preset to replay after canonical ingest, or `None` for a
@@ -201,6 +215,7 @@ struct CanonicalReplayMeasurements {
 struct ReplayRunMeasurements {
     canonical: CanonicalReplayMeasurements,
     projection: ProjectionMeasurements,
+    pipeline_limits: CanonicalPipelineLimits,
     completed_at_unix_millis: u64,
 }
 
@@ -252,7 +267,7 @@ pub async fn replay_fixture(
         config.canonical_fixture_replay_thresholds.is_some() && manifest.from_height > 1;
     let starting_checkpoint_manifest =
         read_starting_checkpoint_manifest(&config.store_path, checkpoint_manifest_required)?;
-    let source = FixtureNodeSource::open(&config.fixture_directory, &manifest)?;
+    let source = open_replay_source(&config, &manifest)?;
 
     let (store, canonical_options) = open_canonical_store(&config, network)?;
 
@@ -269,7 +284,7 @@ pub async fn replay_fixture(
     )?;
     let projection_replay_start_cursor = prepare_projection_replay(&config, &store)?;
 
-    let run_config = bench_bulk_catchup_run_config(BenchBulkCatchupParams {
+    let mut run_config = bench_bulk_catchup_run_config(BenchBulkCatchupParams {
         network,
         storage_path: config.store_path.clone(),
         from_height: zinder_core::BlockHeight::new(manifest.from_height),
@@ -279,6 +294,8 @@ pub async fn replay_fixture(
         raw_blob_policy: RawBlobPolicy::None,
         network_upgrade_activations: activations,
     });
+    run_config.pipeline_limits =
+        resolve_replay_pipeline_limits(&config, run_config.pipeline_limits)?;
 
     let started_at = Instant::now();
     run_bulk_catchup_with_store(&run_config, &source, &store).await?;
@@ -308,6 +325,7 @@ pub async fn replay_fixture(
     let run = ReplayRunMeasurements {
         canonical: canonical_measurements,
         projection: projection_measurements,
+        pipeline_limits: run_config.pipeline_limits,
         completed_at_unix_millis: run_completed_at_unix_millis,
     };
     let measurements =
@@ -319,6 +337,46 @@ pub async fn replay_fixture(
     ))
 }
 
+fn open_replay_source(
+    config: &ReplayConfig,
+    manifest: &FixtureManifest,
+) -> Result<FixtureNodeSource, BenchError> {
+    FixtureNodeSource::open_with_segment_delay(
+        &config.fixture_directory,
+        manifest,
+        Duration::from_millis(config.source_segment_delay_millis),
+    )
+}
+
+fn resolve_replay_pipeline_limits(
+    config: &ReplayConfig,
+    mut pipeline_limits: CanonicalPipelineLimits,
+) -> Result<CanonicalPipelineLimits, BenchError> {
+    if let Some(max_response_bytes) = config.max_response_bytes {
+        pipeline_limits.max_response_bytes = max_response_bytes;
+    }
+    if let Some(source_segment_max_blocks) = config.source_segment_max_blocks {
+        pipeline_limits.source_segment_max_blocks = source_segment_max_blocks;
+    }
+    if let Some(source_segment_target_response_bytes) = config.source_segment_target_response_bytes
+    {
+        pipeline_limits.source_segment_target_response_bytes = source_segment_target_response_bytes;
+    }
+    if let Some(source_fetch_max_in_flight_requests) = config.source_fetch_max_in_flight_requests {
+        pipeline_limits.source_fetch_max_in_flight_requests = source_fetch_max_in_flight_requests;
+    }
+    if let Some(source_fetch_max_in_flight_bytes) = config.source_fetch_max_in_flight_bytes {
+        pipeline_limits.source_fetch_max_in_flight_bytes = source_fetch_max_in_flight_bytes;
+    }
+    if let Some(block_prepare_memory_watermark_bytes) = config.block_prepare_memory_watermark_bytes
+    {
+        pipeline_limits.block_prepare_memory_watermark_bytes = block_prepare_memory_watermark_bytes;
+    }
+    pipeline_limits.validate().map_err(|source| {
+        BenchError::invalid_argument(format!("invalid replay pipeline limits: {source}"))
+    })
+}
+
 fn assemble_replay_measurements(
     config: &ReplayConfig,
     canonical_options: ChainStoreOptions,
@@ -328,10 +386,24 @@ fn assemble_replay_measurements(
     let ReplayRunMeasurements {
         canonical,
         projection,
+        pipeline_limits,
         completed_at_unix_millis,
     } = run;
     Ok(CurrentSchemaFixtureReplayMeasurements {
-        block_prepare_concurrency: config.block_prepare_concurrency.get(),
+        block_prepare_concurrency: pipeline_limits.block_prepare_concurrency.get(),
+        max_response_bytes: pipeline_limits.max_response_bytes.get(),
+        source_segment_max_blocks: pipeline_limits.source_segment_max_blocks.get(),
+        source_segment_target_response_bytes: pipeline_limits
+            .source_segment_target_response_bytes
+            .get(),
+        source_fetch_max_in_flight_requests: pipeline_limits
+            .source_fetch_max_in_flight_requests
+            .get(),
+        source_fetch_max_in_flight_bytes: pipeline_limits.source_fetch_max_in_flight_bytes.get(),
+        block_prepare_memory_watermark_bytes: pipeline_limits
+            .block_prepare_memory_watermark_bytes
+            .get(),
+        source_segment_delay_millis: config.source_segment_delay_millis,
         canonical_writer: canonical_writer_settings(canonical_options),
         projection_preset: config.projection_preset.map(ProjectionPreset::as_str),
         projection_replay_scope: config

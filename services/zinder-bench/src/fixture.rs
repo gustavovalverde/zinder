@@ -8,6 +8,7 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -712,11 +713,21 @@ pub struct FixtureNodeSource {
     capabilities: NodeCapabilities,
     locations: Arc<HashMap<u32, BlockLocation>>,
     subtree_roots: Arc<SubtreeRootsByProtocol>,
+    segment_response_delay: Duration,
 }
 
 impl FixtureNodeSource {
     /// Opens a fixture directory and builds a block-offset index for replay.
     pub fn open(directory: &Path, manifest: &FixtureManifest) -> Result<Self, BenchError> {
+        Self::open_with_segment_delay(directory, manifest, Duration::ZERO)
+    }
+
+    /// Opens a fixture and delays each source-segment response by `delay`.
+    pub fn open_with_segment_delay(
+        directory: &Path,
+        manifest: &FixtureManifest,
+        delay: Duration,
+    ) -> Result<Self, BenchError> {
         let network = manifest.network_typed()?;
         let tip = manifest.tip_id()?;
         let locations = index_segments(directory, manifest)?;
@@ -738,6 +749,7 @@ impl FixtureNodeSource {
             capabilities,
             locations: Arc::new(locations),
             subtree_roots: Arc::new(subtree_roots),
+            segment_response_delay: delay,
         })
     }
 }
@@ -933,6 +945,9 @@ impl NodeSource for FixtureNodeSource {
         &self,
         limits: SourceChainSegmentLimits,
     ) -> Result<SourceChainSegment, SourceError> {
+        if !self.segment_response_delay.is_zero() {
+            tokio::time::sleep(self.segment_response_delay).await;
+        }
         let (start_height, expected_parent_hash) = match limits.cursor.block_id() {
             None => match limits.cursor.next_connected_height() {
                 Some(start_height) => (start_height, None),

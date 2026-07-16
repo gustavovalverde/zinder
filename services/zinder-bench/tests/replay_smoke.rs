@@ -3,7 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use eyre::{Result, eyre};
 use serde_json::Value;
@@ -110,6 +110,13 @@ fn replay_config(
         fixture_directory: fixture_directory.path().to_path_buf(),
         store_path: store_directory.path().join("canonical"),
         block_prepare_concurrency: NonZeroU32::new(2).ok_or_else(|| eyre!("2 is non-zero"))?,
+        max_response_bytes: None,
+        source_segment_max_blocks: None,
+        source_segment_target_response_bytes: None,
+        source_fetch_max_in_flight_requests: None,
+        source_fetch_max_in_flight_bytes: None,
+        block_prepare_memory_watermark_bytes: None,
+        source_segment_delay_millis: 0,
         canonical_block_cache_bytes: None,
         projection_preset,
         projection_replay_scope: ProjectionReplayScope::FixedRange,
@@ -124,6 +131,59 @@ fn replay_config(
         image_reference: Some(format!("sha256:{}", "a".repeat(64))),
         canonical_fixture_replay_thresholds: None,
     })
+}
+
+#[tokio::test]
+async fn replay_reports_source_admission_and_delay_settings() -> Result<()> {
+    let fixture_directory = write_regtest_fixture()?;
+    let store_directory = tempdir()?;
+    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    config.max_response_bytes = NonZeroU64::new(67_108_864);
+    config.source_segment_max_blocks = NonZeroU32::new(64);
+    config.source_segment_target_response_bytes = NonZeroU64::new(33_554_432);
+    config.source_fetch_max_in_flight_requests = NonZeroU32::new(12);
+    config.source_fetch_max_in_flight_bytes = NonZeroU64::new(156_249_984);
+    config.block_prepare_memory_watermark_bytes = NonZeroU64::new(156_249_984);
+    config.source_segment_delay_millis = 37;
+
+    let report = replay_fixture(config, None).await?;
+
+    assert_eq!(report.replay.max_response_bytes, 67_108_864);
+    assert_eq!(report.replay.source_segment_max_blocks, 64);
+    assert_eq!(
+        report.replay.source_segment_target_response_bytes,
+        33_554_432
+    );
+    assert_eq!(report.replay.source_fetch_max_in_flight_requests, 12);
+    assert_eq!(report.replay.source_fetch_max_in_flight_bytes, 156_249_984);
+    assert_eq!(
+        report.replay.block_prepare_memory_watermark_bytes,
+        156_249_984
+    );
+    assert_eq!(report.replay.source_segment_delay_millis, 37);
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_rejects_source_segment_target_above_response_limit() -> Result<()> {
+    let fixture_directory = write_regtest_fixture()?;
+    let store_directory = tempdir()?;
+    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    config.max_response_bytes = NonZeroU64::new(64 * 1024 * 1024);
+    config.source_segment_target_response_bytes = NonZeroU64::new(128 * 1024 * 1024);
+
+    let Some(error) = replay_fixture(config, None).await.err() else {
+        return Err(eyre!(
+            "replay must reject a source segment target above its response limit"
+        ));
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("source segment target 134217728 exceeds maximum response 67108864")
+    );
+    Ok(())
 }
 
 fn write_starting_checkpoint_manifest(

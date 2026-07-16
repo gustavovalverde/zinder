@@ -43,5 +43,5 @@ workspace = true
 [dev-dependencies]
 eyre.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
 zinder-testkit.workspace = true

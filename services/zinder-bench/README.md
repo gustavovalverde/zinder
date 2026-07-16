@@ -121,6 +121,21 @@ Sweep the knobs the backlog calls out by varying flags across otherwise
 identical runs (each against a fresh store clone):
 
 - `--block-prepare-concurrency 4|8|12|24` for the prepare-concurrency sweep.
+- `--max-response-bytes <N>` for the hard source-response limit.
+- `--source-segment-max-blocks <N>` and
+  `--source-segment-target-response-bytes <N>` for the adaptive segment
+  planner's starting ceiling and response-size target.
+- `--source-fetch-max-in-flight-requests <N>` for the source request-count
+  ceiling.
+- `--source-fetch-max-in-flight-bytes <N>` to override the aggregate byte
+  watermark for concurrent source-segment responses. For example, compare the
+  live 10 GB runtime-derived baseline of `156249984` bytes with `402653184`
+  bytes.
+- `--block-prepare-memory-watermark-bytes <N>` for the downstream canonical
+  preparation watermark.
+- `--source-segment-delay-millis <N>` to add the same delay to every fixture
+  segment response, which makes transport-latency A/B runs repeatable without
+  changing the captured bytes.
 - `--block-cache-bytes <N>` for the canonical block-cache-size sweep.
 - `--projection-preset wallet|explorer` to drive one explicit projection
   diagnostic over the committed range. Neither preset builds ADR-0035's wallet
@@ -131,6 +146,36 @@ identical runs (each against a fresh store clone):
 - `--projection-replay-scope fixed-range|retained-history` to compare only the
   captured range (the default) or a full rebuild from retained canonical event
   history. Fixed-range replay requires a fresh projection store in the clone.
+
+The source-planner controls exercise the source lane shared by
+current-schema bulk catchup and version-1 canonical construction. This command
+still commits into `PrimaryChainStore`, so its results isolate source planning,
+admission, and downstream supply; they do not certify version-1 construction
+or the complete version-1 service composition. End-to-end version-1 evidence
+requires a separate checkpointed fixture replay with the authenticated
+predecessor tree checkpoint needed by the version-1 builder.
+
+The command validates the effective limits as one set before replay. It rejects
+a segment response target above the hard response limit and a source byte
+watermark below that limit.
+
+The source-planner arm reproduces the canary's effective limits with these
+flags. This example is the zero-delay baseline; set the final flag to the
+measured delay for the latency arm:
+
+```bash
+zinder-bench current-schema-replay \
+  --fixture ./fixtures/mainnet-dense-range \
+  --store ./fixtures/store-before-dense-range \
+  --block-prepare-concurrency 10 \
+  --max-response-bytes 67108864 \
+  --source-segment-max-blocks 64 \
+  --source-segment-target-response-bytes 33554432 \
+  --source-fetch-max-in-flight-requests 12 \
+  --source-fetch-max-in-flight-bytes 156249984 \
+  --block-prepare-memory-watermark-bytes 156249984 \
+  --source-segment-delay-millis 0
+```
 
 `--software-revision` identifies the source revision. `--image-reference` must
 be either a `sha256:<64-hex>` container image ID or a digest-pinned image
@@ -346,6 +391,13 @@ component diagnostics in the external resource artifacts.
   maxima copied from the captured fixture manifest.
 - `replay.wall_clock_seconds`, `replay.blocks_committed`,
   `replay.blocks_per_second`: throughput over the range.
+- `replay.max_response_bytes`, `replay.source_segment_max_blocks`,
+  `replay.source_segment_target_response_bytes`,
+  `replay.source_fetch_max_in_flight_requests`,
+  `replay.source_fetch_max_in_flight_bytes`,
+  `replay.block_prepare_memory_watermark_bytes`, and
+  `replay.source_segment_delay_millis`: the exact source-planner, admission,
+  preparation, and deterministic delay settings used by the run.
 - `replay.starting_canonical_state`: the opened store's `chain_epoch_id`, tip
   height, RPC-order tip hash, artifact schema version, checkpoint-manifest
   SHA-256, and `empty`, `checkpoint`, or `unverified-clone` provenance kind.
@@ -420,11 +472,14 @@ roots, and complete report-window coverage for every component.
 ## Scope and faithfulness
 
 - Source transport differs from production (fixture files instead of JSON-RPC),
-  so source-fetch timing is not representative. Fixture replay parses only the
-  block header before handing the payload to canonical preparation, matching the
-  production batch-source boundary. Everything downstream (prepare, prefetch,
-  reassembly, commit, and projection construction) runs the real pipeline
-  against the real canonical store.
+  so zero-delay source-fetch timing is not representative. The optional fixed
+  delay supports controlled latency comparisons, but it does not reproduce
+  Zebra response generation, network jitter, or JSON and hexadecimal decoding.
+  Fixture replay parses only the block header before handing the payload to
+  canonical preparation, matching the production batch-source boundary.
+  Everything downstream runs the current-schema bulk-catchup pipeline against
+  `PrimaryChainStore`; version-1 construction shares the source planner but not
+  this command's canonical storage boundary.
 - Shielded subtree roots that complete inside the range are captured verbatim
   and served during replay, so post-Sapling ranges commit correctly.
 - Sparse tree-state checkpoints are not captured; the fixture source does not

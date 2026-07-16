@@ -104,6 +104,27 @@ struct CurrentSchemaReplayArgs {
     /// Prepare concurrency to run with.
     #[arg(long = "block-prepare-concurrency", default_value_t = DEFAULT_BLOCK_PREPARE_CONCURRENCY)]
     block_prepare_concurrency: u32,
+    /// Maximum accepted source-segment response size in bytes.
+    #[arg(long = "max-response-bytes")]
+    max_response_bytes: Option<u64>,
+    /// Maximum connected blocks requested in one source segment.
+    #[arg(long = "source-segment-max-blocks")]
+    source_segment_max_blocks: Option<u32>,
+    /// Adaptive target size for one source-segment response in bytes.
+    #[arg(long = "source-segment-target-response-bytes")]
+    source_segment_target_response_bytes: Option<u64>,
+    /// Maximum concurrent source-segment requests.
+    #[arg(long = "source-fetch-max-in-flight-requests")]
+    source_fetch_max_in_flight_requests: Option<u32>,
+    /// Aggregate byte watermark for concurrent source-segment responses.
+    #[arg(long = "source-fetch-max-in-flight-bytes")]
+    source_fetch_max_in_flight_bytes: Option<u64>,
+    /// Aggregate byte watermark for canonical block preparation.
+    #[arg(long = "block-prepare-memory-watermark-bytes")]
+    block_prepare_memory_watermark_bytes: Option<u64>,
+    /// Deterministic delay applied to every captured source-segment response.
+    #[arg(long = "source-segment-delay-millis", default_value_t = 0)]
+    source_segment_delay_millis: u64,
     /// Optional canonical block-cache override in bytes.
     #[arg(long = "block-cache-bytes")]
     block_cache_bytes: Option<u64>,
@@ -268,6 +289,31 @@ async fn run_current_schema_replay(args: CurrentSchemaReplayArgs) -> Result<(), 
             args.block_prepare_concurrency,
             "block-prepare-concurrency",
         )?,
+        max_response_bytes: args
+            .max_response_bytes
+            .map(|bytes| require_nonzero_u64(bytes, "max-response-bytes"))
+            .transpose()?,
+        source_segment_max_blocks: args
+            .source_segment_max_blocks
+            .map(|blocks| require_nonzero_u32(blocks, "source-segment-max-blocks"))
+            .transpose()?,
+        source_segment_target_response_bytes: args
+            .source_segment_target_response_bytes
+            .map(|bytes| require_nonzero_u64(bytes, "source-segment-target-response-bytes"))
+            .transpose()?,
+        source_fetch_max_in_flight_requests: args
+            .source_fetch_max_in_flight_requests
+            .map(|requests| require_nonzero_u32(requests, "source-fetch-max-in-flight-requests"))
+            .transpose()?,
+        source_fetch_max_in_flight_bytes: args
+            .source_fetch_max_in_flight_bytes
+            .map(|bytes| require_nonzero_u64(bytes, "source-fetch-max-in-flight-bytes"))
+            .transpose()?,
+        block_prepare_memory_watermark_bytes: args
+            .block_prepare_memory_watermark_bytes
+            .map(|bytes| require_nonzero_u64(bytes, "block-prepare-memory-watermark-bytes"))
+            .transpose()?,
+        source_segment_delay_millis: args.source_segment_delay_millis,
         canonical_block_cache_bytes: args.block_cache_bytes,
         projection_preset: args.projection_preset.map(ProjectionPreset::from),
         projection_replay_scope: args.projection_replay_scope.into(),
@@ -478,6 +524,38 @@ mod tests {
         };
 
         assert!(canonical_fixture_replay_thresholds(&args)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn source_admission_experiment_flags_parse() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from(current_schema_replay_args(&[
+            "--max-response-bytes",
+            "67108864",
+            "--source-segment-max-blocks",
+            "64",
+            "--source-segment-target-response-bytes",
+            "33554432",
+            "--source-fetch-max-in-flight-requests",
+            "12",
+            "--source-fetch-max-in-flight-bytes",
+            "156249984",
+            "--block-prepare-memory-watermark-bytes",
+            "156249984",
+            "--source-segment-delay-millis",
+            "250",
+        ]))?;
+        let Command::CurrentSchemaReplay(args) = cli.command else {
+            return Err("expected current-schema-replay command".into());
+        };
+
+        assert_eq!(args.max_response_bytes, Some(67_108_864));
+        assert_eq!(args.source_segment_max_blocks, Some(64));
+        assert_eq!(args.source_segment_target_response_bytes, Some(33_554_432));
+        assert_eq!(args.source_fetch_max_in_flight_requests, Some(12));
+        assert_eq!(args.source_fetch_max_in_flight_bytes, Some(156_249_984));
+        assert_eq!(args.block_prepare_memory_watermark_bytes, Some(156_249_984));
+        assert_eq!(args.source_segment_delay_millis, 250);
         Ok(())
     }
 

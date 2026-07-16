@@ -3,7 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{fs::OpenOptions, io::Write};
+use std::{fs::OpenOptions, io::Write, num::NonZeroU32, time::Duration};
 
 use eyre::{Result, eyre};
 use serde_json::Value;
@@ -14,7 +14,7 @@ use zinder_bench::fixture::{
     FixtureNodeSource, SegmentDescriptor, SubtreeRootSet, read_segment_blocks, write_segment,
 };
 use zinder_core::{BlockHeight, Network, wire::encode_zinder_native_chain_name};
-use zinder_source::{NodeSource, SourceBlock};
+use zinder_source::{NodeSource, SourceBlock, SourceChainCursor, SourceChainSegmentLimits};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 const REGTEST_BLOCK_1: &str =
@@ -219,6 +219,37 @@ async fn segment_and_manifest_round_trip_preserves_blocks() -> Result<()> {
         return Err(eyre!("fixture open must verify each segment digest"));
     };
     assert!(error.to_string().contains("SHA-256"));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn fixture_source_delays_each_segment_response_by_the_configured_duration() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let source_segment_delay = Duration::from_millis(250);
+    let source = FixtureNodeSource::open_with_segment_delay(
+        fixture.directory.path(),
+        &fixture.manifest,
+        source_segment_delay,
+    )?;
+    let segment_limits = SourceChainSegmentLimits::new(
+        SourceChainCursor::before_height(BlockHeight::new(603)),
+        NonZeroU32::MIN,
+        u64::MAX,
+        u64::MAX,
+    );
+
+    let segment_fetch =
+        tokio::spawn(async move { source.fetch_chain_segment(segment_limits).await });
+    tokio::task::yield_now().await;
+    assert!(!segment_fetch.is_finished());
+
+    tokio::time::advance(Duration::from_millis(249)).await;
+    tokio::task::yield_now().await;
+    assert!(!segment_fetch.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let segment = segment_fetch.await??;
+    assert_eq!(segment.stats().connected_blocks(), 1);
     Ok(())
 }
 

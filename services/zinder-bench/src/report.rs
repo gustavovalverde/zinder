@@ -128,6 +128,20 @@ impl TryFrom<&FixtureManifest> for FixtureSummary {
 pub struct CurrentSchemaFixtureReplayMeasurements {
     /// Prepare concurrency the run used.
     pub block_prepare_concurrency: u32,
+    /// Maximum accepted source-segment response size in bytes.
+    pub max_response_bytes: u64,
+    /// Maximum connected blocks requested in one source segment.
+    pub source_segment_max_blocks: u32,
+    /// Adaptive target size for one source-segment response in bytes.
+    pub source_segment_target_response_bytes: u64,
+    /// Maximum concurrent source-segment requests.
+    pub source_fetch_max_in_flight_requests: u32,
+    /// Aggregate source-response admission watermark used by the run.
+    pub source_fetch_max_in_flight_bytes: u64,
+    /// Aggregate canonical block-preparation memory watermark used by the run.
+    pub block_prepare_memory_watermark_bytes: u64,
+    /// Deterministic delay applied to each captured source-segment response.
+    pub source_segment_delay_millis: u64,
     /// Effective canonical writer schema, resource, and durability settings.
     pub canonical_writer: CurrentSchemaReplayWriterSettings,
     /// Projection preset replayed after canonical ingest, or `None` for a
@@ -546,6 +560,20 @@ pub struct TickerStat {
 pub struct CurrentSchemaFixtureReplaySummary {
     /// Prepare concurrency the run used.
     pub block_prepare_concurrency: u32,
+    /// Maximum accepted source-segment response size in bytes.
+    pub max_response_bytes: u64,
+    /// Maximum connected blocks requested in one source segment.
+    pub source_segment_max_blocks: u32,
+    /// Adaptive target size for one source-segment response in bytes.
+    pub source_segment_target_response_bytes: u64,
+    /// Maximum concurrent source-segment requests.
+    pub source_fetch_max_in_flight_requests: u32,
+    /// Aggregate source-response admission watermark used by the run.
+    pub source_fetch_max_in_flight_bytes: u64,
+    /// Aggregate canonical block-preparation memory watermark used by the run.
+    pub block_prepare_memory_watermark_bytes: u64,
+    /// Deterministic delay applied to each captured source-segment response.
+    pub source_segment_delay_millis: u64,
     /// Effective canonical writer schema, resource, and durability settings.
     pub canonical_writer: CurrentSchemaReplayWriterSettings,
     /// Projection preset replayed after canonical ingest, or `None` for a
@@ -1850,6 +1878,13 @@ fn build_replay_summary(
     };
     CurrentSchemaFixtureReplaySummary {
         block_prepare_concurrency: measurements.block_prepare_concurrency,
+        max_response_bytes: measurements.max_response_bytes,
+        source_segment_max_blocks: measurements.source_segment_max_blocks,
+        source_segment_target_response_bytes: measurements.source_segment_target_response_bytes,
+        source_fetch_max_in_flight_requests: measurements.source_fetch_max_in_flight_requests,
+        source_fetch_max_in_flight_bytes: measurements.source_fetch_max_in_flight_bytes,
+        block_prepare_memory_watermark_bytes: measurements.block_prepare_memory_watermark_bytes,
+        source_segment_delay_millis: measurements.source_segment_delay_millis,
         canonical_writer: measurements.canonical_writer,
         projection_preset: measurements.projection_preset,
         projection_replay_scope: measurements.projection_replay_scope,
@@ -2553,6 +2588,13 @@ mod tests {
     fn canonical_measurements() -> CurrentSchemaFixtureReplayMeasurements {
         CurrentSchemaFixtureReplayMeasurements {
             block_prepare_concurrency: 8,
+            max_response_bytes: 384 * 1024 * 1024,
+            source_segment_max_blocks: 16,
+            source_segment_target_response_bytes: 32 * 1024 * 1024,
+            source_fetch_max_in_flight_requests: 12,
+            source_fetch_max_in_flight_bytes: 384 * 1024 * 1024,
+            block_prepare_memory_watermark_bytes: 512 * 1024 * 1024,
+            source_segment_delay_millis: 0,
             canonical_writer: CurrentSchemaReplayWriterSettings {
                 store_schema_version: 13,
                 artifact_schema_version: 18,
