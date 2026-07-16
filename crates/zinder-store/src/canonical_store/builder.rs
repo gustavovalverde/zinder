@@ -321,8 +321,8 @@ mod tests {
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
         CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
         CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds, CanonicalTransactionFacts,
-        ChainTipMetadata, CompactBlockArtifact, LockTime, PrivacyShape, SerializedBytesDigest,
-        TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
+        ChainEpochId, ChainTipMetadata, CompactBlockArtifact, LockTime, PrivacyShape,
+        SerializedBytesDigest, TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
         TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
         TransactionVersion, UnsupportedSection, encode_canonical_block_replay,
         wire::encode_internal_block_hash,
@@ -514,7 +514,7 @@ mod tests {
         let published = validated.publish_baseline(publication)?;
 
         assert_eq!(published.ready_evidence().visible_epoch.value(), 1);
-        assert_eq!(published.ready_evidence().baseline_block_count, 2);
+        assert_eq!(published.ready_evidence().visible_block_count, 2);
         assert_eq!(
             published.ready_evidence().visible_tip.height,
             BlockHeight::new(2)
@@ -542,6 +542,269 @@ mod tests {
         assert_eq!(
             replayed_blocks[1].facts().block_header.block_hash,
             BlockHash::from_bytes([2; 32])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_store_atomically_appends_one_live_canonical_epoch_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let mut store = validated.publish_baseline(publication)?;
+        let mut live_block = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
+        add_tree_state_checkpoint(&mut live_block)?;
+        let expected_fence = store.event_fence();
+
+        let (next_store, outcome) = store.commit_live_append(crate::CanonicalLiveAppend::new(
+            expected_fence,
+            live_block,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+        ))?;
+        store = next_store;
+
+        assert_eq!(outcome.chain_epoch_id(), zinder_core::ChainEpochId::new(2));
+        assert_eq!(outcome.chain_event_sequence(), 2);
+        assert_eq!(outcome.visible_tip().height, BlockHeight::new(3));
+        assert_eq!(outcome.sequence_digest().block_count(), 3);
+        assert_ne!(
+            outcome.sequence_digest().as_bytes(),
+            expected_fence.sequence_digest().as_bytes()
+        );
+        assert_eq!(store.ready_evidence().visible_tip, outcome.visible_tip());
+        drop(store);
+
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reopened.ready_evidence().visible_epoch,
+            outcome.chain_epoch_id()
+        );
+        assert_eq!(
+            reopened
+                .scan_canonical_replay()?
+                .collect::<Result<Vec<_>, _>>()?
+                .len(),
+            3
+        );
+        let expected_fence = reopened.event_fence();
+        let mut block_four = canonical_build_block(BlockHeight::new(4), [4; 32], [3; 32]);
+        add_tree_state_checkpoint(&mut block_four)?;
+        let (store, second_outcome) =
+            reopened.commit_live_append(crate::CanonicalLiveAppend::new(
+                expected_fence,
+                block_four,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_002_000),
+            ))?;
+        assert_eq!(second_outcome.chain_epoch_id(), ChainEpochId::new(3));
+        assert_eq!(second_outcome.sequence_digest().block_count(), 4);
+        drop(store);
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reopened
+                .scan_canonical_replay()?
+                .collect::<Result<Vec<_>, _>>()?
+                .len(),
+            4
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_store_rejects_incomplete_live_wallet_artifacts_without_advancing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let expected_fence = store.event_fence();
+        let error = store
+            .commit_live_append(crate::CanonicalLiveAppend::new(
+                expected_fence,
+                canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]),
+                Vec::new(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+            ))
+            .err()
+            .ok_or("a live tip without its tree state must be rejected")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreError::BlockLoadSequenceInvalid { .. }
+        ));
+
+        let store = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let mut block_three = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
+        add_tree_state_checkpoint(&mut block_three)?;
+        let expected_fence = store.event_fence();
+        let unexpected_root = CanonicalBuildSubtreeRoot {
+            protocol: zinder_core::ShieldedProtocol::Sapling,
+            subtree_index: zinder_core::SubtreeRootIndex::new(0),
+            root_hash: zinder_core::SubtreeRootHash::from_bytes([7; 32]),
+            completing_block_height: BlockHeight::new(3),
+        };
+        let error = store
+            .commit_live_append(crate::CanonicalLiveAppend::new(
+                expected_fence,
+                block_three,
+                vec![unexpected_root],
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+            ))
+            .err()
+            .ok_or("an unexpected live subtree root must be rejected")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreError::LiveCommitRefused { .. }
+        ));
+
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reopened.ready_evidence().visible_epoch,
+            ChainEpochId::new(1)
+        );
+        assert_eq!(
+            reopened
+                .scan_canonical_replay()?
+                .collect::<Result<Vec<_>, _>>()?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_store_rejects_disconnected_live_append_without_advancing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let expected_fence = store.event_fence();
+
+        let mut disconnected_block = canonical_build_block(BlockHeight::new(3), [3; 32], [9; 32]);
+        add_tree_state_checkpoint(&mut disconnected_block)?;
+        let error = store
+            .commit_live_append(crate::CanonicalLiveAppend::new(
+                expected_fence,
+                disconnected_block,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+            ))
+            .err()
+            .ok_or("a disconnected live block must be rejected")?;
+
+        assert!(matches!(
+            error,
+            CanonicalStoreError::LiveCommitRefused { .. }
+        ));
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reopened.ready_evidence().visible_epoch,
+            ChainEpochId::new(1)
+        );
+        assert_eq!(
+            reopened
+                .scan_canonical_replay()?
+                .collect::<Result<Vec<_>, _>>()?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_store_rejects_stale_live_fence_without_advancing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let mut store = validated.publish_baseline(publication)?;
+        let stale_fence = store.event_fence();
+        let mut block_three = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
+        add_tree_state_checkpoint(&mut block_three)?;
+        let (next_store, _) = store.commit_live_append(crate::CanonicalLiveAppend::new(
+            stale_fence,
+            block_three,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_001_000),
+        ))?;
+        store = next_store;
+
+        let error = store
+            .commit_live_append(crate::CanonicalLiveAppend::new(
+                stale_fence,
+                canonical_build_block(BlockHeight::new(4), [4; 32], [3; 32]),
+                Vec::new(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_002_000),
+            ))
+            .err()
+            .ok_or("a stale canonical event fence must be rejected")?;
+
+        assert!(matches!(
+            error,
+            CanonicalStoreError::LiveCommitRefused { .. }
+        ));
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reopened
+                .scan_canonical_replay()?
+                .collect::<Result<Vec<_>, _>>()?
+                .len(),
+            3
         );
         Ok(())
     }

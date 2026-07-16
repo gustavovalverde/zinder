@@ -62,11 +62,11 @@ pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 15] = [
 /// Construction is owned exclusively by [`super::RocksDbCanonicalBuilder`].
 /// This serving type cannot represent or reopen an unpublished BUILDING store.
 pub struct RocksDbCanonicalStore {
-    bounded_open: BoundedRocksDbOpen,
-    workload: CanonicalStoreWorkload,
-    build_plan: super::CanonicalStoreBuildPlan,
-    _cursor_auth_key: [u8; 32],
-    ready_evidence: CanonicalStoreReadyEvidence,
+    pub(super) bounded_open: BoundedRocksDbOpen,
+    pub(super) workload: CanonicalStoreWorkload,
+    pub(super) build_plan: super::CanonicalStoreBuildPlan,
+    pub(super) cursor_auth_key: [u8; 32],
+    pub(super) ready_evidence: CanonicalStoreReadyEvidence,
 }
 
 impl RocksDbCanonicalStore {
@@ -81,7 +81,7 @@ impl RocksDbCanonicalStore {
             bounded_open,
             workload,
             build_plan,
-            _cursor_auth_key: cursor_auth_key,
+            cursor_auth_key,
             ready_evidence,
         }
     }
@@ -164,7 +164,7 @@ impl RocksDbCanonicalStore {
             bounded_open,
             workload: expected_workload,
             build_plan,
-            _cursor_auth_key: opened_control.cursor_auth_key,
+            cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
         })
     }

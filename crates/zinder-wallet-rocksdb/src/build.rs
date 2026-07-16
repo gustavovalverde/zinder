@@ -298,8 +298,8 @@ fn validate_canonical_fence(
     let expected_sequence_digest =
         CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
             ready.sequence_digest_version,
-            ready.baseline_block_count,
-            ready.baseline_sequence_digest,
+            ready.visible_block_count,
+            ready.visible_sequence_digest,
         );
     if prepared.first_block != ready.first_retained_block {
         return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
@@ -311,7 +311,7 @@ fn validate_canonical_fence(
             reason: "prepared tip differs from canonical READY",
         });
     }
-    if prepared.counters.scanned_block_count != ready.baseline_block_count {
+    if prepared.counters.scanned_block_count != ready.visible_block_count {
         return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
             reason: "prepared block count differs from canonical READY",
         });

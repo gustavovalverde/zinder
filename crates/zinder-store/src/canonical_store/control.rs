@@ -76,12 +76,12 @@ pub(super) fn encode_ready_store_control(
     encoded.extend_from_slice(&ready_evidence.visible_tip.hash.as_bytes());
     encoded.extend_from_slice(&ready_evidence.visible_epoch.value().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.visible_event_sequence.to_le_bytes());
-    encoded.extend_from_slice(&ready_evidence.baseline_block_count.to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.visible_block_count.to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.block_digest_version.value().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.replay_format_version.value().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.sequence_digest_version.value().to_le_bytes());
-    encoded.extend_from_slice(&ready_evidence.baseline_sequence_digest);
-    encoded.extend_from_slice(&ready_evidence.baseline_logical_fact_bytes.to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.visible_sequence_digest);
+    encoded.extend_from_slice(&ready_evidence.visible_logical_fact_bytes.to_le_bytes());
     Ok(encoded)
 }
 
@@ -368,7 +368,7 @@ impl<'encoded> Decoder<'encoded> {
         let visible_tip_hash = self.read_array::<32>("visible tip hash")?;
         let visible_epoch = self.read_u64("visible epoch")?;
         let visible_event_sequence = self.read_u64("visible event sequence")?;
-        let baseline_block_count = self.read_u64("baseline block count")?;
+        let visible_block_count = self.read_u64("visible block count")?;
         let block_digest_version =
             CanonicalBlockFactsDigestVersion::try_from(self.read_u16("block digest version")?)
                 .map_err(|source| CanonicalStoreError::admission(self.path, source.to_string()))?;
@@ -379,28 +379,30 @@ impl<'encoded> Decoder<'encoded> {
             self.read_u16("sequence digest version")?,
         )
         .map_err(|source| CanonicalStoreError::admission(self.path, source.to_string()))?;
-        let baseline_sequence_digest = self.read_array::<32>("baseline sequence digest")?;
-        let baseline_logical_fact_bytes = self.read_u64("baseline logical fact bytes")?;
+        let visible_sequence_digest = self.read_array::<32>("visible sequence digest")?;
+        let visible_logical_fact_bytes = self.read_u64("visible logical fact bytes")?;
 
-        let expected_block_count = build_tip
-            .height
-            .value()
+        let expected_block_count = visible_tip_height
             .checked_sub(first_height)
             .map(u64::from)
             .and_then(|height_span| height_span.checked_add(1));
+        let baseline_pointer_is_exact = visible_epoch == 1
+            && visible_event_sequence == 1
+            && visible_tip_height == build_tip.height.value()
+            && visible_tip_hash == build_tip.hash.as_bytes();
+        let live_pointer_advances_baseline = visible_epoch > 1
+            && visible_event_sequence == visible_epoch
+            && visible_tip_height > build_tip.height.value();
         if first_height != history_bounds.first_available_height().value()
-            || visible_tip_height != build_tip.height.value()
-            || visible_tip_hash != build_tip.hash.as_bytes()
-            || visible_epoch != 1
-            || visible_event_sequence != 1
-            || expected_block_count != Some(baseline_block_count)
+            || !(baseline_pointer_is_exact || live_pointer_advances_baseline)
+            || expected_block_count != Some(visible_block_count)
         {
             return Err(CanonicalStoreError::admission(
                 self.path,
                 "ready store control has an invalid chain position",
             ));
         }
-        if baseline_logical_fact_bytes == 0 {
+        if visible_logical_fact_bytes == 0 {
             return Err(CanonicalStoreError::admission(
                 self.path,
                 "ready store control is missing validation evidence",
@@ -426,12 +428,12 @@ impl<'encoded> Decoder<'encoded> {
             ),
             visible_epoch: ChainEpochId::new(visible_epoch),
             visible_event_sequence,
-            baseline_block_count,
+            visible_block_count,
             block_digest_version,
             replay_format_version,
             sequence_digest_version,
-            baseline_sequence_digest,
-            baseline_logical_fact_bytes,
+            visible_sequence_digest,
+            visible_logical_fact_bytes,
         })
     }
 
@@ -828,12 +830,12 @@ mod tests {
                 visible_tip: BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
                 visible_epoch: ChainEpochId::new(1),
                 visible_event_sequence: 1,
-                baseline_block_count: 2,
+                visible_block_count: 2,
                 block_digest_version: CanonicalBlockFactsDigestVersion::V1,
                 replay_format_version: CanonicalBlockReplayFormatVersion::V1,
                 sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
-                baseline_sequence_digest: [3; 32],
-                baseline_logical_fact_bytes: 1,
+                visible_sequence_digest: [3; 32],
+                visible_logical_fact_bytes: 1,
             }),
         }
     }

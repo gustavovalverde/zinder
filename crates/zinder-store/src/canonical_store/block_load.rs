@@ -18,11 +18,13 @@ use zinder_rocksdb::{FixedRecordSorter, OrderedSstWriter, SstFileSet, fixed_reco
 use self::codec::{
     BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN,
     decode_block_final_note_commitment_roots, decode_tree_state_checkpoint,
-    encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
-    encode_transaction_location, encode_transaction_position, encode_tree_state_checkpoint,
 };
 
-pub(super) use self::codec::{BLOCK_HEADER_VALUE_LEN, encode_block_position};
+pub(super) use self::codec::{
+    BLOCK_HEADER_VALUE_LEN, encode_block_final_note_commitment_roots, encode_block_hash_location,
+    encode_block_header, encode_block_position, encode_transaction_location,
+    encode_transaction_position, encode_tree_state_checkpoint,
+};
 
 use super::{
     CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
@@ -53,7 +55,7 @@ pub struct CanonicalBuildBlock {
     pub compact_block: CompactBlockArtifact,
     /// Commitment-tree positions after applying this block.
     pub tip_metadata: ChainTipMetadata,
-    /// Typed commitment-tree state at the global checkpoint cadence or exact build tip.
+    /// Typed commitment-tree state at the global checkpoint cadence or exact transition tip.
     pub tree_state_checkpoint: Option<CommitmentTreeCheckpoint>,
     /// Per-block final roots retained only by the explorer workload.
     pub block_final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
@@ -745,10 +747,25 @@ fn validate_persisted_block_final_note_commitment_roots(
     Ok(())
 }
 
-fn validate_build_block(
+pub(super) fn validate_build_block(
     workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
     block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
+    validate_block(workload, block, build_plan.build_tip().height)
+}
+
+pub(super) fn validate_live_block(
+    workload: CanonicalStoreWorkload,
+    block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
+    validate_block(workload, block, block.facts.block_header.height)
+}
+
+fn validate_block(
+    workload: CanonicalStoreWorkload,
+    block: &CanonicalBuildBlock,
+    transition_tip_height: BlockHeight,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
     let height = header.height;
@@ -781,7 +798,7 @@ fn validate_build_block(
     validate_compact_block_payload(block)?;
     validate_transaction_blobs(block)?;
     validate_block_blob(workload, block)?;
-    validate_tree_state_checkpoint(build_plan, block)?;
+    validate_tree_state_checkpoint(transition_tip_height, block)?;
     validate_block_final_note_commitment_roots(workload, block)
 }
 
@@ -906,12 +923,12 @@ fn validate_block_blob(
 }
 
 fn validate_tree_state_checkpoint(
-    build_plan: &CanonicalStoreBuildPlan,
+    transition_tip_height: BlockHeight,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
     let height = header.height;
-    let checkpoint_required = tree_state_checkpoint_required(height, build_plan.build_tip().height);
+    let checkpoint_required = tree_state_checkpoint_required(height, transition_tip_height);
     match (checkpoint_required, &block.tree_state_checkpoint) {
         (true, None) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
@@ -921,7 +938,7 @@ fn validate_tree_state_checkpoint(
         }
         (false, Some(_)) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
-                "block {} has a tree-state checkpoint outside the global cadence and build tip",
+                "block {} has a tree-state checkpoint outside the global cadence and transition tip",
                 height.value()
             )));
         }

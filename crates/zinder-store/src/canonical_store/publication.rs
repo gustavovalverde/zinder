@@ -220,12 +220,12 @@ impl PublicationContext {
             visible_tip: BlockId::new(replay_evidence.tip_height, replay_evidence.tip_hash),
             visible_epoch: BASELINE_EPOCH_ID,
             visible_event_sequence: BASELINE_EVENT_SEQUENCE,
-            baseline_block_count: replay_evidence.block_count,
+            visible_block_count: replay_evidence.block_count,
             block_digest_version: replay_evidence.block_digest_version,
             replay_format_version: replay_evidence.replay_format_version,
             sequence_digest_version: replay_evidence.sequence_digest_version,
-            baseline_sequence_digest: replay_evidence.sequence_digest.as_bytes(),
-            baseline_logical_fact_bytes: replay_evidence.logical_replay_bytes,
+            visible_sequence_digest: replay_evidence.sequence_digest.as_bytes(),
+            visible_logical_fact_bytes: replay_evidence.logical_replay_bytes,
         };
         abort_at_publication_failpoint("after_cold_validation");
         Ok(ValidatedRocksDbCanonicalBuild {
@@ -265,7 +265,7 @@ impl ValidatedRocksDbCanonicalBuild {
         Ok(PreparedCanonicalBaselinePublication {
             publication,
             build_tip: self.build_plan.build_tip(),
-            source_sequence_digest: self.ready_evidence.baseline_sequence_digest,
+            source_sequence_digest: self.ready_evidence.visible_sequence_digest,
         })
     }
 
@@ -275,7 +275,7 @@ impl ValidatedRocksDbCanonicalBuild {
         prepared: PreparedCanonicalBaselinePublication,
     ) -> Result<RocksDbCanonicalStore, CanonicalStoreError> {
         if prepared.build_tip != self.build_plan.build_tip()
-            || prepared.source_sequence_digest != self.ready_evidence.baseline_sequence_digest
+            || prepared.source_sequence_digest != self.ready_evidence.visible_sequence_digest
         {
             return Err(CanonicalStoreError::publication(
                 "prepared baseline belongs to a different canonical build",
@@ -355,14 +355,6 @@ pub(super) fn validate_ready_publication(
 ) -> Result<(), CanonicalStoreError> {
     validate_first_retained_block(db, ready_evidence.first_retained_block)?;
     let baseline_tip = build_plan.build_tip();
-    if ready_evidence.visible_epoch != BASELINE_EPOCH_ID
-        || ready_evidence.visible_event_sequence != BASELINE_EVENT_SEQUENCE
-        || ready_evidence.visible_tip != baseline_tip
-    {
-        return Err(CanonicalStoreError::publication(
-            "READY live transitions require the canonical live-commit API",
-        ));
-    }
     let baseline_epoch = decode_chain_epoch(&read_family_row(
         db,
         CHAIN_EPOCH_COLUMN_FAMILY,
@@ -379,7 +371,11 @@ pub(super) fn validate_ready_publication(
         baseline_tip,
         baseline_epoch,
     )?;
-    validate_visible_baseline(build_plan, ready_evidence, baseline_epoch, baseline_event)
+    validate_baseline_publication(build_plan, ready_evidence, baseline_epoch, baseline_event)?;
+    if ready_evidence.visible_epoch == BASELINE_EPOCH_ID {
+        return Ok(());
+    }
+    validate_live_append_history(db, ready_evidence, baseline_epoch)
 }
 
 fn validate_first_retained_block(
@@ -394,7 +390,7 @@ fn validate_first_retained_block(
     Ok(())
 }
 
-fn validate_visible_baseline(
+fn validate_baseline_publication(
     build_plan: &super::CanonicalStoreBuildPlan,
     ready_evidence: CanonicalStoreReadyEvidence,
     baseline_epoch: DecodedChainEpoch,
@@ -405,9 +401,7 @@ fn validate_visible_baseline(
         ready_evidence.first_retained_block.height,
         baseline_tip.height,
     );
-    if ready_evidence.visible_event_sequence != BASELINE_EVENT_SEQUENCE
-        || ready_evidence.visible_tip != baseline_tip
-        || baseline_epoch.visible_tip != baseline_tip
+    if baseline_epoch.visible_tip != baseline_tip
         || baseline_event.kind != COMMITTED_EVENT
         || baseline_event.resulting_epoch_id != BASELINE_EPOCH_ID
         || baseline_event.previous_epoch_id != 0
@@ -416,6 +410,70 @@ fn validate_visible_baseline(
     {
         return Err(CanonicalStoreError::publication(
             "visible baseline epoch 1 or event 1 is inconsistent with the fixed build",
+        ));
+    }
+    if ready_evidence.visible_epoch == BASELINE_EPOCH_ID
+        && (ready_evidence.visible_event_sequence != BASELINE_EVENT_SEQUENCE
+            || ready_evidence.visible_tip != baseline_tip)
+    {
+        return Err(CanonicalStoreError::publication(
+            "READY baseline pointer does not match epoch 1 and event 1",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_append_history(
+    db: &DB,
+    ready_evidence: CanonicalStoreReadyEvidence,
+    baseline_epoch: DecodedChainEpoch,
+) -> Result<(), CanonicalStoreError> {
+    if ready_evidence.visible_event_sequence != ready_evidence.visible_epoch.value() {
+        return Err(CanonicalStoreError::publication(
+            "READY live epoch and chain-event sequence must advance together",
+        ));
+    }
+    let mut previous_epoch_id = BASELINE_EPOCH_ID;
+    let mut previous_epoch = baseline_epoch;
+    for epoch_value in 2..=ready_evidence.visible_epoch.value() {
+        let chain_epoch_id = ChainEpochId::new(epoch_value);
+        let chain_epoch = decode_chain_epoch(&read_family_row(
+            db,
+            CHAIN_EPOCH_COLUMN_FAMILY,
+            &epoch_value.to_be_bytes(),
+        )?)?;
+        let chain_event = decode_chain_event(&read_family_row(
+            db,
+            CHAIN_EVENT_COLUMN_FAMILY,
+            &epoch_value.to_be_bytes(),
+        )?)?;
+        let appended_height = previous_epoch.visible_tip.height.next().ok_or_else(|| {
+            CanonicalStoreError::publication("live append height exceeds u32::MAX")
+        })?;
+        let appended_range = BlockHeightRange::inclusive(appended_height, appended_height);
+        validate_epoch_record(
+            db,
+            ready_evidence.first_retained_block.height,
+            chain_epoch.visible_tip,
+            chain_epoch,
+        )?;
+        if chain_epoch.visible_tip.height != appended_height
+            || chain_event.kind != COMMITTED_EVENT
+            || chain_event.resulting_epoch_id != chain_epoch_id
+            || chain_event.previous_epoch_id != previous_epoch_id.value()
+            || chain_event.reverted_range.is_some()
+            || chain_event.committed_range != appended_range
+        {
+            return Err(CanonicalStoreError::publication(
+                "READY live history contains an invalid version-1 append",
+            ));
+        }
+        previous_epoch_id = chain_epoch_id;
+        previous_epoch = chain_epoch;
+    }
+    if previous_epoch.visible_tip != ready_evidence.visible_tip {
+        return Err(CanonicalStoreError::publication(
+            "READY live history does not end at the visible tip",
         ));
     }
     Ok(())
@@ -567,7 +625,7 @@ fn validate_cold_block_families(
     Ok(replay)
 }
 
-fn validate_settled_tip(
+pub(super) fn validate_settled_tip(
     db: &DB,
     ready_evidence: CanonicalStoreReadyEvidence,
     settled_tip: BlockId,
@@ -588,12 +646,35 @@ fn encode_baseline_epoch(
     publication: CanonicalBaselinePublication,
     tip_metadata: ChainTipMetadata,
 ) -> [u8; EPOCH_VALUE_LENGTH] {
+    encode_chain_epoch(
+        ready_evidence.visible_tip,
+        publication.settled_tip,
+        tip_metadata,
+        publication.created_at,
+    )
+}
+
+pub(super) fn encode_live_chain_epoch(
+    visible_tip: BlockId,
+    settled_tip: BlockId,
+    tip_metadata: ChainTipMetadata,
+    created_at: UnixTimestampMillis,
+) -> [u8; EPOCH_VALUE_LENGTH] {
+    encode_chain_epoch(visible_tip, settled_tip, tip_metadata, created_at)
+}
+
+fn encode_chain_epoch(
+    visible_tip: BlockId,
+    settled_tip: BlockId,
+    tip_metadata: ChainTipMetadata,
+    created_at: UnixTimestampMillis,
+) -> [u8; EPOCH_VALUE_LENGTH] {
     let mut encoded = [0; EPOCH_VALUE_LENGTH];
     encoded[0] = VERSION_ONE;
-    encoded[1..5].copy_from_slice(&ready_evidence.visible_tip.height.value().to_le_bytes());
-    encoded[5..37].copy_from_slice(&ready_evidence.visible_tip.hash.as_bytes());
-    encoded[37..41].copy_from_slice(&publication.settled_tip.height.value().to_le_bytes());
-    encoded[41..73].copy_from_slice(&publication.settled_tip.hash.as_bytes());
+    encoded[1..5].copy_from_slice(&visible_tip.height.value().to_le_bytes());
+    encoded[5..37].copy_from_slice(&visible_tip.hash.as_bytes());
+    encoded[37..41].copy_from_slice(&settled_tip.height.value().to_le_bytes());
+    encoded[41..73].copy_from_slice(&settled_tip.hash.as_bytes());
     encoded[73..77].copy_from_slice(
         &tip_metadata
             .commitment_tree_size(ShieldedProtocol::Sapling)
@@ -609,7 +690,7 @@ fn encode_baseline_epoch(
             .commitment_tree_size(ShieldedProtocol::Ironwood)
             .to_le_bytes(),
     );
-    encoded[85..].copy_from_slice(&publication.created_at.value().to_le_bytes());
+    encoded[85..].copy_from_slice(&created_at.value().to_le_bytes());
     encoded
 }
 
@@ -628,6 +709,26 @@ fn encode_baseline_event(ready_evidence: CanonicalStoreReadyEvidence) -> [u8; EV
             ready_evidence.first_retained_block.height,
             ready_evidence.visible_tip.height,
         ),
+    );
+    encoded
+}
+
+pub(super) fn encode_live_append_event(
+    resulting_epoch_id: ChainEpochId,
+    previous_epoch_id: ChainEpochId,
+    appended_height: BlockHeight,
+) -> [u8; EVENT_VALUE_LENGTH] {
+    let mut encoded = [0; EVENT_VALUE_LENGTH];
+    encoded[0] = VERSION_ONE;
+    encoded[1] = COMMITTED_EVENT;
+    encoded[2..10].copy_from_slice(&resulting_epoch_id.value().to_le_bytes());
+    encoded[10..18].copy_from_slice(&previous_epoch_id.value().to_le_bytes());
+    encoded[18] = REVERTED_RANGE_ABSENT;
+    encoded[19..27].fill(0);
+    encode_event_range(
+        &mut encoded,
+        27,
+        BlockHeightRange::inclusive(appended_height, appended_height),
     );
     encoded
 }
@@ -705,6 +806,18 @@ fn decode_chain_epoch(encoded: &[u8]) -> Result<DecodedChainEpoch, CanonicalStor
             read_u32(encoded, 81)?,
         ),
     })
+}
+
+pub(super) fn read_chain_epoch_tips(
+    db: &DB,
+    chain_epoch_id: ChainEpochId,
+) -> Result<(BlockId, BlockId), CanonicalStoreError> {
+    let epoch = decode_chain_epoch(&read_family_row(
+        db,
+        CHAIN_EPOCH_COLUMN_FAMILY,
+        &chain_epoch_id.value().to_be_bytes(),
+    )?)?;
+    Ok((epoch.visible_tip, epoch.settled_tip))
 }
 
 fn decode_chain_event(encoded: &[u8]) -> Result<DecodedChainEvent, CanonicalStoreError> {
@@ -856,7 +969,7 @@ fn read_family_row(
         .ok_or_else(|| CanonicalStoreError::publication(format!("{name} row is absent")))
 }
 
-fn column_family<'db>(
+pub(super) fn column_family<'db>(
     db: &'db DB,
     name: &'static str,
 ) -> Result<Arc<BoundColumnFamily<'db>>, CanonicalStoreError> {
@@ -996,12 +1109,12 @@ mod tests {
             visible_tip: BlockId::new(BlockHeight::new(20), BlockHash::from_bytes([2; 32])),
             visible_epoch: ChainEpochId::new(1),
             visible_event_sequence: 1,
-            baseline_block_count: 11,
+            visible_block_count: 11,
             block_digest_version: CanonicalBlockFactsDigestVersion::V1,
             replay_format_version: CanonicalBlockReplayFormatVersion::V1,
             sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
-            baseline_sequence_digest: [4; 32],
-            baseline_logical_fact_bytes: 1,
+            visible_sequence_digest: [4; 32],
+            visible_logical_fact_bytes: 1,
         }
     }
 }

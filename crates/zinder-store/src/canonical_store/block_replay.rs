@@ -16,8 +16,9 @@ pub(super) const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
 /// One cache-bypassing, forward scan of the READY canonical replay family.
 ///
 /// Every yielded envelope is decoded and semantically validated. Reaching the
-/// end also authenticates the exact first block, tip, row count, parent links,
-/// and ordered sequence digest recorded by canonical publication.
+/// end also authenticates the exact first block, visible tip, current row
+/// count, parent links, every block-local replay digest, and the complete
+/// visible sequence digest recorded by canonical publication.
 pub struct CanonicalReplayScan<'a> {
     iterator: DBRawIteratorWithThreadMode<'a, DB>,
     ready_evidence: CanonicalStoreReadyEvidence,
@@ -59,10 +60,25 @@ impl<'a> CanonicalReplayScan<'a> {
                 operation: "canonical replay scan",
                 source,
             })?;
-        if self.observed_block_count != self.ready_evidence.baseline_block_count {
+        let expected_block_count = u64::from(
+            self.ready_evidence
+                .visible_tip
+                .height
+                .value()
+                .checked_sub(self.ready_evidence.first_retained_block.height.value())
+                .and_then(|distance| distance.checked_add(1))
+                .ok_or_else(|| {
+                    CanonicalStoreError::block_replay_sequence(
+                        "READY visible range cannot produce a block count",
+                    )
+                })?,
+        );
+        if self.ready_evidence.visible_block_count != expected_block_count
+            || self.observed_block_count != expected_block_count
+        {
             return Err(CanonicalStoreError::block_replay_sequence(format!(
-                "READY records {} baseline blocks but replay scan observed {}",
-                self.ready_evidence.baseline_block_count, self.observed_block_count
+                "READY visible range contains {expected_block_count} blocks but replay scan observed {}",
+                self.observed_block_count
             )));
         }
         let observed_tip = self.previous_block;
@@ -80,7 +96,7 @@ impl<'a> CanonicalReplayScan<'a> {
                 "canonical replay scan sequence digest was already finalized",
             )
         })?;
-        if digest_builder.finish().as_bytes() != self.ready_evidence.baseline_sequence_digest {
+        if digest_builder.finish().as_bytes() != self.ready_evidence.visible_sequence_digest {
             return Err(CanonicalStoreError::block_replay_sequence(
                 "replay scan sequence digest does not match READY",
             ));
@@ -144,9 +160,9 @@ impl Iterator for CanonicalReplayScan<'_> {
                 self.observed_block_count.checked_add(1).ok_or_else(|| {
                     CanonicalStoreError::block_replay_sequence("replay scan count exceeds u64::MAX")
                 })?;
-            if self.observed_block_count > self.ready_evidence.baseline_block_count {
+            if self.observed_block_count > self.ready_evidence.visible_block_count {
                 return Err(CanonicalStoreError::block_replay_sequence(
-                    "replay scan contains rows beyond the published baseline",
+                    "replay scan contains rows beyond the visible fence",
                 ));
             }
             let digest_builder = self.sequence_digest_builder.as_mut().ok_or_else(|| {

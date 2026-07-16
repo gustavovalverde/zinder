@@ -8,6 +8,7 @@ mod block_load;
 mod block_replay;
 mod builder;
 mod control;
+mod live_commit;
 mod publication;
 mod rocksdb;
 mod subtree_load;
@@ -27,6 +28,7 @@ use zinder_core::{
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::CanonicalReplayScan;
 pub use builder::RocksDbCanonicalBuilder;
+pub use live_commit::{CanonicalEventFence, CanonicalLiveAppend};
 pub use publication::{
     CanonicalBaselinePublication, PreparedCanonicalBaselinePublication,
     ValidatedRocksDbCanonicalBuild,
@@ -360,18 +362,18 @@ pub struct CanonicalStoreReadyEvidence {
     pub visible_epoch: ChainEpochId,
     /// Latest durable chain-event sequence that produced `visible_epoch`.
     pub visible_event_sequence: u64,
-    /// Number of contiguous blocks authenticated in the baseline build.
-    pub baseline_block_count: u64,
+    /// Number of contiguous blocks authenticated at `visible_tip`.
+    pub visible_block_count: u64,
     /// Canonical block-fact digest contract.
     pub block_digest_version: CanonicalBlockFactsDigestVersion,
     /// Canonical replay-envelope contract.
     pub replay_format_version: CanonicalBlockReplayFormatVersion,
     /// Ordered sequence-digest contract.
     pub sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
-    /// Ordered digest of the baseline build's fact sequence.
-    pub baseline_sequence_digest: [u8; 32],
-    /// Total semantic replay-envelope bytes in the baseline build.
-    pub baseline_logical_fact_bytes: u64,
+    /// Ordered digest of the complete visible fact sequence.
+    pub visible_sequence_digest: [u8; 32],
+    /// Total semantic replay-envelope bytes through `visible_tip`.
+    pub visible_logical_fact_bytes: u64,
 }
 
 /// Failure to create or admit a clean canonical store.
@@ -538,6 +540,34 @@ pub enum CanonicalStoreError {
         /// Immediate verification failure.
         reason: String,
     },
+
+    /// A READY store refused a live canonical transition before its atomic write.
+    #[error("canonical live commit refused: {reason}")]
+    LiveCommitRefused {
+        /// Exact transition invariant that failed.
+        reason: String,
+    },
+
+    /// A live atomic write returned an error, so admission must determine its outcome.
+    #[error("canonical live commit write outcome is unknown for {path:?}")]
+    LiveCommitWriteOutcomeUnknown {
+        /// Store path that must be reopened through normal READY admission.
+        path: PathBuf,
+        /// Underlying atomic write failure.
+        #[source]
+        source: rust_rocksdb::Error,
+    },
+
+    /// A live atomic write committed but immediate exact readback could not certify it.
+    #[error(
+        "canonical live commit completed but immediate verification failed for {path:?}: {reason}"
+    )]
+    LiveCommitCompletedButUnverified {
+        /// Store path that must be reopened through normal READY admission.
+        path: PathBuf,
+        /// Immediate verification failure.
+        reason: String,
+    },
 }
 
 impl CanonicalStoreError {
@@ -569,6 +599,12 @@ impl CanonicalStoreError {
 
     fn subtree_root_sequence(reason: impl Into<String>) -> Self {
         Self::SubtreeRootSequenceInvalid {
+            reason: reason.into(),
+        }
+    }
+
+    fn live_commit(reason: impl Into<String>) -> Self {
+        Self::LiveCommitRefused {
             reason: reason.into(),
         }
     }

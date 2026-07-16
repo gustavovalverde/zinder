@@ -402,14 +402,18 @@ fn retained_block_hash_with_options(
     Ok(BlockHash::from_bytes(block_hash))
 }
 
-fn encode_subtree_root_key(artifact: &SubtreeRootArtifact) -> [u8; SUBTREE_ROOT_KEY_LEN] {
+pub(super) fn encode_subtree_root_key(
+    artifact: &SubtreeRootArtifact,
+) -> [u8; SUBTREE_ROOT_KEY_LEN] {
     let mut key = [0; SUBTREE_ROOT_KEY_LEN];
     key[0] = artifact.protocol.id();
     key[1..].copy_from_slice(&artifact.subtree_index.value().to_be_bytes());
     key
 }
 
-fn encode_subtree_root_value(artifact: &SubtreeRootArtifact) -> [u8; SUBTREE_ROOT_VALUE_LEN] {
+pub(super) fn encode_subtree_root_value(
+    artifact: &SubtreeRootArtifact,
+) -> [u8; SUBTREE_ROOT_VALUE_LEN] {
     let mut encoded_root = [0; SUBTREE_ROOT_VALUE_LEN];
     encoded_root[..32].copy_from_slice(&artifact.root_hash.as_bytes());
     encoded_root[32..36].copy_from_slice(&artifact.completing_block_height.value().to_be_bytes());

@@ -71,7 +71,9 @@ pub(super) enum CanonicalFamilyValueDecodeError {
     },
 }
 
-pub(super) fn encode_block_header(header: &BlockHeaderArtifact) -> [u8; BLOCK_HEADER_VALUE_LEN] {
+pub(in crate::canonical_store) fn encode_block_header(
+    header: &BlockHeaderArtifact,
+) -> [u8; BLOCK_HEADER_VALUE_LEN] {
     let mut encoded_header = [0_u8; BLOCK_HEADER_VALUE_LEN];
     encoded_header[..32].copy_from_slice(&header.block_hash.as_bytes());
     encoded_header[32..64].copy_from_slice(&header.parent_hash.as_bytes());
@@ -85,7 +87,10 @@ pub(super) fn encode_block_header(header: &BlockHeaderArtifact) -> [u8; BLOCK_HE
     encoded_header
 }
 
-pub(super) fn encode_transaction_position(height: BlockHeight, transaction_index: u32) -> [u8; 8] {
+pub(in crate::canonical_store) fn encode_transaction_position(
+    height: BlockHeight,
+    transaction_index: u32,
+) -> [u8; 8] {
     let mut key = [0_u8; 8];
     key[..4].copy_from_slice(&encode_height_key_ascending(height));
     key[4..].copy_from_slice(&transaction_index.to_be_bytes());
@@ -96,14 +101,19 @@ pub(in crate::canonical_store) fn encode_block_position(height: BlockHeight) -> 
     encode_height_key_ascending(height)
 }
 
-pub(super) fn encode_block_hash_location(block_hash: BlockHash, height: BlockHeight) -> [u8; 36] {
+pub(in crate::canonical_store) fn encode_block_hash_location(
+    block_hash: BlockHash,
+    height: BlockHeight,
+) -> [u8; 36] {
     let mut row = [0_u8; BLOCK_HASH_INDEX_RECORD_LEN];
     row[..32].copy_from_slice(&block_hash.as_bytes());
     row[32..].copy_from_slice(&encode_block_position(height));
     row
 }
 
-pub(super) fn encode_transaction_location(location: TransactionLocation) -> [u8; 72] {
+pub(in crate::canonical_store) fn encode_transaction_location(
+    location: TransactionLocation,
+) -> [u8; 72] {
     let mut row = [0_u8; TRANSACTION_LOCATION_RECORD_LEN];
     row[..32].copy_from_slice(&location.transaction_id.as_bytes());
     row[32..36].copy_from_slice(&encode_block_position(location.block_height));
@@ -113,7 +123,7 @@ pub(super) fn encode_transaction_location(location: TransactionLocation) -> [u8;
 }
 
 /// Encodes one v1 tree-state checkpoint value without key-owned block identity.
-pub(super) fn encode_tree_state_checkpoint(
+pub(in crate::canonical_store) fn encode_tree_state_checkpoint(
     block_time_seconds: u32,
     frontiers: &CommitmentTreeFrontiers,
 ) -> Vec<u8> {
@@ -152,7 +162,7 @@ pub(super) fn decode_tree_state_checkpoint(
 }
 
 /// Encodes one v1 block-root value without key/header-owned block identity.
-pub(super) fn encode_block_final_note_commitment_roots(
+pub(in crate::canonical_store) fn encode_block_final_note_commitment_roots(
     roots: &BlockFinalNoteCommitmentRoots,
 ) -> Vec<u8> {
     let presence_bitmap = optional_root_presence_bitmap(roots);

@@ -618,8 +618,8 @@ fn canonical_ready_summary(
 ) -> CanonicalStorageReadySummary {
     let sequence_digest = CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
         ready.sequence_digest_version,
-        ready.baseline_block_count,
-        ready.baseline_sequence_digest,
+        ready.visible_block_count,
+        ready.visible_sequence_digest,
     );
     CanonicalStorageReadySummary {
         scope: "canonical-storage-ready",
@@ -628,7 +628,7 @@ fn canonical_ready_summary(
         visible_tip: block_id_summary(ready.visible_tip),
         visible_epoch_id: ready.visible_epoch.value(),
         visible_event_sequence: ready.visible_event_sequence,
-        block_count: ready.baseline_block_count,
+        block_count: ready.visible_block_count,
         transaction_count: block_load.transaction_count,
         subtree_root_count: subtree_load.subtree_root_count,
         replay_format_version: ready.replay_format_version.value(),
@@ -636,7 +636,7 @@ fn canonical_ready_summary(
             ready.block_digest_version,
             sequence_digest,
         ),
-        logical_replay_bytes: ready.baseline_logical_fact_bytes,
+        logical_replay_bytes: ready.visible_logical_fact_bytes,
         logical_storage_bytes: block_load.logical_bytes,
         sst_file_bytes: block_load.sst_file_bytes,
         sst_file_count: block_load.sst_file_count,
@@ -755,8 +755,8 @@ fn wallet_source_matches_canonical(
     let canonical_sequence_digest =
         CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
             canonical.sequence_digest_version,
-            canonical.baseline_block_count,
-            canonical.baseline_sequence_digest,
+            canonical.visible_block_count,
+            canonical.visible_sequence_digest,
         );
     wallet.source_position.chain_epoch_id == canonical.visible_epoch
         && wallet.source_position.tip == canonical.visible_tip
