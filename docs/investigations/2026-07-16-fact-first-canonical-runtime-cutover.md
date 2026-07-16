@@ -179,6 +179,102 @@ completion forecast because block density changes by era. The active build
 remains intact so later evidence can distinguish this range from the complete
 mainnet lifecycle.
 
+## Authenticated dense mainnet replay
+
+Status: single-run local diagnostic; canary experiment admitted
+Date: 2026-07-16
+Baseline revision: `d1d65ec`
+Candidate revision: `08cd633`
+Baseline image: `sha256:de74423adf14a777fe9596e37f31a5cb0fb9192e80f0583a02b2a7501d167133`
+Candidate image: `sha256:fbbd4b2c3320d218e41e009a0190b0c6be58736aee3369e84d4c90f03aa6e68c`
+
+The deterministic replay fixture contains mainnet heights 1,730,000 through
+1,734,999: 5,000 blocks, 58,285 transactions, 61,870 transparent inputs,
+119,167 transparent outputs, and 3,829,454,475 raw block bytes. Its manifest
+digest is
+`1bdc7b4b774e3a5d1e30ac68e33aed102ed2cb89ad769a3d6d29c32eaba64435`,
+and its canonical sequence digest is
+`91e3fb1e71ce4893fbdb425f45b64f8a8a1b0551b38fe3fe50634d170ff251b9`.
+The fixture carries authenticated Zebra predecessor and source-tip
+checkpoints. Every arm wrote the production version-1 canonical RocksDB store,
+published `READY`, cold-reopened the event fence, and scanned all 5,000 blocks.
+
+The matrix fixed the response cap at 64 MiB, response target at 32 MiB,
+segment ceiling at 64 blocks, request ceiling at 12, preparation concurrency at
+10, and preparation watermark at 156,249,984 bytes. Each Docker container had
+10 CPUs, a 10 GiB memory limit, and a private cgroup namespace. The injected
+4.53-second delay is applied once per outer fixture request, so delayed arms
+measure coarse transport sensitivity rather than reproducing Zebra's recursive
+split latency or response ordering exactly.
+
+| Planner | Source watermark | Delay | Rate | Returned blocks | Response payload | Density restarts | Peak memory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Restart baseline | 156,249,984 B | 0 ms | 14.14 blocks/s | 5,440 | 8.33 GB | 15 | 4.37 GB |
+| Restart baseline | 402,653,184 B | 0 ms | 10.76 blocks/s | 6,970 | 10.94 GB | 13 | 4.58 GB |
+| Restart baseline | 156,249,984 B | 4,530 ms | 6.76 blocks/s | 5,056 | 7.74 GB | 13 | 4.31 GB |
+| Restart baseline | 402,653,184 B | 4,530 ms | 11.89 blocks/s | 5,807 | 8.94 GB | 11 | 4.52 GB |
+| Retention candidate | 156,249,984 B | 4,530 ms | 7.79 blocks/s | 5,000 | 7.66 GB | 0 | 4.31 GB |
+| Retention candidate | 402,653,184 B | 0 ms | 13.45 blocks/s | 5,000 | 7.66 GB | 0 | 4.57 GB |
+| Retention candidate | 402,653,184 B | 4,530 ms | 13.82 blocks/s | 5,000 | 7.66 GB | 0 | 4.37 GB |
+
+The baseline demonstrates why the watermark cannot be widened independently.
+At 402,653,184 bytes with no delay, discard and refetch amplification returned
+39.4% more blocks and 42.8% more payload than the fixture, making the run 24%
+lower in throughput and 31.4% longer than the 156,249,984-byte baseline.
+Density feedback had changed the preferred size of future segments, but the
+implementation cancelled completed and in-flight non-overlapping future ranges
+and fetched them again.
+
+The candidate keeps those bounded ranges under their existing reservations and
+applies the smaller segment size at the unscheduled frontier. Ordered parent
+validation is unchanged. A response that exceeds the hard cap still cancels
+future work and replans. The delayed 402,653,184-byte arm retained 3 completed
+and 132 in-flight segments across 15 density adjustments, while the only
+discard was the six in-flight segments associated with one oversized response.
+It returned exactly the fixture's 5,000 blocks and 7,658,908,950 response bytes.
+
+Retention improved the delayed 156,249,984-byte arm by 15.3%, from 6.76 to
+7.79 blocks per second. The retained 402,653,184-byte arm reached 13.82 blocks
+per second with the same delay, 77.5% faster than retained work under the
+smaller budget. The zero-delay retained arm reached 13.45 blocks per second.
+The two wide-watermark results are effectively tied for this single-run
+diagnostic, which means that preserving source concurrency moves the active
+limit into block-local CPU. Peak memory remained between 4.31 and 4.58 GB,
+well inside the 10 GiB limit.
+
+The sub-hour target requires more than these changes. A fixed mainnet height of
+3,414,286 requires an average 948.4 blocks per second to reconstruct in one
+hour. The Sandblasting band from height 1,702,296 through 2,175,692 contains
+473,397 blocks and alone requires 131.5 blocks per second for a full hour, or
+263.0 blocks per second if it may consume half of the one-hour budget. At the
+observed 12.9 blocks per response and 4.53-second delay, the 12-request ceiling
+can deliver at most 34.2 blocks per second before parsing or persistence. A
+402,653,184-byte watermark that admits eight 44.9 MB reservations has a lower
+22.8-block-per-second reservation ceiling.
+
+The most favorable measured parse, transaction-fact, and compact-artifact work
+was approximately 1,448 cumulative task-seconds for 5,000 blocks, or 0.290
+task-seconds per block. These timers use elapsed time inside concurrent blocking
+tasks and can include scheduler delay; they are not cgroup CPU time. Their total
+is four times the 361.71-second wall interval, which shows approximately four
+of the ten available preparation slots active on average. A dense-band
+30-minute budget allows only 0.038 ten-core-seconds per block, so the current
+task-duration evidence is far outside the target even though it cannot yet
+quantify the exact CPU reduction. The next campaign must capture `cpu.stat`
+deltas before making a CPU-seconds-per-block claim.
+
+The next optimization lane is block-local CPU attribution and removal of
+duplicate parsing, decoding, allocation, or serialization work. The first
+tracer bullet should compute each transaction identity once and reuse it across
+transaction facts and compact artifacts; the current post-version-5 path
+performs repeated full identity conversions. The next run should also capture
+cgroup CPU deltas and finer transaction-identity and serialization-size stage
+timings. Once zero-delay replay approaches the dense-band budget and refetch
+amplification remains below 5%, the remaining delayed-source ceiling should be
+tested against a captured Zebra response stream. If the existing JSON request
+contract then saturates below the target, the evidence supports a pipelined or
+binary historical-range source rather than another watermark increase.
+
 ## Remaining acceptance boundaries
 
 The current canary must finish construction, cold-open the authenticated READY
@@ -191,13 +287,11 @@ cutover, checkpoint restore, dense-range completion evidence, and real-client
 parity remain separate gates. This result is not a claim that
 `rocksdb-single-host`, the Railway canary, or production is certified.
 
-The source-attribution follow-up should replay a captured stream around height
-1,733,000. It should compare the current adaptive planner and watermark with a
-384 MiB source watermark, then separately test delayed segment-size application
-that drains a valid contiguous prefix instead of discarding it on each density
-shrink. The comparison must report blocks per second, CPU, Zebra latency,
-refetched or discarded bytes, and peak memory. A production configuration
-change requires that evidence. The harness must expose the source watermark and
-inject deterministic per-segment delay; the current fixture source and
-hard-coded 384 MiB benchmark watermark cannot represent this source-concurrency
-question unchanged. The live certification build is not a tuning experiment.
+The authenticated dense replay admits the retention candidate and
+402,653,184-byte source budget to the isolated Railway canary. That deployment
+must begin from fresh canary Zinder state because an incomplete construction is
+not a published restart fence. Canary evidence must compare the same dense
+range, record exact source and resource telemetry, and continue far enough to
+produce a defensible full-sync ETA. The local single-run comparison is not
+production configuration certification, and the live certification build is
+not a production traffic experiment.
