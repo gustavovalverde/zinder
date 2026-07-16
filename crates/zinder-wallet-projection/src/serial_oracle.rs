@@ -2,21 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sha2::{Digest, Sha256};
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFacts, Network, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentUtxoSetCommitment,
 };
 
-use crate::contract_error::encoded_len;
 use crate::{
-    WALLET_PROJECTION_VALUE_ENCODING_VERSION, WalletAddressHistoryEntry, WalletAddressHistoryKey,
-    WalletAddressLiveOutputKey, WalletLiveOutput, WalletOutpointKey, WalletProjectionContractError,
-    WalletProjectionDigest, WalletProjectionFamilyRowCounts, WalletReorgUndo, WalletSpentOutput,
-    WalletTransactionPosition, WalletUtxoSetSummary,
+    WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
+    WalletOutpointKey, WalletProjectionContractError, WalletProjectionDigest,
+    WalletProjectionDigestBuilder, WalletProjectionFamilyRowCounts, WalletProjectionRowFamily,
+    WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition, WalletUnspentOutput,
+    WalletUtxoSetSummary,
 };
-
-const PROJECTION_DIGEST_DOMAIN: &[u8] = b"zinder:wallet-projection:rows:v1\0";
 
 /// Small deterministic reference model for complete-history wallet projection.
 ///
@@ -27,10 +24,12 @@ const PROJECTION_DIGEST_DOMAIN: &[u8] = b"zinder:wallet-projection:rows:v1\0";
 pub struct WalletProjectionSerialOracle {
     network: Network,
     last_projected_block: Option<BlockId>,
-    live_outputs: BTreeMap<WalletOutpointKey, WalletLiveOutput>,
+    unspent_outputs: BTreeMap<WalletOutpointKey, WalletUnspentOutput>,
     spent_outputs: BTreeMap<WalletOutpointKey, WalletSpentOutput>,
-    address_history: BTreeMap<WalletAddressHistoryKey, WalletAddressHistoryEntry>,
+    address_transactions: BTreeMap<WalletAddressTransactionKey, WalletAddressTransaction>,
     balance_by_address: BTreeMap<[u8; 32], u64>,
+    supported_reorg_depth: u32,
+    reorg_undo: BTreeMap<BlockHeight, WalletReorgUndo>,
     utxo_count: u64,
     total_utxo_value_zat: u64,
     utxo_commitment: TransparentUtxoSetCommitment,
@@ -40,13 +39,21 @@ impl WalletProjectionSerialOracle {
     /// Starts an empty complete-history oracle for `network`.
     #[must_use]
     pub fn new(network: Network) -> Self {
+        Self::with_supported_reorg_depth(network, 0)
+    }
+
+    /// Starts an oracle that retains exact inverse deltas for a bounded tip window.
+    #[must_use]
+    pub fn with_supported_reorg_depth(network: Network, supported_reorg_depth: u32) -> Self {
         Self {
             network,
             last_projected_block: None,
-            live_outputs: BTreeMap::new(),
+            unspent_outputs: BTreeMap::new(),
             spent_outputs: BTreeMap::new(),
-            address_history: BTreeMap::new(),
+            address_transactions: BTreeMap::new(),
             balance_by_address: BTreeMap::new(),
+            supported_reorg_depth,
+            reorg_undo: BTreeMap::new(),
             utxo_count: 0,
             total_utxo_value_zat: 0,
             utxo_commitment: TransparentUtxoSetCommitment::empty(),
@@ -70,10 +77,13 @@ impl WalletProjectionSerialOracle {
         self.last_projected_block
     }
 
-    /// Finds one currently live output.
+    /// Finds one currently unspent output.
     #[must_use]
-    pub fn find_live_output(&self, outpoint: TransparentOutPoint) -> Option<&WalletLiveOutput> {
-        self.live_outputs.get(&WalletOutpointKey::new(outpoint))
+    pub fn find_unspent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Option<&WalletUnspentOutput> {
+        self.unspent_outputs.get(&WalletOutpointKey::new(outpoint))
     }
 
     /// Finds one historical spent output.
@@ -91,22 +101,28 @@ impl WalletProjectionSerialOracle {
             .unwrap_or_default()
     }
 
-    /// Iterates address history in exact durable key order.
+    /// Iterates address transactions in exact durable key order.
     #[must_use]
-    pub fn address_history(&self) -> impl ExactSizeIterator<Item = &WalletAddressHistoryEntry> {
-        self.address_history.values()
+    pub fn address_transactions(&self) -> impl ExactSizeIterator<Item = &WalletAddressTransaction> {
+        self.address_transactions.values()
+    }
+
+    /// Iterates retained undo rows in ascending block-height order.
+    #[must_use]
+    pub fn reorg_undo(&self) -> impl ExactSizeIterator<Item = &WalletReorgUndo> {
+        self.reorg_undo.values()
     }
 
     /// Returns the logical row counts represented by this reference model.
     #[must_use]
     pub fn row_counts(&self) -> WalletProjectionFamilyRowCounts {
         WalletProjectionFamilyRowCounts {
-            live_output_count: count_rows(self.live_outputs.len()),
-            live_output_by_address_count: count_rows(self.live_outputs.len()),
-            spent_output_count: count_rows(self.spent_outputs.len()),
-            address_history_count: count_rows(self.address_history.len()),
-            address_balance_count: count_rows(self.balance_by_address.len()),
-            reorg_undo_count: 0,
+            transparent_unspent_output_count: count_rows(self.unspent_outputs.len()),
+            transparent_unspent_output_by_address_count: count_rows(self.unspent_outputs.len()),
+            transparent_spent_output_count: count_rows(self.spent_outputs.len()),
+            transparent_address_transaction_count: count_rows(self.address_transactions.len()),
+            transparent_address_balance_count: count_rows(self.balance_by_address.len()),
+            reorg_undo_count: count_rows(self.reorg_undo.len()),
         }
     }
 
@@ -124,41 +140,62 @@ impl WalletProjectionSerialOracle {
     pub fn projection_digest(
         &self,
     ) -> Result<WalletProjectionDigest, WalletProjectionContractError> {
-        let mut hasher = Sha256::new();
-        hasher.update(PROJECTION_DIGEST_DOMAIN);
-        hasher.update(WALLET_PROJECTION_VALUE_ENCODING_VERSION.to_be_bytes());
+        let row_counts = self.row_counts();
+        let mut digest = WalletProjectionDigestBuilder::new();
 
-        begin_digest_family(&mut hasher, 1, self.live_outputs.len());
-        for (key, output) in &self.live_outputs {
-            digest_row(&mut hasher, key.as_bytes(), &output.encode_value()?)?;
+        digest.begin_family(
+            WalletProjectionRowFamily::TransparentUnspentOutput,
+            row_counts.transparent_unspent_output_count,
+        )?;
+        for (key, output) in &self.unspent_outputs {
+            digest.append_row(key.as_bytes(), &output.encode_value()?)?;
         }
 
-        let live_output_address_keys: BTreeSet<_> = self
-            .live_outputs
+        let unspent_output_address_keys: BTreeSet<_> = self
+            .unspent_outputs
             .values()
-            .map(WalletAddressLiveOutputKey::new)
+            .map(WalletAddressUnspentOutputKey::new)
             .collect();
-        begin_digest_family(&mut hasher, 2, live_output_address_keys.len());
-        for address_key in live_output_address_keys {
-            digest_row(&mut hasher, address_key.as_bytes(), &[])?;
+        digest.begin_family(
+            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+            row_counts.transparent_unspent_output_by_address_count,
+        )?;
+        for address_key in unspent_output_address_keys {
+            digest.append_row(address_key.as_bytes(), &[])?;
         }
 
-        begin_digest_family(&mut hasher, 3, self.spent_outputs.len());
+        digest.begin_family(
+            WalletProjectionRowFamily::TransparentSpentOutput,
+            row_counts.transparent_spent_output_count,
+        )?;
         for (key, output) in &self.spent_outputs {
-            digest_row(&mut hasher, key.as_bytes(), &output.encode_value()?)?;
+            digest.append_row(key.as_bytes(), &output.encode_value()?)?;
         }
 
-        begin_digest_family(&mut hasher, 4, self.address_history.len());
-        for (key, entry) in &self.address_history {
-            digest_row(&mut hasher, key.as_bytes(), &entry.encode_value())?;
+        digest.begin_family(
+            WalletProjectionRowFamily::TransparentAddressTransaction,
+            row_counts.transparent_address_transaction_count,
+        )?;
+        for (key, entry) in &self.address_transactions {
+            digest.append_row(key.as_bytes(), &entry.encode_value())?;
         }
 
-        begin_digest_family(&mut hasher, 5, self.balance_by_address.len());
+        digest.begin_family(
+            WalletProjectionRowFamily::TransparentAddressBalance,
+            row_counts.transparent_address_balance_count,
+        )?;
         for (address_script_hash, balance_zat) in &self.balance_by_address {
-            digest_row(&mut hasher, address_script_hash, &balance_zat.to_be_bytes())?;
+            digest.append_row(address_script_hash, &balance_zat.to_be_bytes())?;
         }
 
-        Ok(WalletProjectionDigest::from_bytes(hasher.finalize().into()))
+        digest.begin_family(
+            WalletProjectionRowFamily::ReorgUndo,
+            row_counts.reorg_undo_count,
+        )?;
+        for (height, undo) in &self.reorg_undo {
+            digest.append_row(&height.value().to_be_bytes(), &undo.encode_value()?)?;
+        }
+        digest.finish()
     }
 
     #[allow(
@@ -173,7 +210,7 @@ impl WalletProjectionSerialOracle {
         self.validate_next_block(block, facts.block_header.parent_hash)?;
         let mut created_outpoints = Vec::new();
         let mut spent_outpoints = Vec::new();
-        let mut address_history_keys = Vec::new();
+        let mut address_transaction_keys = Vec::new();
 
         for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
             let tx_index_in_block = u32::try_from(transaction_index)
@@ -197,10 +234,10 @@ impl WalletProjectionSerialOracle {
                     return Err(WalletProjectionContractError::DuplicateSpend);
                 }
                 let output = self
-                    .live_outputs
+                    .unspent_outputs
                     .remove(&key)
                     .ok_or(WalletProjectionContractError::MissingTransparentPredecessor)?;
-                self.subtract_live_output(&output)?;
+                self.subtract_unspent_output(&output)?;
                 touched_addresses.insert(output.address_script_hash.as_bytes());
                 self.spent_outputs.insert(
                     key,
@@ -217,44 +254,55 @@ impl WalletProjectionSerialOracle {
                 }
                 let outpoint = TransparentOutPoint::new(transaction_id, output.output_index);
                 let key = WalletOutpointKey::new(outpoint);
-                if self.live_outputs.contains_key(&key) || self.spent_outputs.contains_key(&key) {
+                if self.unspent_outputs.contains_key(&key) || self.spent_outputs.contains_key(&key)
+                {
                     return Err(WalletProjectionContractError::DuplicateOutput);
                 }
-                let live_output = WalletLiveOutput::new(
+                let unspent_output = WalletUnspentOutput::new(
                     outpoint,
                     output.address_script_hash,
                     output.value_zat,
                     output.script_pub_key.clone(),
                     transaction_position,
                 )?;
-                self.add_live_output(&live_output)?;
+                self.add_unspent_output(&unspent_output)?;
                 touched_addresses.insert(output.address_script_hash.as_bytes());
-                self.live_outputs.insert(key, live_output);
+                self.unspent_outputs.insert(key, unspent_output);
                 created_outpoints.push(key);
             }
 
             for address_bytes in touched_addresses {
                 let address_script_hash = TransparentAddressScriptHash::from_bytes(address_bytes);
-                let key = WalletAddressHistoryKey::new(
+                let key = WalletAddressTransactionKey::new(
                     address_script_hash,
                     block.height,
                     tx_index_in_block,
                 );
-                self.address_history.insert(
+                self.address_transactions.insert(
                     key,
-                    WalletAddressHistoryEntry::new(key, transaction_id, block.hash),
+                    WalletAddressTransaction::new(key, transaction_id, block.hash),
                 );
-                address_history_keys.push(key);
+                address_transaction_keys.push(key);
             }
         }
 
         self.last_projected_block = Some(block);
-        Ok(WalletReorgUndo {
+        let undo = WalletReorgUndo {
             block,
             created_outpoints,
             spent_outpoints,
-            address_history_keys,
-        })
+            address_transaction_keys,
+        };
+        if self.supported_reorg_depth > 0 {
+            self.reorg_undo.insert(block.height, undo.clone());
+            let first_retained_height = block
+                .height
+                .value()
+                .saturating_sub(self.supported_reorg_depth.saturating_sub(1));
+            self.reorg_undo
+                .retain(|height, _| height.value() >= first_retained_height);
+        }
+        Ok(undo)
     }
 
     fn validate_next_block(
@@ -273,9 +321,9 @@ impl WalletProjectionSerialOracle {
         }
     }
 
-    fn add_live_output(
+    fn add_unspent_output(
         &mut self,
-        output: &WalletLiveOutput,
+        output: &WalletUnspentOutput,
     ) -> Result<(), WalletProjectionContractError> {
         let address = output.address_script_hash.as_bytes();
         let balance = self.balance_by_address.entry(address).or_default();
@@ -295,9 +343,9 @@ impl WalletProjectionSerialOracle {
         Ok(())
     }
 
-    fn subtract_live_output(
+    fn subtract_unspent_output(
         &mut self,
-        output: &WalletLiveOutput,
+        output: &WalletUnspentOutput,
     ) -> Result<(), WalletProjectionContractError> {
         let address = output.address_script_hash.as_bytes();
         let balance = self
@@ -326,25 +374,6 @@ impl WalletProjectionSerialOracle {
 
 fn count_rows(len: usize) -> u64 {
     u64::try_from(len).unwrap_or(u64::MAX)
-}
-
-fn begin_digest_family(hasher: &mut Sha256, family_tag: u8, row_count: usize) {
-    hasher.update([family_tag]);
-    hasher.update(count_rows(row_count).to_be_bytes());
-}
-
-fn digest_row(
-    hasher: &mut Sha256,
-    key: &[u8],
-    row_bytes: &[u8],
-) -> Result<(), WalletProjectionContractError> {
-    let key_len = encoded_len(key.len(), "projection digest key")?;
-    let value_len = encoded_len(row_bytes.len(), "projection digest value")?;
-    hasher.update(key_len.to_be_bytes());
-    hasher.update(key);
-    hasher.update(value_len.to_be_bytes());
-    hasher.update(row_bytes);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -401,21 +430,21 @@ mod tests {
         assert_eq!(first_undo.created_outpoints.len(), 1);
         assert_eq!(second_undo.created_outpoints.len(), 1);
         assert_eq!(second_undo.spent_outpoints.len(), 1);
-        assert_eq!(second_undo.address_history_keys.len(), 2);
-        assert!(oracle.find_live_output(outpoint_one).is_none());
+        assert_eq!(second_undo.address_transaction_keys.len(), 2);
+        assert!(oracle.find_unspent_output(outpoint_one).is_none());
         assert!(oracle.find_spent_output(outpoint_one).is_some());
-        assert!(oracle.find_live_output(outpoint_two).is_some());
+        assert!(oracle.find_unspent_output(outpoint_two).is_some());
         assert_eq!(oracle.address_balance(address_one), 0);
         assert_eq!(oracle.address_balance(address_two), 4);
-        assert_eq!(oracle.address_history().len(), 3);
+        assert_eq!(oracle.address_transactions().len(), 3);
         assert_eq!(
             oracle.row_counts(),
             WalletProjectionFamilyRowCounts {
-                live_output_count: 1,
-                live_output_by_address_count: 1,
-                spent_output_count: 1,
-                address_history_count: 3,
-                address_balance_count: 1,
+                transparent_unspent_output_count: 1,
+                transparent_unspent_output_by_address_count: 1,
+                transparent_spent_output_count: 1,
+                transparent_address_transaction_count: 3,
+                transparent_address_balance_count: 1,
                 reorg_undo_count: 0,
             }
         );
@@ -453,7 +482,46 @@ mod tests {
     }
 
     #[test]
+    fn serial_oracle_retains_only_the_configured_reorg_window() {
+        let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
+        let block_one = block_facts(
+            1,
+            [0x00; 32],
+            [0xc1; 32],
+            transaction_facts(
+                TransactionId::from_bytes([0xb1; 32]),
+                Vec::new(),
+                vec![TransparentOutputFact::new(0, 7, [0x51], address)],
+            ),
+        );
+        let block_two = block_facts(
+            2,
+            [0xc1; 32],
+            [0xc2; 32],
+            transaction_facts(
+                TransactionId::from_bytes([0xb2; 32]),
+                Vec::new(),
+                vec![TransparentOutputFact::new(0, 4, [0x52], address)],
+            ),
+        );
+        let mut oracle =
+            WalletProjectionSerialOracle::with_supported_reorg_depth(Network::ZcashRegtest, 1);
+        assert!(oracle.apply_block(&block_one).is_ok());
+        assert!(oracle.apply_block(&block_two).is_ok());
 
+        assert_eq!(oracle.reorg_undo().len(), 1);
+        assert_eq!(
+            oracle.reorg_undo().next().map(|undo| undo.block),
+            Some(BlockId::new(
+                BlockHeight::new(2),
+                BlockHash::from_bytes([0xc2; 32])
+            ))
+        );
+        assert_eq!(oracle.row_counts().reorg_undo_count, 1);
+        assert!(oracle.projection_digest().is_ok());
+    }
+
+    #[test]
     fn serial_oracle_digests_address_index_in_address_key_order() {
         let first_transaction = TransactionId::from_bytes([0x01; 32]);
         let second_transaction = TransactionId::from_bytes([0x02; 32]);
@@ -490,9 +558,9 @@ mod tests {
             .unwrap_or_else(|error| unreachable!("valid ordering fixture: {error}"));
 
         let outpoint_ordered_address_keys: Vec<_> = oracle
-            .live_outputs
+            .unspent_outputs
             .values()
-            .map(WalletAddressLiveOutputKey::new)
+            .map(WalletAddressUnspentOutputKey::new)
             .collect();
         let address_ordered_keys: Vec<_> = outpoint_ordered_address_keys
             .iter()
@@ -508,7 +576,7 @@ mod tests {
                     .unwrap_or_else(|error| unreachable!("valid ordering digest: {error}"))
                     .as_bytes()
             ),
-            "74b4a85bcf65e55859e0a4dc00237e2662098084ef523de75cec7164a0ce4a10"
+            "e627b201a47a62f6784a9627547afb4e7ea5ac39d5ef1ccf2cc9f96e2518c8a1"
         );
     }
 

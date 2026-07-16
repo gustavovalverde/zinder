@@ -9,22 +9,21 @@ compile_error!("Zinder supports only 32-bit and 64-bit pointer-width targets.");
 
 mod contract_error;
 mod control;
+mod digest;
 mod rows;
 mod serial_oracle;
 
 pub use contract_error::WalletProjectionContractError;
 pub use control::{
-    WalletProjectionAnchor, WalletProjectionBuildBase, WalletProjectionBuildPlan,
-    WalletProjectionBuildState, WalletProjectionCheckpointFile, WalletProjectionCheckpointId,
-    WalletProjectionCheckpointManifest, WalletProjectionCheckpointReference,
-    WalletProjectionCoverage, WalletProjectionDigest, WalletProjectionFamilyRowCounts,
-    WalletProjectionPosition, WalletProjectionReadyEvidence, WalletStoreControl,
-    WalletUtxoSetSummary,
+    WalletProjectionBuildPlan, WalletProjectionBuildState, WalletProjectionDigest,
+    WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
+    WalletStoreControl, WalletUtxoSetSummary,
 };
+pub use digest::{WalletProjectionDigestBuilder, WalletProjectionRowFamily};
 pub use rows::{
-    WalletAddressBalance, WalletAddressHistoryEntry, WalletAddressHistoryKey,
-    WalletAddressLiveOutputKey, WalletLiveOutput, WalletOutpointKey, WalletReorgUndo,
-    WalletSpentOutput, WalletTransactionPosition,
+    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
+    WalletAddressUnspentOutputKey, WalletOutpointKey, WalletReorgUndo, WalletSpentOutput,
+    WalletTransactionPosition, WalletUnspentOutput,
 };
 pub use serial_oracle::WalletProjectionSerialOracle;
 
@@ -33,9 +32,6 @@ pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 1;
 
 /// Initial and only wallet projection value-encoding version.
 pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 1;
-
-/// Initial and only Zinder wallet checkpoint-manifest version.
-pub const WALLET_PROJECTION_CHECKPOINT_VERSION: u16 = 1;
 
 /// Canonical store schema admitted by this projection schema.
 pub const REQUIRED_CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
@@ -54,6 +50,3 @@ pub const WALLET_STORE_CONTROL_KEY: &[u8] = b"store_control";
 
 /// Persisted identity admitted as a wallet projection store.
 pub const WALLET_PROJECTION_STORE_IDENTITY: &[u8] = b"wallet-projection";
-
-/// Persisted identity of a version-1 wallet checkpoint manifest.
-pub const WALLET_PROJECTION_CHECKPOINT_MANIFEST_IDENTITY: &[u8] = b"zinder-wallet-checkpoint";

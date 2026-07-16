@@ -76,7 +76,7 @@ The data planes have distinct responsibilities:
 | Data plane | Owns | Does not own |
 | --- | --- | --- |
 | Canonical | Chain epochs, block identity, transaction order and location, immutable transaction facts, compact blocks, tree state, subtree roots, chain and mempool events, optional raw blobs, and sequential replay rows | Global transparent-output state, address indexes, spent-output lookup, wallet balances, explorer summaries, rankings, distributions, or product data |
-| Wallet projection | Live transparent outputs, address-to-live-output index, address balance, durable spent-outpoint lookup, address transaction history, bounded reorg undo, projection cursor, and coverage fence | Canonical truth, explorer analytics, source-node RPCs, or per-wallet private state |
+| Wallet projection | Unspent transparent outputs, address-to-unspent-output index, address balance, durable spent-outpoint lookup, address transactions, bounded reorg undo, and an exact canonical source position | Canonical truth, explorer analytics, source-node RPCs, or per-wallet private state |
 | Explorer projection | Block and transaction summaries, recent activity, fee and value-pool series, rankings, mining and migration views, reorg history, and other rebuildable public analytics | Canonical truth, wallet-private state, Cipherscan labels and names, market prices, or source-node RPCs |
 
 `WalletQuery` and `ExplorerQuery` remain the stable product contracts. Storage
@@ -414,7 +414,7 @@ as soon as another product is added.
 Fresh wallet construction and live following use different algorithms. The
 builder streams canonical replay once, emits created-output and spent-outpoint
 records into bounded sorted runs, merge-joins them by outpoint, and bulk-loads
-the final live-output set, durable spent-output rows, address history, balances,
+the final unspent-output set, durable spent-output rows, address transactions, balances,
 and commitment. RocksDB uses external SST ingestion; PostgreSQL uses binary
 `COPY` into an unpublished schema followed by deferred index construction. The
 builder validates the result, catches up the short chain-event tail, and only
@@ -425,15 +425,15 @@ facts. For each bounded block window it:
 
 1. resolves same-block and same-window outputs in memory;
 2. performs one sorted, deduplicated set-oriented lookup for remaining inputs
-   against the live-output set, which contains only currently unspent outputs;
+   against the unspent-output set, which contains only currently unspent outputs;
    a RocksDB implementation uses `MultiGet`, while Postgres uses a set-valued
    query or temporary input relation;
-3. deletes consumed live outputs and their address index entries;
-4. inserts created live outputs and updates address balances;
-5. appends durable spent-outpoint and address-history rows;
+3. deletes consumed unspent outputs and their address index entries;
+4. inserts created unspent outputs and updates address balances;
+5. appends durable spent-outpoint and address-transaction rows;
 6. records the inverse delta needed for reorgs inside the supported window; and
-7. commits all rows, the authenticated chain-event cursor, the projection tip,
-   and coverage in one storage transaction.
+7. commits all rows and the exact canonical source position—epoch, tip, and
+   event sequence—in one storage transaction.
 
 This changes the asymptotic storage problem. Historical input resolution no
 longer searches every output ever created. It searches the smaller live UTXO
@@ -442,14 +442,15 @@ output value, script, producing location, and spender, so historical wallet and
 explorer reads do not need the deleted live row.
 
 Pure replay preparation may run in parallel across decoded blocks. The state
-transition and cursor commit remain ordered. Batches close by measured input,
+transition and source-position commit remain ordered. Batches close by measured input,
 output, row, and estimated-write cost rather than by a hard-coded historical
 height. A single unusually dense block is allowed to form a batch by itself.
 
-Wallet reads fail closed when the projection cursor does not cover the pinned
-canonical epoch. A matching height alone is insufficient because a same-height
-reorg can replace every relevant row. Capabilities advertise only when the
-projection identity, authenticated event cursor, and required coverage match.
+Wallet reads fail closed unless the projection source position exactly matches
+the pinned canonical epoch, tip, and event sequence. A matching height alone is
+insufficient because a same-height reorg can replace every relevant row.
+Capabilities advertise only after the wallet identity and complete source
+position match.
 
 ## Explorer Projection Contract
 
@@ -538,8 +539,8 @@ Fresh construction is resource-exclusive by default:
 
 Bounded overlap is permitted only after measurements prove that canonical
 latency and memory remain unaffected. A projection handoff may use a bounded
-in-memory notification for low latency, but the durable chain-event cursor is
-always the recovery contract. A slow or failed projection can never
+in-memory notification for low latency, but the durable canonical source
+position is always the recovery contract. A slow or failed projection can never
 backpressure or roll back a committed canonical epoch.
 
 Inactive projection promotion remains blocked on an unimplemented lifecycle
@@ -552,8 +553,10 @@ yet.
 
 Backups record canonical, wallet, and explorer checkpoints independently. A
 restore is admitted only when each included projection proves its schema,
-identity, cursor, and coverage. Missing projection checkpoints cause replay,
-not fabricated readiness.
+identity, and recovery position. Wallet state proves the exact canonical epoch,
+tip, and event sequence; cursor-based projections prove their own cursor and
+coverage. Missing projection checkpoints cause replay, not fabricated
+readiness.
 
 ## Repository Reconciliation
 
@@ -587,7 +590,7 @@ are ancestors of `main` or their rejected status is recorded here.
 
 - promote the validated version-1 `CanonicalBlockFacts` and replay contracts
   into the concrete RocksDB canonical store;
-- stop writing canonical address, live-output, and spent-output read models;
+- stop writing canonical address, unspent-output, and spent-output read models;
 - remove cross-block prevout reads from canonical preparation;
 - require the new `canonical` identity on a physically empty path and refuse
   every previous store without mutation or export compatibility; and
@@ -638,7 +641,8 @@ Acceptance is a fresh mainnet replay, not a synthetic microbenchmark alone:
 - explorer replay reaches tip and serves Zexplorer plus the covered Cipherscan
   route matrix; and
 - restart, same-height reorg, backup, restore, missing-capability, and separate
-  volume-path cases fail closed and recover from durable cursors.
+  volume-path cases fail closed and recover from the wallet source position or
+  the owning projection's durable cursor.
 
 ## Guardrails
 

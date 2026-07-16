@@ -15,6 +15,81 @@ pub enum WalletProjectionContractError {
         /// Field whose length could not be represented.
         field: &'static str,
     },
+    /// A fixed-length durable field has the wrong number of bytes.
+    #[error("{field} requires exactly {expected} bytes, observed {actual}")]
+    DurableFieldLengthMismatch {
+        /// Durable field being decoded.
+        field: &'static str,
+        /// Exact version-1 byte length.
+        expected: usize,
+        /// Observed byte length.
+        actual: usize,
+    },
+    /// A variable-length durable value is shorter than its fixed prefix.
+    #[error("{field} requires at least {minimum} bytes, observed {actual}")]
+    DurableValueTooShort {
+        /// Durable value being decoded.
+        field: &'static str,
+        /// Minimum version-1 byte length.
+        minimum: usize,
+        /// Observed byte length.
+        actual: usize,
+    },
+    /// A durable value's length prefix does not consume the complete value.
+    #[error("{field} length prefix does not match its encoded bytes")]
+    DurableLengthPrefixMismatch {
+        /// Durable value being decoded.
+        field: &'static str,
+    },
+    /// A durable list repeats a key that must be unique.
+    #[error("{field} contains a duplicate key")]
+    DurableDuplicateKey {
+        /// Durable list being decoded.
+        field: &'static str,
+    },
+    /// A durable identity marker does not match the version-1 contract.
+    #[error("{field} identity does not match version 1")]
+    DurableIdentityMismatch {
+        /// Durable contract being decoded.
+        field: &'static str,
+    },
+    /// A durable numeric discriminator is unsupported by version 1.
+    #[error("{field} has unsupported encoded value {encoded}")]
+    UnsupportedEncodedValue {
+        /// Durable discriminator being decoded.
+        field: &'static str,
+        /// Unsupported numeric value.
+        encoded: u64,
+    },
+    /// A durable record contains bytes after its complete version-1 value.
+    #[error("{field} contains trailing bytes")]
+    DurableTrailingBytes {
+        /// Durable record being decoded.
+        field: &'static str,
+    },
+    /// A parsed durable record does not reproduce its exact input bytes.
+    #[error("{field} is not canonically encoded")]
+    DurableNonCanonicalEncoding {
+        /// Durable record being decoded.
+        field: &'static str,
+    },
+    /// Projection digest families were supplied outside the fixed v1 order.
+    #[error("wallet projection digest expected family {expected}, observed {actual}")]
+    ProjectionDigestFamilyOrder {
+        /// Next required numeric family tag.
+        expected: u8,
+        /// Supplied numeric family tag.
+        actual: u8,
+    },
+    /// A projection digest family received too few or too many rows.
+    #[error("wallet projection digest family row count does not match its declaration")]
+    ProjectionDigestRowCountMismatch,
+    /// Projection digest rows are not strictly ordered by durable key.
+    #[error("wallet projection digest row keys must be strictly increasing")]
+    ProjectionDigestKeyOrder,
+    /// Projection digest finalization occurred before all v1 families were framed.
+    #[error("wallet projection digest is missing one or more version-1 families")]
+    ProjectionDigestIncomplete,
     /// A canonical block does not extend the oracle's current tip.
     #[error("canonical block does not extend the wallet projection serial oracle")]
     NonContiguousBlock,
@@ -51,30 +126,15 @@ pub enum WalletProjectionContractError {
     /// The oracle could not remove one known UTXO from its value total.
     #[error("wallet UTXO value underflow")]
     UtxoValueUnderflow,
-    /// A checkpoint manifest captured an incomplete wallet store.
-    #[error("wallet checkpoint requires a ready wallet control record")]
-    CheckpointRequiresReadyControl,
-    /// A checkpoint prefix must use the canonical sequence digest admitted by v1.
-    #[error("wallet checkpoint source sequence digest must use version 1")]
-    CheckpointSourceSequenceVersionMismatch,
-    /// A checkpoint prefix must contain one digest for every projected height.
-    #[error("wallet checkpoint source sequence length does not match its projected tip")]
-    CheckpointSourceSequenceLengthMismatch,
-    /// Ready evidence must cover complete history beginning at height one.
-    #[error("wallet readiness coverage must begin at block height one")]
-    ReadyCoverageMustBeginAtHeightOne,
-    /// Ready coverage and source position identify different tips.
-    #[error("wallet readiness coverage tip does not match its source position")]
-    ReadyCoverageTipMismatch,
-    /// A ready projection cannot retain unresolved transparent predecessors.
-    #[error("wallet readiness requires zero unresolved transparent predecessors")]
-    ReadyHasUnresolvedPredecessors,
-    /// Every live output must have exactly one address secondary-index row.
-    #[error("wallet live-output and address-index row counts do not match")]
-    ReadyLiveOutputIndexCountMismatch,
-    /// The ready UTXO count must equal the live-output row count.
-    #[error("wallet UTXO count does not match the live-output row count")]
+    /// Every unspent output must have exactly one address secondary-index row.
+    #[error("wallet unspent-output and address-index row counts do not match")]
+    ReadyUnspentOutputIndexCountMismatch,
+    /// The ready UTXO count must equal the unspent-output row count.
+    #[error("wallet UTXO count does not match the unspent-output row count")]
     ReadyUtxoCountMismatch,
+    /// The ready undo family must cover the configured tip window exactly.
+    #[error("wallet reorg-undo count does not match its supported depth")]
+    ReadyReorgUndoCountMismatch,
     /// The source sequence must contain one digest for every projected height.
     #[error("wallet source sequence length does not match its projected tip")]
     ReadySourceSequenceLengthMismatch,
