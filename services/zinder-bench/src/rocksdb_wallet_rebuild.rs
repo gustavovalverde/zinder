@@ -78,21 +78,7 @@ pub(crate) struct RocksDbWalletRebuildReport {
 pub(crate) async fn run_rocksdb_wallet_rebuild(
     args: RocksDbWalletRebuildArgs,
 ) -> Result<RocksDbWalletRebuildReport, BenchError> {
-    if args.request_timeout_seconds == 0 {
-        return Err(BenchError::invalid_argument(
-            "--request-timeout-secs must be greater than zero",
-        ));
-    }
-    if args.max_response_bytes == 0 {
-        return Err(BenchError::invalid_argument(
-            "--max-response-bytes must be greater than zero",
-        ));
-    }
-    if args.canonical_store == args.wallet_store {
-        return Err(BenchError::invalid_argument(
-            "--canonical-store and --wallet-store must be different paths",
-        ));
-    }
+    validate_rebuild_args(&args)?;
 
     let network = decode_zinder_native_chain_name(&args.network)
         .map_err(|error| BenchError::invalid_argument(error.to_string()))?;
@@ -162,4 +148,24 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
         ready_publication_seconds: durations.ready_publication.as_secs_f64(),
         total_seconds: durations.total.as_secs_f64(),
     })
+}
+
+fn validate_rebuild_args(args: &RocksDbWalletRebuildArgs) -> Result<(), BenchError> {
+    if args.request_timeout_seconds == 0 {
+        return Err(BenchError::invalid_argument(
+            "--request-timeout-secs must be greater than zero",
+        ));
+    }
+    if args.max_response_bytes == 0 {
+        return Err(BenchError::invalid_argument(
+            "--max-response-bytes must be greater than zero",
+        ));
+    }
+    if args.canonical_store == args.wallet_store {
+        return Err(BenchError::invalid_argument(
+            "--canonical-store and --wallet-store must be different paths",
+        ));
+    }
+
+    Ok(())
 }
