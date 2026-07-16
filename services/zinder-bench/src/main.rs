@@ -28,9 +28,11 @@ use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSour
 #[path = "canonical_fact_round_trip/command.rs"]
 mod fact_round_trip_command;
 mod rocksdb_storage_lifecycle;
+mod rocksdb_wallet_rebuild;
 
 use fact_round_trip_command::{CanonicalFactsRoundTripArgs, run_canonical_facts_round_trip};
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
+use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
 
 const DEFAULT_FROM_HEIGHT: u32 = 150_000;
 const DEFAULT_TO_HEIGHT: u32 = 200_000;
@@ -63,6 +65,9 @@ enum Command {
     /// Build and cold-admit complete version-1 canonical and wallet stores.
     #[command(name = "rocksdb-storage-lifecycle")]
     RocksDbStorageLifecycle(RocksDbStorageLifecycleArgs),
+    /// Rebuild and cold-admit a wallet store from an existing READY canonical store.
+    #[command(name = "rocksdb-wallet-rebuild")]
+    RocksDbWalletRebuild(RocksDbWalletRebuildArgs),
 }
 
 #[derive(Args)]
@@ -278,6 +283,12 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             let output = run_rocksdb_storage_lifecycle(args).await?;
             emit_report(&output.report, output.report_path.as_deref())?;
             output.report.validate()
+        }
+        Command::RocksDbWalletRebuild(args) => {
+            let output = run_rocksdb_wallet_rebuild(args).await?;
+            let encoded = serde_json::to_vec_pretty(&output)?;
+            write_report_to_stdout(&encoded);
+            Ok(())
         }
     }
 }
@@ -576,6 +587,25 @@ mod tests {
             cli.command,
             Command::CaptureCanonicalFixtureCheckpoints(_)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_wallet_rebuild_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "rocksdb-wallet-rebuild",
+            "--network",
+            "zcash-testnet",
+            "--json-rpc-addr",
+            "http://zebra:18232",
+            "--canonical-store",
+            "canonical",
+            "--wallet-store",
+            "wallet",
+        ])?;
+
+        assert!(matches!(cli.command, Command::RocksDbWalletRebuild(_)));
         Ok(())
     }
 
