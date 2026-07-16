@@ -364,28 +364,27 @@ longer warms them through redundant validation. That explanation is an
 inference; a later campaign needs explicit cache telemetry to prove it. The
 end-to-end result remains 184.04 seconds faster.
 
-The next measured canonical target is density-only prefetch invalidation.
-Density feedback changes the preferred size of newly scheduled requests but
-does not make already bounded, non-overlapping requests invalid. Response-size
-splits must continue to cancel and replan speculative ranges. That change must
-be measured separately at the same fixed fence so its effect is attributable.
+The next measured experiment tested density-only prefetch retention. Density
+feedback changes the preferred size of newly scheduled requests but does not
+make already bounded, non-overlapping requests invalid. Response-size splits
+continued to cancel and replan speculative ranges. The experiment used the same
+fixed fence so its source-load effect was attributable.
 
 ## Density-only prefetch retention A/B
 
-Status: accepted as work-efficiency cleanup; elapsed-time gain not demonstrated
+Status: rejected and reverted; fixed-fence source-load gain not demonstrated
 Date: 2026-07-16
-Revision: `e1c5a2769643708a79b8ea5d9e71ab5b2bb822aa`
+Candidate revision: `e1c5a2769643708a79b8ea5d9e71ab5b2bb822aa`
+Revert revision: `21c68d1`
 Image: `sha256:bd8c8f53066fce107af95a10c9489f73852400b827a3fc7eb489d648c2bc77e3`
 Trial: `testnet-20260716-density-final`
 
-Density statistics target efficient response sizes; they do not invalidate an
-already bounded, contiguous source range. The source scheduler now retains
-completed and in-flight ranges after density-only shrinkage and applies the
-smaller plan at the unscheduled frontier. A response that actually exceeds the
-hard transport cap still records a split, cancels speculative old-size ranges,
-and replans them. Tests prove a completed old range, an in-flight old range,
-adapted tail ranges, exact ordered output, and the separate response-split
-cancellation path.
+The candidate retained completed and in-flight ranges after density-only
+shrinkage and applied the smaller plan at the unscheduled frontier. A response
+that actually exceeded the hard transport cap still recorded a split,
+cancelled speculative old-size ranges, and replanned them. Candidate tests
+proved a completed old range, an in-flight old range, adapted tail ranges,
+exact ordered output, and the separate response-split cancellation path.
 
 The final clean run used the same fixed height, hash, 10-core quota, and 10 GiB
 container limit as both preceding runs. Its captured log recorded zero density
@@ -407,9 +406,9 @@ The source-load difference is 0.25% and does not demonstrate a speed
 improvement. The larger wallet and validation movement occurred after source
 fetch ended and cannot be attributed to the scheduler change. Local Docker
 storage and cache variance remain the likely explanation, but cache telemetry
-was not captured, so this is an inference. The result supports retaining the
-change for lower upstream work and a cleaner control contract, not advertising
-another throughput gain.
+was not captured, so this is an inference. Eliminating scheduler restarts did
+not improve the stage it changed. The candidate therefore failed its commit
+gate and was reverted instead of retaining speculative complexity.
 
 The final run reproduced canonical sequence digest
 `57112f5254593b7c290be4d75a39337959bd0820ee18fa2174286de9bd1d2740`
@@ -429,8 +428,9 @@ evidence is not accepted. Revision `e1c5a27` records wall-clock start before
 the measured interval; a fresh 10,000-block smoke and this full-tip run both
 passed the unchanged closed validator.
 
-The next speed work should target the remaining measured costs, not add source
-knobs: canonical cold validation took 153.32 seconds, wallet cold validation
-took 92.04 seconds, and wallet outpoint merge took 79.84 seconds. Any bounded
-parallel validation must preserve ordered replay and report cache state so
-local-volume variance cannot be mistaken for an algorithmic gain.
+Construction-only optimization now stops at the accepted readback result. The
+rejected candidate measured canonical cold validation at 153.32 seconds,
+wallet cold validation at 92.04 seconds, and wallet outpoint merge at 79.84
+seconds, but those benchmark-only opportunities are deferred until the shipped
+ingest, query, and compatibility services complete the version-1 live append,
+reorg, projection-following, readiness, and client-parity lifecycle.
