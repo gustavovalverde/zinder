@@ -168,6 +168,7 @@ jobs:
           ZINDER_BENCH_FIXTURE_CACHE_POLICY: warm
           ZINDER_BENCH_PROJECT_NAME: zinder-storage-observer-ci
           ZINDER_BENCH_RESULTS_PATH: ../benchmark-results
+          ZINDER_BENCH_POSTGRES_DATABASE_CPUS: "2.0"
         run: |
           set -euo pipefail
           evidence_path="benchmark-results/postgres-fact-first-database-ci-compose-ci-compose.resources.json"

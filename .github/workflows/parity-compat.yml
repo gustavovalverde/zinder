@@ -141,7 +141,7 @@ jobs:
           # and its GetLatestBlock matches the reference within one block.
           caught_up=""
           for _ in $(seq 1 90); do
-            if grep -qE " tip_height=${tip} " .tmp/ingest.log; then
+            if grep -qE " visible_tip_height=${tip}( |$)" .tmp/ingest.log; then
               caught_up=yes
               break
             fi
