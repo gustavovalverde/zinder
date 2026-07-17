@@ -14,9 +14,12 @@ use zinder_client::{
     Network, TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentOutPoint, TransparentUnspentOutput,
 };
-use zinder_core::{ChainTipMetadata, SUBTREE_LEAF_COUNT};
-use zinder_derive::TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME;
-use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition};
+use zinder_core::{ChainTipMetadata, SUBTREE_LEAF_COUNT, wire::encode_height_key_ascending};
+use zinder_derive::{
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+};
+use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition, RawBlobRetention};
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, StoreFixture, open_test_derive_store_for_canonical,
     sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
@@ -65,7 +68,8 @@ fn transparent_address_history_fixture() -> eyre::Result<TransparentAddressHisto
     let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
     let transaction_id = TransactionId::from_bytes([0x55; 32]);
-    let base_fixture = parity_chain_fixture(1);
+    let base_fixture =
+        parity_chain_fixture(1).with_raw_blob_retention(RawBlobRetention::Transactions);
     let block = base_fixture
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre::eyre!("fixture must contain block 1"))?;
@@ -100,6 +104,11 @@ fn transparent_address_history_fixture() -> eyre::Result<TransparentAddressHisto
     let store_fixture = committed_store_fixture(&chain_fixture)?;
     let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     seed_transparent_address_transaction_history(&derive_store, std::slice::from_ref(&tx_history))?;
+    derive_store.put_consumer(
+        TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+        &encode_height_key_ascending(block_height),
+        &[],
+    )?;
     let projection_cursor = store_fixture
         .chain_store()
         .resolve_chain_event_stream_start(
@@ -108,10 +117,12 @@ fn transparent_address_history_fixture() -> eyre::Result<TransparentAddressHisto
         )?
         .cursor
         .ok_or_else(|| eyre::eyre!("committed fixture must expose a live-tail cursor"))?;
-    derive_store.put_chain_event_cursor(
+    for projection in [
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-        projection_cursor.as_bytes(),
-    )?;
+        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+    ] {
+        derive_store.put_chain_event_cursor(projection, projection_cursor.as_bytes())?;
+    }
     Ok(TransparentAddressHistoryFixture {
         store_fixture,
         derive_store,

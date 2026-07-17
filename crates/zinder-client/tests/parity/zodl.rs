@@ -13,7 +13,7 @@ use tonic::Request;
 use zinder_client::{ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
-use zinder_query::WalletQuery;
+use zinder_query::{WalletQuery, derive_store_wallet_projection_reader};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use super::{committed_store_fixture, parity_chain_fixture, transparent_address_history_fixture};
@@ -154,7 +154,10 @@ async fn serves_zodl_transparent_discovery_shape_from_fixture() -> eyre::Result<
         .with_derive_store(fixture.derive_store.clone()),
         activations,
     )
-    .with_transparent_address_support();
+    .with_transparent_address_support()
+    .with_wallet_projection_reader(derive_store_wallet_projection_reader(
+        fixture.derive_store.clone(),
+    ));
 
     let lightd_info = adapter
         .get_lightd_info(Request::new(lightwalletd::Empty {}))

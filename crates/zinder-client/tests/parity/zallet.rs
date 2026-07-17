@@ -13,6 +13,7 @@ use zinder_client::{
     BlockHeight, BlockSelector, ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex,
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TxStatus,
 };
+use zinder_store::RawBlobRetention;
 use zinder_testkit::FixtureTransactionRows;
 
 use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixture};
@@ -51,7 +52,8 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
 #[tokio::test]
 async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([0x42; 32]);
-    let base_fixture = parity_chain_fixture(2);
+    let base_fixture =
+        parity_chain_fixture(2).with_raw_blob_retention(RawBlobRetention::Transactions);
     let transaction_block = base_fixture
         .block_at(BlockHeight::new(2))
         .ok_or_else(|| eyre!("fixture must contain block 2"))?;
