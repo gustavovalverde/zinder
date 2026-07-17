@@ -20,7 +20,7 @@ const TREE_STATE_CHECKPOINT_FIXED_VALUE_LEN: usize = 4 + 1;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 /// Rejection reason for one malformed clean-v1 canonical-family value.
-pub(super) enum CanonicalFamilyValueDecodeError {
+pub(in crate::canonical_store) enum CanonicalFamilyValueDecodeError {
     /// The value ended before one fixed or length-delimited field was complete.
     #[error(
         "{family} value ended while decoding {field}: required {required_bytes} bytes, found {remaining_bytes}"
@@ -145,7 +145,7 @@ pub(in crate::canonical_store) fn encode_tree_state_checkpoint(
 }
 
 /// Decodes and revalidates one exact v1 tree-state checkpoint value.
-pub(super) fn decode_tree_state_checkpoint(
+pub(in crate::canonical_store) fn decode_tree_state_checkpoint(
     encoded: &[u8],
 ) -> Result<(u32, CommitmentTreeFrontiers), CanonicalFamilyValueDecodeError> {
     let mut decoder = ValueDecoder::new("tree_state_checkpoint", encoded);

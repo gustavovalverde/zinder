@@ -5780,6 +5780,8 @@ dependencies = [
  "zinder-source",
  "zinder-store",
  "zinder-testkit",
+ "zinder-wallet-projection",
+ "zinder-wallet-rocksdb",
 ]
 
 [[package]]
@@ -5914,6 +5916,7 @@ dependencies = [
  "clap",
  "config",
  "eyre",
+ "hex",
  "metrics",
  "parking_lot",
  "prost",
@@ -5938,6 +5941,8 @@ dependencies = [
  "zinder-source",
  "zinder-store",
  "zinder-testkit",
+ "zinder-wallet-projection",
+ "zinder-wallet-rocksdb",
 ]
 
 [[package]]

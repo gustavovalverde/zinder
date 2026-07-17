@@ -66,6 +66,46 @@ fn fixed_tip_build_matches_exact_version_one_wallet_contract()
     Ok(())
 }
 
+#[test]
+fn ready_canonical_store_serves_wallet_artifacts() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let tip = block_id(&fixture.blocks[2]);
+
+    let chain_epoch = canonical_store.chain_epoch()?;
+    assert_eq!(
+        chain_epoch.id,
+        canonical_store.event_fence().chain_epoch_id()
+    );
+    assert_eq!(chain_epoch.visible_tip_height, tip.height);
+    assert_eq!(chain_epoch.visible_tip_hash, tip.hash);
+
+    let compact_block = canonical_store
+        .compact_block_at(tip.height)?
+        .ok_or("tip compact block must be present")?;
+    assert_eq!(compact_block.height, tip.height);
+    assert_eq!(compact_block.block_hash, tip.hash);
+
+    let transaction_id = fixture.blocks[2].transactions[0]
+        .public_facts
+        .transaction_id;
+    let transaction_location = canonical_store
+        .transaction_location(transaction_id)?
+        .ok_or("transaction location must be present")?;
+    assert_eq!(transaction_location.block_height, tip.height);
+    let transaction_blob = canonical_store
+        .transaction_blob(transaction_location)?
+        .ok_or("transaction blob must be present")?;
+    assert_eq!(transaction_blob.location, transaction_location);
+
+    let checkpoint = canonical_store
+        .tree_state_checkpoint_at_or_before(tip.height)?
+        .ok_or("tip tree-state checkpoint must be present")?;
+    assert_eq!(checkpoint.block_id, tip);
+    Ok(())
+}
+
 fn build_ready_canonical_store(
     temporary: &TempDir,
     fixture: &WalletBaselineFixture,

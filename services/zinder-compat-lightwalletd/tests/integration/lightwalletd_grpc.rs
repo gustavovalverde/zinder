@@ -181,6 +181,29 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn lightd_info_refuses_transparent_support_without_projection_readiness() -> eyre::Result<()>
+{
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_transparent_address_support();
+
+    let lightd_info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    assert!(!lightd_info.taddr_support);
+    Ok(())
+}
+
+#[tokio::test]
 async fn lightd_info_advertises_transparent_support_only_when_wallet_projections_cover_tip()
 -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
@@ -1358,6 +1381,29 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
             )
         },
     )?;
+    let derive_tempdir = tempdir()?;
+    let derive_store = DeriveStore::open_with_projection_preset(
+        derive_tempdir.path(),
+        ProjectionPreset::Wallet,
+        DeriveStoreOptions {
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
+        },
+    )?;
+    let tip_key = encode_height_key_ascending(ACCEPTANCE_BLOCK_HEIGHT);
+    for (projection, index_column_family) in [
+        (
+            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+        ),
+        (
+            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+        ),
+    ] {
+        set_projection_at_canonical_tip(store_fixture.chain_store(), &derive_store, projection)?;
+        derive_store.put_consumer(index_column_family, &tip_key, &[])?;
+    }
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
             store_fixture.chain_store().clone(),
@@ -1367,7 +1413,9 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let adapter = adapter.with_transparent_address_support();
+    let adapter = adapter
+        .with_transparent_address_support()
+        .with_wallet_projection_reader(derive_store_wallet_projection_reader(derive_store));
 
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address.clone()],
