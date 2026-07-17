@@ -19,7 +19,7 @@ use zinder_core::{
     TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
     TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
     TransparentOutputArtifact, encode_canonical_block_replay,
-    wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
+    wire::{encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_hex},
 };
 use zinder_proto::compat::lightwalletd::{
     ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
@@ -898,7 +898,7 @@ fn compact_transaction_with_transaction_id(
 ) -> Result<CompactTx, CanonicalBlockConstructionError> {
     Ok(CompactTx {
         index,
-        txid: transaction_id.as_bytes().to_vec(),
+        txid: encode_internal_transaction_id(transaction_id).to_vec(),
         fee: 0,
         spends: compact_sapling_spends(transaction),
         outputs: compact_sapling_outputs(transaction)?,

@@ -700,9 +700,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Hard ceiling on connected blocks requested from the source in one \
-                      bulk-catchup segment. The byte-density controller may request fewer. \
-                      Defaults to 64.",
+        description: "Diagnostic override for the hard ceiling on connected blocks requested \
+                      from the source in one segment. The resource-resolved default is 64.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES",
@@ -710,8 +709,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Target source response bytes for adaptive segment sizing. Defaults to \
-                      33554432.",
+        description: "Diagnostic override for adaptive response sizing. The default is \
+                      `min(node.max_response_bytes, 33554432)`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS",
@@ -727,11 +726,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Admission watermark for predicted active source responses plus measured \
-                      completed reassembly. Measured responses can temporarily exceed it; the \
-                      absolute active bound is request concurrency times node.max_response_bytes. \
-                      Must be greater than or equal to node.max_response_bytes. Defaults to \
-                      402653184.",
+        description: "Diagnostic override for predicted active source responses plus measured \
+                      completed reassembly. The default is \
+                      `max(node.max_response_bytes, clamp(container_memory / 64, 134217728, \
+                      402653184))`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY",
@@ -739,8 +737,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Parallel canonical block-prepare slots. Defaults to \
-                      `min(available_parallelism(), 16)`.",
+        description: "Diagnostic override for parallel canonical block-prepare slots. The \
+                      default is `min(available_parallelism(), 16)`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES",
@@ -748,11 +746,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Admission watermark over conservative prepare peaks, ordered prevout \
-                      resolution, recent-output cache entries, and resident commit-preparation \
-                      handoff data. One oversized block or a larger measured result may exceed the \
-                      watermark; further prepare admission pauses until reservations fall below it. \
-                      Defaults to 536870912.",
+        description: "Diagnostic override for the prepare and resident-handoff admission \
+                      watermark. The default is \
+                      `clamp(container_memory / 64, 134217728, 536870912)`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",
