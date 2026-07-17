@@ -592,6 +592,27 @@ mod tests {
     }
 
     #[test]
+    fn ready_store_reads_history_predecessor_without_a_retained_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let predecessor = store.build_plan().history_predecessor();
+
+        assert_eq!(store.block_header_at(predecessor.block_id.height)?, None);
+        assert_eq!(
+            store.tree_state_checkpoint_at_or_before(BlockHeight::new(1))?,
+            Some(predecessor.clone())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ready_store_atomically_appends_one_live_canonical_epoch_and_reopens()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;

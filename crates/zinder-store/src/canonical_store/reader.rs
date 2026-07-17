@@ -144,13 +144,26 @@ impl RocksDbCanonicalStore {
             source,
         })?;
         let checkpoint_height = decode_height_key(&key)?;
-        let header = self.block_header_at(checkpoint_height)?.ok_or_else(|| {
-            CanonicalStoreError::publication("tree-state checkpoint header is absent")
-        })?;
         let (block_time_seconds, frontiers) = decode_tree_state_checkpoint(&encoded)
             .map_err(|source| CanonicalStoreError::publication(source.to_string()))?;
+        let history_predecessor = self.build_plan().history_predecessor();
+        let block_id = if checkpoint_height == history_predecessor.block_id.height {
+            if block_time_seconds != history_predecessor.block_time_seconds
+                || frontiers != history_predecessor.frontiers
+            {
+                return Err(CanonicalStoreError::publication(
+                    "tree-state history predecessor does not match the admitted build plan",
+                ));
+            }
+            history_predecessor.block_id
+        } else {
+            let header = self.block_header_at(checkpoint_height)?.ok_or_else(|| {
+                CanonicalStoreError::publication("tree-state checkpoint header is absent")
+            })?;
+            BlockId::new(checkpoint_height, header.block_hash)
+        };
         Ok(Some(CommitmentTreeCheckpoint::new(
-            BlockId::new(checkpoint_height, header.block_hash),
+            block_id,
             block_time_seconds,
             frontiers,
         )))
