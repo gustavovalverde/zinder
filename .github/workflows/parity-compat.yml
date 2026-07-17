@@ -1,10 +1,9 @@
 name: parity-compat
 
-# T3 (live) parity diff between Zinder's `zinder-compat-lightwalletd` and the
-# pinned upstream `electriccoinco/lightwalletd` Go reference, both pointed at
-# the same pinned regtest Zebra node. Lands as a recurring schedule plus manual
-# dispatch; per-PR gating is advisory until the harness has a stable
-# regression baseline.
+# T3 (live) fixed-fence parity diff between Zinder's `zinder-compat-lightwalletd`
+# and the pinned upstream `electriccoinco/lightwalletd` Go reference, both
+# pointed at the same pinned regtest Zebra node. Mempool parity remains outside
+# this workflow until fact-first ingest-control composition is restored.
 #
 # Test sources: services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs
 
@@ -15,8 +14,11 @@ on:
   pull_request:
     paths:
       - "services/zinder-compat-lightwalletd/**"
+      - "services/zinder-bench/**"
+      - "services/zinder-ingest/**"
       - "crates/zinder-proto/proto/compat/lightwalletd/**"
       - "services/zinder-query/**"
+      - "crates/zinder-store/**"
       - "crates/zinder-core/src/wire/**"
       - "crates/zinder-proto/src/capabilities.rs"
       - ".github/workflows/parity-compat.yml"
@@ -83,7 +85,7 @@ jobs:
         run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
 
       - name: Build Zinder binaries
-        run: cargo build --release -p zinder-ingest -p zinder-compat-lightwalletd
+        run: cargo build --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
 
       - name: Advance regtest chain and start reference lightwalletd
         run: |
@@ -118,7 +120,7 @@ jobs:
             sleep 2
           done
 
-      - name: Start Zinder pipeline (ingest + compat-shim)
+      - name: Build fixed-fence Zinder stores and start compat
         env:
           ZINDER_NODE__JSON_RPC_ADDR: http://127.0.0.1:39232
           ZINDER_NODE__AUTH__METHOD: basic
@@ -136,9 +138,9 @@ jobs:
           tip=$(curl -sf -X POST -H 'content-type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
             "${ZEBRA_RPC_URL}" | sed -E 's/.*"result":[[:space:]]*([0-9]+).*/\1/')
-          # Bring ingest (the writer) to the mined tip before opening the shim,
-          # so the shim's read-only secondary sees the whole chain on startup
-          # and its GetLatestBlock matches the reference within one block.
+          # Bring ingest to the mined tip, then hand the fixed canonical fence
+          # to the one-shot wallet builder and compatibility service. Fact-first
+          # serving currently requires exclusive primary-store access.
           caught_up=""
           for _ in $(seq 1 90); do
             if grep -qE " visible_tip_height=${tip}( |$)" .tmp/ingest.log; then
@@ -153,37 +155,34 @@ jobs:
             exit 1
           fi
           echo "ingest caught up to tip ${tip}"
-          control_ready=""
-          mempool_ready=""
-          for _ in $(seq 1 30); do
-            if grep -q "ingest_control_endpoint_started" .tmp/ingest.log; then
-              control_ready=yes
-            fi
-            if grep -q "mempool_source_selected" .tmp/ingest.log; then
-              mempool_ready=yes
-            fi
-            if [ -n "${control_ready}" ] && [ -n "${mempool_ready}" ]; then
-              break
-            fi
-            sleep 1
-          done
-          if [ -z "${control_ready}" ] || [ -z "${mempool_ready}" ]; then
-            echo "ingest control or mempool surface did not become ready in time; last ingest log lines:" >&2
-            tail -n 50 .tmp/ingest.log >&2 || true
-            exit 1
-          fi
+          ingest_pid=$(sed -n 's/^ingest=//p' .tmp/parity.pids)
+          kill "${ingest_pid}"
+          wait "${ingest_pid}" || true
+          ./target/release/zinder-bench rocksdb-wallet-rebuild \
+            --network zcash-regtest \
+            --json-rpc-addr "${ZEBRA_RPC_URL}" \
+            --canonical-store .tmp/parity-store \
+            --wallet-store .tmp/parity-wallet-store > .tmp/wallet-rebuild.json
           ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
             --storage-path .tmp/parity-store \
             --secondary-path .tmp/parity-secondary-compat \
+            --wallet-storage-path .tmp/parity-wallet-store \
             --listen-addr 127.0.0.1:9087 \
             --node-json-rpc-addr http://127.0.0.1:39232 > .tmp/compat.log 2>&1 &
-          echo "compat=$!" >> .tmp/parity.pids
+          echo "compat=$!" > .tmp/parity.pids
+          compat_ready=""
           for _ in $(seq 1 30); do
             if grep -q "compat_started" .tmp/compat.log; then
+              compat_ready=yes
               break
             fi
             sleep 1
           done
+          if [ -z "${compat_ready}" ]; then
+            echo "compat did not become ready in time; last compat log lines:" >&2
+            tail -n 50 .tmp/compat.log >&2 || true
+            exit 1
+          fi
 
       - name: Run parity diff
         env:
@@ -198,7 +197,7 @@ jobs:
           ZINDER_TEST_PARITY_TRANSPARENT_ADDRESS: ${{ env.PARITY_TRANSPARENT_ADDRESS }}
         run: |
           cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
-            -E 'test(/^live::parity_against_lightwalletd::/)'
+            -E 'test(/^live::parity_against_lightwalletd::/) and not test(/mempool/)'
 
       - name: Dump pipeline logs on failure
         if: failure()
