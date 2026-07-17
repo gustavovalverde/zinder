@@ -10,8 +10,8 @@ use zinder_core::{
     Network, UnixTimestampMillis, ValuePoolBalance,
 };
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEventHistoryRequest,
-    ChainStoreOptions, PrimaryChainStore, ReorgWindowChange, StoreError,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
+    PrimaryChainStore, ReorgWindowChange, StoreError,
 };
 
 use super::synthetic_block_header;
@@ -23,7 +23,7 @@ fn balances_round_trip_optional_future_pools_and_bounded_ranges() -> eyre::Resul
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 15);
     let balances_1 = balances(block_1.height, block_1.block_hash, block_1.block_time, 11);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_1])
+        super::synthetic_chain_epoch_artifacts(epoch_1, vec![block_1], vec![compact_1])
             .with_block_value_pool_balances(vec![balances_1.clone()]),
     )?;
 
@@ -47,7 +47,7 @@ fn historical_enrichment_is_idempotent_hash_and_time_bound_and_event_neutral() -
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 14);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1.clone()],
         vec![compact_1],
@@ -97,7 +97,7 @@ fn historical_enrichment_is_idempotent_hash_and_time_bound_and_event_neutral() -
 
     let (epoch_2, block_2, compact_2) =
         epoch_artifacts(2, 2, 2, 1, 1, 1, 2, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_2,
         vec![block_2],
         vec![compact_2],
@@ -120,7 +120,7 @@ fn reorged_balances_remain_epoch_readable_but_leave_the_canonical_view() -> eyre
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 15);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1],
         vec![compact_1],
@@ -129,16 +129,20 @@ fn reorged_balances_remain_epoch_readable_but_leave_the_canonical_view() -> eyre
     let (epoch_2, block_2, compact_2) = epoch_artifacts(2, 2, 2, 1, 1, 1, 2, 15);
     let old_balances = balances(block_2.height, block_2.block_hash, block_2.block_time, 51);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_2])
+        super::synthetic_chain_epoch_artifacts(epoch_2, vec![block_2], vec![compact_2])
             .with_block_value_pool_balances(vec![old_balances.clone()]),
     )?;
 
     let (epoch_3, replacement, replacement_compact) = epoch_artifacts(3, 2, 92, 1, 1, 1, 3, 15);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_3, vec![replacement], vec![replacement_compact])
-            .with_reorg_window_change(ReorgWindowChange::Replace {
-                from_height: BlockHeight::new(2),
-            }),
+        super::synthetic_chain_epoch_artifacts(
+            epoch_3,
+            vec![replacement],
+            vec![replacement_compact],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: BlockHeight::new(2),
+        }),
     )?;
 
     assert_eq!(

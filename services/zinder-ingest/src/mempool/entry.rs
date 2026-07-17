@@ -45,9 +45,9 @@ pub enum MempoolEntryBuildError {
     /// Building the lightwalletd-compatible compact transaction failed.
     #[error("mempool compact-transaction build failed: {source}")]
     CompactTransactionBuildFailed {
-        /// Underlying derive error from `artifact_builder`.
+        /// Underlying compact-transaction construction error.
         #[source]
-        source: crate::ArtifactDeriveError,
+        source: crate::CanonicalBlockConstructionError,
     },
 
     /// The transaction reports more transparent outputs than `u32::MAX`.

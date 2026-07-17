@@ -1493,8 +1493,12 @@ async fn spawn_ingest_control_with_options(
     let listen_addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
     let adapter = {
-        let mut adapter =
-            IngestControlGrpcAdapter::new(Network::ZcashRegtest, store).with_mempool(mempool_index);
+        let mut adapter = IngestControlGrpcAdapter::new(
+            Network::ZcashRegtest,
+            store,
+            zinder_runtime::Readiness::default(),
+        )
+        .with_mempool(mempool_index);
         if let Some(token) = bearer_token {
             adapter = adapter.with_bearer_token(token);
         }

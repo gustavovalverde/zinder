@@ -238,7 +238,9 @@ async fn serve_ingest_control_grpc(
     store: PrimaryChainStore,
     mempool_index: MempoolIndex,
 ) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter = IngestControlGrpcAdapter::new(network, store).with_mempool(mempool_index);
+    let adapter =
+        IngestControlGrpcAdapter::new(network, store, zinder_runtime::Readiness::default())
+            .with_mempool(mempool_index);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(async move {
@@ -287,7 +289,12 @@ async fn bulk_catchup_and_sample_tip_coinbase(
         activations,
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(
+            checkpoint_height,
+            &bulk_catchup_config.network_upgrade_activations,
+        )
+        .await?;
     bulk_catchup_config.checkpoint = Some(checkpoint);
     run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
@@ -698,7 +705,12 @@ async fn bulk_catchup_from_coinbase(
         Duration::from_secs(90),
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(
+            checkpoint_height,
+            &bulk_catchup_config.network_upgrade_activations,
+        )
+        .await?;
     bulk_catchup_config.checkpoint = Some(checkpoint);
     run_bulk_catchup(&bulk_catchup_config, &source)
         .await?

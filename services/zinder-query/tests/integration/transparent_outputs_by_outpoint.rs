@@ -12,10 +12,12 @@ use zinder_core::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
-use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
-use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ReorgWindowChange};
+use zinder_testkit::{
+    StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+};
 
-use crate::common::synthetic_chain_epoch;
+use crate::common::{chain_epoch_artifacts_with_transparent_facts, synthetic_chain_epoch};
 
 fn synthetic_transparent_output_artifact(
     block_height: BlockHeight,
@@ -44,11 +46,13 @@ async fn transparent_outputs_by_outpoint_resolves_known_outpoint() -> eyre::Resu
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let prevout = synthetic_transparent_output_artifact(block.height, block.block_hash, 0xCC, 0x77);
     let outpoint = prevout.outpoint;
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_transparent_outputs_by_outpoint(vec![prevout]),
-    )?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+        &[prevout],
+        Vec::new(),
+    ))?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
@@ -75,10 +79,12 @@ async fn transparent_outputs_by_outpoint_returns_none_for_unknown_transaction() 
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 
@@ -109,11 +115,13 @@ async fn transparent_outputs_by_outpoint_returns_none_for_out_of_bounds_index() 
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let prevout = synthetic_transparent_output_artifact(block.height, block.block_hash, 0xAB, 0x33);
     let transaction_id = prevout.outpoint.transaction_id;
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_transparent_outputs_by_outpoint(vec![prevout]),
-    )?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+        &[prevout],
+        Vec::new(),
+    ))?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
@@ -137,9 +145,11 @@ async fn transparent_mempool_outputs_by_outpoint_grpc_rejects_coinbase_sentinel(
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
@@ -172,9 +182,11 @@ async fn transparent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyr
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
@@ -208,8 +220,8 @@ fn commit_two_block_fixture(
     store: &zinder_store::PrimaryChainStore,
 ) -> eyre::Result<(ChainEpoch, [TransactionId; 3])> {
     use zinder_core::{
-        ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, ChainTipMetadata,
-        CompactBlockArtifact, Network, UnixTimestampMillis,
+        BlockHash, BlockHeaderArtifact, ChainTipMetadata, CompactBlockArtifact, Network,
+        UnixTimestampMillis,
     };
 
     let first_height = BlockHeight::new(1);
@@ -224,7 +236,7 @@ fn commit_two_block_fixture(
         visible_tip_hash: second_hash,
         settled_tip_height: second_height,
         settled_tip_hash: second_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_300_000),
     };
@@ -270,11 +282,16 @@ fn commit_two_block_fixture(
         prevouts[2].outpoint.transaction_id,
     ];
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, blocks, compact_blocks)
-            .with_transparent_outputs_by_outpoint(prevouts)
-            .with_reorg_window_change(ReorgWindowChange::Extend {
-                block_range: BlockHeightRange::inclusive(first_height, second_height),
-            }),
+        chain_epoch_artifacts_with_transparent_facts(
+            chain_epoch,
+            blocks,
+            compact_blocks,
+            &prevouts,
+            Vec::new(),
+        )
+        .with_reorg_window_change(ReorgWindowChange::Extend {
+            block_range: BlockHeightRange::inclusive(first_height, second_height),
+        }),
     )?;
     Ok((chain_epoch, ids))
 }
@@ -345,11 +362,13 @@ async fn transparent_outputs_by_outpoint_preserves_input_order_and_dedupes_reads
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let prevout = synthetic_transparent_output_artifact(block.height, block.block_hash, 0xCC, 0x55);
     let transaction_id = prevout.outpoint.transaction_id;
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-            .with_transparent_outputs_by_outpoint(vec![prevout]),
-    )?;
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+        &[prevout],
+        Vec::new(),
+    ))?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let outpoints = vec![

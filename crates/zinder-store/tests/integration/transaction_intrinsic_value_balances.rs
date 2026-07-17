@@ -11,19 +11,19 @@ use zinder_core::{
     UnixTimestampMillis,
 };
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEventHistoryRequest,
-    ChainStoreOptions, PrimaryChainStore, ReorgWindowChange, StoreError,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
+    PrimaryChainStore, ReorgWindowChange, StoreError,
 };
 
 use super::{synthetic_block_header, synthetic_transaction_rows};
 
 #[test]
-fn signed_intrinsic_balances_round_trip_and_remain_optional() -> eyre::Result<()> {
+fn signed_intrinsic_balances_round_trip_and_unknown_transaction_is_absent() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch, block, compact) = epoch_artifacts(1, 1, 1, 0, 1, 1, 14);
     let transaction_id = TransactionId::from_bytes([7; 32]);
-    let (index, location, facts, blob) = synthetic_transaction_rows(
+    let (index, location, facts, _) = synthetic_transaction_rows(
         transaction_id,
         block.height,
         block.block_hash,
@@ -34,14 +34,13 @@ fn signed_intrinsic_balances_round_trip_and_remain_optional() -> eyre::Result<()
         location,
         TransactionIntrinsicValueBalances::new(-11, 22, -33, 44),
     );
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch, vec![block], vec![compact])
+    store.commit_chain_epoch(super::with_synthetic_block_replay_envelopes(
+        super::synthetic_chain_epoch_artifacts(epoch, vec![block], vec![compact])
             .with_block_transaction_index(vec![index])
             .with_transaction_locations(vec![location])
             .with_transaction_facts(vec![facts])
-            .with_transaction_intrinsic_value_balances(vec![balances])
-            .with_transaction_blobs(vec![blob]),
-    )?;
+            .with_transaction_intrinsic_value_balances(vec![balances]),
+    ))?;
 
     let reader = store.current_chain_epoch_reader()?;
     assert_eq!(
@@ -71,7 +70,7 @@ fn reorged_intrinsic_balances_are_hidden_from_the_replacement_epoch() -> eyre::R
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 14);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1],
         vec![compact_1],
@@ -90,20 +89,24 @@ fn reorged_intrinsic_balances_are_hidden_from_the_replacement_epoch() -> eyre::R
         location,
         TransactionIntrinsicValueBalances::new(1, 2, 3, 4),
     );
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_2])
+    store.commit_chain_epoch(super::with_synthetic_block_replay_envelopes(
+        super::synthetic_chain_epoch_artifacts(epoch_2, vec![block_2], vec![compact_2])
             .with_block_transaction_index(vec![index])
             .with_transaction_locations(vec![location])
             .with_transaction_facts(vec![facts])
             .with_transaction_intrinsic_value_balances(vec![balances]),
-    )?;
+    ))?;
 
     let (epoch_3, replacement_block, replacement_compact) = epoch_artifacts(3, 2, 92, 1, 1, 1, 14);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_3, vec![replacement_block], vec![replacement_compact])
-            .with_reorg_window_change(ReorgWindowChange::Replace {
-                from_height: BlockHeight::new(2),
-            }),
+        super::synthetic_chain_epoch_artifacts(
+            epoch_3,
+            vec![replacement_block],
+            vec![replacement_compact],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: BlockHeight::new(2),
+        }),
     )?;
 
     assert_eq!(
@@ -136,7 +139,8 @@ fn reorged_intrinsic_balances_are_hidden_from_the_replacement_epoch() -> eyre::R
 }
 
 #[test]
-fn historical_enrichment_is_settled_idempotent_and_emits_no_chain_event() -> eyre::Result<()> {
+fn existing_intrinsic_balance_enrichment_is_settled_idempotent_and_event_neutral()
+-> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 13);
@@ -148,16 +152,17 @@ fn historical_enrichment_is_settled_idempotent_and_emits_no_chain_event() -> eyr
         0,
         b"historically-enriched-transaction",
     );
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_1])
-            .with_block_transaction_index(vec![index])
-            .with_transaction_locations(vec![location])
-            .with_transaction_facts(vec![facts]),
-    )?;
     let balances = TransactionIntrinsicValueBalancesArtifact::new(
         location,
         TransactionIntrinsicValueBalances::new(-5, -6, 7, 8),
     );
+    store.commit_chain_epoch(super::with_synthetic_block_replay_envelopes(
+        super::synthetic_chain_epoch_artifacts(epoch_1, vec![block_1], vec![compact_1])
+            .with_block_transaction_index(vec![index])
+            .with_transaction_locations(vec![location])
+            .with_transaction_facts(vec![facts])
+            .with_transaction_intrinsic_value_balances(vec![balances]),
+    ))?;
     let events_before =
         store.chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
 
@@ -190,7 +195,7 @@ fn historical_enrichment_is_settled_idempotent_and_emits_no_chain_event() -> eyr
     ));
 
     let (epoch_2, block_2, compact_2) = epoch_artifacts(2, 2, 2, 1, 2, 2, 14);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_2,
         vec![block_2],
         vec![compact_2],
@@ -210,7 +215,7 @@ fn enrichment_rejects_transactions_above_the_settled_tip() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 14);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1],
         vec![compact_1],
@@ -224,16 +229,17 @@ fn enrichment_rejects_transactions_above_the_settled_tip() -> eyre::Result<()> {
         0,
         b"unsettled-transaction",
     );
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_2])
-            .with_block_transaction_index(vec![index])
-            .with_transaction_locations(vec![location])
-            .with_transaction_facts(vec![facts]),
-    )?;
     let balances = TransactionIntrinsicValueBalancesArtifact::new(
         location,
         TransactionIntrinsicValueBalances::default(),
     );
+    store.commit_chain_epoch(super::with_synthetic_block_replay_envelopes(
+        super::synthetic_chain_epoch_artifacts(epoch_2, vec![block_2], vec![compact_2])
+            .with_block_transaction_index(vec![index])
+            .with_transaction_locations(vec![location])
+            .with_transaction_facts(vec![facts])
+            .with_transaction_intrinsic_value_balances(vec![balances]),
+    ))?;
 
     assert!(matches!(
         store.enrich_transaction_intrinsic_value_balances(&[balances]),
@@ -277,6 +283,6 @@ fn epoch_artifacts(
 }
 
 #[test]
-fn current_schema_is_eighteen() {
-    assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 18);
+fn current_schema_is_nineteen() {
+    assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 19);
 }

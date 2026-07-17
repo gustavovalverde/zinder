@@ -129,7 +129,9 @@ async fn bulk_catchup_and_sample_tip_coinbase(
         Arc::clone(&activations),
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(checkpoint_height, &activations)
+        .await?;
     bulk_catchup_config.checkpoint = Some(checkpoint);
     run_bulk_catchup(&bulk_catchup_config, &source)
         .await?

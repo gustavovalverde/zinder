@@ -16,28 +16,45 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tempfile::tempdir;
 use zinder_core::{
-    BlockHeight, BlockId, ChainTipMetadata, Network, ShieldedProtocol, SubtreeRootIndex,
+    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
+    CommitmentTreeFrontiers, Network, ShieldedProtocol, SubtreeRootIndex,
 };
 use zinder_derive::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, DeriveStoreError, ProjectionPreset,
     decode_stored_record,
 };
 use zinder_ingest::{
-    BulkCatchupRunConfig, DeriveReplayPolicy, IngestDeriveConfig, NodeSourceKind,
-    catch_up_derive_store_to_canonical, run_bulk_catchup, run_bulk_catchup_until_complete,
+    BulkCatchupRunConfig, CanonicalPipelineLimits, DeriveReplayPolicy, IngestDeriveConfig,
+    NodeSourceKind, catch_up_derive_store_to_canonical, run_bulk_catchup,
+    run_bulk_catchup_until_complete,
 };
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
     DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapabilities, NodeCapability, NodeSource,
-    NodeTarget, SourceBlock, SourceChainCheckpoint, SourceError, SourceSubtreeRoots,
-    SourceTreeState, decode_rpc_block_hash,
+    NodeTarget, SourceBlock, SourceError, SourceSubtreeRoots, SourceTreeState,
+    decode_rpc_block_hash,
 };
 use zinder_store::{
     ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
-    PrimaryChainStore,
+    PrimaryChainStore, RawBlobRetention,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{one_leaf_sapling_frontier, sample_regtest_upgrade_activations};
+
+fn test_pipeline_limits() -> CanonicalPipelineLimits {
+    CanonicalPipelineLimits {
+        max_response_bytes: DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+        source_segment_max_blocks: NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),
+        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
+        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+        block_prepare_concurrency: NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),
+        block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+            .unwrap_or(NonZeroU64::MIN),
+    }
+}
 
 fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
     Ok(zinder_derive::DeriveStore::open(
@@ -50,6 +67,17 @@ fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStor
     )?)
 }
 
+fn test_all_blob_store_options() -> ChainStoreOptions {
+    ChainStoreOptions {
+        raw_blob_retention: RawBlobRetention::All,
+        ..ChainStoreOptions::for_network(Network::ZcashTestnet)
+    }
+}
+
+fn empty_checkpoint(block_id: BlockId) -> CommitmentTreeCheckpoint {
+    CommitmentTreeCheckpoint::new(block_id, 0, CommitmentTreeFrontiers::default())
+}
+
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -58,11 +86,7 @@ fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStor
 async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = SourceChainCheckpoint::new(
-        checkpoint_height,
-        source_block.parent_hash,
-        ChainTipMetadata::empty(),
-    );
+    let checkpoint = empty_checkpoint(BlockId::new(checkpoint_height, source_block.parent_hash));
     let fetched_heights = Arc::new(Mutex::new(Vec::new()));
     let source = FixtureCheckpointSource {
         block: source_block.clone(),
@@ -84,6 +108,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         node_source: NodeSourceKind::ZebraJsonRpc,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: storage_path.clone(),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -100,18 +125,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        source_segment_max_blocks: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        block_prepare_concurrency: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
+        pipeline_limits: test_pipeline_limits(),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -134,10 +148,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     );
     assert_eq!(fetched_heights.lock().as_slice(), [source_block.height]);
 
-    let store = PrimaryChainStore::open(
-        &storage_path,
-        ChainStoreOptions::for_network(Network::ZcashTestnet),
-    )?;
+    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
     assert_eq!(
         store
             .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?
@@ -188,11 +199,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
 async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = SourceChainCheckpoint::new(
-        checkpoint_height,
-        source_block.parent_hash,
-        ChainTipMetadata::empty(),
-    );
+    let checkpoint = empty_checkpoint(BlockId::new(checkpoint_height, source_block.parent_hash));
     let source = FixtureCheckpointSource {
         block: source_block.clone(),
         tip_height: BlockHeight::new(source_block.height.value().saturating_add(200)),
@@ -213,6 +220,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         node_source: NodeSourceKind::ZebraJsonRpc,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: storage_path.clone(),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -229,18 +237,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        source_segment_max_blocks: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        block_prepare_concurrency: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
+        pipeline_limits: test_pipeline_limits(),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -248,10 +245,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
     };
-    let store = PrimaryChainStore::open(
-        &storage_path,
-        ChainStoreOptions::for_network(Network::ZcashTestnet),
-    )?;
+    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
     let readiness = Readiness::default();
 
     run_bulk_catchup_until_complete(&bulk_catchup_config, &source, &store, &readiness)
@@ -366,15 +360,18 @@ fn assert_block_summary_materialized(
 }
 
 #[tokio::test]
-async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result<()> {
-    let checkpoint_tip_metadata = ChainTipMetadata::new(107_795, 0, 0);
-    let expected_tip_metadata = ChainTipMetadata::new(107_796, 0, 0);
-    let source_block = fixture_source_block()?;
+async fn bulk_catchup_seeds_compact_metadata_from_valid_nonzero_checkpoint() -> Result<()> {
+    let source_block = super::fixture_block::fixture_ironwood_source_block()
+        .map_err(|error| eyre!(error.to_string()))?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = SourceChainCheckpoint::new(
-        checkpoint_height,
-        source_block.parent_hash,
-        checkpoint_tip_metadata,
+    let checkpoint = CommitmentTreeCheckpoint::new(
+        BlockId::new(checkpoint_height, source_block.parent_hash),
+        0,
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(one_leaf_sapling_frontier()?),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+            None,
+        ),
     );
     let source = FixtureCheckpointSource {
         block: source_block.clone(),
@@ -385,7 +382,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
     let tempdir = tempdir()?;
     let bulk_catchup_config = BulkCatchupRunConfig {
         node: NodeTarget::new(
-            Network::ZcashTestnet,
+            Network::ZcashRegtest,
             "http://127.0.0.1:39232".to_owned(),
             NodeAuth::None,
             Duration::from_secs(30),
@@ -394,6 +391,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
         node_source: NodeSourceKind::ZebraJsonRpc,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: tempdir.path().join("nonzero-checkpoint-bulk-catchup-store"),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -410,18 +408,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        source_segment_max_blocks: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        block_prepare_concurrency: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
+        pipeline_limits: test_pipeline_limits(),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -434,8 +421,10 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
         .await?
         .ok_or_else(|| eyre!("expected checkpoint bulk catchup to commit"))?;
 
-    assert_eq!(outcome.chain_epoch.tip_metadata, expected_tip_metadata);
-
+    assert_eq!(
+        outcome.chain_epoch.tip_metadata,
+        ChainTipMetadata::new(1, 0, 2)
+    );
     Ok(())
 }
 
@@ -447,11 +436,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_nonzero_checkpoint() -> Result
 async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = SourceChainCheckpoint::new(
-        checkpoint_height,
-        source_block.parent_hash,
-        ChainTipMetadata::empty(),
-    );
+    let checkpoint = empty_checkpoint(BlockId::new(checkpoint_height, source_block.parent_hash));
     let pending_retryable_fetch_failures = Arc::new(Mutex::new(6));
     let fetched_heights = Arc::new(Mutex::new(Vec::new()));
     let source = FixtureCheckpointSource {
@@ -473,6 +458,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
         node_source: NodeSourceKind::ZebraJsonRpc,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: storage_path.clone(),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         from_height: source_block.height,
@@ -489,18 +475,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        source_segment_max_blocks: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid source segment blocks"))?,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source segment target bytes"))?,
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-            .ok_or_else(|| eyre!("invalid source fetch requests"))?,
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid source fetch bytes"))?,
-        block_prepare_concurrency: NonZeroU32::new(4)
-            .ok_or_else(|| eyre!("invalid derive concurrency"))?,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid block prepare artifact bytes"))?,
+        pipeline_limits: test_pipeline_limits(),
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
@@ -508,10 +483,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
         allow_near_tip_finalize: false,
         checkpoint: Some(checkpoint),
     };
-    let store = PrimaryChainStore::open(
-        &storage_path,
-        ChainStoreOptions::for_network(Network::ZcashTestnet),
-    )?;
+    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
     let readiness = Readiness::default();
 
     let outcome =

@@ -9,6 +9,7 @@
 #     docker build -f deploy/Dockerfile --target zinder-explorer -t zinder-explorer .
 #     docker build -f deploy/Dockerfile --target zinder-compat-lightwalletd -t zinder-compat-lightwalletd .
 #     docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench .
+#     docker build -f deploy/Dockerfile --target zinder-ingest-live-tests -t zinder-ingest-live-tests .
 #     docker build -f deploy/Dockerfile --target zinder-single-container -t zinder .
 #
 # Every runtime target depends on the same `zinder-binaries` stage. That stage
@@ -79,6 +80,25 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && cp /workspace/target/release/zinder-compat-lightwalletd /zinder-binaries/zinder-compat-lightwalletd \
     && cp /workspace/target/release/zinder-bench /zinder-binaries/zinder-bench
 
+FROM zinder-build-base AS zinder-ingest-live-test-binary
+
+ARG RUST_VERSION
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"
+
+COPY . .
+
+RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/workspace/target,sharing=locked \
+    cargo test --locked --release -p zinder-ingest --test acceptance --no-run \
+    && mkdir -p /zinder-live-tests \
+    && test_binary="$(find /workspace/target/release/deps -maxdepth 1 -type f -name 'acceptance-*' -perm /111 -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f 2-)" \
+    && test -n "$test_binary" \
+    && cp "$test_binary" /zinder-live-tests/zinder-ingest-acceptance
+
 FROM debian:${DEBIAN_RELEASE}-slim AS zinder-runtime-base
 
 RUN apt-get update \
@@ -87,7 +107,7 @@ RUN apt-get update \
 
 RUN groupadd --system --gid 1000 zinder \
     && useradd --system --uid 1000 --gid zinder --home /var/lib/zinder --shell /usr/sbin/nologin zinder \
-    && mkdir -p /var/lib/zinder/store /var/lib/zinder/secondary /etc/zinder \
+    && mkdir -p /var/lib/zinder/secondary /etc/zinder \
     && chown -R zinder:zinder /var/lib/zinder /etc/zinder
 
 FROM zinder-runtime-base AS zinder-ingest
@@ -98,15 +118,23 @@ USER zinder:zinder
 WORKDIR /var/lib/zinder
 
 ENV ZINDER_OPS__LISTEN_ADDR=[::]:9105
-ENV ZINDER_INGEST_CONTROL__LISTEN_ADDR=[::]:9100
 ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
 
-EXPOSE 9100 9105
+EXPOSE 9105
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS http://localhost:9105/readyz || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:9105/healthz || exit 1
 
 ENTRYPOINT ["zinder-ingest"]
+
+FROM zinder-runtime-base AS zinder-ingest-live-tests
+
+COPY --from=zinder-ingest-live-test-binary /zinder-live-tests/zinder-ingest-acceptance /usr/local/bin/zinder-ingest-acceptance
+
+USER zinder:zinder
+WORKDIR /var/lib/zinder
+
+ENTRYPOINT ["zinder-ingest-acceptance"]
 
 FROM zinder-runtime-base AS zinder-query
 
@@ -165,11 +193,12 @@ ENTRYPOINT ["zinder-compat-lightwalletd"]
 FROM zinder-runtime-base AS zinder-bench
 
 COPY --from=zinder-binaries /zinder-binaries/zinder-bench /usr/local/bin/zinder-bench
+COPY --chmod=0755 deploy/capture-container-resource-evidence.sh /usr/local/bin/zinder-capture-container-resource-evidence
 
 USER zinder:zinder
 WORKDIR /var/lib/zinder
 
-ENTRYPOINT ["zinder-bench"]
+ENTRYPOINT ["zinder-capture-container-resource-evidence", "zinder-bench"]
 
 FROM zinder-runtime-base AS zinder-single-container
 

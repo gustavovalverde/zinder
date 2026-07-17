@@ -20,16 +20,18 @@ use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, BlockValuePoolBalances,
     BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
     BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainValuePool, ChainValuePools,
-    ConsensusBranchId, FinalNoteCommitmentRoot, Network, NetworkUpgradeActivation,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootHash,
-    SubtreeRootIndex, TransactionBroadcastResult, TransactionId, ValuePoolBalance,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
+    CommitmentTreeFrontiers, ConsensusBranchId, FinalNoteCommitmentRoot, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
+    ValuePoolBalance,
 };
 
 use crate::{
     CookieSource, CookieSourceError, NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig,
-    NodeSource, ResilientClient, SourceBlock, SourceChainCheckpoint, SourceChainCursor,
-    SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
-    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, TransactionBroadcaster,
+    NodeSource, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
+    SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
+    SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, TransactionBroadcaster,
     TreeStateUpstream, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
@@ -112,10 +114,6 @@ const JSON_RPC_INVALID_ENCODING_CODE: i32 = -22;
 const JSON_RPC_DUPLICATE_TRANSACTION_CODE: i32 = -27;
 /// JSON-RPC error code returned when a txid is not in mempool or main chain.
 const JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE: i32 = -5;
-/// Number of fresh tip observations after Zebra invalidates a just-observed tip hash.
-const TIP_VIEW_RETRY_COUNT: u8 = 2;
-/// Delay between fresh observations of Zebra's best-chain view.
-const TIP_VIEW_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// JSON-RPC error code for general transaction verification failures.
 ///
 /// Zebra collapses every mempool rejection into this code; the
@@ -170,6 +168,12 @@ impl Default for ZebraJsonRpcSourceOptions {
 }
 
 impl ZebraJsonRpcSource {
+    /// Returns the network whose blocks this source decodes.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.network
+    }
+
     /// Returns the static baseline capability set Zebra JSON-RPC sources
     /// are assumed to support before runtime discovery runs.
     ///
@@ -226,70 +230,70 @@ impl ZebraJsonRpcSource {
         }
     }
 
-    /// Fetches the chain checkpoint (block hash and commitment-tree sizes)
-    /// at `height` from the node.
+    /// Fetches the chain checkpoint identity, block time, and commitment-tree
+    /// frontiers at `height` from the node.
     ///
     /// This is the data Zinder needs to bootstrap canonical storage from a
     /// recent height instead of replaying the chain from genesis. The values
-    /// come from Zebra's height-keyed `getblock` RPC at verbosity 1,
-    /// which exposes `trees.{sapling,orchard,ironwood}.size` for every height.
+    /// come from one height-keyed `z_gettreestate` request. Frontier presence
+    /// is validated against `network_upgrade_activations`, including custom
+    /// Testnet and Regtest schedules.
     ///
     /// # Errors
     ///
     /// Returns [`SourceError::BlockUnavailable`] when the node does not
     /// have the requested height (e.g. because it is still syncing) and
-    /// [`SourceError::SourceProtocolMismatch`] when the response shape is
-    /// missing the expected `trees` field. Capability discovery
-    /// ([`ZebraJsonRpcSource::probe_capabilities`]) does not gate this call;
-    /// older Zebra deployments without `trees` in `getblock` will surface a
-    /// protocol mismatch the first time a checkpoint is requested.
+    /// [`SourceError::SourceProtocolMismatch`] when the response identity is
+    /// malformed or does not match `height`. Capability discovery
+    /// ([`ZebraJsonRpcSource::probe_capabilities`]) does not gate this call.
     pub async fn fetch_chain_checkpoint(
         &self,
         height: BlockHeight,
-    ) -> Result<SourceChainCheckpoint, SourceError> {
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        if network_upgrade_activations.network() != self.network {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "checkpoint activation table network does not match the node source",
+            });
+        }
+        if network_upgrade_activations
+            .activation_height_by_name("Sapling")
+            .is_none()
+        {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "checkpoint activation table is missing Sapling",
+            });
+        }
         let block_unavailable = |error: JsonRpcCallError| SourceError::BlockUnavailable {
             height,
             reason: error.message,
         };
 
-        let block_response: ZebraGetBlockTrees = self
+        let tree_state: ZebraGetTreestate = self
             .call_typed(
-                "getblock",
-                positional_params([Value::from(height.value().to_string()), Value::from(1)])?,
+                "z_gettreestate",
+                positional_params([Value::from(height.value().to_string())])?,
                 block_unavailable,
             )
             .await?;
-        if block_response.height != height.value() {
+        if tree_state.height != height.value() {
             return Err(SourceError::SourceProtocolMismatch {
-                reason: "getblock height does not match requested checkpoint height",
+                reason: "z_gettreestate height does not match requested checkpoint height",
             });
         }
-        let trees = block_response
-            .trees
-            .ok_or(SourceError::SourceProtocolMismatch {
-                reason: "getblock response is missing the trees field; \
-                         Zinder checkpoint bootstrap requires Zebra >= 2.x",
-            })?;
-        let sapling = trees.sapling.size;
-        let orchard = trees.orchard.size;
-        let ironwood = trees.ironwood.size;
-        let sapling_size =
-            u32::try_from(sapling).map_err(|_| SourceError::SourceProtocolMismatch {
-                reason: "sapling commitment tree size does not fit u32",
-            })?;
-        let orchard_size =
-            u32::try_from(orchard).map_err(|_| SourceError::SourceProtocolMismatch {
-                reason: "orchard commitment tree size does not fit u32",
-            })?;
-        let ironwood_size =
-            u32::try_from(ironwood).map_err(|_| SourceError::SourceProtocolMismatch {
-                reason: "ironwood commitment tree size does not fit u32",
-            })?;
-        let block_hash = decode_rpc_block_hash(&block_response.hash)?;
-        Ok(SourceChainCheckpoint::new(
+        let block_hash = decode_rpc_block_hash(&tree_state.hash)?;
+        let block_id = BlockId::new(height, block_hash);
+        let block_time_seconds = tree_state.time;
+        let frontiers = decode_zebra_commitment_tree_frontiers(
+            tree_state,
             height,
-            zinder_core::BlockHash::from_bytes(block_hash.as_bytes()),
-            zinder_core::ChainTipMetadata::new(sapling_size, orchard_size, ironwood_size),
+            network_upgrade_activations,
+        )?;
+
+        Ok(CommitmentTreeCheckpoint::new(
+            block_id,
+            block_time_seconds,
+            frontiers,
         ))
     }
 
@@ -385,37 +389,17 @@ impl ZebraJsonRpcSource {
     /// advertises plus [`NodeCapability::JsonRpc`] and
     /// [`NodeCapability::OpenRpcDiscovery`].
     ///
-    /// On probe failure (older Zebra without `rpc.discover`, transient
-    /// transport error), the cache falls back to the baseline capability set.
-    /// Operators that require strict capability discovery can pair this call
-    /// with a [`NodeCapabilities::supports`] check against
-    /// [`NodeCapability::OpenRpcDiscovery`].
+    /// Missing discovery fails closed because assuming a method set would let
+    /// startup accept a node that cannot satisfy the source contract.
     pub async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
-        let started_at = Instant::now();
-        let response_body = self
-            .client
-            .snapshot()
-            .request::<Value, _>("rpc.discover", ArrayParams::new())
-            .await;
-        record_json_rpc_client_result("rpc.discover", started_at, &response_body);
-        self.client.record_outcome(&jsonrpsee_transport_signal(
-            &response_body,
-            "rpc.discover",
-            self.max_response_bytes,
-        ));
-
-        let json_rpc_capabilities = match response_body {
-            Ok(openrpc_response) => parse_openrpc_capabilities(&openrpc_response),
-            Err(probe_error) => {
-                tracing::warn!(
-                    target: "zinder::source",
-                    event = "node_capability_probe_fallback",
-                    reason = %probe_error,
-                    "node does not expose rpc.discover; falling back to trusted defaults"
-                );
-                default_zebra_capabilities()
-            }
-        };
+        let openrpc_response: Value = self
+            .call_typed("rpc.discover", ArrayParams::new(), |_error| {
+                SourceError::NodeCapabilityMissing {
+                    capability: NodeCapability::OpenRpcDiscovery,
+                }
+            })
+            .await?;
+        let json_rpc_capabilities = parse_openrpc_capabilities(&openrpc_response);
 
         let probed_capabilities =
             with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
@@ -667,11 +651,8 @@ impl ZebraJsonRpcSource {
                 .map_err(|source| SourceError::InvalidRawBlockHex { source })?;
             record_block_decode_stage("hex_decode", decode_started_at);
             let header_started_at = Instant::now();
-            let source_block = SourceBlock::from_raw_block_bytes_using_header(
-                self.network,
-                height,
-                raw_block_bytes_outcome,
-            )?;
+            let source_block =
+                SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes_outcome)?;
             record_block_decode_stage("block_header", header_started_at);
             blocks.push(source_block);
         }
@@ -839,6 +820,87 @@ impl ZebraJsonRpcSource {
             )),
         }
     }
+
+    async fn fetch_bounded_subtree_roots(
+        &self,
+        protocol: ShieldedProtocol,
+        start_index: SubtreeRootIndex,
+        max_entries: NonZeroU32,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        let subtree_response: ZebraSubtreeRootsByIndex = self
+            .call_typed(
+                "z_getsubtreesbyindex",
+                positional_params([
+                    Value::from(protocol.rpc_pool_name()),
+                    Value::from(start_index.value()),
+                    Value::from(max_entries.get()),
+                ])?,
+                |error| SourceError::SubtreeRootsUnavailable {
+                    protocol,
+                    start_index,
+                    reason: error.message,
+                },
+            )
+            .await?;
+
+        if subtree_response.pool != protocol.rpc_pool_name() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "subtree roots pool does not match requested protocol",
+            });
+        }
+        if subtree_response.start_index != start_index.value() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "subtree roots start index does not match requested index",
+            });
+        }
+        let response_entry_count =
+            u32::try_from(subtree_response.subtrees.len()).map_err(|_| {
+                SourceError::SourceProtocolMismatch {
+                    reason: "subtree roots response has too many entries",
+                }
+            })?;
+        if response_entry_count > max_entries.get() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "subtree roots response exceeds the requested bound",
+            });
+        }
+
+        let mut subtree_roots = Vec::with_capacity(subtree_response.subtrees.len());
+        let mut previous_completing_block_height = None;
+        for (offset, subtree) in subtree_response.subtrees.into_iter().enumerate() {
+            let offset =
+                u32::try_from(offset).map_err(|_| SourceError::SourceProtocolMismatch {
+                    reason: "subtree roots response has too many entries",
+                })?;
+            let subtree_index = start_index
+                .value()
+                .checked_add(offset)
+                .map(SubtreeRootIndex::new)
+                .ok_or(SourceError::SourceProtocolMismatch {
+                    reason: "subtree roots response exceeds the SubtreeRootIndex range",
+                })?;
+            let completing_block_height = BlockHeight::new(subtree.end_height);
+            if previous_completing_block_height
+                .is_some_and(|previous_height| completing_block_height < previous_height)
+            {
+                return Err(SourceError::SourceProtocolMismatch {
+                    reason: "subtree root completion heights are not ascending",
+                });
+            }
+            previous_completing_block_height = Some(completing_block_height);
+            subtree_roots.push(SourceSubtreeRoot::new(
+                subtree_index,
+                decode_subtree_root_hash(&subtree.root)?,
+                completing_block_height,
+            ));
+        }
+
+        Ok(SourceSubtreeRoots::new(
+            protocol,
+            start_index,
+            subtree_roots,
+        ))
+    }
 }
 
 #[async_trait]
@@ -942,52 +1004,26 @@ impl NodeSource for ZebraJsonRpcSource {
         ))
     }
 
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        Self::fetch_chain_checkpoint(self, height, network_upgrade_activations).await
+    }
+
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        let mut retries_remaining = TIP_VIEW_RETRY_COUNT;
-        loop {
-            let best_block_hash_hex: String = self
-                .call_typed("getbestblockhash", ArrayParams::new(), map_node_unavailable)
-                .await?;
-            let best_block_hash = decode_rpc_block_hash(&best_block_hash_hex)?;
-            let header = self
-                .call_typed(
-                    "getblockheader",
-                    positional_params([Value::from(best_block_hash_hex), Value::from(true)])?,
-                    |error| {
-                        if error.is_best_chain_view_changed() {
-                            SourceError::TipViewChanged {
-                                reason: error.message,
-                            }
-                        } else {
-                            map_node_unavailable(error)
-                        }
-                    },
-                )
-                .await;
-
-            let header: ZebraBlockHeader = match header {
-                Ok(header) => header,
-                Err(SourceError::TipViewChanged { reason }) => {
-                    if retries_remaining == 0 {
-                        return Err(SourceError::TipViewChanged { reason });
-                    }
-                    retries_remaining = retries_remaining.saturating_sub(1);
-                    tokio::time::sleep(TIP_VIEW_RETRY_DELAY).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if decode_rpc_block_hash(&header.hash)? != best_block_hash {
-                return Err(SourceError::SourceProtocolMismatch {
-                    reason: "best block header hash does not match tip hash",
-                });
-            }
-
-            return Ok(BlockId::new(
-                BlockHeight::new(header.height),
-                best_block_hash,
-            ));
-        }
+        let observed_tip: ZebraBestBlockHeightAndHash = self
+            .call_typed(
+                "getbestblockheightandhash",
+                ArrayParams::new(),
+                map_node_unavailable,
+            )
+            .await?;
+        Ok(BlockId::new(
+            BlockHeight::new(observed_tip.height),
+            BlockHash::from_bytes(observed_tip.hash),
+        ))
     }
 
     async fn fetch_subtree_roots(
@@ -996,59 +1032,34 @@ impl NodeSource for ZebraJsonRpcSource {
         start_index: SubtreeRootIndex,
         max_entries: NonZeroU32,
     ) -> Result<SourceSubtreeRoots, SourceError> {
-        let subtree_response: ZebraSubtreeRootsByIndex = self
-            .call_typed(
-                "z_getsubtreesbyindex",
-                positional_params([
-                    Value::from(protocol.rpc_pool_name()),
-                    Value::from(start_index.value()),
-                    Value::from(max_entries.get()),
-                ])?,
-                |error| SourceError::SubtreeRootsUnavailable {
-                    protocol,
-                    start_index,
-                    reason: error.message,
-                },
-            )
+        self.fetch_bounded_subtree_roots(protocol, start_index, max_entries)
+            .await
+    }
+
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        let subtree_roots = self
+            .fetch_bounded_subtree_roots(range.protocol, range.start_index, range.max_entries)
             .await?;
-
-        if subtree_response.pool != protocol.rpc_pool_name() {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "subtree roots pool does not match requested protocol",
+        let actual_count = u32::try_from(subtree_roots.subtree_roots.len()).map_err(|_| {
+            SourceError::SourceProtocolMismatch {
+                reason: "subtree roots response has too many entries",
+            }
+        })?;
+        if actual_count != range.max_entries.get() {
+            return Err(SourceError::SubtreeRootsUnavailable {
+                protocol: range.protocol,
+                start_index: range.start_index,
+                reason: format!(
+                    "expected {} subtree roots, got {actual_count}",
+                    range.max_entries
+                ),
             });
         }
 
-        if subtree_response.start_index != start_index.value() {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "subtree roots start index does not match requested index",
-            });
-        }
-
-        let mut subtree_roots = Vec::with_capacity(subtree_response.subtrees.len());
-        for (offset, subtree) in subtree_response.subtrees.into_iter().enumerate() {
-            let offset =
-                u32::try_from(offset).map_err(|_| SourceError::SourceProtocolMismatch {
-                    reason: "subtree roots response has too many entries",
-                })?;
-            let subtree_index = start_index
-                .value()
-                .checked_add(offset)
-                .map(SubtreeRootIndex::new)
-                .ok_or(SourceError::SourceProtocolMismatch {
-                    reason: "subtree roots response exceeds the SubtreeRootIndex range",
-                })?;
-            subtree_roots.push(SourceSubtreeRoot::new(
-                subtree_index,
-                decode_subtree_root_hash(&subtree.root)?,
-                BlockHeight::new(subtree.end_height),
-            ));
-        }
-
-        Ok(SourceSubtreeRoots::new(
-            protocol,
-            start_index,
-            subtree_roots,
-        ))
+        Ok(subtree_roots)
     }
 
     async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
@@ -1393,7 +1404,7 @@ fn batch_call_error_message(method: &str, error: &ErrorObject<'_>) -> String {
     format!("{method}: {}", error.message())
 }
 
-fn validate_source_block_links(blocks: &[SourceBlock]) -> Result<(), SourceError> {
+pub(crate) fn validate_source_block_links(blocks: &[SourceBlock]) -> Result<(), SourceError> {
     for pair in blocks.windows(2) {
         let [previous, current] = pair else {
             continue;
@@ -1479,7 +1490,6 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::NodeUnavailable { .. }) => "node_unavailable",
         Some(SourceError::SourceResponseTooLarge { .. }) => "source_response_too_large",
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
-        Some(SourceError::TipViewChanged { .. }) => "tip_view_changed",
         Some(SourceError::BlockReorgDuringFetch { .. }) => "block_reorg_during_fetch",
         Some(SourceError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(SourceError::SourceProtocolMismatch { .. }) => "source_protocol_mismatch",
@@ -1502,11 +1512,16 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
             | SourceError::MalformedFinalNoteCommitmentRoot { .. }
             | SourceError::InvalidFinalNoteCommitmentRootHex { .. }
             | SourceError::InvalidFinalNoteCommitmentRootLength { .. }
+            | SourceError::MalformedCommitmentTreeFrontier { .. }
+            | SourceError::InvalidCommitmentTreeFrontierHex { .. }
+            | SourceError::CommitmentTreeFrontierTooLarge { .. }
+            | SourceError::InvalidCommitmentTreeFrontierEncoding { .. }
+            | SourceError::CommitmentTreeSizeOutOfRange { .. }
+            | SourceError::CommitmentTreeFrontierRootMismatch { .. }
+            | SourceError::CommitmentTreeFrontierActivationMismatch { .. }
             | SourceError::RawBlockParseFailed { .. }
             | SourceError::RawTransactionParseFailed { .. }
             | SourceError::TransactionComponentIndexOverflow { .. }
-            | SourceError::RawBlockCoinbaseHeightMissing
-            | SourceError::RawBlockHeightMismatch { .. }
             | SourceError::RawBlockTimeOutOfRange,
         ) => "source_decode_failed",
     }
@@ -1538,7 +1553,7 @@ fn parse_openrpc_capabilities(openrpc_response: &Value) -> NodeCapabilities {
     if method_names.contains(&"getblock") {
         probed_capabilities.push(NodeCapability::SourceChainSegments);
     }
-    if openrpc_supports_all_methods(&method_names, &["getbestblockhash", "getblockheader"]) {
+    if method_names.contains(&"getbestblockheightandhash") {
         probed_capabilities.push(NodeCapability::TipId);
     }
     if method_names.contains(&"z_gettreestate") {
@@ -1565,12 +1580,6 @@ fn openrpc_method_names(openrpc_response: &Value) -> Vec<&str> {
         .flatten()
         .filter_map(|method| method.get("name").and_then(Value::as_str))
         .collect()
-}
-
-fn openrpc_supports_all_methods(method_names: &[&str], required_methods: &[&str]) -> bool {
-    required_methods
-        .iter()
-        .all(|required_method| method_names.contains(required_method))
 }
 
 /// Builds the `Authorization: Basic ...` header value from node credentials.
@@ -1719,6 +1728,125 @@ fn parse_zebra_final_note_commitment_root(
             protocol,
             reason: "finalRoot must be a hex string or null",
         })?;
+    decode_final_note_commitment_root_hex(protocol, root_hex).map(Some)
+}
+
+fn decode_zebra_commitment_tree_frontiers(
+    tree_state: ZebraGetTreestate,
+    height: BlockHeight,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<CommitmentTreeFrontiers, SourceError> {
+    let sapling = decode_zebra_commitment_tree_frontier(
+        ShieldedProtocol::Sapling,
+        tree_state.sapling,
+        height,
+        network_upgrade_activations,
+    )?;
+    let orchard = decode_zebra_commitment_tree_frontier(
+        ShieldedProtocol::Orchard,
+        tree_state.orchard,
+        height,
+        network_upgrade_activations,
+    )?;
+    let ironwood = decode_zebra_commitment_tree_frontier(
+        ShieldedProtocol::Ironwood,
+        tree_state.ironwood,
+        height,
+        network_upgrade_activations,
+    )?;
+
+    Ok(CommitmentTreeFrontiers::from_validated_parts(
+        sapling, orchard, ironwood,
+    ))
+}
+
+fn decode_zebra_commitment_tree_frontier(
+    protocol: ShieldedProtocol,
+    tree_state: Option<ZebraTreestate>,
+    height: BlockHeight,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<Option<CommitmentTreeFrontier>, SourceError> {
+    let commitments = tree_state.and_then(|state| state.commitments);
+    let (final_root_hex, final_state_hex) = commitments.map_or((None, None), |commitments| {
+        (commitments.final_root, commitments.final_state)
+    });
+    let is_active = commitment_tree_is_active(network_upgrade_activations, protocol, height);
+
+    let (final_root_hex, final_state_hex) = match (final_root_hex, final_state_hex, is_active) {
+        (None, None, false) => return Ok(None),
+        (Some(_), Some(_), false) => {
+            return Err(SourceError::CommitmentTreeFrontierActivationMismatch {
+                protocol,
+                height,
+                reason: "frontier is present before the pool activation height",
+            });
+        }
+        (None, None, true) => {
+            return Err(SourceError::CommitmentTreeFrontierActivationMismatch {
+                protocol,
+                height,
+                reason: "frontier is absent at or after the pool activation height",
+            });
+        }
+        (Some(final_root_hex), Some(final_state_hex), true) => (final_root_hex, final_state_hex),
+        _ => {
+            return Err(SourceError::MalformedCommitmentTreeFrontier {
+                protocol,
+                reason: "finalRoot and finalState must both be present or both be absent",
+            });
+        }
+    };
+
+    let final_root = decode_final_note_commitment_root_hex(protocol, &final_root_hex)?;
+    let final_state_bytes = hex::decode(final_state_hex)
+        .map_err(|source| SourceError::InvalidCommitmentTreeFrontierHex { protocol, source })?;
+    CommitmentTreeFrontier::from_canonical_final_state(protocol, final_root, final_state_bytes)
+        .map(Some)
+        .map_err(|source| map_frontier_validation_error(protocol, source))
+}
+
+const fn map_frontier_validation_error(
+    protocol: ShieldedProtocol,
+    source: CommitmentTreeFrontierValidationError,
+) -> SourceError {
+    match source {
+        CommitmentTreeFrontierValidationError::TooLarge {
+            byte_count,
+            max_byte_count,
+        } => SourceError::CommitmentTreeFrontierTooLarge {
+            protocol,
+            byte_count,
+            max_byte_count,
+        },
+        CommitmentTreeFrontierValidationError::InvalidEncoding { reason } => {
+            SourceError::InvalidCommitmentTreeFrontierEncoding { protocol, reason }
+        }
+        CommitmentTreeFrontierValidationError::TreeSizeOutOfRange { tree_size } => {
+            SourceError::CommitmentTreeSizeOutOfRange {
+                protocol,
+                tree_size,
+            }
+        }
+        CommitmentTreeFrontierValidationError::RootMismatch => {
+            SourceError::CommitmentTreeFrontierRootMismatch { protocol }
+        }
+    }
+}
+
+fn commitment_tree_is_active(
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    protocol: ShieldedProtocol,
+    height: BlockHeight,
+) -> bool {
+    network_upgrade_activations
+        .activation_height_by_name(protocol.activation_upgrade_name())
+        .is_some_and(|activation_height| activation_height <= height)
+}
+
+fn decode_final_note_commitment_root_hex(
+    protocol: ShieldedProtocol,
+    root_hex: &str,
+) -> Result<FinalNoteCommitmentRoot, SourceError> {
     let root_bytes = hex::decode(root_hex)
         .map_err(|source| SourceError::InvalidFinalNoteCommitmentRootHex { protocol, source })?;
     let byte_count = root_bytes.len();
@@ -1728,8 +1856,7 @@ fn parse_zebra_final_note_commitment_root(
             byte_count,
         }
     })?;
-
-    Ok(Some(FinalNoteCommitmentRoot::from_bytes(root_bytes)))
+    Ok(FinalNoteCommitmentRoot::from_bytes(root_bytes))
 }
 
 fn decode_display_transaction_id(
@@ -1873,14 +2000,6 @@ impl JsonRpcCallError {
             Some(code) if i32::try_from(code).ok() == Some(JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE)
         )
     }
-
-    /// Returns whether Zebra rejected a hash because its best-chain view
-    /// changed between `getbestblockhash` and `getblockheader`.
-    fn is_best_chain_view_changed(&self) -> bool {
-        self.message
-            .to_ascii_lowercase()
-            .contains("not in best chain")
-    }
 }
 
 impl From<ErrorObjectOwned> for JsonRpcCallError {
@@ -1949,9 +2068,9 @@ fn jsonrpsee_transport_signal<Response>(
 }
 
 #[derive(Deserialize)]
-struct ZebraBlockHeader {
-    hash: String,
+struct ZebraBestBlockHeightAndHash {
     height: u32,
+    hash: [u8; 32],
 }
 
 #[derive(Deserialize)]
@@ -1962,10 +2081,30 @@ struct ZebraSubtreeRootsByIndex {
 }
 
 #[derive(Deserialize)]
-struct ZebraGetBlockTrees {
+struct ZebraGetTreestate {
     hash: String,
     height: u32,
-    trees: Option<ZebraTrees>,
+    time: u32,
+    #[serde(default)]
+    sapling: Option<ZebraTreestate>,
+    #[serde(default)]
+    orchard: Option<ZebraTreestate>,
+    #[serde(default)]
+    ironwood: Option<ZebraTreestate>,
+}
+
+#[derive(Deserialize)]
+struct ZebraTreestate {
+    #[serde(default)]
+    commitments: Option<ZebraCommitments>,
+}
+
+#[derive(Deserialize)]
+struct ZebraCommitments {
+    #[serde(rename = "finalRoot", default)]
+    final_root: Option<String>,
+    #[serde(rename = "finalState", default)]
+    final_state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2052,22 +2191,6 @@ struct ZebraNetworkUpgradeInfo {
     name: String,
     #[serde(rename = "activationheight")]
     activation_height: u32,
-}
-
-/// Zebra omits `sapling`/`orchard`/`ironwood` from `trees` on regtest blocks
-/// with no shielded payload, so all three fields default to a zero-size pool.
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct ZebraTrees {
-    sapling: ZebraTreeSize,
-    orchard: ZebraTreeSize,
-    ironwood: ZebraTreeSize,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct ZebraTreeSize {
-    size: u64,
 }
 
 #[derive(Deserialize)]

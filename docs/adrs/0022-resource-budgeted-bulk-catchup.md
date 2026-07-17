@@ -25,7 +25,7 @@ Bulk catchup is a resource-budgeted staged pipeline:
 SourceFetchStage
   -> CanonicalBlockPrepareStage
   -> CanonicalPrevoutResolveStage
-  -> CanonicalFinalizeStage
+  -> CanonicalPositionStage
   -> SubtreeRootAttachmentStage
   -> CanonicalCommitStage
   -> CanonicalFlushStage
@@ -38,14 +38,16 @@ separate source call, `fetch_tree_state_for_block(block_id)`, and JSON-RPC
 adapters reject a tree-state response whose height or hash does not match the
 requested block.
 
-Bulk catchup uses byte-watermarked source fetch config:
+Fresh canonical construction and bulk catchup both consume one
+`CanonicalPipelineLimits` value. The runtime resolves it from the container
+memory budget, logical CPU count, and `node.max_response_bytes`:
 
 - `source_segment_max_blocks = 64`
-- `source_segment_target_response_bytes = 33554432`
+- `source_segment_target_response_bytes = min(node.max_response_bytes, 33554432)`
 - `source_fetch_max_in_flight_requests = 12`
-- `source_fetch_max_in_flight_bytes = 402653184`
+- `source_fetch_max_in_flight_bytes = max(node.max_response_bytes, clamp(memory / 64, 128 MiB, 384 MiB))`
 - `block_prepare_concurrency = min(available_parallelism, 16)`
-- `block_prepare_max_in_flight_artifact_bytes = 536870912`
+- `block_prepare_memory_watermark_bytes = clamp(memory / 64, 128 MiB, 512 MiB)`
 - `commit_reassembly_max_queued_artifact_bytes = 536870912`
 - `canonical_batch_max_blocks = 1000`
 - `canonical_batch_max_artifact_bytes = 536870912`
@@ -57,14 +59,21 @@ The segment sizer uses observed response bytes per block, p95 density, overshoot
 memory after split attempts, and network-upgrade resets. The JSON-RPC response
 default is 64 MiB, so the default segment target is 32 MiB. Source fetch and
 block prepare may complete out of order, but ordered reassembly is the only
-place that releases blocks to the prevout and serial finalization boundaries.
+place that releases blocks to the prevout and serial positioning boundaries.
 Block prepare derives canonical artifacts. The ordered prevout resolver uses
 same-window outputs and a recent-output cache before issuing one deduplicated
 multi-get for the window's remaining cold outpoints; canonical commit still
 performs the authoritative fallback lookup. The cache shares
-`block_prepare_max_in_flight_artifact_bytes`, so cache entries yield to new
-prepare work instead of creating another independent memory ceiling. Completed
-out-of-order source segments keep their measured-byte reservation until emitted.
+`block_prepare_memory_watermark_bytes`, so cache entries yield to new
+prepare work instead of creating another independent memory ceiling. Prepare
+workers reserve a conservative peak estimate before parsing and retain the
+larger of that peak or measured completed residency through ordered prevout
+resolution. The reservation then resizes to resident commit-preparation data
+and remains attached until commit reassembly takes ownership.
+This is admission control rather than a hard allocator cap: one oversized block
+or a measured resize can exceed the watermark, after which new work pauses until
+the reservation falls below the configured limit. Completed out-of-order source
+segments keep their measured-byte reservation until emitted.
 The first density probe reserves `node.max_response_bytes`. Later requests
 reserve the larger of the response target or 1.5 times the density prediction,
 capped at `node.max_response_bytes`, then resize to the measured response after
@@ -116,14 +125,14 @@ The canonical ingest vocabulary is `CanonicalBatch`, `CanonicalBatchBudget`,
 derive replay plane.
 
 Bulk-catchup observability uses stage labels from this ADR:
-`source_fetch`, `canonical_block_prepare`, `canonical_prevout_resolve`, `canonical_finalize`,
+`source_fetch`, `canonical_block_prepare`, `canonical_prevout_resolve`, `canonical_position`,
 `subtree_root_attachment`, `checkpoint_tree_state`, `commit_reassembly`,
 `canonical_commit`, and `canonical_flush`.
 
 ## Revision: container-aware default queue caps (2026-05-26)
 
 The four bulk-catchup queue byte-caps (`source_fetch_max_in_flight_bytes`,
-`block_prepare_max_in_flight_artifact_bytes`,
+`block_prepare_memory_watermark_bytes`,
 `commit_reassembly_max_queued_artifact_bytes`,
 `canonical_batch_max_estimated_write_bytes`) shipped as fixed constants
 (~512 MiB) sized for hosts with plenty of headroom. Deployed inside a
@@ -139,13 +148,18 @@ SIGTERM from the container runtime).
 The queue-cap defaults now derive from the container memory budget at
 startup. `services/zinder-ingest/src/memory_pressure.rs` exposes
 `container_memory_budget_bytes()`, which returns `memory.high` (preferred)
-or `memory.max` from cgroup v2; `services/zinder-ingest/src/config.rs`
-computes each queue cap as `container_budget / 64`, clamped to
-`[128 MiB, original fallback]`. On a 24 GiB Railway container each queue
-shrinks from 512 MiB to 384 MiB; on dev hosts without cgroup the
-fallback constants apply unchanged.
+or `memory.max` from cgroup v2. `CanonicalPipelineLimits` owns the source and
+prepare policy; runtime configuration retains the commit-reassembly and
+canonical-write bounds. Each resource-aware bound uses
+`container_budget / 64`, clamped to `[128 MiB, original fallback]`. On a
+10 GiB container the source and prepare watermarks are both 160 MiB. On a
+24 GiB container they are 384 MiB; on dev hosts without cgroup the fallback
+constants apply.
 
 The `ZINDER_INGEST__BULK_CATCHUP__*_BYTES` env-var overrides still take
-precedence over the auto-derived default. No new env var, no new ADR.
-The mechanism reuses the existing `RuntimeMemorySnapshot` sampler that
-already feeds the derive-replay backpressure ratios.
+precedence over the auto-derived default. They are diagnostic overrides: the
+tracked deployment examples omit them so the deployed runtime and the closed
+storage-lifecycle certification resolve the same resource profile. The closed
+lifecycle command does not accept independent source or prepare tuning flags;
+its report validator recomputes the expected profile from the recorded CPU,
+memory, and node response limits.

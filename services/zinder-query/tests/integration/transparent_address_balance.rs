@@ -21,10 +21,10 @@ use zinder_query::{
     MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, ServerInfoSettings, WalletQuery,
     WalletQueryGrpcAdapter,
 };
-use zinder_store::{ChainEpochArtifacts, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
-use crate::common::synthetic_chain_epoch;
+use crate::common::{chain_epoch_artifacts_with_transparent_facts, synthetic_chain_epoch};
 
 const SCRIPT_PUB_KEY: &[u8] = &[
     0x76, 0xa9, 0x14, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88, 0xac, 0x88,
@@ -180,8 +180,13 @@ fn commit_unspent_outputs(
         ));
     }
 
-    let artifacts = ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
-        .with_transparent_outputs_by_outpoint(prevouts);
+    let artifacts = chain_epoch_artifacts_with_transparent_facts(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+        &prevouts,
+        Vec::new(),
+    );
     store.commit_chain_epoch(artifacts)?;
     Ok(total_value_zat)
 }

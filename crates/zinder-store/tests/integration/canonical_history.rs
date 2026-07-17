@@ -4,8 +4,7 @@ use zinder_core::{
     ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore,
-    StoreError,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainStoreOptions, PrimaryChainStore, StoreError,
 };
 
 use super::synthetic_block_header;
@@ -19,7 +18,7 @@ fn first_full_commit_publishes_complete_history_bounds() -> eyre::Result<()> {
         CompactBlockArtifact::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32]), [1]);
 
     assert_eq!(store.canonical_history_bounds()?, None);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch(1, 1, 1),
         vec![block],
         vec![compact_block],
@@ -135,7 +134,7 @@ fn ordinary_commit_cannot_publish_an_artifactless_checkpoint_as_complete_history
 
     assert!(matches!(
         store.commit_chain_epoch(
-            ChainEpochArtifacts::new(checkpoint_epoch, Vec::new(), Vec::new())
+            super::synthetic_chain_epoch_artifacts(checkpoint_epoch, Vec::new(), Vec::new())
                 .with_reorg_window_change(zinder_store::ReorgWindowChange::AdvanceSafeTipTo {
                     height: BlockHeight::new(20),
                 })

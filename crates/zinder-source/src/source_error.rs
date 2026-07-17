@@ -115,11 +115,80 @@ pub enum SourceError {
         byte_count: usize,
     },
 
-    /// Raw block bytes could not be parsed as a Zcash block.
+    /// A note-commitment frontier did not have the required response shape.
+    #[error("{protocol:?} note-commitment frontier is malformed: {reason}")]
+    MalformedCommitmentTreeFrontier {
+        /// Shielded protocol whose frontier was malformed.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Frontier invariant that was violated.
+        reason: &'static str,
+    },
+
+    /// A note-commitment frontier was not valid hex.
+    #[error("{protocol:?} note-commitment frontier is not valid hex")]
+    InvalidCommitmentTreeFrontierHex {
+        /// Shielded protocol whose frontier was invalid.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Hex decoding failure.
+        #[source]
+        source: hex::FromHexError,
+    },
+
+    /// A note-commitment frontier exceeded the maximum canonical RPC length.
+    #[error(
+        "{protocol:?} note-commitment frontier exceeds {max_byte_count} bytes: got {byte_count}"
+    )]
+    CommitmentTreeFrontierTooLarge {
+        /// Shielded protocol whose frontier was oversized.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Actual decoded frontier length.
+        byte_count: usize,
+        /// Maximum canonical frontier length.
+        max_byte_count: usize,
+    },
+
+    /// A note-commitment frontier was not a canonical legacy tree encoding.
+    #[error("{protocol:?} note-commitment frontier encoding is invalid: {reason}")]
+    InvalidCommitmentTreeFrontierEncoding {
+        /// Shielded protocol whose frontier was invalid.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Encoding invariant that was violated.
+        reason: &'static str,
+    },
+
+    /// A decoded note-commitment frontier cannot be represented by Zinder.
+    #[error("{protocol:?} note-commitment tree size {tree_size} exceeds u32")]
+    CommitmentTreeSizeOutOfRange {
+        /// Shielded protocol whose tree was too large.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Decoded tree size.
+        tree_size: u64,
+    },
+
+    /// A note-commitment frontier did not match its advertised final root.
+    #[error("{protocol:?} note-commitment frontier does not match finalRoot")]
+    CommitmentTreeFrontierRootMismatch {
+        /// Shielded protocol whose root did not match.
+        protocol: zinder_core::ShieldedProtocol,
+    },
+
+    /// A pool's frontier presence disagreed with its activation height.
+    #[error("{protocol:?} note-commitment frontier activation mismatch at {height:?}: {reason}")]
+    CommitmentTreeFrontierActivationMismatch {
+        /// Shielded protocol whose presence was invalid.
+        protocol: zinder_core::ShieldedProtocol,
+        /// Checkpoint height being validated.
+        height: BlockHeight,
+        /// Presence invariant that was violated.
+        reason: &'static str,
+    },
+
+    /// Raw block bytes did not contain a valid serialized Zcash block header.
     ///
     /// Prefer this variant when bytes decoded from hex successfully but the
-    /// resulting buffer is not a valid Zcash block (truncated header,
-    /// unexpected transaction encoding). For hex-layer failures use
+    /// header prefix is truncated or malformed. Full-block and transaction
+    /// validation belongs to canonical preparation after the source adapter has
+    /// established the ordered header identity. For hex-layer failures use
     /// [`Self::InvalidRawBlockHex`]; for JSON-RPC envelope violations use
     /// [`Self::SourceProtocolMismatch`].
     #[error("raw block parse failed: {reason}")]
@@ -140,25 +209,6 @@ pub enum SourceError {
     TransactionComponentIndexOverflow {
         /// Component whose zero-based index overflowed.
         component: &'static str,
-    },
-
-    /// Parsed raw block did not contain a coinbase height.
-    #[error("raw block is missing its coinbase height")]
-    RawBlockCoinbaseHeightMissing,
-
-    /// Parsed raw block height did not match the node-reported height.
-    ///
-    /// Prefer this variant when the bytes parsed cleanly but the coinbase
-    /// height disagrees with what the node-side height lookup returned (a
-    /// Zcash consensus-level mismatch). For JSON-RPC envelope mismatches
-    /// (header object reports a different height than requested) use
-    /// [`Self::SourceProtocolMismatch`] instead.
-    #[error("raw block height {parsed_height} does not match source height {source_height:?}")]
-    RawBlockHeightMismatch {
-        /// Height parsed from the raw block coinbase transaction.
-        parsed_height: u32,
-        /// Height reported by the node request path.
-        source_height: BlockHeight,
     },
 
     /// Parsed raw block timestamp could not be represented as Unix seconds.
@@ -234,19 +284,6 @@ pub enum SourceError {
         reason: String,
     },
 
-    /// The node changed its best chain while a tip observation was in flight.
-    ///
-    /// A JSON-RPC tip observation reads `getbestblockhash` and then reads the
-    /// returned hash's header. During a reorg, Zebra can acknowledge the hash
-    /// before that hash is no longer addressable as part of the best chain.
-    /// The adapter retries that bounded race internally before returning this
-    /// recoverable signal.
-    #[error("upstream best-chain view changed while observing the tip: {reason}")]
-    TipViewChanged {
-        /// Node error message from the stale best-chain observation.
-        reason: String,
-    },
-
     /// Concurrent observations of the same height disagreed.
     ///
     /// Produced when the JSON-RPC adapter's height-keyed `getblock` and
@@ -283,9 +320,7 @@ pub enum SourceError {
     /// wrong: missing fields, wrong types, header height disagreeing with the
     /// requested height, tree-state hash disagreeing with the anchor hash. For
     /// hex-layer failures use [`Self::InvalidRawBlockHex`]; for byte-level
-    /// parse failures use [`Self::RawBlockParseFailed`]; for coinbase-height
-    /// disagreements after successful parse use
-    /// [`Self::RawBlockHeightMismatch`].
+    /// parse failures use [`Self::RawBlockParseFailed`].
     #[error("source protocol mismatch: {reason}")]
     SourceProtocolMismatch {
         /// Protocol mismatch reason.
@@ -433,7 +468,6 @@ impl SourceError {
             Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
             Self::SourceResponseTooLarge { .. } => SourceFailureClass::Configuration,
             Self::BlockUnavailable { .. }
-            | Self::TipViewChanged { .. }
             | Self::BlockReorgDuringFetch { .. }
             | Self::SubtreeRootsUnavailable { .. }
             | Self::MempoolHydrationFailed { .. } => SourceFailureClass::UpstreamViewChanged,
@@ -456,11 +490,16 @@ impl SourceError {
             | Self::MalformedFinalNoteCommitmentRoot { .. }
             | Self::InvalidFinalNoteCommitmentRootHex { .. }
             | Self::InvalidFinalNoteCommitmentRootLength { .. }
+            | Self::MalformedCommitmentTreeFrontier { .. }
+            | Self::InvalidCommitmentTreeFrontierHex { .. }
+            | Self::CommitmentTreeFrontierTooLarge { .. }
+            | Self::InvalidCommitmentTreeFrontierEncoding { .. }
+            | Self::CommitmentTreeSizeOutOfRange { .. }
+            | Self::CommitmentTreeFrontierRootMismatch { .. }
+            | Self::CommitmentTreeFrontierActivationMismatch { .. }
             | Self::RawBlockParseFailed { .. }
             | Self::RawTransactionParseFailed { .. }
             | Self::TransactionComponentIndexOverflow { .. }
-            | Self::RawBlockCoinbaseHeightMissing
-            | Self::RawBlockHeightMismatch { .. }
             | Self::RawBlockTimeOutOfRange
             | Self::SourcePayloadEncodingFailed { .. } => SourceFailureClass::Malformed,
         }

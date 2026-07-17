@@ -30,9 +30,12 @@ use zinder_testkit::StoreFixture;
 #[tokio::test]
 async fn ingest_control_reports_the_selected_projection_workload() -> Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let adapter =
-        IngestControlGrpcAdapter::new(Network::ZcashRegtest, store_fixture.chain_store().clone())
-            .with_projection_preset(ProjectionPreset::Wallet);
+    let adapter = IngestControlGrpcAdapter::new(
+        Network::ZcashRegtest,
+        store_fixture.chain_store().clone(),
+        zinder_runtime::Readiness::default(),
+    )
+    .with_projection_preset(ProjectionPreset::Wallet);
 
     let info = IngestControlService::server_info(&adapter, Request::new(ServerInfoRequest {}))
         .await?
@@ -56,8 +59,11 @@ async fn ingest_control_reports_the_selected_projection_workload() -> Result<()>
 #[tokio::test]
 async fn ingest_control_advertises_value_pools_only_when_source_supports_them() -> Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let adapter_without_source =
-        IngestControlGrpcAdapter::new(Network::ZcashRegtest, store_fixture.chain_store().clone());
+    let adapter_without_source = IngestControlGrpcAdapter::new(
+        Network::ZcashRegtest,
+        store_fixture.chain_store().clone(),
+        zinder_runtime::Readiness::default(),
+    );
     let info_without_source = IngestControlService::server_info(
         &adapter_without_source,
         Request::new(ServerInfoRequest {}),
@@ -74,15 +80,18 @@ async fn ingest_control_advertises_value_pools_only_when_source_supports_them() 
             .any(|capability| capability == INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1)
     );
 
-    let adapter_with_source =
-        IngestControlGrpcAdapter::new(Network::ZcashRegtest, store_fixture.chain_store().clone())
-            .with_node_source(Arc::new(StaticValuePoolSource::new(
-                NodeCapabilities::new([NodeCapability::ChainValuePools])?,
-                ChainValuePools::new(
-                    BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
-                    Vec::new(),
-                ),
-            )));
+    let adapter_with_source = IngestControlGrpcAdapter::new(
+        Network::ZcashRegtest,
+        store_fixture.chain_store().clone(),
+        zinder_runtime::Readiness::default(),
+    )
+    .with_node_source(Arc::new(StaticValuePoolSource::new(
+        NodeCapabilities::new([NodeCapability::ChainValuePools])?,
+        ChainValuePools::new(
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            Vec::new(),
+        ),
+    )));
     let info_with_source =
         IngestControlService::server_info(&adapter_with_source, Request::new(ServerInfoRequest {}))
             .await?
@@ -105,25 +114,28 @@ async fn ingest_control_chain_value_pools_at_tip_uses_node_source() -> Result<()
     let expected_epoch = store_fixture
         .committed_chain_epoch()
         .ok_or_else(|| eyre::eyre!("fixture did not commit a chain epoch"))?;
-    let adapter =
-        IngestControlGrpcAdapter::new(Network::ZcashRegtest, store_fixture.chain_store().clone())
-            .with_node_source(Arc::new(StaticValuePoolSource::new(
-                NodeCapabilities::new([NodeCapability::ChainValuePools])?,
-                ChainValuePools::new(
-                    BlockId::new(
-                        BlockHeight::new(1_234),
-                        BlockHash::from_bytes([
-                            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
-                            0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-                            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-                        ]),
-                    ),
-                    vec![
-                        ChainValuePool::new("transparent", true, Some(100)),
-                        ChainValuePool::new("lockbox", false, None),
-                    ],
-                ),
-            )));
+    let adapter = IngestControlGrpcAdapter::new(
+        Network::ZcashRegtest,
+        store_fixture.chain_store().clone(),
+        zinder_runtime::Readiness::default(),
+    )
+    .with_node_source(Arc::new(StaticValuePoolSource::new(
+        NodeCapabilities::new([NodeCapability::ChainValuePools])?,
+        ChainValuePools::new(
+            BlockId::new(
+                BlockHeight::new(1_234),
+                BlockHash::from_bytes([
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+                    0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+                ]),
+            ),
+            vec![
+                ChainValuePool::new("transparent", true, Some(100)),
+                ChainValuePool::new("lockbox", false, None),
+            ],
+        ),
+    )));
 
     let response = IngestControlService::chain_value_pools_at_tip(
         &adapter,

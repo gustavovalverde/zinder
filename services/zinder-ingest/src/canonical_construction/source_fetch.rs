@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    mem,
     num::{NonZeroU32, NonZeroU64},
     sync::Arc,
     time::{Duration, Instant},
@@ -20,32 +19,32 @@ use zinder_source::{
 
 use super::abort_on_drop::AbortOnDropTask;
 use super::watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer};
-use super::{
-    BULK_STAGE_SOURCE_FETCH, IngestError, SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT,
-    SOURCE_SEGMENT_GROW_AFTER_SUCCESS_COUNT, SOURCE_SEGMENT_GROW_DENOMINATOR,
-    SOURCE_SEGMENT_GROW_NUMERATOR, nonzero_u32, nonzero_u32_to_usize,
-    record_source_segment_sizer_adjustment, record_source_segment_sizer_state, u64_to_f64,
-    usize_to_u32_saturating,
-};
-use crate::chain_ingest::{IngestRetryState, fetch_chain_segment_with_retry};
+use crate::chain_ingest::{IngestError, IngestRetryState, fetch_chain_segment_with_retry};
 
+const CANONICAL_STAGE_SOURCE_FETCH: &str = "source_fetch";
+const SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT: usize = 64;
+const SOURCE_SEGMENT_GROW_AFTER_SUCCESS_COUNT: u32 = 8;
+const SOURCE_SEGMENT_GROW_NUMERATOR: u32 = 5;
+const SOURCE_SEGMENT_GROW_DENOMINATOR: u32 = 4;
 const SOURCE_RESPONSE_RESERVATION_HEADROOM_NUMERATOR: u64 = 3;
 const SOURCE_RESPONSE_RESERVATION_HEADROOM_DENOMINATOR: u64 = 2;
 
-pub(super) struct BulkCatchupSourceFetchStreamConfig {
-    pub(super) request_timeout: Duration,
-    pub(super) from_height: BlockHeight,
-    pub(super) to_height: BlockHeight,
-    pub(super) max_response_bytes: NonZeroU64,
-    pub(super) target_response_payload_bytes: NonZeroU64,
-    pub(super) source_fetch_max_in_flight_requests: NonZeroU32,
-    pub(super) source_fetch_max_in_flight_bytes: NonZeroU64,
-    pub(super) source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
+pub(crate) struct CanonicalSourceFetchConfig {
+    pub(crate) request_timeout: Duration,
+    pub(crate) history_predecessor: Option<BlockId>,
+    pub(crate) from_height: BlockHeight,
+    pub(crate) to_height: BlockHeight,
+    pub(crate) max_response_bytes: NonZeroU64,
+    pub(crate) target_response_payload_bytes: NonZeroU64,
+    pub(crate) source_fetch_max_in_flight_requests: NonZeroU32,
+    pub(crate) source_fetch_max_in_flight_bytes: NonZeroU64,
+    pub(crate) source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
 }
 
 struct SourceBlockStreamState<'a, Source> {
     source: &'a Source,
     request_timeout: Duration,
+    history_predecessor: Option<BlockId>,
     from_height: BlockHeight,
     to_height: BlockHeight,
     source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
@@ -60,14 +59,13 @@ struct SourceBlockStreamState<'a, Source> {
     in_flight_segments:
         FuturesUnordered<BoxFuture<'static, Result<PrefetchedSourceSegment, IngestError>>>,
     completed_segments: BTreeMap<BlockHeight, PrefetchedSourceSegment>,
-    pending_blocks: Vec<SourceBlock>,
     last_connected_block_id: Option<BlockId>,
 }
 
-pub(super) fn build_source_block_stream<'a, Source>(
+pub(crate) fn build_source_block_stream<'a, Source>(
     source: &'a Source,
-    config: BulkCatchupSourceFetchStreamConfig,
-) -> impl Stream<Item = Result<Vec<SourceBlock>, IngestError>> + Send + 'a
+    config: CanonicalSourceFetchConfig,
+) -> impl Stream<Item = Result<SourceBlockChunk, IngestError>> + Send + 'a
 where
     Source: NodeSource + Clone + 'a,
 {
@@ -75,6 +73,7 @@ where
     let state = SourceBlockStreamState {
         source,
         request_timeout: config.request_timeout,
+        history_predecessor: config.history_predecessor,
         from_height: config.from_height,
         to_height: config.to_height,
         source_segment_sizer: config.source_segment_sizer,
@@ -82,7 +81,7 @@ where
         target_response_payload_bytes: config.target_response_payload_bytes,
         source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
         source_fetch_watermark: ByteWatermark::new(
-            BULK_STAGE_SOURCE_FETCH,
+            CANONICAL_STAGE_SOURCE_FETCH,
             config.source_fetch_max_in_flight_bytes,
         ),
         completed_segment_bytes: 0,
@@ -91,8 +90,7 @@ where
         next_emit_height: Some(config.from_height),
         in_flight_segments: FuturesUnordered::new(),
         completed_segments: BTreeMap::new(),
-        pending_blocks: Vec::new(),
-        last_connected_block_id: None,
+        last_connected_block_id: config.history_predecessor,
     };
 
     stream::unfold(state, |mut state| async move {
@@ -103,30 +101,32 @@ where
 
 async fn next_source_block_chunk<Source>(
     state: &mut SourceBlockStreamState<'_, Source>,
-) -> Option<Result<Vec<SourceBlock>, IngestError>>
+) -> Option<Result<SourceBlockChunk, IngestError>>
 where
     Source: NodeSource + Clone,
 {
     loop {
-        if !state.pending_blocks.is_empty() {
-            return Some(Ok(mem::take(&mut state.pending_blocks)));
-        }
-
         fill_source_segment_prefetch_queue(state);
         if let Some(prefetched_segment) = pop_next_completed_source_segment(state) {
-            let feedback_action = prefetched_segment.feedback_action;
-            let segment = prefetched_segment.segment;
+            let PrefetchedSourceSegment {
+                segment,
+                feedback_action,
+                reservation,
+                ..
+            } = prefetched_segment;
             if segment.is_empty() {
                 return None;
             }
 
-            if let Err(error) = enqueue_source_segment_max_blocks(state, segment) {
-                return Some(Err(error));
+            let source_block_chunk = match validated_source_block_chunk(state, segment, reservation)
+            {
+                Ok(source_block_chunk) => source_block_chunk,
+                Err(error) => return Some(Err(error)),
+            };
+            if let Some(action) = feedback_action {
+                apply_source_segment_feedback_action(state, action);
             }
-            if let Some(reason) = feedback_action {
-                restart_future_source_prefetch(state, reason);
-            }
-            continue;
+            return Some(Ok(source_block_chunk));
         }
         record_source_head_of_line_wait_started(state);
 
@@ -175,7 +175,13 @@ where
             }
         };
 
-        let cursor = SourceChainCursor::before_height(next_height);
+        let cursor = if next_height == state.from_height
+            && let Some(history_predecessor) = state.history_predecessor
+        {
+            SourceChainCursor::at_block(history_predecessor)
+        } else {
+            SourceChainCursor::before_height(next_height)
+        };
         let Some(reservation) = state
             .source_fetch_watermark
             .try_reserve(reserved_response_bytes.get())
@@ -226,8 +232,8 @@ struct PrefetchedSourceSegment {
     max_connected_blocks: NonZeroU32,
     segment: SourceChainSegment,
     queued_response_bytes: u64,
-    feedback_action: Option<SourceSegmentPrefetchRestartReason>,
-    _reservation: ByteReservation,
+    feedback_action: Option<SourceSegmentFeedbackAction>,
+    reservation: ByteReservation,
 }
 
 fn fetch_prefetched_chain_segment<Source>(
@@ -272,7 +278,7 @@ where
             segment,
             queued_response_bytes,
             feedback_action: None,
-            _reservation: reservation,
+            reservation,
         })
     });
 
@@ -320,7 +326,7 @@ fn insert_completed_source_segment<Source>(
         || prefetched_segment.start_height > state.to_height
     {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
-            reason: "source chain segment completed outside the requested bulk-catchup range",
+            reason: "source chain segment completed outside the requested construction range",
         }));
     }
     let queued_response_bytes = prefetched_segment.queued_response_bytes;
@@ -330,7 +336,7 @@ fn insert_completed_source_segment<Source>(
         .is_some()
     {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
-            reason: "source chain segment completed twice during bulk catchup",
+            reason: "source chain segment completed twice during canonical construction",
         }));
     }
     state.completed_segment_bytes = state
@@ -339,17 +345,53 @@ fn insert_completed_source_segment<Source>(
     Ok(())
 }
 
-/// Discards speculative requests after ordered feedback invalidates their plan.
+/// Applies completed segment feedback after the head range is emitted in order.
 ///
-/// The emitted head segment has already been link-validated and queued before
-/// this runs. Every discarded range therefore starts strictly at
-/// `next_emit_height` or later and is re-fetched with the updated sizer state.
-fn restart_future_source_prefetch<Source>(
+/// Density feedback changes only the unscheduled frontier. An oversized
+/// response proves the outstanding request widths stale, so those ranges are
+/// canceled and fetched again with the updated size.
+fn apply_source_segment_feedback_action<Source>(
     state: &mut SourceBlockStreamState<'_, Source>,
-    reason: SourceSegmentPrefetchRestartReason,
+    action: SourceSegmentFeedbackAction,
 ) {
-    let discarded_in_flight = state.in_flight_segments.len();
-    let discarded_completed = state.completed_segments.len();
+    match action {
+        SourceSegmentFeedbackAction::DensityShrink => retain_future_source_prefetch(state),
+        SourceSegmentFeedbackAction::ResponseTooLarge => restart_future_source_prefetch(state),
+    }
+}
+
+fn retain_future_source_prefetch<Source>(state: &SourceBlockStreamState<'_, Source>) {
+    // Retained ranges stay bounded by their live reservations and are still
+    // parent-link validated only when emitted in height order.
+    let retained = source_prefetch_queue_accounting(state);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_retained_completed_segments_total",
+        "reason" => "density"
+    )
+    .increment(retained.completed_segment_count);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_retained_in_flight_segments_total",
+        "reason" => "density"
+    )
+    .increment(retained.in_flight_segment_count);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_retained_completed_response_bytes_total",
+        "reason" => "density"
+    )
+    .increment(retained.completed_response_bytes);
+    tracing::info!(
+        event = "source_segment_prefetch_retained",
+        reason = "density",
+        next_fetch_height = ?state.next_fetch_height,
+        retained_in_flight_segments = retained.in_flight_segment_count,
+        retained_completed_segments = retained.completed_segment_count,
+        retained_completed_response_bytes = retained.completed_response_bytes,
+        "retained bounded source prefetch after density adjustment"
+    );
+}
+
+fn restart_future_source_prefetch<Source>(state: &mut SourceBlockStreamState<'_, Source>) {
+    let discard_accounting = source_prefetch_queue_accounting(state);
     state.in_flight_segments = FuturesUnordered::new();
     state.completed_segments.clear();
     state.completed_segment_bytes = 0;
@@ -357,18 +399,51 @@ fn restart_future_source_prefetch<Source>(
     state.source_head_of_line_started_at = None;
     metrics::counter!(
         "zinder_ingest_source_segment_prefetch_restarts_total",
-        "reason" => reason.metric_label()
+        "reason" => "response_too_large"
     )
     .increment(1);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_discarded_completed_segments_total",
+        "reason" => "response_too_large"
+    )
+    .increment(discard_accounting.completed_segment_count);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total",
+        "reason" => "response_too_large"
+    )
+    .increment(discard_accounting.in_flight_segment_count);
+    metrics::counter!(
+        "zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total",
+        "reason" => "response_too_large"
+    )
+    .increment(discard_accounting.completed_response_bytes);
     tracing::info!(
         event = "source_segment_prefetch_restarted",
-        reason = reason.metric_label(),
+        reason = "response_too_large",
         next_fetch_height = ?state.next_fetch_height,
-        discarded_in_flight,
-        discarded_completed,
+        discarded_in_flight_segments = discard_accounting.in_flight_segment_count,
+        discarded_completed_segments = discard_accounting.completed_segment_count,
+        discarded_completed_response_bytes = discard_accounting.completed_response_bytes,
         "discarded stale source prefetches after ordered segment feedback"
     );
     record_source_fetch_queue_state(state);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourcePrefetchQueueAccounting {
+    completed_segment_count: u64,
+    in_flight_segment_count: u64,
+    completed_response_bytes: u64,
+}
+
+fn source_prefetch_queue_accounting<Source>(
+    state: &SourceBlockStreamState<'_, Source>,
+) -> SourcePrefetchQueueAccounting {
+    SourcePrefetchQueueAccounting {
+        completed_segment_count: usize_to_u64_saturating(state.completed_segments.len()),
+        in_flight_segment_count: usize_to_u64_saturating(state.in_flight_segments.len()),
+        completed_response_bytes: state.completed_segment_bytes,
+    }
 }
 
 fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, Source>) {
@@ -383,9 +458,9 @@ fn record_source_fetch_queue_state<Source>(state: &SourceBlockStreamState<'_, So
     ));
     metrics::gauge!("zinder_ingest_source_segment_reassembly_bytes")
         .set(u64_to_f64(state.completed_segment_bytes));
-    record_queue_depth(BULK_STAGE_SOURCE_FETCH, state.in_flight_segments.len());
+    record_queue_depth(CANONICAL_STAGE_SOURCE_FETCH, state.in_flight_segments.len());
     record_reorder_buffer(
-        BULK_STAGE_SOURCE_FETCH,
+        CANONICAL_STAGE_SOURCE_FETCH,
         state.completed_segments.len(),
         state.completed_segment_bytes,
     );
@@ -409,45 +484,71 @@ fn record_source_head_of_line_wait_completed<Source>(
     };
     metrics::histogram!(
         "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds",
-        "stage" => BULK_STAGE_SOURCE_FETCH
+        "stage" => CANONICAL_STAGE_SOURCE_FETCH
     )
     .record(started_at.elapsed());
 }
 
-fn enqueue_source_segment_max_blocks<Source>(
+fn validated_source_block_chunk<Source>(
     state: &mut SourceBlockStreamState<'_, Source>,
     segment: SourceChainSegment,
-) -> Result<(), IngestError>
+    reservation: ByteReservation,
+) -> Result<SourceBlockChunk, IngestError>
 where
     Source: NodeSource,
 {
-    let mut connected_blocks = 0_u32;
+    let mut connected_blocks = VecDeque::new();
     for update in segment.into_updates() {
         match update {
             SourceChainUpdate::ConnectedBlock { block, .. } => {
                 validate_prefetched_block_link(state.last_connected_block_id, &block)?;
                 state.last_connected_block_id = Some(BlockId::new(block.height, block.hash));
                 if block.height <= state.to_height {
-                    connected_blocks = connected_blocks.saturating_add(1);
-                    state.pending_blocks.push(block);
+                    connected_blocks.push_back(block);
                 }
             }
             SourceChainUpdate::RevertedBlock { block_id, .. } => {
                 return Err(IngestError::from(SourceError::BlockReorgDuringFetch {
                     height: block_id.height,
-                    reason: "source chain segment reverted during bulk catchup",
+                    reason: "source chain segment reverted during canonical construction",
                 }));
             }
             SourceChainUpdate::SafeTip { .. } => {}
         }
     }
 
-    if connected_blocks == 0 {
+    if connected_blocks.is_empty() {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
-            reason: "source chain segment did not contain connected blocks during bulk catchup",
+            reason: "source chain segment did not contain connected blocks during canonical construction",
         }));
     }
-    Ok(())
+    Ok(SourceBlockChunk {
+        blocks: connected_blocks,
+        _reservation: reservation,
+    })
+}
+
+pub(crate) struct SourceBlockChunk {
+    blocks: VecDeque<SourceBlock>,
+    _reservation: ByteReservation,
+}
+
+impl SourceBlockChunk {
+    pub(crate) fn front(&self) -> Option<&SourceBlock> {
+        self.blocks.front()
+    }
+
+    pub(crate) fn pop_front(&mut self) -> Option<SourceBlock> {
+        self.blocks.pop_front()
+    }
+
+    pub(crate) fn push_front(&mut self, block: SourceBlock) {
+        self.blocks.push_front(block);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
 }
 
 fn validate_prefetched_block_link(
@@ -464,7 +565,7 @@ fn validate_prefetched_block_link(
     };
     if block.height != expected_height {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
-            reason: "source chain segment skipped a height during bulk catchup",
+            reason: "source chain segment skipped a height during canonical construction",
         }));
     }
     if block.parent_hash != previous_block_id.hash {
@@ -493,7 +594,7 @@ struct SourceSegmentDensitySample {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SourceSegmentPlan {
+pub(crate) enum SourceSegmentPlan {
     Ready {
         max_blocks: NonZeroU32,
         reserved_response_bytes: NonZeroU64,
@@ -503,21 +604,21 @@ pub(super) enum SourceSegmentPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SourceSegmentPrefetchRestartReason {
+pub(crate) enum SourceSegmentFeedbackAction {
+    DensityShrink,
     ResponseTooLarge,
-    Density,
 }
 
-impl SourceSegmentPrefetchRestartReason {
+impl SourceSegmentFeedbackAction {
     const fn metric_label(self) -> &'static str {
         match self {
             Self::ResponseTooLarge => "response_too_large",
-            Self::Density => "density",
+            Self::DensityShrink => "density",
         }
     }
 }
 
-pub(super) struct SourceSegmentSizer {
+pub(crate) struct SourceSegmentSizer {
     max_blocks: NonZeroU32,
     target_response_payload_bytes: NonZeroU64,
     current_blocks: NonZeroU32,
@@ -531,7 +632,7 @@ pub(super) struct SourceSegmentSizer {
 }
 
 impl SourceSegmentSizer {
-    pub(super) fn new(
+    pub(crate) fn new(
         max_blocks: NonZeroU32,
         target_response_payload_bytes: NonZeroU64,
         activations: Arc<NetworkUpgradeActivations>,
@@ -558,7 +659,7 @@ impl SourceSegmentSizer {
         }
     }
 
-    pub(super) fn blocks_for_remaining_range(
+    pub(crate) fn blocks_for_remaining_range(
         &mut self,
         next_height: BlockHeight,
         to_height: BlockHeight,
@@ -574,7 +675,7 @@ impl SourceSegmentSizer {
         NonZeroU32::new(remaining_blocks.min(self.current_blocks.get()))
     }
 
-    pub(super) fn plan_segment(
+    pub(crate) fn plan_segment(
         &mut self,
         next_height: BlockHeight,
         to_height: BlockHeight,
@@ -611,7 +712,7 @@ impl SourceSegmentSizer {
         NonZeroU64::new(reserved_response_bytes).unwrap_or(max_response_bytes)
     }
 
-    pub(super) fn record_segment_scheduled(&mut self, start_height: BlockHeight) {
+    pub(crate) fn record_segment_scheduled(&mut self, start_height: BlockHeight) {
         if self.activations.consensus_branch_id_at(start_height) != self.active_branch_id
             || !self.density_samples.is_empty()
         {
@@ -626,11 +727,11 @@ impl SourceSegmentSizer {
         metrics::gauge!("zinder_ingest_source_segment_initial_probe_in_flight").set(0.0);
     }
 
-    pub(super) fn record_segment(
+    pub(crate) fn record_segment(
         &mut self,
         start_height: BlockHeight,
         stats: SourceChainSegmentStats,
-    ) -> Option<SourceSegmentPrefetchRestartReason> {
+    ) -> Option<SourceSegmentFeedbackAction> {
         if self.activations.consensus_branch_id_at(start_height) != self.active_branch_id {
             return None;
         }
@@ -652,9 +753,9 @@ impl SourceSegmentSizer {
         );
         let feedback_action = if self.current_blocks < previous_blocks {
             if stats.split_count() > 0 {
-                Some(SourceSegmentPrefetchRestartReason::ResponseTooLarge)
+                Some(SourceSegmentFeedbackAction::ResponseTooLarge)
             } else {
-                Some(SourceSegmentPrefetchRestartReason::Density)
+                Some(SourceSegmentFeedbackAction::DensityShrink)
             }
         } else {
             None
@@ -826,4 +927,208 @@ fn response_payload_bytes_per_block(stats: SourceChainSegmentStats) -> Option<u6
             .saturating_add(blocks.saturating_sub(1))
             / blocks,
     )
+}
+
+fn nonzero_u32(amount: u32) -> NonZeroU32 {
+    NonZeroU32::new(amount.max(1)).unwrap_or(NonZeroU32::MIN)
+}
+
+fn nonzero_u32_to_usize(amount: NonZeroU32) -> usize {
+    usize::try_from(amount.get()).unwrap_or(usize::MAX)
+}
+
+fn usize_to_u32_saturating(amount: usize) -> u32 {
+    u32::try_from(amount).unwrap_or(u32::MAX)
+}
+
+fn usize_to_u64_saturating(amount: usize) -> u64 {
+    u64::try_from(amount).unwrap_or(u64::MAX)
+}
+
+fn record_source_segment_sizer_state(
+    current_blocks: NonZeroU32,
+    max_blocks: NonZeroU32,
+    target_response_payload_bytes: NonZeroU64,
+) {
+    metrics::gauge!("zinder_ingest_source_segment_next_blocks")
+        .set(f64::from(current_blocks.get()));
+    metrics::gauge!("zinder_ingest_source_segment_max_blocks").set(f64::from(max_blocks.get()));
+    metrics::gauge!("zinder_ingest_source_segment_target_response_payload_bytes")
+        .set(u64_to_f64(target_response_payload_bytes.get()));
+}
+
+fn record_source_segment_sizer_adjustment(
+    reason: &'static str,
+    previous_blocks: NonZeroU32,
+    current_blocks: NonZeroU32,
+) {
+    if previous_blocks == current_blocks && reason != "network_upgrade" {
+        return;
+    }
+    metrics::counter!(
+        "zinder_ingest_source_segment_sizing_adjustment_total",
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges and histograms use f64 samples; byte counts are diagnostic magnitudes"
+)]
+fn u64_to_f64(sample: u64) -> f64 {
+    sample as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        num::{NonZeroU32, NonZeroU64},
+        sync::Arc,
+    };
+
+    use futures_util::{FutureExt, future, stream::FuturesUnordered};
+    use parking_lot::Mutex;
+    use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations};
+    use zinder_source::{SourceChainSegment, SourceChainSegmentStats};
+
+    use super::{
+        CANONICAL_STAGE_SOURCE_FETCH, PrefetchedSourceSegment, SourceBlockStreamState,
+        SourceSegmentFeedbackAction, SourceSegmentSizer, apply_source_segment_feedback_action,
+        source_prefetch_queue_accounting,
+    };
+    use crate::canonical_construction::watermark::ByteWatermark;
+
+    #[test]
+    fn response_too_large_feedback_discards_future_source_prefetch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = test_source_prefetch_state()?;
+        let accounting = source_prefetch_queue_accounting(&state);
+
+        assert_eq!(accounting.completed_segment_count, 2);
+        assert_eq!(accounting.in_flight_segment_count, 1);
+        assert_eq!(accounting.completed_response_bytes, 30);
+        apply_source_segment_feedback_action(
+            &mut state,
+            SourceSegmentFeedbackAction::ResponseTooLarge,
+        );
+        assert!(state.completed_segments.is_empty());
+        assert!(state.in_flight_segments.is_empty());
+        assert_eq!(state.completed_segment_bytes, 0);
+        assert_eq!(state.next_fetch_height, Some(BlockHeight::new(3)));
+        Ok(())
+    }
+
+    #[test]
+    fn density_feedback_retains_future_source_prefetch() -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = test_source_prefetch_state()?;
+
+        apply_source_segment_feedback_action(
+            &mut state,
+            SourceSegmentFeedbackAction::DensityShrink,
+        );
+
+        let accounting = source_prefetch_queue_accounting(&state);
+        assert_eq!(accounting.completed_segment_count, 2);
+        assert_eq!(accounting.in_flight_segment_count, 1);
+        assert_eq!(accounting.completed_response_bytes, 30);
+        assert_eq!(state.completed_segment_bytes, 30);
+        assert_eq!(state.next_emit_height, Some(BlockHeight::new(3)));
+        assert_eq!(state.next_fetch_height, Some(BlockHeight::new(5)));
+        Ok(())
+    }
+
+    #[test]
+    fn segment_sizer_distinguishes_density_retention_from_oversized_restart() {
+        let mut density_sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+            NonZeroU64::new(32).unwrap_or(NonZeroU64::MIN),
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        );
+        let dense_stats =
+            SourceChainSegmentStats::from_response_payload_bytes(128).with_connected_blocks(2);
+        assert_eq!(
+            density_sizer.record_segment(BlockHeight::new(1), dense_stats),
+            Some(SourceSegmentFeedbackAction::DensityShrink)
+        );
+
+        let mut oversized_sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+            NonZeroU64::new(32).unwrap_or(NonZeroU64::MIN),
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        );
+        let oversized_stats = dense_stats.with_added_splits(1);
+        assert_eq!(
+            oversized_sizer.record_segment(BlockHeight::new(1), oversized_stats),
+            Some(SourceSegmentFeedbackAction::ResponseTooLarge)
+        );
+    }
+
+    fn test_source_prefetch_state()
+    -> Result<SourceBlockStreamState<'static, ()>, Box<dyn std::error::Error>> {
+        static SOURCE: () = ();
+        let source_fetch_watermark = ByteWatermark::new(
+            CANONICAL_STAGE_SOURCE_FETCH,
+            NonZeroU64::new(100).unwrap_or(NonZeroU64::MIN),
+        );
+        let first_reservation = source_fetch_watermark
+            .try_reserve(10)
+            .ok_or("first test reservation should fit")?;
+        let second_reservation = source_fetch_watermark
+            .try_reserve(20)
+            .ok_or("second test reservation should fit")?;
+        let mut completed_segments = BTreeMap::new();
+        completed_segments.insert(
+            BlockHeight::new(3),
+            PrefetchedSourceSegment {
+                start_height: BlockHeight::new(3),
+                max_connected_blocks: NonZeroU32::MIN,
+                segment: SourceChainSegment::default(),
+                queued_response_bytes: 10,
+                feedback_action: None,
+                reservation: first_reservation,
+            },
+        );
+        completed_segments.insert(
+            BlockHeight::new(4),
+            PrefetchedSourceSegment {
+                start_height: BlockHeight::new(4),
+                max_connected_blocks: NonZeroU32::MIN,
+                segment: SourceChainSegment::default(),
+                queued_response_bytes: 20,
+                feedback_action: None,
+                reservation: second_reservation,
+            },
+        );
+        let in_flight_segments = FuturesUnordered::new();
+        in_flight_segments
+            .push(future::pending::<Result<PrefetchedSourceSegment, crate::IngestError>>().boxed());
+        Ok(SourceBlockStreamState {
+            source: &SOURCE,
+            request_timeout: std::time::Duration::from_secs(1),
+            history_predecessor: None,
+            from_height: BlockHeight::new(1),
+            to_height: BlockHeight::new(8),
+            source_segment_sizer: Arc::new(Mutex::new(SourceSegmentSizer::new(
+                NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
+                NonZeroU64::new(32).unwrap_or(NonZeroU64::MIN),
+                Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+                BlockHeight::new(1),
+            ))),
+            max_response_bytes: NonZeroU64::new(64).unwrap_or(NonZeroU64::MIN),
+            target_response_payload_bytes: NonZeroU64::new(32).unwrap_or(NonZeroU64::MIN),
+            source_fetch_max_in_flight_requests: NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),
+            source_fetch_watermark,
+            completed_segment_bytes: 30,
+            source_head_of_line_started_at: None,
+            next_fetch_height: Some(BlockHeight::new(5)),
+            next_emit_height: Some(BlockHeight::new(3)),
+            in_flight_segments,
+            completed_segments,
+            last_connected_block_id: None,
+        })
+    }
 }

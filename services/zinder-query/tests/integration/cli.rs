@@ -304,8 +304,7 @@ fn wallet_reader_node() -> eyre::Result<JsonRpcTestServer> {
             "info": {"title": "Zebra", "version": "test"},
             "methods": [
                 {"name": "getblock"},
-                {"name": "getbestblockhash"},
-                {"name": "getblockheader"},
+                {"name": "getbestblockheightandhash"},
                 {"name": "z_gettreestate"},
                 {"name": "z_getsubtreesbyindex"},
                 {"name": "sendrawtransaction"},

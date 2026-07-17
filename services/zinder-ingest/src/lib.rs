@@ -8,10 +8,14 @@ mod artifact_builder;
 pub mod bench_support;
 mod block_production_time_backfill;
 mod bulk_catchup;
+mod canonical_construction;
+mod canonical_follow;
+mod canonical_runtime;
 mod chain_ingest;
 mod commitment_root_backfill;
 mod conventional_fee_distribution_backfill;
 mod derive_consumers;
+mod derive_status_reader;
 mod ingest_control;
 mod ingest_loop;
 mod memory_pressure;
@@ -30,16 +34,26 @@ mod value_pool_balance_backfill;
 mod value_pool_flow_backfill;
 
 pub use artifact_builder::{
-    ArtifactDeriveError, BlockMismatchField, CommitmentTreeSizes, DerivedBlockArtifacts,
-    RawBlobPolicy, derive_block, derive_block_with_raw_blob_policy, finalize_derived_block,
+    BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
+    PositionedCanonicalBlock, PreparedCanonicalBlock, RawBlobPolicy, RetainedRawBlobs,
+    position_canonical_block, prepare_canonical_block,
 };
 pub use block_production_time_backfill::spawn_block_production_time_backfill_task;
 pub use bulk_catchup::{
     BulkCatchupRunConfig, run_bulk_catchup, run_bulk_catchup_until_complete,
     run_bulk_catchup_with_store,
 };
+pub use canonical_construction::{
+    CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
+    CanonicalPipelineLimits, CanonicalPipelineLimitsError, CanonicalSourceLoadOutcome,
+    load_fresh_canonical, load_fresh_canonical_blocks, load_fresh_canonical_source_families,
+};
+pub use canonical_follow::{
+    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, follow_canonical_tip,
+};
+pub use canonical_runtime::{CanonicalRuntimeConfig, CanonicalRuntimeError, run_canonical_runtime};
 pub use chain_ingest::{
-    BuiltArtifacts, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, IngestError, NodeSourceKind,
 };
 pub use commitment_root_backfill::{
@@ -56,6 +70,9 @@ pub use derive_consumers::{
     open_primary_derive_store_for_canonical_with_projection_preset,
     seed_backfill_owned_consumer_cursors, seed_commitment_root_search_cursor_for_backfill,
     spawn_derive_replay_budget_metrics_task, spawn_derive_tailer_task,
+};
+pub use derive_status_reader::{
+    DeriveStatusReadError, DeriveStatusReader, RocksDbDeriveStatusReader,
 };
 pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
 pub use ingest_loop::{

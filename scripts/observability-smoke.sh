@@ -31,6 +31,7 @@ NODE_AUTH_USERNAME="${ZINDER_OBSERVABILITY_NODE_AUTH_USERNAME:-${ZINDER_NODE__AU
 NODE_AUTH_PASSWORD="${ZINDER_OBSERVABILITY_NODE_AUTH_PASSWORD:-${ZINDER_NODE__AUTH__PASSWORD:-zebra}}"
 
 PROMETHEUS_PORT="${ZINDER_PROMETHEUS_PORT:-9095}"
+PROMETHEUS_STACK_LABEL="${ZINDER_OBSERVABILITY_PROMETHEUS_STACK_LABEL:-zinder-local}"
 GRAFANA_PORT="${ZINDER_GRAFANA_PORT:-3002}"
 INGEST_OPS_ADDR="${ZINDER_OBSERVABILITY_INGEST_OPS_ADDR:-0.0.0.0:9190}"
 QUERY_OPS_ADDR="${ZINDER_OBSERVABILITY_QUERY_OPS_ADDR:-0.0.0.0:9191}"
@@ -105,6 +106,10 @@ Default local node:
 Optional upstream lightwalletd client check:
   ZINDER_OBSERVABILITY_LIGHTWALLETD_TESTCLIENT=1
   ZINDER_OBSERVABILITY_LIGHTWALLETD_REPO=/path/to/lightwalletd
+
+Snapshot an existing deployment Compose Prometheus instead of the local stack:
+  ZINDER_PROMETHEUS_PORT=19095
+  ZINDER_OBSERVABILITY_PROMETHEUS_STACK_LABEL=zinder
 USAGE
 }
 
@@ -888,16 +893,18 @@ snapshot() {
   printf '  Logs:       %s\n' "$LOG_DIR"
 
   log "Prometheus evidence"
-  print_query_summary "targets up" 'up{stack="zinder-local"}'
+  print_query_summary "targets up" "up{stack=\"${PROMETHEUS_STACK_LABEL}\"}"
   print_query_summary "build info" 'zinder_build_info'
   print_query_summary "readiness states" 'zinder_readiness_state'
   print_query_summary "readiness sync lag" 'zinder_readiness_sync_lag_blocks'
   print_query_summary "readiness replica lag" 'zinder_readiness_replica_lag_chain_epochs'
   print_query_summary "node requests" 'sum by (service, method, status, error_class) (zinder_node_request_total)'
-  print_query_summary "writer rate 5m" 'rate(zinder_ingest_writer_finalized_height[5m])'
-  print_query_summary "writer rate 15m" 'rate(zinder_ingest_writer_finalized_height[15m])'
-  print_query_summary "writer rate 30m" 'rate(zinder_ingest_writer_finalized_height[30m])'
-  print_query_summary "writer rate 60m" 'rate(zinder_ingest_writer_finalized_height[1h])'
+  print_query_summary "canonical committed rate 5m" 'sum(rate(zinder_ingest_commit_batch_block_count_sum{status="ok"}[5m]))'
+  print_query_summary "canonical committed rate 15m" 'sum(rate(zinder_ingest_commit_batch_block_count_sum{status="ok"}[15m]))'
+  print_query_summary "canonical committed rate 30m" 'sum(rate(zinder_ingest_commit_batch_block_count_sum{status="ok"}[30m]))'
+  print_query_summary "canonical committed rate 60m" 'sum(rate(zinder_ingest_commit_batch_block_count_sum{status="ok"}[1h]))'
+  print_query_summary "canonical writer height" 'zinder_ingest_writer_tip_height'
+  print_query_summary "canonical lag" 'zinder_ingest_canonical_lag_blocks'
   print_query_summary "source request average 15m" 'sum by (operation) (rate(zinder_ingest_source_request_duration_seconds_sum[15m])) / sum by (operation) (rate(zinder_ingest_source_request_duration_seconds_count[15m]))'
   print_query_summary "node request p95 15m" 'histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[15m])))'
   print_query_summary "bulk stage p95 15m" 'histogram_quantile(0.95, sum by (le, stage) (rate(zinder_ingest_bulk_pipeline_stage_duration_seconds_bucket[15m])))'
@@ -913,17 +920,17 @@ snapshot() {
   print_query_summary "ingest writer status available" 'zinder_ingest_writer_status_available'
   print_query_summary "ingest backups" 'sum by (network, status, error_class) (zinder_ingest_backup_total)'
   print_query_summary "query requests" 'sum by (service, operation, status, error_class) (zinder_query_request_total)'
-  print_query_summary "wallet query p95" 'zinder_query_request_duration_seconds{quantile="0.95"}'
+  print_query_summary "wallet query p95" 'histogram_quantile(0.95, sum by (le, operation) (rate(zinder_query_request_duration_seconds_bucket[15m])))'
   print_query_summary "query secondary catchup" 'sum by (service, status, error_class) (zinder_query_secondary_catchup_total)'
-  print_query_summary "query secondary catchup p95" 'zinder_query_secondary_catchup_duration_seconds{quantile="0.95"}'
+  print_query_summary "query secondary catchup p95" 'histogram_quantile(0.95, sum by (le) (rate(zinder_query_secondary_catchup_duration_seconds_bucket[15m])))'
   print_query_summary "query secondary progress" 'zinder_query_secondary_chain_epoch_id'
   print_query_summary "query secondary lag" 'zinder_query_secondary_replica_lag_chain_epochs'
   print_query_summary "query writer status requests" 'sum by (service, status, error_class) (zinder_query_writer_status_request_total)'
   print_query_summary "query writer status available" 'zinder_query_writer_status_available'
   print_query_summary "query writer status progress" 'zinder_query_writer_status_chain_epoch_id'
-  print_query_summary "node rpc p95" 'zinder_node_request_latency_seconds{quantile="0.95"}'
-  print_query_summary "store reads" 'sum by (service, operation, table, status) (zinder_store_read_latency_seconds_count)'
-  print_query_summary "store read p95" 'zinder_store_read_latency_seconds{quantile="0.95"}'
+  print_query_summary "node rpc p95" 'histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[15m])))'
+  print_query_summary "store reads" 'sum by (service, operation, table, caller, status) (zinder_store_read_duration_seconds_count)'
+  print_query_summary "store read p95" 'histogram_quantile(0.95, sum by (le, operation, table, caller) (rate(zinder_store_read_duration_seconds_bucket[15m])))'
   print_query_summary "visibility seeks" 'sum by (service, artifact_family) (zinder_store_visibility_seek_total)'
   print_query_summary "rocksdb properties" 'zinder_store_rocksdb_property'
 }
@@ -941,6 +948,16 @@ write_readiness_report() {
   local report_readiness_warning_services
   local report_readiness_sync_lag_blocks
   local report_readiness_replica_lag_chain_epochs
+  local report_canonical_writer_height
+  local report_canonical_lag_blocks
+  local report_canonical_rate_blocks_per_second
+  local report_derive_replay_height
+  local report_derive_replay_tip_height
+  local report_derive_replay_lag_blocks
+  local report_derive_replay_rate_blocks_per_second
+  local report_derive_replay_phase_gate
+  local report_derive_replay_caught_up
+  local report_memory_pressure_ratio
   local report_wallet_query_p95_seconds
   local report_node_rpc_p95_seconds
   local report_store_read_p95_seconds
@@ -965,15 +982,25 @@ write_readiness_report() {
   report_ingest_metrics_url="http://$(local_url_addr "$INGEST_OPS_ADDR")/metrics"
   report_query_metrics_url="http://$(local_url_addr "$QUERY_OPS_ADDR")/metrics"
   report_compat_metrics_url="http://$(local_url_addr "$COMPAT_OPS_ADDR")/metrics"
-  report_targets_up="$(prometheus_max_value 'sum(up{stack="zinder-local"})')"
+  report_targets_up="$(prometheus_max_value "sum(up{stack=\"${PROMETHEUS_STACK_LABEL}\"})")"
   report_traffic_blocking_services="$(prometheus_max_value "sum(zinder_readiness_state{cause!~\"${TRAFFIC_READY_READINESS_CAUSES}\"} == 1) or vector(0)")"
   report_readiness_warning_services="$(prometheus_max_value "sum(zinder_readiness_state{cause=~\"${READINESS_WARNING_CAUSES}\"} == 1) or vector(0)")"
   report_readiness_sync_lag_blocks="$(prometheus_max_value 'max(zinder_readiness_sync_lag_blocks)')"
   report_readiness_replica_lag_chain_epochs="$(prometheus_max_value 'max(zinder_readiness_replica_lag_chain_epochs)')"
-  report_wallet_query_p95_seconds="$(prometheus_max_value 'max(zinder_query_request_duration_seconds{quantile="0.95"})')"
-  report_node_rpc_p95_seconds="$(prometheus_max_value 'max(zinder_node_request_latency_seconds{quantile="0.95"})')"
-  report_store_read_p95_seconds="$(prometheus_max_value 'max(zinder_store_read_latency_seconds{quantile="0.95"})')"
-  report_secondary_catchup_p95_seconds="$(prometheus_max_value 'max(zinder_query_secondary_catchup_duration_seconds{quantile="0.95"})')"
+  report_canonical_writer_height="$(prometheus_max_value 'max(zinder_ingest_writer_tip_height)')"
+  report_canonical_lag_blocks="$(prometheus_max_value 'max(zinder_ingest_canonical_lag_blocks)')"
+  report_canonical_rate_blocks_per_second="$(prometheus_max_value 'sum(rate(zinder_ingest_commit_batch_block_count_sum{status="ok"}[5m]))')"
+  report_derive_replay_height="$(prometheus_max_value 'max(zinder_ingest_derive_replay_height)')"
+  report_derive_replay_tip_height="$(prometheus_max_value 'max(zinder_ingest_derive_replay_tip_height)')"
+  report_derive_replay_lag_blocks="$(prometheus_max_value 'max(zinder_ingest_derive_replay_lag_blocks)')"
+  report_derive_replay_rate_blocks_per_second="$(prometheus_max_value 'sum(rate(zinder_ingest_derive_replay_blocks_total{status="ok"}[5m]))')"
+  report_derive_replay_phase_gate="$(prometheus_max_value 'max(zinder_ingest_derive_replay_phase_gate)')"
+  report_derive_replay_caught_up="$(prometheus_max_value 'max(zinder_ingest_derive_replay_caught_up)')"
+  report_memory_pressure_ratio="$(prometheus_max_value 'max(zinder_ingest_memory_pressure_ratio)')"
+  report_wallet_query_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le, operation) (rate(zinder_query_request_duration_seconds_bucket[15m]))))')"
+  report_node_rpc_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[15m]))))')"
+  report_store_read_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le, operation, table, caller) (rate(zinder_store_read_duration_seconds_bucket[15m]))))')"
+  report_secondary_catchup_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le) (rate(zinder_query_secondary_catchup_duration_seconds_bucket[15m]))))')"
   report_rocksdb_pending_compaction_bytes="$(prometheus_max_value 'max(zinder_store_rocksdb_property{property="rocksdb.estimate-pending-compaction-bytes"})')"
   report_rocksdb_running_compactions="$(prometheus_max_value 'max(zinder_store_rocksdb_property{property="rocksdb.num-running-compactions"})')"
   report_rocksdb_property_samples="$(prometheus_sample_count 'zinder_store_rocksdb_property')"
@@ -1004,6 +1031,16 @@ write_readiness_report() {
   export REPORT_READINESS_WARNING_SERVICES="$report_readiness_warning_services"
   export REPORT_READINESS_SYNC_LAG_BLOCKS="$report_readiness_sync_lag_blocks"
   export REPORT_READINESS_REPLICA_LAG_CHAIN_EPOCHS="$report_readiness_replica_lag_chain_epochs"
+  export REPORT_CANONICAL_WRITER_HEIGHT="$report_canonical_writer_height"
+  export REPORT_CANONICAL_LAG_BLOCKS="$report_canonical_lag_blocks"
+  export REPORT_CANONICAL_RATE_BLOCKS_PER_SECOND="$report_canonical_rate_blocks_per_second"
+  export REPORT_DERIVE_REPLAY_HEIGHT="$report_derive_replay_height"
+  export REPORT_DERIVE_REPLAY_TIP_HEIGHT="$report_derive_replay_tip_height"
+  export REPORT_DERIVE_REPLAY_LAG_BLOCKS="$report_derive_replay_lag_blocks"
+  export REPORT_DERIVE_REPLAY_RATE_BLOCKS_PER_SECOND="$report_derive_replay_rate_blocks_per_second"
+  export REPORT_DERIVE_REPLAY_PHASE_GATE="$report_derive_replay_phase_gate"
+  export REPORT_DERIVE_REPLAY_CAUGHT_UP="$report_derive_replay_caught_up"
+  export REPORT_MEMORY_PRESSURE_RATIO="$report_memory_pressure_ratio"
   export REPORT_WALLET_QUERY_P95_SECONDS="$report_wallet_query_p95_seconds"
   export REPORT_NODE_RPC_P95_SECONDS="$report_node_rpc_p95_seconds"
   export REPORT_STORE_READ_P95_SECONDS="$report_store_read_p95_seconds"
@@ -1056,6 +1093,16 @@ report = {
         "readiness_warning_services": metric("REPORT_READINESS_WARNING_SERVICES"),
         "readiness_sync_lag_blocks": metric("REPORT_READINESS_SYNC_LAG_BLOCKS"),
         "readiness_replica_lag_chain_epochs": metric("REPORT_READINESS_REPLICA_LAG_CHAIN_EPOCHS"),
+        "canonical_writer_height": metric("REPORT_CANONICAL_WRITER_HEIGHT"),
+        "canonical_lag_blocks": metric("REPORT_CANONICAL_LAG_BLOCKS"),
+        "canonical_rate_blocks_per_second": metric("REPORT_CANONICAL_RATE_BLOCKS_PER_SECOND"),
+        "derive_replay_height": metric("REPORT_DERIVE_REPLAY_HEIGHT"),
+        "derive_replay_tip_height": metric("REPORT_DERIVE_REPLAY_TIP_HEIGHT"),
+        "derive_replay_lag_blocks": metric("REPORT_DERIVE_REPLAY_LAG_BLOCKS"),
+        "derive_replay_rate_blocks_per_second": metric("REPORT_DERIVE_REPLAY_RATE_BLOCKS_PER_SECOND"),
+        "derive_replay_phase_gate": metric("REPORT_DERIVE_REPLAY_PHASE_GATE"),
+        "derive_replay_caught_up": metric("REPORT_DERIVE_REPLAY_CAUGHT_UP"),
+        "memory_pressure_ratio": metric("REPORT_MEMORY_PRESSURE_RATIO"),
         "wallet_query_p95_max_seconds": metric("REPORT_WALLET_QUERY_P95_SECONDS"),
         "node_rpc_p95_max_seconds": metric("REPORT_NODE_RPC_P95_SECONDS"),
         "store_read_p95_max_seconds": metric("REPORT_STORE_READ_P95_SECONDS"),
@@ -1098,6 +1145,16 @@ lines = [
     f"- Readiness warning services: `{measurements['readiness_warning_services']}`",
     f"- Sync lag: `{measurements['readiness_sync_lag_blocks']}` blocks",
     f"- Replica lag: `{measurements['readiness_replica_lag_chain_epochs']}` chain epochs",
+    f"- Canonical writer height: `{measurements['canonical_writer_height']}`",
+    f"- Canonical lag: `{measurements['canonical_lag_blocks']}` blocks",
+    f"- Canonical rate: `{measurements['canonical_rate_blocks_per_second']}` blocks/second",
+    f"- Derive replay height: `{measurements['derive_replay_height']}`",
+    f"- Derive replay tip: `{measurements['derive_replay_tip_height']}`",
+    f"- Derive replay lag: `{measurements['derive_replay_lag_blocks']}` blocks",
+    f"- Derive replay rate: `{measurements['derive_replay_rate_blocks_per_second']}` blocks/second",
+    f"- Derive phase gate: `{measurements['derive_replay_phase_gate']}`",
+    f"- Derive caught up: `{measurements['derive_replay_caught_up']}`",
+    f"- Memory pressure ratio: `{measurements['memory_pressure_ratio']}`",
     f"- Wallet query p95 max: `{measurements['wallet_query_p95_max_seconds']}` seconds",
     f"- Node RPC p95 max: `{measurements['node_rpc_p95_max_seconds']}` seconds",
     f"- Store read p95 max: `{measurements['store_read_p95_max_seconds']}` seconds",
@@ -1297,12 +1354,12 @@ run_stack() {
   generate_traffic
   run_lightwalletd_testclient
 
-  wait_prometheus_samples "target scrape" 'up{stack="zinder-local"}' 45 || true
+  wait_prometheus_samples "target scrape" "up{stack=\"${PROMETHEUS_STACK_LABEL}\"}" 45 || true
   wait_prometheus_samples "readiness metric" 'zinder_readiness_state' 45 || true
   wait_prometheus_samples "query request metric" 'zinder_query_request_total' 45 || true
   wait_prometheus_samples "query secondary catchup metric" 'zinder_query_secondary_catchup_total' 45 || true
   wait_prometheus_samples "query writer status metric" 'zinder_query_writer_status_request_total' 45 || true
-  wait_prometheus_samples "store read metric" 'zinder_store_read_latency_seconds_count' 45 || true
+  wait_prometheus_samples "store read metric" 'zinder_store_read_duration_seconds_count' 45 || true
   wait_prometheus_samples "rocksdb property metric" 'zinder_store_rocksdb_property' 45 || true
   wait_prometheus_samples "ingest commit metric" 'zinder_ingest_commit_duration_seconds_count' 45 || true
   wait_prometheus_samples "ingest writer progress metric" 'zinder_ingest_writer_chain_epoch_id' 45 || true

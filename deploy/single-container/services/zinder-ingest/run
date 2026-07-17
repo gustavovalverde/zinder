@@ -38,14 +38,13 @@ fi
 # exec so it can't crash load_config after the archive step above has run.
 unset ZINDER_WIPE_PRIMARY_ON_BOOT
 
-# Remove a stale RocksDB primary LOCK file left by an unclean shutdown.
-# Safe in this single-container image because exactly one writer ever
-# runs in this PID namespace. RocksDB clears stale POSIX locks only when
-# the previous holder ran on the same kernel, so PaaS targets that
-# reschedule containers across hosts trip on the staleness check.
-mkdir -p /var/lib/zinder/store
-chown zinder:zinder /var/lib/zinder/store
-rm -f /var/lib/zinder/store/LOCK
+# Remove a stale RocksDB primary LOCK file only when an admitted store already
+# exists. A fresh v1 construction requires the configured store path to be
+# absent, so this wrapper must not create it ahead of the builder.
+if [ -d /var/lib/zinder/store ]; then
+    chown zinder:zinder /var/lib/zinder/store
+    rm -f /var/lib/zinder/store/LOCK
+fi
 
 # Strip env vars whose TOML section the ingest schema doesn't allow. The
 # single-container image shares one process env across all three supervised

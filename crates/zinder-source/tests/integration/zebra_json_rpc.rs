@@ -6,11 +6,18 @@
 use std::{collections::HashSet, num::NonZeroU64, time::Duration};
 
 use eyre::eyre;
+use incrementalmerkletree::{
+    Position,
+    frontier::{CommitmentTree, Frontier},
+};
+use orchard::tree::MerkleHashOrchard;
+use sapling::Node as SaplingNode;
 use serde_json::{Value, json};
+use zcash_primitives::merkle_tree::write_commitment_tree;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, BroadcastAccepted, ChainTipMetadata, Network,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastResult,
-    TransactionId,
+    BlockHash, BlockHeight, BlockId, BroadcastAccepted, ConsensusBranchId, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
 };
 use zinder_source::{
     NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor, SourceChainUpdate,
@@ -79,13 +86,7 @@ async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre:
 async fn fetch_chain_update_after_start_emits_connected_block() -> eyre::Result<()> {
     let fixture = fixture_block()?;
     let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
+        method("getbestblockheightandhash").reply(RpcReply::result(zebra_tip_response(&fixture)?)),
         method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
     ])?;
     let source = ZebraJsonRpcSource::new(
@@ -127,15 +128,9 @@ async fn fetch_chain_update_after_tip_cursor_returns_none() -> eyre::Result<()> 
         BlockHeight::new(1),
         decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
     );
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-    ])?;
+    let server =
+        JsonRpcTestServer::start([method("getbestblockheightandhash")
+            .reply(RpcReply::result(zebra_tip_response(&fixture)?))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -159,15 +154,9 @@ async fn fetch_chain_update_after_tip_cursor_returns_none() -> eyre::Result<()> 
 async fn fetch_chain_update_after_diverged_tip_emits_reverted_block() -> eyre::Result<()> {
     let fixture = fixture_block()?;
     let old_block_id = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([7; 32]));
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-    ])?;
+    let server =
+        JsonRpcTestServer::start([method("getbestblockheightandhash")
+            .reply(RpcReply::result(zebra_tip_response(&fixture)?))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -281,10 +270,12 @@ async fn missing_json_rpc_result_maps_to_protocol_mismatch() -> eyre::Result<()>
 
 #[tokio::test]
 async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
-    let server =
-        JsonRpcTestServer::start(
-            [method("getbestblockhash").reply(RpcReply::result(json!("00")))],
-        )?;
+    let server = JsonRpcTestServer::start([method("getbestblockheightandhash").reply(
+        RpcReply::result(json!({
+            "height": 1,
+            "hash": vec![0_u8; 32],
+        })),
+    )])?;
     let source = ZebraJsonRpcSource::with_options(
         Network::ZcashRegtest,
         server.url(),
@@ -306,7 +297,7 @@ async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
     assert!(matches!(
         error,
         SourceError::SourceResponseTooLarge {
-            operation: "getbestblockhash",
+            operation: "getbestblockheightandhash",
             max_response_bytes: 1,
         }
     ));
@@ -320,8 +311,9 @@ async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn http_503_marks_node_unavailable_retryable() -> eyre::Result<()> {
-    let server =
-        JsonRpcTestServer::start([method("getbestblockhash").reply(RpcReply::http_status(503))])?;
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(RpcReply::http_status(503))
+    ])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -347,9 +339,8 @@ async fn http_503_marks_node_unavailable_retryable() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn json_rpc_warming_up_error_marks_tip_node_unreachable() -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::error_with_code(-28, "node warming up"))
-    ])?;
+    let server = JsonRpcTestServer::start([method("getbestblockheightandhash")
+        .reply(RpcReply::error_with_code(-28, "node warming up"))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -374,17 +365,15 @@ async fn json_rpc_warming_up_error_marks_tip_node_unreachable() -> eyre::Result<
 }
 
 #[tokio::test]
-async fn tip_id_uses_header_height_from_observed_best_hash() -> eyre::Result<()> {
+async fn tip_id_uses_atomic_height_and_hash_observation() -> eyre::Result<()> {
     let fixture = fixture_block()?;
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
+    let expected_hash = decode_rpc_block_hash(string_field(&fixture, "hash")?)?;
+    let server = JsonRpcTestServer::start([method("getbestblockheightandhash").reply(
+        RpcReply::result(json!({
             "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-    ])?;
+            "hash": expected_hash.as_bytes(),
+        })),
+    )])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -395,94 +384,14 @@ async fn tip_id_uses_header_height_from_observed_best_hash() -> eyre::Result<()>
     let tip_id = source.tip_id().await?;
 
     assert_eq!(tip_id.height, BlockHeight::new(1));
+    assert_eq!(tip_id.hash, expected_hash);
+    let requests = server.requests()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "getbestblockheightandhash");
     assert_eq!(
-        tip_id.hash,
-        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
-    );
-    let methods_called: HashSet<String> =
-        server.requests()?.into_iter().map(|r| r.method).collect();
-    let expected: HashSet<String> = ["getbestblockhash", "getblockheader"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(methods_called, expected);
-    assert_eq!(
-        server.requests_for("getbestblockhash")?[0].params,
+        server.requests_for("getbestblockheightandhash")?[0].params,
         Value::Null
     );
-    assert_eq!(
-        server.requests_for("getblockheader")?[0].params,
-        json!([fixture["hash"], true])
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tip_id_reobserves_after_zebra_invalidates_the_observed_tip() -> eyre::Result<()> {
-    let fixture = fixture_block()?;
-    let stale_tip_hash = "ab".repeat(32);
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
-        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
-        method("getbestblockhash").reply(RpcReply::result(json!(fixture["hash"]))),
-        method("getblockheader").reply(RpcReply::result(json!({
-            "hash": fixture["hash"],
-            "height": fixture["height"],
-            "previousblockhash": fixture["previousblockhash"],
-            "time": fixture["time"],
-        }))),
-    ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    let tip_id = source.tip_id().await?;
-
-    assert_eq!(tip_id.height, BlockHeight::new(1));
-    assert_eq!(
-        tip_id.hash,
-        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
-    );
-    assert_eq!(server.requests_for("getbestblockhash")?.len(), 2);
-    assert_eq!(server.requests_for("getblockheader")?.len(), 2);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tip_id_classifies_an_unstable_best_chain_view_as_recoverable() -> eyre::Result<()> {
-    let stale_tip_hash = "ab".repeat(32);
-    let server = JsonRpcTestServer::start([
-        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
-        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
-        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
-        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
-        method("getbestblockhash").reply(RpcReply::result(json!(stale_tip_hash))),
-        method("getblockheader").reply(RpcReply::error("block height not in best chain")),
-    ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    let error = match source.tip_id().await {
-        Ok(tip_id) => return Err(eyre!("expected tip error, got {tip_id:?}")),
-        Err(error) => error,
-    };
-
-    assert!(matches!(error, SourceError::TipViewChanged { .. }));
-    assert_eq!(
-        error.upstream_classification(),
-        zinder_source::SourceFailureClass::UpstreamViewChanged,
-    );
-    assert_eq!(server.requests_for("getbestblockhash")?.len(), 3);
-    assert_eq!(server.requests_for("getblockheader")?.len(), 3);
 
     Ok(())
 }
@@ -845,6 +754,169 @@ async fn fetch_subtree_roots_uses_expected_json_rpc_request() -> eyre::Result<()
 }
 
 #[tokio::test]
+async fn fetch_subtree_root_range_requires_every_requested_root() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_getsubtreesbyindex").reply(
+        RpcReply::result(json!({
+            "pool": "orchard",
+            "start_index": 9,
+            "subtrees": [
+                {
+                    "root": "3333333333333333333333333333333333333333333333333333333333333333",
+                    "end_height": 1_687_104
+                },
+                {
+                    "root": "4444444444444444444444444444444444444444444444444444444444444444",
+                    "end_height": 1_689_227
+                }
+            ]
+        })),
+    )])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    let requested_range = SubtreeRootRange::new(
+        ShieldedProtocol::Orchard,
+        SubtreeRootIndex::new(9),
+        std::num::NonZeroU32::new(2).ok_or_else(|| eyre!("invalid root count"))?,
+    );
+
+    let subtree_roots = source.fetch_subtree_root_range(requested_range).await?;
+    let requests = server.requests_for("z_getsubtreesbyindex")?;
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].params, json!(["orchard", 9, 2]));
+    assert_eq!(subtree_roots.protocol, ShieldedProtocol::Orchard);
+    assert_eq!(subtree_roots.start_index, SubtreeRootIndex::new(9));
+    assert_eq!(subtree_roots.subtree_roots.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_subtree_root_range_rejects_incomplete_response() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_getsubtreesbyindex").reply(
+        RpcReply::result(json!({
+            "pool": "sapling",
+            "start_index": 4,
+            "subtrees": [{
+                "root": "1111111111111111111111111111111111111111111111111111111111111111",
+                "end_height": 558_822
+            }]
+        })),
+    )])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    let requested_range = SubtreeRootRange::new(
+        ShieldedProtocol::Sapling,
+        SubtreeRootIndex::new(4),
+        std::num::NonZeroU32::new(2).ok_or_else(|| eyre!("invalid root count"))?,
+    );
+
+    let outcome = source.fetch_subtree_root_range(requested_range).await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SubtreeRootsUnavailable {
+            protocol: ShieldedProtocol::Sapling,
+            start_index,
+            ..
+        }) if start_index == SubtreeRootIndex::new(4)
+    ));
+    assert_eq!(server.requests_for("z_getsubtreesbyindex")?.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_subtree_roots_rejects_response_above_requested_bound() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_getsubtreesbyindex").reply(
+        RpcReply::result(json!({
+            "pool": "sapling",
+            "start_index": 0,
+            "subtrees": [
+                {
+                    "root": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "end_height": 558_822
+                },
+                {
+                    "root": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "end_height": 670_209
+                }
+            ]
+        })),
+    )])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let outcome = source
+        .fetch_subtree_roots(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            std::num::NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
+        )
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_subtree_roots_rejects_descending_completion_heights() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_getsubtreesbyindex").reply(
+        RpcReply::result(json!({
+            "pool": "sapling",
+            "start_index": 0,
+            "subtrees": [
+                {
+                    "root": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "end_height": 670_209
+                },
+                {
+                    "root": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "end_height": 558_822
+                }
+            ]
+        })),
+    )])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let outcome = source
+        .fetch_subtree_roots(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            std::num::NonZeroU32::new(2).ok_or_else(|| eyre!("invalid max entries"))?,
+        )
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn json_rpc_warming_up_error_marks_subtree_roots_unavailable_retryable() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([
         method("z_getsubtreesbyindex").reply(RpcReply::error_with_code(-28, "node warming up"))
@@ -1095,8 +1167,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
             "info": {"title": "Zebra", "version": "8.0.0"},
             "methods": [
                 {"name": "getblock"},
-                {"name": "getbestblockhash"},
-                {"name": "getblockheader"},
+                {"name": "getbestblockheightandhash"},
                 {"name": "z_gettreestate"},
                 {"name": "z_getsubtreesbyindex"},
                 {"name": "sendrawtransaction"},
@@ -1128,7 +1199,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn probe_capabilities_falls_back_when_method_not_found() -> eyre::Result<()> {
+async fn probe_capabilities_rejects_missing_openrpc_discovery() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([
         method("rpc.discover").reply(RpcReply::error_with_code(-32601, "Method not found"))
     ])?;
@@ -1139,26 +1210,33 @@ async fn probe_capabilities_falls_back_when_method_not_found() -> eyre::Result<(
         Duration::from_secs(5),
     )?;
 
-    let probed = source.probe_capabilities().await?;
+    let error = match source.probe_capabilities().await {
+        Ok(capabilities) => {
+            return Err(eyre::eyre!(
+                "a Zebra source without OpenRPC discovery must fail closed, got {capabilities:?}"
+            ));
+        }
+        Err(error) => error,
+    };
 
-    assert!(probed.supports(NodeCapability::JsonRpc));
-    assert!(!probed.supports(NodeCapability::OpenRpcDiscovery));
-    assert!(probed.supports(NodeCapability::BestChainBlocks));
-    assert!(probed.supports(NodeCapability::TipId));
-    assert!(probed.supports(NodeCapability::TreeState));
-    assert!(probed.supports(NodeCapability::SubtreeRoots));
-    assert!(probed.supports(NodeCapability::ChainValuePools));
+    assert!(matches!(
+        error,
+        SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::OpenRpcDiscovery,
+        }
+    ));
 
     Ok(())
 }
 
 #[tokio::test]
-async fn probe_capabilities_requires_tip_id_method_set() -> eyre::Result<()> {
+async fn probe_capabilities_requires_atomic_tip_method() -> eyre::Result<()> {
     let server =
         JsonRpcTestServer::start([method("rpc.discover").reply(RpcReply::result(json!({
             "openrpc": "1.3.2",
             "methods": [
                 {"name": "getbestblockhash"},
+                {"name": "getblockheader"},
                 {"name": "rpc.discover"},
             ],
         })))])?;
@@ -1188,8 +1266,7 @@ async fn probe_capabilities_keeps_only_advertised_capabilities_on_success() -> e
         JsonRpcTestServer::start([method("rpc.discover").reply(RpcReply::result(json!({
             "openrpc": "1.3.2",
             "methods": [
-                {"name": "getbestblockhash"},
-                {"name": "getblockheader"},
+                {"name": "getbestblockheightandhash"},
                 {"name": "rpc.discover"},
             ],
         })))])?;
@@ -1213,74 +1290,469 @@ async fn probe_capabilities_keeps_only_advertised_capabilities_on_success() -> e
     Ok(())
 }
 
-#[tokio::test]
-async fn fetch_chain_checkpoint_parses_getblock_trees_field() -> eyre::Result<()> {
-    let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
-        "height": 100,
-        "hash": block_hash_hex,
-        "trees": {
-            "sapling": {"size": 1234},
-            "orchard": {"size": 567},
-            "ironwood": {"size": 89},
+const CHECKPOINT_BLOCK_HASH_HEX: &str =
+    "010101010101010101010101010101010101010101010101010101010101010f";
+const ONE_LEAF_SAPLING_FINAL_STATE_HEX: &str = "010100000000000000000000000000000000000000000000000000000000000000001f00000000000000000000000000000000000000000000000000000000000000";
+
+fn checkpoint_activations(
+    sapling_height: u32,
+    orchard_height: u32,
+) -> eyre::Result<NetworkUpgradeActivations> {
+    checkpoint_activations_with_ironwood(sapling_height, orchard_height, None)
+}
+
+fn checkpoint_activations_with_ironwood(
+    sapling_height: u32,
+    orchard_height: u32,
+    ironwood_height: Option<u32>,
+) -> eyre::Result<NetworkUpgradeActivations> {
+    let mut activations = vec![
+        NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(1),
+            activation_height: BlockHeight::new(sapling_height),
+            name: "Sapling".to_owned(),
         },
-    })))])?;
+        NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(2),
+            activation_height: BlockHeight::new(orchard_height),
+            name: "NU5".to_owned(),
+        },
+    ];
+    if let Some(ironwood_height) = ironwood_height {
+        activations.push(NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(3),
+            activation_height: BlockHeight::new(ironwood_height),
+            name: "NU6.3".to_owned(),
+        });
+    }
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        activations,
+    )?)
+}
+
+fn sapling_frontier_rpc_parts(
+    frontier: &Frontier<SaplingNode, 32>,
+) -> eyre::Result<(String, String)> {
+    let tree = CommitmentTree::from_frontier(frontier);
+    let mut final_state_bytes = Vec::new();
+    write_commitment_tree(&tree, &mut final_state_bytes)?;
+    let mut final_root_bytes = frontier.root().to_bytes();
+    final_root_bytes.reverse();
+    Ok((
+        hex::encode(final_root_bytes),
+        hex::encode(final_state_bytes),
+    ))
+}
+
+fn empty_sapling_frontier_rpc_parts() -> eyre::Result<(String, String)> {
+    sapling_frontier_rpc_parts(&Frontier::empty())
+}
+
+fn one_leaf_sapling_frontier_rpc_parts() -> eyre::Result<(String, String)> {
+    let leaf_bytes = {
+        let mut bytes = [0; 32];
+        bytes[0] = 1;
+        bytes
+    };
+    let leaf = Option::<SaplingNode>::from(SaplingNode::from_bytes(leaf_bytes))
+        .ok_or_else(|| eyre!("one is a canonical Sapling field element"))?;
+    let frontier: Frontier<SaplingNode, 32> =
+        Frontier::from_parts(Position::from(0), leaf, Vec::new())
+            .map_err(|error| eyre!("valid one-leaf frontier rejected: {error:?}"))?;
+    sapling_frontier_rpc_parts(&frontier)
+}
+
+fn one_leaf_orchard_frontier_rpc_parts(leaf_byte: u8) -> eyre::Result<(String, String)> {
+    let leaf_bytes = {
+        let mut bytes = [0; 32];
+        bytes[0] = leaf_byte;
+        bytes
+    };
+    let leaf = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&leaf_bytes))
+        .ok_or_else(|| eyre!("small integers are canonical Orchard field elements"))?;
+    let frontier: Frontier<MerkleHashOrchard, 32> =
+        Frontier::from_parts(Position::from(0), leaf, Vec::new())
+            .map_err(|error| eyre!("valid one-leaf frontier rejected: {error:?}"))?;
+    let tree = CommitmentTree::from_frontier(&frontier);
+    let mut final_state_bytes = Vec::new();
+    write_commitment_tree(&tree, &mut final_state_bytes)?;
+    Ok((
+        hex::encode(frontier.root().to_bytes()),
+        hex::encode(final_state_bytes),
+    ))
+}
+
+fn full_sapling_frontier_state_hex() -> eyre::Result<String> {
+    let leaf_bytes = {
+        let mut bytes = [0; 32];
+        bytes[0] = 1;
+        bytes
+    };
+    let leaf = Option::<SaplingNode>::from(SaplingNode::from_bytes(leaf_bytes))
+        .ok_or_else(|| eyre!("one is a canonical Sapling field element"))?;
+    let tree =
+        CommitmentTree::<SaplingNode, 32>::from_parts(Some(leaf), Some(leaf), vec![Some(leaf); 31])
+            .map_err(|()| eyre!("depth-32 legacy tree accepts 31 parent slots"))?;
+    let mut final_state_bytes = Vec::new();
+    write_commitment_tree(&tree, &mut final_state_bytes)?;
+    Ok(hex::encode(final_state_bytes))
+}
+
+fn checkpoint_response(final_root: Option<&str>, final_state: Option<&str>) -> Value {
+    json!({
+        "height": 100,
+        "hash": CHECKPOINT_BLOCK_HASH_HEX,
+        "time": 1_774_668_700,
+        "sapling": {"commitments": {
+            "finalRoot": final_root,
+            "finalState": final_state,
+        }},
+        "orchard": {"commitments": {}},
+    })
+}
+
+fn checkpoint_response_with_all_frontiers(
+    sapling: (&str, &str),
+    orchard: (&str, &str),
+    ironwood: (&str, &str),
+) -> Value {
+    json!({
+        "height": 100,
+        "hash": CHECKPOINT_BLOCK_HASH_HEX,
+        "time": 1_774_668_700,
+        "sapling": {"commitments": {
+            "finalRoot": sapling.0,
+            "finalState": sapling.1,
+        }},
+        "orchard": {"commitments": {
+            "finalRoot": orchard.0,
+            "finalState": orchard.1,
+        }},
+        "ironwood": {"commitments": {
+            "finalRoot": ironwood.0,
+            "finalState": ironwood.1,
+        }},
+    })
+}
+
+async fn fetch_checkpoint_response(
+    response: Value,
+    activations: &NetworkUpgradeActivations,
+) -> eyre::Result<Result<zinder_core::CommitmentTreeCheckpoint, SourceError>> {
+    let server =
+        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(response))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
         NodeAuth::None,
         Duration::from_secs(5),
     )?;
+    Ok(source
+        .fetch_chain_checkpoint(BlockHeight::new(100), activations)
+        .await)
+}
 
-    let checkpoint = source.fetch_chain_checkpoint(BlockHeight::new(100)).await?;
+#[tokio::test]
+async fn fetch_chain_checkpoint_uses_one_tree_state_request_and_decodes_nonempty_frontier()
+-> eyre::Result<()> {
+    let (final_root, final_state) = one_leaf_sapling_frontier_rpc_parts()?;
+    assert_eq!(final_state, ONE_LEAF_SAPLING_FINAL_STATE_HEX);
+    let server = JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(
+        checkpoint_response(Some(&final_root), Some(&final_state)),
+    ))])?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    let activations = checkpoint_activations(1, 200)?;
 
-    assert_eq!(checkpoint.height, BlockHeight::new(100));
-    assert_eq!(checkpoint.hash, decode_rpc_block_hash(block_hash_hex)?);
+    let checkpoint = source
+        .fetch_chain_checkpoint(BlockHeight::new(100), &activations)
+        .await?;
+
+    assert_eq!(checkpoint.block_id.height, BlockHeight::new(100));
+    assert_eq!(checkpoint.block_time_seconds, 1_774_668_700);
     assert_eq!(
-        checkpoint.tip_metadata,
-        ChainTipMetadata::new(1234, 567, 89)
+        checkpoint.block_id.hash,
+        decode_rpc_block_hash(CHECKPOINT_BLOCK_HASH_HEX)?
     );
-    assert!(
-        server.requests_for("getblockhash")?.is_empty(),
-        "checkpoint fetch should use height-keyed getblock directly"
+    assert_eq!(checkpoint.tip_metadata().sapling_commitment_tree_size, 1);
+    assert_eq!(
+        checkpoint
+            .frontiers
+            .sapling()
+            .ok_or_else(|| eyre!("sapling frontier must be present"))?
+            .final_state_bytes(),
+        hex::decode(ONE_LEAF_SAPLING_FINAL_STATE_HEX)?,
+    );
+    assert_eq!(server.requests()?.len(), 1);
+    assert_eq!(
+        server.requests_for("z_gettreestate")?[0].params,
+        json!(["100"])
+    );
+    assert!(server.requests_for("getblock")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_accepts_active_empty_canonical_frontier() -> eyre::Result<()> {
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+    assert_eq!(final_state, "000000");
+    let checkpoint = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), Some(&final_state)),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await??;
+
+    assert_eq!(checkpoint.tip_metadata().sapling_commitment_tree_size, 0);
+    assert!(checkpoint.frontiers.sapling().is_some());
+    assert!(checkpoint.frontiers.orchard().is_none());
+    assert!(checkpoint.frontiers.ironwood().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_accepts_schedule_with_post_canopy_pools_disabled()
+-> eyre::Result<()> {
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        vec![NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(1),
+            activation_height: BlockHeight::new(1),
+            name: "Sapling".to_owned(),
+        }],
+    )?;
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+
+    let checkpoint = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), Some(&final_state)),
+        &activations,
+    )
+    .await??;
+
+    assert!(checkpoint.frontiers.sapling().is_some());
+    assert!(checkpoint.frontiers.orchard().is_none());
+    assert!(checkpoint.frontiers.ironwood().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_decodes_same_height_pool_activations_independently()
+-> eyre::Result<()> {
+    let sapling = one_leaf_sapling_frontier_rpc_parts()?;
+    let orchard = one_leaf_orchard_frontier_rpc_parts(1)?;
+    let ironwood = one_leaf_orchard_frontier_rpc_parts(2)?;
+    let response = checkpoint_response_with_all_frontiers(
+        (&sapling.0, &sapling.1),
+        (&orchard.0, &orchard.1),
+        (&ironwood.0, &ironwood.1),
+    );
+    let checkpoint = fetch_checkpoint_response(
+        response,
+        &checkpoint_activations_with_ironwood(1, 1, Some(1))?,
+    )
+    .await??;
+
+    assert_eq!(checkpoint.tip_metadata().sapling_commitment_tree_size, 1);
+    assert_eq!(checkpoint.tip_metadata().orchard_commitment_tree_size, 1);
+    assert_eq!(checkpoint.tip_metadata().ironwood_commitment_tree_size, 1);
+    assert_eq!(
+        checkpoint
+            .frontiers
+            .orchard()
+            .ok_or_else(|| eyre!("orchard frontier must be present"))?
+            .final_root()
+            .as_bytes(),
+        <[u8; 32]>::try_from(hex::decode(&orchard.0)?.as_slice())?,
+        "Orchard finalRoot bytes must stay in direct RPC order",
     );
     assert_eq!(
-        server.requests_for("getblock")?[0].params,
-        json!(["100", 1])
+        checkpoint
+            .frontiers
+            .ironwood()
+            .ok_or_else(|| eyre!("ironwood frontier must be present"))?
+            .final_state_bytes(),
+        hex::decode(&ironwood.1)?,
+    );
+    assert_ne!(
+        checkpoint
+            .frontiers
+            .orchard()
+            .ok_or_else(|| eyre!("orchard frontier must be present"))?
+            .final_root(),
+        checkpoint
+            .frontiers
+            .ironwood()
+            .ok_or_else(|| eyre!("ironwood frontier must be present"))?
+            .final_root(),
+        "Orchard and Ironwood use independent frontiers",
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_chain_checkpoint_defaults_missing_tree_pools_to_zero() -> eyre::Result<()> {
-    let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
-        "height": 100,
-        "hash": block_hash_hex,
-        "trees": {},
-    })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    let checkpoint = source.fetch_chain_checkpoint(BlockHeight::new(100)).await?;
-
-    assert_eq!(checkpoint.height, BlockHeight::new(100));
-    assert_eq!(checkpoint.hash, decode_rpc_block_hash(block_hash_hex)?);
-    assert_eq!(checkpoint.tip_metadata, ChainTipMetadata::empty());
+async fn fetch_chain_checkpoint_rejects_height_mismatch() -> eyre::Result<()> {
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+    let mut response = checkpoint_response(Some(&final_root), Some(&final_state));
+    response["height"] = json!(99);
+    let outcome = fetch_checkpoint_response(response, &checkpoint_activations(1, 200)?).await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_chain_checkpoint_rejects_response_without_trees() -> eyre::Result<()> {
-    let block_hash_hex = "010101010101010101010101010101010101010101010101010101010101010f";
-    let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!({
-        "height": 100,
-        "hash": block_hash_hex,
-    })))])?;
+async fn fetch_chain_checkpoint_rejects_one_sided_frontier() -> eyre::Result<()> {
+    let (final_root, _) = empty_sapling_frontier_rpc_parts()?;
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), None),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::MalformedCommitmentTreeFrontier {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_trailing_frontier_bytes() -> eyre::Result<()> {
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), Some(&format!("{final_state}00"))),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::InvalidCommitmentTreeFrontierEncoding {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_frontier_root_mismatch() -> eyre::Result<()> {
+    let (_, final_state) = empty_sapling_frontier_rpc_parts()?;
+    let wrong_root = hex::encode([0; 32]);
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&wrong_root), Some(&final_state)),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::CommitmentTreeFrontierRootMismatch {
+            protocol: ShieldedProtocol::Sapling,
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_tree_size_outside_u32_contract() -> eyre::Result<()> {
+    let final_state = full_sapling_frontier_state_hex()?;
+    let placeholder_root = hex::encode([0; 32]);
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&placeholder_root), Some(&final_state)),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::CommitmentTreeSizeOutOfRange {
+            protocol: ShieldedProtocol::Sapling,
+            tree_size: 4_294_967_296,
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_inactive_present_frontier() -> eyre::Result<()> {
+    let (final_root, final_state) = empty_sapling_frontier_rpc_parts()?;
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(Some(&final_root), Some(&final_state)),
+        &checkpoint_activations(200, 300)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::CommitmentTreeFrontierActivationMismatch {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_active_missing_frontier() -> eyre::Result<()> {
+    let outcome = fetch_checkpoint_response(
+        checkpoint_response(None, None),
+        &checkpoint_activations(1, 200)?,
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::CommitmentTreeFrontierActivationMismatch {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_activation_table_without_required_upgrades()
+-> eyre::Result<()> {
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        vec![NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(2),
+            activation_height: BlockHeight::new(200),
+            name: "NU5".to_owned(),
+        }],
+    )?;
+    let outcome = fetch_checkpoint_response(json!({}), &activations).await?;
+    assert!(matches!(
+        outcome,
+        Err(SourceError::SourceProtocolMismatch { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_checkpoint_rejects_activation_table_for_another_network_before_rpc()
+-> eyre::Result<()> {
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashTestnet,
+        vec![
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(1),
+                activation_height: BlockHeight::new(1),
+                name: "Sapling".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(2),
+                activation_height: BlockHeight::new(1),
+                name: "NU5".to_owned(),
+            },
+        ],
+    )?;
+    let server =
+        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(json!({})))])?;
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         server.url(),
@@ -1288,12 +1760,15 @@ async fn fetch_chain_checkpoint_rejects_response_without_trees() -> eyre::Result
         Duration::from_secs(5),
     )?;
 
-    let outcome = source.fetch_chain_checkpoint(BlockHeight::new(100)).await;
+    let outcome = source
+        .fetch_chain_checkpoint(BlockHeight::new(100), &activations)
+        .await;
 
     assert!(matches!(
         outcome,
         Err(SourceError::SourceProtocolMismatch { .. })
     ));
+    assert!(server.requests()?.is_empty());
     Ok(())
 }
 
@@ -1653,6 +2128,14 @@ fn fixture_block() -> eyre::Result<Value> {
         "../../../../services/zinder-ingest/tests/fixtures/z3-regtest-block-1.json"
     ))
     .map_err(|error| eyre!("failed to parse fixture block: {error}"))
+}
+
+fn zebra_tip_response(fixture: &Value) -> eyre::Result<Value> {
+    let hash = decode_rpc_block_hash(string_field(fixture, "hash")?)?;
+    Ok(json!({
+        "height": fixture["height"],
+        "hash": hash.as_bytes(),
+    }))
 }
 
 fn string_field<'fixture>(

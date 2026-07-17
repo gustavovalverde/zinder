@@ -20,7 +20,7 @@ use std::{
 
 use eyre::Result;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
-use zinder_ingest::{BulkCatchupRunConfig, NodeSourceKind};
+use zinder_ingest::{BulkCatchupRunConfig, CanonicalPipelineLimits, NodeSourceKind};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_testkit::live::LiveTestEnv;
 
@@ -45,6 +45,7 @@ pub(crate) fn live_bulk_catchup_run_config(
         node_source: NodeSourceKind::ZebraJsonRpc,
         storage_path: storage_path.to_owned(),
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        reorg_window_blocks: 100,
         raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
         network_upgrade_activations,
         from_height,
@@ -60,15 +61,18 @@ pub(crate) fn live_bulk_catchup_run_config(
             zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )
         .unwrap_or(NonZeroU32::MIN),
-        source_segment_max_blocks: SOURCE_SEGMENT_MAX_BLOCKS,
-        source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-            .unwrap_or(NonZeroU64::MIN),
-        source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
-        source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-            .unwrap_or(NonZeroU64::MIN),
-        block_prepare_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
-        block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .unwrap_or(NonZeroU64::MIN),
+        pipeline_limits: CanonicalPipelineLimits {
+            max_response_bytes: env.target.max_response_bytes,
+            source_segment_max_blocks: SOURCE_SEGMENT_MAX_BLOCKS,
+            source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+            source_fetch_max_in_flight_requests: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
+            source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+            block_prepare_concurrency: SOURCE_SEGMENT_MAX_BLOCKS,
+            block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+        },
         commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
         flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),

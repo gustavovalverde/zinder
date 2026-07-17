@@ -6,12 +6,14 @@ use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockId, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, FinalNoteCommitmentRoot, Network, ShieldedProtocol, TransactionId,
+    TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
     UnixTimestampMillis,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochReader, ChainStoreOptions,
-    DisplacedBlockStore, PrimaryChainStore, ReorgWindowChange, SecondaryChainStore, StoreError,
+    DisplacedBlockStore, PrimaryChainStore, RawBlobRetention, ReorgWindowChange,
+    SecondaryChainStore, StoreError,
 };
 
 #[test]
@@ -27,7 +29,7 @@ fn replacement_archives_displaced_blocks_without_affecting_canonical_reads() -> 
     let replacement_hash_3 = block_hash(30);
 
     {
-        let store = PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
+        let store = PrimaryChainStore::open(&primary_path, raw_blob_test_options())?;
         store.commit_chain_epoch(initial_artifacts(
             old_hash_2,
             old_hash_3,
@@ -67,7 +69,7 @@ fn replacement_archives_displaced_blocks_without_affecting_canonical_reads() -> 
         assert_historical_reader_rejects_displaced_roots(&historical)?;
     }
 
-    let reopened = PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
+    let reopened = PrimaryChainStore::open(&primary_path, raw_blob_test_options())?;
     assert_eq!(reopened.displaced_block_count()?, 2);
     assert_eq!(
         reopened
@@ -77,11 +79,8 @@ fn replacement_archives_displaced_blocks_without_affecting_canonical_reads() -> 
     );
     drop(reopened);
 
-    let secondary = SecondaryChainStore::open(
-        &primary_path,
-        &secondary_path,
-        ChainStoreOptions::for_local_tests(),
-    )?;
+    let secondary =
+        SecondaryChainStore::open(&primary_path, &secondary_path, raw_blob_test_options())?;
     assert_eq!(secondary.displaced_block_count()?, 2);
     assert_eq!(secondary.newest_displaced_blocks(nonzero(8)?)?.len(), 2);
     let secondary_reader = secondary.current_chain_epoch_reader()?;
@@ -105,18 +104,15 @@ fn secondary_reader_pins_roots_coverage_and_canonical_validation_to_one_snapshot
     let old_hash_3 = block_hash(3);
     let replacement_hash_2 = block_hash(20);
     let replacement_hash_3 = block_hash(30);
-    let primary = PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
+    let primary = PrimaryChainStore::open(&primary_path, raw_blob_test_options())?;
     primary.commit_chain_epoch(initial_artifacts(
         old_hash_2,
         old_hash_3,
         transaction_id(2),
         transaction_id(3),
     ))?;
-    let secondary = SecondaryChainStore::open(
-        &primary_path,
-        &secondary_path,
-        ChainStoreOptions::for_local_tests(),
-    )?;
+    let secondary =
+        SecondaryChainStore::open(&primary_path, &secondary_path, raw_blob_test_options())?;
     let before_catchup = secondary.current_chain_epoch_reader()?;
     assert_eq!(before_catchup.displaced_root_archive_coverage()?, None);
     assert_eq!(
@@ -169,7 +165,7 @@ fn secondary_reader_pins_roots_coverage_and_canonical_validation_to_one_snapshot
 #[test]
 fn failed_replacement_writes_no_archive_rows_or_metadata() -> eyre::Result<()> {
     let tempdir = tempdir()?;
-    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let store = PrimaryChainStore::open(tempdir.path(), raw_blob_test_options())?;
     let old_hash_2 = block_hash(2);
     let old_hash_3 = block_hash(3);
     store.commit_chain_epoch(initial_artifacts(
@@ -210,9 +206,11 @@ fn failed_replacement_writes_no_archive_rows_or_metadata() -> eyre::Result<()> {
 
     let replacement_hash = block_hash(30);
     let replacement_epoch = chain_epoch(2, replacement_hash, 2_000);
-    let replacement_header = block_header(3, replacement_hash, old_hash_2);
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    let mut replacement_header = block_header(3, replacement_hash, old_hash_2);
+    let replacement_block_blob =
+        bind_raw_block_blob(&mut replacement_header, b"raw-replacement-block-3".to_vec());
+    store.commit_chain_epoch(super::with_synthetic_block_replay_envelopes(
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_header.clone()],
             vec![CompactBlockArtifact::new(
@@ -221,10 +219,11 @@ fn failed_replacement_writes_no_archive_rows_or_metadata() -> eyre::Result<()> {
                 [0x03],
             )],
         )
+        .with_block_blobs(vec![replacement_block_blob])
         .with_reorg_window_change(ReorgWindowChange::Replace {
             from_height: BlockHeight::new(3),
         }),
-    )?;
+    ))?;
     assert_eq!(store.displaced_block_count()?, 1);
     let current_reader = store.current_chain_epoch_reader()?;
     assert_eq!(
@@ -263,7 +262,7 @@ fn assert_historical_reader_rejects_displaced_roots(
 #[test]
 fn repeated_displacement_counts_occurrences_and_pages_strictly_older() -> eyre::Result<()> {
     let tempdir = tempdir()?;
-    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let store = PrimaryChainStore::open(tempdir.path(), raw_blob_test_options())?;
     let hash_a = block_hash(3);
     let hash_b = block_hash(30);
     let mut initial =
@@ -350,11 +349,21 @@ fn initial_artifacts(
     coinbase_id_3: TransactionId,
 ) -> ChainEpochArtifacts {
     let epoch = chain_epoch(1, old_hash_3, 1_000);
-    let headers = vec![
+    let mut headers = vec![
         block_header(1, block_hash(1), block_hash(0)),
         block_header(2, old_hash_2, block_hash(1)),
         block_header(3, old_hash_3, old_hash_2),
     ];
+    let block_blobs = headers
+        .iter_mut()
+        .map(|header| {
+            let height = header.height;
+            bind_raw_block_blob(
+                header,
+                format!("raw-old-block-{}", height.value()).into_bytes(),
+            )
+        })
+        .collect();
     let compacts = headers
         .iter()
         .map(|header| CompactBlockArtifact::new(header.height, header.block_hash, [0x01]))
@@ -363,6 +372,22 @@ fn initial_artifacts(
         BlockTransactionIndexArtifact::new(BlockHeight::new(2), 0, coinbase_id_2, old_hash_2),
         BlockTransactionIndexArtifact::new(BlockHeight::new(3), 0, coinbase_id_3, old_hash_3),
     ];
+    let (_, location_2, transaction_facts_2, transaction_blob_2) =
+        super::synthetic_transaction_rows(
+            coinbase_id_2,
+            BlockHeight::new(2),
+            old_hash_2,
+            0,
+            b"coinbase-2",
+        );
+    let (_, location_3, transaction_facts_3, transaction_blob_3) =
+        super::synthetic_transaction_rows(
+            coinbase_id_3,
+            BlockHeight::new(3),
+            old_hash_3,
+            0,
+            b"coinbase-3",
+        );
     let outpoint = TransparentOutPoint::new(coinbase_id_2, 0);
     let output = TransparentOutputArtifact::new(
         outpoint,
@@ -372,16 +397,30 @@ fn initial_artifacts(
         BlockHeight::new(2),
         old_hash_2,
     );
-    ChainEpochArtifacts::new(epoch, headers, compacts)
-        .with_block_blobs(vec![BlockBlobArtifact::new(
-            BlockHeight::new(2),
-            old_hash_2,
-            block_hash(1),
-            b"raw-old-block-2".to_vec(),
-        )])
-        .with_block_transaction_index(transaction_index)
-        .with_final_note_commitment_roots(vec![final_roots(BlockHeight::new(2), old_hash_2, 0x42)])
-        .with_transparent_outputs_by_outpoint(vec![output])
+    super::with_synthetic_block_replay_envelopes(
+        super::synthetic_chain_epoch_artifacts(epoch, headers, compacts)
+            .with_block_blobs(block_blobs)
+            .with_block_transaction_index(transaction_index)
+            .with_transaction_locations(vec![location_2, location_3])
+            .with_transaction_facts(vec![transaction_facts_2, transaction_facts_3])
+            .with_transaction_intrinsic_value_balances(vec![
+                TransactionIntrinsicValueBalancesArtifact::new(
+                    location_2,
+                    TransactionIntrinsicValueBalances::default(),
+                ),
+                TransactionIntrinsicValueBalancesArtifact::new(
+                    location_3,
+                    TransactionIntrinsicValueBalances::default(),
+                ),
+            ])
+            .with_transaction_blobs(vec![transaction_blob_2, transaction_blob_3])
+            .with_final_note_commitment_roots(vec![final_roots(
+                BlockHeight::new(2),
+                old_hash_2,
+                0x42,
+            )])
+            .with_transparent_outputs_by_outpoint(vec![output]),
+    )
 }
 
 fn assert_multi_block_archive(
@@ -396,7 +435,7 @@ fn assert_multi_block_archive(
     let newest = store.newest_displaced_blocks(nonzero(1)?)?;
     assert_eq!(newest.len(), 1);
     assert_eq!(newest[0].block_hash, old_hash_3);
-    assert_eq!(newest[0].raw_block_bytes, None);
+    assert_eq!(newest[0].raw_block_bytes, Some(b"raw-old-block-3".to_vec()));
     assert_eq!(newest[0].transaction_ids, vec![coinbase_id_3]);
 
     let displaced_2 = store
@@ -476,18 +515,30 @@ fn assert_displaced_root_capture(
 
 fn replacement_artifacts(hash_2: BlockHash, hash_3: BlockHash) -> ChainEpochArtifacts {
     let epoch = chain_epoch(2, hash_3, 2_000);
-    let headers = vec![
+    let mut headers = vec![
         block_header(2, hash_2, block_hash(1)),
         block_header(3, hash_3, hash_2),
     ];
+    let block_blobs = headers
+        .iter_mut()
+        .map(|header| {
+            let height = header.height;
+            bind_raw_block_blob(
+                header,
+                format!("raw-replacement-block-{}", height.value()).into_bytes(),
+            )
+        })
+        .collect();
     let compacts = headers
         .iter()
         .map(|header| CompactBlockArtifact::new(header.height, header.block_hash, [0x02]))
         .collect();
-    ChainEpochArtifacts::new(epoch, headers, compacts).with_reorg_window_change(
-        ReorgWindowChange::Replace {
-            from_height: BlockHeight::new(2),
-        },
+    super::with_synthetic_block_replay_envelopes(
+        super::synthetic_chain_epoch_artifacts(epoch, headers, compacts)
+            .with_block_blobs(block_blobs)
+            .with_reorg_window_change(ReorgWindowChange::Replace {
+                from_height: BlockHeight::new(2),
+            }),
     )
 }
 
@@ -497,24 +548,31 @@ fn single_block_replacement(
     root_seed: u8,
 ) -> ChainEpochArtifacts {
     let epoch = chain_epoch(epoch_id, block_hash, epoch_id.saturating_mul(1_000));
-    let header = block_header(3, block_hash, self::block_hash(2));
-    ChainEpochArtifacts::new(
-        epoch,
-        vec![header.clone()],
-        vec![CompactBlockArtifact::new(
+    let mut header = block_header(3, block_hash, self::block_hash(2));
+    let block_blob = bind_raw_block_blob(
+        &mut header,
+        format!("raw-replacement-block-{epoch_id}").into_bytes(),
+    );
+    super::with_synthetic_block_replay_envelopes(
+        super::synthetic_chain_epoch_artifacts(
+            epoch,
+            vec![header.clone()],
+            vec![CompactBlockArtifact::new(
+                header.height,
+                header.block_hash,
+                [0x04],
+            )],
+        )
+        .with_block_blobs(vec![block_blob])
+        .with_final_note_commitment_roots(vec![final_roots(
             header.height,
             header.block_hash,
-            [0x04],
-        )],
+            root_seed,
+        )])
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: BlockHeight::new(3),
+        }),
     )
-    .with_final_note_commitment_roots(vec![final_roots(
-        header.height,
-        header.block_hash,
-        root_seed,
-    )])
-    .with_reorg_window_change(ReorgWindowChange::Replace {
-        from_height: BlockHeight::new(3),
-    })
 }
 
 fn final_roots(
@@ -535,6 +593,13 @@ fn final_root(seed: u8) -> FinalNoteCommitmentRoot {
     FinalNoteCommitmentRoot::from_bytes([seed; 32])
 }
 
+fn raw_blob_test_options() -> ChainStoreOptions {
+    ChainStoreOptions {
+        raw_blob_retention: RawBlobRetention::All,
+        ..ChainStoreOptions::for_local_tests()
+    }
+}
+
 fn chain_epoch(id: u64, tip_hash: BlockHash, created_at: u64) -> ChainEpoch {
     ChainEpoch {
         id: ChainEpochId::new(id),
@@ -551,6 +616,19 @@ fn chain_epoch(id: u64, tip_hash: BlockHash, created_at: u64) -> ChainEpoch {
 
 fn block_header(height: u32, hash: BlockHash, parent_hash: BlockHash) -> BlockHeaderArtifact {
     super::synthetic_block_header(BlockHeight::new(height), hash, parent_hash, b"header")
+}
+
+fn bind_raw_block_blob(
+    header: &mut BlockHeaderArtifact,
+    raw_block_bytes: Vec<u8>,
+) -> BlockBlobArtifact {
+    header.block_size_bytes = u64::try_from(raw_block_bytes.len()).unwrap_or(u64::MAX);
+    BlockBlobArtifact::new(
+        header.height,
+        header.block_hash,
+        header.parent_hash,
+        raw_block_bytes,
+    )
 }
 
 fn block_hash(seed: u32) -> BlockHash {

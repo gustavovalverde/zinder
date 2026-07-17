@@ -39,13 +39,22 @@ name: zinder-${Z3_NETWORK_LOWER:-mainnet}
 # and z3-<network>-cookie volume), ZINDER_NETWORK__NAME, the Zebra JSON-RPC
 # + indexer ports, and the per-network host-port offsets. The defaults below
 # match mainnet so omitting --env-file deploys the mainnet flavour.
+#
+# Reproducible canary or validation runs may pin ZINDER_INGEST_IMAGE,
+# ZINDER_QUERY_IMAGE, and ZINDER_EXPLORER_IMAGE to immutable current-branch
+# tags. They may also isolate state with ZINDER_SINGLE_HOST_DATA_VOLUME_NAME,
+# ZINDER_PROMETHEUS_VOLUME_NAME, ZINDER_GRAFANA_VOLUME_NAME, and
+# ZINDER_OBSERVABILITY_NETWORK_NAME. Normal deployments omit these overrides
+# and retain the stable per-network names below.
 
 networks:
   z3:
     external: true
     name: z3-${Z3_NETWORK_LOWER:-mainnet}
   observability:
-    name: zinder-${Z3_NETWORK_LOWER:-mainnet}-observability
+    # Override for isolated validation, canary, or side-by-side deployments.
+    # The default remains the stable per-network production name.
+    name: ${ZINDER_OBSERVABILITY_NETWORK_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-observability}
 
 services:
   # Unified ingest loop per ADR-0015. The single process classifies
@@ -53,7 +62,7 @@ services:
   # AwaitingUpstream / BulkCatchup / FollowingTip; bulk catch-up is no
   # longer a separate Compose service.
   zinder-ingest:
-    image: zinder-ingest:latest
+    image: ${ZINDER_INGEST_IMAGE:-zinder-ingest:latest}
     mem_limit: ${ZINDER_INGEST_MEMORY_LIMIT:-14g}
     build:
       context: ..
@@ -65,6 +74,7 @@ services:
       - data:/var/lib/zinder
       - ./config/ingest.toml:/etc/zinder/config.toml:ro
       - z3-cookie:/var/run/auth:ro
+    command: ["--config", "/etc/zinder/config.toml"]
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
       # Default to Z3's in-network Zebra DNS name and per-network ports.
@@ -99,7 +109,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: zinder-query
-    image: zinder-query:latest
+    image: ${ZINDER_QUERY_IMAGE:-zinder-query:latest}
     mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-4g}
     restart: on-failure
     depends_on:
@@ -110,6 +120,7 @@ services:
       - data:/var/lib/zinder
       - ./config/query.toml:/etc/zinder/config.toml:ro
       - z3-cookie:/var/run/auth:ro
+    command: ["--config", "/etc/zinder/config.toml"]
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
@@ -138,7 +149,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: zinder-explorer
-    image: zinder-explorer:latest
+    image: ${ZINDER_EXPLORER_IMAGE:-zinder-explorer:latest}
     mem_limit: ${ZINDER_EXPLORER_MEMORY_LIMIT:-4g}
     restart: on-failure
     depends_on:
@@ -148,6 +159,7 @@ services:
     volumes:
       - data:/var/lib/zinder
       - ./config/explorer.toml:/etc/zinder/config.toml:ro
+    command: ["--config", "/etc/zinder/config.toml"]
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
       # Explorer delegates some reads to the wallet plane via in-network DNS.
@@ -219,11 +231,11 @@ services:
 
 volumes:
   data:
-    name: zinder-${Z3_NETWORK_LOWER:-mainnet}-data
+    name: ${ZINDER_SINGLE_HOST_DATA_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-data}
   prometheus:
-    name: zinder-${Z3_NETWORK_LOWER:-mainnet}-prometheus
+    name: ${ZINDER_PROMETHEUS_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-prometheus}
   grafana:
-    name: zinder-${Z3_NETWORK_LOWER:-mainnet}-grafana
+    name: ${ZINDER_GRAFANA_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-grafana}
   z3-cookie:
     external: true
     name: z3-${Z3_NETWORK_LOWER:-mainnet}-cookie

@@ -92,6 +92,14 @@ fn typed_detail_for(error: &StoreError) -> ErrorDetails {
             format!("snapshot_page:{anchor_event_sequence}"),
             format!("current applied mempool-event sequence is {current_event_sequence}"),
         )]),
+        StoreError::ArtifactRangeTooLarge {
+            requested_block_count,
+            maximum_block_count,
+            ..
+        } => ErrorDetails::with_bad_request(vec![FieldViolation::new(
+            "max_blocks",
+            format!("requested {requested_block_count} blocks; maximum is {maximum_block_count}"),
+        )]),
         StoreError::ArtifactMissing { family, key } => ErrorDetails::with_resource_info(
             family.wire_label(),
             format!("{key:?}"),
@@ -130,8 +138,11 @@ impl BoundaryError for StoreError {
             Self::MempoolEventCursorExpired { .. } => ErrorReason::MempoolEventCursorExpired,
             Self::SnapshotPageCursorInvalid { .. } => ErrorReason::SnapshotPageCursorInvalid,
             Self::SnapshotPageCursorExpired { .. } => ErrorReason::SnapshotPageCursorExpired,
-            Self::SchemaMismatch { .. } | Self::SchemaTooOld { .. } => ErrorReason::SchemaMismatch,
+            Self::SchemaMismatch { .. }
+            | Self::StoreSchemaIncomplete { .. }
+            | Self::SchemaTooOld { .. } => ErrorReason::SchemaMismatch,
             Self::SchemaTooNew { .. } => ErrorReason::SchemaTooNew,
+            Self::ArtifactRangeTooLarge { .. } => ErrorReason::InvalidBlockRange,
             Self::ReorgWindowExceeded { .. } => ErrorReason::ReorgWindowExceeded,
             Self::ChainEpochConflict { .. } => ErrorReason::ChainEpochConflict,
             Self::ChainEpochNetworkMismatch { .. } => ErrorReason::ChainEpochNetworkMismatch,
@@ -144,7 +155,9 @@ impl BoundaryError for StoreError {
             Self::ArtifactCorrupt { .. } => ErrorReason::ArtifactCorrupt,
             Self::InvalidChainEpochArtifacts { .. } => ErrorReason::InvalidChainEpochArtifacts,
             Self::ArtifactPayloadTooLarge { .. } => ErrorReason::ArtifactPayloadTooLarge,
-            Self::InvalidChainStoreOptions { .. } => ErrorReason::InvalidChainStoreOptions,
+            Self::InvalidChainStoreOptions { .. } | Self::RawBlobRetentionMismatch { .. } => {
+                ErrorReason::InvalidChainStoreOptions
+            }
             _ => ErrorReason::StorageUnavailable,
         }
     }
@@ -193,6 +206,11 @@ mod tests {
                 first_available_height: BlockHeight::new(2),
                 checkpoint: BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             },
+            StoreError::ArtifactRangeTooLarge {
+                family: ArtifactFamily::BlockReplay,
+                requested_block_count: std::num::NonZeroU32::MIN.saturating_add(256),
+                maximum_block_count: std::num::NonZeroU32::MIN.saturating_add(255),
+            },
             StoreError::ChainEpochConflict {
                 current: ChainEpochId::new(1),
                 attempted: ChainEpochId::new(2),
@@ -201,9 +219,16 @@ mod tests {
                 current: Network::ZcashMainnet,
                 attempted: Network::ZcashTestnet,
             },
+            StoreError::RawBlobRetentionMismatch {
+                persisted: crate::RawBlobRetention::None,
+                configured: crate::RawBlobRetention::All,
+            },
             StoreError::SchemaMismatch {
                 persisted_version: 1,
                 expected_version: 2,
+            },
+            StoreError::StoreSchemaIncomplete {
+                missing_column_family: "probe",
             },
             StoreError::SchemaTooNew {
                 persisted_version: 3,

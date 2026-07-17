@@ -6,12 +6,17 @@
 use eyre::eyre;
 use std::sync::Arc;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
-    TransactionId, TxStatus, UnixTimestampMillis,
+    BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, Network, TransactionId, TxStatus,
+    UnixTimestampMillis,
 };
 use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
-use zinder_store::ChainEpochArtifacts;
-use zinder_testkit::{FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations};
+use zinder_store::{
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention,
+};
+use zinder_testkit::{
+    FixtureTransactionRows, StoreFixture, encode_fixture_block_replay,
+    sample_regtest_upgrade_activations,
+};
 
 use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
 
@@ -20,10 +25,12 @@ async fn compact_block_at_returns_indexed_block() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block.clone()],
     ))?;
 
@@ -43,10 +50,12 @@ async fn compact_block_at_reports_unavailable_for_missing_height() -> eyre::Resu
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 
@@ -77,7 +86,7 @@ async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result
         visible_tip_hash: checkpoint_hash,
         settled_tip_height: checkpoint_height,
         settled_tip_hash: checkpoint_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::new(130_002, 39_758, 0),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -97,7 +106,10 @@ async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result
 
 #[tokio::test]
 async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
+    let store_fixture = StoreFixture::open_with_options(ChainStoreOptions {
+        raw_blob_retention: RawBlobRetention::Transactions,
+        ..ChainStoreOptions::for_local_tests()
+    })?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let transaction_id = TransactionId::from_bytes([0xAB; 32]);
@@ -109,12 +121,18 @@ async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
         b"raw-transaction-bytes".to_vec(),
     );
     let transaction_location = transaction_rows.location;
+    let transaction_intrinsic_value_balances = transaction_rows
+        .intrinsic_value_balances_artifact()
+        .into_iter()
+        .collect();
+    let replay = encode_fixture_block_replay(&block, std::slice::from_ref(&transaction_rows));
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
             .with_block_transaction_index(vec![transaction_rows.block_transaction_index])
             .with_transaction_locations(vec![transaction_rows.location])
             .with_transaction_facts(vec![transaction_rows.facts])
+            .with_transaction_intrinsic_value_balances(transaction_intrinsic_value_balances)
             .with_transaction_blobs(transaction_rows.blob.into_iter().collect()),
     )?;
 
@@ -161,12 +179,23 @@ async fn transaction_omits_bytes_when_blob_is_not_retained() -> eyre::Result<()>
         0,
         b"raw-transaction-bytes".to_vec(),
     );
+    let replay_transaction_rows = FixtureTransactionRows {
+        blob: None,
+        ..transaction_rows.clone()
+    };
+    let replay =
+        encode_fixture_block_replay(&block, std::slice::from_ref(&replay_transaction_rows));
+    let transaction_intrinsic_value_balances = transaction_rows
+        .intrinsic_value_balances_artifact()
+        .into_iter()
+        .collect();
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
             .with_block_transaction_index(vec![transaction_rows.block_transaction_index])
             .with_transaction_locations(vec![transaction_rows.location])
-            .with_transaction_facts(vec![transaction_rows.facts]),
+            .with_transaction_facts(vec![transaction_rows.facts])
+            .with_transaction_intrinsic_value_balances(transaction_intrinsic_value_balances),
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
@@ -188,10 +217,12 @@ async fn transaction_reports_unavailable_for_unknown_id() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
 

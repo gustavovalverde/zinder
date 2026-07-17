@@ -178,6 +178,7 @@ pub(crate) fn decide_recovery(
         }
         IngestError::Store(_)
         | IngestError::ReorgWindowExceeded { .. }
+        | IngestError::CanonicalWriterReorgWindowMismatch { .. }
         | IngestError::UnknownNodeSource { .. }
         | IngestError::SubtreeRootsUnavailable { .. }
         | IngestError::SubtreeRootCompletingBlockMissing { .. }
@@ -193,7 +194,7 @@ pub(crate) fn decide_recovery(
         | IngestError::TipFollowParentMetadataUnavailable { .. }
         | IngestError::SystemTimeBeforeUnixEpoch { .. }
         | IngestError::TimestampTooLarge
-        | IngestError::ArtifactDerive(_)
+        | IngestError::CanonicalBlockConstruction(_)
         | IngestError::BlockingTaskFailed { .. }
         | IngestError::SourceSegmentFetchTaskStopped { .. }
         | IngestError::DeriveDispatch(_)

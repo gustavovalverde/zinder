@@ -10,6 +10,7 @@ runner profiles, live-node gates, and consumer-facing certification evidence.
 | ---- | -------- | ------- | ------- | ------- |
 | T0 unit | `#[cfg(test)] mod tests in src/` | `default-filter` of `default`/`ci` | Every commit | Logic regressions in the unit under test |
 | T1 integration | `tests/integration/` | `default-filter` of `default`/`ci` | Every commit | Cross-module wiring, gRPC adapter shape, store/proto round-trips |
+| T1 PostgreSQL integration | `services/zinder-bench/tests/integration/postgres_canonical_fact_round_trip.rs` | `ci-postgres` | Every pull request with disposable PostgreSQL | SCRAM connection, binary COPY, transaction, reconnect, and persisted read-back through the production-intended driver |
 | T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
 | Consumer parity | `crates/zinder-client/tests/parity/` | `ci-parity` | Consumer contract changes / release certification | Consumer-shaped request and error-shape regressions for lightwalletd-compatible wallets, Zallet, public lightwalletd operators, and explorers |
 | T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI | Real upstream-node behavior (Zebra JSON-RPC, indexer gRPC) |
@@ -27,6 +28,12 @@ talk to a node by accident.
 `ci-parity` is fixture-backed and does not require `ZINDER_TEST_LIVE`. Treat it
 as a consumer-contract gate for request and error shapes, not as a
 replacement for live SDK, Zallet, or network validation.
+
+The PostgreSQL integration test remains `#[ignore]` so the DB-free default gate
+cannot connect to an accidental local service. Pull-request CI supplies a fresh
+SCRAM-configured PostgreSQL service and runs `ci-postgres` with
+`--run-ignored=all`; developers use the same profile with an explicit
+`ZINDER_TEST_POSTGRES_DATABASE_URL`.
 
 ## Lightwalletd certification
 
@@ -54,6 +61,8 @@ cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 cargo deny check
 cargo machete
+scripts/test-container-resource-evidence.sh
+scripts/test-storage-benchmark-campaign-validator.sh
 scripts/runbook-lint.sh docs/runbooks/testing.md
 git diff --check
 ```
@@ -62,12 +71,36 @@ Expected outcome: every command exits zero. The full suite runs in ~5 minutes
 on a developer laptop. If `cargo machete` reports unused dependencies on a
 crate you did not touch, treat it as a pre-existing finding, not a blocker.
 
+The 2 storage-benchmark shell tests are hermetic contract tests. One exercises
+resource observation, failure-status preservation, and exclusive artifact
+publication against a fake cgroup; the other constructs a complete synthetic
+campaign and verifies report, resource, alignment, and aggregation rejection
+paths. Neither requires Docker or a live PostgreSQL server.
+
 `scripts/runbook-lint.sh` parses every fenced `bash` block in this runbook
 through `bash -n` (syntax-only mode) so a typo or unclosed quote in an
 operator recipe fails CI immediately rather than ambushing an on-call
 engineer. It does not execute the blocks; running them still requires the
 documented prerequisites. See [Runbook self-test](#runbook-self-test)
 below for the full contract.
+
+## PostgreSQL driver integration gate
+
+Run after changing the fact-first PostgreSQL path, its driver dependencies, or
+the benchmark database configuration. The URL must identify a fresh disposable
+database because the test deliberately leaves its completed schema in place and
+then proves reuse is rejected.
+
+```bash
+ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_only@127.0.0.1:55432/zinder_bench' \
+  cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all
+```
+
+The test generates its own one-block regtest fixture. A passing run proves a
+real TCP password-authenticated connection, binary COPY, commit, deferred index
+creation, complete read-back, completion publication, reconnect, WAL/storage
+measurement, and safe existing-schema rejection. Start and clean the disposable
+database with the commands in [Storage benchmark environment](../../deploy/storage-benchmark.md#run-the-postgresql-driver-integration-gate).
 
 ## Consumer parity gate (consumer-shaped fixtures)
 
@@ -210,6 +243,129 @@ ZINDER_TEST_LIVE=1 \
 that target only mainnet (see below) still skip. Tests that exercise
 regtest-only RPCs (`generate`, `invalidateblock`, `reconsiderblock`) opt in
 via `require_live_for(&[Network::ZcashRegtest])` and refuse to run here.
+
+The fixed-range canonical tracer runs on testnet and mainnet. It captures one
+tip identity, retains the requested predecessor-to-tip range, and loads every
+source-derived version-1 family retained by the Wallet workload through one
+production source-to-SST pass. Construction fully decodes the persisted replay
+sequence without filling the block cache. The tracer then reopens RocksDB
+read-only, checks exact live-file entry counts, rejects tombstones and
+overlapping or malformed SST key ranges, checksum-reads every SST boundary,
+and cross-checks first, middle, and tip identities across the header, reverse
+index, replay, compact-block, transaction-location, and raw transaction
+families. It reports per-family prepared logical bytes and persisted SST
+telemetry plus aggregate throughput. The store deliberately remains
+`BUILDING`: this test does not claim canonical or wallet readiness before the
+remaining source-observed families, publication records, and wallet projection
+exist.
+Run only this tracer with the same environment shown above:
+
+```bash
+cargo nextest run --profile=ci-live --run-ignored=all \
+  -E 'test(canonical_blocks_load_requested_range_from_fixed_checkpoint)'
+```
+
+The tracer retains 1,000 blocks by default. Set
+`ZINDER_TEST_CANONICAL_BLOCK_COUNT` to a positive integer for a larger
+fixed-tip calibration range.
+
+For the local Z3 testnet topology, the dedicated Docker setup builds the test
+in release mode, joins the existing Zebra network, mounts its cookie volume
+read-only, and creates an isolated project-scoped Zinder volume. It never
+mounts Zebra's chain volume or the active Zinder data volume:
+
+```bash
+docker build -f deploy/Dockerfile \
+  --target zinder-ingest-live-tests \
+  -t zinder-ingest-live-tests:local .
+docker compose -p zinder-canonical-live-test \
+  -f deploy/docker-compose.canonical-live-test.yml \
+  run --rm canonical-blocks
+docker compose -p zinder-canonical-live-test \
+  -f deploy/docker-compose.canonical-live-test.yml \
+  down -v
+```
+
+### Complete RocksDB storage lifecycle
+
+The canonical tracer above proves a bounded source-to-SST range but
+deliberately leaves the store `BUILDING`. Use the dedicated
+[RocksDB storage lifecycle harness](../../deploy/rocksdb-storage-lifecycle.md)
+to measure a fresh complete-history canonical store through `READY`, then build
+and cold-admit the version-1 wallet store at the same fixed Zebra tip. The
+harness reports canonical and wallet times separately and captures exact peak
+container memory plus sampled peak disk usage.
+
+Run a small fixed-tip smoke before a current-tip measurement. Both runs reuse
+Zebra's synchronized chain state but delete all project-scoped Zinder state:
+
+```bash
+docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench:local .
+
+ZINDER_STORAGE_LIFECYCLE_TIP_HEIGHT=10000 \
+ZINDER_STORAGE_LIFECYCLE_PROJECT_NAME=zinder-storage-lifecycle-smoke \
+ZINDER_STORAGE_LIFECYCLE_EVIDENCE_PATH="$PWD/.tmp/rocksdb-storage-lifecycle-smoke" \
+  scripts/run-rocksdb-storage-lifecycle.sh
+
+scripts/run-rocksdb-storage-lifecycle.sh
+```
+
+This certifies only canonical and wallet storage readiness. Query serving,
+continuous tip following, and executed reorg recovery remain separate gates.
+
+### Version-1 canonical runtime tracer
+
+Use the dedicated runtime topology after the storage lifecycle gate. It starts
+the actual `zinder-ingest` binary, gives it one disposable Zinder volume, joins
+the existing Zebra network, and mounts only Zebra's authentication cookie
+read-only. It enforces the established 10-CPU, 10-GiB envelope. `/healthz` is
+the container liveness check; the operator must poll `/readyz` separately and
+record the authenticated canonical fence.
+
+Choose a fixed source-authenticated predecessor below the current Zebra tip and
+pin the locally reviewed image by immutable ID:
+
+```bash
+docker build -f deploy/Dockerfile \
+  --target zinder-ingest \
+  -t zinder-ingest:canonical-runtime-local .
+
+image_id=$(docker image inspect \
+  zinder-ingest:canonical-runtime-local \
+  --format '{{.Id}}')
+
+ZINDER_CANONICAL_RUNTIME_IMAGE="$image_id" \
+ZINDER_CANONICAL_RUNTIME_CHECKPOINT_HEIGHT=<height> \
+  docker compose \
+    -f deploy/docker-compose.canonical-runtime-test.yml \
+    up -d zinder-ingest
+```
+
+Acceptance requires a fresh `canonical.building` path to publish and cold-open
+epoch 1 and event 1, then at least one natural Zebra advance to increment the
+tip, epoch, event sequence, and digest together. Restart the service and require
+the same fence to reopen before accepting further appends. A reversible source
+outage may be tested by disconnecting only the ingest container from the source
+network; readiness must become `node_unavailable`, the fence must remain
+unchanged, and reconnecting must restore following. Never stop Zebra or mount,
+delete, or modify its chain volume for this gate.
+
+Record the image ID, checkpoint and fixed build fence, each appended fence,
+readiness payloads, resource limit and observations, volume mounts, and these
+metrics:
+
+- `zinder_ingest_canonical_chain_epoch`;
+- `zinder_ingest_canonical_chain_event_sequence`;
+- `zinder_ingest_canonical_tip_height`;
+- `zinder_ingest_canonical_lag_blocks`;
+- `zinder_ingest_canonical_historical_prevout_reads_total`; and
+- `zinder_ingest_canonical_cross_block_wallet_reads_total`.
+
+This tracer certifies append-only service composition, not full-chain
+construction performance, reorg replacement, wallet readiness, query serving,
+client parity, or Railway behavior. Preserve its project-scoped volume until
+the evidence has been reviewed. Remove it only with the Compose project name
+and without `external` Zebra resources in the command scope.
 
 ## T3: Live mainnet (operator-hosted Zebra)
 
@@ -757,10 +913,12 @@ to pin the probe to a specific artifact height:
 scripts/native-grpc-smoke.sh 127.0.0.1:9069
 ```
 
-The script verifies the standalone `WalletQuery` capability baseline, exercises
-`LatestBlock`, both `BlockIdBySelector` arms (height + hash round-trip),
+The script verifies that every advertised `WalletQuery` capability is
+registered in the authoritative capability table and that each exercised RPC
+advertises its table-mapped capability. It then exercises `LatestBlock`, both
+`BlockIdBySelector` arms (height + hash round-trip),
 `BlockHeaderBySelector`, and asserts the `Transaction` NotFound mapping. Exit
-code zero is the contract; any drift fails CI.
+code zero is the contract; any drift fails the smoke.
 `wallet.address.transparent_balance_v1` is always advertised: the confirmed
 total reads the canonical unspent index, and the mempool overlay degrades to a
 zero delta when no ingest-control endpoint is wired.
@@ -788,7 +946,7 @@ the writer (per the conventions above). A transaction request carrying
 grpcurl -plaintext \
   -import-path crates/zinder-proto/proto \
   -proto crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto \
-  127.0.0.1:9069 zinder.v1.wallet.WalletQuery/ServerInfo | jq '.capabilities.capabilities'
+  127.0.0.1:9069 zinder.v1.wallet.WalletQuery/ServerInfo | jq '.info.common.capabilities'
 ```
 
 Expected entries (this list is the public contract; treat any drift as a

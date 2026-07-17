@@ -144,7 +144,7 @@ Perf tests should capture at least these output metrics per corpus range:
 
 - blocks per second
 - source response bytes per block
-- derived artifact bytes per block
+- prepared canonical bytes per block
 - estimated canonical write bytes per block
 - transparent spend references per block
 - Sapling spends and outputs per block
@@ -160,10 +160,12 @@ The current local validation source is the mainnet Zebra container
 Overwinter `347500`, Sapling `419200`, Blossom `653600`, Heartwood `903000`,
 Canopy `1046400`, NU5 `1687104`, NU6 `2726400`, and NU6.1 `3146400`.
 
-The parser benchmark used local raw blocks from that node and ran the former
-Zinder parser path: `SourceBlock::from_raw_block_bytes` followed by
-`derive_block_with_raw_blob_policy(..., RawBlobPolicy::None)`. Those values are
-the pre-optimization baseline because that path parsed the complete block twice
+The parser benchmark used local raw blocks from that node and ran
+`SourceBlock::from_raw_block_bytes` followed by the function then named
+`derive_block_with_raw_blob_policy(..., RawBlobPolicy::None)`. That function is
+now named `prepare_canonical_block`; the historical
+measurement still describes its pre-optimization implementation. Those values
+are the baseline because that implementation parsed the complete block twice
 and serialized plus parsed each transaction again. The current bulk source
 parses only the header before canonical preparation, which parses the complete
 block once and builds facts directly from the parsed transactions. JSON-RPC
@@ -178,7 +180,7 @@ concurrency, then require higher `replay.blocks_per_second` without increased
 Sapling, and end-side ranges in the comparison so one workload shape cannot
 hide a regression in another.
 
-| Window | Range | Component evidence | `derive_block` timing |
+| Window | Range | Component evidence | canonical block preparation timing |
 | --- | ---: | --- | --- |
 | May 2017 peak | `108089..108109` | `43,201` transparent spend references, `2,063` transparent outputs, `6.5 MB` raw block bytes | avg `3.8 ms`, p95 `15.9 ms`, max `21.0 ms` at `108106` |
 | Heavy Orchard anchor | `1708038..1708058` | `3,754` Orchard actions, `13.3 MB` raw block bytes | avg `78.4 ms`, p95 `154.1 ms`, max `235.1 ms` at `1708048` |
@@ -190,7 +192,7 @@ hide a regression in another.
 
 Single-block anchors show the same shape:
 
-| Anchor | Raw bytes | Transactions | Dominant counts | `derive_block` time |
+| Anchor | Raw bytes | Transactions | Dominant counts | canonical block preparation time |
 | ---: | ---: | ---: | --- | ---: |
 | `108099` | `99,149` | `11` | `551` transparent spend references | `0.8 ms` |
 | `1708048` | `1,999,370` | `96` | `552` Orchard actions | `129.7 ms` |
@@ -217,7 +219,7 @@ The performance architecture should stay measurement-driven:
 1. The source adapter fetches bounded raw block segments and records response
    density. It may split dense ranges, but it must not change parsing behavior
    based on a historical label.
-2. Canonical block prepare derives per-block cost signals before batching. Dense
+2. Canonical block prepare computes per-block cost signals before batching. Dense
    shielded blocks, transparent-input-heavy blocks, and artifact-heavy blocks
    can all close batches through the same measured budget model.
 3. The commit accumulator closes by resource budget, not only by block count.

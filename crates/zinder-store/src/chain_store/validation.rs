@@ -1,15 +1,21 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+};
 
 use zinder_core::{
-    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    BlockValuePoolBalances, ChainEpoch, CompactBlockArtifact, SubtreeRootArtifact,
-    TransactionFactsArtifact, TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact,
-    TreeStateArtifact,
+    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockId, BlockTransactionIndexArtifact, BlockValuePoolBalances,
+    CanonicalBlockFacts, CanonicalTransactionFacts, ChainEpoch, CompactBlockArtifact,
+    SerializedBytesDigest, SubtreeRootArtifact, TransactionBlobArtifact, TransactionFactsArtifact,
+    TransactionId, TransactionIntrinsicValueBalancesArtifact, TransactionLocation,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
+    decode_canonical_block_replay,
 };
 
 use crate::{
-    ChainEpochArtifacts, ReorgWindowChange, StoreError, block_artifact::read_block_header_artifact,
-    kv::RocksChainStore,
+    ChainEpochArtifacts, RawBlobRetention, ReorgWindowChange, StoreError,
+    block_artifact::read_block_header_artifact, kv::RocksChainStore,
 };
 
 use super::ChainStoreOptions;
@@ -38,9 +44,13 @@ pub(super) fn validate_chain_store_options(options: ChainStoreOptions) -> Result
     Ok(())
 }
 
+pub(super) struct ValidatedBlockReplayOrder {
+    pub(super) block_heights: Vec<BlockHeight>,
+}
+
 pub(super) fn validate_chain_epoch_artifacts(
     artifacts: &ChainEpochArtifacts,
-) -> Result<(), StoreError> {
+) -> Result<ValidatedBlockReplayOrder, StoreError> {
     if artifacts.chain_epoch.id.value() == 0 {
         return Err(StoreError::InvalidChainEpochArtifacts {
             reason: "chain epoch id must be greater than zero",
@@ -65,6 +75,8 @@ pub(super) fn validate_chain_epoch_artifacts(
         "safe_tip_hash must match the committed block at safe_tip_height",
     )?;
     validate_block_header_artifacts(&artifacts.block_headers, tip_height)?;
+    let validated_block_replay_order =
+        validate_block_replay_envelopes(artifacts, &block_hash_by_height)?;
     validate_compact_block_artifacts(&artifacts.compact_blocks, tip_height, &block_hash_by_height)?;
     validate_transaction_facts_artifacts(
         &artifacts.transaction_facts,
@@ -96,7 +108,38 @@ pub(super) fn validate_chain_epoch_artifacts(
         &artifacts.transparent_spend_facts,
         tip_height,
         &block_hash_by_height,
-    )
+    )?;
+
+    Ok(validated_block_replay_order)
+}
+
+pub(super) fn validate_retained_blob_artifacts(
+    artifacts: &ChainEpochArtifacts,
+    retention: RawBlobRetention,
+) -> Result<(), StoreError> {
+    let block_blob_count_matches = match retention {
+        RawBlobRetention::None | RawBlobRetention::Transactions => artifacts.block_blobs.is_empty(),
+        RawBlobRetention::All => artifacts.block_blobs.len() == artifacts.block_headers.len(),
+    };
+    if !block_blob_count_matches {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "block blob artifacts must match the configured raw blob retention",
+        });
+    }
+
+    let transaction_blob_count_matches = match retention {
+        RawBlobRetention::None => artifacts.transaction_blobs.is_empty(),
+        RawBlobRetention::Transactions | RawBlobRetention::All => {
+            artifacts.transaction_blobs.len() == artifacts.transaction_facts.len()
+        }
+    };
+    if !transaction_blob_count_matches {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "transaction blob artifacts must match the configured raw blob retention",
+        });
+    }
+
+    Ok(())
 }
 
 pub(super) fn committed_block_range(
@@ -146,6 +189,7 @@ fn safe_tip_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> bo
         artifacts.reorg_window_change,
         ReorgWindowChange::AdvanceSafeTipTo { .. }
     ) && artifacts.block_headers.is_empty()
+        && artifacts.block_replay_envelopes.is_empty()
         && artifacts.compact_blocks.is_empty()
         && artifacts.transaction_facts.is_empty()
         && artifacts.transaction_intrinsic_value_balances.is_empty()
@@ -657,6 +701,498 @@ fn validate_block_header_artifacts(
         }
     }
 
+    Ok(())
+}
+
+fn validate_block_replay_envelopes(
+    artifacts: &ChainEpochArtifacts,
+    block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
+) -> Result<ValidatedBlockReplayOrder, StoreError> {
+    if artifacts.block_replay_envelopes.len() != artifacts.block_headers.len() {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "every committed block header must have exactly one block replay envelope",
+        });
+    }
+
+    let artifact_index = BlockReplayArtifactIndex::new(artifacts)?;
+
+    let mut decoded_block_ids = HashSet::new();
+    let mut ordered_block_heights = Vec::with_capacity(artifacts.block_replay_envelopes.len());
+    let mut decoded_transaction_ids = HashSet::new();
+    let mut decoded_transparent_index = DecodedTransparentIndex::default();
+    for replay_envelope in &artifacts.block_replay_envelopes {
+        let replay = decode_canonical_block_replay(replay_envelope.as_bytes()).map_err(|_| {
+            StoreError::InvalidChainEpochArtifacts {
+                reason: "block replay envelope failed semantic validation",
+            }
+        })?;
+        let decoded_facts = replay.facts();
+        let block_id = validate_replay_block_header(
+            decoded_facts,
+            block_hash_by_height,
+            &artifact_index.block_headers_by_id,
+        )?;
+        if !decoded_block_ids.insert(block_id) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block replay cannot repeat a block identity",
+            });
+        }
+        validate_replay_transactions(
+            decoded_facts,
+            block_id,
+            &artifact_index,
+            &mut decoded_transaction_ids,
+            &mut decoded_transparent_index,
+        )?;
+        validate_replay_block_blob(decoded_facts, block_id, &artifact_index)?;
+        ordered_block_heights.push(block_id.height);
+    }
+
+    validate_replay_block_order(artifacts, &ordered_block_heights)?;
+    validate_replay_artifact_membership(
+        artifacts,
+        &artifact_index,
+        &decoded_block_ids,
+        &decoded_transaction_ids,
+    )?;
+    validate_replay_transparent_artifacts(artifacts, &decoded_transparent_index)?;
+
+    Ok(ValidatedBlockReplayOrder {
+        block_heights: ordered_block_heights,
+    })
+}
+
+fn validate_replay_block_order(
+    artifacts: &ChainEpochArtifacts,
+    ordered_replay_heights: &[BlockHeight],
+) -> Result<(), StoreError> {
+    if !artifacts
+        .block_headers
+        .iter()
+        .map(|header| header.height)
+        .eq(ordered_replay_heights.iter().copied())
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "block replay must follow committed block header order",
+        });
+    }
+    Ok(())
+}
+
+struct BlockReplayArtifactIndex<'a> {
+    block_headers_by_id: HashMap<BlockId, &'a BlockHeaderArtifact>,
+    transaction_index_by_block: HashMap<BlockId, Vec<&'a BlockTransactionIndexArtifact>>,
+    transaction_facts_by_block: HashMap<BlockId, Vec<&'a TransactionFactsArtifact>>,
+    transaction_locations_by_id: HashMap<TransactionId, &'a TransactionLocation>,
+    intrinsic_balances_by_id: HashMap<TransactionId, &'a TransactionIntrinsicValueBalancesArtifact>,
+    transaction_blobs_by_id: HashMap<TransactionId, &'a TransactionBlobArtifact>,
+    block_blobs_by_id: HashMap<BlockId, &'a BlockBlobArtifact>,
+}
+
+impl<'a> BlockReplayArtifactIndex<'a> {
+    fn new(artifacts: &'a ChainEpochArtifacts) -> Result<Self, StoreError> {
+        Ok(Self {
+            block_headers_by_id: index_unique_by_key(
+                &artifacts.block_headers,
+                |header| BlockId::new(header.height, header.block_hash),
+                "block headers cannot repeat a block identity",
+            )?,
+            transaction_index_by_block: transaction_index_by_block(artifacts),
+            transaction_facts_by_block: transaction_facts_by_block(artifacts),
+            transaction_locations_by_id: index_unique_by_key(
+                &artifacts.transaction_locations,
+                |location| location.transaction_id,
+                "transaction locations cannot repeat a transaction id",
+            )?,
+            intrinsic_balances_by_id: index_unique_by_key(
+                &artifacts.transaction_intrinsic_value_balances,
+                |balances| balances.location.transaction_id,
+                "transaction intrinsic balances cannot repeat a transaction id",
+            )?,
+            transaction_blobs_by_id: index_unique_by_key(
+                &artifacts.transaction_blobs,
+                |blob| blob.location.transaction_id,
+                "transaction blobs cannot repeat a transaction id",
+            )?,
+            block_blobs_by_id: index_unique_by_key(
+                &artifacts.block_blobs,
+                |blob| BlockId::new(blob.height, blob.block_hash),
+                "block blobs cannot repeat a block identity",
+            )?,
+        })
+    }
+}
+
+fn index_unique_by_key<'a, Key, Row>(
+    rows: &'a [Row],
+    key_for: impl Fn(&Row) -> Key,
+    duplicate_reason: &'static str,
+) -> Result<HashMap<Key, &'a Row>, StoreError>
+where
+    Key: Eq + Hash,
+{
+    let mut rows_by_key = HashMap::with_capacity(rows.len());
+    for row in rows {
+        if rows_by_key.insert(key_for(row), row).is_some() {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: duplicate_reason,
+            });
+        }
+    }
+    Ok(rows_by_key)
+}
+
+fn transaction_index_by_block(
+    artifacts: &ChainEpochArtifacts,
+) -> HashMap<BlockId, Vec<&BlockTransactionIndexArtifact>> {
+    let mut rows_by_block = HashMap::<BlockId, Vec<_>>::new();
+    for row in &artifacts.block_transaction_index {
+        rows_by_block
+            .entry(BlockId::new(row.block_height, row.block_hash))
+            .or_default()
+            .push(row);
+    }
+    for rows in rows_by_block.values_mut() {
+        rows.sort_by_key(|row| row.tx_index_in_block);
+    }
+    rows_by_block
+}
+
+fn transaction_facts_by_block(
+    artifacts: &ChainEpochArtifacts,
+) -> HashMap<BlockId, Vec<&TransactionFactsArtifact>> {
+    let mut transactions_by_block = HashMap::<BlockId, Vec<_>>::new();
+    for transaction in &artifacts.transaction_facts {
+        transactions_by_block
+            .entry(BlockId::new(
+                transaction.location.block_height,
+                transaction.location.block_hash,
+            ))
+            .or_default()
+            .push(transaction);
+    }
+    for transactions in transactions_by_block.values_mut() {
+        transactions.sort_by_key(|transaction| transaction.location.tx_index_in_block);
+    }
+    transactions_by_block
+}
+
+fn validate_replay_block_header(
+    decoded_facts: &CanonicalBlockFacts,
+    block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
+    block_headers_by_id: &HashMap<BlockId, &BlockHeaderArtifact>,
+) -> Result<BlockId, StoreError> {
+    let replay_header = &decoded_facts.block_header;
+    let block_id = BlockId::new(replay_header.height, replay_header.block_hash);
+    if block_hash_by_height.get(&replay_header.height) != Some(&replay_header.block_hash)
+        || block_headers_by_id.get(&block_id).copied() != Some(replay_header)
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "block replay header must match the committed block header",
+        });
+    }
+    Ok(block_id)
+}
+
+fn validate_replay_transactions(
+    decoded_facts: &CanonicalBlockFacts,
+    block_id: BlockId,
+    artifact_index: &BlockReplayArtifactIndex<'_>,
+    decoded_transaction_ids: &mut HashSet<TransactionId>,
+    decoded_transparent_index: &mut DecodedTransparentIndex,
+) -> Result<(), StoreError> {
+    let transaction_index = artifact_index
+        .transaction_index_by_block
+        .get(&block_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let transaction_facts = artifact_index
+        .transaction_facts_by_block
+        .get(&block_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if transaction_index.len() != decoded_facts.transactions.len()
+        || transaction_facts.len() != decoded_facts.transactions.len()
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "block replay transaction count must match block index and transaction facts",
+        });
+    }
+
+    for (position, replay_transaction) in decoded_facts.transactions.iter().enumerate() {
+        let tx_index_in_block =
+            u32::try_from(position).map_err(|_| StoreError::InvalidChainEpochArtifacts {
+                reason: "block replay transaction count exceeds the supported index range",
+            })?;
+        validate_replay_transaction(
+            ReplayTransactionRows {
+                decoded_facts: replay_transaction,
+                block_index: transaction_index[position],
+                stored_facts: transaction_facts[position],
+                index_in_block: tx_index_in_block,
+            },
+            artifact_index,
+            decoded_transaction_ids,
+            decoded_transparent_index,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ReplayTransactionRows<'a> {
+    decoded_facts: &'a CanonicalTransactionFacts,
+    block_index: &'a BlockTransactionIndexArtifact,
+    stored_facts: &'a TransactionFactsArtifact,
+    index_in_block: u32,
+}
+
+fn validate_replay_transaction(
+    rows: ReplayTransactionRows<'_>,
+    artifact_index: &BlockReplayArtifactIndex<'_>,
+    decoded_transaction_ids: &mut HashSet<TransactionId>,
+    decoded_transparent_index: &mut DecodedTransparentIndex,
+) -> Result<(), StoreError> {
+    let transaction_id = rows.decoded_facts.public_facts.transaction_id;
+    if rows.block_index.tx_index_in_block != rows.index_in_block
+        || rows.block_index.transaction_id != transaction_id
+        || rows.stored_facts.location.tx_index_in_block != rows.index_in_block
+        || rows.stored_facts.location.transaction_id != transaction_id
+        || rows.stored_facts.public_facts != rows.decoded_facts.public_facts
+        || rows.stored_facts.transparent_inputs != rows.decoded_facts.transparent_inputs
+        || rows.stored_facts.transparent_outputs != rows.decoded_facts.transparent_outputs
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "ordered block replay transactions must match index and transaction facts",
+        });
+    }
+    if !decoded_transaction_ids.insert(transaction_id) {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "block replay cannot repeat a transaction id",
+        });
+    }
+
+    let Some(location) = artifact_index
+        .transaction_locations_by_id
+        .get(&transaction_id)
+    else {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "every block replay transaction must have a transaction location",
+        });
+    };
+    if **location != rows.stored_facts.location {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "transaction location must match block replay",
+        });
+    }
+    let Some(balances) = artifact_index.intrinsic_balances_by_id.get(&transaction_id) else {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "every block replay transaction must have intrinsic balances",
+        });
+    };
+    if balances.location != rows.stored_facts.location
+        || balances.value_balances != rows.decoded_facts.intrinsic_value_balances
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "transaction intrinsic balances must match block replay",
+        });
+    }
+    if let Some(transaction_blob) = artifact_index.transaction_blobs_by_id.get(&transaction_id) {
+        validate_replay_transaction_blob(rows, transaction_blob)?;
+    }
+    decoded_transparent_index.record_transaction(rows)?;
+    Ok(())
+}
+
+fn validate_replay_transaction_blob(
+    rows: ReplayTransactionRows<'_>,
+    transaction_blob: &TransactionBlobArtifact,
+) -> Result<(), StoreError> {
+    if transaction_blob.location != rows.stored_facts.location {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "transaction blob location must match block replay",
+        });
+    }
+    if u32::try_from(transaction_blob.raw_transaction_bytes.len())
+        != Ok(rows.decoded_facts.public_facts.size_bytes)
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "transaction blob size must match block replay",
+        });
+    }
+    if SerializedBytesDigest::from_serialized_bytes(&transaction_blob.raw_transaction_bytes)
+        != rows.decoded_facts.serialized_bytes_digest
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "transaction blob bytes must match block replay digest",
+        });
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct DecodedTransparentIndex {
+    outputs_by_outpoint: HashMap<TransparentOutPoint, TransparentOutputArtifact>,
+    input_identities: HashSet<ReplayTransparentInputIdentity>,
+}
+
+impl DecodedTransparentIndex {
+    fn record_transaction(&mut self, rows: ReplayTransactionRows<'_>) -> Result<(), StoreError> {
+        let transaction_id = rows.decoded_facts.public_facts.transaction_id;
+        let location = rows.stored_facts.location;
+        for output in &rows.decoded_facts.transparent_outputs {
+            let outpoint = TransparentOutPoint::new(transaction_id, output.output_index);
+            let artifact = TransparentOutputArtifact::new(
+                outpoint,
+                output.value_zat,
+                output.script_pub_key.clone(),
+                output.address_script_hash,
+                location.block_height,
+                location.block_hash,
+            );
+            if self
+                .outputs_by_outpoint
+                .insert(outpoint, artifact)
+                .is_some()
+            {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "block replay cannot repeat a transparent output outpoint",
+                });
+            }
+        }
+
+        for input in &rows.decoded_facts.transparent_inputs {
+            if input.spent_outpoint.is_coinbase_sentinel() {
+                continue;
+            }
+            let identity = ReplayTransparentInputIdentity {
+                block_id: BlockId::new(location.block_height, location.block_hash),
+                transaction_id,
+                tx_index_in_block: rows.index_in_block,
+                input_index: input.input_index,
+                spent_outpoint: input.spent_outpoint,
+            };
+            if !self.input_identities.insert(identity) {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "block replay cannot repeat a transparent input identity",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ReplayTransparentInputIdentity {
+    block_id: BlockId,
+    transaction_id: TransactionId,
+    tx_index_in_block: u32,
+    input_index: u32,
+    spent_outpoint: TransparentOutPoint,
+}
+
+fn validate_replay_transparent_artifacts(
+    artifacts: &ChainEpochArtifacts,
+    decoded_index: &DecodedTransparentIndex,
+) -> Result<(), StoreError> {
+    let transparent_outputs_match = artifacts.transparent_outputs_by_outpoint.len()
+        == decoded_index.outputs_by_outpoint.len()
+        && artifacts
+            .transparent_outputs_by_outpoint
+            .iter()
+            .all(|artifact| {
+                decoded_index.outputs_by_outpoint.get(&artifact.outpoint) == Some(artifact)
+            });
+    if !transparent_outputs_match {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "transparent output artifacts must exactly match block replay",
+        });
+    }
+
+    let every_spend_has_replay_input = artifacts.transparent_spend_facts.iter().all(|spend| {
+        decoded_index
+            .input_identities
+            .contains(&ReplayTransparentInputIdentity {
+                block_id: BlockId::new(spend.block_height, spend.block_hash),
+                transaction_id: spend.spending_transaction_id,
+                tx_index_in_block: spend.tx_index_in_block,
+                input_index: spend.input_index,
+                spent_outpoint: spend.spent_outpoint,
+            })
+    });
+    if !every_spend_has_replay_input {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "every transparent spend fact must identify an input in block replay",
+        });
+    }
+    Ok(())
+}
+
+fn validate_replay_block_blob(
+    decoded_facts: &CanonicalBlockFacts,
+    block_id: BlockId,
+    artifact_index: &BlockReplayArtifactIndex<'_>,
+) -> Result<(), StoreError> {
+    let block_blob = artifact_index.block_blobs_by_id.get(&block_id);
+    if let Some(block_blob) = block_blob {
+        if block_blob.parent_hash != decoded_facts.block_header.parent_hash {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block blob identity must match block replay",
+            });
+        }
+        if u64::try_from(block_blob.raw_block_bytes.len())
+            != Ok(decoded_facts.block_header.block_size_bytes)
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block blob size must match block replay",
+            });
+        }
+        if SerializedBytesDigest::from_serialized_bytes(&block_blob.raw_block_bytes)
+            != decoded_facts.serialized_bytes_digest
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "block blob bytes must match block replay digest",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_replay_artifact_membership(
+    artifacts: &ChainEpochArtifacts,
+    artifact_index: &BlockReplayArtifactIndex<'_>,
+    decoded_block_ids: &HashSet<BlockId>,
+    decoded_transaction_ids: &HashSet<TransactionId>,
+) -> Result<(), StoreError> {
+    let contains_unknown_block =
+        decoded_block_ids.len() != artifact_index.block_headers_by_id.len()
+            || artifacts.block_blobs.iter().any(|blob| {
+                !decoded_block_ids.contains(&BlockId::new(blob.height, blob.block_hash))
+            })
+            || artifacts.block_transaction_index.iter().any(|row| {
+                !decoded_block_ids.contains(&BlockId::new(row.block_height, row.block_hash))
+            });
+    let contains_unknown_transaction = artifacts
+        .transaction_facts
+        .iter()
+        .any(|transaction| !decoded_transaction_ids.contains(&transaction.location.transaction_id))
+        || artifacts
+            .transaction_locations
+            .iter()
+            .any(|location| !decoded_transaction_ids.contains(&location.transaction_id))
+        || artifacts
+            .transaction_blobs
+            .iter()
+            .any(|blob| !decoded_transaction_ids.contains(&blob.location.transaction_id))
+        || artifacts
+            .transaction_intrinsic_value_balances
+            .iter()
+            .any(|balances| !decoded_transaction_ids.contains(&balances.location.transaction_id));
+    if contains_unknown_block || contains_unknown_transaction {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "committed artifacts must belong to the supplied block replay",
+        });
+    }
     Ok(())
 }
 

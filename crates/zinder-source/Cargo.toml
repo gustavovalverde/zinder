@@ -23,6 +23,7 @@ hyper-util = { workspace = true, features = ["tokio"] }
 jsonrpsee.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -32,14 +33,19 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 zebra-chain.workspace = true
+zcash_primitives = { version = "0.29.0", default-features = false, features = ["std"] }
+zcash_protocol = { version = "0.10.0", default-features = false, features = ["std"] }
 zinder-core.workspace = true
 zinder-proto.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
+incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
+orchard = { version = "0.15.0", default-features = false }
+sapling = { package = "sapling-crypto", version = "0.7.0", default-features = false }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
-tokio-stream = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tokio-stream = { workspace = true, features = ["net", "sync"] }
 zinder-testkit = { path = "../zinder-testkit" }
 
 [lints]

@@ -17,22 +17,29 @@ use thiserror::Error;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
-    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis,
+    BlockHeightRange, BlockTransactionIndexArtifact, CanonicalBlockReplayEnvelope,
+    CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
+    Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_source::{
     NodeCapability, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceFailureClass, SourceSubtreeRoots, SourceTreeState,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, PrimaryChainStore, ReorgWindowChange,
-    StoreError, StoreReadCaller,
+    ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, ChainStoreOptions, PrimaryChainStore,
+    ReorgWindowChange, RocksDbResourceBudget, StoreError, StoreReadCaller,
 };
 
-use crate::ArtifactDeriveError;
+use crate::{
+    CanonicalBlockConstructionError,
+    artifact_builder::{
+        CurrentSchemaBlockArtifacts, PositionedCanonicalBlock, RawBlobPolicy,
+        expand_current_schema_block_artifacts,
+    },
+};
 
 const FETCH_RETRY_MAX_ATTEMPTS: u32 = 5;
 #[cfg(not(test))]
@@ -47,19 +54,6 @@ pub const DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES: u64 = 536_870_912;
 /// Default minimum batch size before estimated write bytes can close a bulk-catchup batch.
 pub const DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE: u32 = 100;
 
-/// Stride between consecutive tree-state checkpoints written by the ingest
-/// pipeline.
-///
-/// Wallet implementations (notably `zcash_client_backend`) cap their rewind
-/// window at roughly 100 blocks behind `fully_scanned_height`; if the
-/// nearest checkpoint at-or-below that window is older than the cap, the
-/// wallet cannot recover from a stall without a manual reset. An ingest
-/// batch can span thousands of blocks (bulk catchup) or tens of blocks
-/// (tip-follow during chain catchup), so a single end-of-batch checkpoint
-/// leaves arbitrary gaps. Emitting one checkpoint every 100 heights in
-/// both ingest phases guarantees the wallet can always find an anchor
-/// inside its rewind window regardless of where in a batch it landed.
-pub(crate) const TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
 const ESTIMATED_BLOCK_WRITE_BYTES: usize = 512;
 const ESTIMATED_BLOCK_TRANSACTION_INDEX_WRITE_BYTES: usize = 96;
 const ESTIMATED_TRANSACTION_LOCATION_WRITE_BYTES: usize = 96;
@@ -291,7 +285,7 @@ pub enum IngestError {
         maximum_historical_height: BlockHeight,
     },
 
-    /// Bulk catchup cannot derive a chain-global commitment-tree size base.
+    /// Bulk catchup cannot resolve a chain-global commitment-tree size base.
     #[error(
         "bulk catchup from height {from_height:?} requires contiguous commitment-tree metadata; start a fresh store at height 1 or append immediately after current tip {current_tip_height:?}"
     )]
@@ -349,6 +343,17 @@ pub enum IngestError {
         configured_window_blocks: u32,
     },
 
+    /// A caller-owned canonical writer uses a different reorg-window contract.
+    #[error(
+        "caller-owned canonical writer reorg window {store_reorg_window_blocks} does not match configured reorg window {configured_reorg_window_blocks}"
+    )]
+    CanonicalWriterReorgWindowMismatch {
+        /// Reorg window used to open the caller-owned writer.
+        store_reorg_window_blocks: u32,
+        /// Reorg window selected by ingest configuration.
+        configured_reorg_window_blocks: u32,
+    },
+
     /// Retryable node failures exceeded the per-run ingest budget.
     #[error(
         "ingest source retry budget exceeded during {operation}: {retryable_failures} failures, budget {failure_budget}"
@@ -387,9 +392,9 @@ pub enum IngestError {
     #[error(transparent)]
     Source(#[from] SourceError),
 
-    /// Artifact derivation failed.
+    /// Canonical block construction failed.
     #[error(transparent)]
-    ArtifactDerive(#[from] ArtifactDeriveError),
+    CanonicalBlockConstruction(#[from] CanonicalBlockConstructionError),
 
     /// Canonical store failed.
     #[error(transparent)]
@@ -404,39 +409,50 @@ pub enum IngestError {
     },
 }
 
-/// Built canonical artifacts produced for one source block.
-///
-/// Output of [`finalize_derived_block`](crate::artifact_builder::finalize_derived_block).
-/// Each field is final once this struct exists; the consumer absorbs it
-/// into an `CanonicalBatch` and the batch is then committed atomically.
-#[derive(Debug)]
-pub struct BuiltArtifacts {
-    /// Canonical block-header facts.
-    pub block_header: BlockHeaderArtifact,
-    /// Optional raw block blob.
-    pub block_blob: Option<BlockBlobArtifact>,
-    /// Lightwalletd compact block with final `chain_metadata` stamped.
-    pub compact_block: CompactBlockArtifact,
-    /// Block-local transaction id index rows.
-    pub block_transaction_index: Vec<BlockTransactionIndexArtifact>,
-    /// Mined transaction locations.
-    pub transaction_locations: Vec<TransactionLocation>,
-    /// Per-transaction public facts.
-    pub transaction_facts: Vec<TransactionFactsArtifact>,
-    /// Per-transaction signed shielded-pool balances.
-    pub transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
-    /// Optional raw transaction blobs.
-    pub transaction_blobs: Vec<TransactionBlobArtifact>,
-    /// Transparent output artifacts keyed by outpoint. The store derives
-    /// the address-output projection rows from these at commit.
-    pub transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
-    /// Running commitment-tree position after this block is folded in.
-    pub tip_metadata: ChainTipMetadata,
+/// Builds the canonical writer options shared by every ingest phase and probe.
+pub(crate) fn canonical_writer_store_options(
+    network: Network,
+    reorg_window_blocks: u32,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    raw_blob_policy: RawBlobPolicy,
+) -> ChainStoreOptions {
+    ChainStoreOptions {
+        reorg_window_blocks,
+        rocksdb_resource_budget,
+        raw_blob_retention: raw_blob_policy.to_retention(),
+        ..ChainStoreOptions::for_network(network)
+    }
+}
+
+/// Rejects a caller-owned writer whose runtime contract differs from ingest config.
+pub(crate) fn validate_writer_store_contract(
+    store: &PrimaryChainStore,
+    configured_reorg_window_blocks: u32,
+    configured_policy: RawBlobPolicy,
+) -> Result<(), IngestError> {
+    let store_reorg_window_blocks = store.reorg_window_blocks();
+    if store_reorg_window_blocks != configured_reorg_window_blocks {
+        return Err(IngestError::CanonicalWriterReorgWindowMismatch {
+            store_reorg_window_blocks,
+            configured_reorg_window_blocks,
+        });
+    }
+    let persisted_retention = store.raw_blob_retention()?;
+    let configured_retention = configured_policy.to_retention();
+    if persisted_retention != configured_retention {
+        return Err(StoreError::RawBlobRetentionMismatch {
+            persisted: persisted_retention,
+            configured: configured_retention,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// In-flight canonical artifact batch accumulated between commits.
 #[derive(Default)]
 pub(crate) struct CanonicalBatch {
+    pub(crate) block_replay_envelopes: Vec<CanonicalBlockReplayEnvelope>,
     pub(crate) block_headers: Vec<BlockHeaderArtifact>,
     pub(crate) block_blobs: Vec<BlockBlobArtifact>,
     pub(crate) compact_blocks: Vec<CompactBlockArtifact>,
@@ -460,36 +476,46 @@ pub(crate) struct CanonicalBatch {
 }
 
 impl CanonicalBatch {
-    /// Appends one block.s built artifacts into the in-flight batch.
+    /// Appends one block's canonical facts into the in-flight batch.
     ///
-    /// Called once per `finalize_derived_block` result. Each field is
+    /// Called once per `position_canonical_block` result. Each field is
     /// moved into its matching `CanonicalBatch` vector; the running tip
-    /// metadata is overwritten with the latest built value.
-    pub(crate) fn absorb(&mut self, built: BuiltArtifacts) {
-        self.absorb_with_prefetched_spent_outputs(built, Vec::new());
+    /// metadata is overwritten with the latest block value.
+    pub(crate) fn absorb(
+        &mut self,
+        block: PositionedCanonicalBlock,
+    ) -> Result<(), CanonicalBlockConstructionError> {
+        self.absorb_with_prefetched_spent_outputs(block, Vec::new())
     }
 
-    /// Returns the resource cost contributed by one finalized block.
+    /// Returns the resource cost contributed by one positioned block.
     ///
     /// This is intentionally shared by pre-admission budgeting and the
     /// post-admission accumulator, so they cannot drift apart as canonical
     /// artifacts gain new write paths.
     pub(crate) fn work_cost_for_block(
-        built: &BuiltArtifacts,
+        block: &PositionedCanonicalBlock,
         prefetched_outputs: &[TransparentOutputArtifact],
     ) -> CanonicalBatchCost {
+        let facts = &block.facts;
         let transparent_spend_references =
-            transparent_spend_reference_count_for_transactions(&built.transaction_facts);
+            transparent_spend_reference_count_for_canonical_transactions(&facts.transactions);
+        let transparent_outputs = facts
+            .transactions
+            .iter()
+            .fold(0usize, |count, transaction| {
+                count.saturating_add(transaction.transparent_outputs.len())
+            });
         CanonicalBatchCost {
             blocks: 1,
-            transactions: built.transaction_facts.len(),
-            transparent_outputs: built.transparent_outputs_by_outpoint.len(),
+            transactions: facts.transactions.len(),
+            transparent_outputs,
             transparent_spend_references,
-            artifact_bytes: canonical_block_artifact_bytes(built).saturating_add(
+            artifact_bytes: canonical_block_artifact_bytes(block).saturating_add(
                 prefetched_spent_transparent_output_bytes(prefetched_outputs),
             ),
             estimated_write_bytes: canonical_block_estimated_write_bytes(
-                built,
+                block,
                 transparent_spend_references,
             ),
         }
@@ -509,36 +535,57 @@ impl CanonicalBatch {
             .saturating_add(cost.estimated_write_bytes);
     }
 
-    fn absorb_built_artifacts(&mut self, built: BuiltArtifacts) {
-        self.block_headers.push(built.block_header);
-        if let Some(block_blob) = built.block_blob {
+    fn absorb_positioned_canonical_block(
+        &mut self,
+        block: PositionedCanonicalBlock,
+    ) -> Result<(), CanonicalBlockConstructionError> {
+        let PositionedCanonicalBlock {
+            facts,
+            replay_envelope,
+            retained_raw_blobs,
+            compact_block,
+            tip_metadata,
+        } = block;
+        let CurrentSchemaBlockArtifacts {
+            block_header,
+            block_blob,
+            block_transaction_index,
+            transaction_locations,
+            transaction_facts,
+            transaction_intrinsic_value_balances,
+            transaction_blobs,
+            transparent_outputs_by_outpoint,
+        } = expand_current_schema_block_artifacts(facts, retained_raw_blobs)?;
+        self.block_replay_envelopes.push(replay_envelope);
+        self.block_headers.push(block_header);
+        if let Some(block_blob) = block_blob {
             self.block_blobs.push(block_blob);
         }
-        self.compact_blocks.push(built.compact_block);
-        self.block_transaction_index
-            .extend(built.block_transaction_index);
-        self.transaction_locations
-            .extend(built.transaction_locations);
-        self.transaction_facts.extend(built.transaction_facts);
+        self.compact_blocks.push(compact_block);
+        self.block_transaction_index.extend(block_transaction_index);
+        self.transaction_locations.extend(transaction_locations);
+        self.transaction_facts.extend(transaction_facts);
         self.transaction_intrinsic_value_balances
-            .extend(built.transaction_intrinsic_value_balances);
-        self.transaction_blobs.extend(built.transaction_blobs);
+            .extend(transaction_intrinsic_value_balances);
+        self.transaction_blobs.extend(transaction_blobs);
         self.transparent_outputs_by_outpoint
-            .extend(built.transparent_outputs_by_outpoint);
-        self.tip_metadata = Some(built.tip_metadata);
+            .extend(transparent_outputs_by_outpoint);
+        self.tip_metadata = Some(tip_metadata);
+        Ok(())
     }
 
-    /// Appends built artifacts with transparent prevouts prefetched upstream.
+    /// Appends canonical block facts with transparent prevouts prefetched upstream.
     pub(crate) fn absorb_with_prefetched_spent_outputs(
         &mut self,
-        built: BuiltArtifacts,
+        block: PositionedCanonicalBlock,
         prefetched_outputs: Vec<TransparentOutputArtifact>,
-    ) {
-        let cost = Self::work_cost_for_block(&built, &prefetched_outputs);
+    ) -> Result<(), CanonicalBlockConstructionError> {
+        let cost = Self::work_cost_for_block(&block, &prefetched_outputs);
         self.absorb_work_cost(cost);
-        self.absorb_built_artifacts(built);
+        self.absorb_positioned_canonical_block(block)?;
         self.prefetched_spent_transparent_outputs
             .extend(prefetched_outputs);
+        Ok(())
     }
 
     pub(crate) fn push_tree_state_checkpoint(&mut self, tree_state: TreeStateArtifact) {
@@ -580,57 +627,62 @@ impl CanonicalBatch {
     }
 }
 
-fn canonical_block_artifact_bytes(built: &BuiltArtifacts) -> usize {
-    let block_blob_bytes = built
+fn canonical_block_artifact_bytes(block: &PositionedCanonicalBlock) -> usize {
+    let block_blob_bytes = block
+        .retained_raw_blobs
         .block_blob
         .as_ref()
-        .map_or(0, |block_blob| block_blob.raw_block_bytes.len());
-    let compact_block_bytes = built.compact_block.payload_bytes.len();
-    let transaction_blob_bytes =
-        built
-            .transaction_blobs
-            .iter()
-            .fold(0usize, |bytes, transaction_blob| {
-                bytes.saturating_add(transaction_blob.raw_transaction_bytes.len())
-            });
-    block_blob_bytes
+        .map_or(0, |blob| blob.raw_block_bytes.len());
+    let replay_envelope_byte_count = block.replay_envelope.as_bytes().len();
+    let compact_block_bytes = block.compact_block.payload_bytes.len();
+    let transaction_blob_bytes = block.retained_raw_blobs.transaction_blobs.iter().fold(
+        0usize,
+        |bytes, transaction_blob| {
+            bytes.saturating_add(transaction_blob.raw_transaction_bytes.len())
+        },
+    );
+    replay_envelope_byte_count
+        .saturating_add(block_blob_bytes)
         .saturating_add(compact_block_bytes)
         .saturating_add(transaction_blob_bytes)
 }
 
 fn canonical_block_estimated_write_bytes(
-    built: &BuiltArtifacts,
+    block: &PositionedCanonicalBlock,
     transparent_spend_references: usize,
 ) -> usize {
+    let facts = &block.facts;
     let block_index_bytes = ESTIMATED_BLOCK_WRITE_BYTES
         .saturating_add(
-            built
-                .block_transaction_index
+            facts
+                .transactions
                 .len()
                 .saturating_mul(ESTIMATED_BLOCK_TRANSACTION_INDEX_WRITE_BYTES),
         )
         .saturating_add(
-            built
-                .transaction_locations
+            facts
+                .transactions
                 .len()
                 .saturating_mul(ESTIMATED_TRANSACTION_LOCATION_WRITE_BYTES),
         );
-    let transaction_fact_bytes = built
-        .transaction_facts
+    let transaction_fact_bytes = facts
+        .transactions
         .len()
         .saturating_mul(ESTIMATED_TRANSACTION_FACT_WRITE_BYTES);
-    let transparent_output_bytes = built
-        .transparent_outputs_by_outpoint
-        .len()
-        .saturating_mul(ESTIMATED_TRANSPARENT_OUTPUT_WRITE_BYTES);
-    let address_output_index_bytes = built
-        .transparent_outputs_by_outpoint
-        .len()
-        .saturating_mul(ESTIMATED_ADDRESS_OUTPUT_INDEX_WRITE_BYTES);
+    let transparent_output_count = facts
+        .transactions
+        .iter()
+        .fold(0usize, |count, transaction| {
+            count.saturating_add(transaction.transparent_outputs.len())
+        });
+    let transparent_output_bytes =
+        transparent_output_count.saturating_mul(ESTIMATED_TRANSPARENT_OUTPUT_WRITE_BYTES);
+    let address_output_index_bytes =
+        transparent_output_count.saturating_mul(ESTIMATED_ADDRESS_OUTPUT_INDEX_WRITE_BYTES);
     let transparent_spend_fact_bytes =
         transparent_spend_references.saturating_mul(ESTIMATED_TRANSPARENT_SPEND_FACT_WRITE_BYTES);
 
-    canonical_block_artifact_bytes(built)
+    canonical_block_artifact_bytes(block)
         .saturating_add(block_index_bytes)
         .saturating_add(transaction_fact_bytes)
         .saturating_add(transparent_output_bytes)
@@ -717,7 +769,7 @@ impl CanonicalBatchBudget {
     }
 
     /// Returns the close trigger for the current batch before admitting the
-    /// next finalized block.
+    /// next positioned block.
     ///
     /// Exact-limit blocks still join the current batch and close it through
     /// [`Self::commit_trigger`]. This path is only for an existing batch that
@@ -919,6 +971,8 @@ where
     record_ingest_source_outcome("fetch_chain_segment", started_at, &source_outcome);
     if let Ok(segment) = &source_outcome {
         let stats = segment.stats();
+        metrics::counter!("zinder_ingest_source_segment_connected_blocks_total")
+            .increment(u64::from(stats.connected_blocks()));
         metrics::histogram!("zinder_ingest_source_segment_max_blocks")
             .record(usize_to_u32_saturating(segment.len()));
         metrics::histogram!("zinder_ingest_source_segment_response_payload_bytes")
@@ -1417,8 +1471,8 @@ fn transparent_spend_references_for_transactions(
     spends
 }
 
-fn transparent_spend_reference_count_for_transactions(
-    transactions: &[TransactionFactsArtifact],
+fn transparent_spend_reference_count_for_canonical_transactions(
+    transactions: &[CanonicalTransactionFacts],
 ) -> usize {
     transactions.iter().fold(0usize, |count, transaction| {
         count.saturating_add(
@@ -1449,6 +1503,7 @@ fn drain_batch_into_chain_epoch_artifacts(
     let mut artifacts = ChainEpochArtifacts::new(
         chain_epoch,
         std::mem::take(&mut batch.block_headers),
+        std::mem::take(&mut batch.block_replay_envelopes),
         std::mem::take(&mut batch.compact_blocks),
     );
     if !batch.block_blobs.is_empty() {
@@ -1564,12 +1619,12 @@ impl Drop for SourceFetchActiveGauge {
     }
 }
 
-/// Records derive wall-clock and outcome for one source block.
+/// Records canonical block-preparation wall-clock and outcome.
 ///
-/// In bulk catchup this wraps the parallel-safe `derive_block` call inside
+/// In bulk catchup this wraps the parallel-safe `prepare_canonical_block` call inside
 /// the buffered stream; in tip-follow this wraps the one-block artifact
 /// build. The histogram is the per-block CPU contribution to ingest
-/// throughput before serial finalization and commit work.
+/// throughput before serial positioning and commit work.
 pub(crate) fn record_ingest_block_prepare_outcome<T>(
     started_at: Instant,
     block_prepare_outcome: &Result<T, IngestError>,
@@ -1730,12 +1785,15 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
             "tip_follow_parent_metadata_unavailable"
         }
         Some(IngestError::ReorgWindowExceeded { .. }) => "reorg_window_exceeded",
+        Some(IngestError::CanonicalWriterReorgWindowMismatch { .. }) => {
+            "canonical_writer_reorg_window_mismatch"
+        }
         Some(IngestError::SourceRetryBudgetExceeded { .. }) => "source_retry_budget_exceeded",
         Some(IngestError::SourceRetryDeadlineExceeded { .. }) => "source_retry_deadline_exceeded",
         Some(IngestError::SystemTimeBeforeUnixEpoch { .. }) => "system_time_before_unix_epoch",
         Some(IngestError::TimestampTooLarge) => "timestamp_too_large",
         Some(IngestError::Source(_)) => "source",
-        Some(IngestError::ArtifactDerive(_)) => "artifact_derive",
+        Some(IngestError::CanonicalBlockConstruction(_)) => "canonical_block_construction",
         Some(IngestError::Store(_)) => "store",
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",
@@ -1929,7 +1987,64 @@ const fn u32_to_usize(count: u32) -> usize {
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
+    use tempfile::tempdir;
+    use zinder_core::Network;
+    use zinder_store::{ChainStoreOptions, RawBlobRetention};
+
     use super::*;
+
+    #[test]
+    fn caller_owned_writer_rejects_mismatched_raw_blob_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(
+            tempdir.path(),
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+
+        let error = match validate_writer_store_contract(&store, 100, RawBlobPolicy::All) {
+            Ok(()) => return Err("an all-blob writer must reject a none-retention store".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            IngestError::Store(StoreError::RawBlobRetentionMismatch {
+                persisted: RawBlobRetention::None,
+                configured: RawBlobRetention::All,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_writer_rejects_mismatched_reorg_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(
+            tempdir.path(),
+            ChainStoreOptions {
+                reorg_window_blocks: 25,
+                ..ChainStoreOptions::for_network(Network::ZcashRegtest)
+            },
+        )?;
+
+        let error = match validate_writer_store_contract(&store, 50, RawBlobPolicy::None) {
+            Ok(()) => {
+                return Err("a caller-owned writer must reject a different reorg window".into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            IngestError::CanonicalWriterReorgWindowMismatch {
+                store_reorg_window_blocks: 25,
+                configured_reorg_window_blocks: 50,
+            }
+        ));
+        Ok(())
+    }
 
     #[test]
     fn ingest_batch_budget_triggers_on_block_count_limit() {

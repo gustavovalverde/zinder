@@ -1,4 +1,5 @@
 mod bulk_catchup;
+mod canonical_construction;
 mod cli;
 mod event_stream_start;
 mod fixture_block;

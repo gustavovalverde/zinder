@@ -8,13 +8,14 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
-use zinder_derive::{DeriveStore, DeriveStoreOptions};
 use zinder_runtime::{
-    Readiness, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
+    Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
     install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
-use zinder_store::{RawBlobRetention, SecondaryChainStore};
+use zinder_store::{CanonicalStoreWorkload, RocksDbCanonicalStore};
+use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionSourcePosition};
+use zinder_wallet_rocksdb::RocksDbWalletStore;
 
 mod config;
 
@@ -39,6 +40,9 @@ struct Cli {
     /// Process-unique `RocksDB` secondary metadata path.
     #[arg(long = "secondary-path")]
     secondary_path: Option<PathBuf>,
+    /// Version-1 wallet projection store path opened by this compatibility process.
+    #[arg(long = "wallet-storage-path")]
+    wallet_storage_path: Option<PathBuf>,
     /// Private `zinder-ingest` control gRPC endpoint.
     #[arg(long = "ingest-control-addr")]
     ingest_control_addr: Option<String>,
@@ -122,71 +126,6 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         Vec::new(),
     );
 
-    let open_storage_phase = StartupPhase::OpenStorage.start();
-    let canonical_store = match SecondaryChainStore::open(
-        &lightwalletd_config.storage.path,
-        &lightwalletd_config.storage.secondary_path,
-        zinder_store::ChainStoreOptions {
-            rocksdb_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
-            ..zinder_store::ChainStoreOptions::for_network(lightwalletd_config.network)
-        },
-    ) {
-        Ok(handle) => handle,
-        Err(error) => {
-            let wrapped = LightwalletdConfigError::Store(error);
-            open_storage_phase.fail(&wrapped);
-            start_api_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
-    let derive_primary_path = DeriveStore::path_for_canonical(&lightwalletd_config.storage.path);
-    let projection_preset =
-        match DeriveStore::detect_projection_preset_at_path(&derive_primary_path) {
-            Ok(projection_preset) => projection_preset.unwrap_or_default(),
-            Err(error) => {
-                let wrapped = LightwalletdConfigError::DeriveStore(error);
-                open_storage_phase.fail(&wrapped);
-                start_api_phase.fail(&wrapped);
-                return Err(wrapped);
-            }
-        };
-    readiness.set_projection_workload(
-        projection_preset.as_str(),
-        projection_preset
-            .consumer_schemas()
-            .iter()
-            .map(|schema| schema.name.as_str().to_owned())
-            .collect(),
-    );
-    let derive_store = match DeriveStore::open_secondary_with_projection_preset(
-        &derive_primary_path,
-        lightwalletd_config.storage.secondary_path.join("derive"),
-        projection_preset,
-        DeriveStoreOptions {
-            sync_writes: false,
-            rocksdb_resource_budget: lightwalletd_config.storage.derive_rocksdb_budget,
-            ..DeriveStoreOptions::default()
-        },
-    ) {
-        Ok(derive_store) => derive_store,
-        Err(error) => {
-            let wrapped = LightwalletdConfigError::DeriveStore(error);
-            open_storage_phase.fail(&wrapped);
-            start_api_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
-    open_storage_phase.complete();
-    let transparent_history_blobs_available = lightwalletd_transparent_history_blobs_available(
-        canonical_store
-            .raw_blob_retention()
-            .map_err(LightwalletdConfigError::Store)?,
-    );
-    let visible_height = canonical_store
-        .current_chain_epoch()
-        .map_err(LightwalletdConfigError::Store)?
-        .map(|epoch| epoch.visible_tip_height.value());
-
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let broadcaster = match build_broadcaster(lightwalletd_config.broadcaster.as_ref()) {
         Ok(broadcaster) => broadcaster,
@@ -225,17 +164,50 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let tree_state_upstream = broadcaster
         .as_ref()
         .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
-    let wallet_projection_reader =
-        zinder_query::derive_store_wallet_projection_reader(derive_store.clone());
-    let mut wallet_query = zinder_query::WalletQuery::new(
-        canonical_store.clone(),
+
+    let open_storage_phase = StartupPhase::OpenStorage.start();
+    let canonical_store = Arc::new(RocksDbCanonicalStore::open_ready(
+        &lightwalletd_config.storage.path,
+        &network_upgrade_activations,
+        CanonicalStoreWorkload::Wallet,
+        lightwalletd_config.storage.canonical_rocksdb_budget,
+    )?);
+    let canonical_fence = canonical_store.event_fence();
+    let wallet_source = WalletCanonicalSourceIdentity::new(
+        WalletProjectionSourcePosition::new(
+            canonical_fence.chain_epoch_id(),
+            canonical_fence.visible_tip(),
+            canonical_fence.chain_event_sequence(),
+        ),
+        canonical_fence.sequence_digest(),
+    );
+    let wallet_store = Arc::new(RocksDbWalletStore::open_ready(
+        &lightwalletd_config.wallet_storage_path,
+        lightwalletd_config.network,
+        wallet_source,
+        lightwalletd_config.storage.derive_rocksdb_budget,
+    )?);
+    let visible_height = Some(canonical_fence.visible_tip().height.value());
+    readiness.set_projection_workload(
+        "wallet",
+        vec![
+            "transparent-address-history-v1".to_owned(),
+            "transparent-utxo-v1".to_owned(),
+        ],
+    );
+    readiness.set(ReadinessState::ready(visible_height));
+    open_storage_phase.complete();
+
+    let mut wallet_query = zinder_query::FactFirstWalletQuery::new(
+        canonical_store,
+        wallet_store,
         broadcaster,
         network_upgrade_activations.clone(),
-    )
-    .with_wallet_projection_reader(Arc::clone(&wallet_projection_reader));
+    )?;
     if let Some(tree_state_upstream) = tree_state_upstream {
         wallet_query = wallet_query.with_tree_state_upstream(tree_state_upstream);
     }
+    let fact_first_wallet_readiness = wallet_query.wallet_readiness();
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let mempool_surface = Arc::new({
@@ -251,29 +223,11 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         lightwalletd_config.ingest_control_bearer_token.clone(),
         cancel.clone(),
     );
-    let mut grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
-        .with_wallet_projection_reader(wallet_projection_reader)
+    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
+        .with_fact_first_wallet_readiness(fact_first_wallet_readiness)
+        .with_transparent_address_support()
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);
-    if transparent_history_blobs_available {
-        grpc_adapter = grpc_adapter.with_transparent_address_support();
-    }
-    let _refresh_handle = zinder_query::spawn_secondary_catchup(
-        canonical_store,
-        readiness.clone(),
-        zinder_query::SecondaryCatchupOptions {
-            interval: lightwalletd_config.storage.secondary_catchup_interval,
-            lag_threshold_chain_epochs: lightwalletd_config
-                .storage
-                .secondary_replica_lag_threshold_chain_epochs,
-            writer_status: Some(zinder_query::WriterStatusConfig {
-                endpoint: lightwalletd_config.ingest_control_addr.clone(),
-                network: lightwalletd_config.network,
-                bearer_token: lightwalletd_config.ingest_control_bearer_token.clone(),
-            }),
-        },
-        cancel.clone(),
-    );
 
     tracing::info!(
         target: "zinder::compat_lightwalletd",
@@ -332,10 +286,6 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     server_result.map_err(LightwalletdConfigError::Transport)
 }
 
-const fn lightwalletd_transparent_history_blobs_available(retention: RawBlobRetention) -> bool {
-    retention.retains_transaction_blobs()
-}
-
 fn build_broadcaster(
     broadcaster_target: Option<&NodeTarget>,
 ) -> Result<Option<ZebraJsonRpcSource>, LightwalletdConfigError> {
@@ -385,29 +335,12 @@ impl From<Cli> for LightwalletdConfigOverrides {
             network: cli.network,
             storage_path: cli.storage_path,
             secondary_path: cli.secondary_path,
+            wallet_storage_path: cli.wallet_storage_path,
             ingest_control_addr: cli.ingest_control_addr,
             ingest_control_bearer_token_path: cli.ingest_control_token_path,
             listen_addr: cli.listen_addr,
             ops_listen_addr: cli.ops_listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lightwalletd_transparent_history_requires_transaction_blob_retention() {
-        assert!(!lightwalletd_transparent_history_blobs_available(
-            RawBlobRetention::None
-        ));
-        assert!(lightwalletd_transparent_history_blobs_available(
-            RawBlobRetention::Transactions
-        ));
-        assert!(lightwalletd_transparent_history_blobs_available(
-            RawBlobRetention::All
-        ));
     }
 }

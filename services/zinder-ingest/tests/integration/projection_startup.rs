@@ -32,7 +32,9 @@ use zinder_store::{
     ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
     RocksDbResourceBudget,
 };
-use zinder_testkit::{ChainFixture, MockNodeSource, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    ChainFixture, MockNodeSource, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+};
 
 const LEGACY_OUTPOINT_SPEND_SCHEMA: DeriveConsumerSchema = DeriveConsumerSchema::new(
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
@@ -227,7 +229,7 @@ async fn startup_defers_existing_derive_replay_to_the_tailer() -> Result<()> {
 
 #[test]
 fn complete_startup_plan_owns_every_optional_projection_job() {
-    let plan = ProjectionStartupPlan::for_preset(ProjectionPreset::Complete);
+    let plan = ProjectionStartupPlan::for_preset(ProjectionPreset::Explorer);
     assert_eq!(
         plan.selected_work().collect::<Vec<_>>(),
         ProjectionStartupWork::all().to_vec()
@@ -253,7 +255,7 @@ async fn startup_rejects_a_plan_store_mismatch() -> Result<()> {
     readiness.set_phase(IngestPhase::BulkCatchup);
     let historical_work_gate = HistoricalWorkGate::new(readiness);
 
-    let outcome = ProjectionStartupPlan::for_preset(ProjectionPreset::Complete)
+    let outcome = ProjectionStartupPlan::for_preset(ProjectionPreset::Explorer)
         .start(ProjectionStartupInputs {
             settings: enabled_settings(),
             request_timeout: Duration::from_secs(1),
@@ -440,10 +442,13 @@ fn preflight_allows_destructive_rebuild_only_with_full_event_history() -> Result
     let chain_epoch = fixture
         .chain_epoch(ChainEpochId::new(2))
         .ok_or_else(|| eyre!("fixture epoch missing"))?;
+    let block_header = block.block_header_artifact();
+    let replay_envelope = encode_fixture_block_replay(&block_header, &[]);
     let second_commit = chain_store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             chain_epoch,
-            vec![block.block_header_artifact()],
+            vec![block_header],
+            vec![replay_envelope],
             vec![block.compact_block_artifact()],
         )
         .with_reorg_window_change(ReorgWindowChange::Extend {

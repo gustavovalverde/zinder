@@ -586,7 +586,7 @@ async fn sleep_or_cancel(duration: Duration, cancel: &CancellationToken) -> bool
 mod tests {
     use zinder_core::{BlockHeightRange, ChainEpochId, Network, TransactionId};
     use zinder_store::{ChainEpochArtifacts, ChainStoreOptions, ReorgWindowChange};
-    use zinder_testkit::{ChainFixture, FixtureTransactionRows};
+    use zinder_testkit::{ChainFixture, FixtureTransactionRows, encode_fixture_block_replay};
 
     use super::*;
 
@@ -658,15 +658,23 @@ mod tests {
         let first_available_epoch = chain
             .chain_epoch(ChainEpochId::new(2))
             .ok_or("first available fixture epoch missing")?;
+        let block_header = first_available_block.block_header_artifact();
+        let replay_envelope =
+            encode_fixture_block_replay(&block_header, std::slice::from_ref(&transaction_rows));
+        let transaction_intrinsic_value_balances = transaction_rows
+            .intrinsic_value_balances_artifact()
+            .ok_or("fixture transaction intrinsic balances missing")?;
         store.commit_chain_epoch(
             ChainEpochArtifacts::new(
                 first_available_epoch,
-                vec![first_available_block.block_header_artifact()],
+                vec![block_header],
+                vec![replay_envelope],
                 vec![first_available_block.compact_block_artifact()],
             )
             .with_block_transaction_index(vec![transaction_rows.block_transaction_index])
             .with_transaction_locations(vec![transaction_rows.location])
             .with_transaction_facts(vec![transaction_rows.facts])
+            .with_transaction_intrinsic_value_balances(vec![transaction_intrinsic_value_balances])
             .with_reorg_window_change(ReorgWindowChange::Extend {
                 block_range: BlockHeightRange::inclusive(
                     first_available_block.height,

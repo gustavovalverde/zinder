@@ -10,8 +10,8 @@ use zinder_core::{
     CompactBlockArtifact, FinalNoteCommitmentRoot, Network, UnixTimestampMillis,
 };
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEventHistoryRequest,
-    ChainStoreOptions, PrimaryChainStore, ReorgWindowChange, StoreError,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
+    PrimaryChainStore, ReorgWindowChange, StoreError,
 };
 
 use super::synthetic_block_header;
@@ -23,7 +23,7 @@ fn final_roots_round_trip_optional_pools_and_bounded_ranges() -> eyre::Result<()
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 13);
     let roots_1 = roots(block_1.height, block_1.block_hash, 11, 12, 13);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_1])
+        super::synthetic_chain_epoch_artifacts(epoch_1, vec![block_1], vec![compact_1])
             .with_final_note_commitment_roots(vec![roots_1]),
     )?;
 
@@ -31,7 +31,7 @@ fn final_roots_round_trip_optional_pools_and_bounded_ranges() -> eyre::Result<()
     let unavailable =
         BlockFinalNoteCommitmentRoots::unavailable(block_2.height, block_2.block_hash);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_2])
+        super::synthetic_chain_epoch_artifacts(epoch_2, vec![block_2], vec![compact_2])
             .with_final_note_commitment_roots(vec![unavailable]),
     )?;
 
@@ -56,7 +56,7 @@ fn reorged_final_roots_remain_physical_but_are_not_canonical() -> eyre::Result<(
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 13);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1],
         vec![compact_1],
@@ -65,17 +65,21 @@ fn reorged_final_roots_remain_physical_but_are_not_canonical() -> eyre::Result<(
     let (epoch_2, block_2, compact_2) = epoch_artifacts(2, 2, 2, 1, 1, 1, 2, 13);
     let old_roots = roots(block_2.height, block_2.block_hash, 21, 22, 23);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_2])
+        super::synthetic_chain_epoch_artifacts(epoch_2, vec![block_2], vec![compact_2])
             .with_final_note_commitment_roots(vec![old_roots]),
     )?;
 
     let (epoch_3, replacement_block, replacement_compact) =
         epoch_artifacts(3, 2, 92, 1, 1, 1, 2, 13);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_3, vec![replacement_block], vec![replacement_compact])
-            .with_reorg_window_change(ReorgWindowChange::Replace {
-                from_height: BlockHeight::new(2),
-            }),
+        super::synthetic_chain_epoch_artifacts(
+            epoch_3,
+            vec![replacement_block],
+            vec![replacement_compact],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Replace {
+            from_height: BlockHeight::new(2),
+        }),
     )?;
 
     assert_eq!(
@@ -100,7 +104,7 @@ fn historical_enrichment_is_idempotent_rejects_stale_hashes_and_survives_commit(
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 12);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1.clone()],
         vec![compact_1],
@@ -130,7 +134,7 @@ fn historical_enrichment_is_idempotent_rejects_stale_hashes_and_survives_commit(
     ));
 
     let (epoch_2, block_2, compact_2) = epoch_artifacts(2, 2, 2, 1, 1, 1, 2, 13);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_2,
         vec![block_2],
         vec![compact_2],
@@ -146,9 +150,9 @@ fn historical_enrichment_is_idempotent_rejects_stale_hashes_and_survives_commit(
 }
 
 #[test]
-fn only_artifact_schema_18_is_readable_older_and_newer_are_rejected_and_18_commits()
+fn only_artifact_schema_19_is_readable_older_and_newer_are_rejected_and_19_commits()
 -> eyre::Result<()> {
-    assert_schema_reopen(18, true)?;
+    assert_schema_reopen(19, true)?;
     assert_schema_reopen(11, false)?;
     assert_schema_reopen(12, false)?;
     assert_schema_reopen(13, false)?;
@@ -156,12 +160,17 @@ fn only_artifact_schema_18_is_readable_older_and_newer_are_rejected_and_18_commi
     assert_schema_reopen(15, false)?;
     assert_schema_reopen(16, false)?;
     assert_schema_reopen(17, false)?;
-    assert_schema_reopen(19, false)?;
+    assert_schema_reopen(18, false)?;
+    assert_schema_reopen(20, false)?;
 
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch, block, compact) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 18);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(epoch, vec![block], vec![compact]))?;
+    let (epoch, block, compact) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 19);
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
+        epoch,
+        vec![block],
+        vec![compact],
+    ))?;
     assert_eq!(
         store
             .current_chain_epoch()?
@@ -177,7 +186,11 @@ fn assert_schema_reopen(version: u16, should_open: bool) -> eyre::Result<()> {
     {
         let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
         let (epoch, block, compact) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, version);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(epoch, vec![block], vec![compact]))?;
+        store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
+            epoch,
+            vec![block],
+            vec![compact],
+        ))?;
     }
 
     let reopened = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests());
@@ -188,8 +201,8 @@ fn assert_schema_reopen(version: u16, should_open: bool) -> eyre::Result<()> {
     );
     if let Err(error) = reopened {
         match version {
-            11..=17 => assert!(matches!(error, StoreError::SchemaTooOld { .. })),
-            19 => assert!(matches!(error, StoreError::SchemaTooNew { .. })),
+            11..=18 => assert!(matches!(error, StoreError::SchemaTooOld { .. })),
+            20 => assert!(matches!(error, StoreError::SchemaTooNew { .. })),
             _ => return Err(eyre::eyre!("unexpected schema reopen error: {error}")),
         }
     }

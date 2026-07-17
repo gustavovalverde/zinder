@@ -12,9 +12,9 @@ use zinder_core::{
     CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEvent, ChainEventEnvelope,
-    ChainEventHistoryRequest, ChainEventStreamFamily, ChainStoreOptions, EventStreamStartPosition,
-    PrimaryChainStore, ReorgWindowChange, StoreError, StreamCursorTokenV1,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,
+    ChainEventStreamFamily, ChainStoreOptions, EventStreamStartPosition, PrimaryChainStore,
+    ReorgWindowChange, StoreError, StreamCursorTokenV1,
 };
 
 #[test]
@@ -24,12 +24,12 @@ fn chain_event_history_resumes_after_persisted_cursor() -> eyre::Result<()> {
     let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
     let (second_epoch, second_block, second_compact_block) = synthetic_epoch(2, 2);
 
-    let first_commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let first_commit = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         first_epoch,
         vec![first_block],
         vec![first_compact_block],
     ))?;
-    let second_commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let second_commit = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         second_epoch,
         vec![second_block],
         vec![second_compact_block],
@@ -75,7 +75,7 @@ fn checkpoint_bootstrap_cursor_resumes_after_artifactless_anchor() -> eyre::Resu
     };
     let checkpoint_commit = store.commit_artifactless_checkpoint(checkpoint_epoch)?;
     let (next_epoch, next_block, next_compact_block) = synthetic_epoch(2, 11);
-    let next_commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let next_commit = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         next_epoch,
         vec![next_block],
         vec![next_compact_block],
@@ -99,7 +99,7 @@ fn chain_event_history_returns_bounded_pages() -> eyre::Result<()> {
 
     for height in 1..=3 {
         let (chain_epoch, block, compact_block) = synthetic_epoch(u64::from(height), height);
-        let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+        let commit = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block],
             vec![compact_block],
@@ -132,7 +132,7 @@ fn chain_event_retention_prunes_prefix_and_expires_stale_cursors() -> eyre::Resu
 
     for height in 1..=3 {
         let (chain_epoch, block, compact_block) = synthetic_epoch(u64::from(height), height);
-        let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+        let commit = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block],
             vec![compact_block],
@@ -181,7 +181,7 @@ fn chain_event_retention_never_prunes_the_newest_event() -> eyre::Result<()> {
 
     for height in 1..=2 {
         let (chain_epoch, block, compact_block) = synthetic_epoch(u64::from(height), height);
-        let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+        let commit = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block],
             vec![compact_block],
@@ -207,7 +207,7 @@ fn chain_event_history_encodes_requested_stream_family() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block],
         vec![compact_block],
@@ -233,7 +233,7 @@ fn chain_event_history_survives_store_reopen() -> eyre::Result<()> {
     let committed_envelope = {
         let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
         let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-        let commit_outcome = store.commit_chain_epoch(ChainEpochArtifacts::new(
+        let commit_outcome = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block],
             vec![compact_block],
@@ -258,7 +258,7 @@ fn tampered_chain_event_cursor_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-    let commit_outcome = store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let commit_outcome = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block],
         vec![compact_block],
@@ -291,7 +291,7 @@ fn cursor_from_another_store_is_rejected() -> eyre::Result<()> {
     let first_store =
         PrimaryChainStore::open(first_tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
-    let first_commit = first_store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let first_commit = first_store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         first_epoch,
         vec![first_block],
         vec![first_compact_block],
@@ -301,7 +301,7 @@ fn cursor_from_another_store_is_rejected() -> eyre::Result<()> {
     let second_store =
         PrimaryChainStore::open(second_tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (second_epoch, second_block, second_compact_block) = synthetic_epoch(1, 1);
-    second_store.commit_chain_epoch(ChainEpochArtifacts::new(
+    second_store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         second_epoch,
         vec![second_block],
         vec![second_compact_block],
@@ -329,7 +329,7 @@ fn cursor_before_any_commits_is_rejected() -> eyre::Result<()> {
         let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
         let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
         store
-            .commit_chain_epoch(ChainEpochArtifacts::new(
+            .commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
                 chain_epoch,
                 vec![block],
                 vec![compact_block],
@@ -362,7 +362,7 @@ fn commit_outcome_includes_cursor_bound_chain_event() -> eyre::Result<()> {
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
 
-    let commit_outcome = store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let commit_outcome = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block],
         vec![compact_block],
@@ -380,7 +380,7 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
     let (_, initial_block_1, initial_compact_block_1) = synthetic_epoch(1, 1);
     let (initial_epoch, initial_block, initial_compact_block) =
         synthetic_epoch_with_safe_tip(1, 2, 1, block_hash(2));
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         initial_epoch,
         vec![initial_block_1, initial_block],
         vec![initial_compact_block_1, initial_compact_block],
@@ -408,7 +408,7 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
     let (replacement_epoch, replacement_block, replacement_compact_block) =
         synthetic_epoch_with_safe_tip(2, 2, 1, replacement_hash);
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -454,14 +454,14 @@ fn commit_reorgable_chain_and_cursor(
 ) -> eyre::Result<StreamCursorTokenV1> {
     let (first_epoch, first_block, first_compact_block) =
         synthetic_epoch_with_safe_tip(1, 1, 1, block_hash(1));
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         first_epoch,
         vec![first_block],
         vec![first_compact_block],
     ))?;
     let (second_epoch, second_block, second_compact_block) =
         synthetic_epoch_with_safe_tip(2, 2, 1, block_hash(2));
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         second_epoch,
         vec![second_block],
         vec![second_compact_block],
@@ -488,7 +488,7 @@ fn commit_height_two_reorg(
         synthetic_epoch_with_safe_tip(3, 2, 1, block_hash(20));
     replacement_epoch.created_at = created_at;
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -574,7 +574,7 @@ fn live_tail_start_skips_prior_events_and_delivers_later_commits() -> eyre::Resu
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     for height in 1..=2 {
         let (chain_epoch, block, compact_block) = synthetic_epoch(u64::from(height), height);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
+        store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
             chain_epoch,
             vec![block],
             vec![compact_block],
@@ -597,7 +597,7 @@ fn live_tail_start_skips_prior_events_and_delivers_later_commits() -> eyre::Resu
     assert!(quiet_page.is_empty());
 
     let (third_epoch, third_block, third_compact_block) = synthetic_epoch(3, 3);
-    let third_commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let third_commit = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         third_epoch,
         vec![third_block],
         vec![third_compact_block],
@@ -619,7 +619,7 @@ fn live_tail_start_mints_a_cursor_in_the_requested_family() -> eyre::Result<()> 
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block],
         vec![compact_block],
@@ -663,7 +663,7 @@ fn after_cursor_start_takes_the_cursor_family_as_authoritative() -> eyre::Result
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block],
         vec![compact_block],
@@ -697,7 +697,7 @@ fn after_cursor_start_rejects_request_family_mismatch() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-    let commit_outcome = store.commit_chain_epoch(ChainEpochArtifacts::new(
+    let commit_outcome = store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
         vec![block],
         vec![compact_block],

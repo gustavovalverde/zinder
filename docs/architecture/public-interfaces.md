@@ -60,6 +60,10 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `BlockHeaderArtifact` | Durable typed block-header fact row |
 | `BlockBlobArtifact` | Optional raw block blob available only when raw blob policy stores blocks |
 | `CompactBlockArtifact` | Wallet-oriented compact block artifact |
+| `CanonicalBlockFacts` | Backend-neutral semantic facts for one source block: one header plus ordered transaction public facts, intrinsic shielded-pool balances, transparent inputs, and transparent outputs. Chain position, resolved spends, address indexes, and retention-dependent raw blobs are excluded. |
+| `ValidatedCanonicalBlockReplay` | Decoded, semantically validated view of one versioned canonical replay envelope. Its reference digest covers `CanonicalBlockFacts`, so raw-blob retention does not change replay identity. |
+| `BlockReplayStore` | Epoch-bound read boundary for one replay value or a bounded forward batch. Batch reads resolve visibility with one ordered scan and fetch replay payloads with one `multi_get`. |
+| `BlockReplayBatchRequest` | Forward replay request containing `start_height` and nonzero `max_blocks`. The store rejects limits above `MAX_BLOCK_REPLAY_BATCH_BLOCKS` (256), returns an empty batch after the pinned visible tip, clips a crossing batch to the tip, and fails the whole batch on a missing or corrupt row. |
 | `BlockId` | Stable block identity (`{ height: BlockHeight, hash: BlockHash }`); lives in `zinder-core` and is the canonical (height, hash) pair across the source boundary, the wallet protocol, and the reader API |
 | `ChainValuePools` | Live-source value-pool totals paired with `source_tip: BlockId`; Zebra supplies the height, hash, and pool list in one `getblockchaininfo` observation |
 | `ChainValuePoolsAtTip` | Wallet-facing value-pool totals paired with both the writer-visible `ChainEpoch` and the hash-bound source tip so consumers can verify canonical agreement |
@@ -78,6 +82,11 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `NetworkUpgradeActivations` | Node-discovered consensus upgrade table (branch id, activation height, name per upgrade) carried as `Arc<NetworkUpgradeActivations>` from process startup. Source of truth for `consensus_branch_id_at`, `active_at`, and Sapling activation height across the compat shim, native query API, and signer testkit. Required at construction by every consumer: see [ADR-0008](../adrs/0008-network-parameter-discovery.md). |
 | `NetworkUpgradeActivation` | One entry in a `NetworkUpgradeActivations` table: `{ branch_id: u32, activation_height: BlockHeight, name: String }`, name carried verbatim from `getblockchaininfo.upgrades` |
 
+The current canonical admission floor is store schema 14 and artifact schema
+19. An older volume fails closed at open and requires a fresh rebuild or, when
+available, a separately certified snapshot; primary open does not create the
+missing replay column family in an existing store.
+
 ### Source Boundary
 
 | Term | Meaning |
@@ -85,6 +94,8 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `NodeSource` | Rust trait for configured source adapters in `zinder-source` |
 | `NodeCapabilities` | Capability descriptor detected from the selected source |
 | `NodeAuth` | Typed source authentication configuration |
+| `SourceBlockHeader` | Header-prefix observation used for early block identity, parent-link, and time validation. It does not deserialize the transaction list or replace canonical coinbase-height validation. |
+| `SourceBlock` | Node-sourced header observation plus raw serialized block bytes. Construction parses only the header prefix; parallel canonical preparation performs the one full parse and validates source identity before producing artifacts. |
 | `MempoolSourceEvent` | Source-level mempool observation normalized from source streams or polling diffs |
 | `ChainTipNotification` | Source-level chain-tip wake-up payload normalized from Zebra indexer streams |
 | `ChainTipNotificationSource` | Source boundary that opens chain-tip notification streams. Consumers treat it as a wake-up source and keep JSON-RPC polling as the canonical catch-up path |
@@ -130,8 +141,8 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `DisplacedBlockArchive` | Writer-owned append-only archive of blocks displaced by an accepted canonical replacement. Capture is atomic with `ReorgWindowChange::Replace`; hash is identity, event/height is observation order, and explicit activation coverage prevents claims about earlier reorgs. |
 | `DisplacedBlockHistory` | Explorer RPC returning bounded newest-first displaced-block observations plus each block's current canonical counterpart at the former height. It exposes raw payout scripts and values without product-specific address labels or miner branding. |
 | `DisplacedBlockDetail` | Explorer hash lookup for one displaced block, its current canonical counterpart, optional already-retained consensus bytes, and archive activation coverage. |
-| `BlockFinalNoteCommitmentRoots` | Typed canonical artifact containing the post-block Sapling, Orchard, and Ironwood note-commitment-tree roots. Pool fields are optional before activation; an absent artifact means enrichment has not reached that height. A store persisted below the current artifact-schema floor 18 is refused at open and rebuilt from genesis. |
-| `TransactionIntrinsicValueBalances` | Signed Sprout, Sapling, Orchard, and Ironwood value balances parsed from one transaction. Positive values enter the transaction from the named pool; negative values leave it for that pool. Transparent value is excluded because it requires prevout resolution. The value-pool flow-history projection reads one such row per retained transparent-participating transaction; a store persisted below the current artifact-schema floor 18 is refused at open and rebuilt from genesis. |
+| `BlockFinalNoteCommitmentRoots` | Typed canonical artifact containing the post-block Sapling, Orchard, and Ironwood note-commitment-tree roots. Pool fields are optional before activation; an absent artifact means enrichment has not reached that height. A store persisted below the current artifact-schema floor 19 is refused at open and rebuilt from genesis. |
+| `TransactionIntrinsicValueBalances` | Signed Sprout, Sapling, Orchard, and Ironwood value balances parsed from one transaction. Positive values enter the transaction from the named pool; negative values leave it for that pool. Transparent value is excluded because it requires prevout resolution. Artifact schema 19 carries the same value in each canonical replay transaction and requires exact parity with this row; a store below that floor is refused at open and rebuilt from genesis. |
 | `CommitmentRootSearch` | Explorer RPC that reverse-indexes canonical final note-commitment roots and returns explicit historical coverage. It does not claim transaction-intermediate anchors or orphaned blocks. |
 | `TransactionHistory` | Explorer RPC returning bounded, filter-aware, newest-first canonical transaction pages. Version 2 adds a projection read fence, verified contiguous coverage, and explicit count scope without replacing the v1 RPC or entry fields. |
 | `TransactionHistoryReadFence` | Exact identity of one history projection view: canonical chain epoch, projection revision, and projection tip height and hash. Requests and opaque cursors carrying a stale fence fail closed. |
@@ -145,6 +156,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `DeriveStoreTable` | Logical column-family identifier referenced by reads and `WriteBatch` puts |
 | `DeriveConsumerName` | Stable static identifier scoping cursor and metadata rows; renaming is a schema migration, not a config change |
 | `DeriveConsumer` | Rust trait every chain-events derive consumer implements: dispatches `ChainCommittedEvent` and `ChainReorgedEvent` through `apply_chain_committed` / `apply_chain_reorged` |
+| `BlockSummaryConsumer` | Block-keyed derive consumer at schema 1. It keeps `total_size_bytes` as the complete serialized block size recorded in `BlockHeaderArtifact`. `project_block_summary_record` is a pure `CanonicalBlockFacts` equivalence seam; production dispatch still projects from `BlockCommitContext`, not persisted replay. |
 | `ReorgIncidentsConsumer` | Event-only chain-event derive consumer that writes one durable `reorg_incidents` row per `ChainReorged` event, keyed by ascending `event_sequence`. It does not hydrate committed block contexts and has an event-only cursor independent from block-keyed derive replay. |
 | `CommitmentRootSearchConsumer` | Block-keyed derive consumer that maps each canonical final note-commitment root to newest-first block matches. Its resumable historical coverage is independent from the shared chain-event cursor because ingest first enriches the canonical artifact and then writes bounded backfill batches. |
 | `ConsumerProjectionState` | Per-consumer canonical epoch, projection tip, monotonic revision, and optional contiguous coverage. Block-keyed consumers stage it atomically with projection rows and their chain-event cursor. |
@@ -208,8 +220,16 @@ The `_at` suffix is reserved for height; using `_at` for any non-height key is a
 
 Methods that read a contiguous range of artifacts, returning a stream or vector:
 
-- Always plural, always `_in_range` suffix. Example: `compact_blocks_in_range(range)`, `subtree_roots_in_range(range)`, `transactions_in_range(range)`.
-- The argument is always a `RangeInclusive<BlockHeight>` or a domain range type (`SubtreeRootRange`).
+- A closed caller-supplied range uses a plural `_in_range` suffix. Examples are
+  `compact_blocks_in_range(range)`, `subtree_roots_in_range(range)`, and
+  `transactions_in_range(range)`. The argument is a
+  `RangeInclusive<BlockHeight>` or a domain range type such as
+  `SubtreeRootRange`.
+- A caller-advanced forward batch with an enforced store limit uses plural
+  `{artifacts}_batch(request)` instead of accepting an end height. The canonical
+  example is `block_replay_batch(BlockReplayBatchRequest)`; callers
+  advance `start_height` by the returned count, and the store never returns
+  more than 256 rows.
 
 ### Rule 3 — Tip-pinned reads with no key
 
@@ -464,9 +484,9 @@ mempool_cursor_at_risk_warning_minutes = 12
 # for the full enum vocabulary (`auto`, `zebra-json-rpc`,
 # `zebra-indexer-grpc`, `zebra-in-process`).
 source = "zebra-json-rpc"
-# Closed derive workload. Defaults to "complete". Selecting a different preset
+# Closed derive workload. Defaults to "explorer". Selecting a different preset
 # requires a fresh canonical-plus-projection store.
-projection_preset = "complete" # "wallet" | "complete"
+projection_preset = "explorer" # "wallet" | "explorer"
 # Chain-truth invariant; classifier defaults to this.
 reorg_window_blocks = 100
 
@@ -487,12 +507,8 @@ canonical_batch_max_blocks = 1000
 canonical_batch_max_artifact_bytes = 536870912
 canonical_batch_max_estimated_write_bytes = 536870912
 canonical_batch_min_blocks_before_estimated_write_close = 100
-source_segment_max_blocks = 64
-source_segment_target_response_bytes = 33554432
-source_fetch_max_in_flight_requests = 20
-source_fetch_max_in_flight_bytes = 671088640
-block_prepare_concurrency = 16
-block_prepare_max_in_flight_artifact_bytes = 536870912
+# Source and prepare limits derive from container memory, logical CPUs, and
+# node.max_response_bytes. Explicit fields are diagnostic overrides.
 commit_reassembly_max_queued_artifact_bytes = 536870912
 
 [ingest.tip_follow]
@@ -580,7 +596,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_INGEST_CONTROL__ADDR` | zinder-query, zinder-compat-lightwalletd | Optional | `ingest_control.addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. Defaults to `http://127.0.0.1:9100`. |
 | `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `ingest_control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0006). The writer reads it to verify; the readers read the same file to present. File-only by policy; inline secrets are rejected at config load. |
 | `ZINDER_STORAGE__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.path` | Canonical RocksDB store path. Writers open it as primary; readers open it as a secondary. |
-| `ZINDER_STORAGE__SECONDARY_PATH` | zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.secondary_path` | Process-unique RocksDB secondary metadata directory. Never share this path across reader processes. |
+| `ZINDER_STORAGE__SECONDARY_PATH` | zinder-ingest (verify-canonical-replay only), zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.secondary_path` | Process-unique RocksDB secondary metadata directory. Never share this path across reader processes. |
 | `ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS` | zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.initial_catchup_timeout_ms` | Maximum startup RocksDB secondary catchup duration before a reader starts with the opened secondary and lets /readyz report replica lag. Defaults to 30000. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.block_cache_bytes` | Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912 for writers and 134217728 for readers. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_wal_bytes` | Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for writers and 33554432 for readers. |
@@ -599,20 +615,20 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_STORAGE__DERIVE__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.derive.rocksdb.memtable_budget_bytes` | Derive-store total RocksDB memtable budget across column families. Defaults to 536870912 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__DERIVE__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.derive.rocksdb.statistics_level` | Derive-store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md). |
-| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Raw-byte blob write policy: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so fact-first indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because lightwalletd transaction and transparent-history methods require retained bytes. |
-| `ZINDER_INGEST__PROJECTION_PRESET` | zinder-ingest | Optional | `ingest.projection_preset` | Closed derive workload: `"wallet"` or `"complete"`. Defaults to `"complete"`. Selection is supported only when creating a fresh canonical-plus-projection store. |
+| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Immutable raw-blob retention contract: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so fact-first indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because lightwalletd transaction and transparent-history methods require retained bytes. The first canonical commit fixes historical coverage; changing a non-empty store requires a rebuild. |
+| `ZINDER_INGEST__PROJECTION_PRESET` | zinder-ingest | Optional | `ingest.projection_preset` | Closed derive workload: `"wallet"` or `"explorer"`. Defaults to `"explorer"`. Selection is supported only when creating a fresh canonical-plus-projection store. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds finalization, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__PHASES__CATCHUP_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.phases.catchup_threshold_blocks` | Gap (in blocks) at which the unified loop transitions between `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
 | `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_max_blocks` | Block count per bulk-catchup commit batch. Defaults to 1000. |
 | `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_max_artifact_bytes` | Canonical artifact bytes accumulated before closing a bulk-catchup batch. Defaults to 536870912. |
 | `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes` | Estimated canonical write bytes accumulated before closing a bulk-catchup batch. Defaults to 536870912. |
 | `ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE` | zinder-ingest | Optional | `ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close` | Minimum blocks accumulated before estimated write bytes can close a bulk-catchup batch. Single oversized blocks can still close immediately. Defaults to 100. |
-| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_max_blocks` | Hard ceiling on connected blocks requested from the source in one bulk-catchup segment. The byte-density controller may request fewer. Defaults to 64. |
-| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_target_response_bytes` | Target source response bytes for adaptive segment sizing. Defaults to 33554432. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_max_blocks` | Diagnostic override for the hard ceiling on connected blocks requested from the source in one segment. The resource-resolved default is 64. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_segment_target_response_bytes` | Diagnostic override for adaptive response sizing. The default is `min(node.max_response_bytes, 33554432)`. |
 | `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_requests` | Maximum concurrent source segment requests. Defaults to 12. |
-| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Admission watermark for predicted active source responses plus measured completed reassembly. Measured responses can temporarily exceed it; the absolute active bound is request concurrency times node.max_response_bytes. Must be greater than or equal to node.max_response_bytes. Defaults to 402653184. |
-| `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_concurrency` | Parallel canonical block-prepare slots. Defaults to `min(available_parallelism(), 16)`. |
-| `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes` | Maximum reserved derived artifact bytes across active and completed block-prepare work. Defaults to 536870912. |
+| `ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.source_fetch_max_in_flight_bytes` | Diagnostic override for predicted active source responses plus measured completed reassembly. The default is `max(node.max_response_bytes, clamp(container_memory / 64, 134217728, 402653184))`. |
+| `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_concurrency` | Diagnostic override for parallel canonical block-prepare slots. The default is `min(available_parallelism(), 16)`. |
+| `ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.block_prepare_memory_watermark_bytes` | Diagnostic override for the prepare and resident-handoff admission watermark. The default is `clamp(container_memory / 64, 134217728, 536870912)`. |
 | `ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes` | Maximum safe-tip artifact bytes that can accumulate while the previous bulk-catchup batch is attaching metadata, committing, or flushing. Defaults to 536870912. |
 | `ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.derive.replay_batch_blocks` | Maximum block contexts hydrated and dispatched in one derive replay write. Must be greater than zero. Defaults to 100. |
 | `ZINDER_INGEST__DERIVE__REPLAY_POLICY` | zinder-ingest | Optional | `ingest.derive.replay_policy` | Derive replay pressure policy. `canonical-first` pauses rebuildable derive replay under memory pressure so canonical ingest keeps the process budget. `continuous` replays retained chain events whenever they are available while the writer is at tip; during bulk catch-up the canonical-phase gate pauses replay regardless of policy. Defaults to `canonical-first`. |
@@ -709,7 +725,7 @@ RPC removal is an explicit contract migration, not a side effect of adding a bro
 
 The single source of truth is the `CAPABILITIES` table in [`crates/zinder-proto/src/capabilities.rs`](../../crates/zinder-proto/src/capabilities.rs). Each row binds a capability string to its surface (`Wallet`, `Explorer`, `Ingest`), the proto method it gates, and a declarative advertise policy. The three `ServerInfo` builders fold over the table filtered by surface and evaluate each row's policy against their own readiness; no service hand-maintains a parallel capability array. Two CI guards keep the table honest: `capability_descriptor_drift` cross-checks every row's proto-method binding against the compiled `FileDescriptorSet`, and `capability_docs::public_interfaces_capability_list_mirrors_zinder_capabilities` fails when the list below diverges from the wallet and explorer rows of the table.
 
-Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the wallet-plane `RequiresBroadcaster`, `RequiresChainEvents`, `RequiresChainValuePools`, `RequiresBlockBlobs`, and `RequiresTransactionBlobs`; and the explorer-plane readiness gates. `RequiresBlockBlobs` gates `wallet.read.full_block_at_v1` and `wallet.read.full_block_range_v1`; `RequiresTransactionBlobs` gates `wallet.read.transaction_bytes_v1` (the `MinedTransaction.raw_transaction_bytes` field). Both resolve against the store's persisted raw-blob retention, not against reader config: ingest persists the active `raw_blob_policy` into a `StorageControl` singleton on every primary open, and readers read it. A legacy store with no signal reads back as `none`, so a blob-serving capability is never advertised unless the store demonstrably retains the bytes. See [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md).
+Advertise policies name the precondition each surface evaluates: `AlwaysOn`; the wallet-plane `RequiresBroadcaster`, `RequiresChainEvents`, `RequiresChainValuePools`, `RequiresBlockBlobs`, and `RequiresTransactionBlobs`; and the explorer-plane readiness gates. `RequiresBlockBlobs` gates `wallet.read.full_block_at_v1` and `wallet.read.full_block_range_v1`; `RequiresTransactionBlobs` gates `wallet.read.transaction_bytes_v1` (the `MinedTransaction.raw_transaction_bytes` field). Both resolve against the store's persisted raw-blob retention, not against reader config. An empty primary records the configured policy, but after the first canonical commit that value is an immutable historical-coverage contract. A reopen with a different policy fails with `RawBlobRetentionMismatch` and requires a rebuild. A non-empty schema-14 store with no signal is corrupt and fails closed, so a blob-serving capability is never advertised without complete persisted coverage. See [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md).
 
 `wallet.read.compact_block_ironwood_v1` is `AlwaysOn` on every deployment of this binary and gates the `ironwoodActions`/`ironwoodCommitmentTreeSize` fields inside `CompactBlock.payload_bytes` (the vendored lightwalletd `CompactTx`/`ChainMetadata` shape, not a native `zinder.v1.wallet` field). A server advertising it has derived Ironwood action data for every block it serves, so an absent `ironwoodActions` on a given block means that block has no Ironwood activity. A server that does not advertise it predates Ironwood wallet-plane support: a missing `ironwoodActions` there is not authoritative, and a client must not read it as "no Ironwood activity".
 
@@ -881,7 +897,7 @@ they are not monotonic. Historical scanning fetches only daily candidates from
 Zebra's verbose `getblock`, while the replaceable live tail retains every
 block for exact reorg reconciliation. The optional schema-16 canonical
 artifact binds each source snapshot to the requested block hash and time; a
-store persisted below artifact schema 18 is refused at open and rebuilt from
+store persisted below artifact schema 19 is refused at open and rebuilt from
 genesis.
 
 `ExplorerQuery.DisplacedBlockHistory` and
@@ -1097,9 +1113,9 @@ Public shapes describe behavior that production code can actually reach.
 - Delete unreachable public variants. Do not keep fallback variants only because they might be useful later.
 - Names identify the source of truth. Use `created_at` for the wall-clock time when Zinder created a record. Use a chain-derived name such as `tip_block_time_millis` when the value comes from block header time.
 - Use `ChainTipMetadata` for chain-derived wallet counters at the visible tip, such as Sapling, Orchard, and Ironwood note commitment tree sizes. Do not make query code rediscover those counters by decoding wallet protocol payloads. The proto `ChainEpoch` message carries `sapling_commitment_tree_size`, `orchard_commitment_tree_size`, and `ironwood_commitment_tree_size` directly.
-- Bulk-catchup ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest seeds the builder from the checkpoint's chain-global tree sizes.
+- Bulk-catchup ranges that publish `ChainTipMetadata` must be contiguous with a known metadata base. Fresh stores start at height 1; non-empty stores append after the current tip; checkpoint-bounded stores start at `SourceChainCheckpoint.height + 1` after ingest validates and persists the checkpoint's canonical Sapling, Orchard, and Ironwood frontiers, then derives the chain-global tree sizes once for block construction.
 - Wallet-serving coverage is selected with `ingest.modifiers.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`. Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md), this is a consumer-neutral serving-store profile, not a Zodl-specific mode. In that mode, ingest derives the bulk-catchup floor and `checkpoint_height` from upstream-node-advertised activation heights; explicit height overrides and `allow_near_tip_finalize` are rejected so serving stores do not silently become recent-checkpoint or near-tip-safe-tip fixtures.
-- Projection workload is selected independently with `ingest.projection_preset = "wallet" | "complete"` or `zinder-ingest --projection-preset`. `complete` is the default. The first release permits selection only for a fresh canonical-plus-projection store; a persisted mismatch fails before projection-manifest mutation and directs the operator to rebuild at a new empty storage path.
+- Projection workload is selected independently with `ingest.projection_preset = "wallet" | "explorer"` or `zinder-ingest --projection-preset`. `explorer` is the default. The first release permits selection only for a fresh canonical-plus-projection store; a persisted mismatch fails before projection-manifest mutation and directs the operator to rebuild at a new empty storage path. Earlier preset names are rejected rather than interpreted as aliases.
 - Transition names match the visible state change. If finality advances, use a finality transition such as `FinalizeThrough`; if no visible transition side effect occurred, use `Unchanged`.
 - Cursor fields that are serialized and authenticated must either be validated on read or documented as reserved state in the owning cursor contract.
 - Operator-facing errors name the real cause and carry useful fields. Prefer `NoVisibleChainEpoch`, sequence-overflow, and payload-size errors over sentinel IDs or reused malformed-input errors.

@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -eu
+
+# Railway mounts the persistent volume after the image filesystem is
+# materialized, so the mount root is owned by root instead of the runtime UID.
+# Repair only the Zinder volume before dropping privileges. Fresh construction
+# still requires the final store path to be absent.
+chown -R zinder:zinder /var/lib/zinder
+
+exec setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
+    /usr/local/bin/zinder-ingest "$@"

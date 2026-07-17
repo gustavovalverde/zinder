@@ -12,7 +12,10 @@ use zinder_core::wire::{
     HEIGHT_KEY_LEN, encode_height_key_ascending, encode_rpc_block_hash_hex,
     encode_rpc_transaction_id_hex,
 };
-use zinder_core::{BlockHeight, TransactionFactsArtifact};
+use zinder_core::{
+    BlockHash, BlockHeight, CanonicalBlockFacts, CanonicalTransactionFacts,
+    TransactionFactsArtifact, TransactionPublicFacts, TransparentOutputFact,
+};
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1,
 };
@@ -76,7 +79,7 @@ impl BlockKeyedConsumer for BlockSummaryConsumer {
         block: &BlockCommitContext,
         ctx: &mut DeriveConsumerCtx<'_>,
     ) -> Result<(), DeriveConsumerError> {
-        let record = build_block_summary_record(block);
+        let record = project_block_summary_record_from_commit_context(block);
         let cf = ctx
             .store
             .consumer_column_family(BLOCK_SUMMARY_COLUMN_FAMILY)?;
@@ -102,23 +105,69 @@ impl BlockKeyedConsumer for BlockSummaryConsumer {
     }
 }
 
-fn build_block_summary_record(block: &BlockCommitContext) -> BlockSummaryRecord {
-    let block_time_unix_seconds = block.block_time_unix_seconds;
-    let transaction_count = u32::try_from(block.transactions.len()).unwrap_or(u32::MAX);
-    let total_size_bytes = block.block_size_bytes;
-    let aggregates = aggregate_block_facts(&block.transactions);
+/// Projects immutable, block-local canonical facts into the persisted
+/// [`BlockSummaryRecord`] read model.
+///
+/// The projection is pure: it does not parse retained raw bytes, resolve
+/// previous outputs, read a store, or consult transaction-intrinsic value
+/// balances. Transaction order in `facts` is preserved in the record.
+///
+#[must_use]
+pub fn project_block_summary_record(facts: &CanonicalBlockFacts) -> BlockSummaryRecord {
+    let transaction_ids = facts
+        .transactions
+        .iter()
+        .map(|transaction| encode_rpc_transaction_id_hex(transaction.public_facts.transaction_id))
+        .collect();
+    let aggregates = aggregate_canonical_transaction_facts(&facts.transactions);
+    build_block_summary_record(
+        BlockSummaryBlockMetadata {
+            height: facts.block_header.height,
+            hash: facts.block_header.block_hash,
+            previous_hash: facts.block_header.parent_hash,
+            time_unix_seconds: facts.block_header.block_time,
+            size_bytes: facts.block_header.block_size_bytes,
+        },
+        transaction_ids,
+        aggregates,
+    )
+}
+
+fn project_block_summary_record_from_commit_context(
+    block: &BlockCommitContext,
+) -> BlockSummaryRecord {
     let transaction_ids = block
         .transactions
         .iter()
         .map(|transaction| encode_rpc_transaction_id_hex(transaction.location.transaction_id))
         .collect();
+    let aggregates = aggregate_committed_transaction_facts(&block.transactions);
+    build_block_summary_record(
+        BlockSummaryBlockMetadata {
+            height: block.height,
+            hash: block.block_hash,
+            previous_hash: block.previous_block_hash,
+            time_unix_seconds: block.block_time_unix_seconds,
+            size_bytes: block.block_size_bytes,
+        },
+        transaction_ids,
+        aggregates,
+    )
+}
+
+fn build_block_summary_record(
+    block: BlockSummaryBlockMetadata,
+    transaction_ids: Vec<String>,
+    aggregates: BlockFactsAggregate,
+) -> BlockSummaryRecord {
+    let transaction_count = u32::try_from(transaction_ids.len()).unwrap_or(u32::MAX);
     let summary = BlockSummary {
         block_height: block.height.value(),
-        block_hash: encode_rpc_block_hash_hex(block.block_hash),
-        block_time_unix_seconds,
+        block_hash: encode_rpc_block_hash_hex(block.hash),
+        block_time_unix_seconds: block.time_unix_seconds,
         transaction_count,
-        previous_block_hash: encode_rpc_block_hash_hex(block.previous_block_hash),
-        total_size_bytes,
+        previous_block_hash: encode_rpc_block_hash_hex(block.previous_hash),
+        total_size_bytes: block.size_bytes,
         fees_collected_zat: aggregates.zip317_conventional_fees_collected_zat,
         paid_fees_collected_zat: None,
         coinbase_reward_zat: aggregates.coinbase_reward_zat,
@@ -137,6 +186,15 @@ fn build_block_summary_record(block: &BlockCommitContext) -> BlockSummaryRecord 
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BlockSummaryBlockMetadata {
+    height: BlockHeight,
+    hash: BlockHash,
+    previous_hash: BlockHash,
+    time_unix_seconds: i64,
+    size_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct BlockFactsAggregate {
     coinbase_reward_zat: u64,
@@ -149,49 +207,76 @@ struct BlockFactsAggregate {
     max_zip317_conventional_fee_zat: Option<u64>,
 }
 
-fn aggregate_block_facts(transactions: &[TransactionFactsArtifact]) -> BlockFactsAggregate {
+fn aggregate_canonical_transaction_facts(
+    transactions: &[CanonicalTransactionFacts],
+) -> BlockFactsAggregate {
     let mut aggregate = BlockFactsAggregate::default();
     for transaction in transactions {
-        let facts = &transaction.public_facts;
-        let counts = facts.counts;
-        aggregate.sapling_output_count = aggregate
-            .sapling_output_count
-            .saturating_add(counts.sapling_output_count);
-        aggregate.orchard_action_count = aggregate
-            .orchard_action_count
-            .saturating_add(counts.orchard_action_count);
-        aggregate.ironwood_action_count = aggregate
-            .ironwood_action_count
-            .saturating_add(counts.ironwood_action_count);
-        if facts.is_coinbase {
-            for output in &transaction.transparent_outputs {
-                aggregate.coinbase_reward_zat = aggregate
-                    .coinbase_reward_zat
-                    .saturating_add(output.value_zat);
-            }
-            continue;
-        }
-        aggregate.fee_transaction_count = aggregate.fee_transaction_count.saturating_add(1);
-        let conventional_fee_zat = counts.zip317_conventional_fee_zat();
-        aggregate.min_zip317_conventional_fee_zat = Some(
-            aggregate
-                .min_zip317_conventional_fee_zat
-                .map_or(conventional_fee_zat, |prior| {
-                    prior.min(conventional_fee_zat)
-                }),
+        accumulate_transaction_facts(
+            &mut aggregate,
+            &transaction.public_facts,
+            &transaction.transparent_outputs,
         );
-        aggregate.max_zip317_conventional_fee_zat = Some(
-            aggregate
-                .max_zip317_conventional_fee_zat
-                .map_or(conventional_fee_zat, |prior| {
-                    prior.max(conventional_fee_zat)
-                }),
-        );
-        aggregate.zip317_conventional_fees_collected_zat = aggregate
-            .zip317_conventional_fees_collected_zat
-            .saturating_add(conventional_fee_zat);
     }
     aggregate
+}
+
+fn aggregate_committed_transaction_facts(
+    transactions: &[TransactionFactsArtifact],
+) -> BlockFactsAggregate {
+    let mut aggregate = BlockFactsAggregate::default();
+    for transaction in transactions {
+        accumulate_transaction_facts(
+            &mut aggregate,
+            &transaction.public_facts,
+            &transaction.transparent_outputs,
+        );
+    }
+    aggregate
+}
+
+fn accumulate_transaction_facts(
+    aggregate: &mut BlockFactsAggregate,
+    public_facts: &TransactionPublicFacts,
+    transparent_outputs: &[TransparentOutputFact],
+) {
+    let counts = public_facts.counts;
+    aggregate.sapling_output_count = aggregate
+        .sapling_output_count
+        .saturating_add(counts.sapling_output_count);
+    aggregate.orchard_action_count = aggregate
+        .orchard_action_count
+        .saturating_add(counts.orchard_action_count);
+    aggregate.ironwood_action_count = aggregate
+        .ironwood_action_count
+        .saturating_add(counts.ironwood_action_count);
+    if public_facts.is_coinbase {
+        for output in transparent_outputs {
+            aggregate.coinbase_reward_zat = aggregate
+                .coinbase_reward_zat
+                .saturating_add(output.value_zat);
+        }
+        return;
+    }
+    aggregate.fee_transaction_count = aggregate.fee_transaction_count.saturating_add(1);
+    let conventional_fee_zat = counts.zip317_conventional_fee_zat();
+    aggregate.min_zip317_conventional_fee_zat = Some(
+        aggregate
+            .min_zip317_conventional_fee_zat
+            .map_or(conventional_fee_zat, |prior| {
+                prior.min(conventional_fee_zat)
+            }),
+    );
+    aggregate.max_zip317_conventional_fee_zat = Some(
+        aggregate
+            .max_zip317_conventional_fee_zat
+            .map_or(conventional_fee_zat, |prior| {
+                prior.max(conventional_fee_zat)
+            }),
+    );
+    aggregate.zip317_conventional_fees_collected_zat = aggregate
+        .zip317_conventional_fees_collected_zat
+        .saturating_add(conventional_fee_zat);
 }
 
 /// Consumer-specific failure modes [`BlockSummaryConsumer`] can surface.
@@ -215,4 +300,260 @@ pub enum BlockSummaryConsumerError {
 /// the public wire shapes.
 pub fn decode_stored_record(payload: &[u8]) -> Result<BlockSummaryRecord, prost::DecodeError> {
     BlockSummaryRecord::decode(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use zinder_core::wire::encode_rpc_transaction_id_hex;
+    use zinder_core::{
+        BlockHash, BlockHeaderArtifact, BlockHeight, CanonicalBlockFacts,
+        CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
+        CanonicalTransactionFacts, LockTime, PrivacyShape, TransactionComponentCounts,
+        TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
+        TransactionLocation, TransactionPublicFacts, TransactionVersion,
+        TransparentAddressScriptHash, TransparentOutputFact, decode_canonical_block_replay,
+        encode_canonical_block_replay,
+    };
+
+    use super::{project_block_summary_record, project_block_summary_record_from_commit_context};
+    use crate::consumer::{BlockCommitContext, BlockCommitPayload, TransparentSpendFacts};
+
+    #[test]
+    fn canonical_facts_projection_matches_commit_context_consumer() {
+        let facts = representative_block_facts();
+
+        let canonical_record = project_block_summary_record(&facts);
+        let commit_context_record =
+            project_block_summary_record_from_commit_context(&block_commit_context_from(&facts));
+
+        assert_eq!(canonical_record, commit_context_record);
+        assert_eq!(
+            canonical_record.transaction_ids,
+            [0x11, 0x22, 0x33]
+                .map(|seed| encode_rpc_transaction_id_hex(TransactionId::from_bytes([seed; 32])))
+        );
+        assert_eq!(canonical_record.fee_transaction_count, 2);
+        assert_eq!(canonical_record.min_zip317_conventional_fee_zat, 10_000);
+        assert_eq!(canonical_record.max_zip317_conventional_fee_zat, 50_000);
+        assert_eq!(
+            canonical_record.summary.as_ref().map(|summary| (
+                summary.transaction_count,
+                summary.fees_collected_zat,
+                summary.coinbase_reward_zat,
+                summary.sapling_output_count,
+                summary.orchard_action_count,
+                summary.ironwood_action_count,
+            )),
+            Some((3, 60_000, 625_000_000, 6, 2, 1))
+        );
+    }
+
+    #[test]
+    fn decoded_replay_projects_without_store_hydration() -> Result<(), Box<dyn std::error::Error>> {
+        let facts = representative_block_facts();
+        let replay_envelope = encode_canonical_block_replay(
+            &facts,
+            CanonicalBlockReplayFormatVersion::CURRENT,
+            CanonicalBlockFactsDigestVersion::CURRENT,
+        );
+        let replay = decode_canonical_block_replay(replay_envelope.as_bytes())?;
+
+        assert_eq!(
+            project_block_summary_record(replay.facts()),
+            project_block_summary_record(&facts)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intrinsic_balances_do_not_change_projection() {
+        let baseline_facts = representative_block_facts();
+        let mut changed_facts = baseline_facts.clone();
+        for (index, transaction) in changed_facts.transactions.iter_mut().enumerate() {
+            let balance_seed = i64::try_from(index).unwrap_or(i64::MAX);
+            transaction.intrinsic_value_balances = TransactionIntrinsicValueBalances::new(
+                balance_seed,
+                balance_seed.saturating_add(1),
+                balance_seed.saturating_add(2),
+                balance_seed.saturating_add(3),
+            );
+        }
+
+        assert_eq!(
+            project_block_summary_record(&baseline_facts),
+            project_block_summary_record(&changed_facts)
+        );
+    }
+
+    #[test]
+    fn projection_preserves_serialized_block_size() {
+        let facts = representative_block_facts();
+        let transaction_size_sum = facts
+            .transactions
+            .iter()
+            .map(|transaction| u64::from(transaction.public_facts.size_bytes))
+            .sum::<u64>();
+        let record = project_block_summary_record(&facts);
+
+        assert_eq!(
+            record
+                .summary
+                .as_ref()
+                .map(|summary| summary.total_size_bytes),
+            Some(facts.block_header.block_size_bytes)
+        );
+        assert_ne!(transaction_size_sum, facts.block_header.block_size_bytes);
+    }
+
+    fn representative_block_facts() -> CanonicalBlockFacts {
+        CanonicalBlockFacts {
+            block_header: BlockHeaderArtifact::new(
+                BlockHeight::new(900_001),
+                BlockHash::from_bytes([0x41; 32]),
+                BlockHash::from_bytes([0x40; 32]),
+                [0x42; 32],
+                [0x43; 32],
+                1_750_000_000,
+                0x1f07_ffff,
+                [0x44; 32],
+                4,
+                2_048,
+            ),
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
+                b"representative block",
+            ),
+            transactions: vec![
+                transaction_facts(
+                    0x11,
+                    true,
+                    TransactionComponentCounts {
+                        transparent_input_count: 1,
+                        transparent_output_count: 2,
+                        sapling_spend_count: 0,
+                        sapling_output_count: 2,
+                        orchard_action_count: 0,
+                        ironwood_action_count: 0,
+                        sprout_joinsplit_count: 0,
+                    },
+                    &[500_000_000, 125_000_000],
+                ),
+                transaction_facts(
+                    0x22,
+                    false,
+                    TransactionComponentCounts {
+                        transparent_input_count: 1,
+                        transparent_output_count: 1,
+                        sapling_spend_count: 0,
+                        sapling_output_count: 0,
+                        orchard_action_count: 0,
+                        ironwood_action_count: 0,
+                        sprout_joinsplit_count: 0,
+                    },
+                    &[75_000],
+                ),
+                transaction_facts(
+                    0x33,
+                    false,
+                    TransactionComponentCounts {
+                        transparent_input_count: 3,
+                        transparent_output_count: 1,
+                        sapling_spend_count: 1,
+                        sapling_output_count: 4,
+                        orchard_action_count: 2,
+                        ironwood_action_count: 1,
+                        sprout_joinsplit_count: 0,
+                    },
+                    &[50_000],
+                ),
+            ],
+        }
+    }
+
+    fn transaction_facts(
+        seed: u8,
+        is_coinbase: bool,
+        counts: TransactionComponentCounts,
+        transparent_output_values_zat: &[u64],
+    ) -> CanonicalTransactionFacts {
+        CanonicalTransactionFacts {
+            public_facts: TransactionPublicFacts {
+                transaction_id: TransactionId::from_bytes([seed; 32]),
+                auth_digest: None,
+                wtxid: None,
+                version: TransactionVersion::V4,
+                consensus_branch_id: None,
+                lock_time: LockTime::Unlocked,
+                expiry_height: None,
+                size_bytes: u32::from(seed).saturating_mul(10),
+                counts,
+                orchard_value_balance_zat: None,
+                orchard_anchor: None,
+                ironwood_value_balance_zat: None,
+                privacy_shape: if is_coinbase {
+                    PrivacyShape::ShieldedCoinbase
+                } else {
+                    PrivacyShape::Mixed
+                },
+                is_coinbase,
+                unsupported_sections: Vec::new(),
+            },
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(&[
+                seed,
+            ]),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::new(
+                i64::from(seed),
+                -i64::from(seed),
+                i64::from(seed).saturating_mul(2),
+                -i64::from(seed).saturating_mul(2),
+            ),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: transparent_output_values_zat
+                .iter()
+                .enumerate()
+                .map(|(output_index, value_zat)| {
+                    TransparentOutputFact::new(
+                        u32::try_from(output_index).unwrap_or(u32::MAX),
+                        *value_zat,
+                        [0x51],
+                        TransparentAddressScriptHash::from_bytes([seed; 32]),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn block_commit_context_from(facts: &CanonicalBlockFacts) -> BlockCommitContext {
+        let transactions = facts
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(transaction_index, transaction)| {
+                TransactionFactsArtifact::new(
+                    TransactionLocation::new(
+                        transaction.public_facts.transaction_id,
+                        facts.block_header.height,
+                        facts.block_header.block_hash,
+                        u32::try_from(transaction_index).unwrap_or(u32::MAX),
+                    ),
+                    transaction.public_facts.clone(),
+                )
+                .with_transparent_facts(
+                    transaction.transparent_inputs.clone(),
+                    transaction.transparent_outputs.clone(),
+                )
+            })
+            .collect();
+        BlockCommitContext::new(
+            BlockCommitPayload {
+                height: facts.block_header.height,
+                block_hash: facts.block_header.block_hash,
+                previous_block_hash: facts.block_header.parent_hash,
+                block_time_unix_seconds: facts.block_header.block_time,
+                block_size_bytes: facts.block_header.block_size_bytes,
+                transactions,
+                final_note_commitment_roots: None,
+            },
+            TransparentSpendFacts::Offline,
+        )
+    }
 }

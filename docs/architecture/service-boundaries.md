@@ -2,7 +2,7 @@
 
 Zinder is one product with multiple deployable services. The boundary rule is simple: the service that follows the chain writes canonical state, and the service that serves wallets reads epoch-bound state through a Zinder-owned read contract.
 
-## Boundary Map
+## Current Boundary Map
 
 | Boundary                     | Owns                                                                                                                    | Must Not Own                                                                    |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
@@ -11,11 +11,29 @@ Zinder is one product with multiple deployable services. The boundary rule is si
 | `zinder-compat-lightwalletd` | Vendored lightwalletd-compatible gRPC behavior, compatibility error mapping, protocol translation over `WalletQueryApi` | Upstream node calls, primary canonical storage, migrations, compact block construction |
 | `zinder-explorer`            | Explorer query serving, secondary derive-store reads, explorer-specific APIs and capability advertising                 | Wallet sync, canonical chain state, source truth, derive-store primary writes   |
 
+This table describes the schema-19 runtime. It is not the accepted fact-first
+ownership target because `zinder-ingest` still hosts projection writes.
+
+## Target Boundary Map
+
+| Boundary | Owns | Must not own |
+| --- | --- | --- |
+| `zinder-ingest` | Upstream connections, chain selection, canonical construction and following, reorg handling, and canonical publication | Wallet or explorer projection writes, public query traffic, or projection promotion |
+| `zinder-projector` | Build, verify, catch up, follow, and promote one selected wallet or explorer projection under an authenticated position and fence | Chain selection, canonical writes, source-node RPCs, or public query traffic |
+| `zinder-query` | Wallet-facing APIs and epoch-bound canonical plus exact wallet-projection reads | Chain selection, canonical writes, projection writes, migrations, or explorer analytics |
+| `zinder-explorer` | Explorer APIs and read-only composition of canonical, wallet, and explorer planes | Canonical, wallet, or explorer writes; source truth; or wallet sync orchestration |
+| Compatibility services | Stateless protocol translation over `WalletQuery` or `ExplorerQuery` | Direct storage access, source-node calls, migrations, or product-owned state |
+
+These boundaries apply to both retained topologies. `rocksdb-single-host` may
+colocate the processes and stores on one host; `postgres-scale-out` may deploy
+them independently. Colocation does not merge readiness, restart, migration,
+or resource ownership.
+
 ## Why This Split Exists
 
 Zcash indexing has two distinct jobs that often get coupled: converting upstream node state into durable, queryable chain artifacts, and serving wallets and applications with stable APIs and privacy-aware behavior. The jobs have different failure modes. Ingestion needs deterministic sync, reorg handling, atomic commits, schema migration, recoverability, and source-failure handling. Query serving needs latency, compatibility, privacy boundaries, and independent scale-out.
 
-Coupling them in one runtime hides operational costs: read load can interfere with chain commits, migrations become user-visible outages, and derived explorer features can drift into the wallet path. One runtime can do both during local development. Production architecture must not let read traffic share the same ownership boundary as chain commits.
+Coupling them in one runtime hides operational costs: read load can interfere with chain commits, migrations become user-visible outages, and derived explorer features can drift into the wallet path. One runtime can do both during local development. Neither supported deployment topology may let read traffic share the same ownership boundary as chain commits.
 
 The same shape appears across the indexer ecosystem: Blockscout separates indexer, web, and API modes; Sui separates checkpoint processing from ingestion sources; Reth Execution Extensions model committed and reverted chains explicitly; Substreams treats indexing as deterministic transformations with replayable sinks.
 
@@ -38,6 +56,12 @@ The services must not share:
 
 ## Storage Ownership
 
+The current implementation is the `rocksdb-single-host` topology. The accepted
+`postgres-scale-out` migration target preserves the ownership rules below while
+replacing RocksDB primary/secondary mechanics with fenced writers and
+request-scoped Postgres read sessions. [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
+owns the two-topology contract.
+
 `zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). It also owns the derive-store primary for bundled explorer projections and runs the derive tailer over retained canonical events. The derive store remains separate from canonical storage and is rebuildable from canonical artifacts and retained events.
 
 `zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They also open the bundled derive store as a secondary when serving derive-backed wallet reads such as transparent-address transaction history. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
@@ -59,9 +83,11 @@ one process hosts multiple services locally, that process is composition glue;
 the product boundaries remain `zinder-ingest`, `zinder-query`, and
 `zinder-compat-lightwalletd`.
 
-## Production Profiles
+## Deployment Topologies
 
-Minimum production deployment (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)):
+### `rocksdb-single-host`
+
+Minimum service set (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)):
 
 ```text
 zinder-ingest              -> canonical RocksDB (primary)
@@ -77,7 +103,7 @@ zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_pat
                            -> CompactTxStreamer
 ```
 
-Extended production deployment (adds derived plane):
+Extended service set (adds the current derived plane):
 
 ```text
 zinder-ingest              -> canonical RocksDB (primary)
@@ -88,7 +114,29 @@ zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_pat
 zinder-explorer            -> derive RocksDB (secondary when available, secondary_path/derive) -> ExplorerQuery
 ```
 
-Read replicas are colocated with the writer in v1 (shared filesystem). Cross-host replicas are out of scope; see [ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).
+Read replicas are colocated with the writer on one shared-filesystem host.
+Cross-host RocksDB replicas are out of scope; see
+[ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).
+This topology is production-supported and has no Postgres dependency.
+
+### `postgres-scale-out` target
+
+This topology is not implemented or certified yet. Its accepted service shape
+keeps one fenced canonical writer while allowing projectors, query services,
+and Postgres replicas to deploy and scale independently:
+
+```text
+zinder-ingest       -> Postgres canonical schema (one fenced active writer)
+zinder-projector    -> Postgres wallet or explorer schema (fenced per projection)
+zinder-query        -> epoch-bound canonical + wallet read sessions -> WalletQueryApi
+zinder-explorer     -> epoch-bound canonical + wallet + explorer reads -> ExplorerQuery
+compatibility edges -> WalletQueryApi / ExplorerQuery
+```
+
+Role-scoped credentials, writer-generation fencing, replica-lag reporting,
+request-scoped epoch reads, failover, and stale-writer rejection are part of
+this topology's certification boundary. It becomes production-supported only
+after those gates and the shared lifecycle targets pass.
 
 ## Anti-Patterns
 

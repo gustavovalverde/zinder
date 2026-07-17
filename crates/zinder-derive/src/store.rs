@@ -265,9 +265,10 @@ pub enum ProjectionPreset {
     /// Wallet-serving projections required for transparent history and durable
     /// spender resolution.
     Wallet,
-    /// Every projection bundled with this Zinder release.
+    /// Wallet-serving projections plus every explorer projection bundled with
+    /// this Zinder release.
     #[default]
-    Complete,
+    Explorer,
 }
 
 /// Read-only facts discovered from an existing projection store before a
@@ -315,7 +316,7 @@ impl ProjectionPreset {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Wallet => "wallet",
-            Self::Complete => "complete",
+            Self::Explorer => "explorer",
         }
     }
 
@@ -324,7 +325,7 @@ impl ProjectionPreset {
     pub const fn consumer_schemas(self) -> &'static [DeriveConsumerSchema] {
         match self {
             Self::Wallet => WALLET_PROJECTION_CONSUMERS,
-            Self::Complete => BUNDLED_CONSUMERS,
+            Self::Explorer => BUNDLED_CONSUMERS,
         }
     }
 }
@@ -1102,8 +1103,8 @@ impl DeriveStore {
     /// Returns the closed product workload represented by this store's
     /// selected consumer identities.
     ///
-    /// Generic test stores and legacy bundled stores classify as complete;
-    /// only the exact wallet identity set classifies as wallet.
+    /// Generic test stores and stores with explorer projections classify as
+    /// explorer. Only the exact wallet identity set classifies as wallet.
     #[must_use]
     pub fn effective_projection_preset(&self) -> ProjectionPreset {
         let is_wallet = self.consumers.len() == WALLET_PROJECTION_CONSUMERS.len()
@@ -1113,7 +1114,7 @@ impl DeriveStore {
         if is_wallet {
             ProjectionPreset::Wallet
         } else {
-            ProjectionPreset::Complete
+            ProjectionPreset::Explorer
         }
     }
 
@@ -1159,10 +1160,8 @@ impl DeriveStore {
     /// Opens or creates a derive store for one closed projection preset.
     ///
     /// The durable per-consumer manifest is preflighted before consumer schemas
-    /// are reconciled. Reopening a wallet store as complete, or a complete
+    /// are reconciled. Reopening a wallet store as explorer, or an explorer
     /// store as wallet, fails before that manifest can be expanded or reduced.
-    /// A legacy bundled store remains compatible with
-    /// [`ProjectionPreset::Complete`]; a wallet preset requires a fresh store.
     pub fn open_with_projection_preset(
         path: impl AsRef<Path>,
         projection_preset: ProjectionPreset,
@@ -1258,9 +1257,10 @@ impl DeriveStore {
     /// Detects the closed projection preset recorded by an existing derive
     /// store without opening it for writes or reconciling schemas.
     ///
-    /// Returns `None` when the path is not a derive `RocksDB` store. Legacy
-    /// bundled manifests are classified as [`ProjectionPreset::Complete`];
-    /// only the exact two-identity wallet manifest is classified as wallet.
+    /// Returns `None` when the path is not a derive `RocksDB` store. Manifests
+    /// containing explorer projections are classified as
+    /// [`ProjectionPreset::Explorer`]; only the exact two-identity wallet
+    /// manifest is classified as wallet.
     pub fn detect_projection_preset_at_path(
         path: impl AsRef<Path>,
     ) -> Result<Option<ProjectionPreset>, DeriveStoreError> {
@@ -2583,10 +2583,10 @@ impl DeriveStore {
         let recorded_preset = Self::preset_for_recorded_consumers(recorded_consumers);
         let compatible = match requested {
             ProjectionPreset::Wallet => recorded_preset == ProjectionPreset::Wallet,
-            // Complete preserves the legacy behavior of adding newly bundled
-            // consumers during a release upgrade. A store whose durable
-            // identity set is exactly wallet is the one forbidden expansion.
-            ProjectionPreset::Complete => recorded_preset == ProjectionPreset::Complete,
+            // Explorer manifests may include a subset of the current explorer
+            // catalog when a projection was added after the store was created.
+            // An exact wallet identity set is the one forbidden expansion.
+            ProjectionPreset::Explorer => recorded_preset == ProjectionPreset::Explorer,
         };
         if compatible {
             return Ok(());
@@ -2623,7 +2623,7 @@ impl DeriveStore {
         if recorded_is_wallet {
             ProjectionPreset::Wallet
         } else {
-            ProjectionPreset::Complete
+            ProjectionPreset::Explorer
         }
     }
 

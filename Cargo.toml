@@ -4,16 +4,20 @@ members = [
     "crates/zinder-client",
     "crates/zinder-derive",
     "crates/zinder-proto",
+    "crates/zinder-rocksdb",
     "crates/zinder-runtime",
     "crates/zinder-source",
     "crates/zinder-store",
     "crates/zinder-testkit",
+    "crates/zinder-wallet-projection",
+    "crates/zinder-wallet-rocksdb",
     "services/zinder-bench",
     "services/zinder-compat-lightwalletd",
     "services/zinder-compat-cipherscan",
     "services/zinder-explorer",
     "services/zinder-ingest",
     "services/zinder-query",
+    "vendor/postgres-protocol",
 ]
 resolver = "3"
 
@@ -40,7 +44,7 @@ hmac = "0.12.1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
-jsonrpsee = { version = "0.26.0", default-features = false, features = ["http-client"] }
+jsonrpsee = { version = "0.26.0", default-features = false, features = ["http-client", "server"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.12.5"
@@ -59,6 +63,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.18"
 time = { version = "0.3.53", features = ["formatting"] }
 tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime"] }
 tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
 toml = "1.1.2"
@@ -80,11 +85,21 @@ zinder-derive = { path = "crates/zinder-derive" }
 zinder-explorer = { path = "services/zinder-explorer" }
 zinder-ingest = { path = "services/zinder-ingest" }
 zinder-proto = { path = "crates/zinder-proto" }
+zinder-rocksdb = { path = "crates/zinder-rocksdb" }
 zinder-query = { path = "services/zinder-query" }
 zinder-runtime = { path = "crates/zinder-runtime" }
 zinder-source = { path = "crates/zinder-source" }
 zinder-store = { path = "crates/zinder-store" }
 zinder-testkit = { path = "crates/zinder-testkit" }
+zinder-wallet-projection = { path = "crates/zinder-wallet-projection" }
+zinder-wallet-rocksdb = { path = "crates/zinder-wallet-rocksdb" }
+
+[patch.crates-io]
+# `bip32 0.6.0-pre.1` pins prerelease RustCrypto 0.13 packages that Cargo
+# cannot resolve beside the stable 0.13 packages used by postgres-protocol.
+# This tested 0.6.12 compatibility fork retains the mature 0.10/0.12 crypto
+# line while preserving all upstream 0.6.12 protocol and security fixes.
+postgres-protocol = { path = "vendor/postgres-protocol" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

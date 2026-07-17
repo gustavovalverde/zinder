@@ -3,8 +3,8 @@
 use std::io::Cursor;
 
 use zebra_chain::{
-    block::{Block as ZebraBlock, Header as ZebraBlockHeader, merkle::Root as ZebraMerkleRoot},
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    block::{Header as ZebraBlockHeader, merkle::Root as ZebraMerkleRoot},
+    serialization::ZcashDeserialize,
 };
 use zinder_core::{BlockHash, BlockHeaderInfo, BlockHeight, BlockId, Network};
 
@@ -26,38 +26,6 @@ pub struct SourceBlockHeader {
 }
 
 impl SourceBlockHeader {
-    /// Parses source block metadata from raw serialized Zcash block bytes.
-    pub fn from_raw_block_bytes(
-        network: Network,
-        height: BlockHeight,
-        raw_block_bytes: &[u8],
-    ) -> Result<Self, SourceError> {
-        let parsed_block = parse_raw_block(raw_block_bytes)?;
-        let parsed_height = parsed_block
-            .coinbase_height()
-            .ok_or(SourceError::RawBlockCoinbaseHeightMissing)?
-            .0;
-        if parsed_height != height.value() {
-            return Err(SourceError::RawBlockHeightMismatch {
-                parsed_height,
-                source_height: height,
-            });
-        }
-
-        let block_time_seconds = u32::try_from(parsed_block.header.time.timestamp())
-            .map_err(|_| SourceError::RawBlockTimeOutOfRange)?;
-        let hash = BlockHash::from_bytes(parsed_block.hash().0);
-        let parent_hash = BlockHash::from_bytes(parsed_block.header.previous_block_hash.0);
-
-        Ok(Self {
-            network,
-            height,
-            hash,
-            parent_hash,
-            block_time_seconds,
-        })
-    }
-
     /// Parses only the serialized block header and uses the height supplied by
     /// the source request.
     ///
@@ -65,7 +33,7 @@ impl SourceBlockHeader {
     /// preparation. Canonical preparation still parses the complete block and
     /// validates the coinbase height against this source height before writing
     /// any artifact.
-    fn from_raw_block_bytes_using_header(
+    fn from_raw_block_header(
         network: Network,
         height: BlockHeight,
         raw_block_bytes: &[u8],
@@ -82,14 +50,6 @@ impl SourceBlockHeader {
             block_time_seconds,
         })
     }
-}
-
-fn parse_raw_block(raw_block_bytes: &[u8]) -> Result<ZebraBlock, SourceError> {
-    raw_block_bytes
-        .zcash_deserialize_into::<ZebraBlock>()
-        .map_err(|source| SourceError::RawBlockParseFailed {
-            reason: source.to_string(),
-        })
 }
 
 /// Parses a typed [`BlockHeaderInfo`] from raw serialized Zcash block
@@ -153,33 +113,18 @@ pub struct SourceBlock {
 }
 
 impl SourceBlock {
-    /// Creates a source block from raw serialized Zcash block bytes.
+    /// Creates a source block after parsing only the serialized header prefix.
+    ///
+    /// Source adapters need the header identity to validate chain links before
+    /// canonical preparation. The canonical preparation boundary performs the
+    /// one full-block parse and validates the coinbase height before any write.
     pub fn from_raw_block_bytes(
         network: Network,
         height: BlockHeight,
         raw_block_bytes: impl Into<Vec<u8>>,
     ) -> Result<Self, SourceError> {
         let raw_block_bytes = raw_block_bytes.into();
-        let header = SourceBlockHeader::from_raw_block_bytes(network, height, &raw_block_bytes)?;
-        Ok(Self::new(header, raw_block_bytes))
-    }
-
-    /// Creates a source block after parsing only the serialized header prefix.
-    ///
-    /// This crate-private constructor is reserved for batched bulk-catchup
-    /// fetches whose complete payload is parsed and identity-checked by the
-    /// canonical preparation stage.
-    pub(crate) fn from_raw_block_bytes_using_header(
-        network: Network,
-        height: BlockHeight,
-        raw_block_bytes: impl Into<Vec<u8>>,
-    ) -> Result<Self, SourceError> {
-        let raw_block_bytes = raw_block_bytes.into();
-        let header = SourceBlockHeader::from_raw_block_bytes_using_header(
-            network,
-            height,
-            &raw_block_bytes,
-        )?;
+        let header = SourceBlockHeader::from_raw_block_header(network, height, &raw_block_bytes)?;
         Ok(Self::new(header, raw_block_bytes))
     }
 
@@ -267,78 +212,44 @@ mod tests {
     use serde_json::Value;
 
     #[test]
-    fn raw_block_parser_rejects_unparseable_block() {
+    fn source_block_rejects_unparseable_header() {
         assert!(matches!(
-            SourceBlockHeader::from_raw_block_bytes(
+            SourceBlock::from_raw_block_bytes(
                 Network::ZcashRegtest,
                 BlockHeight::new(1),
-                &[],
+                Vec::new(),
             ),
             Err(SourceError::RawBlockParseFailed { .. })
         ));
     }
 
     #[test]
-    fn raw_block_parser_accepts_matching_coinbase_height() -> eyre::Result<()> {
+    fn source_block_accepts_a_valid_header_prefix() -> eyre::Result<()> {
         let raw_block_bytes = fixture_raw_block_bytes()?;
 
-        let header = SourceBlockHeader::from_raw_block_bytes(
+        let block = SourceBlock::from_raw_block_bytes(
             Network::ZcashRegtest,
             BlockHeight::new(1),
-            &raw_block_bytes,
+            raw_block_bytes,
         )?;
 
-        assert_eq!(header.height, BlockHeight::new(1));
+        assert_eq!(block.height, BlockHeight::new(1));
 
         Ok(())
     }
 
     #[test]
-    fn raw_block_parser_rejects_coinbase_height_mismatch() -> eyre::Result<()> {
+    fn source_block_defers_coinbase_height_validation_to_canonical_preparation() -> eyre::Result<()>
+    {
         let raw_block_bytes = fixture_raw_block_bytes()?;
 
-        let error = match SourceBlockHeader::from_raw_block_bytes(
-            Network::ZcashRegtest,
-            BlockHeight::new(2),
-            &raw_block_bytes,
-        ) {
-            Ok(header) => return Err(eyre!("expected height mismatch, got {header:?}")),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            SourceError::RawBlockHeightMismatch {
-                parsed_height: 1,
-                source_height,
-            } if source_height == BlockHeight::new(2)
-        ));
-
-        Ok(())
-    }
-
-    #[test]
-    fn header_only_source_block_defers_coinbase_height_validation() -> eyre::Result<()> {
-        let raw_block_bytes = fixture_raw_block_bytes()?;
-
-        let source_block = SourceBlock::from_raw_block_bytes_using_header(
+        let source_block = SourceBlock::from_raw_block_bytes(
             Network::ZcashRegtest,
             BlockHeight::new(2),
             raw_block_bytes,
         )?;
 
         assert_eq!(source_block.height, BlockHeight::new(2));
-        assert!(matches!(
-            SourceBlock::from_raw_block_bytes(
-                Network::ZcashRegtest,
-                BlockHeight::new(2),
-                source_block.raw_block_bytes,
-            ),
-            Err(SourceError::RawBlockHeightMismatch {
-                parsed_height: 1,
-                source_height,
-            }) if source_height == BlockHeight::new(2)
-        ));
 
         Ok(())
     }

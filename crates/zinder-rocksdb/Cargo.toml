@@ -1,0 +1,19 @@
+[package]
+name = "zinder-rocksdb"
+version = "0.1.0"
+description = "Shared RocksDB infrastructure for Zinder storage engines"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "rocksdb"]
+categories = ["database"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rust-rocksdb.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

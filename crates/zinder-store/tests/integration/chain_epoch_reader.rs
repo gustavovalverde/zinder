@@ -19,8 +19,8 @@ use zinder_core::{
     TransparentSpendFact, TransparentUnspentOutput, UnixTimestampMillis,
 };
 use zinder_store::{
-    BlockHashLookup, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions,
-    PrimaryChainStore, ReorgWindowChange,
+    BlockHashLookup, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainStoreOptions, PrimaryChainStore,
+    ReorgWindowChange,
 };
 
 const CRASH_CHILD_ENV: &str = "ZINDER_STORE_CRASH_CHILD";
@@ -33,18 +33,24 @@ fn chain_epoch_reader_stays_pinned_after_a_new_epoch_is_committed() -> eyre::Res
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (epoch_1, block_1, compact_block_1) = synthetic_epoch(1, 1);
     let (epoch_2, block_2, compact_block_2) = synthetic_epoch(2, 2);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        epoch_1,
-        vec![block_1.clone()],
-        vec![compact_block_1],
-    ))?;
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
+            epoch_1,
+            vec![block_1.clone()],
+            vec![compact_block_1],
+        ),
+    )?;
     let reader_1 = store.current_chain_epoch_reader()?;
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        epoch_2,
-        vec![block_2.clone()],
-        vec![compact_block_2],
-    ))?;
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
+            epoch_2,
+            vec![block_2.clone()],
+            vec![compact_block_2],
+        ),
+    )?;
 
     let reader_2 = store.current_chain_epoch_reader()?;
 
@@ -86,11 +92,14 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(1, 2);
     initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
     initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        initial_epoch,
-        vec![safe_tip_block.clone(), initial_block],
-        vec![safe_tip_compact_block, initial_compact_block.clone()],
-    ))?;
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
+            initial_epoch,
+            vec![safe_tip_block.clone(), initial_block],
+            vec![safe_tip_compact_block, initial_compact_block.clone()],
+        ),
+    )?;
     let pre_reorg_reader = store.current_chain_epoch_reader()?;
 
     let replacement_hash = BlockHash::from_bytes([42; 32]);
@@ -118,8 +127,9 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
         b"replacement-block-2",
     );
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block.clone()],
@@ -156,11 +166,14 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
     initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
     let reintroduced_hash = initial_block.block_hash;
     let replacement_height = BlockHeight::new(2);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        initial_epoch,
-        vec![safe_tip_block.clone(), initial_block],
-        vec![safe_tip_compact_block, initial_compact_block],
-    ))?;
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
+            initial_epoch,
+            vec![safe_tip_block.clone(), initial_block],
+            vec![safe_tip_compact_block, initial_compact_block],
+        ),
+    )?;
 
     let replacement_hash = BlockHash::from_bytes([42; 32]);
     let replacement_epoch = ChainEpoch {
@@ -185,8 +198,9 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         replacement_hash,
         b"replacement-compact-block-2".to_vec(),
     );
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -218,8 +232,9 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         reintroduced_hash,
         b"reintroduced-compact-block-2".to_vec(),
     );
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             reintroduced_epoch,
             vec![reintroduced_block],
             vec![reintroduced_compact_block],
@@ -297,16 +312,18 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
         replacement_hash,
     );
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             initial_epoch,
             vec![safe_tip_block, initial_block],
             vec![safe_tip_compact_block, initial_compact_block],
         )
         .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&stale_utxo)]),
     )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -420,12 +437,14 @@ fn transparent_spend_facts_by_outpoint_read_current_rows() -> eyre::Result<()> {
         output.block_hash,
     );
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(epoch_1, vec![block_1], vec![compact_block_1])
             .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
     )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_block_2])
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(epoch_2, vec![block_2], vec![compact_block_2])
             .with_transparent_spend_facts(vec![spend.clone()]),
     )?;
 
@@ -488,12 +507,14 @@ fn current_transparent_spend_facts_match_visible_for_finalized_outpoints() -> ey
         output.block_hash,
     );
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(epoch_1, vec![block_1], vec![compact_block_1])
             .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
     )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_2, vec![block_2], vec![compact_block_2])
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(epoch_2, vec![block_2], vec![compact_block_2])
             .with_transparent_spend_facts(vec![spend.clone()]),
     )?;
 
@@ -573,20 +594,23 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
         output.block_hash,
     );
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(epoch_1, vec![block_1], vec![compact_block_1])
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(epoch_1, vec![block_1], vec![compact_block_1])
             .with_transparent_outputs_by_outpoint(vec![transparent_output_from_utxo(&output)]),
     )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             initial_epoch,
             vec![initial_block],
             vec![initial_compact_block],
         )
         .with_transparent_spend_facts(vec![reorged_spend]),
     )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -670,21 +694,26 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
     );
     let stale_prevout = transparent_output_from_utxo(&stale_utxo);
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        safe_tip_epoch,
-        vec![safe_tip_block],
-        vec![safe_tip_compact_block],
-    ))?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
+            safe_tip_epoch,
+            vec![safe_tip_block],
+            vec![safe_tip_compact_block],
+        ),
+    )?;
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             initial_epoch,
             vec![initial_block],
             vec![initial_compact_block],
         )
         .with_transparent_outputs_by_outpoint(vec![stale_prevout]),
     )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -747,24 +776,27 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
     );
     let rows = reorged_outpoint_rows(safe_tip_epoch, &initial_block, replacement_height);
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             safe_tip_epoch,
             vec![safe_tip_block],
             vec![safe_tip_compact_block],
         )
         .with_transparent_outputs_by_outpoint(vec![rows.visible_prevout.clone()]),
     )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             initial_epoch,
             vec![initial_block],
             vec![initial_compact_block],
         )
         .with_transparent_outputs_by_outpoint(vec![rows.stale_prevout.clone()]),
     )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],
@@ -832,11 +864,14 @@ fn reopening_store_recovers_the_last_visible_epoch() -> eyre::Result<()> {
 
     {
         let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block],
-            vec![compact_block.clone()],
-        ))?;
+        super::commit_synthetic_chain_epoch(
+            &store,
+            super::synthetic_chain_epoch_artifacts(
+                chain_epoch,
+                vec![block],
+                vec![compact_block.clone()],
+            ),
+        )?;
     }
 
     let reopened = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
@@ -943,11 +978,14 @@ fn checkpoint_commit_establishes_artifact_lower_bound() -> eyre::Result<()> {
         ..chain_epoch
     };
 
-    let outcome = store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block.clone()],
-        vec![compact_block.clone()],
-    ))?;
+    let outcome = super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
+            chain_epoch,
+            vec![block.clone()],
+            vec![compact_block.clone()],
+        ),
+    )?;
     let reader = store.current_chain_epoch_reader()?;
     let below_lower_bound = match reader.block_header_at(BlockHeight::new(1)) {
         Ok(block) => {
@@ -984,11 +1022,10 @@ fn many_epoch_reads_do_not_depend_on_dense_artifact_rewrites() -> eyre::Result<(
             first_block = Some(block.clone());
         }
 
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block],
-            vec![compact_block],
-        ))?;
+        super::commit_synthetic_chain_epoch(
+            &store,
+            super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block]),
+        )?;
     }
 
     let reader = store.current_chain_epoch_reader()?;
@@ -1097,18 +1134,24 @@ fn run_crash_child(store_path: &Path, crash_mode: &str) -> eyre::Result<()> {
 
 fn commit_append_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
     let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        first_epoch,
-        vec![first_block],
-        vec![first_compact_block],
-    ))?;
+    super::commit_synthetic_chain_epoch(
+        store,
+        super::synthetic_chain_epoch_artifacts(
+            first_epoch,
+            vec![first_block],
+            vec![first_compact_block],
+        ),
+    )?;
 
     let (second_epoch, second_block, second_compact_block) = synthetic_epoch(2, 2);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        second_epoch,
-        vec![second_block],
-        vec![second_compact_block],
-    ))?;
+    super::commit_synthetic_chain_epoch(
+        store,
+        super::synthetic_chain_epoch_artifacts(
+            second_epoch,
+            vec![second_block],
+            vec![second_compact_block],
+        ),
+    )?;
 
     Ok(())
 }
@@ -1118,11 +1161,14 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(1, 2);
     initial_epoch.settled_tip_height = first_epoch.visible_tip_height;
     initial_epoch.settled_tip_hash = first_epoch.visible_tip_hash;
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        initial_epoch,
-        vec![first_block.clone(), initial_block],
-        vec![first_compact_block, initial_compact_block],
-    ))?;
+    super::commit_synthetic_chain_epoch(
+        store,
+        super::synthetic_chain_epoch_artifacts(
+            initial_epoch,
+            vec![first_block.clone(), initial_block],
+            vec![first_compact_block, initial_compact_block],
+        ),
+    )?;
 
     let replacement_hash = BlockHash::from_bytes([20; 32]);
     let replacement_height = BlockHeight::new(2);
@@ -1149,8 +1195,9 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
         b"replacement-compact-block-2".to_vec(),
     );
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
+    super::commit_synthetic_chain_epoch(
+        store,
+        super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_block],
             vec![replacement_compact_block],

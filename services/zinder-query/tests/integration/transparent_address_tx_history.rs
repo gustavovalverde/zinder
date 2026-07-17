@@ -29,8 +29,8 @@ use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, PrimaryChainStore, ReorgWindowChange,
 };
 use zinder_testkit::{
-    StoreFixture, open_test_derive_store_for_canonical, sample_regtest_upgrade_activations,
-    seed_transparent_address_transaction_history,
+    StoreFixture, encode_fixture_block_replay, open_test_derive_store_for_canonical,
+    sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
 };
 
 use crate::common::{block_hash_from_seed, split_tx_ids_stream, synthetic_chain_epoch};
@@ -423,9 +423,12 @@ fn commit_initial_tx_index_row(
     let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_chain_epoch(1, 2);
     initial_epoch.settled_tip_height = safe_tip_epoch.visible_tip_height;
     initial_epoch.settled_tip_hash = safe_tip_epoch.visible_tip_hash;
+    let safe_tip_replay = encode_fixture_block_replay(&safe_tip_block, &[]);
+    let initial_replay = encode_fixture_block_replay(&initial_block, &[]);
     let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
         initial_epoch,
         vec![safe_tip_block, initial_block],
+        vec![safe_tip_replay, initial_replay],
         vec![safe_tip_compact_block, initial_compact_block],
     ))?;
     let initial_artifact = TransparentAddressTxIndexArtifact::new(
@@ -489,11 +492,13 @@ fn commit_same_height_replacement(
         TransactionId::from_bytes([0x22; 32]),
         replacement_hash,
     );
+    let replacement_replay = encode_fixture_block_replay(&replacement_block, &[]);
 
     let commit = store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             replacement_epoch,
             vec![replacement_block],
+            vec![replacement_replay],
             vec![replacement_compact_block],
         )
         .with_reorg_window_change(ReorgWindowChange::Replace {
@@ -533,10 +538,12 @@ fn commit_tx_index(
             block.block_hash,
         ));
     }
+    let replay = encode_fixture_block_replay(&block, &[]);
 
     let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
     derive_store.put_chain_event_cursor(

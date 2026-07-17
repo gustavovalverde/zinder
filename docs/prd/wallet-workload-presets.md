@@ -39,7 +39,7 @@ Every projection keeps its own identity, schema, cursor, recovery coverage, fres
 
 ### Canonical truth stays shared
 
-The first release does not create wallet-specific canonical schemas or skip canonical transparent facts. Canonical facts remain the common source for wallet reads, complete deployments, future projection workers, and rebuilds.
+The first release does not create wallet-specific canonical schemas or skip canonical transparent facts. Canonical facts remain the common source for wallet reads, explorer deployments, future projection workers, and rebuilds.
 
 ### Payload retention stays orthogonal
 
@@ -60,18 +60,18 @@ Zinder must never serve a partial projection as complete, infer that a missing s
 ## User Stories
 
 1. As a wallet operator, I want a supported wallet preset, so that I do not materialize explorer and analytics projections that my deployment never serves.
-2. As a shared deployment operator, I want a complete preset, so that one installation continues to expose every shipped product projection.
-3. As an existing operator, I want the complete preset to preserve current behavior by default, so that an upgrade does not silently remove capabilities.
+2. As a shared deployment operator, I want an explorer preset, so that one installation continues to expose every shipped product projection.
+3. As an operator, I want the omitted preset to resolve explicitly to explorer, so that the deployed workload is predictable.
 4. As a lightwalletd-compatible wallet integrator, I want transparent-address transaction history to remain available under the wallet preset, so that transaction enhancement and transparent history remain complete.
 5. As a native full-block wallet integrator, I want durable transparent spender resolution under the wallet preset, so that offline recovery can identify old spends after canonical retention.
 6. As a compact-block wallet operator, I want transaction payload retention without full block payload retention, so that the deployment supports wallet history without paying for unused full blocks.
 7. As a full-block wallet operator, I want to retain full blocks with the same wallet projection preset, so that a Zallet-style backend can scan epoch-pinned blocks.
-8. As an operator, I want Zinder to reject incompatible preset and store combinations before mutation, so that a failed start does not leave the store impossible to upgrade or roll back.
+8. As an operator, I want Zinder to reject incompatible preset and store combinations before mutation, so that a failed start leaves the input store unchanged.
 9. As an operator, I want a clear rebuild instruction when a requested preset cannot use an existing store, so that recovery is deliberate and predictable.
 10. As a wallet integrator, I want capabilities to reflect the required projection and payload availability, so that the client does not discover missing data halfway through sync.
 11. As an operator, I want readiness to identify the lagging or unavailable projection, so that I can distinguish wallet correctness from optional product lag.
 12. As a Zinder maintainer, I want every new projection to declare its product role, recovery source, preset membership, and retention authority, so that preset behavior cannot drift accidentally.
-13. As a Zinder maintainer, I want the wallet and complete workloads measured with the same deterministic replay input, so that the product decision rests on comparable storage and sync evidence.
+13. As a Zinder maintainer, I want the wallet and explorer workloads measured with the same deterministic replay input, so that the product decision rests on comparable storage and sync evidence.
 14. As an operator, I want backup metadata to state which projections were captured and whether they were current, so that restore does not overstate the recovered capability set.
 15. As a projection operator, I want future workers to reuse the same projection identities and preset membership, so that moving work out of ingest does not change the product contract.
 16. As a developer, I want default local tests to remain embedded and fast, so that optional future databases do not become prerequisites for wallet-preset development.
@@ -83,7 +83,7 @@ Zinder must never serve a partial projection as complete, infer that a missing s
 In scope:
 
 - Named presets that expand to stable projection identities.
-- A wallet preset and a complete preset.
+- A wallet preset and an explorer preset.
 - Explicit projection roles and retention authority.
 - Fresh-store selection and fail-closed lifecycle validation.
 - Per-projection capability, freshness, and readiness decisions.
@@ -107,9 +107,9 @@ Out of scope:
 
 | Projection class | Current projection | Product requirement | Canonical retention authority |
 | --- | --- | --- | --- |
-| Wallet correctness | `transparent_outpoint_spend` | Required by the wallet preset and complete preset | May publish the transparent-spend retention release floor after durable commit |
-| Wallet serving | `transparent_address_transaction_history` | Required by the wallet preset and complete preset | None |
-| Optional product view | Every other current bundled projection | Required by the complete preset only | None |
+| Wallet correctness | `transparent_outpoint_spend` | Required by the wallet preset and explorer preset | May publish the transparent-spend retention release floor after durable commit |
+| Wallet serving | `transparent_address_transaction_history` | Required by the wallet preset and explorer preset | None |
+| Optional product view | Every other current bundled projection | Required by the explorer preset only | None |
 
 New projections must enter one of these classes before they join a preset. A projection does not become wallet-critical because a wallet might display its output; it becomes wallet-critical only when wallet correctness or an advertised compatibility contract fails without it.
 
@@ -117,11 +117,11 @@ New projections must enter one of these classes before they join a preset. A pro
 
 ### R-PRESET-1. Presets select projection identities
 
-Zinder must expose a closed set of named workload presets. The first set contains `wallet` and `complete`. A preset expands to stable projection identities and their required startup work; it does not expose internal column-family names or consumer implementation types.
+Zinder must expose a closed set of named workload presets. The first set contains `wallet` and `explorer`. A preset expands to stable projection identities and their required startup work; it does not expose internal column-family names or consumer implementation types.
 
-### R-PRESET-2. Complete preserves current behavior
+### R-PRESET-2. Explorer is the default shared workload
 
-`complete` must remain the default for existing configuration that does not select a preset. It includes every shipped projection and preserves the shared-product deployment posture.
+`explorer` is the default for new configuration that does not select a preset. It includes every shipped projection and preserves the shared-product deployment posture.
 
 ### R-WALLET-1. Wallet contains the minimum supported set
 
@@ -133,7 +133,7 @@ Each projection must have one product role, one recovery-source declaration, one
 
 ### R-CANONICAL-1. Presets do not change canonical facts
 
-The first implementation must build the same canonical artifacts for `wallet` and `complete`. Projection selection may change derive writes, replay, startup jobs, and product capabilities, but not canonical epoch atomicity, reorg repair, wallet facts, or event history.
+The first implementation must build the same canonical artifacts for `wallet` and `explorer`. Projection selection may change derive writes, replay, startup jobs, and product capabilities, but not canonical epoch atomicity, reorg repair, wallet facts, or event history.
 
 ### R-PAYLOAD-1. Raw payload retention remains independent
 
@@ -143,7 +143,7 @@ The raw payload policy remains a separate operator choice:
 - `transactions`: retain transaction blobs only.
 - `all`: retain block and transaction blobs.
 
-Projection selection does not mutate payload retention. A deployment that claims the complete wallet and lightwalletd-compatible contract also selects `ingest.modifiers.coverage = "wallet-serving"`; that coverage profile defaults to `transactions` and rejects `none`. A full-block wallet selects `all`. The complete projection preset does not imply `all`.
+Projection selection does not mutate payload retention. A deployment that claims the full wallet and lightwalletd-compatible contract also selects `ingest.modifiers.coverage = "wallet-serving"`; that coverage profile defaults to `transactions` and rejects `none`. A full-block wallet selects `all`. The explorer projection preset does not imply `all`.
 
 ### R-READ-1. Reads depend on projection-specific state
 
@@ -157,9 +157,9 @@ Capabilities must be advertised only when their canonical facts, payload retenti
 
 The first implementation must apply preset selection only when creating a fresh canonical-plus-projection store. A requested preset that conflicts with persisted projection identities, recovery coverage, canonical schema, or retention markers must fail before mutating the projection manifest.
 
-### R-LIFECYCLE-2. Existing-store transitions require a separate design
+### R-LIFECYCLE-2. Existing-store transitions require a rebuild
 
-Wallet-to-complete expansion, complete-to-wallet reduction, and automatic disk reclamation are unsupported until a migration design proves manifest preflight, historical recovery coverage, rollback behavior, and retention safety. The error must direct operators to a supported full rebuild procedure.
+Wallet-to-explorer expansion, explorer-to-wallet reduction, and automatic disk reclamation are unsupported. The error must direct operators to rebuild into a fresh store. The implementation does not provide aliases or migration support for earlier preset names.
 
 ### R-OPS-1. The effective workload is observable
 
@@ -171,7 +171,7 @@ A backup or restore manifest must state the selected preset, included projection
 
 ### R-BENCHMARK-1. Public selection is evidence-gated
 
-The wallet preset must run against the same captured dense and recent ranges as the complete control. The comparison reports canonical blocks per second, derive rows and bytes written, compaction bytes, peak anonymous resident memory, projection lag, startup recovery time, and final disk use.
+The wallet preset must run against the same captured dense and recent ranges as the explorer control. The comparison reports canonical blocks per second, derive rows and bytes written, compaction bytes, peak anonymous resident memory, projection lag, startup recovery time, and final disk use.
 
 The public preset ships only when the benchmark shows a repeatable derive-write reduction outside measured run-to-run noise, plus an improvement in at least one of disk use, compaction, memory, or recovery time. Canonical throughput and wallet correctness must not regress outside the benchmark's stated noise.
 
@@ -190,7 +190,7 @@ Tests exercise the public workload contract rather than internal consumer arrays
 - Contract tests prove that the effective projection set matches each preset and remains stable across configuration parsing, ingest startup, query startup, backup, and restore.
 - Storage tests prove fresh-store initialization, manifest preflight, fail-closed mismatches, and retention-release safety.
 - Query tests prove per-projection capability and readiness decisions, including deliberate omission and lag.
-- Fixed-range performance tests compare identical inputs under wallet and complete presets.
+- Fixed-range performance tests compare identical inputs under wallet and explorer presets.
 - Live wallet tests exercise compact sync, transparent history, durable spend recovery, broadcast, mempool behavior, and reorg recovery.
 - Full-block wallet tests run with raw payload retention set to `all`.
 - Compatibility tests keep support claims scoped to the wallet release and network actually exercised.
@@ -198,7 +198,7 @@ Tests exercise the public workload contract rather than internal consumer arrays
 ## Acceptance Criteria
 
 - A fresh wallet-preset store reaches wallet-serving readiness without creating optional product projection state.
-- A fresh complete-preset store preserves the current capability and projection set.
+- A fresh explorer-preset store preserves the current capability and projection set.
 - Transparent-address history and durable spender resolution remain complete under the wallet preset.
 - Canonical epoch, reorg, event, and retention contract tests pass under both presets.
 - Full-block reads remain unavailable under `transactions` and become available under `all`, independent of projection preset.
@@ -206,14 +206,14 @@ Tests exercise the public workload contract rather than internal consumer arrays
 - Capability and readiness output identifies every required missing or lagging dependency.
 - Backup and restore preserve or explicitly omit each projection's state.
 - The fixed-range evidence satisfies R-BENCHMARK-1 before the preset becomes a supported operator feature.
-- The default complete deployment and its existing clients observe no behavior change.
+- The explorer preset includes every wallet and explorer projection declared by the release.
 
 ## Open Questions
 
-1. Should the public name be `complete`, `shared`, or `all`? This PRD uses `complete` to avoid confusing projection coverage with full-block payload retention.
+1. Resolved: the public name is `explorer`. It describes the consumer surface without confusing it with coverage completeness.
 2. Which exact compatibility claim requires transaction blobs, and can a narrower native-wallet deployment safely use `none` without creating another public preset?
 3. What backup manifest format should become durable before multi-backend projection stores exist?
-4. Should a future wallet-to-complete transition backfill in place, or should every preset change continue to require a fresh store?
+4. Resolved: every preset change requires a fresh store.
 5. Which numeric improvement threshold, beyond measured run-to-run noise, should release policy require after the first fixed-range control exists?
 
 ## Source References

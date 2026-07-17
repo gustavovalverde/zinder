@@ -17,14 +17,14 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    BlockSelector, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected,
-    BroadcastRejectionReason, BroadcastUnknown, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
-    SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastResult, TransactionId, TransactionLocation,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendFact,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockSelector,
+    BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastRejected, BroadcastRejectionReason,
+    BroadcastUnknown, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network,
+    NetworkUpgradeActivations, RawTransactionBytes, SUBTREE_LEAF_COUNT, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    TransparentOutputsByOutpointResponse, TransparentSpendFact,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, UnixTimestampMillis,
     wire::{encode_height_key_ascending, encode_internal_block_hash},
@@ -49,13 +49,14 @@ use zinder_query::{
     derive_store_wallet_projection_reader,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
-    ReorgWindowChange, RocksDbResourceBudget, StreamCursorTokenV1,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEventStreamFamily,
+    ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention, ReorgWindowChange,
+    RocksDbResourceBudget, StreamCursorTokenV1,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
-    sample_regtest_upgrade_activations, seed_transparent_address_transaction_history,
-    synthetic_transaction_public_facts,
+    encode_fixture_block_replay, sample_regtest_upgrade_activations,
+    seed_transparent_address_transaction_history, synthetic_transaction_public_facts,
 };
 
 const ACCEPTANCE_BLOCK_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -176,6 +177,29 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         lightd_info.upgrade_height
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn lightd_info_refuses_transparent_support_without_projection_readiness() -> eyre::Result<()>
+{
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_transparent_address_support();
+
+    let lightd_info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    assert!(!lightd_info.taddr_support);
     Ok(())
 }
 
@@ -988,6 +1012,7 @@ async fn get_transaction_by_hash_pins_every_read_to_one_epoch() -> eyre::Result<
     let transaction_payload = b"single-epoch-transaction-bytes".to_vec();
     let store_fixture = acceptance_store_fixture_with_transaction_rows(
         DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        RawBlobRetention::Transactions,
         |block| {
             vec![FixtureTransactionRows::from_raw_transaction(
                 transaction_id,
@@ -1317,6 +1342,7 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
     let spending_transaction_id = TransactionId::from_bytes([0x77; 32]);
     let store_fixture = acceptance_store_fixture_with_transaction_rows_and_transparent(
         DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        RawBlobRetention::None,
         |_| Vec::new(),
         |block| {
             let unspent_outpoint = TransparentOutPoint::new(transaction_id, 0);
@@ -1355,6 +1381,29 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
             )
         },
     )?;
+    let derive_tempdir = tempdir()?;
+    let derive_store = DeriveStore::open_with_projection_preset(
+        derive_tempdir.path(),
+        ProjectionPreset::Wallet,
+        DeriveStoreOptions {
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            ..DeriveStoreOptions::default()
+        },
+    )?;
+    let tip_key = encode_height_key_ascending(ACCEPTANCE_BLOCK_HEIGHT);
+    for (projection, index_column_family) in [
+        (
+            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+        ),
+        (
+            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+        ),
+    ] {
+        set_projection_at_canonical_tip(store_fixture.chain_store(), &derive_store, projection)?;
+        derive_store.put_consumer(index_column_family, &tip_key, &[])?;
+    }
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
             store_fixture.chain_store().clone(),
@@ -1364,7 +1413,9 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let adapter = adapter.with_transparent_address_support();
+    let adapter = adapter
+        .with_transparent_address_support()
+        .with_wallet_projection_reader(derive_store_wallet_projection_reader(derive_store));
 
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address.clone()],
@@ -1484,6 +1535,7 @@ async fn get_address_utxos_txid_round_trips_through_get_transaction_by_hash() ->
     let transaction_payload = b"round-trip-transaction-bytes".to_vec();
     let store_fixture = acceptance_store_fixture_with_transaction_rows_and_transparent(
         DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        RawBlobRetention::Transactions,
         |block| {
             vec![FixtureTransactionRows::from_raw_transaction(
                 transaction_id,
@@ -1545,6 +1597,10 @@ async fn get_address_utxos_txid_round_trips_through_get_transaction_by_hash() ->
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the acceptance scenario keeps multi-address ordering and truncation assertions together"
+)]
 async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Result<()> {
     let transparent_address_a =
         ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x21; 20]);
@@ -1559,6 +1615,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
     let truncated_transaction_id = TransactionId::from_bytes([0x30; 32]);
     let store_fixture = acceptance_store_fixture_with_transaction_rows_and_transparent(
         DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        RawBlobRetention::None,
         |_| Vec::new(),
         |block| {
             (
@@ -1641,6 +1698,7 @@ async fn get_taddress_history_drains_native_pages() -> eyre::Result<()> {
     let (store_fixture, derive_store) =
         acceptance_store_fixture_with_transaction_rows_and_tx_history(
             DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+            RawBlobRetention::Transactions,
             |block| {
                 (0..1001)
                     .map(|index| {
@@ -1708,6 +1766,7 @@ async fn get_transaction_returns_not_found_when_blob_is_unretained() -> eyre::Re
     let transaction_id = TransactionId::from_bytes([0x32; 32]);
     let store_fixture = acceptance_store_fixture_with_transaction_rows(
         DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+        RawBlobRetention::None,
         |block| vec![transaction_rows_without_blob(transaction_id, block)],
     )?;
     let adapter = LightwalletdGrpcAdapter::new(
@@ -1815,6 +1874,7 @@ async fn taddress_history_returns_not_found_when_blob_is_unretained() -> eyre::R
     let (store_fixture, derive_store) =
         acceptance_store_fixture_with_transaction_rows_and_tx_history(
             DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
+            RawBlobRetention::None,
             |block| vec![transaction_rows_without_blob(transaction_id, block)],
             |block| {
                 vec![TransparentAddressTxIndexArtifact::new(
@@ -1874,7 +1934,9 @@ async fn taddress_history_honors_requested_block_range_floor() -> eyre::Result<(
     let at_floor_transaction_id = TransactionId::from_bytes([0x35; 32]);
     let before_floor_payload = b"before-floor-transparent-history".to_vec();
     let at_floor_payload = b"at-floor-transparent-history".to_vec();
-    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
     let before_floor_block = chain_fixture
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre!("transparent-history fixture must include height 1"))?
@@ -2708,7 +2770,7 @@ fn genesis_store_fixture() -> eyre::Result<StoreFixture> {
         visible_tip_hash: block_hash,
         settled_tip_height: height,
         settled_tip_hash: block_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -2729,12 +2791,18 @@ fn genesis_store_fixture() -> eyre::Result<StoreFixture> {
         block_hash,
         acceptance_compact_block_payload_at(height, block_hash, parent_hash, block_time_seconds),
     );
+    let replay = encode_fixture_block_replay(&block_header, &[]);
 
     store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block_header], vec![compact_block])
-            .with_reorg_window_change(ReorgWindowChange::Extend {
-                block_range: BlockHeightRange::inclusive(height, height),
-            }),
+        ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block_header],
+            vec![replay],
+            vec![compact_block],
+        )
+        .with_reorg_window_change(ReorgWindowChange::Extend {
+            block_range: BlockHeightRange::inclusive(height, height),
+        }),
     )?;
 
     Ok(store_fixture)
@@ -2751,7 +2819,7 @@ fn wallet_serving_floor_store_fixture() -> eyre::Result<(StoreFixture, BlockHeig
         visible_tip_hash: wallet_serving_floor_hash,
         settled_tip_height: wallet_serving_floor_height,
         settled_tip_hash: wallet_serving_floor_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -2796,7 +2864,7 @@ fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundary
         visible_tip_hash: floor_block.hash,
         settled_tip_height: floor_block.height,
         settled_tip_hash: floor_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -2811,14 +2879,17 @@ fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundary
         visible_tip_hash: retained_block.hash,
         settled_tip_height: retained_block.height,
         settled_tip_hash: retained_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_010),
     };
+    let retained_block_header = retained_block.block_header_artifact();
+    let retained_replay = encode_fixture_block_replay(&retained_block_header, &[]);
     store_fixture.chain_store().commit_chain_epoch(
         ChainEpochArtifacts::new(
             retained_epoch,
-            vec![retained_block.block_header_artifact()],
+            vec![retained_block_header],
+            vec![retained_replay],
             vec![retained_compact_block.clone()],
         )
         .with_tree_states(vec![retained_block.tree_state_checkpoint_artifact()])
@@ -2842,7 +2913,7 @@ fn reorg_replacement_artifacts(parent_hash: BlockHash, height: BlockHeight) -> C
         visible_tip_hash: replacement_hash,
         settled_tip_height: BlockHeight::new(height.value() - 1),
         settled_tip_hash: parent_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -2863,20 +2934,27 @@ fn reorg_replacement_artifacts(parent_hash: BlockHash, height: BlockHeight) -> C
         replacement_hash,
         b"replacement-compact-block".to_vec(),
     );
+    let replacement_replay = encode_fixture_block_replay(&replacement_block, &[]);
 
     ChainEpochArtifacts::new(
         replacement_epoch,
         vec![replacement_block],
+        vec![replacement_replay],
         vec![replacement_compact_block],
     )
 }
 
 fn acceptance_store_fixture(tree_state_payload: Vec<u8>) -> eyre::Result<StoreFixture> {
-    acceptance_store_fixture_with_transaction_rows(tree_state_payload, |_| Vec::new())
+    acceptance_store_fixture_with_transaction_rows(
+        tree_state_payload,
+        RawBlobRetention::None,
+        |_| Vec::new(),
+    )
 }
 
 fn acceptance_store_fixture_with_transaction_rows<TransactionsFn>(
     tree_state_payload: Vec<u8>,
+    raw_blob_retention: RawBlobRetention,
     build_transaction_rows: TransactionsFn,
 ) -> eyre::Result<StoreFixture>
 where
@@ -2884,6 +2962,7 @@ where
 {
     acceptance_store_fixture_with_transaction_rows_and_transparent(
         tree_state_payload,
+        raw_blob_retention,
         build_transaction_rows,
         |_| (Vec::new(), Vec::new()),
     )
@@ -2891,6 +2970,7 @@ where
 
 fn acceptance_store_fixture_with_transaction_rows_and_transparent<TransactionsFn, TransparentFn>(
     tree_state_payload: Vec<u8>,
+    raw_blob_retention: RawBlobRetention,
     build_transaction_rows: TransactionsFn,
     build_transparent_artifacts: TransparentFn,
 ) -> eyre::Result<StoreFixture>
@@ -2901,6 +2981,7 @@ where
     ) -> (Vec<TransparentUnspentOutput>, Vec<TransparentSpendFact>),
 {
     let base_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(raw_blob_retention)
         .extend_blocks(1)
         .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0))
         .with_tree_state_checkpoint_payload_at(ACCEPTANCE_BLOCK_HEIGHT, tree_state_payload);
@@ -2945,6 +3026,7 @@ where
 
 fn acceptance_store_fixture_with_transaction_rows_and_tx_history<TransactionsFn, TxHistoryFn>(
     tree_state_payload: Vec<u8>,
+    raw_blob_retention: RawBlobRetention,
     build_transaction_rows: TransactionsFn,
     build_tx_history: TxHistoryFn,
 ) -> eyre::Result<(StoreFixture, zinder_derive::DeriveStore)>
@@ -2953,6 +3035,7 @@ where
     TxHistoryFn: FnOnce(&zinder_testkit::FixtureBlock) -> Vec<TransparentAddressTxIndexArtifact>,
 {
     let base_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(raw_blob_retention)
         .extend_blocks(1)
         .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0))
         .with_tree_state_checkpoint_payload_at(ACCEPTANCE_BLOCK_HEIGHT, tree_state_payload);

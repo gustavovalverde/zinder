@@ -4,8 +4,9 @@ use std::num::NonZeroU32;
 
 use async_trait::async_trait;
 use zinder_core::{
-    BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastResult,
+    BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, CommitmentTreeCheckpoint,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBroadcastResult,
 };
 
 use crate::{
@@ -103,6 +104,18 @@ pub trait NodeSource: Send + Sync + 'static {
         })
     }
 
+    /// Fetches one source-authenticated checkpoint with validated typed frontiers.
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        let _ = (height, network_upgrade_activations);
+        Err(SourceError::NodeCapabilityMissing {
+            capability: crate::NodeCapability::TreeState,
+        })
+    }
+
     /// Returns the node's current best tip identity (height and hash).
     ///
     /// Tip-follow uses [`BlockId::hash`] as the cheap change-detection signal:
@@ -118,6 +131,22 @@ pub trait NodeSource: Send + Sync + 'static {
         max_entries: NonZeroU32,
     ) -> Result<SourceSubtreeRoots, SourceError> {
         let _ = (protocol, start_index, max_entries);
+        Err(SourceError::NodeCapabilityMissing {
+            capability: crate::NodeCapability::SubtreeRoots,
+        })
+    }
+
+    /// Fetches every shielded subtree root in `range` with one source request.
+    ///
+    /// Unlike [`Self::fetch_subtree_roots`], this exact-range contract rejects
+    /// a short response. Canonical construction uses it only after computing
+    /// the completed-subtree range at a fixed chain tip, so accepting a partial
+    /// response could publish an incomplete wallet artifact family.
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        let _ = range;
         Err(SourceError::NodeCapabilityMissing {
             capability: crate::NodeCapability::SubtreeRoots,
         })

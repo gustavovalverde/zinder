@@ -195,7 +195,12 @@ async fn bulk_catchup_store(
         activations,
     );
     let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source.fetch_chain_checkpoint(checkpoint_height).await?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(
+            checkpoint_height,
+            &bulk_catchup_config.network_upgrade_activations,
+        )
+        .await?;
     bulk_catchup_config.checkpoint = Some(checkpoint);
     run_bulk_catchup(&bulk_catchup_config, &source)
         .await?
@@ -237,9 +242,10 @@ async fn serve_ingest_control_grpc(
     mempool_index: MempoolIndex,
     source: zinder_source::ZebraJsonRpcSource,
 ) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter = IngestControlGrpcAdapter::new(network, store)
-        .with_mempool(mempool_index)
-        .with_node_source(Arc::new(source));
+    let adapter =
+        IngestControlGrpcAdapter::new(network, store, zinder_runtime::Readiness::default())
+            .with_mempool(mempool_index)
+            .with_node_source(Arc::new(source));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(async move {

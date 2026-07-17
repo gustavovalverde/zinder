@@ -102,7 +102,7 @@ flowchart LR
     Zebra["Zebra node"] --> Ingest["zinder-ingest<br/>indexes the chain once"]
     Ingest --> Canonical[("Canonical chain view<br/>shared source of truth")]
     Canonical --> APIs["Zinder APIs<br/>WalletQuery · lightwalletd · ExplorerQuery"]
-    Canonical -->|"rebuildable events"| Projections[("Selected derived views<br/>wallet or complete")]
+    Canonical -->|"rebuildable events"| Projections[("Selected derived views<br/>wallet or explorer")]
     Projections --> APIs
     APIs --> Consumers["Wallets · applications · explorers"]
 ```
@@ -149,6 +149,7 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --profile=ci
+cargo nextest run --profile=ci-parity
 cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 cargo deny check
@@ -156,7 +157,7 @@ cargo machete
 git diff --check
 ```
 
-`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory as documented in the [Testing Runbook](docs/runbooks/testing.md): T0 unit, T1 integration, T2 perf, T3 live, and consumer certification. The `default`/`ci` profile runs T0 and T1; `ci-perf` runs T2; `ci-live` runs upstream-node T3; `ci-zallet-live` provides a future-adapter harness for an externally supplied Zallet build. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
+`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory as documented in the [Testing Runbook](docs/runbooks/testing.md): T0 unit, T1 integration, T2 perf, T3 live/deploy, and T4 consumer certification. The `default`/`ci` profile runs T0 and database-free T1; `ci-postgres` runs the externally backed PostgreSQL driver test; `ci-perf` runs T2; `ci-live` runs upstream-node T3; `ci-zallet-live` runs the externally supplied Zallet adapter; `ci-deploy` runs Docker deployment smoke tests; and `ci-parity` runs T4. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
 
 Heavier probes for trust-sensitive storage or parser changes:
 

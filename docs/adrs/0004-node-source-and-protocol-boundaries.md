@@ -69,7 +69,7 @@ pub trait NodeSource: Send + Sync + 'static {
 }
 ```
 
-`tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality without fetching the full block. The Zebra JSON-RPC adapter implements `tip_id()` as `getbestblockhash` followed by `getblockheader(best_hash, true)` so the height and hash come from the same observation. Idle steady-state cost is two cheap RPCs.
+`tip_id()` returns `BlockId { height, hash }` so steady-state ingest can short-circuit on hash equality without fetching the full block. The Zebra JSON-RPC adapter uses `getbestblockheightandhash`, whose height and hash come from one node snapshot. Idle steady-state cost is one RPC and has no cross-call reorg race.
 
 Transaction broadcast is a separate boundary because it is a command, not an observation:
 
@@ -158,7 +158,7 @@ Current `NodeCapability` names:
 
 New capability names appear in `NodeCapability` only when a real consumer reads them; aspirational vocabulary stays out.
 
-Capability discovery happens in the `connect_node` startup phase. The Zebra JSON-RPC adapter calls `rpc.discover` (Zebra v4.2+) and parses the OpenRPC method list. The required methods (`getbestblockhash`, `getblockheader`, `getblock`, `z_gettreestate`, `z_getsubtreesbyindex`, `getblockcount`, `sendrawtransaction`) must be present; missing required methods produce `NodeCapabilityMissing` and readiness advances no further than `node_capability_missing`.
+Capability discovery happens in the `connect_node` startup phase. The Zebra JSON-RPC adapter calls `rpc.discover` and parses the OpenRPC method list. Canonical ingest requires `getbestblockheightandhash`, `getblock`, and `z_getsubtreesbyindex`; missing discovery or required methods produce `NodeCapabilityMissing` and readiness advances no further than `node_capability_missing`. There is no assumed legacy method set when discovery fails.
 
 Capability discovery for Zebra indexer gRPC and zcashd JSON-RPC follows the same pattern: probe by attempting a no-op subscription or by method-probing `getnetworkinfo`. Version strings may be logged and included in diagnostics, but they are not the primary compatibility contract.
 

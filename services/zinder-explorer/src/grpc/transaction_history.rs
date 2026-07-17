@@ -1255,16 +1255,16 @@ mod tests {
             TransactionHistoryProjectionReadiness::Omitted
         );
 
-        let complete_path = tempdir()?;
-        let complete_store = DeriveStore::open_with_projection_preset(
-            complete_path.path(),
-            ProjectionPreset::Complete,
+        let explorer_path = tempdir()?;
+        let explorer_store = DeriveStore::open_with_projection_preset(
+            explorer_path.path(),
+            ProjectionPreset::Explorer,
             test_options(),
         )?;
-        let complete_reader =
-            DeriveStoreTransactionHistoryProjectionReader::new(complete_store.clone());
+        let explorer_reader =
+            DeriveStoreTransactionHistoryProjectionReader::new(explorer_store.clone());
         assert_eq!(
-            complete_reader.readiness()?,
+            explorer_reader.readiness()?,
             TransactionHistoryProjectionReadiness::Materializing
         );
 
@@ -1275,9 +1275,9 @@ mod tests {
             revision: 1,
             coverage: None,
         };
-        complete_store
+        explorer_store
             .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, partial_state)?;
-        let readiness = complete_reader.readiness()?;
+        let readiness = explorer_reader.readiness()?;
         assert!(readiness.is_available());
         assert!(!readiness.is_complete_at(Some((
             partial_state.projection_epoch_id,
@@ -1294,9 +1294,9 @@ mod tests {
             }),
             ..partial_state
         };
-        complete_store
+        explorer_store
             .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, checkpoint_state)?;
-        let readiness = complete_reader.readiness()?;
+        let readiness = explorer_reader.readiness()?;
         assert!(readiness.is_available());
         assert!(!readiness.is_complete_at(Some((
             checkpoint_state.projection_epoch_id,
@@ -1313,9 +1313,9 @@ mod tests {
             }),
             ..partial_state
         };
-        complete_store
+        explorer_store
             .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, complete_state)?;
-        let readiness = complete_reader.readiness()?;
+        let readiness = explorer_reader.readiness()?;
         assert!(readiness.is_available());
         assert!(readiness.is_complete_at(Some((
             complete_state.projection_epoch_id,

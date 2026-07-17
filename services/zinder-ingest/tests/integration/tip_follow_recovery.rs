@@ -180,7 +180,7 @@ fn sample_tip_follow_config(storage_path: &std::path::Path) -> TipFollowConfig {
         ),
         storage_path: storage_path.to_path_buf(),
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::None,
         network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
         reorg_window_blocks: 100,
         poll_interval: Duration::from_millis(10),

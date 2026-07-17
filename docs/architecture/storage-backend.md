@@ -2,6 +2,11 @@
 
 The storage backend is the contract between chain ingestion, epoch-bound readers, migrations, and operational recovery. It is not a public table schema.
 
+This document describes the current `rocksdb-single-host` implementation.
+[ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) also
+accepts a `postgres-scale-out` topology, which remains a migration target until
+its concrete storage and lifecycle gates pass.
+
 Event and reorg semantics live in [Chain events](chain-events.md).
 
 ## Ownership
@@ -68,10 +73,11 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `storage_control` | Visible epoch pointer, event sequence pointer, cursor secret, schema version, store identity, and network anchor. Also holds `oldest_retained_chain_event_sequence` and `oldest_retained_mempool_event_sequence`. |
 | `chain_epoch` | Epoch metadata, including `ChainTipMetadata` |
 | `block_header` | Canonical block-header facts and links |
+| `block_replay` | Versioned, reversible, block-ordered semantic `CanonicalBlockFacts` envelopes. One envelope is required for every committed header and shares the safe-block visibility index. Retention-dependent raw block and transaction blobs remain outside this family. |
 | `compact_block` | Protobuf-compatible compact block artifact envelopes |
 | `tree_state` | Sapling and Orchard tree state metadata needed by wallet APIs |
 | `transaction` | Transaction lookup records required by wallet and explorer APIs |
-| `transaction_intrinsic_value_balances` | Optional signed Sprout, Sapling, Orchard, and Ironwood balances parsed from one canonical transaction. The value-pool flow-history projection reads one such row per retained transparent-participating transaction; a store persisted below the current artifact-schema floor 18 is refused at open and rebuilt from genesis |
+| `transaction_intrinsic_value_balances` | Signed Sprout, Sapling, Orchard, and Ironwood balances parsed from one canonical transaction. Artifact schema 19 requires one row for every transaction represented by the replay envelope; a store below that floor is refused at open and rebuilt from genesis. |
 | `final_note_commitment_roots` | Optional post-block Sapling, Orchard, and Ironwood roots with explicit historical enrichment coverage; introduced by artifact schema 14 |
 | `block_value_pool_balances` | Optional post-block cumulative value-pool balances bound to exact block identity and time; introduced by artifact schema 16 |
 | `displaced_block` and indexes | Writer-owned archive keyed by displaced block hash and observation order; capture begins at the schema-17 activation record and is retained permanently |
@@ -85,7 +91,7 @@ The first RocksDB layout should use separate column families only when tuning, i
 | `chain_event` | Durable chain-event stream envelopes; retained per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure) (default 168 hours, time-windowed pruning) |
 | `mempool_event` | Durable mempool-event log per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md); retained per kind (default 60 minutes for `Mined`, 24 hours for `Invalidated`, derived shorter window for `Added`) |
 
-Canonical artifact schema and derive-consumer schema are separate version domains. Canonical schemas 13 through 18 describe facts written or enriched by the single canonical writer. Schema 18 and store schema 13 make each block's observed transparent input set and resolved spend facts durable; older store schemas are refused and require a genesis rebuild because retained point rows cannot reconstruct the missing payload safely. Each derive consumer independently versions its own rows and publishes a projection checkpoint and coverage. Neither version can be used as a substitute for the other.
+Canonical artifact schema and derive-consumer schema are separate version domains. Canonical schemas 13 through 19 describe facts written or enriched by the single canonical writer. Schema 18 and store schema 13 make each block's observed transparent input set and resolved spend facts durable. Schema 19 and store schema 14 add a complete reversible semantic replay envelope for every committed block. Older stores are refused and require a genesis rebuild because facts omitted by their persisted schema cannot be reconstructed safely. Each derive consumer independently versions its own rows and publishes a projection checkpoint and coverage. Neither version can be used as a substitute for the other.
 
 The displaced-block archive is intentionally permanent in this release. There is no retention knob and no pruning path. This preserves hash-addressed post-reorg evidence and makes coverage monotonic, but the archive and its indexes grow with accepted replacements. Any future bounded policy requires its own ADR covering cursor invalidation, coverage contraction, secondary-reader safety, and checkpoint restore behavior.
 
@@ -110,6 +116,14 @@ every other block. Bloom filters attach only to newly written SST files, so an
 existing store acquires them as compaction rewrites its files; no migration or
 volume wipe is required. Other column families stay on default options until a
 measured access pattern justifies table-specific tuning.
+
+Canonical replay uses a separate bounded read shape. A
+`BlockReplayBatchRequest` supplies `start_height` and nonzero `max_blocks`;
+the store rejects limits above 256 blocks. It resolves source epochs with one
+ordered `reorg_window` scan, then reads the replay payloads with one
+`block_replay` `multi_get`. A start beyond the pinned visible tip returns
+an empty batch, a crossing batch stops at the tip, and any missing or corrupt
+row fails the entire batch.
 
 Readers must revalidate branch identity before returning data from a visibility lookup. For example, transaction lookup can find an older same-transaction-id row from a reorged branch, so the reader checks that the artifact's block hash still matches the visible block at that height before returning it.
 
@@ -159,9 +173,9 @@ The full ingest pipeline lives in [Chain ingestion §Operation Shape](chain-inge
 
 Required steps inside `commit_chain_epoch`:
 
-1. Validate block links, compact block artifacts, transaction references, tree metadata, and reorg-window metadata.
+1. Validate block links, compact block artifacts, transaction references, tree metadata, reorg-window metadata, and one replay envelope per header. Replay headers, transaction order, public facts, intrinsic balances, and transparent input and output facts must exactly match the other semantic rows in the commit. Raw block and transaction blobs must exactly match the store's immutable retention contract for every committed header and transaction; their identities and locations are validated separately, and their bytes are not replay fields.
 2. Serialize the read-validate-write window for the visible epoch pointer and event sequence pointer, or use an equivalent compare-and-swap write fence.
-3. Build the single `WriteBatch` covering artifacts (including the address-output projection rows derived from `transparent_outputs_by_outpoint`), transparent current-projection repairs, event envelope, sequence pointer, store metadata, and visible-epoch pointer. Historical retention is a separate maintenance write.
+3. Build the single `WriteBatch` covering artifacts (including `block_replay` and the address-output projection rows derived from `transparent_outputs_by_outpoint`), transparent current-projection repairs, event envelope, sequence pointer, store metadata, and visible-epoch pointer. Historical retention is a separate maintenance write.
 4. Commit with the configured durability policy.
 5. Return the committed epoch and envelope only after the batch succeeds.
 6. Leave the previous visible epoch intact if the batch fails.
@@ -198,6 +212,13 @@ Older releases could migrate metadata versions 10 and 11 in place, but those
 layouts do not contain durable complete spend replay records and may have
 deleted their point facts. Primary open therefore rejects every pre-13 store;
 secondaries must use the freshly rebuilt volume after ingest establishes it.
+
+Store schema 14 adds the `block_replay` column family, and artifact schema
+19 requires exactly one canonical replay envelope for every committed header.
+Open refuses schema-13 volumes rather than creating the new column family or
+pretending that omitted source facts can be reconstructed. Primary and
+secondary processes must use a fresh schema-14 volume populated from source or,
+when available, a separately certified schema-19 snapshot.
 
 Artifact schema version 12 adds the Ironwood (NU6.3) shielded pool to
 `tip_metadata` and to each compact block's payload. A version-11 artifact store
@@ -295,9 +316,12 @@ Readiness causes and operational metrics are owned by [Service operations](servi
   `block_prefetch`, `commit_fallback`, `retention_sweep`, `derive_hydration`),
   and `zinder_store_multi_get_keys_total` / `zinder_store_multi_get_resolved_total`
   carry the same label to size serial-seek wall time under concurrency.
-- Visibility-index seek count through `zinder_store_visibility_seek_total`,
-  labeled by artifact family. This identifies fanout-heavy wallet scans before
-  adding new indexes or caches.
+- Visibility-index point-read seeks through
+  `zinder_store_visibility_seek_total` and bounded batch scans through
+  `zinder_store_visibility_scan_total`, both labeled by artifact family. A
+  block replay batch contributes one scan followed by one payload `multi_get`,
+  independent of its block count; per-height seek growth indicates a caller
+  bypassed the batch boundary.
 - Transparent-retention sweep size through
   `zinder_store_retention_swept_outpoints_total`, remaining height backlog
   through `zinder_store_retention_backlog_heights`, and bounded pass latency

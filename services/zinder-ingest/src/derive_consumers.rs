@@ -427,7 +427,7 @@ pub fn open_primary_derive_store_for_canonical(
     open_primary_derive_store_for_canonical_with_projection_preset(
         canonical_path,
         rocksdb_resource_budget,
-        ProjectionPreset::Complete,
+        ProjectionPreset::Explorer,
     )
 }
 
@@ -3054,9 +3054,7 @@ fn u64_to_f64(sample: u64) -> f64 {
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use zinder_core::{
-        ArtifactSchemaVersion, ChainEpoch, ChainTipMetadata, Network, UnixTimestampMillis,
-    };
+    use zinder_core::{ChainEpoch, ChainTipMetadata, Network, UnixTimestampMillis};
 
     use super::*;
 
@@ -3124,7 +3122,7 @@ mod tests {
             visible_tip_hash: tip_hash,
             settled_tip_height: tip_height,
             settled_tip_hash: tip_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(18),
+            artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1),
         })?;
@@ -3181,7 +3179,7 @@ mod tests {
             visible_tip_hash: tip_hash,
             settled_tip_height: tip_height,
             settled_tip_hash: tip_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1),
         };
@@ -3218,7 +3216,7 @@ mod tests {
             visible_tip_hash: BlockHash::from_bytes([0x42; 32]),
             settled_tip_height,
             settled_tip_hash: BlockHash::from_bytes([0x24; 32]),
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(2),
         };

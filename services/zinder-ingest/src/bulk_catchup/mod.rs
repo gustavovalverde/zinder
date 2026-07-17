@@ -7,16 +7,25 @@ use std::{
 
 use parking_lot::Mutex;
 use zinder_core::{
-    BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, Network, NetworkUpgradeActivations,
+    BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, CommitmentTreeCheckpoint, Network,
+    NetworkUpgradeActivations,
 };
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessState};
-use zinder_source::{NodeSource, NodeTarget, SourceChainCheckpoint, SourceFailureClass};
+use zinder_source::{NodeSource, NodeTarget, SourceFailureClass};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochCommitOutcome, ChainStoreOptions, PrimaryChainStore,
 };
 
-use crate::artifact_builder::{RawBlobPolicy, derive_block_with_raw_blob_policy};
-use crate::chain_ingest::{IngestError, NodeSourceKind, current_unix_millis};
+use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block};
+#[cfg(test)]
+use crate::canonical_construction::source_fetch::SourceSegmentPlan;
+use crate::canonical_construction::{
+    CanonicalPipelineLimits, source_fetch::SourceSegmentSizer, watermark::record_stage_duration,
+};
+use crate::chain_ingest::{
+    IngestError, NodeSourceKind, canonical_writer_store_options, current_unix_millis,
+    validate_writer_store_contract,
+};
 use crate::phase::current_chain_height;
 use crate::source_recovery::{
     SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
@@ -25,30 +34,16 @@ use crate::source_recovery::{
 use block_prepare::{BulkCatchupBlockPrepareStreamConfig, build_block_prepare_stream};
 use commit_reassembly::run_commit_reassembly;
 pub(crate) use flush::flush_pending_bulk_catchup_writes;
-#[cfg(test)]
-use source_fetch::SourceSegmentPlan;
-use source_fetch::SourceSegmentSizer;
-use watermark::record_stage_duration;
 
 #[cfg(test)]
-use crate::artifact_builder::{CommitmentTreeSizes, DerivedBlockArtifacts};
+use crate::artifact_builder::{CommitmentTreeSizes, PreparedCanonicalBlock};
 
-mod abort_on_drop;
 mod block_prepare;
 mod commit_reassembly;
 mod flush;
-mod source_fetch;
-mod watermark;
-
-const SOURCE_SEGMENT_DENSITY_SAMPLE_LIMIT: usize = 64;
-const SOURCE_SEGMENT_GROW_AFTER_SUCCESS_COUNT: u32 = 8;
-const SOURCE_SEGMENT_GROW_NUMERATOR: u32 = 5;
-const SOURCE_SEGMENT_GROW_DENOMINATOR: u32 = 4;
-
-const BULK_STAGE_SOURCE_FETCH: &str = "source_fetch";
 const BULK_STAGE_CANONICAL_BLOCK_PREPARE: &str = "canonical_block_prepare";
 const BULK_STAGE_CANONICAL_PREVOUT_RESOLVE: &str = "canonical_prevout_resolve";
-const BULK_STAGE_CANONICAL_FINALIZE: &str = "canonical_finalize";
+const BULK_STAGE_CANONICAL_POSITION: &str = "canonical_position";
 const BULK_STAGE_SUBTREE_ROOT_ATTACHMENT: &str = "subtree_root_attachment";
 const BULK_STAGE_CHECKPOINT_TREE_STATE: &str = "checkpoint_tree_state";
 const BULK_STAGE_COMMIT_REASSEMBLY: &str = "commit_reassembly";
@@ -67,6 +62,8 @@ pub struct BulkCatchupRunConfig {
     pub storage_path: PathBuf,
     /// Bounded `RocksDB` resource budget applied when opening the canonical store.
     pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    /// Reorg window used by the canonical writer and historical finality checks.
+    pub reorg_window_blocks: u32,
     /// First block height to ingest.
     pub from_height: BlockHeight,
     /// Last block height to ingest.
@@ -79,32 +76,8 @@ pub struct BulkCatchupRunConfig {
     pub canonical_batch_max_estimated_write_bytes: NonZeroU64,
     /// Minimum batch size before estimated write bytes can close the batch.
     pub canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32,
-    /// Maximum connected blocks requested from the source adapter in one
-    /// bounded bulk-catchup segment.
-    ///
-    /// Zebra JSON-RPC batches the segment into one JSON-RPC request containing
-    /// raw `getblock` calls. Checkpoint tree state is fetched separately for
-    /// committed epoch tips. Future streaming sources can satisfy the same
-    /// boundary without changing canonical ingest.
-    /// Operator-tunable via `ingest.bulk_catchup.source_segment_max_blocks`.
-    pub source_segment_max_blocks: NonZeroU32,
-    /// Target JSON-RPC response body size for adaptive source segments.
-    pub source_segment_target_response_bytes: NonZeroU64,
-    /// Maximum concurrent source segment requests.
-    pub source_fetch_max_in_flight_requests: NonZeroU32,
-    /// Maximum reserved response bytes across source segment requests.
-    pub source_fetch_max_in_flight_bytes: NonZeroU64,
-    /// Number of parallel `derive_block` invocations kept in flight on the
-    /// Tokio blocking pool. Per-block derivation is CPU-bound (block
-    /// deserialization, per-tx canonical re-serialization, compact-block
-    /// proto encoding, per-output `SHA256(script_pub_key)`); parallelism
-    /// scales nearly linearly with cores up to the commit-batch boundary.
-    /// Operator-tunable via `ingest.bulk_catchup.block_prepare_concurrency`.
-    /// See [ADR-0021](../../../../docs/adrs/0021-parallel-block-derivation.md).
-    pub block_prepare_concurrency: NonZeroU32,
-    /// Maximum reserved derived artifact bytes across active and completed
-    /// block-prepare work.
-    pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
+    /// Shared source-fetch and block-preparation limits.
+    pub pipeline_limits: CanonicalPipelineLimits,
     /// Maximum safe-tip artifact bytes that can accumulate while the previous
     /// batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
@@ -130,7 +103,18 @@ pub struct BulkCatchupRunConfig {
     /// `tip_metadata`, then begins bulk catchup from `checkpoint.height + 1`.
     /// `from_height` must equal `checkpoint.height + 1` in this mode. Reads
     /// at heights below the checkpoint return `ArtifactUnavailable`.
-    pub checkpoint: Option<SourceChainCheckpoint>,
+    pub checkpoint: Option<CommitmentTreeCheckpoint>,
+}
+
+impl BulkCatchupRunConfig {
+    fn canonical_store_options(&self) -> ChainStoreOptions {
+        canonical_writer_store_options(
+            self.node.network,
+            self.reorg_window_blocks,
+            self.canonical_rocksdb_budget,
+            self.raw_blob_policy,
+        )
+    }
 }
 
 /// Mutable state carried across bulk-catchup batches.
@@ -169,8 +153,8 @@ impl BulkCatchupFlushState {
     ) -> Arc<Mutex<SourceSegmentSizer>> {
         Arc::clone(self.source_segment_sizer.get_or_insert_with(|| {
             Arc::new(Mutex::new(SourceSegmentSizer::new(
-                config.source_segment_max_blocks,
-                config.source_segment_target_response_bytes,
+                config.pipeline_limits.source_segment_max_blocks,
+                config.pipeline_limits.source_segment_target_response_bytes,
                 Arc::clone(&config.network_upgrade_activations),
                 from_height,
             )))
@@ -236,11 +220,7 @@ pub async fn run_bulk_catchup<Source>(
 where
     Source: NodeSource + Clone,
 {
-    let store_options = ChainStoreOptions {
-        rocksdb_resource_budget: config.canonical_rocksdb_budget,
-        raw_blob_retention: config.raw_blob_policy.to_retention(),
-        ..ChainStoreOptions::for_network(config.node.network)
-    };
+    let store_options = config.canonical_store_options();
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
     run_bulk_catchup_with_store(config, source, &store).await
 }
@@ -250,8 +230,9 @@ where
 /// Returns `Some(commit_outcome)` when at least one chain epoch was
 /// committed and `None` when the requested range was already present in
 /// the store. The supplied store must have been opened with the same
-/// [`ChainStoreOptions`] bulk catchup expects
-/// (`ChainStoreOptions::for_network(config.node.network)`); `RocksDB`
+/// [`ChainStoreOptions`] bulk catchup expects, including
+/// `config.reorg_window_blocks` and `config.raw_blob_policy.to_retention()`;
+/// `RocksDB`
 /// enforces a single primary handle per database, so a caller that
 /// needs to expose readable surfaces (the `IngestControl` gRPC service)
 /// during bulk catchup must open the store once and pass it to this entry
@@ -270,6 +251,7 @@ pub async fn run_bulk_catchup_with_store<Source>(
 where
     Source: NodeSource + Clone,
 {
+    validate_writer_store_contract(store, config.reorg_window_blocks, config.raw_blob_policy)?;
     let mut flush_state = BulkCatchupFlushState::default();
     let run = BulkCatchupRunContext::new(config, source, store);
     run_bulk_catchup_with_store_inner(
@@ -289,26 +271,17 @@ where
     Source: NodeSource + Clone,
 {
     let config = run.config;
-    let store_options = ChainStoreOptions::for_network(config.node.network);
     let node_tip_height = match config.upstream_tip_hint {
         Some(height) => height,
         None => run.source.tip_id().await?.height,
     };
-    validate_bulk_catchup_finality_bound(
-        config,
-        node_tip_height,
-        store_options.reorg_window_blocks,
-    )?;
-    warn_if_checkpoint_within_reorg_window(
-        config,
-        node_tip_height,
-        store_options.reorg_window_blocks,
-    );
+    validate_bulk_catchup_finality_bound(config, node_tip_height, config.reorg_window_blocks)?;
+    warn_if_checkpoint_within_reorg_window(config, node_tip_height, config.reorg_window_blocks);
 
     let current_chain_epoch = match bootstrap_from_checkpoint_if_needed(
         run.store,
         config.node.network,
-        config.checkpoint,
+        config.checkpoint.as_ref(),
         config.from_height,
     )? {
         Some(bootstrapped) => Some(bootstrapped),
@@ -346,6 +319,7 @@ pub async fn run_bulk_catchup_until_complete<Source>(
 where
     Source: NodeSource + Clone,
 {
+    validate_writer_store_contract(store, config.reorg_window_blocks, config.raw_blob_policy)?;
     let mut flush_state = BulkCatchupFlushState::default();
     let run = BulkCatchupRunContext::new(config, source, store);
     run_bulk_catchup_until_complete_inner(
@@ -450,7 +424,7 @@ fn bulk_catchup_readiness_state(
     };
     let lag_blocks = u64::from(upstream_tip.saturating_sub(current_height));
     if lag_blocks == 0 {
-        ReadinessState::ready(Some(current_height))
+        ReadinessState::ready_with_target(Some(current_height), Some(upstream_tip))
     } else {
         ReadinessState::syncing(Some(lag_blocks), Some(current_height), Some(upstream_tip))
     }
@@ -491,29 +465,36 @@ where
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
-    let block_prepare_concurrency = config.block_prepare_concurrency.get() as usize;
+    let block_prepare_concurrency = config.pipeline_limits.block_prepare_concurrency.get() as usize;
     let block_prepare_stream = build_block_prepare_stream(
         run.source,
         BulkCatchupBlockPrepareStreamConfig {
             request_timeout,
             from_height: bulk_catchup_start.from_height,
             to_height: config.to_height,
-            max_response_bytes: config.node.max_response_bytes,
-            target_response_payload_bytes: config.source_segment_target_response_bytes,
-            source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
-            source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
+            max_response_bytes: config.pipeline_limits.max_response_bytes,
+            target_response_payload_bytes: config
+                .pipeline_limits
+                .source_segment_target_response_bytes,
+            source_fetch_max_in_flight_requests: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_requests,
+            source_fetch_max_in_flight_bytes: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes,
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, bulk_catchup_start.from_height),
             block_prepare_concurrency,
-            block_prepare_max_in_flight_artifact_bytes: config
-                .block_prepare_max_in_flight_artifact_bytes,
+            block_prepare_memory_watermark_bytes: config
+                .pipeline_limits
+                .block_prepare_memory_watermark_bytes,
             store: run.store.clone(),
         },
         move |source_block| {
             let activations = Arc::clone(&network_upgrade_activations);
             async move {
                 tokio::task::spawn_blocking(move || {
-                    derive_block_with_raw_blob_policy(&source_block, &activations, raw_blob_policy)
+                    prepare_canonical_block(&source_block, &activations, raw_blob_policy)
                         .map_err(IngestError::from)
                 })
                 .await
@@ -534,14 +515,6 @@ where
     .await
 }
 
-fn nonzero_u32(amount: u32) -> NonZeroU32 {
-    NonZeroU32::new(amount.max(1)).unwrap_or(NonZeroU32::MIN)
-}
-
-fn nonzero_u32_to_usize(amount: NonZeroU32) -> usize {
-    usize::try_from(amount.get()).unwrap_or(usize::MAX)
-}
-
 fn usize_to_u32_saturating(amount: usize) -> u32 {
     u32::try_from(amount).unwrap_or(u32::MAX)
 }
@@ -554,41 +527,6 @@ fn nonzero_u64_to_usize(amount: NonZeroU64) -> usize {
     usize::try_from(amount.get()).unwrap_or(usize::MAX)
 }
 
-fn record_source_segment_sizer_state(
-    current_blocks: NonZeroU32,
-    max_blocks: NonZeroU32,
-    target_response_payload_bytes: NonZeroU64,
-) {
-    metrics::gauge!("zinder_ingest_source_segment_next_blocks")
-        .set(f64::from(current_blocks.get()));
-    metrics::gauge!("zinder_ingest_source_segment_max_blocks").set(f64::from(max_blocks.get()));
-    metrics::gauge!("zinder_ingest_source_segment_target_response_payload_bytes")
-        .set(u64_to_f64(target_response_payload_bytes.get()));
-}
-
-fn record_source_segment_sizer_adjustment(
-    reason: &'static str,
-    previous_blocks: NonZeroU32,
-    current_blocks: NonZeroU32,
-) {
-    if previous_blocks == current_blocks && reason != "network_upgrade" {
-        return;
-    }
-    metrics::counter!(
-        "zinder_ingest_source_segment_sizing_adjustment_total",
-        "reason" => reason
-    )
-    .increment(1);
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "Prometheus gauges and histograms use f64 samples; byte counts are diagnostic magnitudes"
-)]
-fn u64_to_f64(sample: u64) -> f64 {
-    sample as f64
-}
-
 fn record_bulk_pipeline_stage_duration(
     stage: &'static str,
     started_at: Instant,
@@ -598,24 +536,22 @@ fn record_bulk_pipeline_stage_duration(
 }
 
 #[cfg(test)]
-async fn bulk_catchup_from_source_with_mock_derive<Source, F>(
+async fn bulk_catchup_from_source_with_mock_prepare<Source, F>(
     config: &BulkCatchupRunConfig,
     source: &Source,
-    derive_fn: F,
+    prepare_fn: F,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
     Source: NodeSource + Clone,
-    F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
+    F: Fn(
+            &zinder_source::SourceBlock,
+        ) -> Result<PreparedCanonicalBlock, crate::CanonicalBlockConstructionError>
         + Clone
         + Send
         + Sync
         + 'static,
 {
-    let store_options = ChainStoreOptions {
-        rocksdb_resource_budget: config.canonical_rocksdb_budget,
-        raw_blob_retention: config.raw_blob_policy.to_retention(),
-        ..ChainStoreOptions::for_network(config.node.network)
-    };
+    let store_options = config.canonical_store_options();
     validate_bulk_catchup_finality_bound(
         config,
         source.tip_id().await?.height,
@@ -623,11 +559,11 @@ where
     )?;
 
     let store = PrimaryChainStore::open(&config.storage_path, store_options)?;
-    bulk_catchup_from_source_with_store_using_derive_fn(
+    bulk_catchup_from_source_with_store_using_prepare_fn(
         config,
         source,
         &store,
-        derive_fn,
+        prepare_fn,
         BulkCatchupStart {
             from_height: config.from_height,
             initial_tip_metadata: ChainTipMetadata::empty(),
@@ -639,18 +575,20 @@ where
 #[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
-    reason = "test seam mirrors the production bulk-catchup path plus an injected derive function"
+    reason = "test seam mirrors the production bulk-catchup path plus injected canonical preparation"
 )]
-async fn bulk_catchup_from_source_with_store_using_derive_fn<Source, F>(
+async fn bulk_catchup_from_source_with_store_using_prepare_fn<Source, F>(
     config: &BulkCatchupRunConfig,
     source: &Source,
     store: &PrimaryChainStore,
-    derive_fn: F,
+    prepare_fn: F,
     bulk_catchup_start: BulkCatchupStart,
 ) -> Result<ChainEpochCommitOutcome, IngestError>
 where
     Source: NodeSource + Clone,
-    F: Fn(&zinder_source::SourceBlock) -> Result<DerivedBlockArtifacts, crate::ArtifactDeriveError>
+    F: Fn(
+            &zinder_source::SourceBlock,
+        ) -> Result<PreparedCanonicalBlock, crate::CanonicalBlockConstructionError>
         + Clone
         + Send
         + Sync
@@ -661,7 +599,7 @@ where
         clippy::cast_possible_truncation,
         reason = "zinder-core rejects targets with pointer widths below 32 bits, so u32 fits in usize"
     )]
-    let block_prepare_concurrency = config.block_prepare_concurrency.get() as usize;
+    let block_prepare_concurrency = config.pipeline_limits.block_prepare_concurrency.get() as usize;
     let mut flush_state = BulkCatchupFlushState::default();
     let block_prepare_stream = build_block_prepare_stream(
         source,
@@ -669,20 +607,27 @@ where
             request_timeout,
             from_height: bulk_catchup_start.from_height,
             to_height: config.to_height,
-            max_response_bytes: config.node.max_response_bytes,
-            target_response_payload_bytes: config.source_segment_target_response_bytes,
-            source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
-            source_fetch_max_in_flight_bytes: config.source_fetch_max_in_flight_bytes,
+            max_response_bytes: config.pipeline_limits.max_response_bytes,
+            target_response_payload_bytes: config
+                .pipeline_limits
+                .source_segment_target_response_bytes,
+            source_fetch_max_in_flight_requests: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_requests,
+            source_fetch_max_in_flight_bytes: config
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes,
             source_segment_sizer: flush_state
                 .source_segment_sizer(config, bulk_catchup_start.from_height),
             block_prepare_concurrency,
-            block_prepare_max_in_flight_artifact_bytes: config
-                .block_prepare_max_in_flight_artifact_bytes,
+            block_prepare_memory_watermark_bytes: config
+                .pipeline_limits
+                .block_prepare_memory_watermark_bytes,
             store: store.clone(),
         },
         move |source_block| {
-            let derive_fn = derive_fn.clone();
-            async move { derive_fn(&source_block).map_err(IngestError::from) }
+            let prepare_fn = prepare_fn.clone();
+            async move { prepare_fn(&source_block).map_err(IngestError::from) }
         },
     );
 
@@ -703,7 +648,7 @@ struct BulkCatchupStart {
     initial_tip_metadata: ChainTipMetadata,
 }
 
-/// Seeds an empty store with a stub chain epoch derived from the operator's
+/// Seeds an empty store with a stub chain epoch built from the operator's
 /// checkpoint, so bulk catchup can start at `checkpoint.height + 1` without
 /// replaying every block from genesis.
 ///
@@ -715,7 +660,7 @@ struct BulkCatchupStart {
 fn bootstrap_from_checkpoint_if_needed(
     store: &PrimaryChainStore,
     network: Network,
-    checkpoint: Option<SourceChainCheckpoint>,
+    checkpoint: Option<&CommitmentTreeCheckpoint>,
     from_height: BlockHeight,
 ) -> Result<Option<ChainEpoch>, IngestError> {
     let Some(checkpoint) = checkpoint else {
@@ -724,10 +669,14 @@ fn bootstrap_from_checkpoint_if_needed(
     if store.current_chain_epoch()?.is_some() {
         return Ok(None);
     }
-    let expected_from_height = checkpoint.height.next().unwrap_or(checkpoint.height);
+    let expected_from_height = checkpoint
+        .block_id
+        .height
+        .next()
+        .unwrap_or(checkpoint.block_id.height);
     if from_height != expected_from_height {
         return Err(IngestError::BulkCatchupCheckpointMisaligned {
-            checkpoint_height: checkpoint.height,
+            checkpoint_height: checkpoint.block_id.height,
             from_height,
         });
     }
@@ -735,12 +684,12 @@ fn bootstrap_from_checkpoint_if_needed(
     let bootstrap_chain_epoch = ChainEpoch {
         id: ChainEpochId::new(1),
         network,
-        visible_tip_height: checkpoint.height,
-        visible_tip_hash: checkpoint.hash,
-        settled_tip_height: checkpoint.height,
-        settled_tip_hash: checkpoint.hash,
+        visible_tip_height: checkpoint.block_id.height,
+        visible_tip_hash: checkpoint.block_id.hash,
+        settled_tip_height: checkpoint.block_id.height,
+        settled_tip_hash: checkpoint.block_id.hash,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-        tip_metadata: checkpoint.tip_metadata,
+        tip_metadata: checkpoint.tip_metadata(),
         created_at: current_unix_millis()?,
     };
     let outcome = store.commit_artifactless_checkpoint(bootstrap_chain_epoch)?;
@@ -822,14 +771,15 @@ fn warn_if_checkpoint_within_reorg_window(
     let Some(checkpoint) = config.checkpoint.as_ref() else {
         return;
     };
-    if !checkpoint_within_reorg_window(checkpoint.height, tip_height, reorg_window_blocks) {
+    if !checkpoint_within_reorg_window(checkpoint.block_id.height, tip_height, reorg_window_blocks)
+    {
         return;
     }
     let safe_floor = tip_height.value().saturating_sub(reorg_window_blocks);
     tracing::warn!(
         target: "zinder::ingest",
         event = "bulk_catchup_checkpoint_within_reorg_window",
-        checkpoint_height = checkpoint.height.value(),
+        checkpoint_height = checkpoint.block_id.height.value(),
         tip_height = tip_height.value(),
         reorg_window_blocks,
         safe_checkpoint_floor = safe_floor,
@@ -861,11 +811,13 @@ mod tests {
     use futures_util::StreamExt as _;
     use parking_lot::Mutex;
     use tempfile::tempdir;
+    use zinder_core::SUBTREE_LEAF_COUNT;
     use zinder_core::{
-        BlockHash, BlockId, ConsensusBranchId, NetworkUpgradeActivation, SUBTREE_LEAF_COUNT,
-        ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, TransactionFactsArtifact,
-        TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
-        TransparentOutPoint, TransparentOutputArtifact, TransparentUnspentOutput,
+        BlockHash, BlockId, CanonicalTransactionFacts, CommitmentTreeFrontier,
+        CommitmentTreeFrontiers, ConsensusBranchId, NetworkUpgradeActivation, ShieldedProtocol,
+        SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact, TransactionId,
+        TransactionIntrinsicValueBalances, TransactionLocation, TransparentAddressScriptHash,
+        TransparentInputFact, TransparentOutPoint, TransparentOutputFact, TransparentUnspentOutput,
         UnixTimestampMillis, wire::encode_internal_block_hash,
     };
     use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
@@ -875,10 +827,85 @@ mod tests {
         SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
     };
     use zinder_store::{ChainEventHistoryRequest, StoreReadCaller};
+    use zinder_testkit::completed_sapling_subtree_frontier;
 
-    use crate::ArtifactDeriveError;
+    use crate::CanonicalBlockConstructionError;
 
     use super::*;
+
+    fn empty_checkpoint(block_id: BlockId) -> CommitmentTreeCheckpoint {
+        CommitmentTreeCheckpoint::new(block_id, 0, CommitmentTreeFrontiers::default())
+    }
+
+    #[tokio::test]
+    async fn until_complete_rejects_a_mismatched_writer_before_catchup()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("mismatched-until-complete-writer");
+        let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, true)?;
+        let store = PrimaryChainStore::open(
+            &storage_path,
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let source = TestNodeSource {
+            tip_height: BlockHeight::new(200),
+            network: Network::ZcashRegtest,
+        };
+
+        let error =
+            match run_bulk_catchup_until_complete(&config, &source, &store, &Readiness::default())
+                .await
+            {
+                Ok(outcome) => {
+                    return Err(format!("expected writer mismatch, got {outcome:?}").into());
+                }
+                Err(error) => error,
+            };
+
+        assert!(matches!(
+            error,
+            IngestError::Store(zinder_store::StoreError::RawBlobRetentionMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_catchup_from_checkpoint_skips_pre_checkpoint_subtree_root_indexes()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("checkpoint-subtree-indexes-store");
+        let checkpoint_height = BlockHeight::new(10);
+        let checkpoint_hash = block_hash(checkpoint_height.value());
+        let mut config = test_bulk_catchup_run_config(&storage_path, 11, 11, 1, true)?;
+        config.checkpoint = Some(CommitmentTreeCheckpoint::new(
+            BlockId::new(checkpoint_height, checkpoint_hash),
+            0,
+            CommitmentTreeFrontiers::from_validated_parts(
+                Some(completed_sapling_subtree_frontier()?),
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+                None,
+            ),
+        ));
+        let source = TestNodeSource {
+            tip_height: BlockHeight::new(200),
+            network: Network::ZcashRegtest,
+        };
+
+        // The checkpoint already covers subtree index 0. The next block adds
+        // no commitments, so catchup must not fetch a root completed before
+        // retained history.
+        let commit_outcome =
+            bulk_catchup_with_bootstrap_using_mock_prepare(&config, &source, |source_block| {
+                Ok(test_prepared_block(source_block, 0, 0))
+            })
+            .await?;
+
+        assert_eq!(
+            commit_outcome.chain_epoch.visible_tip_height,
+            BlockHeight::new(11)
+        );
+        Ok(())
+    }
 
     #[test]
     fn bulk_catchup_flush_state_preserves_epoch_cadence() -> Result<(), Box<dyn Error>> {
@@ -1128,8 +1155,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 101, 150, 50, false)?;
 
-        let error = match bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let error = match bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await
         {
@@ -1166,8 +1193,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 10, 5, false)?;
 
-        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let commit_outcome = bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await?;
 
@@ -1176,10 +1203,7 @@ mod tests {
             commit_outcome.chain_epoch.visible_tip_height,
             BlockHeight::new(10)
         );
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         assert_eq!(
             store
                 .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?
@@ -1221,17 +1245,17 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1267,7 +1291,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 4,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1275,7 +1299,7 @@ mod tests {
                 if source_block.height == BlockHeight::new(1) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                Ok(test_derived_block(&source_block, 0, 0))
+                Ok(test_prepared_block(&source_block, 0, 0))
             },
         );
         futures_util::pin_mut!(block_prepare_stream);
@@ -1327,7 +1351,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 1,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store: store.clone(),
             },
@@ -1347,7 +1371,10 @@ mod tests {
             .ok_or("missing prepared chunk")??;
         assert_eq!(prepared_chunk.len(), 1);
         let prepared = prepared_chunk.remove(0);
-        assert_eq!(prepared.derived.block_header.height, BlockHeight::new(2));
+        assert_eq!(
+            prepared.prepared.facts.block_header.height,
+            BlockHeight::new(2)
+        );
         assert_eq!(
             prepared.prefetched_spent_transparent_outputs,
             store
@@ -1396,10 +1423,8 @@ mod tests {
                         .ok_or("invalid source fetch bytes")?,
                     source_segment_sizer,
                     block_prepare_concurrency,
-                    block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
-                        .ok_or(
-                        "invalid block prepare artifact bytes",
-                    )?,
+                    block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                        .ok_or("invalid block prepare artifact bytes")?,
                     store,
                 },
                 move |source_block| async move {
@@ -1410,7 +1435,7 @@ mod tests {
                             spending_transaction_id,
                             spent_outpoint,
                         )),
-                        _ => Ok(test_derived_block(&source_block, 0, 0)),
+                        _ => Ok(test_prepared_block(&source_block, 0, 0)),
                     }
                 },
             );
@@ -1465,17 +1490,17 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1532,11 +1557,11 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         while let Some(chunk_result) = block_prepare_stream.next().await {
@@ -1605,17 +1630,17 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1666,17 +1691,17 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1734,17 +1759,17 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
-            |source_block| async move { Ok(test_derived_block(&source_block, 0, 0)) },
+            |source_block| async move { Ok(test_prepared_block(&source_block, 0, 0)) },
         );
         futures_util::pin_mut!(block_prepare_stream);
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
@@ -1772,7 +1797,7 @@ mod tests {
 
     #[tokio::test]
     async fn block_prepare_schedules_past_slow_earlier_block() -> Result<(), Box<dyn Error>> {
-        let derive_events = Arc::new(Mutex::new(Vec::new()));
+        let prepare_events = Arc::new(Mutex::new(Vec::new()));
         let source = RecordingSegmentSource {
             requested_segments: Arc::new(Mutex::new(Vec::new())),
             network: Network::ZcashRegtest,
@@ -1783,7 +1808,7 @@ mod tests {
             Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
             BlockHeight::new(1),
         )));
-        let derive_events_for_stream = Arc::clone(&derive_events);
+        let prepare_events_for_stream = Arc::clone(&prepare_events);
         let (_store_tempdir, store) =
             test_primary_chain_store("slow-block-prepare-prefetch-store")?;
         let block_prepare_stream = build_block_prepare_stream(
@@ -1802,15 +1827,15 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
             move |source_block| {
-                let derive_events = Arc::clone(&derive_events_for_stream);
+                let prepare_events = Arc::clone(&prepare_events_for_stream);
                 async move {
                     let height = source_block.height;
-                    derive_events
+                    prepare_events
                         .lock()
                         .push(BlockPrepareEvent::Started { height });
                     match height.value() {
@@ -1818,10 +1843,10 @@ mod tests {
                         2 => tokio::time::sleep(Duration::from_millis(10)).await,
                         _ => {}
                     }
-                    derive_events
+                    prepare_events
                         .lock()
                         .push(BlockPrepareEvent::Finished { height });
-                    Ok(test_derived_block(&source_block, 0, 0))
+                    Ok(test_prepared_block(&source_block, 0, 0))
                 }
             },
         );
@@ -1829,35 +1854,34 @@ mod tests {
         let mut observed_heights = Vec::new();
         while let Some(chunk_result) = block_prepare_stream.next().await {
             for prepared in chunk_result? {
-                observed_heights.push(prepared.derived.block_header.height.value());
+                observed_heights.push(prepared.prepared.facts.block_header.height.value());
             }
         }
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6]);
-        let derive_events = derive_events.lock().clone();
+        let prepare_events = prepare_events.lock().clone();
         let start_third_block = block_prepare_event_index(
-            &derive_events,
+            &prepare_events,
             BlockPrepareEvent::Started {
                 height: BlockHeight::new(3),
             },
         )?;
         let finish_first_block = block_prepare_event_index(
-            &derive_events,
+            &prepare_events,
             BlockPrepareEvent::Finished {
                 height: BlockHeight::new(1),
             },
         )?;
         assert!(
             start_third_block < finish_first_block,
-            "expected later block prepare to start before the slow first block finished; events: {derive_events:?}"
+            "expected later block prepare to start before the slow first block finished; events: {prepare_events:?}"
         );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn block_prepare_derive_futures_progress_without_stream_polling()
-    -> Result<(), Box<dyn Error>> {
+    async fn block_prepare_futures_progress_without_stream_polling() -> Result<(), Box<dyn Error>> {
         let source = RecordingSegmentSource {
             requested_segments: Arc::new(Mutex::new(Vec::new())),
             network: Network::ZcashRegtest,
@@ -1895,7 +1919,7 @@ mod tests {
                     .ok_or("invalid source fetch bytes")?,
                 source_segment_sizer,
                 block_prepare_concurrency: 2,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(32 * 1024 * 1024)
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(32 * 1024 * 1024)
                     .ok_or("invalid block prepare artifact bytes")?,
                 store,
             },
@@ -1913,7 +1937,7 @@ mod tests {
                         }
                         _ => {}
                     }
-                    Ok(test_derived_block(&source_block, 0, 0))
+                    Ok(test_prepared_block(&source_block, 0, 0))
                 }
             },
         );
@@ -1924,7 +1948,10 @@ mod tests {
             .await
             .ok_or("missing first prepared chunk")??;
         let first_block = first_chunk.first().ok_or("empty prepared chunk")?;
-        assert_eq!(first_block.derived.block_header.height, BlockHeight::new(1));
+        assert_eq!(
+            first_block.prepared.facts.block_header.height,
+            BlockHeight::new(1)
+        );
 
         second_block_release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), second_block_completed.notified())
@@ -1950,8 +1977,8 @@ mod tests {
         // successful sequential epochs prove the overlap kept commits ordered.
         let config = test_bulk_catchup_run_config(&storage_path, 1, 8, 1, false)?;
 
-        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let commit_outcome = bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await?;
 
@@ -1961,10 +1988,7 @@ mod tests {
             BlockHeight::new(8)
         );
 
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         let events =
             store.chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
         assert_eq!(events.len(), 8);
@@ -1987,7 +2011,7 @@ mod tests {
     /// Batch {1,2} funds an output that block 3 (batch {3,4}) spends.
     ///
     /// The first commit is held at its tree-state fetch until block 4's
-    /// derive releases it. With `block_prepare_concurrency = 1`, the ordered
+    /// preparation releases it. With `block_prepare_concurrency = 1`, the ordered
     /// prevout resolver must carry block 1's output across emitted windows;
     /// the store does not yet contain epoch 1 when block 3 resolves its spend.
     #[tokio::test]
@@ -2006,21 +2030,21 @@ mod tests {
             events: Arc::clone(&recorded_events),
         };
         let mut config = test_bulk_catchup_run_config(&storage_path, 1, 4, 2, false)?;
-        config.block_prepare_concurrency =
+        config.pipeline_limits.block_prepare_concurrency =
             NonZeroU32::new(1).ok_or("invalid prepare concurrency")?;
         let funding_transaction_id = TransactionId::from_bytes([0x51; 32]);
         let spent_outpoint = TransparentOutPoint::new(funding_transaction_id, 0);
         let spending_transaction_id = TransactionId::from_bytes([0x52; 32]);
-        let derive_events = Arc::clone(&recorded_events);
+        let prepare_events = Arc::clone(&recorded_events);
         let release_gate = Arc::clone(&commit_gate);
 
         let commit_outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            bulk_catchup_from_source_with_mock_derive(&config, &source, move |source_block| {
+            bulk_catchup_from_source_with_mock_prepare(&config, &source, move |source_block| {
                 match source_block.height.value() {
                     1 => Ok(test_output_creating_block(source_block, spent_outpoint)),
                     3 => {
-                        derive_events.lock().push("spending_block_derived");
+                        prepare_events.lock().push("spending_block_prepared");
                         Ok(test_transparent_spend_block(
                             source_block,
                             spending_transaction_id,
@@ -2028,11 +2052,11 @@ mod tests {
                         ))
                     }
                     4 => {
-                        derive_events.lock().push("release_block_derived");
+                        prepare_events.lock().push("release_block_prepared");
                         release_gate.notify_one();
-                        Ok(test_derived_block(source_block, 0, 0))
+                        Ok(test_prepared_block(source_block, 0, 0))
                     }
-                    _ => Ok(test_derived_block(source_block, 0, 0)),
+                    _ => Ok(test_prepared_block(source_block, 0, 0)),
                 }
             }),
         )
@@ -2044,20 +2068,17 @@ mod tests {
             BlockHeight::new(4)
         );
         let observed = recorded_events.lock().clone();
-        let spend_derived = recorded_event_index(&observed, "spending_block_derived")?;
-        let release_derived = recorded_event_index(&observed, "release_block_derived")?;
+        let spend_prepared = recorded_event_index(&observed, "spending_block_prepared")?;
+        let release_prepared = recorded_event_index(&observed, "release_block_prepared")?;
         let commit_held = recorded_event_index(&observed, "first_commit_holding")?;
         let commit_released = recorded_event_index(&observed, "first_commit_released")?;
         assert!(
-            spend_derived < release_derived && release_derived < commit_released,
+            spend_prepared < release_prepared && release_prepared < commit_released,
             "spending block must be prepared before the first commit resumes; events: {observed:?}"
         );
         assert!(commit_held < commit_released);
 
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         let reader = store.current_chain_epoch_reader()?;
         let spend_facts = reader.transparent_spend_facts_by_outpoints(&[spent_outpoint])?;
         let spend_fact = spend_facts
@@ -2085,8 +2106,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, false)?;
 
-        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let commit_outcome = bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await?;
 
@@ -2125,8 +2146,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, false)?;
 
-        let error = match bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, 0, 0))
+        let error = match bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, 0, 0))
         })
         .await
         {
@@ -2182,8 +2203,8 @@ mod tests {
         };
         let config = test_bulk_catchup_run_config(&storage_path, 1, 1, 1, false)?;
 
-        let commit_outcome = bulk_catchup_from_source_with_mock_derive(&config, &source, |sb| {
-            Ok(test_derived_block(sb, SUBTREE_LEAF_COUNT, 0))
+        let commit_outcome = bulk_catchup_from_source_with_mock_prepare(&config, &source, |sb| {
+            Ok(test_prepared_block(sb, SUBTREE_LEAF_COUNT, 0))
         })
         .await?;
 
@@ -2191,10 +2212,7 @@ mod tests {
             commit_outcome.chain_epoch.visible_tip_height,
             BlockHeight::new(1)
         );
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         let reader = store.current_chain_epoch_reader()?;
         let subtree_roots = reader.subtree_roots(zinder_core::SubtreeRootRange::new(
             ShieldedProtocol::Sapling,
@@ -2306,24 +2324,21 @@ mod tests {
         // Match the TestNodeSource's block hash convention so the first
         // bulk-caught-up block (height 11) finds the right parent linkage.
         let checkpoint_hash = block_hash(checkpoint_height.value());
-        // Tree sizes well below SUBTREE_LEAF_COUNT so no subtree completes
-        // during bulk catchup; the unit test validates the bootstrap + extend
-        // round-trip without spawning a real source subtree path.
-        let checkpoint_tip_metadata = ChainTipMetadata::new(0, 0, 0);
+        // The empty checkpoint validates bootstrap plus extension without
+        // spawning a real source subtree path.
         let mut config = test_bulk_catchup_run_config(&storage_path, 11, 12, 1, true)?;
-        config.checkpoint = Some(SourceChainCheckpoint::new(
+        config.checkpoint = Some(empty_checkpoint(BlockId::new(
             checkpoint_height,
             checkpoint_hash,
-            checkpoint_tip_metadata,
-        ));
+        )));
         let source = TestNodeSource {
             tip_height: BlockHeight::new(200),
             network: Network::ZcashRegtest,
         };
 
         let commit_outcome =
-            bulk_catchup_with_bootstrap_using_mock_derive(&config, &source, |sb| {
-                Ok(test_derived_block(sb, 0, 0))
+            bulk_catchup_with_bootstrap_using_mock_prepare(&config, &source, |sb| {
+                Ok(test_prepared_block(sb, 0, 0))
             })
             .await?;
 
@@ -2332,10 +2347,7 @@ mod tests {
             BlockHeight::new(12)
         );
 
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
-        )?;
+        let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
         let event_history =
             store.chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?;
         // 1 bootstrap commit + 2 single-block bulk catchup commits (heights 11
@@ -2352,48 +2364,6 @@ mod tests {
             )?)
         );
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bulk_catchup_from_checkpoint_skips_pre_checkpoint_subtree_root_indexes()
-    -> Result<(), Box<dyn Error>> {
-        let tempdir = tempdir()?;
-        let storage_path = tempdir.path().join("checkpoint-subtree-indexes-store");
-        let checkpoint_height = BlockHeight::new(10);
-        let checkpoint_hash = block_hash(checkpoint_height.value());
-        // Checkpoint encodes one already-completed Sapling subtree. Without
-        // seeding `IngestSubtreeRootIndexes` from `tip_metadata`, the bulk catchup
-        // would ask the node for subtree 0 (completing far below the
-        // batch range) and surface SubtreeRootCompletingBlockMissing. This
-        // mirrors the live mainnet failure observed when calibrating against
-        // a checkpoint at `tip - 1000`.
-        let checkpoint_tip_metadata = ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0);
-        let mut config = test_bulk_catchup_run_config(&storage_path, 11, 11, 1, true)?;
-        config.checkpoint = Some(SourceChainCheckpoint::new(
-            checkpoint_height,
-            checkpoint_hash,
-            checkpoint_tip_metadata,
-        ));
-        let source = TestNodeSource {
-            tip_height: BlockHeight::new(200),
-            network: Network::ZcashRegtest,
-        };
-
-        // Checkpoint already carries SUBTREE_LEAF_COUNT outputs, so the
-        // post-checkpoint block contributes a zero delta. The defense
-        // under test is that the writer does not re-fetch the
-        // already-recorded subtree root for the checkpoint range.
-        let commit_outcome =
-            bulk_catchup_with_bootstrap_using_mock_derive(&config, &source, |sb| {
-                Ok(test_derived_block(sb, 0, 0))
-            })
-            .await?;
-
-        assert_eq!(
-            commit_outcome.chain_epoch.visible_tip_height,
-            BlockHeight::new(11)
-        );
         Ok(())
     }
 
@@ -2437,11 +2407,10 @@ mod tests {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("misaligned-checkpoint-store");
         let mut config = test_bulk_catchup_run_config(&storage_path, 50, 60, 1, true)?;
-        config.checkpoint = Some(SourceChainCheckpoint::new(
+        config.checkpoint = Some(empty_checkpoint(BlockId::new(
             BlockHeight::new(10),
             BlockHash::from_bytes([0xa5; 32]),
-            ChainTipMetadata::empty(),
-        ));
+        )));
         let source = TestNodeSource {
             tip_height: BlockHeight::new(200),
             network: Network::ZcashRegtest,
@@ -2468,25 +2437,25 @@ mod tests {
         Ok(())
     }
 
-    /// Test helper that runs the checkpoint bootstrap and then the
-    /// commit loop with `derive_fn` substituted for `derive_block`, so
-    /// unit tests can exercise both phases without parsing real Zcash
-    /// block bytes.
+    /// Runs checkpoint bootstrap and the commit loop for tests.
+    ///
+    /// A preparation function replaces [`prepare_canonical_block`], so tests
+    /// exercise both phases without parsing real Zcash block bytes.
     #[cfg(test)]
-    async fn bulk_catchup_with_bootstrap_using_mock_derive<Source, F>(
+    async fn bulk_catchup_with_bootstrap_using_mock_prepare<Source, F>(
         config: &BulkCatchupRunConfig,
         source: &Source,
-        derive_fn: F,
+        prepare_fn: F,
     ) -> Result<ChainEpochCommitOutcome, IngestError>
     where
         Source: NodeSource + Clone,
-        F: Fn(&SourceBlock) -> Result<DerivedBlockArtifacts, ArtifactDeriveError>
+        F: Fn(&SourceBlock) -> Result<PreparedCanonicalBlock, CanonicalBlockConstructionError>
             + Clone
             + Send
             + Sync
             + 'static,
     {
-        let store_options = ChainStoreOptions::for_network(config.node.network);
+        let store_options = config.canonical_store_options();
         validate_bulk_catchup_finality_bound(
             config,
             source.tip_id().await?.height,
@@ -2496,18 +2465,18 @@ mod tests {
         let bootstrapped = bootstrap_from_checkpoint_if_needed(
             &store,
             config.node.network,
-            config.checkpoint,
+            config.checkpoint.as_ref(),
             config.from_height,
         )?;
         let initial_tip_metadata = bootstrapped
             .map_or_else(ChainTipMetadata::empty, |chain_epoch| {
                 chain_epoch.tip_metadata
             });
-        bulk_catchup_from_source_with_store_using_derive_fn(
+        bulk_catchup_from_source_with_store_using_prepare_fn(
             config,
             source,
             &store,
-            derive_fn,
+            prepare_fn,
             BulkCatchupStart {
                 from_height: config.from_height,
                 initial_tip_metadata,
@@ -2534,6 +2503,7 @@ mod tests {
             node_source: NodeSourceKind::ZebraJsonRpc,
             storage_path: storage_path.to_owned(),
             canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_window_blocks: 100,
             raw_blob_policy: RawBlobPolicy::All,
             network_upgrade_activations: Arc::new(
                 zinder_testkit::sample_regtest_upgrade_activations(),
@@ -2552,18 +2522,21 @@ mod tests {
                 crate::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
             )
             .ok_or("invalid test estimated write close floor")?,
-            source_segment_max_blocks: NonZeroU32::new(4)
-                .ok_or("invalid test source segment blocks")?,
-            source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
-                .ok_or("invalid test source segment target bytes")?,
-            source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-                .ok_or("invalid test source fetch requests")?,
-            source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
-                .ok_or("invalid test source fetch bytes")?,
-            block_prepare_concurrency: NonZeroU32::new(4)
-                .ok_or("invalid test derive concurrency")?,
-            block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-                .ok_or("invalid test block prepare artifact bytes")?,
+            pipeline_limits: CanonicalPipelineLimits {
+                max_response_bytes: zinder_source::DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+                source_segment_max_blocks: NonZeroU32::new(4)
+                    .ok_or("invalid test source segment blocks")?,
+                source_segment_target_response_bytes: NonZeroU64::new(12 * 1024 * 1024)
+                    .ok_or("invalid test source segment target bytes")?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or("invalid test source fetch requests")?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                    .ok_or("invalid test source fetch bytes")?,
+                block_prepare_concurrency: NonZeroU32::new(4)
+                    .ok_or("invalid test prepare concurrency")?,
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                    .ok_or("invalid test block prepare artifact bytes")?,
+            },
             commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or("invalid test commit reassembly bytes")?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,
@@ -2571,6 +2544,13 @@ mod tests {
             allow_near_tip_finalize,
             checkpoint: None,
         })
+    }
+
+    fn test_all_blob_store_options() -> ChainStoreOptions {
+        ChainStoreOptions {
+            raw_blob_retention: RawBlobPolicy::All.to_retention(),
+            ..ChainStoreOptions::for_network(Network::ZcashRegtest)
+        }
     }
 
     fn test_primary_chain_store(
@@ -2629,44 +2609,74 @@ mod tests {
         source_block: &SourceBlock,
         spending_transaction_id: TransactionId,
         spent_outpoint: TransparentOutPoint,
-    ) -> DerivedBlockArtifacts {
-        let mut derived = test_derived_block(source_block, 0, 0);
-        let location = TransactionLocation::new(
-            spending_transaction_id,
-            source_block.height,
-            source_block.hash,
-            0,
-        );
-        let transaction_facts = TransactionFactsArtifact::new(
-            location,
-            zinder_testkit::synthetic_transaction_public_facts(spending_transaction_id, 64),
-        )
-        .with_transparent_facts(
-            vec![TransparentInputFact::new(0, spent_outpoint)],
-            Vec::new(),
-        );
-        derived.transaction_facts.push(transaction_facts);
-        derived
+    ) -> PreparedCanonicalBlock {
+        let mut prepared = test_prepared_block(source_block, 0, 0);
+        prepared.facts.transactions.push(CanonicalTransactionFacts {
+            public_facts: zinder_testkit::synthetic_transaction_public_facts(
+                spending_transaction_id,
+                64,
+            ),
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
+                &[0; 64],
+            ),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: vec![TransparentInputFact::new(0, spent_outpoint)],
+            transparent_outputs: Vec::new(),
+        });
+        prepared
+            .retained_raw_blobs
+            .transaction_blobs
+            .push(TransactionBlobArtifact::new(
+                TransactionLocation::new(
+                    spending_transaction_id,
+                    source_block.height,
+                    source_block.hash,
+                    0,
+                ),
+                vec![0; 64],
+            ));
+        refresh_test_replay_envelope(&mut prepared);
+        prepared
     }
 
     fn test_output_creating_block(
         source_block: &SourceBlock,
         outpoint: TransparentOutPoint,
-    ) -> DerivedBlockArtifacts {
-        let mut derived = test_derived_block(source_block, 0, 0);
+    ) -> PreparedCanonicalBlock {
+        let mut prepared = test_prepared_block(source_block, 0, 0);
         let script_pub_key = vec![0x76, 0xa9, 0x14, 0x77];
         let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
-        derived
-            .transparent_outputs_by_outpoint
-            .push(TransparentOutputArtifact::new(
-                outpoint,
+        prepared.facts.transactions.push(CanonicalTransactionFacts {
+            public_facts: zinder_testkit::synthetic_transaction_public_facts(
+                outpoint.transaction_id,
+                64,
+            ),
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
+                &[0; 64],
+            ),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: vec![TransparentOutputFact::new(
+                outpoint.output_index,
                 21,
                 script_pub_key,
                 address_script_hash,
-                source_block.height,
-                source_block.hash,
+            )],
+        });
+        prepared
+            .retained_raw_blobs
+            .transaction_blobs
+            .push(TransactionBlobArtifact::new(
+                TransactionLocation::new(
+                    outpoint.transaction_id,
+                    source_block.height,
+                    source_block.hash,
+                    0,
+                ),
+                vec![0; 64],
             ));
-        derived
+        refresh_test_replay_envelope(&mut prepared);
+        prepared
     }
 
     #[derive(Clone)]
@@ -3160,37 +3170,53 @@ mod tests {
         }
     }
 
-    /// Constructs a synthetic [`DerivedBlockArtifacts`] for tests that
+    /// Constructs a synthetic [`PreparedCanonicalBlock`] for tests that
     /// drive the commit loop without parsing real Zcash bytes.
     ///
     /// The mock partial compact block carries the same identifiers the
-    /// production derive would emit; `finalize_derived_block` then folds
+    /// production preparation would emit; `position_canonical_block` then folds
     /// the supplied tree-size additions and stamps the final
     /// `chain_metadata` before encoding the proto.
-    fn test_derived_block(
+    fn test_prepared_block(
         source_block: &SourceBlock,
         sapling_tree_size_addition: u32,
         orchard_tree_size_addition: u32,
-    ) -> DerivedBlockArtifacts {
-        DerivedBlockArtifacts {
-            block_header: zinder_core::BlockHeaderArtifact::new(
-                source_block.height,
-                source_block.hash,
-                source_block.parent_hash,
-                [0; 32],
-                [0; 32],
-                i64::from(source_block.block_time_seconds),
-                0,
-                [0; 32],
-                0,
-                u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+    ) -> PreparedCanonicalBlock {
+        let block_header = zinder_core::BlockHeaderArtifact::new(
+            source_block.height,
+            source_block.hash,
+            source_block.parent_hash,
+            [0; 32],
+            [0; 32],
+            i64::from(source_block.block_time_seconds),
+            0,
+            [0; 32],
+            0,
+            u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+        );
+        let facts = zinder_core::CanonicalBlockFacts {
+            block_header: block_header.clone(),
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
+                &source_block.raw_block_bytes,
             ),
-            block_blob: Some(zinder_core::BlockBlobArtifact::new(
-                source_block.height,
-                source_block.hash,
-                source_block.parent_hash,
-                source_block.raw_block_bytes.clone(),
-            )),
+            transactions: Vec::new(),
+        };
+        PreparedCanonicalBlock {
+            replay_envelope: zinder_core::encode_canonical_block_replay(
+                &facts,
+                zinder_core::CanonicalBlockReplayFormatVersion::CURRENT,
+                zinder_core::CanonicalBlockFactsDigestVersion::CURRENT,
+            ),
+            retained_raw_blobs: crate::RetainedRawBlobs {
+                block_blob: Some(zinder_core::BlockBlobArtifact::new(
+                    block_header.height,
+                    block_header.block_hash,
+                    block_header.parent_hash,
+                    source_block.raw_block_bytes.clone(),
+                )),
+                transaction_blobs: Vec::new(),
+            },
+            facts,
             partial_compact_block: LightwalletdCompactBlock {
                 height: u64::from(source_block.height.value()),
                 hash: encode_internal_block_hash(source_block.hash).to_vec(),
@@ -3205,12 +3231,14 @@ mod tests {
                 orchard: orchard_tree_size_addition,
                 ironwood: 0,
             },
-            block_transaction_index: Vec::new(),
-            transaction_locations: Vec::new(),
-            transaction_facts: Vec::new(),
-            transaction_intrinsic_value_balances: Vec::new(),
-            transaction_blobs: Vec::new(),
-            transparent_outputs_by_outpoint: Vec::new(),
         }
+    }
+
+    fn refresh_test_replay_envelope(prepared: &mut PreparedCanonicalBlock) {
+        prepared.replay_envelope = zinder_core::encode_canonical_block_replay(
+            &prepared.facts,
+            zinder_core::CanonicalBlockReplayFormatVersion::CURRENT,
+            zinder_core::CanonicalBlockFactsDigestVersion::CURRENT,
+        );
     }
 }

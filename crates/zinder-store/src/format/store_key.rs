@@ -35,7 +35,8 @@ const BLOCK_VALUE_POOL_BALANCES_KEY_KIND: u8 = 22;
 const DISPLACED_BLOCK_BY_ORDER_KEY_KIND: u8 = 23;
 const DISPLACED_BLOCK_BY_HASH_KEY_KIND: u8 = 24;
 const DISPLACED_ROOT_INDEX_KEY_KIND: u8 = 25;
-// Key kinds 26..=32 are reserved for future artifact families; visibility keys start at 33.
+const BLOCK_REPLAY_KEY_KIND: u8 = 26;
+// Key kinds 27..=32 are reserved for future artifact families; visibility keys start at 33.
 const VISIBLE_BLOCK_EPOCH_KEY_KIND: u8 = 33;
 const VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND: u8 = 34;
 const VISIBLE_TREE_STATE_EPOCH_KEY_KIND: u8 = 35;
@@ -148,6 +149,16 @@ impl StoreKey {
         height: BlockHeight,
     ) -> Self {
         let mut key = artifact_key_prefix(BLOCK_HEADER_KEY_KIND);
+        push_network_epoch_height(&mut key, network, chain_epoch, height);
+        Self(key)
+    }
+
+    pub(crate) fn block_replay(
+        network: Network,
+        chain_epoch: ChainEpochId,
+        height: BlockHeight,
+    ) -> Self {
+        let mut key = artifact_key_prefix(BLOCK_REPLAY_KEY_KIND);
         push_network_epoch_height(&mut key, network, chain_epoch, height);
         Self(key)
     }
@@ -526,6 +537,16 @@ impl StoreKey {
         visible_height_epoch_key(VISIBLE_BLOCK_EPOCH_KEY_KIND, network, height, chain_epoch)
     }
 
+    pub(crate) fn visible_block_epoch_range_end_exclusive(
+        network: Network,
+        end_height: BlockHeight,
+        pinned_epoch: ChainEpochId,
+    ) -> Self {
+        let mut key = Self::visible_block_epoch(network, end_height, pinned_epoch).0;
+        key.push(0);
+        Self(key)
+    }
+
     pub(crate) fn visible_compact_block_epoch_prefix(
         network: Network,
         height: BlockHeight,
@@ -686,6 +707,45 @@ impl StoreKey {
         (key_bytes.len() >= prefix_len).then_some(prefix_len)
     }
 
+    /// Returns the publication epoch encoded in a complete visibility key.
+    ///
+    /// Prefix-only seek keys and malformed keys are rejected so a visibility
+    /// value cannot silently select an artifact published by a neighboring
+    /// epoch.
+    pub(crate) fn visibility_publication_epoch(key_bytes: &[u8]) -> Option<ChainEpochId> {
+        let prefix_len = Self::reorg_window_prefix_len(key_bytes)?;
+        if key_bytes.len() != prefix_len + CHAIN_EPOCH_ID_LEN {
+            return None;
+        }
+
+        let epoch_bytes = key_bytes[prefix_len..].try_into().ok()?;
+        Some(ChainEpochId::new(u64::from_be_bytes(epoch_bytes)))
+    }
+
+    pub(crate) fn visible_block_epoch_key_parts(
+        key_bytes: &[u8],
+    ) -> Option<(Network, BlockHeight, ChainEpochId)> {
+        let expected_len = HEIGHT_VISIBILITY_PREFIX_LEN + CHAIN_EPOCH_ID_LEN;
+        if key_bytes.len() != expected_len
+            || key_bytes[0] != KEY_VERSION
+            || key_bytes[1] != VISIBLE_BLOCK_EPOCH_KEY_KIND
+        {
+            return None;
+        }
+
+        let network_start = STORE_KEY_HEADER_LEN;
+        let height_start = network_start + NETWORK_ID_LEN;
+        let epoch_start = height_start + BLOCK_HEIGHT_LEN;
+        let network_bytes = key_bytes[network_start..height_start].try_into().ok()?;
+        let height_bytes = key_bytes[height_start..epoch_start].try_into().ok()?;
+        let epoch_bytes = key_bytes[epoch_start..].try_into().ok()?;
+        Some((
+            Network::from_id(u32::from_be_bytes(network_bytes))?,
+            BlockHeight::new(u32::from_be_bytes(height_bytes)),
+            ChainEpochId::new(u64::from_be_bytes(epoch_bytes)),
+        ))
+    }
+
     pub(crate) fn transparent_artifact_chain_epoch_id(key_bytes: &[u8]) -> Option<ChainEpochId> {
         if key_bytes.len() < STORE_KEY_HEADER_LEN || key_bytes[0] != KEY_VERSION {
             return None;
@@ -781,6 +841,7 @@ mod tests {
         let root = FinalNoteCommitmentRoot::from_bytes([0x33; 32]);
         let artifact_prefixes = [
             StoreKey::block_header(network, chain_epoch, height),
+            StoreKey::block_replay(network, chain_epoch, height),
             StoreKey::compact_block(network, chain_epoch, height),
             StoreKey::transaction_facts(network, chain_epoch, transaction_id),
             StoreKey::transaction_intrinsic_value_balances(network, chain_epoch, transaction_id),
@@ -843,6 +904,101 @@ mod tests {
         for visibility_prefix in visibility_prefixes {
             assert!(!artifact_prefixes.contains(&visibility_prefix));
         }
+    }
+
+    #[test]
+    fn visible_block_epoch_key_parts_round_trip_and_reject_malformed_keys() {
+        let network = Network::ZcashRegtest;
+        let height = BlockHeight::new(42);
+        let chain_epoch = ChainEpochId::new(7);
+        let key = StoreKey::visible_block_epoch(network, height, chain_epoch);
+
+        assert_eq!(
+            StoreKey::visible_block_epoch_key_parts(key.as_bytes()),
+            Some((network, height, chain_epoch))
+        );
+        assert_eq!(
+            StoreKey::visible_block_epoch_key_parts(
+                StoreKey::visible_block_epoch_prefix(network, height).as_bytes()
+            ),
+            None
+        );
+        assert_eq!(
+            StoreKey::visible_block_epoch_key_parts(
+                StoreKey::visible_compact_block_epoch(network, height, chain_epoch).as_bytes()
+            ),
+            None
+        );
+        let end_exclusive =
+            StoreKey::visible_block_epoch_range_end_exclusive(network, height, chain_epoch);
+        assert!(key.as_bytes() < end_exclusive.as_bytes());
+        assert!(
+            end_exclusive.as_bytes()
+                < StoreKey::visible_block_epoch(
+                    network,
+                    height,
+                    ChainEpochId::new(chain_epoch.value().saturating_add(1))
+                )
+                .as_bytes()
+        );
+
+        let maximum_epoch = ChainEpochId::new(u64::MAX);
+        assert!(
+            StoreKey::visible_block_epoch(network, height, maximum_epoch).as_bytes()
+                < StoreKey::visible_block_epoch_range_end_exclusive(network, height, maximum_epoch)
+                    .as_bytes()
+        );
+    }
+
+    #[test]
+    fn visibility_publication_epoch_accepts_complete_visibility_keys_only() {
+        let network = Network::ZcashRegtest;
+        let height = BlockHeight::new(42);
+        let transaction_id = TransactionId::from_bytes([0x11; 32]);
+        let subtree_index = SubtreeRootIndex::new(3);
+        let chain_epoch = ChainEpochId::new(7);
+        let complete_keys = [
+            StoreKey::visible_block_epoch(network, height, chain_epoch),
+            StoreKey::visible_compact_block_epoch(network, height, chain_epoch),
+            StoreKey::visible_tree_state_epoch(network, height, chain_epoch),
+            StoreKey::visible_final_note_commitment_roots_epoch(network, height, chain_epoch),
+            StoreKey::visible_block_value_pool_balances_epoch(network, height, chain_epoch),
+            StoreKey::visible_transaction_epoch(network, transaction_id, chain_epoch),
+            StoreKey::visible_subtree_root_epoch(
+                network,
+                ShieldedProtocol::Sapling,
+                subtree_index,
+                chain_epoch,
+            ),
+        ];
+
+        for key in complete_keys {
+            assert_eq!(
+                StoreKey::visibility_publication_epoch(key.as_bytes()),
+                Some(chain_epoch)
+            );
+
+            let mut key_with_trailing_byte = key.into_bytes();
+            key_with_trailing_byte.push(0);
+            assert_eq!(
+                StoreKey::visibility_publication_epoch(&key_with_trailing_byte),
+                None
+            );
+        }
+
+        assert_eq!(
+            StoreKey::visibility_publication_epoch(
+                StoreKey::visible_block_epoch_prefix(network, height).as_bytes()
+            ),
+            None
+        );
+        assert_eq!(
+            StoreKey::visibility_publication_epoch(&[
+                super::KEY_VERSION,
+                super::BLOCK_HEADER_KEY_KIND,
+            ]),
+            None
+        );
     }
 
     #[test]

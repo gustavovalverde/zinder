@@ -154,10 +154,10 @@ impl Default for ServerInfoSettings {
             utxo_set_commitment_enabled: false,
             transparent_address_history_available: true,
             transparent_outpoint_spend_available: true,
-            projection_preset: zinder_derive::ProjectionPreset::Complete
+            projection_preset: zinder_derive::ProjectionPreset::Explorer
                 .as_str()
                 .to_owned(),
-            projection_identities: zinder_derive::ProjectionPreset::Complete
+            projection_identities: zinder_derive::ProjectionPreset::Explorer
                 .consumer_schemas()
                 .iter()
                 .map(|schema| schema.name.as_str().to_owned())
@@ -990,7 +990,7 @@ mod server_info_tests {
         };
         assert_eq!(common.service_name, env!("CARGO_PKG_NAME"));
         assert!(!common.capabilities.is_empty());
-        assert_eq!(common.projection_preset, "complete");
+        assert_eq!(common.projection_preset, "explorer");
         assert!(!common.projection_identities.is_empty());
     }
 

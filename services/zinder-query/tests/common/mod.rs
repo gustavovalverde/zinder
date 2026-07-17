@@ -15,11 +15,88 @@
 use prost::Message;
 use zinder_core::{
     BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, Network, UnixTimestampMillis,
+    CompactBlockArtifact, Network, TransparentOutputArtifact, TransparentSpendFact,
+    UnixTimestampMillis,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_proto::v1::wallet;
-use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
+use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts};
+use zinder_testkit::{
+    FixtureTransactionRows, build_fixture_transaction_rows, encode_fixture_block_replay,
+};
+
+/// Builds commit-ready canonical artifacts whose replay envelopes and
+/// transparent projection rows come from the same fixture transaction rows.
+#[must_use]
+pub fn chain_epoch_artifacts_with_transparent_facts(
+    chain_epoch: ChainEpoch,
+    block_headers: Vec<BlockHeaderArtifact>,
+    compact_blocks: Vec<CompactBlockArtifact>,
+    transparent_outputs: &[TransparentOutputArtifact],
+    transparent_spends: Vec<TransparentSpendFact>,
+) -> ChainEpochArtifacts {
+    let transaction_rows =
+        build_fixture_transaction_rows(&[], transparent_outputs, &transparent_spends);
+    let block_replay_envelopes = block_headers
+        .iter()
+        .map(|block_header| {
+            let block_transaction_rows = transaction_rows
+                .iter()
+                .filter(|rows| {
+                    rows.location.block_height == block_header.height
+                        && rows.location.block_hash == block_header.block_hash
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            encode_fixture_block_replay(block_header, &block_transaction_rows)
+        })
+        .collect();
+    let mut artifacts = ChainEpochArtifacts::new(
+        chain_epoch,
+        block_headers,
+        block_replay_envelopes,
+        compact_blocks,
+    );
+    if !transaction_rows.is_empty() {
+        artifacts = attach_fixture_transaction_rows(artifacts, &transaction_rows);
+    }
+    if !transparent_spends.is_empty() {
+        artifacts = artifacts.with_transparent_spend_facts(transparent_spends);
+    }
+    artifacts
+}
+
+fn attach_fixture_transaction_rows(
+    artifacts: ChainEpochArtifacts,
+    transaction_rows: &[FixtureTransactionRows],
+) -> ChainEpochArtifacts {
+    artifacts
+        .with_block_transaction_index(
+            transaction_rows
+                .iter()
+                .map(|rows| rows.block_transaction_index)
+                .collect(),
+        )
+        .with_transaction_locations(transaction_rows.iter().map(|rows| rows.location).collect())
+        .with_transaction_facts(
+            transaction_rows
+                .iter()
+                .map(|rows| rows.facts.clone())
+                .collect(),
+        )
+        .with_transaction_intrinsic_value_balances(
+            transaction_rows
+                .iter()
+                .filter_map(FixtureTransactionRows::intrinsic_value_balances_artifact)
+                .collect(),
+        )
+        .with_transparent_outputs_by_outpoint(
+            transaction_rows
+                .iter()
+                .flat_map(FixtureTransactionRows::transparent_output_artifacts)
+                .collect(),
+        )
+}
 
 /// Splits a `TransparentAddressUnspentOutputs` stream into the single leading
 /// `ChainView` header and the payload items that follow it.
@@ -91,6 +168,12 @@ pub fn block_hash_from_seed(seed: u32) -> BlockHash {
     BlockHash::from_bytes(bytes)
 }
 
+/// Returns the deterministic raw block bytes used by synthetic query fixtures.
+#[must_use]
+pub fn synthetic_raw_block_bytes(height: u32) -> Vec<u8> {
+    format!("raw-block-{height}").into_bytes()
+}
+
 /// Creates a synthetic single-block chain epoch with deterministic identifiers.
 #[must_use]
 pub fn synthetic_chain_epoch(
@@ -123,7 +206,7 @@ pub fn synthetic_chain_epoch(
             0,
             [0; 32],
             0,
-            u64::try_from(format!("raw-block-{chain_epoch_id}-{height}").len()).unwrap_or(u64::MAX),
+            u64::try_from(synthetic_raw_block_bytes(height).len()).unwrap_or(u64::MAX),
         ),
         CompactBlockArtifact::new(
             block_height,

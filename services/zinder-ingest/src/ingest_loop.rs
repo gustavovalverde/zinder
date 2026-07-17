@@ -33,20 +33,21 @@ use std::{
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zinder_core::{BlockHeight, NetworkUpgradeActivations};
+use zinder_core::{BlockHeight, CommitmentTreeCheckpoint, NetworkUpgradeActivations};
 use zinder_runtime::{IngestPhase, Readiness};
-use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget, SourceChainCheckpoint};
+use zinder_source::{ChainTipNotificationSource, NodeSource, NodeTarget};
 use zinder_store::PrimaryChainStore;
 
 use crate::bulk_catchup::{
     BulkCatchupFlushState, BulkCatchupRunContext, flush_pending_bulk_catchup_writes,
     run_bulk_catchup_until_complete_with_flush_state,
 };
+use crate::chain_ingest::validate_writer_store_contract;
 use crate::memory_pressure::wait_for_bulk_catchup_memory_headroom;
 use crate::{
-    BulkCatchupRunConfig, CommitmentRootBackfillConfig, IngestError, MempoolReadyGate,
-    NodeSourceKind, RawBlobPolicy, TipFollowConfig, classify_phase, current_chain_height,
-    tip_follow_with_primary_store,
+    BulkCatchupRunConfig, CanonicalPipelineLimits, CommitmentRootBackfillConfig, IngestError,
+    MempoolReadyGate, NodeSourceKind, RawBlobPolicy, TipFollowConfig, classify_phase,
+    current_chain_height, tip_follow_with_primary_store,
 };
 
 /// Backoff applied when the source's `tip_id()` call fails at the unified
@@ -171,6 +172,19 @@ pub struct IngestLoopConfig {
     pub modifiers: IngestModifiers,
 }
 
+impl IngestLoopConfig {
+    /// Returns the canonical writer options shared by run, probe, and both ingest phases.
+    #[must_use]
+    pub fn canonical_store_options(&self) -> zinder_store::ChainStoreOptions {
+        crate::chain_ingest::canonical_writer_store_options(
+            self.node.network,
+            self.reorg_window_blocks,
+            self.canonical_rocksdb_budget,
+            self.raw_blob_policy,
+        )
+    }
+}
+
 /// Resolved `[ingest.phases]` configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhasesConfig {
@@ -255,19 +269,8 @@ pub struct BulkCatchupConfig {
     pub canonical_batch_max_estimated_write_bytes: NonZeroU64,
     /// Minimum batch size before estimated write bytes can close the batch.
     pub canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32,
-    /// Maximum connected blocks requested from the source in one segment.
-    pub source_segment_max_blocks: NonZeroU32,
-    /// Target source response bytes for adaptive segment sizing.
-    pub source_segment_target_response_bytes: NonZeroU64,
-    /// Maximum concurrent source segment fetches.
-    pub source_fetch_max_in_flight_requests: NonZeroU32,
-    /// Maximum reserved response bytes across source fetches.
-    pub source_fetch_max_in_flight_bytes: NonZeroU64,
-    /// Parallel canonical block-prepare slots.
-    pub block_prepare_concurrency: NonZeroU32,
-    /// Maximum reserved derived artifact bytes across active and completed
-    /// canonical block prepares.
-    pub block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
+    /// Shared source-fetch and block-preparation limits.
+    pub pipeline_limits: CanonicalPipelineLimits,
     /// Maximum safe-tip artifact bytes allowed to queue while the previous
     /// canonical batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
@@ -313,7 +316,7 @@ pub struct IngestModifiers {
     /// Optional starting checkpoint resolved against the upstream node
     /// before the loop starts. Populated by the binary entrypoint after
     /// the `checkpoint_height` lookup completes.
-    pub checkpoint: Option<SourceChainCheckpoint>,
+    pub checkpoint: Option<CommitmentTreeCheckpoint>,
 }
 
 /// Subsystem handles surfaced by the spawn-once gate.
@@ -399,6 +402,10 @@ pub(crate) async fn wait_until_historical_work_or_cancelled(
 /// workers, and any chain-tip notification subscription. The launcher
 /// runs at most once; subsequent re-entries reuse the handles it
 /// returned.
+///
+/// The caller-owned store must use `config.reorg_window_blocks` and
+/// `config.raw_blob_policy`; the loop validates both before observing the
+/// upstream tip or launching any phase work.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -416,6 +423,7 @@ pub async fn run_ingest_loop<Source>(
 where
     Source: NodeSource + Clone,
 {
+    validate_writer_store_contract(&store, config.reorg_window_blocks, config.raw_blob_policy)?;
     let mut tip_subsystems: Option<TipFollowSubsystems> = None;
     let mut bulk_flush_state = BulkCatchupFlushState::default();
 
@@ -486,7 +494,8 @@ where
                 }
             }
             IngestPhase::BulkCatchup => {
-                let store_tip = bulk_catchup_progress_tip(store_tip, config.modifiers.checkpoint);
+                let store_tip =
+                    bulk_catchup_progress_tip(store_tip, config.modifiers.checkpoint.as_ref());
                 let Some(batch_target) = compute_bulk_catchup_target(BulkCatchupTargetInput {
                     upstream_tip,
                     progress_tip: store_tip,
@@ -617,10 +626,10 @@ struct BulkCatchupTargetInput {
 
 fn bulk_catchup_progress_tip(
     store_tip: Option<u32>,
-    checkpoint: Option<zinder_source::SourceChainCheckpoint>,
+    checkpoint: Option<&CommitmentTreeCheckpoint>,
 ) -> u32 {
     store_tip
-        .or_else(|| checkpoint.map(|checkpoint| checkpoint.height.value()))
+        .or_else(|| checkpoint.map(|checkpoint| checkpoint.block_id.height.value()))
         .unwrap_or(0)
 }
 
@@ -631,8 +640,12 @@ fn build_bulk_catchup_batch_config(
     batch_target: u32,
     upstream_tip: BlockHeight,
 ) -> BulkCatchupRunConfig {
-    let from_height = match config.modifiers.checkpoint {
-        Some(checkpoint) if store_tip == 0 => checkpoint.height.next().unwrap_or(checkpoint.height),
+    let from_height = match &config.modifiers.checkpoint {
+        Some(checkpoint) if store_tip == 0 => checkpoint
+            .block_id
+            .height
+            .next()
+            .unwrap_or(checkpoint.block_id.height),
         _ => BlockHeight::new(store_tip.saturating_add(1)),
     };
     BulkCatchupRunConfig {
@@ -640,6 +653,7 @@ fn build_bulk_catchup_batch_config(
         node_source: config.node_source,
         storage_path: config.storage_path.clone(),
         canonical_rocksdb_budget: config.canonical_rocksdb_budget,
+        reorg_window_blocks: config.reorg_window_blocks,
         raw_blob_policy: config.raw_blob_policy,
         network_upgrade_activations,
         from_height,
@@ -652,25 +666,14 @@ fn build_bulk_catchup_batch_config(
         canonical_batch_min_blocks_before_estimated_write_close: config
             .bulk_catchup
             .canonical_batch_min_blocks_before_estimated_write_close,
-        source_segment_max_blocks: config.bulk_catchup.source_segment_max_blocks,
-        source_segment_target_response_bytes: config
-            .bulk_catchup
-            .source_segment_target_response_bytes,
-        source_fetch_max_in_flight_requests: config
-            .bulk_catchup
-            .source_fetch_max_in_flight_requests,
-        source_fetch_max_in_flight_bytes: config.bulk_catchup.source_fetch_max_in_flight_bytes,
-        block_prepare_concurrency: config.bulk_catchup.block_prepare_concurrency,
-        block_prepare_max_in_flight_artifact_bytes: config
-            .bulk_catchup
-            .block_prepare_max_in_flight_artifact_bytes,
+        pipeline_limits: config.bulk_catchup.pipeline_limits,
         commit_reassembly_max_queued_artifact_bytes: config
             .bulk_catchup
             .commit_reassembly_max_queued_artifact_bytes,
         flush_interval_epochs: config.bulk_catchup.flush_interval_epochs,
         upstream_tip_hint: Some(upstream_tip),
         allow_near_tip_finalize: config.modifiers.allow_near_tip_finalize,
-        checkpoint: config.modifiers.checkpoint,
+        checkpoint: config.modifiers.checkpoint.clone(),
     }
 }
 
@@ -731,10 +734,10 @@ async fn sleep_or_cancel(duration: Duration, cancel: &CancellationToken) -> Canc
 mod tests {
     use std::path::PathBuf;
 
-    use zinder_core::{BlockHash, ChainTipMetadata, Network};
-    use zinder_source::{
-        DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget, SourceChainCheckpoint,
+    use zinder_core::{
+        BlockHash, BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, Network,
     };
+    use zinder_source::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget};
 
     use super::*;
 
@@ -784,18 +787,22 @@ mod tests {
                     crate::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
                 )
                 .ok_or("invalid estimated write close floor")?,
-                source_segment_max_blocks: NonZeroU32::new(128)
-                    .ok_or("invalid source segment blocks")?,
-                source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
-                    .ok_or("invalid source target bytes")?,
-                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-                    .ok_or("invalid source fetch requests")?,
-                source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
-                    .ok_or("invalid source fetch bytes")?,
-                block_prepare_concurrency: NonZeroU32::new(4)
-                    .ok_or("invalid block prepare slots")?,
-                block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-                    .ok_or("invalid block prepare artifact bytes")?,
+                pipeline_limits: CanonicalPipelineLimits {
+                    max_response_bytes: NonZeroU64::new(64 * 1024 * 1024)
+                        .ok_or("invalid maximum response bytes")?,
+                    source_segment_max_blocks: NonZeroU32::new(128)
+                        .ok_or("invalid source segment blocks")?,
+                    source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
+                        .ok_or("invalid source target bytes")?,
+                    source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                        .ok_or("invalid source fetch requests")?,
+                    source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
+                        .ok_or("invalid source fetch bytes")?,
+                    block_prepare_concurrency: NonZeroU32::new(4)
+                        .ok_or("invalid block prepare slots")?,
+                    block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                        .ok_or("invalid block prepare artifact bytes")?,
+                },
                 commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                     .ok_or("invalid commit reassembly bytes")?,
                 flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid flush cadence")?,
@@ -861,15 +868,46 @@ mod tests {
     }
 
     #[test]
+    fn writer_contract_propagates_to_store_and_both_ingest_phases() -> Result<(), &'static str> {
+        let mut config = sample_loop_config(IngestModifiers::default())?;
+        config.reorg_window_blocks = 37;
+        config.raw_blob_policy = RawBlobPolicy::All;
+
+        let store_options = config.canonical_store_options();
+        assert_eq!(store_options.reorg_window_blocks, 37);
+        assert_eq!(
+            store_options.raw_blob_retention,
+            zinder_store::RawBlobRetention::All
+        );
+        assert_eq!(
+            store_options.rocksdb_resource_budget,
+            config.canonical_rocksdb_budget
+        );
+
+        let activations = Arc::new(zinder_testkit::sample_regtest_upgrade_activations());
+        let bulk_config = build_bulk_catchup_batch_config(
+            &config,
+            Arc::clone(&activations),
+            0,
+            10,
+            BlockHeight::new(100),
+        );
+        let tip_config = build_tip_follow_config(&config, activations);
+        assert_eq!(bulk_config.reorg_window_blocks, 37);
+        assert_eq!(tip_config.reorg_window_blocks, 37);
+        Ok(())
+    }
+
+    #[test]
     fn empty_store_with_checkpoint_starts_at_checkpoint_plus_one() -> Result<(), &'static str> {
         // Regression guard: under the unified loop, a wallet-serving (or
         // operator-supplied) checkpoint must seed `from_height` even when
         // the store is empty. Without this, `bulk catchup` rejects the batch
         // with `BulkCatchupCheckpointMisaligned`.
-        let checkpoint = SourceChainCheckpoint::new(
-            BlockHeight::new(279_999),
-            BlockHash::from_bytes([0xAB; 32]),
-            ChainTipMetadata::empty(),
+        let checkpoint = CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(279_999), BlockHash::from_bytes([0xAB; 32])),
+            0,
+            CommitmentTreeFrontiers::default(),
         );
         let config = sample_loop_config(IngestModifiers {
             checkpoint: Some(checkpoint),
@@ -891,10 +929,10 @@ mod tests {
     #[test]
     fn non_empty_store_starts_at_store_tip_plus_one_even_with_checkpoint()
     -> Result<(), &'static str> {
-        let checkpoint = SourceChainCheckpoint::new(
-            BlockHeight::new(279_999),
-            BlockHash::from_bytes([0xAB; 32]),
-            ChainTipMetadata::empty(),
+        let checkpoint = CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(279_999), BlockHash::from_bytes([0xAB; 32])),
+            0,
+            CommitmentTreeFrontiers::default(),
         );
         let config = sample_loop_config(IngestModifiers {
             checkpoint: Some(checkpoint),
@@ -1012,15 +1050,15 @@ mod tests {
 
     #[test]
     fn bulk_catchup_progress_tip_uses_checkpoint_for_empty_store() {
-        let checkpoint = SourceChainCheckpoint::new(
-            BlockHeight::new(1_592),
-            BlockHash::from_bytes([0xAB; 32]),
-            ChainTipMetadata::empty(),
+        let checkpoint = CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(1_592), BlockHash::from_bytes([0xAB; 32])),
+            0,
+            CommitmentTreeFrontiers::default(),
         );
 
-        assert_eq!(bulk_catchup_progress_tip(None, Some(checkpoint)), 1_592);
+        assert_eq!(bulk_catchup_progress_tip(None, Some(&checkpoint)), 1_592);
         assert_eq!(
-            bulk_catchup_progress_tip(Some(1_617), Some(checkpoint)),
+            bulk_catchup_progress_tip(Some(1_617), Some(&checkpoint)),
             1_617
         );
         assert_eq!(bulk_catchup_progress_tip(None, None), 0);

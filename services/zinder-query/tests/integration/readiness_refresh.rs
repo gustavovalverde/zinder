@@ -24,7 +24,7 @@ use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
 use zinder_store::{
     ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, SecondaryChainStore,
 };
-use zinder_testkit::StoreFixture;
+use zinder_testkit::{StoreFixture, encode_fixture_block_replay};
 
 use crate::common::synthetic_chain_epoch;
 
@@ -206,9 +206,11 @@ async fn secondary_catchup_marks_writer_status_unavailable_when_method_is_unimpl
 
 fn commit_epoch(store: &PrimaryChainStore, chain_epoch_id: u64, height: u32) -> eyre::Result<()> {
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(chain_epoch_id, height);
+    let replay = encode_fixture_block_replay(&block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay],
         vec![compact_block],
     ))?;
     Ok(())

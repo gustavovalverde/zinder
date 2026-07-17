@@ -7,7 +7,9 @@ mod address_output_index;
 mod artifact_visibility;
 mod block_artifact;
 mod block_hash_index;
+mod block_replay;
 mod block_value_pool_balances;
+mod canonical_store;
 mod chain_epoch;
 mod chain_epoch_reader;
 mod chain_event;
@@ -21,6 +23,7 @@ mod kv;
 mod mempool_event;
 mod mempool_event_store;
 mod proto_codec;
+mod raw_blob_retention;
 mod rocksdb_resource_budget;
 mod store_error;
 mod subtree_root;
@@ -36,7 +39,18 @@ pub use block_artifact::{
     BlockBlobStore, BlockHeaderStore, BlockTransactionIndexStore, CompactBlockStore,
 };
 pub use block_hash_index::BlockHashLookup;
+pub use block_replay::{BlockReplayBatchRequest, BlockReplayStore, MAX_BLOCK_REPLAY_BATCH_BLOCKS};
 pub use block_value_pool_balances::BlockValuePoolBalancesStore;
+pub use canonical_store::{
+    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalAppendAnchor,
+    CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalBuildBlock,
+    CanonicalBuildSubtreeRoot, CanonicalEventFence, CanonicalLiveAppend, CanonicalReplayScan,
+    CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
+    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence, PreparedCanonicalBaselinePublication,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
+    ValidatedRocksDbCanonicalBuild,
+};
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;
 pub use chain_event::{
@@ -45,14 +59,15 @@ pub use chain_event::{
 };
 pub use chain_store::{
     AddressOutputIndexPage, AddressOutputIndexPageRequest, BlockValuePoolBalanceEnrichmentOutcome,
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochReadApi, ChainEventHistoryRequest,
-    ChainEventRetentionReport, ChainStoreOptions, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
-    FinalNoteCommitmentRootEnrichmentOutcome, MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH,
-    MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION, ChainEpochReadApi,
+    ChainEventHistoryRequest, ChainEventRetentionReport, ChainStoreOptions,
+    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, FinalNoteCommitmentRootEnrichmentOutcome,
+    MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH, MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH,
+    MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
     MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH,
-    MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, RawBlobRetention,
-    SecondaryCatchupOutcome, SecondaryChainStore,
-    TransactionIntrinsicValueBalanceEnrichmentOutcome, TransparentRetentionSweepOutcome,
+    MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, SecondaryCatchupOutcome,
+    SecondaryChainStore, TransactionIntrinsicValueBalanceEnrichmentOutcome,
+    TransparentRetentionSweepOutcome,
 };
 pub use displaced_block::{DisplacedBlockCursor, DisplacedBlockPage, DisplacedBlockStore};
 pub use event_stream::{
@@ -91,6 +106,7 @@ pub use proto_codec::{
     transparent_mempool_spend_from_message, transparent_mempool_spend_message,
     transparent_output_entry_message, transparent_output_message, transparent_spend_message,
 };
+pub use raw_blob_retention::RawBlobRetention;
 pub use rocksdb_resource_budget::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
 pub use subtree_root::SubtreeRootStore;

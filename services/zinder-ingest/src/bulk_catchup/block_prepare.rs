@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     mem::size_of,
     num::{NonZeroU32, NonZeroU64},
@@ -13,21 +13,30 @@ use futures_util::{
     stream::{self, BoxStream, FuturesUnordered, Stream, StreamExt},
 };
 use parking_lot::Mutex;
-use prost::Message as _;
-use zinder_core::{BlockHeight, TransparentOutPoint, TransparentOutputArtifact};
+use zinder_core::{
+    BlockHeight, CanonicalBlockFacts, CanonicalTransactionFacts, TransactionBlobArtifact,
+    TransparentInputFact, TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact,
+    UnsupportedSection,
+};
+use zinder_proto::compat::lightwalletd::{
+    CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
+    CompactTxIn, TxOut,
+};
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{PrimaryChainStore, StoreReadCaller};
 
-use super::abort_on_drop::AbortOnDropTask;
-use super::source_fetch::{
-    BulkCatchupSourceFetchStreamConfig, SourceSegmentSizer, build_source_block_stream,
-};
-use super::watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer};
 use super::{
     BULK_STAGE_CANONICAL_BLOCK_PREPARE, BULK_STAGE_CANONICAL_PREVOUT_RESOLVE, IngestError,
     record_bulk_pipeline_stage_duration, usize_to_u32_saturating, usize_to_u64_saturating,
 };
-use crate::artifact_builder::DerivedBlockArtifacts;
+use crate::artifact_builder::{PreparedCanonicalBlock, current_schema_transparent_outputs};
+use crate::canonical_construction::{
+    abort_on_drop::AbortOnDropTask,
+    source_fetch::{
+        CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
+    },
+    watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer},
+};
 use crate::chain_ingest::{
     prefetched_spent_transparent_output_bytes, record_ingest_block_prepare_outcome,
 };
@@ -36,6 +45,14 @@ const LIGHT_PREVOUT_COALESCE_DELAY: Duration = Duration::from_millis(2);
 const DENSE_PREVOUT_COALESCE_DELAY: Duration = Duration::from_millis(20);
 const DENSE_BLOCK_TRANSPARENT_INPUTS: usize = 128;
 const PREVOUT_WINDOW_TARGET_TRANSPARENT_INPUTS: usize = 2_048;
+// One active prepare temporarily owns the source bytes, Zebra's decoded block,
+// canonical facts, replay bytes, compact artifacts, and (under `all`) two raw
+// retention copies. This multiplier deliberately leaves headroom for decoded
+// collection and allocator overhead. The reservation retains the larger of
+// this peak and measured completed residency through prevout resolution, then
+// shrinks to the resident commit-preparation handoff.
+const BLOCK_PREPARE_PEAK_RAW_BYTE_MULTIPLIER: u64 = 16;
+const BLOCK_PREPARE_FIXED_PEAK_BYTES: u64 = 64 * 1_024;
 
 pub(super) struct BulkCatchupBlockPrepareStreamConfig {
     pub(super) request_timeout: Duration,
@@ -47,24 +64,25 @@ pub(super) struct BulkCatchupBlockPrepareStreamConfig {
     pub(super) source_fetch_max_in_flight_bytes: NonZeroU64,
     pub(super) source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
     pub(super) block_prepare_concurrency: usize,
-    pub(super) block_prepare_max_in_flight_artifact_bytes: NonZeroU64,
+    pub(super) block_prepare_memory_watermark_bytes: NonZeroU64,
     pub(super) store: PrimaryChainStore,
 }
 
-pub(super) struct PreparedBlockArtifacts {
-    pub(super) derived: DerivedBlockArtifacts,
+pub(super) struct CanonicalBlockCommitPreparation {
+    pub(super) prepared: PreparedCanonicalBlock,
     pub(super) prefetched_spent_transparent_outputs: Vec<TransparentOutputArtifact>,
+    pub(super) block_prepare_reservation: ByteReservation,
 }
 
 pub(super) fn build_block_prepare_stream<'a, Source, F, Fut>(
     source: &'a Source,
     config: BulkCatchupBlockPrepareStreamConfig,
-    derive_fn: F,
-) -> impl Stream<Item = Result<Vec<PreparedBlockArtifacts>, IngestError>> + Send + 'a
+    prepare_fn: F,
+) -> impl Stream<Item = Result<Vec<CanonicalBlockCommitPreparation>, IngestError>> + Send + 'a
 where
     Source: NodeSource + Clone + 'a,
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
+    Fut: Future<Output = Result<PreparedCanonicalBlock, IngestError>> + Send + 'static,
 {
     let BulkCatchupBlockPrepareStreamConfig {
         request_timeout,
@@ -76,12 +94,13 @@ where
         source_fetch_max_in_flight_bytes,
         source_segment_sizer,
         block_prepare_concurrency,
-        block_prepare_max_in_flight_artifact_bytes,
+        block_prepare_memory_watermark_bytes,
         store,
     } = config;
     let block_prepare_concurrency = block_prepare_concurrency.max(1);
-    let source_fetch_config = BulkCatchupSourceFetchStreamConfig {
+    let source_fetch_config = CanonicalSourceFetchConfig {
         request_timeout,
+        history_predecessor: None,
         from_height,
         to_height,
         max_response_bytes,
@@ -94,14 +113,14 @@ where
         source_blocks: build_source_block_stream(source, source_fetch_config).boxed(),
         in_flight_block_prepares: FuturesUnordered::new(),
         completed_block_prepares: BTreeMap::new(),
-        completed_block_prepare_bytes: 0,
-        pending_source_blocks: VecDeque::new(),
-        derive_fn,
+        completed_block_prepare_resident_bytes: 0,
+        pending_source_chunk: None,
+        prepare_fn,
         store,
         block_prepare_concurrency,
         block_prepare_watermark: ByteWatermark::new(
             BULK_STAGE_CANONICAL_BLOCK_PREPARE,
-            block_prepare_max_in_flight_artifact_bytes,
+            block_prepare_memory_watermark_bytes,
         ),
         recent_outputs: None,
         prevout_coalesce_deadline: None,
@@ -116,16 +135,16 @@ where
     })
 }
 
-struct DerivedBlock {
+struct PreparedBlock {
     height: BlockHeight,
-    derived: DerivedBlockArtifacts,
-    artifact_bytes: u64,
+    prepared: PreparedCanonicalBlock,
+    resident_bytes: u64,
     reservation: ByteReservation,
 }
 
-struct QueuedDerivedBlock {
-    derived: DerivedBlockArtifacts,
-    artifact_bytes: u64,
+struct QueuedPreparedBlock {
+    prepared: PreparedCanonicalBlock,
+    resident_bytes: u64,
     reservation: ByteReservation,
 }
 
@@ -136,13 +155,13 @@ enum PendingBlockPrepareSchedule {
 }
 
 struct BlockPrepareStreamState<'a, F> {
-    source_blocks: BoxStream<'a, Result<Vec<SourceBlock>, IngestError>>,
+    source_blocks: BoxStream<'a, Result<SourceBlockChunk, IngestError>>,
     in_flight_block_prepares:
-        FuturesUnordered<BoxFuture<'static, Result<DerivedBlock, IngestError>>>,
-    completed_block_prepares: BTreeMap<BlockHeight, QueuedDerivedBlock>,
-    completed_block_prepare_bytes: u64,
-    pending_source_blocks: VecDeque<SourceBlock>,
-    derive_fn: F,
+        FuturesUnordered<BoxFuture<'static, Result<PreparedBlock, IngestError>>>,
+    completed_block_prepares: BTreeMap<BlockHeight, QueuedPreparedBlock>,
+    completed_block_prepare_resident_bytes: u64,
+    pending_source_chunk: Option<SourceBlockChunk>,
+    prepare_fn: F,
     store: PrimaryChainStore,
     block_prepare_concurrency: usize,
     block_prepare_watermark: ByteWatermark,
@@ -155,10 +174,10 @@ struct BlockPrepareStreamState<'a, F> {
 
 async fn next_block_prepare_chunk<F, Fut>(
     state: &mut BlockPrepareStreamState<'_, F>,
-) -> Option<Result<Vec<PreparedBlockArtifacts>, IngestError>>
+) -> Option<Result<Vec<CanonicalBlockCommitPreparation>, IngestError>>
 where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
+    Fut: Future<Output = Result<PreparedCanonicalBlock, IngestError>> + Send + 'static,
 {
     loop {
         let prepare_schedule_blocked = match schedule_next_pending_block_prepare(state) {
@@ -219,18 +238,18 @@ where
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(coalesce_deadline)), if state.prevout_coalesce_deadline.is_some() => {}
             source_chunk_result = state.source_blocks.next(), if can_schedule_block_prepare => {
                 match source_chunk_result {
-                    Some(Ok(source_chunk)) => state.pending_source_blocks.extend(source_chunk),
+                    Some(Ok(source_chunk)) => state.pending_source_chunk = Some(source_chunk),
                     Some(Err(error)) => return Some(Err(error)),
                     None => state.source_exhausted = true,
                 }
             }
             block_prepare_result = state.in_flight_block_prepares.next(), if !state.in_flight_block_prepares.is_empty() => {
-                let derived_block = match block_prepare_result {
-                    Some(Ok(derived_block)) => derived_block,
+                let prepared_block = match block_prepare_result {
+                    Some(Ok(prepared_block)) => prepared_block,
                     Some(Err(error)) => return Some(Err(error)),
                     None => continue,
                 };
-                if let Err(error) = insert_completed_block_prepare(state, derived_block) {
+                if let Err(error) = insert_completed_block_prepare(state, prepared_block) {
                     return Some(Err(error));
                 }
             }
@@ -243,18 +262,33 @@ fn schedule_next_pending_block_prepare<F, Fut>(
 ) -> PendingBlockPrepareSchedule
 where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
+    Fut: Future<Output = Result<PreparedCanonicalBlock, IngestError>> + Send + 'static,
 {
     if state.in_flight_block_prepares.len() >= state.block_prepare_concurrency {
         return PendingBlockPrepareSchedule::Idle;
     }
-    let Some(source_block) = state.pending_source_blocks.pop_front() else {
+    let Some(source_block) = state
+        .pending_source_chunk
+        .as_mut()
+        .and_then(SourceBlockChunk::pop_front)
+    else {
         return PendingBlockPrepareSchedule::Idle;
     };
     match schedule_block_prepare(state, source_block) {
-        Ok(()) => PendingBlockPrepareSchedule::Scheduled,
+        Ok(()) => {
+            if state
+                .pending_source_chunk
+                .as_ref()
+                .is_some_and(SourceBlockChunk::is_empty)
+            {
+                state.pending_source_chunk = None;
+            }
+            PendingBlockPrepareSchedule::Scheduled
+        }
         Err(source_block) => {
-            state.pending_source_blocks.push_front(source_block);
+            if let Some(source_chunk) = state.pending_source_chunk.as_mut() {
+                source_chunk.push_front(source_block);
+            }
             PendingBlockPrepareSchedule::WatermarkBlocked
         }
     }
@@ -262,7 +296,7 @@ where
 
 fn take_contiguous_completed_block_prepares<F>(
     state: &mut BlockPrepareStreamState<'_, F>,
-) -> Vec<QueuedDerivedBlock> {
+) -> Vec<QueuedPreparedBlock> {
     let mut ready_blocks = Vec::new();
     let mut transparent_input_count = 0usize;
     while let Some(next_emit_height) = state.next_emit_height {
@@ -277,7 +311,7 @@ fn take_contiguous_completed_block_prepares<F>(
         let Some(queued) = state.completed_block_prepares.get(&next_emit_height) else {
             break;
         };
-        let next_transparent_input_count = derived_block_transparent_input_count(&queued.derived);
+        let next_transparent_input_count = prepared_block_transparent_input_count(&queued.prepared);
         transparent_input_count =
             transparent_input_count.saturating_add(next_transparent_input_count);
         let Some(queued) = state.completed_block_prepares.remove(&next_emit_height) else {
@@ -286,10 +320,10 @@ fn take_contiguous_completed_block_prepares<F>(
         state.next_emit_height = next_emit_height
             .next()
             .filter(|height| *height <= state.to_height);
-        let artifact_bytes = queued.artifact_bytes;
-        state.completed_block_prepare_bytes = state
-            .completed_block_prepare_bytes
-            .saturating_sub(artifact_bytes);
+        let resident_bytes = queued.resident_bytes;
+        state.completed_block_prepare_resident_bytes = state
+            .completed_block_prepare_resident_bytes
+            .saturating_sub(resident_bytes);
         ready_blocks.push(queued);
     }
     ready_blocks
@@ -306,7 +340,7 @@ impl<F> BlockPrepareStreamState<'_, F> {
             };
             count += 1;
             transparent_input_count = transparent_input_count
-                .saturating_add(derived_block_transparent_input_count(&queued.derived));
+                .saturating_add(prepared_block_transparent_input_count(&queued.prepared));
             next_height = height.next().filter(|height| *height <= self.to_height);
         }
         (count, transparent_input_count)
@@ -316,14 +350,14 @@ impl<F> BlockPrepareStreamState<'_, F> {
         self.next_emit_height
             .and_then(|height| self.completed_block_prepares.get(&height))
             .is_some_and(|queued| {
-                derived_block_transparent_input_count(&queued.derived)
+                prepared_block_transparent_input_count(&queued.prepared)
                     >= DENSE_BLOCK_TRANSPARENT_INPUTS
             })
     }
 
     fn can_schedule_block_prepare(&self) -> bool {
         !self.source_exhausted
-            && self.pending_source_blocks.is_empty()
+            && self.pending_source_chunk.is_none()
             && self.in_flight_block_prepares.len() < self.block_prepare_concurrency
             && self.completed_block_prepares.len() < self.block_prepare_concurrency
     }
@@ -335,38 +369,38 @@ fn schedule_block_prepare<F, Fut>(
 ) -> Result<(), SourceBlock>
 where
     F: Fn(SourceBlock) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<DerivedBlockArtifacts, IngestError>> + Send + 'static,
+    Fut: Future<Output = Result<PreparedCanonicalBlock, IngestError>> + Send + 'static,
 {
     if state.in_flight_block_prepares.len() >= state.block_prepare_concurrency {
         return Err(source_block);
     }
-    let estimated_artifact_bytes = source_block.raw_block_bytes.len().max(1);
-    let reservation_bytes = usize_to_u64_saturating(estimated_artifact_bytes);
-    let Some(reservation) = state.reserve_block_prepare_bytes(reservation_bytes) else {
+    let estimated_peak_resident_bytes =
+        estimated_peak_block_prepare_bytes(source_block.raw_block_bytes.capacity());
+    let Some(reservation) = state.reserve_block_prepare_bytes(estimated_peak_resident_bytes) else {
         return Err(source_block);
     };
-    let derive_fn = state.derive_fn.clone();
-    // Spawned so per-block artifact derivation progresses on runtime workers
+    let prepare_fn = state.prepare_fn.clone();
+    // Spawned so per-block canonical preparation progresses on runtime workers
     // instead of only while this stream is polled by the commit consumer.
     let block_prepare_task = AbortOnDropTask::spawn(async move {
         let height = source_block.height;
         let block_prepare_started_at = Instant::now();
         let block_prepare_outcome = async {
-            let artifact_derive_started_at = Instant::now();
-            let artifact_derive_outcome = derive_fn(source_block).await;
+            let preparation_started_at = Instant::now();
+            let preparation_outcome = prepare_fn(source_block).await;
             record_block_prepare_stage(
-                "artifact_derive",
-                artifact_derive_started_at,
-                &artifact_derive_outcome,
+                "canonical_block_prepare",
+                preparation_started_at,
+                &preparation_outcome,
             );
-            let derived = artifact_derive_outcome?;
-            let artifact_bytes = derived_block_artifact_bytes(&derived);
+            let prepared = preparation_outcome?;
+            let resident_bytes = prepared_block_resident_bytes(&prepared);
             let mut reservation = reservation;
-            reservation.resize(artifact_bytes);
-            Ok(DerivedBlock {
+            reservation.resize(estimated_peak_resident_bytes.max(resident_bytes));
+            Ok(PreparedBlock {
                 height,
-                derived,
-                artifact_bytes,
+                prepared,
+                resident_bytes,
                 reservation,
             })
         }
@@ -423,30 +457,30 @@ fn record_block_prepare_stage<T>(
 
 fn insert_completed_block_prepare<F>(
     state: &mut BlockPrepareStreamState<'_, F>,
-    derived_block: DerivedBlock,
+    prepared_block: PreparedBlock,
 ) -> Result<(), IngestError> {
-    if derived_block.height > state.to_height {
+    if prepared_block.height > state.to_height {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
-            reason: "derived block completed outside the requested bulk-catchup range",
+            reason: "prepared block completed outside the requested bulk-catchup range",
         }));
     }
-    state.completed_block_prepare_bytes = state
-        .completed_block_prepare_bytes
-        .saturating_add(derived_block.artifact_bytes);
+    state.completed_block_prepare_resident_bytes = state
+        .completed_block_prepare_resident_bytes
+        .saturating_add(prepared_block.resident_bytes);
     if state
         .completed_block_prepares
         .insert(
-            derived_block.height,
-            QueuedDerivedBlock {
-                derived: derived_block.derived,
-                artifact_bytes: derived_block.artifact_bytes,
-                reservation: derived_block.reservation,
+            prepared_block.height,
+            QueuedPreparedBlock {
+                prepared: prepared_block.prepared,
+                resident_bytes: prepared_block.resident_bytes,
+                reservation: prepared_block.reservation,
             },
         )
         .is_some()
     {
         return Err(IngestError::from(SourceError::SourceProtocolMismatch {
-            reason: "derived block completed twice during bulk catchup",
+            reason: "prepared block completed twice during bulk catchup",
         }));
     }
     Ok(())
@@ -463,7 +497,7 @@ fn record_block_prepare_reassembly_state<F>(state: &BlockPrepareStreamState<'_, 
     record_reorder_buffer(
         BULK_STAGE_CANONICAL_BLOCK_PREPARE,
         state.completed_block_prepares.len(),
-        state.completed_block_prepare_bytes,
+        state.completed_block_prepare_resident_bytes,
     );
 }
 
@@ -596,8 +630,8 @@ impl Drop for RecentTransparentOutputCache {
 
 async fn resolve_prevouts_for_window<F>(
     state: &mut BlockPrepareStreamState<'_, F>,
-    queued_blocks: Vec<QueuedDerivedBlock>,
-) -> Result<Vec<PreparedBlockArtifacts>, IngestError> {
+    queued_blocks: Vec<QueuedPreparedBlock>,
+) -> Result<Vec<CanonicalBlockCommitPreparation>, IngestError> {
     metrics::histogram!("zinder_ingest_prevout_resolver_window_blocks")
         .record(usize_to_u32_saturating(queued_blocks.len()));
 
@@ -607,15 +641,17 @@ async fn resolve_prevouts_for_window<F>(
     let mut created_outputs_spent = HashSet::new();
     let mut cold_consumers = HashMap::<TransparentOutPoint, Vec<usize>>::new();
     let mut resolution_stats = PrevoutResolutionStats::default();
+    let created_outputs_by_block = queued_blocks
+        .iter()
+        .map(|queued| current_schema_transparent_outputs(&queued.prepared.facts))
+        .collect::<Vec<_>>();
 
     for (block_index, queued) in queued_blocks.iter().enumerate() {
-        let same_block_outputs = queued
-            .derived
-            .transparent_outputs_by_outpoint
+        let same_block_outputs = created_outputs_by_block[block_index]
             .iter()
             .map(|output| output.outpoint)
             .collect::<HashSet<_>>();
-        for spent_outpoint in spent_outpoints_for_derived_block(&queued.derived) {
+        for spent_outpoint in spent_outpoints_for_prepared_block(&queued.prepared) {
             if same_block_outputs.contains(&spent_outpoint) {
                 created_outputs_spent.insert(spent_outpoint);
                 resolution_stats.same_block = resolution_stats.same_block.saturating_add(1);
@@ -624,10 +660,8 @@ async fn resolve_prevouts_for_window<F>(
             if let Some(&(producer_block_index, producer_output_index)) =
                 window_output_locations.get(&spent_outpoint)
             {
-                let output = queued_blocks[producer_block_index]
-                    .derived
-                    .transparent_outputs_by_outpoint[producer_output_index]
-                    .clone();
+                let output =
+                    created_outputs_by_block[producer_block_index][producer_output_index].clone();
                 prefetched_by_block[block_index].push(output);
                 created_outputs_spent.insert(spent_outpoint);
                 resolution_stats.same_window = resolution_stats.same_window.saturating_add(1);
@@ -646,15 +680,11 @@ async fn resolve_prevouts_for_window<F>(
                 .push(block_index);
         }
 
-        for (output_index, output) in queued
-            .derived
-            .transparent_outputs_by_outpoint
-            .iter()
-            .enumerate()
-        {
+        for (output_index, output) in created_outputs_by_block[block_index].iter().enumerate() {
             window_output_locations.insert(output.outpoint, (block_index, output_index));
         }
     }
+    drop(window_output_locations);
 
     let mut cold_outpoints = cold_consumers.keys().copied().collect::<Vec<_>>();
     sort_outpoints(&mut cold_outpoints);
@@ -670,11 +700,13 @@ async fn resolve_prevouts_for_window<F>(
             prefetched_by_block[block_index].push(output.clone());
         }
     }
+    drop(resolved_store_outputs);
 
     let prepared_blocks = prepare_resolved_window(
         state,
         queued_blocks,
         prefetched_by_block,
+        created_outputs_by_block,
         &created_outputs_spent,
     );
     record_prevout_resolution_stats(&resolution_stats);
@@ -683,34 +715,32 @@ async fn resolve_prevouts_for_window<F>(
 
 fn prepare_resolved_window<F>(
     state: &mut BlockPrepareStreamState<'_, F>,
-    queued_blocks: Vec<QueuedDerivedBlock>,
+    queued_blocks: Vec<QueuedPreparedBlock>,
     prefetched_by_block: Vec<Vec<TransparentOutputArtifact>>,
+    created_outputs_by_block: Vec<Vec<TransparentOutputArtifact>>,
     created_outputs_spent: &HashSet<TransparentOutPoint>,
-) -> Vec<PreparedBlockArtifacts> {
-    let outputs_to_cache = queued_blocks
-        .iter()
-        .flat_map(|queued| queued.derived.transparent_outputs_by_outpoint.iter())
-        .filter(|output| !created_outputs_spent.contains(&output.outpoint))
-        .cloned()
-        .collect::<Vec<_>>();
-    let prepared_blocks = queued_blocks
+) -> Vec<CanonicalBlockCommitPreparation> {
+    let mut prepared_blocks = queued_blocks
         .into_iter()
         .zip(prefetched_by_block)
         .map(|(queued, mut prefetched_spent_transparent_outputs)| {
             sort_outputs(&mut prefetched_spent_transparent_outputs);
-            let prepared = PreparedBlockArtifacts {
-                derived: queued.derived,
+            CanonicalBlockCommitPreparation {
+                prepared: queued.prepared,
                 prefetched_spent_transparent_outputs,
-            };
-            let mut reservation = queued.reservation;
-            reservation.resize(prepared_block_artifact_bytes(&prepared));
-            drop(reservation);
-            prepared
+                block_prepare_reservation: queued.reservation,
+            }
         })
         .collect::<Vec<_>>();
 
-    for output in outputs_to_cache {
-        state.recent_outputs().insert(output);
+    for output in created_outputs_by_block.into_iter().flatten() {
+        if !created_outputs_spent.contains(&output.outpoint) {
+            state.recent_outputs().insert(output);
+        }
+    }
+    for prepared in &mut prepared_blocks {
+        let resident_bytes = block_commit_preparation_resident_bytes(prepared);
+        prepared.block_prepare_reservation.resize(resident_bytes);
     }
     prepared_blocks
 }
@@ -741,9 +771,12 @@ async fn resolve_cold_prevouts(
     })?
 }
 
-fn spent_outpoints_for_derived_block(derived: &DerivedBlockArtifacts) -> Vec<TransparentOutPoint> {
-    let mut spent_outpoints = derived
-        .transaction_facts
+fn spent_outpoints_for_prepared_block(
+    prepared: &PreparedCanonicalBlock,
+) -> Vec<TransparentOutPoint> {
+    let mut spent_outpoints = prepared
+        .facts
+        .transactions
         .iter()
         .flat_map(|transaction| {
             transaction
@@ -758,9 +791,10 @@ fn spent_outpoints_for_derived_block(derived: &DerivedBlockArtifacts) -> Vec<Tra
     spent_outpoints
 }
 
-fn derived_block_transparent_input_count(derived: &DerivedBlockArtifacts) -> usize {
-    derived
-        .transaction_facts
+fn prepared_block_transparent_input_count(prepared: &PreparedCanonicalBlock) -> usize {
+    prepared
+        .facts
+        .transactions
         .iter()
         .fold(0usize, |count, transaction| {
             count.saturating_add(transaction.transparent_inputs.len())
@@ -823,27 +857,337 @@ fn u64_to_f64(sample: u64) -> f64 {
     sample as f64
 }
 
-fn prepared_block_artifact_bytes(prepared: &PreparedBlockArtifacts) -> u64 {
-    derived_block_artifact_bytes(&prepared.derived).saturating_add(usize_to_u64_saturating(
+fn estimated_peak_block_prepare_bytes(raw_block_capacity: usize) -> u64 {
+    BLOCK_PREPARE_FIXED_PEAK_BYTES.saturating_add(
+        usize_to_u64_saturating(raw_block_capacity.max(1))
+            .saturating_mul(BLOCK_PREPARE_PEAK_RAW_BYTE_MULTIPLIER),
+    )
+}
+
+fn block_commit_preparation_resident_bytes(prepared: &CanonicalBlockCommitPreparation) -> u64 {
+    prepared_block_resident_bytes(&prepared.prepared).saturating_add(usize_to_u64_saturating(
         prefetched_spent_transparent_output_bytes(&prepared.prefetched_spent_transparent_outputs),
     ))
 }
 
-fn derived_block_artifact_bytes(derived: &DerivedBlockArtifacts) -> u64 {
-    let block_blob_bytes = derived
+fn prepared_block_resident_bytes(prepared: &PreparedCanonicalBlock) -> u64 {
+    let resident_bytes = size_of::<PreparedCanonicalBlock>()
+        .saturating_add(canonical_block_facts_heap_bytes(&prepared.facts))
+        .saturating_add(prepared.replay_envelope.as_bytes().len())
+        .saturating_add(compact_block_heap_bytes(&prepared.partial_compact_block))
+        .saturating_add(retained_raw_blob_heap_bytes(prepared));
+    usize_to_u64_saturating(resident_bytes)
+}
+
+fn canonical_block_facts_heap_bytes(facts: &CanonicalBlockFacts) -> usize {
+    let mut resident_bytes =
+        vector_allocation_bytes::<CanonicalTransactionFacts>(facts.transactions.capacity());
+    for transaction in &facts.transactions {
+        resident_bytes = resident_bytes
+            .saturating_add(vector_allocation_bytes::<UnsupportedSection>(
+                transaction.public_facts.unsupported_sections.capacity(),
+            ))
+            .saturating_add(vector_allocation_bytes::<TransparentInputFact>(
+                transaction.transparent_inputs.capacity(),
+            ))
+            .saturating_add(vector_allocation_bytes::<TransparentOutputFact>(
+                transaction.transparent_outputs.capacity(),
+            ));
+        for output in &transaction.transparent_outputs {
+            resident_bytes = resident_bytes.saturating_add(output.script_pub_key.capacity());
+        }
+    }
+    resident_bytes
+}
+
+fn compact_block_heap_bytes(block: &CompactBlock) -> usize {
+    let mut resident_bytes = block
+        .hash
+        .capacity()
+        .saturating_add(block.prev_hash.capacity())
+        .saturating_add(block.header.capacity())
+        .saturating_add(vector_allocation_bytes::<CompactTx>(block.vtx.capacity()));
+    for transaction in &block.vtx {
+        resident_bytes = resident_bytes
+            .saturating_add(transaction.txid.capacity())
+            .saturating_add(vector_allocation_bytes::<CompactSaplingSpend>(
+                transaction.spends.capacity(),
+            ))
+            .saturating_add(vector_allocation_bytes::<CompactSaplingOutput>(
+                transaction.outputs.capacity(),
+            ))
+            .saturating_add(vector_allocation_bytes::<CompactOrchardAction>(
+                transaction.actions.capacity(),
+            ))
+            .saturating_add(vector_allocation_bytes::<CompactOrchardAction>(
+                transaction.ironwood_actions.capacity(),
+            ))
+            .saturating_add(vector_allocation_bytes::<CompactTxIn>(
+                transaction.vin.capacity(),
+            ))
+            .saturating_add(vector_allocation_bytes::<TxOut>(
+                transaction.vout.capacity(),
+            ));
+        for spend in &transaction.spends {
+            resident_bytes = resident_bytes.saturating_add(spend.nf.capacity());
+        }
+        for output in &transaction.outputs {
+            resident_bytes = resident_bytes
+                .saturating_add(output.cmu.capacity())
+                .saturating_add(output.ephemeral_key.capacity())
+                .saturating_add(output.ciphertext.capacity());
+        }
+        for action in transaction
+            .actions
+            .iter()
+            .chain(&transaction.ironwood_actions)
+        {
+            resident_bytes = resident_bytes
+                .saturating_add(action.nullifier.capacity())
+                .saturating_add(action.cmx.capacity())
+                .saturating_add(action.ephemeral_key.capacity())
+                .saturating_add(action.ciphertext.capacity());
+        }
+        for input in &transaction.vin {
+            resident_bytes = resident_bytes.saturating_add(input.prevout_txid.capacity());
+        }
+        for output in &transaction.vout {
+            resident_bytes = resident_bytes.saturating_add(output.script_pub_key.capacity());
+        }
+    }
+    resident_bytes
+}
+
+fn retained_raw_blob_heap_bytes(prepared: &PreparedCanonicalBlock) -> usize {
+    let block_blob_bytes = prepared
+        .retained_raw_blobs
         .block_blob
         .as_ref()
-        .map_or(0usize, |block_blob| block_blob.raw_block_bytes.len());
-    let transaction_blob_bytes =
-        derived
-            .transaction_blobs
-            .iter()
-            .fold(0usize, |bytes, transaction_blob| {
-                bytes.saturating_add(transaction_blob.raw_transaction_bytes.len())
-            });
-    usize_to_u64_saturating(
-        block_blob_bytes
-            .saturating_add(derived.partial_compact_block.encoded_len())
-            .saturating_add(transaction_blob_bytes),
+        .map_or(0usize, |blob| blob.raw_block_bytes.capacity());
+    prepared.retained_raw_blobs.transaction_blobs.iter().fold(
+        block_blob_bytes.saturating_add(vector_allocation_bytes::<TransactionBlobArtifact>(
+            prepared.retained_raw_blobs.transaction_blobs.capacity(),
+        )),
+        |resident_bytes, transaction_blob| {
+            resident_bytes.saturating_add(transaction_blob.raw_transaction_bytes.capacity())
+        },
     )
+}
+
+fn vector_allocation_bytes<T>(capacity: usize) -> usize {
+    capacity.saturating_mul(size_of::<T>())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, HashSet},
+        error::Error,
+        num::NonZeroU64,
+        sync::Arc,
+    };
+
+    use futures_util::{StreamExt as _, stream};
+    use serde_json::Value;
+    use zinder_core::{BlockHeight, Network};
+    use zinder_source::SourceBlock;
+    use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+    use zinder_testkit::sample_regtest_upgrade_activations;
+
+    use super::{
+        BLOCK_PREPARE_FIXED_PEAK_BYTES, BLOCK_PREPARE_PEAK_RAW_BYTE_MULTIPLIER,
+        BlockPrepareStreamState, ByteWatermark, FuturesUnordered, IngestError, QueuedPreparedBlock,
+        block_commit_preparation_resident_bytes, canonical_block_facts_heap_bytes,
+        compact_block_heap_bytes, current_schema_transparent_outputs,
+        estimated_peak_block_prepare_bytes, prepare_resolved_window, prepared_block_resident_bytes,
+        retained_raw_blob_heap_bytes, schedule_block_prepare,
+    };
+    use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block};
+
+    #[test]
+    fn peak_estimate_scales_from_raw_capacity_with_fixed_headroom() {
+        assert_eq!(
+            estimated_peak_block_prepare_bytes(0),
+            BLOCK_PREPARE_FIXED_PEAK_BYTES + BLOCK_PREPARE_PEAK_RAW_BYTE_MULTIPLIER
+        );
+        assert_eq!(
+            estimated_peak_block_prepare_bytes(1_024),
+            BLOCK_PREPARE_FIXED_PEAK_BYTES + (1_024 * BLOCK_PREPARE_PEAK_RAW_BYTE_MULTIPLIER)
+        );
+    }
+
+    #[test]
+    fn peak_estimate_covers_fixture_prepare_residency_across_blob_policies()
+    -> Result<(), Box<dyn Error>> {
+        let source_block = regtest_fixture_block()?;
+        let activations = sample_regtest_upgrade_activations();
+        let estimated_peak_bytes =
+            estimated_peak_block_prepare_bytes(source_block.raw_block_bytes.capacity());
+        let no_blobs = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::None)?;
+        let transaction_blobs =
+            prepare_canonical_block(&source_block, &activations, RawBlobPolicy::Transactions)?;
+        let all_blobs = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::All)?;
+
+        let no_blob_resident_bytes = prepared_block_resident_bytes(&no_blobs);
+        let transaction_blob_resident_bytes = prepared_block_resident_bytes(&transaction_blobs);
+        let all_blob_resident_bytes = prepared_block_resident_bytes(&all_blobs);
+
+        assert!(canonical_block_facts_heap_bytes(&no_blobs.facts) > 0);
+        assert!(compact_block_heap_bytes(&no_blobs.partial_compact_block) > 0);
+        assert!(!no_blobs.replay_envelope.as_bytes().is_empty());
+        assert_eq!(retained_raw_blob_heap_bytes(&no_blobs), 0);
+        assert!(transaction_blob_resident_bytes > no_blob_resident_bytes);
+        assert!(all_blob_resident_bytes > transaction_blob_resident_bytes);
+        assert!(estimated_peak_bytes >= all_blob_resident_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_window_reservation_covers_commit_handoff_and_cache_ownership()
+    -> Result<(), Box<dyn Error>> {
+        let source_block = regtest_fixture_block()?;
+        let prepared = prepare_canonical_block(
+            &source_block,
+            &sample_regtest_upgrade_activations(),
+            RawBlobPolicy::All,
+        )?;
+        let created_outputs = current_schema_transparent_outputs(&prepared.facts);
+        assert!(!created_outputs.is_empty());
+
+        let prepared_resident_bytes = prepared_block_resident_bytes(&prepared);
+        let prepared_peak_bytes =
+            estimated_peak_block_prepare_bytes(source_block.raw_block_bytes.capacity())
+                .max(prepared_resident_bytes);
+        let watermark = ByteWatermark::new(
+            "test_block_prepare",
+            NonZeroU64::new(64 * 1_024 * 1_024).ok_or("invalid test watermark")?,
+        );
+        let reservation = watermark
+            .try_reserve(prepared_peak_bytes)
+            .ok_or("prepared block reservation should fit")?;
+        let tempdir = tempfile::tempdir()?;
+        let store = PrimaryChainStore::open(
+            tempdir.path(),
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let mut state = test_block_prepare_state((), watermark.clone(), store, source_block.height);
+        let resolved_blocks = prepare_resolved_window(
+            &mut state,
+            vec![QueuedPreparedBlock {
+                prepared,
+                resident_bytes: prepared_resident_bytes,
+                reservation,
+            }],
+            vec![Vec::new()],
+            vec![created_outputs],
+            &HashSet::new(),
+        );
+        let resolved_resident_bytes = block_commit_preparation_resident_bytes(&resolved_blocks[0]);
+        let cache = state
+            .recent_outputs
+            .as_mut()
+            .ok_or("created outputs should populate the recent-output cache")?;
+        let cache_resident_bytes = cache.resident_bytes;
+
+        assert_eq!(
+            watermark.snapshot().reserved_bytes,
+            resolved_resident_bytes.saturating_add(cache_resident_bytes)
+        );
+
+        drop(resolved_blocks);
+        assert_eq!(watermark.snapshot().reserved_bytes, cache_resident_bytes);
+
+        while cache.evict_oldest() {}
+        assert_eq!(watermark.snapshot().reserved_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_prepare_retains_admission_peak_until_prevout_resolution()
+    -> Result<(), Box<dyn Error>> {
+        let source_block = regtest_fixture_block()?;
+        let prepared_peak_bytes =
+            estimated_peak_block_prepare_bytes(source_block.raw_block_bytes.capacity());
+        let watermark = ByteWatermark::new(
+            "test_block_prepare",
+            NonZeroU64::new(64 * 1_024 * 1_024).ok_or("invalid test watermark")?,
+        );
+        let tempdir = tempfile::tempdir()?;
+        let store = PrimaryChainStore::open(
+            tempdir.path(),
+            ChainStoreOptions::for_network(Network::ZcashRegtest),
+        )?;
+        let activations = Arc::new(sample_regtest_upgrade_activations());
+        let prepare_fn = move |source_block: SourceBlock| {
+            let activations = Arc::clone(&activations);
+            async move {
+                prepare_canonical_block(&source_block, &activations, RawBlobPolicy::None)
+                    .map_err(IngestError::from)
+            }
+        };
+        let mut state =
+            test_block_prepare_state(prepare_fn, watermark.clone(), store, source_block.height);
+
+        schedule_block_prepare(&mut state, source_block)
+            .map_err(|_| "block prepare should be admitted")?;
+        assert_eq!(watermark.snapshot().reserved_bytes, prepared_peak_bytes);
+
+        let prepared_block = state
+            .in_flight_block_prepares
+            .next()
+            .await
+            .ok_or("scheduled block prepare should complete")??;
+        assert_eq!(
+            watermark.snapshot().reserved_bytes,
+            prepared_peak_bytes.max(prepared_block.resident_bytes)
+        );
+
+        drop(prepared_block);
+        assert_eq!(watermark.snapshot().reserved_bytes, 0);
+        Ok(())
+    }
+
+    fn test_block_prepare_state<F>(
+        prepare_fn: F,
+        watermark: ByteWatermark,
+        store: PrimaryChainStore,
+        to_height: BlockHeight,
+    ) -> BlockPrepareStreamState<'static, F> {
+        BlockPrepareStreamState {
+            source_blocks: stream::empty().boxed(),
+            in_flight_block_prepares: FuturesUnordered::new(),
+            completed_block_prepares: BTreeMap::default(),
+            completed_block_prepare_resident_bytes: 0,
+            pending_source_chunk: None,
+            prepare_fn,
+            store,
+            block_prepare_concurrency: 1,
+            block_prepare_watermark: watermark,
+            recent_outputs: None,
+            prevout_coalesce_deadline: None,
+            next_emit_height: None,
+            to_height,
+            source_exhausted: true,
+        }
+    }
+
+    fn regtest_fixture_block() -> Result<SourceBlock, Box<dyn Error>> {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/z3-regtest-block-1.json"))?;
+        let raw_block_hex = fixture
+            .get("raw_block_hex")
+            .and_then(Value::as_str)
+            .ok_or("fixture raw_block_hex is missing")?;
+        let raw_block_bytes = hex::decode(raw_block_hex)?;
+        let height = fixture
+            .get("height")
+            .and_then(Value::as_u64)
+            .and_then(|height| u32::try_from(height).ok())
+            .ok_or("fixture height is missing")?;
+        Ok(SourceBlock::from_raw_block_bytes(
+            Network::ZcashRegtest,
+            BlockHeight::new(height),
+            raw_block_bytes,
+        )?)
+    }
 }

@@ -23,16 +23,17 @@ use zinder_derive::{
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
     bundled_projection_definitions,
 };
+use zinder_ingest::RawBlobPolicy;
 use zinder_store::{
     ChainEpochReadApi, ChainEvent, ChainEventHistoryRequest, ChainStoreOptions, PrimaryChainStore,
-    RocksDbResourceBudget, SecondaryChainStore, StoreError, StreamCursorTokenV1,
+    RawBlobRetention, RocksDbResourceBudget, SecondaryChainStore, StoreError, StreamCursorTokenV1,
 };
 
 use crate::{IngestError, config::BackupCommandConfig};
 
 pub(crate) const BACKUP_MANIFEST_FILE_NAME: &str = "zinder-backup-manifest.json";
 pub(crate) const RESTORE_ADMISSION_FILE_NAME: &str = "zinder-restore-admission.json";
-const BACKUP_MANIFEST_FORMAT_VERSION: u32 = 2;
+const BACKUP_MANIFEST_FORMAT_VERSION: u32 = 3;
 const BACKUP_MANIFEST_TEMP_FILE_NAME: &str = ".zinder-backup-manifest.json.tmp";
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,8 +42,27 @@ struct BackupManifest {
     format_version: u32,
     network: String,
     projection_preset: String,
+    raw_blob_retention: BackupRawBlobRetention,
     canonical_position: Option<CanonicalBackupPosition>,
     projections: Vec<ProjectionBackupPosition>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BackupRawBlobRetention {
+    None,
+    Transactions,
+    All,
+}
+
+impl From<RawBlobPolicy> for BackupRawBlobRetention {
+    fn from(policy: RawBlobPolicy) -> Self {
+        match policy {
+            RawBlobPolicy::None => Self::None,
+            RawBlobPolicy::Transactions => Self::Transactions,
+            RawBlobPolicy::All => Self::All,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -106,19 +126,38 @@ pub(crate) enum RestoreAdmission {
     PreviouslyAdmitted,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RestoreAdmissionOptions {
+    pub(crate) network: Network,
+    pub(crate) projection_preset: ProjectionPreset,
+    pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
+    pub(crate) derive_rocksdb_budget: RocksDbResourceBudget,
+    pub(crate) raw_blob_policy: RawBlobPolicy,
+}
+
 trait CanonicalBackupRead: ChainEpochReadApi {
     fn current_backup_chain_epoch(&self) -> Result<Option<ChainEpoch>, StoreError>;
+
+    fn persisted_raw_blob_retention(&self) -> Result<RawBlobRetention, StoreError>;
 }
 
 impl CanonicalBackupRead for PrimaryChainStore {
     fn current_backup_chain_epoch(&self) -> Result<Option<ChainEpoch>, StoreError> {
         self.current_chain_epoch()
     }
+
+    fn persisted_raw_blob_retention(&self) -> Result<RawBlobRetention, StoreError> {
+        self.raw_blob_retention()
+    }
 }
 
 impl CanonicalBackupRead for SecondaryChainStore {
     fn current_backup_chain_epoch(&self) -> Result<Option<ChainEpoch>, StoreError> {
         self.current_chain_epoch()
+    }
+
+    fn persisted_raw_blob_retention(&self) -> Result<RawBlobRetention, StoreError> {
+        self.raw_blob_retention()
     }
 }
 
@@ -191,6 +230,11 @@ fn build_backup_manifest(
     derive_store: &DeriveStore,
     projection_preset: ProjectionPreset,
 ) -> Result<BackupManifest, IngestError> {
+    let persisted_raw_blob_retention = canonical_store.persisted_raw_blob_retention()?;
+    validate_configured_raw_blob_retention(
+        persisted_raw_blob_retention,
+        backup_config.raw_blob_policy,
+    )?;
     let canonical_epoch = canonical_store.current_backup_chain_epoch()?;
     let canonical_history_bounds = canonical_store.canonical_history_bounds()?;
     let canonical_position = match (canonical_epoch, canonical_history_bounds) {
@@ -230,9 +274,41 @@ fn build_backup_manifest(
         format_version: BACKUP_MANIFEST_FORMAT_VERSION,
         network: encode_zinder_native_chain_name(backup_config.network).to_owned(),
         projection_preset: projection_preset.as_str().to_owned(),
+        raw_blob_retention: backup_config.raw_blob_policy.into(),
         canonical_position,
         projections,
     })
+}
+
+fn validate_configured_raw_blob_retention(
+    persisted: RawBlobRetention,
+    configured_policy: RawBlobPolicy,
+) -> Result<(), IngestError> {
+    let configured = configured_policy.to_retention();
+    if persisted != configured {
+        return Err(StoreError::RawBlobRetentionMismatch {
+            persisted,
+            configured,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_recorded_raw_blob_retention(
+    recorded: BackupRawBlobRetention,
+    persisted: RawBlobRetention,
+    configured_policy: RawBlobPolicy,
+    bundle_path: &Path,
+) -> Result<(), IngestError> {
+    validate_configured_raw_blob_retention(persisted, configured_policy)?;
+    if recorded != BackupRawBlobRetention::from(configured_policy) {
+        return Err(backup_validation_error(
+            bundle_path,
+            "manifest raw-blob retention does not match the configured store contract",
+        ));
+    }
+    Ok(())
 }
 
 fn canonical_history_backup_bounds(bounds: CanonicalHistoryBounds) -> CanonicalHistoryBackupBounds {
@@ -671,6 +747,12 @@ fn validate_staged_backup_bundle(
             ..ChainStoreOptions::for_network(backup_config.network)
         },
     )?;
+    validate_recorded_raw_blob_retention(
+        recorded_manifest.raw_blob_retention,
+        canonical_store.raw_blob_retention()?,
+        backup_config.raw_blob_policy,
+        bundle_staging_path,
+    )?;
     let derive_store = DeriveStore::open_secondary_with_projection_preset(
         DeriveStore::path_for_canonical(bundle_staging_path),
         scratch.derive_path(),
@@ -699,11 +781,15 @@ fn validate_staged_backup_bundle(
 
 pub(crate) fn admit_restore_bundle_if_present(
     bundle_path: &Path,
-    network: Network,
-    projection_preset: ProjectionPreset,
-    canonical_rocksdb_budget: RocksDbResourceBudget,
-    derive_rocksdb_budget: RocksDbResourceBudget,
+    options: RestoreAdmissionOptions,
 ) -> Result<RestoreAdmission, IngestError> {
+    let RestoreAdmissionOptions {
+        network,
+        projection_preset,
+        canonical_rocksdb_budget,
+        derive_rocksdb_budget,
+        raw_blob_policy,
+    } = options;
     let pending_manifest_path = bundle_path.join(BACKUP_MANIFEST_FILE_NAME);
     let admission_path = bundle_path.join(RESTORE_ADMISSION_FILE_NAME);
     let pending_manifest_exists = pending_manifest_path.exists();
@@ -721,6 +807,7 @@ pub(crate) fn admit_restore_bundle_if_present(
             &admitted_manifest,
             network,
             projection_preset,
+            raw_blob_policy,
             bundle_path,
         )?;
         return Ok(RestoreAdmission::PreviouslyAdmitted);
@@ -734,6 +821,7 @@ pub(crate) fn admit_restore_bundle_if_present(
         storage_path: bundle_path.to_path_buf(),
         canonical_rocksdb_budget,
         derive_rocksdb_budget,
+        raw_blob_policy,
         to_path: bundle_path.to_path_buf(),
     };
     validate_staged_backup_bundle(&validation_config, bundle_path, projection_preset)?;
@@ -822,6 +910,7 @@ fn validate_consumed_restore_evidence(
     manifest: &BackupManifest,
     expected_network: Network,
     expected_preset: ProjectionPreset,
+    expected_raw_blob_policy: RawBlobPolicy,
     bundle_path: &Path,
 ) -> Result<(), IngestError> {
     if manifest.format_version != BACKUP_MANIFEST_FORMAT_VERSION {
@@ -840,6 +929,12 @@ fn validate_consumed_restore_evidence(
         return Err(backup_validation_error(
             bundle_path,
             "consumed restore evidence preset does not match the opened store",
+        ));
+    }
+    if manifest.raw_blob_retention != BackupRawBlobRetention::from(expected_raw_blob_policy) {
+        return Err(backup_validation_error(
+            bundle_path,
+            "consumed restore evidence raw-blob retention does not match the configured store contract",
         ));
     }
     if let Some(canonical) = &manifest.canonical_position {
@@ -1117,7 +1212,7 @@ mod tests {
         TRANSACTION_HISTORY_CONSUMER_NAME,
     };
     use zinder_store::{ChainStoreOptions, RocksDbResourceBudget};
-    use zinder_testkit::ChainFixture;
+    use zinder_testkit::{ChainFixture, encode_fixture_block_replay};
 
     use super::*;
 
@@ -1137,7 +1232,7 @@ mod tests {
         let commit = canonical_store.commit_chain_epoch(artifacts)?;
         let derive_store = DeriveStore::open_with_projection_preset(
             DeriveStore::path_for_canonical(&storage_path),
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
             DeriveStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..DeriveStoreOptions::default()
@@ -1152,6 +1247,7 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: tempdir.path().join("checkpoint"),
         };
 
@@ -1159,7 +1255,7 @@ mod tests {
             &config,
             &canonical_store,
             &derive_store,
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
         )?;
         let paid_fee = manifest
             .projections
@@ -1201,6 +1297,7 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: checkpoint_path.clone(),
         };
 
@@ -1209,6 +1306,7 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(checkpoint_path.join(BACKUP_MANIFEST_FILE_NAME))?)?;
         assert_eq!(manifest["format_version"], BACKUP_MANIFEST_FORMAT_VERSION);
+        assert_eq!(manifest["raw_blob_retention"], "none");
         assert_eq!(
             manifest["canonical_position"]["visible_tip_hash"],
             encode_rpc_block_hash_hex(commit.chain_epoch.visible_tip_hash)
@@ -1346,6 +1444,7 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: tempdir.path().join("checkpoint"),
         };
 
@@ -1456,6 +1555,7 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: checkpoint_path.clone(),
         };
 
@@ -1511,6 +1611,7 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: checkpoint_path.clone(),
         };
 
@@ -1549,6 +1650,7 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: checkpoint_path.clone(),
         };
 
@@ -1584,9 +1686,12 @@ mod tests {
         let chain_epoch = fixture
             .chain_epoch(ChainEpochId::new(u64::from(height)))
             .ok_or("fixture epoch missing")?;
+        let block_header = block.block_header_artifact();
+        let replay_envelope = encode_fixture_block_replay(&block_header, &[]);
         let artifacts = zinder_store::ChainEpochArtifacts::new(
             chain_epoch,
-            vec![block.block_header_artifact()],
+            vec![block_header],
+            vec![replay_envelope],
             vec![block.compact_block_artifact()],
         )
         .with_reorg_window_change(zinder_store::ReorgWindowChange::Extend {
@@ -1642,7 +1747,7 @@ mod tests {
             .ok_or("canonical epoch missing")?;
         let derive_store = DeriveStore::open_with_projection_preset(
             DeriveStore::path_for_canonical(&storage_path),
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
             DeriveStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..DeriveStoreOptions::default()
@@ -1657,6 +1762,7 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: tempdir.path().join("checkpoint"),
         };
 
@@ -1664,7 +1770,7 @@ mod tests {
             &config,
             &canonical_store,
             &derive_store,
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
         );
         assert!(matches!(
             incomplete,
@@ -1689,7 +1795,7 @@ mod tests {
             &config,
             &canonical_store,
             &derive_store,
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
         )?;
         let transaction_history = manifest
             .projections
@@ -1718,7 +1824,7 @@ mod tests {
         {
             let derive_store = DeriveStore::open_with_projection_preset(
                 DeriveStore::path_for_canonical(&storage_path),
-                ProjectionPreset::Complete,
+                ProjectionPreset::Explorer,
                 DeriveStoreOptions {
                     rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                     ..DeriveStoreOptions::default()
@@ -1734,11 +1840,12 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: checkpoint_path.clone(),
         };
 
         assert!(
-            create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Complete)
+            create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Explorer)
                 .is_err()
         );
         assert!(!checkpoint_path.exists());
@@ -1763,7 +1870,7 @@ mod tests {
         canonical_store.commit_chain_epoch(artifacts)?;
         let derive_store = DeriveStore::open_with_projection_preset(
             DeriveStore::path_for_canonical(&storage_path),
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
             DeriveStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..DeriveStoreOptions::default()
@@ -1774,13 +1881,14 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: checkpoint_path.clone(),
         };
         let staging_path = stage_backup_bundle_for_test(
             &config,
             &canonical_store,
             &derive_store,
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
         )?;
         drop(derive_store);
         let manifest_path = staging_path.join(BACKUP_MANIFEST_FILE_NAME);
@@ -1789,7 +1897,7 @@ mod tests {
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
         let outcome =
-            validate_staged_backup_bundle(&config, &staging_path, ProjectionPreset::Complete);
+            validate_staged_backup_bundle(&config, &staging_path, ProjectionPreset::Explorer);
 
         assert!(matches!(
             outcome,
@@ -1817,7 +1925,7 @@ mod tests {
         let commit = canonical_store.commit_chain_epoch(artifacts)?;
         let derive_store = DeriveStore::open_with_projection_preset(
             DeriveStore::path_for_canonical(&storage_path),
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
             DeriveStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..DeriveStoreOptions::default()
@@ -1832,19 +1940,20 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
             to_path: checkpoint_path.clone(),
         };
         let staging_path = stage_backup_bundle_for_test(
             &config,
             &canonical_store,
             &derive_store,
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
         )?;
         drop(derive_store);
         {
             let staged_derive = DeriveStore::open_with_projection_preset(
                 DeriveStore::path_for_canonical(&staging_path),
-                ProjectionPreset::Complete,
+                ProjectionPreset::Explorer,
                 DeriveStoreOptions {
                     rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                     ..DeriveStoreOptions::default()
@@ -1857,7 +1966,7 @@ mod tests {
         }
 
         assert!(
-            validate_staged_backup_bundle(&config, &staging_path, ProjectionPreset::Complete)
+            validate_staged_backup_bundle(&config, &staging_path, ProjectionPreset::Explorer)
                 .is_err()
         );
         assert!(!checkpoint_path.exists());
@@ -1868,15 +1977,16 @@ mod tests {
     #[test]
     fn valid_restore_bundle_is_admitted_once_before_writer_use()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Complete)?;
-        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Complete)?;
+        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Explorer)?;
+        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Explorer)?;
 
         let first_admission = admit_restore_bundle_if_present(
             &config.to_path,
-            config.network,
-            ProjectionPreset::Complete,
-            config.canonical_rocksdb_budget,
-            config.derive_rocksdb_budget,
+            fixture_restore_admission_options(
+                &config,
+                ProjectionPreset::Explorer,
+                config.raw_blob_policy,
+            ),
         )?;
 
         assert_eq!(first_admission, RestoreAdmission::NewlyAdmitted);
@@ -1885,7 +1995,7 @@ mod tests {
 
         let derive_store = DeriveStore::open_with_projection_preset(
             DeriveStore::path_for_canonical(&config.to_path),
-            ProjectionPreset::Complete,
+            ProjectionPreset::Explorer,
             DeriveStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..DeriveStoreOptions::default()
@@ -1897,27 +2007,108 @@ mod tests {
 
         let second_admission = admit_restore_bundle_if_present(
             &config.to_path,
-            config.network,
-            ProjectionPreset::Complete,
-            config.canonical_rocksdb_budget,
-            config.derive_rocksdb_budget,
+            fixture_restore_admission_options(
+                &config,
+                ProjectionPreset::Explorer,
+                config.raw_blob_policy,
+            ),
         )?;
         assert_eq!(second_admission, RestoreAdmission::PreviouslyAdmitted);
         Ok(())
     }
 
     #[test]
-    fn consumed_restore_evidence_survives_later_catalog_and_schema_changes()
+    fn restore_retention_mismatch_preserves_pending_evidence_until_config_is_corrected()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Complete)?;
-        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Complete)?;
+        let (_tempdir, config, canonical_store) =
+            backup_fixture_with_raw_blob_policy(ProjectionPreset::Explorer, RawBlobPolicy::All)?;
+        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Explorer)?;
+        let pending_manifest_path = config.to_path.join(BACKUP_MANIFEST_FILE_NAME);
+        let admission_path = config.to_path.join(RESTORE_ADMISSION_FILE_NAME);
+
+        let mismatched_admission = admit_restore_bundle_if_present(
+            &config.to_path,
+            fixture_restore_admission_options(
+                &config,
+                ProjectionPreset::Explorer,
+                RawBlobPolicy::None,
+            ),
+        );
+
+        assert!(matches!(
+            mismatched_admission,
+            Err(IngestError::Store(StoreError::RawBlobRetentionMismatch {
+                persisted: RawBlobRetention::All,
+                configured: RawBlobRetention::None,
+            }))
+        ));
+        assert!(pending_manifest_path.exists());
+        assert!(!admission_path.exists());
+
         assert_eq!(
             admit_restore_bundle_if_present(
                 &config.to_path,
-                config.network,
-                ProjectionPreset::Complete,
-                config.canonical_rocksdb_budget,
-                config.derive_rocksdb_budget,
+                fixture_restore_admission_options(
+                    &config,
+                    ProjectionPreset::Explorer,
+                    RawBlobPolicy::All,
+                ),
+            )?,
+            RestoreAdmission::NewlyAdmitted
+        );
+        assert!(!pending_manifest_path.exists());
+        assert!(admission_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_restore_evidence_rejects_a_different_retention_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_tempdir, config, canonical_store) =
+            backup_fixture_with_raw_blob_policy(ProjectionPreset::Explorer, RawBlobPolicy::All)?;
+        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Explorer)?;
+        assert_eq!(
+            admit_restore_bundle_if_present(
+                &config.to_path,
+                fixture_restore_admission_options(
+                    &config,
+                    ProjectionPreset::Explorer,
+                    RawBlobPolicy::All,
+                ),
+            )?,
+            RestoreAdmission::NewlyAdmitted
+        );
+
+        let mismatched_restart = admit_restore_bundle_if_present(
+            &config.to_path,
+            fixture_restore_admission_options(
+                &config,
+                ProjectionPreset::Explorer,
+                RawBlobPolicy::None,
+            ),
+        );
+
+        assert!(matches!(
+            mismatched_restart,
+            Err(IngestError::BackupCheckpointValidation { .. })
+        ));
+        assert!(config.to_path.join(RESTORE_ADMISSION_FILE_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn consumed_restore_evidence_survives_later_catalog_and_schema_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Explorer)?;
+        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Explorer)?;
+        assert_eq!(
+            admit_restore_bundle_if_present(
+                &config.to_path,
+                fixture_restore_admission_options(
+                    &config,
+                    ProjectionPreset::Explorer,
+                    config.raw_blob_policy,
+                ),
             )?,
             RestoreAdmission::NewlyAdmitted
         );
@@ -1933,10 +2124,11 @@ mod tests {
 
         let admission = admit_restore_bundle_if_present(
             &config.to_path,
-            config.network,
-            ProjectionPreset::Complete,
-            config.canonical_rocksdb_budget,
-            config.derive_rocksdb_budget,
+            fixture_restore_admission_options(
+                &config,
+                ProjectionPreset::Explorer,
+                config.raw_blob_policy,
+            ),
         )?;
 
         assert_eq!(admission, RestoreAdmission::PreviouslyAdmitted);
@@ -1946,8 +2138,8 @@ mod tests {
     #[test]
     fn tampered_restore_manifest_fails_without_consuming_pending_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Complete)?;
-        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Complete)?;
+        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Explorer)?;
+        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Explorer)?;
         let manifest_path = config.to_path.join(BACKUP_MANIFEST_FILE_NAME);
         let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
         manifest["network"] = "zcash-testnet".into();
@@ -1955,10 +2147,11 @@ mod tests {
 
         let admission = admit_restore_bundle_if_present(
             &config.to_path,
-            config.network,
-            ProjectionPreset::Complete,
-            config.canonical_rocksdb_budget,
-            config.derive_rocksdb_budget,
+            fixture_restore_admission_options(
+                &config,
+                ProjectionPreset::Explorer,
+                config.raw_blob_policy,
+            ),
         );
 
         assert!(matches!(
@@ -1972,15 +2165,16 @@ mod tests {
 
     #[test]
     fn conflicting_restore_evidence_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
-        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Complete)?;
-        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Complete)?;
+        let (_tempdir, config, canonical_store) = backup_fixture(ProjectionPreset::Explorer)?;
+        create_backup_checkpoints(&config, &canonical_store, ProjectionPreset::Explorer)?;
         assert_eq!(
             admit_restore_bundle_if_present(
                 &config.to_path,
-                config.network,
-                ProjectionPreset::Complete,
-                config.canonical_rocksdb_budget,
-                config.derive_rocksdb_budget,
+                fixture_restore_admission_options(
+                    &config,
+                    ProjectionPreset::Explorer,
+                    config.raw_blob_policy,
+                ),
             )?,
             RestoreAdmission::NewlyAdmitted
         );
@@ -1991,10 +2185,11 @@ mod tests {
 
         let admission = admit_restore_bundle_if_present(
             &config.to_path,
-            config.network,
-            ProjectionPreset::Complete,
-            config.canonical_rocksdb_budget,
-            config.derive_rocksdb_budget,
+            fixture_restore_admission_options(
+                &config,
+                ProjectionPreset::Explorer,
+                config.raw_blob_policy,
+            ),
         );
         assert!(matches!(
             admission,
@@ -2008,13 +2203,8 @@ mod tests {
         let tempdir = tempdir()?;
         fs::write(tempdir.path().join(RESTORE_ADMISSION_FILE_NAME), b"{}")?;
 
-        let admission = admit_restore_bundle_if_present(
-            tempdir.path(),
-            Network::ZcashRegtest,
-            ProjectionPreset::Complete,
-            RocksDbResourceBudget::for_local_tests(),
-            RocksDbResourceBudget::for_local_tests(),
-        );
+        let admission =
+            admit_restore_bundle_if_present(tempdir.path(), local_restore_admission_options());
         assert!(matches!(
             admission,
             Err(IngestError::BackupManifestDecode { .. })
@@ -2027,16 +2217,34 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let tempdir = tempdir()?;
         assert_eq!(
-            admit_restore_bundle_if_present(
-                tempdir.path(),
-                Network::ZcashRegtest,
-                ProjectionPreset::Complete,
-                RocksDbResourceBudget::for_local_tests(),
-                RocksDbResourceBudget::for_local_tests(),
-            )?,
+            admit_restore_bundle_if_present(tempdir.path(), local_restore_admission_options(),)?,
             RestoreAdmission::NotApplicable
         );
         Ok(())
+    }
+
+    fn fixture_restore_admission_options(
+        config: &BackupCommandConfig,
+        projection_preset: ProjectionPreset,
+        raw_blob_policy: RawBlobPolicy,
+    ) -> RestoreAdmissionOptions {
+        RestoreAdmissionOptions {
+            network: config.network,
+            projection_preset,
+            canonical_rocksdb_budget: config.canonical_rocksdb_budget,
+            derive_rocksdb_budget: config.derive_rocksdb_budget,
+            raw_blob_policy,
+        }
+    }
+
+    fn local_restore_admission_options() -> RestoreAdmissionOptions {
+        RestoreAdmissionOptions {
+            network: Network::ZcashRegtest,
+            projection_preset: ProjectionPreset::Explorer,
+            canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
+        }
     }
 
     fn backup_fixture(
@@ -2045,13 +2253,27 @@ mod tests {
         (tempfile::TempDir, BackupCommandConfig, PrimaryChainStore),
         Box<dyn std::error::Error>,
     > {
+        backup_fixture_with_raw_blob_policy(projection_preset, RawBlobPolicy::None)
+    }
+
+    fn backup_fixture_with_raw_blob_policy(
+        projection_preset: ProjectionPreset,
+        raw_blob_policy: RawBlobPolicy,
+    ) -> Result<
+        (tempfile::TempDir, BackupCommandConfig, PrimaryChainStore),
+        Box<dyn std::error::Error>,
+    > {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("source");
         let canonical_store = PrimaryChainStore::open(
             &storage_path,
-            ChainStoreOptions::for_network(Network::ZcashRegtest),
+            ChainStoreOptions {
+                raw_blob_retention: raw_blob_policy.to_retention(),
+                ..ChainStoreOptions::for_network(Network::ZcashRegtest)
+            },
         )?;
         let artifacts = ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(raw_blob_policy.to_retention())
             .extend_blocks(1)
             .chain_epoch_artifacts(ChainEpochId::new(1))
             .ok_or("chain fixture unexpectedly empty")?;
@@ -2069,6 +2291,7 @@ mod tests {
             storage_path,
             canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
             derive_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy,
             to_path: tempdir.path().join("checkpoint"),
         };
         Ok((tempdir, config, canonical_store))

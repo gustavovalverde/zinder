@@ -5,12 +5,14 @@
 //! storage engine, node client, or wallet protocol crate.
 
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
-compile_error!("Zinder supports only 32-bit and wider targets.");
+compile_error!("Zinder supports only 32-bit and 64-bit pointer-width targets.");
 
 pub mod artifact_family;
 mod block_artifact;
 mod block_header;
 mod block_id;
+mod canonical_block_facts;
+mod canonical_block_replay;
 mod canonical_history;
 mod chain_epoch;
 mod chain_value_pools;
@@ -40,6 +42,19 @@ pub use block_artifact::{
 };
 pub use block_header::BlockHeaderInfo;
 pub use block_id::{BlockId, BlockSelector};
+pub use canonical_block_facts::{
+    CanonicalBlockFacts, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
+    CanonicalBlockFactsReferenceEncoding, CanonicalBlockFactsSequenceDigest,
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalBlockFactsSequenceLengthOverflow, CanonicalTransactionFacts, SerializedBytesDigest,
+    UnsupportedCanonicalBlockFactsDigestVersion,
+    UnsupportedCanonicalBlockFactsSequenceDigestVersion,
+};
+pub use canonical_block_replay::{
+    CanonicalBlockReplayDecodeError, CanonicalBlockReplayEnvelope,
+    CanonicalBlockReplayFormatVersion, UnsupportedCanonicalBlockReplayFormatVersion,
+    ValidatedCanonicalBlockReplay, decode_canonical_block_replay, encode_canonical_block_replay,
+};
 pub use canonical_history::{CanonicalHistoryBounds, CanonicalHistoryBoundsError};
 pub use chain_epoch::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter,
@@ -58,7 +73,9 @@ pub use mempool::{
 };
 pub use network_upgrade_activations::{
     ConsensusBranchId, NetworkUpgradeActivation, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsError,
+    NetworkUpgradeActivationsError, NetworkUpgradeActivationsFingerprint,
+    NetworkUpgradeActivationsFingerprintVersion,
+    UnsupportedNetworkUpgradeActivationsFingerprintVersion,
 };
 pub use subtree_root::{
     SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
@@ -86,4 +103,9 @@ pub use transparent_output::{
     TransparentUnspentOutputsByOutpointResponse,
 };
 pub use transparent_utxo_set_summary::TransparentUtxoSetSummary;
-pub use tree_state::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, TreeStateArtifact};
+pub use tree_state::{
+    BlockFinalNoteCommitmentRoots, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
+    CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, TreeStateArtifact,
+};

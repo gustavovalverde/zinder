@@ -52,7 +52,8 @@ impl ByteWatermark {
         let mut state = self.inner.lock();
         let next_reserved_bytes = state.reserved_bytes.checked_add(bytes)?;
         let first_reservation = state.reservations == 0;
-        if next_reserved_bytes > self.limit_bytes.get() && !first_reservation {
+        let is_over_limit = next_reserved_bytes > self.limit_bytes.get();
+        if is_over_limit && !first_reservation {
             metrics::counter!(
                 "zinder_ingest_bulk_pipeline_watermark_blocked_total",
                 "stage" => self.stage
@@ -66,6 +67,9 @@ impl ByteWatermark {
         let snapshot = self.snapshot_from_state(&state);
         drop(state);
         self.record(snapshot);
+        if is_over_limit {
+            self.record_oversized("single_reservation");
+        }
         Some(ByteReservation {
             watermark: self.clone(),
             bytes,
@@ -80,6 +84,7 @@ impl ByteWatermark {
 
     fn resize(&self, current_bytes: u64, next_bytes: u64) {
         let mut state = self.inner.lock();
+        let was_over_limit = state.reserved_bytes > self.limit_bytes.get();
         state.reserved_bytes = state
             .reserved_bytes
             .saturating_sub(current_bytes)
@@ -87,6 +92,9 @@ impl ByteWatermark {
         let snapshot = self.snapshot_from_state(&state);
         drop(state);
         self.record(snapshot);
+        if snapshot.is_over_limit() && !was_over_limit {
+            self.record_oversized("reservation_resize");
+        }
     }
 
     fn release(&self, bytes: u64) {
@@ -118,9 +126,37 @@ impl ByteWatermark {
         )
         .set(f64::from(snapshot.reservations));
     }
+
+    fn record_oversized(&self, reason: &'static str) {
+        metrics::counter!(
+            "zinder_ingest_bulk_pipeline_watermark_oversized_total",
+            "stage" => self.stage,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+}
+
+impl WatermarkSnapshot {
+    /// Returns whether accepted or measured work currently exceeds the
+    /// admission limit.
+    ///
+    /// The watermark permits one oversized reservation so a single large work
+    /// item can make progress, and a measured resize can reveal that an
+    /// estimate was low. Both states stop additional admission until existing
+    /// reservations fall back under the configured limit.
+    #[must_use]
+    pub(crate) const fn is_over_limit(self) -> bool {
+        self.reserved_bytes > self.limit_bytes
+    }
 }
 
 impl ByteReservation {
+    /// Replaces an admission estimate with the measured retained bytes.
+    ///
+    /// A measurement can exceed the configured limit because the allocation
+    /// already exists. The watermark records that transition and blocks new
+    /// reservations; it is admission control, not a hard allocator cap.
     pub(crate) fn resize(&mut self, next_bytes: u64) {
         if self.is_released.load(Ordering::Acquire) {
             return;
@@ -252,6 +288,24 @@ mod tests {
         reservation.resize(70);
 
         assert_eq!(watermark.snapshot().reserved_bytes, 70);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_resize_blocks_new_admission_until_release() -> Result<(), Box<dyn Error>> {
+        let watermark = ByteWatermark::new(
+            "test_stage",
+            NonZeroU64::new(100).ok_or("invalid watermark")?,
+        );
+        let mut reservation = watermark.try_reserve(40).ok_or("reservation should fit")?;
+
+        reservation.resize(120);
+
+        assert!(watermark.snapshot().is_over_limit());
+        assert!(watermark.try_reserve(1).is_none());
+        reservation.release();
+        assert!(!watermark.snapshot().is_over_limit());
+        assert!(watermark.try_reserve(1).is_some());
         Ok(())
     }
 }

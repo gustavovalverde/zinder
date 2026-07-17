@@ -28,9 +28,9 @@ use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHash, BlockHeight, BlockId, Network, ShieldedProtocol, SubtreeRootIndex};
 use zinder_ingest::{
-    BulkCatchupConfig, DeriveReplayPolicy, IngestDeriveConfig, IngestLoopConfig, IngestModifiers,
-    NodeSourceKind, PhasesConfig, TipFollowPhaseConfig, TipFollowSubsystems,
-    TipFollowSubsystemsLauncher, run_ingest_loop,
+    BulkCatchupConfig, CanonicalPipelineLimits, DeriveReplayPolicy, IngestDeriveConfig,
+    IngestLoopConfig, IngestModifiers, NodeSourceKind, PhasesConfig, TipFollowPhaseConfig,
+    TipFollowSubsystems, TipFollowSubsystemsLauncher, run_ingest_loop,
 };
 use zinder_runtime::{IngestPhase, Readiness};
 use zinder_source::{
@@ -170,6 +170,46 @@ async fn ingest_loop_exits_when_target_height_already_covered() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn ingest_loop_rejects_a_mismatched_writer_before_source_work() -> Result<()> {
+    let storage_path = tempdir()?.path().join("ingest-loop-mismatched-writer");
+    let store = PrimaryChainStore::open(
+        &storage_path,
+        ChainStoreOptions {
+            reorg_window_blocks: 25,
+            ..ChainStoreOptions::for_network(Network::ZcashRegtest)
+        },
+    )?;
+    let source = ControllableTipSource::new(ChainFixture::new(Network::ZcashRegtest));
+    source.set_tip_height(BlockHeight::new(1));
+    let config = sample_loop_config(&storage_path)?;
+
+    let error = match run_ingest_loop(
+        &config,
+        Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+        Arc::new(source.clone()),
+        store,
+        &Readiness::default(),
+        CancellationToken::new(),
+        Some(noop_launcher()),
+    )
+    .await
+    {
+        Ok(()) => return Err(eyre!("expected caller-owned writer mismatch")),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        zinder_ingest::IngestError::CanonicalWriterReorgWindowMismatch {
+            store_reorg_window_blocks: 25,
+            configured_reorg_window_blocks: 100,
+        }
+    ));
+    assert_eq!(source.fetch_attempts(), 0);
+    Ok(())
+}
+
 fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig> {
     Ok(IngestLoopConfig {
         node: NodeTarget::new(
@@ -183,7 +223,7 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         derive_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         storage_path: storage_path.to_path_buf(),
-        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
+        raw_blob_policy: zinder_ingest::RawBlobPolicy::None,
         reorg_window_blocks: 100,
         phases: PhasesConfig {
             catchup_threshold_blocks: 100,
@@ -215,16 +255,19 @@ fn sample_loop_config(storage_path: &std::path::Path) -> Result<IngestLoopConfig
                 zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
             )
             .ok_or_else(|| eyre!("nonzero"))?,
-            source_segment_max_blocks: NonZeroU32::new(128).ok_or_else(|| eyre!("nonzero"))?,
-            source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
-                .ok_or_else(|| eyre!("nonzero"))?,
-            source_fetch_max_in_flight_requests: NonZeroU32::new(8)
-                .ok_or_else(|| eyre!("nonzero"))?,
-            source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
-                .ok_or_else(|| eyre!("nonzero"))?,
-            block_prepare_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
-            block_prepare_max_in_flight_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-                .ok_or_else(|| eyre!("nonzero"))?,
+            pipeline_limits: CanonicalPipelineLimits {
+                max_response_bytes: DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+                source_segment_max_blocks: NonZeroU32::new(128).ok_or_else(|| eyre!("nonzero"))?,
+                source_segment_target_response_bytes: NonZeroU64::new(48 * 1024 * 1024)
+                    .ok_or_else(|| eyre!("nonzero"))?,
+                source_fetch_max_in_flight_requests: NonZeroU32::new(8)
+                    .ok_or_else(|| eyre!("nonzero"))?,
+                source_fetch_max_in_flight_bytes: NonZeroU64::new(256 * 1024 * 1024)
+                    .ok_or_else(|| eyre!("nonzero"))?,
+                block_prepare_concurrency: NonZeroU32::new(4).ok_or_else(|| eyre!("nonzero"))?,
+                block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
+                    .ok_or_else(|| eyre!("nonzero"))?,
+            },
             commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
                 .ok_or_else(|| eyre!("nonzero"))?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("nonzero"))?,

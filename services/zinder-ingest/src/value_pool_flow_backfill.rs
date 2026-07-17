@@ -353,17 +353,21 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::Value;
     use zinder_core::{
-        ArtifactSchemaVersion, BlockId, ChainEpoch, ChainEpochId, Network, UnixTimestampMillis,
+        BlockId, ChainEpoch, ChainEpochId, Network, UnixTimestampMillis,
         wire::encode_height_key_ascending,
     };
     use zinder_source::{
         NodeCapabilities, NodeSource, SourceBlock, SourceError, ZebraJsonRpcSource,
     };
-    use zinder_store::{ChainEpochArtifacts, RocksDbResourceBudget};
+    use zinder_store::{
+        CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, RocksDbResourceBudget,
+    };
     use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
     use super::*;
-    use crate::{CommitmentTreeSizes, derive_block, finalize_derived_block};
+    use crate::{
+        CommitmentTreeSizes, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
+    };
 
     struct FixtureSource {
         block: SourceBlock,
@@ -446,15 +450,29 @@ mod tests {
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the regression keeps preserved canonical state, source hydration, and cursor assertions together"
+        reason = "the regression keeps canonical state, source-observation, and cursor assertions together"
     )]
-    async fn preserved_store_startup_hydrates_missing_intrinsic_facts_from_source()
+    async fn current_store_startup_uses_persisted_intrinsic_facts_without_source_fetch()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         let source_block = regtest_fixture_block()?;
-        let derived = derive_block(&source_block, &sample_regtest_upgrade_activations())?;
+        let prepared = prepare_canonical_block(
+            &source_block,
+            &sample_regtest_upgrade_activations(),
+            RawBlobPolicy::None,
+        )?;
         let mut tree_sizes = CommitmentTreeSizes::default();
-        let built = finalize_derived_block(derived, &mut tree_sizes)?;
-        assert!(!built.transaction_intrinsic_value_balances.is_empty());
+        let block = position_canonical_block(prepared, &mut tree_sizes)?;
+        let replay_envelope = block.replay_envelope;
+        let current_schema_artifacts =
+            crate::artifact_builder::expand_current_schema_block_artifacts(
+                block.facts,
+                block.retained_raw_blobs,
+            )?;
+        assert!(
+            !current_schema_artifacts
+                .transaction_intrinsic_value_balances
+                .is_empty()
+        );
 
         let fixture = StoreFixture::open()?;
         let chain_store = fixture.chain_store().clone();
@@ -465,20 +483,27 @@ mod tests {
             visible_tip_hash: source_block.hash,
             settled_tip_height: BlockHeight::new(0),
             settled_tip_hash: source_block.parent_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(12),
-            tip_metadata: built.tip_metadata,
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+            tip_metadata: block.tip_metadata,
             created_at: UnixTimestampMillis::new(1_774_669_000_000),
         };
         chain_store.commit_chain_epoch(
             ChainEpochArtifacts::new(
                 chain_epoch,
-                vec![built.block_header],
-                vec![built.compact_block],
+                vec![current_schema_artifacts.block_header],
+                vec![replay_envelope],
+                vec![block.compact_block],
             )
-            .with_block_transaction_index(built.block_transaction_index)
-            .with_transaction_locations(built.transaction_locations)
-            .with_transaction_facts(built.transaction_facts)
-            .with_transaction_blobs(built.transaction_blobs),
+            .with_block_transaction_index(current_schema_artifacts.block_transaction_index)
+            .with_transaction_locations(current_schema_artifacts.transaction_locations)
+            .with_transaction_facts(current_schema_artifacts.transaction_facts)
+            .with_transaction_intrinsic_value_balances(
+                current_schema_artifacts.transaction_intrinsic_value_balances,
+            )
+            .with_transaction_blobs(current_schema_artifacts.transaction_blobs)
+            .with_transparent_outputs_by_outpoint(
+                current_schema_artifacts.transparent_outputs_by_outpoint,
+            ),
         )?;
         let transaction_id = chain_store
             .current_chain_epoch_reader()?
@@ -490,7 +515,7 @@ mod tests {
             chain_store
                 .current_chain_epoch_reader()?
                 .transaction_intrinsic_value_balances_by_id(transaction_id)?
-                .is_none()
+                .is_some()
         );
 
         let derive_store = crate::open_primary_derive_store_for_canonical(
@@ -533,7 +558,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
         assert_eq!(
             derive_store.get_chain_event_cursor(VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME)?,
             Some(b"existing-cursor".to_vec())

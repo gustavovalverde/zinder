@@ -8,49 +8,98 @@ use std::error::Error;
 use prost::Message;
 use serde_json::Value;
 use zebra_chain::{
-    block::Header as ZebraBlockHeader,
+    block::{Block as ZebraBlock, Header as ZebraBlockHeader},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
 };
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    Network, TransactionFactsArtifact, UnixTimestampMillis,
+    BlockHash, BlockHeight, CanonicalBlockFactsDigestVersion,
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
+    TransactionFactsArtifact, TransactionLocation, TransparentInputFact, UnixTimestampMillis,
 };
+use zinder_derive::project_block_summary_record;
 use zinder_ingest::{
-    ArtifactDeriveError, BlockMismatchField, BuiltArtifacts, CommitmentTreeSizes, RawBlobPolicy,
-    derive_block_with_raw_blob_policy, finalize_derived_block,
+    BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
+    PositionedCanonicalBlock, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
+};
+use zinder_proto::compat::lightwalletd::CompactBlock;
+use zinder_source::{SourceBlock, decode_rpc_block_hash};
+use zinder_store::{
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention,
+};
+use zinder_testkit::{
+    FixtureTransactionRows, StoreFixture, encode_fixture_block_replay_with_raw_block,
+    sample_regtest_upgrade_activations,
 };
 
 /// Runs the production two-stage pipeline against an empty offset.
 ///
-/// Calls `derive_block` then `finalize_derived_block` on `source_block`
+/// Calls `prepare_canonical_block` then `position_canonical_block` on `source_block`
 /// with a zeroed running commitment-tree position, returning the
-/// built `BuiltArtifacts`. Use this when a test wants the full
-/// artifact set from one fixture block.
-fn derive_for_test(source_block: &SourceBlock) -> Result<BuiltArtifacts, ArtifactDeriveError> {
+/// [`PositionedCanonicalBlock`]. Use this when a test wants the block-local facts
+/// together with position-dependent compact metadata.
+fn build_positioned_block_for_test(
+    source_block: &SourceBlock,
+) -> Result<PositionedCanonicalBlock, CanonicalBlockConstructionError> {
     let activations = sample_regtest_upgrade_activations();
-    let derived =
-        derive_block_with_raw_blob_policy(source_block, &activations, RawBlobPolicy::All)?;
-    let mut counters = CommitmentTreeSizes::default();
-    finalize_derived_block(derived, &mut counters)
+    let prepared = prepare_canonical_block(source_block, &activations, RawBlobPolicy::All)?;
+    let mut tree_sizes = CommitmentTreeSizes::default();
+    position_canonical_block(prepared, &mut tree_sizes)
 }
-use zinder_proto::compat::lightwalletd::CompactBlock;
-use zinder_source::{SourceBlock, decode_rpc_block_hash};
-use zinder_store::ChainEpochArtifacts;
-use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 #[test]
 #[allow(
     clippy::too_many_lines,
     reason = "this end-to-end fixture test asserts the full artifact surface in one place"
 )]
-fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
+fn fixture_block_builds_canonical_facts() -> Result<(), Box<dyn Error>> {
     let source_block = fixture_source_block()?;
-    let built = derive_for_test(&source_block)?;
-    let block_header_artifact = built.block_header;
-    let block_blob_artifact = built
+    let block = build_positioned_block_for_test(&source_block)?;
+    assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+    let block_header_artifact = block.facts.block_header.clone();
+    let block_blob_artifact = block
+        .retained_raw_blobs
         .block_blob
-        .ok_or("fixture derivation must include a raw block blob")?;
-    let compact_block_artifact = built.compact_block;
+        .clone()
+        .ok_or("all-retention fixture must include a block blob")?;
+    let mut transaction_rows = Vec::with_capacity(block.facts.transactions.len());
+    for (tx_index_in_block, transaction) in block.facts.transactions.iter().enumerate() {
+        let tx_index_in_block = u32::try_from(tx_index_in_block)?;
+        let transaction_id = transaction.public_facts.transaction_id;
+        let location = TransactionLocation::new(
+            transaction_id,
+            block_header_artifact.height,
+            block_header_artifact.block_hash,
+            tx_index_in_block,
+        );
+        let mut rows =
+            FixtureTransactionRows::from_public_facts(location, transaction.public_facts.clone())
+                .with_intrinsic_value_balances(transaction.intrinsic_value_balances);
+        rows.facts = TransactionFactsArtifact::new(location, transaction.public_facts.clone())
+            .with_transparent_facts(
+                transaction.transparent_inputs.clone(),
+                transaction.transparent_outputs.clone(),
+            );
+        rows.blob = Some(
+            block
+                .retained_raw_blobs
+                .transaction_blobs
+                .iter()
+                .find(|blob| blob.location == location)
+                .ok_or("all-retention fixture must include every transaction blob")?
+                .clone(),
+        );
+        transaction_rows.push(rows);
+    }
+    let expected_replay_envelope = encode_fixture_block_replay_with_raw_block(
+        &block_header_artifact,
+        &source_block.raw_block_bytes,
+        &transaction_rows,
+    );
+    assert_eq!(block.replay_envelope, expected_replay_envelope);
+    let expected_block_summary = project_block_summary_record(&block.facts);
+    let replay_envelope = block.replay_envelope;
+    let compact_block_artifact = block.compact_block;
 
     assert_eq!(block_header_artifact.height, BlockHeight::new(1));
     assert_eq!(block_header_artifact.block_hash, source_block.hash);
@@ -114,7 +163,10 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         "76a914b75028cd1ea0ca554fd5e7c8cc7ad70a89b8dd4f88ac"
     );
 
-    let store_fixture = StoreFixture::open()?;
+    let store_fixture = StoreFixture::open_with_options(ChainStoreOptions {
+        raw_blob_retention: RawBlobRetention::All,
+        ..ChainStoreOptions::for_local_tests()
+    })?;
     let store = store_fixture.chain_store().clone();
     let chain_epoch = ChainEpoch {
         id: ChainEpochId::new(1),
@@ -123,7 +175,7 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         visible_tip_hash: source_block.hash,
         settled_tip_height: source_block.height,
         settled_tip_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_669_000_000),
     };
@@ -132,9 +184,41 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         ChainEpochArtifacts::new(
             chain_epoch,
             vec![block_header_artifact.clone()],
+            vec![replay_envelope],
             vec![compact_block_artifact.clone()],
         )
-        .with_block_blobs(vec![block_blob_artifact.clone()]),
+        .with_block_blobs(vec![block_blob_artifact.clone()])
+        .with_block_transaction_index(
+            transaction_rows
+                .iter()
+                .map(|rows| rows.block_transaction_index)
+                .collect(),
+        )
+        .with_transaction_locations(transaction_rows.iter().map(|rows| rows.location).collect())
+        .with_transaction_facts(
+            transaction_rows
+                .iter()
+                .map(|rows| rows.facts.clone())
+                .collect(),
+        )
+        .with_transaction_intrinsic_value_balances(
+            transaction_rows
+                .iter()
+                .filter_map(FixtureTransactionRows::intrinsic_value_balances_artifact)
+                .collect(),
+        )
+        .with_transaction_blobs(
+            transaction_rows
+                .iter()
+                .filter_map(|rows| rows.blob.clone())
+                .collect(),
+        )
+        .with_transparent_outputs_by_outpoint(
+            transaction_rows
+                .iter()
+                .flat_map(FixtureTransactionRows::transparent_output_artifacts)
+                .collect(),
+        ),
     )?;
 
     let reader = store.current_chain_epoch_reader()?;
@@ -150,95 +234,239 @@ fn fixture_block_builds_durable_artifacts() -> Result<(), Box<dyn Error>> {
         reader.compact_block_at(source_block.height)?,
         Some(compact_block_artifact)
     );
+    let persisted_replay = reader
+        .block_replay_at(source_block.height)?
+        .ok_or("persisted canonical replay envelope is missing")?;
+    assert_eq!(
+        project_block_summary_record(persisted_replay.facts()),
+        expected_block_summary,
+        "persisted replay must reproduce the block-summary projection without hydration"
+    );
 
     Ok(())
 }
 
 #[test]
-fn fixture_block_transaction_artifacts_round_trip_through_store() -> Result<(), Box<dyn Error>> {
-    let source_block = fixture_source_block()?;
-    let built = derive_for_test(&source_block)?;
-    let block_header_artifact = built.block_header;
-    let block_blob_artifact = built
-        .block_blob
-        .ok_or("fixture derivation must include a raw block blob")?;
-    let compact_block_artifact = built.compact_block;
-    let block_transaction_index = built.block_transaction_index;
-    let transaction_locations = built.transaction_locations;
-    let transaction_facts = built.transaction_facts;
-    let transaction_blobs = built.transaction_blobs;
-    assert_eq!(
-        transaction_locations.len(),
-        1,
-        "regtest fixture block 1 has a single coinbase transaction"
-    );
-    let coinbase_location = transaction_locations
-        .first()
-        .copied()
-        .ok_or("transaction location vector is empty")?;
-    assert_eq!(coinbase_location.block_height, source_block.height);
-    assert_eq!(coinbase_location.block_hash, source_block.hash);
-    assert_eq!(coinbase_location.tx_index_in_block, 0);
-    let coinbase_blob = transaction_blobs
-        .first()
-        .cloned()
-        .ok_or("transaction blob vector is empty")?;
-    assert!(
-        !coinbase_blob.raw_transaction_bytes.is_empty(),
-        "coinbase serialized payload bytes must be present"
-    );
-    assert_coinbase_branch_id_uses_activation_table(&transaction_facts, &source_block)?;
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let chain_epoch = ChainEpoch {
-        id: ChainEpochId::new(1),
-        network: Network::ZcashRegtest,
-        visible_tip_height: source_block.height,
-        visible_tip_hash: source_block.hash,
-        settled_tip_height: source_block.height,
-        settled_tip_hash: source_block.hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
-        tip_metadata: ChainTipMetadata::empty(),
-        created_at: UnixTimestampMillis::new(1_774_669_000_000),
-    };
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block_header_artifact],
-            vec![compact_block_artifact],
-        )
-        .with_block_blobs(vec![block_blob_artifact])
-        .with_block_transaction_index(block_transaction_index)
-        .with_transaction_locations(transaction_locations)
-        .with_transaction_facts(transaction_facts.clone())
-        .with_transaction_blobs(transaction_blobs),
+fn canonical_block_facts_keep_transparent_state_block_local() -> Result<(), Box<dyn Error>> {
+    let source_block = fixture_source_block_from(
+        Network::ZcashRegtest,
+        include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
     )?;
+    let PositionedCanonicalBlock { facts, .. } = build_positioned_block_for_test(&source_block)?;
+    let transparent_input = facts
+        .transactions
+        .iter()
+        .flat_map(|transaction| &transaction.transparent_inputs)
+        .find(|input| !input.spent_outpoint.is_coinbase_sentinel())
+        .ok_or("Ironwood fixture must contain a non-coinbase transparent input")?;
+    let &TransparentInputFact {
+        input_index,
+        spent_outpoint,
+    } = transparent_input;
 
-    let reader = store.current_chain_epoch_reader()?;
-    let stored = reader
-        .transaction_facts_by_id(coinbase_location.transaction_id)?
-        .ok_or("coinbase transaction should be readable after commit")?;
-    assert_eq!(
-        &stored,
-        transaction_facts
-            .first()
-            .ok_or("transaction facts vector is empty")?
-    );
-    assert_eq!(
-        reader.transaction_id_at_block_index(source_block.height, 0)?,
-        Some(coinbase_location.transaction_id)
-    );
-    assert_eq!(
-        reader.transaction_blob_by_id(coinbase_location.transaction_id)?,
-        Some(coinbase_blob)
+    assert_eq!(input_index, 0);
+    assert!(!spent_outpoint.is_coinbase_sentinel());
+    assert!(
+        facts
+            .transactions
+            .iter()
+            .any(|transaction| !transaction.transparent_outputs.is_empty())
     );
 
     Ok(())
 }
 
+#[test]
+fn canonical_block_facts_digest_is_stable_and_content_sensitive() -> Result<(), Box<dyn Error>> {
+    let source_block = fixture_source_block()?;
+    let facts = build_positioned_block_for_test(&source_block)?.facts;
+    let repeated_facts = build_positioned_block_for_test(&source_block)?.facts;
+    let digest = facts.digest(CanonicalBlockFactsDigestVersion::CURRENT);
+
+    assert_eq!(
+        digest,
+        repeated_facts.digest(CanonicalBlockFactsDigestVersion::CURRENT)
+    );
+    assert_eq!(
+        hex::encode(digest.as_bytes()),
+        "76474516b2f4184e9f434750ed6970ed8eac53e5fbb698e1959dcc6c33c5456f"
+    );
+
+    let mut changed_facts = facts;
+    changed_facts.block_header.block_time = changed_facts
+        .block_header
+        .block_time
+        .checked_add(1)
+        .ok_or("fixture block time cannot be incremented")?;
+    let changed_digest = changed_facts.digest(CanonicalBlockFactsDigestVersion::CURRENT);
+    assert_ne!(digest, changed_digest);
+
+    let mut reference_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
+        CanonicalBlockFactsSequenceDigestVersion::CURRENT,
+    );
+    reference_builder.try_append(digest)?;
+    reference_builder.try_append(changed_digest)?;
+    let reference_sequence_digest = reference_builder.finish();
+    assert_eq!(
+        reference_sequence_digest.version(),
+        CanonicalBlockFactsSequenceDigestVersion::CURRENT
+    );
+    assert_eq!(
+        hex::encode(reference_sequence_digest.as_bytes()),
+        "ed2a1aad9e6f996361f05f507b02f4ed8a7da714ad02ebaf81747cccea6f5170"
+    );
+
+    let mut repeated_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
+        CanonicalBlockFactsSequenceDigestVersion::CURRENT,
+    );
+    repeated_builder.try_append(digest)?;
+    repeated_builder.try_append(changed_digest)?;
+    assert_eq!(reference_sequence_digest, repeated_builder.finish());
+    assert_eq!(reference_sequence_digest.block_count(), 2);
+
+    let mut reordered_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
+        CanonicalBlockFactsSequenceDigestVersion::CURRENT,
+    );
+    reordered_builder.try_append(changed_digest)?;
+    reordered_builder.try_append(digest)?;
+    assert_ne!(reference_sequence_digest, reordered_builder.finish());
+
+    Ok(())
+}
+
+#[test]
+fn ironwood_canonical_block_facts_digest_matches_known_answer() -> Result<(), Box<dyn Error>> {
+    let source_block = fixture_source_block_from(
+        Network::ZcashRegtest,
+        include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
+    )?;
+    let block = build_positioned_block_for_test(&source_block)?;
+    assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+    assert_compact_transaction_ids_match_canonical_facts(&block)?;
+    let facts = block.facts;
+
+    assert!(facts.transactions.len() > 1);
+    assert!(facts.transactions.iter().any(|transaction| {
+        transaction.public_facts.version == zinder_core::TransactionVersion::V6
+            && transaction.public_facts.auth_digest.is_some()
+            && !transaction.transparent_inputs.is_empty()
+    }));
+    assert_eq!(
+        hex::encode(
+            facts
+                .digest(CanonicalBlockFactsDigestVersion::CURRENT)
+                .as_bytes()
+        ),
+        "86cb193efe15992d994f9813e061d8f3b247fd86980d50a2585ee1137a0d3f70"
+    );
+
+    Ok(())
+}
+
+fn assert_compact_transaction_ids_match_canonical_facts(
+    block: &PositionedCanonicalBlock,
+) -> Result<(), Box<dyn Error>> {
+    let compact_block = CompactBlock::decode(block.compact_block.payload_bytes.as_slice())?;
+    for compact_transaction in compact_block.vtx {
+        let transaction_index = usize::try_from(compact_transaction.index)?;
+        let transaction_facts = block
+            .facts
+            .transactions
+            .get(transaction_index)
+            .ok_or("compact transaction index is outside canonical facts")?;
+        assert_eq!(
+            compact_transaction.txid,
+            transaction_facts
+                .public_facts
+                .transaction_id
+                .as_bytes()
+                .to_vec(),
+            "compact transaction id must match the same-position canonical fact"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn fixture_block_separates_ordered_facts_from_retained_transaction_bytes()
+-> Result<(), Box<dyn Error>> {
+    let source_block = fixture_source_block()?;
+    let block = build_positioned_block_for_test(&source_block)?;
+    let transaction_facts = &block.facts.transactions;
+    assert_eq!(
+        transaction_facts.len(),
+        1,
+        "regtest fixture block 1 has a single coinbase transaction"
+    );
+    let coinbase_facts = transaction_facts
+        .first()
+        .ok_or("transaction facts vector is empty")?;
+    let coinbase_blob = block
+        .retained_raw_blobs
+        .transaction_blobs
+        .first()
+        .ok_or("coinbase transaction blob is missing")?;
+    assert!(
+        !coinbase_blob.raw_transaction_bytes.is_empty(),
+        "coinbase serialized payload bytes must be present"
+    );
+    assert_eq!(
+        coinbase_blob.location.transaction_id,
+        coinbase_facts.public_facts.transaction_id
+    );
+    assert_eq!(coinbase_facts.transparent_outputs.len(), 1);
+    assert_eq!(coinbase_facts.transparent_outputs[0].output_index, 0);
+    assert_coinbase_branch_id_uses_activation_table(transaction_facts, &source_block)?;
+
+    Ok(())
+}
+
+fn assert_transaction_bytes_match_parsed_source(
+    source_block: &SourceBlock,
+    block: &PositionedCanonicalBlock,
+) -> Result<(), Box<dyn Error>> {
+    let parsed_block: ZebraBlock = source_block
+        .raw_block_bytes
+        .as_slice()
+        .zcash_deserialize_into()?;
+    assert_eq!(
+        parsed_block.transactions.len(),
+        block.facts.transactions.len(),
+        "canonical facts must preserve every parsed transaction"
+    );
+    assert_eq!(
+        parsed_block.transactions.len(),
+        block.retained_raw_blobs.transaction_blobs.len(),
+        "all-retention construction must retain every parsed transaction"
+    );
+
+    for ((parsed_transaction, transaction_facts), transaction_blob) in parsed_block
+        .transactions
+        .iter()
+        .zip(&block.facts.transactions)
+        .zip(&block.retained_raw_blobs.transaction_blobs)
+    {
+        let parsed_transaction_bytes = parsed_transaction.zcash_serialize_to_vec()?;
+        assert_eq!(
+            transaction_blob.raw_transaction_bytes, parsed_transaction_bytes,
+            "retained transaction bytes must be the exact source transaction slice"
+        );
+        assert_eq!(
+            transaction_blob.location.transaction_id, transaction_facts.public_facts.transaction_id,
+            "retained transaction order must match canonical fact order"
+        );
+        assert_eq!(
+            transaction_facts.serialized_bytes_digest,
+            zinder_core::SerializedBytesDigest::from_serialized_bytes(&parsed_transaction_bytes),
+            "canonical transaction facts must bind the exact source transaction bytes"
+        );
+    }
+
+    Ok(())
+}
+
 fn assert_coinbase_branch_id_uses_activation_table(
-    transaction_facts: &[TransactionFactsArtifact],
+    transaction_facts: &[CanonicalTransactionFacts],
     source_block: &SourceBlock,
 ) -> Result<(), Box<dyn Error>> {
     let coinbase_facts = transaction_facts
@@ -258,7 +486,7 @@ fn testnet_sapling_block_compact_artifact_carries_sapling_outputs() -> Result<()
         Network::ZcashTestnet,
         include_str!("../fixtures/zcash-testnet-sapling-block-1842432.json"),
     )?;
-    let compact_block_artifact = derive_for_test(&source_block)?.compact_block;
+    let compact_block_artifact = build_positioned_block_for_test(&source_block)?.compact_block;
     let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
     let chain_metadata = compact_block
         .chain_metadata
@@ -294,7 +522,7 @@ fn testnet_orchard_block_compact_artifact_carries_orchard_actions() -> Result<()
         Network::ZcashTestnet,
         include_str!("../fixtures/zcash-testnet-orchard-block-1842462.json"),
     )?;
-    let compact_block_artifact = derive_for_test(&source_block)?.compact_block;
+    let compact_block_artifact = build_positioned_block_for_test(&source_block)?.compact_block;
     let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
     let chain_metadata = compact_block
         .chain_metadata
@@ -330,7 +558,7 @@ fn regtest_ironwood_block_compact_artifact_carries_ironwood_actions() -> Result<
         Network::ZcashRegtest,
         include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
     )?;
-    let compact_block_artifact = derive_for_test(&source_block)?.compact_block;
+    let compact_block_artifact = build_positioned_block_for_test(&source_block)?.compact_block;
     let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
     let chain_metadata = compact_block
         .chain_metadata
@@ -365,25 +593,25 @@ fn regtest_ironwood_block_compact_artifact_carries_ironwood_actions() -> Result<
 fn regtest_block_without_orchard_actions_carries_forward_tree_size() -> Result<(), Box<dyn Error>> {
     let source_block = fixture_source_block()?;
     let activations = sample_regtest_upgrade_activations();
-    let derived =
-        derive_block_with_raw_blob_policy(&source_block, &activations, RawBlobPolicy::All)?;
+    let prepared = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::All)?;
 
-    assert_eq!(derived.tree_size_additions.orchard, 0);
-    assert_eq!(derived.tree_size_additions.sapling, 0);
-    assert_eq!(derived.tree_size_additions.ironwood, 0);
+    assert_eq!(prepared.tree_size_additions.orchard, 0);
+    assert_eq!(prepared.tree_size_additions.sapling, 0);
+    assert_eq!(prepared.tree_size_additions.ironwood, 0);
 
     let mut running_tree_sizes = CommitmentTreeSizes {
         sapling: 11,
         orchard: 42,
         ironwood: 7,
     };
-    let built = finalize_derived_block(derived, &mut running_tree_sizes)?;
+    let positioned_block = position_canonical_block(prepared, &mut running_tree_sizes)?;
 
     assert_eq!(running_tree_sizes.orchard, 42);
     assert_eq!(running_tree_sizes.sapling, 11);
     assert_eq!(running_tree_sizes.ironwood, 7);
 
-    let compact_block = CompactBlock::decode(built.compact_block.payload_bytes.as_slice())?;
+    let compact_block =
+        CompactBlock::decode(positioned_block.compact_block.payload_bytes.as_slice())?;
     let chain_metadata = compact_block
         .chain_metadata
         .as_ref()
@@ -423,10 +651,17 @@ fn compact_block_builder_rejects_source_identity_mismatch() -> Result<(), Box<dy
     Ok(())
 }
 
-fn fixture_source_block() -> Result<SourceBlock, Box<dyn Error>> {
+pub(super) fn fixture_source_block() -> Result<SourceBlock, Box<dyn Error>> {
     fixture_source_block_from(
         Network::ZcashRegtest,
         include_str!("../fixtures/z3-regtest-block-1.json"),
+    )
+}
+
+pub(super) fn fixture_ironwood_source_block() -> Result<SourceBlock, Box<dyn Error>> {
+    fixture_source_block_from(
+        Network::ZcashRegtest,
+        include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
     )
 }
 
@@ -467,14 +702,14 @@ fn assert_compact_block_mismatch(
     source_block: &SourceBlock,
     expected_field: BlockMismatchField,
 ) -> Result<(), Box<dyn Error>> {
-    let error = match derive_for_test(source_block) {
-        Ok(built) => {
-            return Err(format!("expected compact block build failure, got {built:?}").into());
+    let error = match build_positioned_block_for_test(source_block) {
+        Ok(block) => {
+            return Err(format!("expected compact block build failure, got {block:?}").into());
         }
         Err(error) => error,
     };
 
-    let ArtifactDeriveError::SourceBlockMismatch { field, .. } = error else {
+    let CanonicalBlockConstructionError::SourceBlockMismatch { field, .. } = error else {
         return Err(format!("expected source block mismatch, got {error:?}").into());
     };
     if field != expected_field {

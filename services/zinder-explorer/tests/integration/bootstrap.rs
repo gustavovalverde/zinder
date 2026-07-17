@@ -53,8 +53,8 @@ use zinder_store::{
     ChainEpochArtifacts, ChainStoreOptions, ReorgWindowChange, SecondaryChainStore,
 };
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations,
-    synthetic_transaction_public_facts,
+    ChainFixture, FixtureTransactionRows, StoreFixture, encode_fixture_block_replay,
+    sample_regtest_upgrade_activations, synthetic_transaction_public_facts,
 };
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
@@ -851,25 +851,59 @@ fn canonical_store_without_transaction_facts(
     let mut artifacts = chain_fixture
         .chain_epoch_artifacts(ChainEpochId::new(1))
         .ok_or_else(|| eyre!("fixture chain epoch artifacts missing"))?;
-    artifacts
-        .transaction_facts
-        .retain(|artifact| artifact.location.transaction_id != missing_transaction_id);
     let block = chain_fixture
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre!("fixture block missing"))?;
     let parent_transaction_id = TransactionId::from_bytes([0xA1; 32]);
-    let parent_location =
-        TransactionLocation::new(parent_transaction_id, block.height, block.hash, 99);
-    artifacts.transaction_facts.push(
-        zinder_core::TransactionFactsArtifact::new(
-            parent_location,
+    let mut retained_transaction_rows =
+        block_transaction_fixture_rows(block.height, block.hash, block_transaction_ids())
+            .into_iter()
+            .filter(|transaction_rows| {
+                transaction_rows.location.transaction_id != missing_transaction_id
+            })
+            .collect::<Vec<_>>();
+    retained_transaction_rows.push(FixtureTransactionRows {
+        facts: zinder_core::TransactionFactsArtifact::new(
+            TransactionLocation::new(parent_transaction_id, block.height, block.hash, 2),
             synthetic_transaction_public_facts(parent_transaction_id, 64),
         )
         .with_transparent_facts(
             Vec::new(),
             vec![transparent_output_fact(4, 60_000, vec![0x53])],
         ),
-    );
+        ..FixtureTransactionRows::from_public_facts(
+            TransactionLocation::new(parent_transaction_id, block.height, block.hash, 2),
+            synthetic_transaction_public_facts(parent_transaction_id, 64),
+        )
+    });
+    artifacts.block_replay_envelopes = vec![encode_fixture_block_replay(
+        &block.block_header_artifact(),
+        &retained_transaction_rows,
+    )];
+    artifacts.block_transaction_index = retained_transaction_rows
+        .iter()
+        .map(|transaction_rows| transaction_rows.block_transaction_index)
+        .collect();
+    artifacts.transaction_locations = retained_transaction_rows
+        .iter()
+        .map(|transaction_rows| transaction_rows.location)
+        .collect();
+    artifacts.transaction_facts = retained_transaction_rows
+        .iter()
+        .map(|transaction_rows| transaction_rows.facts.clone())
+        .collect();
+    artifacts.transaction_intrinsic_value_balances = retained_transaction_rows
+        .iter()
+        .filter_map(FixtureTransactionRows::intrinsic_value_balances_artifact)
+        .collect();
+    artifacts.transaction_blobs = retained_transaction_rows
+        .iter()
+        .filter_map(|transaction_rows| transaction_rows.blob.clone())
+        .collect();
+    artifacts.transparent_outputs_by_outpoint = retained_transaction_rows
+        .iter()
+        .flat_map(FixtureTransactionRows::transparent_output_artifacts)
+        .collect();
     let store_fixture = StoreFixture::open()?;
     store_fixture.chain_store().commit_chain_epoch(artifacts)?;
     let secondary_store = SecondaryChainStore::open(
@@ -1163,10 +1197,16 @@ fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
         .ok_or_else(|| eyre!("initial fixture missing chain epoch"))?;
     initial_epoch.settled_tip_height = settled_block.height;
     initial_epoch.settled_tip_hash = settled_block.hash;
+    let initial_block_headers = initial_chain.block_header_artifacts();
+    let initial_block_replay_envelopes = initial_block_headers
+        .iter()
+        .map(|block_header| encode_fixture_block_replay(block_header, &[]))
+        .collect();
     store_fixture.chain_store().commit_chain_epoch(
         ChainEpochArtifacts::new(
             initial_epoch,
-            initial_chain.block_header_artifacts(),
+            initial_block_headers,
+            initial_block_replay_envelopes,
             initial_chain.compact_block_artifacts(),
         )
         .with_reorg_window_change(ReorgWindowChange::Extend {
@@ -1183,10 +1223,13 @@ fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
         .ok_or_else(|| eyre!("replacement fixture missing chain epoch"))?;
     replacement_epoch.settled_tip_height = settled_block.height;
     replacement_epoch.settled_tip_hash = settled_block.hash;
+    let replacement_block_header = replacement_block.block_header_artifact();
+    let replacement_replay = encode_fixture_block_replay(&replacement_block_header, &[]);
     store_fixture.chain_store().commit_chain_epoch(
         ChainEpochArtifacts::new(
             replacement_epoch,
-            vec![replacement_block.block_header_artifact()],
+            vec![replacement_block_header],
+            vec![replacement_replay],
             vec![replacement_block.compact_block_artifact()],
         )
         .with_reorg_window_change(ReorgWindowChange::Replace {

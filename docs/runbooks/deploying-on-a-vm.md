@@ -109,15 +109,23 @@ The expected readiness sequence is `phase=awaiting_upstream cause=starting` → 
 
 ### Artifact schema upgrades
 
-Every store persisted below artifact schema 18 or canonical store schema 13 is
-refused at open. Schema 18 stores block-local transparent input sets and
-resolved spend replay facts that remain after per-outpoint retention; older volumes may have already
-deleted the source facts and cannot be upgraded safely in place. Deploy this
-service set against a fresh canonical and derive volume and resync from genesis;
-ingest opens the primary and stamps artifact schema 18/store schema 13 on its
-first canonical commit, and query and explorer readers open once ingest is
-healthy. Keep the schema-12 checkpoint if rollback is required; binaries on the
-two sides of this boundary must not share a volume.
+Every store persisted below artifact schema 19 or canonical store schema 14 is
+refused at open. Schema 19 requires one reversible `CanonicalBlockFacts` replay
+envelope per block and validates it against the other canonical rows before the
+atomic epoch commit. The semantic envelope excludes retention-dependent raw
+block and transaction blobs, which remain controlled by `raw_blob_policy`.
+Choose that policy before the first canonical commit. It becomes the volume's
+immutable historical-coverage contract; changing it later fails startup with
+`RawBlobRetentionMismatch`, so rebuild or restore a snapshot created with the
+desired policy rather than reopening the existing volume under a new value.
+Older volumes never retained all required semantic facts and cannot be upgraded
+safely in place; opening them also does not create the missing column family.
+Deploy this service set against fresh canonical and derive volumes and resync
+from genesis, or restore a separately certified schema-19 snapshot when one is
+available. Ingest stamps artifact schema 19/store schema 14 on the first
+canonical commit; query and explorer readers open only after ingest is healthy.
+Keep the previous checkpoint if rollback is required; binaries on the 2 sides
+of this boundary must not share a volume.
 
 Schema 17 also introduces the writer-owned displaced-block archive with a
 permanent retention policy, so include its monotonic growth in capacity

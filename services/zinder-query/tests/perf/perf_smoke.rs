@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use zinder_core::{BlockHeight, BlockHeightRange, ChainEpochId, Network};
 use zinder_query::{FULL_BLOCK_STREAM_CHANNEL_CAPACITY, WalletQuery, WalletQueryApi};
+use zinder_store::RawBlobRetention;
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 
 const PERF_SMOKE_BLOCK_COUNT: u32 = 1_000;
@@ -76,8 +77,9 @@ async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Resu
         );
     }
 
-    let chain_fixture =
-        ChainFixture::new(Network::ZcashRegtest).extend_blocks(PERF_SMOKE_BLOCK_COUNT);
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::All)
+        .extend_blocks(PERF_SMOKE_BLOCK_COUNT);
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),

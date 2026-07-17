@@ -55,6 +55,16 @@ impl ShieldedProtocol {
             Self::Ironwood => "ironwood",
         }
     }
+
+    /// Returns the node-advertised upgrade name that activates this pool.
+    #[must_use]
+    pub const fn activation_upgrade_name(self) -> &'static str {
+        match self {
+            Self::Sapling => "Sapling",
+            Self::Orchard => "NU5",
+            Self::Ironwood => "NU6.3",
+        }
+    }
 }
 
 /// Index of a 2^16-leaf shielded note commitment subtree.

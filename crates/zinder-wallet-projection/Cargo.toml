@@ -1,0 +1,22 @@
+[package]
+name = "zinder-wallet-projection"
+version = "0.1.0"
+description = "Version-1 wallet projection domain and durable encoding contracts"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "wallet"]
+categories = ["database"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true
+zinder-core.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints]
+workspace = true

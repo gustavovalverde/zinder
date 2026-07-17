@@ -12,7 +12,7 @@ use zinder_core::{
     ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
-use zinder_store::{ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore};
+use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 
 #[test]
 fn subtree_roots_read_from_one_visible_chain_epoch() -> eyre::Result<()> {
@@ -28,7 +28,7 @@ fn subtree_roots_read_from_one_visible_chain_epoch() -> eyre::Result<()> {
     );
 
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![compact_block])
+        super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block])
             .with_subtree_roots(vec![subtree_root.clone()]),
     )?;
 

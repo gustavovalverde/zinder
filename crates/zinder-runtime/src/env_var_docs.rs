@@ -355,6 +355,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         name: "ZINDER_STORAGE__SECONDARY_PATH",
         toml_path: "storage.secondary_path",
         used_by: &[
+            "zinder-ingest (verify-canonical-replay only)",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -619,11 +620,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Raw-byte blob write policy: `none`, `transactions`, or `all`. Defaults to \
-                      `none` for explicit coverage so fact-first indexing does not write raw block \
-                      or transaction blobs unless a deployment explicitly needs raw export. \
+        description: "Immutable raw-blob retention contract: `none`, `transactions`, or `all`. \
+                      Defaults to `none` for explicit coverage so fact-first indexing does not write \
+                      raw block or transaction blobs unless a deployment explicitly needs raw export. \
                       Wallet-serving coverage defaults to `transactions` and rejects `none`, because \
-                      lightwalletd transaction and transparent-history methods require retained bytes.",
+                      lightwalletd transaction and transparent-history methods require retained bytes. \
+                      The first canonical commit fixes historical coverage; changing a non-empty store \
+                      requires a rebuild.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__PROJECTION_PRESET",
@@ -631,8 +634,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Closed derive workload: `\"wallet\"` or `\"complete\"`. Defaults to \
-                      `\"complete\"`. Selection is supported only when creating a fresh \
+        description: "Closed derive workload: `\"wallet\"` or `\"explorer\"`. Defaults to \
+                      `\"explorer\"`. Selection is supported only when creating a fresh \
                       canonical-plus-projection store.",
     },
     EnvVarDoc {
@@ -697,9 +700,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Hard ceiling on connected blocks requested from the source in one \
-                      bulk-catchup segment. The byte-density controller may request fewer. \
-                      Defaults to 64.",
+        description: "Diagnostic override for the hard ceiling on connected blocks requested \
+                      from the source in one segment. The resource-resolved default is 64.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES",
@@ -707,8 +709,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Target source response bytes for adaptive segment sizing. Defaults to \
-                      33554432.",
+        description: "Diagnostic override for adaptive response sizing. The default is \
+                      `min(node.max_response_bytes, 33554432)`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS",
@@ -724,11 +726,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Admission watermark for predicted active source responses plus measured \
-                      completed reassembly. Measured responses can temporarily exceed it; the \
-                      absolute active bound is request concurrency times node.max_response_bytes. \
-                      Must be greater than or equal to node.max_response_bytes. Defaults to \
-                      402653184.",
+        description: "Diagnostic override for predicted active source responses plus measured \
+                      completed reassembly. The default is \
+                      `max(node.max_response_bytes, clamp(container_memory / 64, 134217728, \
+                      402653184))`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY",
@@ -736,17 +737,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Parallel canonical block-prepare slots. Defaults to \
-                      `min(available_parallelism(), 16)`.",
+        description: "Diagnostic override for parallel canonical block-prepare slots. The \
+                      default is `min(available_parallelism(), 16)`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MAX_IN_FLIGHT_ARTIFACT_BYTES",
-        toml_path: "ingest.bulk_catchup.block_prepare_max_in_flight_artifact_bytes",
+        name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES",
+        toml_path: "ingest.bulk_catchup.block_prepare_memory_watermark_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum reserved derived artifact bytes across active and completed \
-                      block-prepare work. Defaults to 536870912.",
+        description: "Diagnostic override for the prepare and resident-handoff admission \
+                      watermark. The default is \
+                      `clamp(container_memory / 64, 134217728, 536870912)`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",

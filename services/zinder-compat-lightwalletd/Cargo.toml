@@ -34,6 +34,8 @@ zinder-query.workspace = true
 zinder-runtime.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
+zinder-wallet-projection.workspace = true
+zinder-wallet-rocksdb.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

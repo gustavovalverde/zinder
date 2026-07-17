@@ -49,10 +49,10 @@ pub enum CanonicalRetentionAuthority {
 /// Product presets that include one projection identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectionPresetMembership {
-    /// Projection is required by both wallet and complete deployments.
-    WalletAndComplete,
-    /// Projection is included only in the complete shared-product workload.
-    CompleteOnly,
+    /// Projection is required by both wallet and explorer deployments.
+    WalletAndExplorer,
+    /// Projection is included only in the explorer workload.
+    ExplorerOnly,
 }
 
 /// Complete product and recovery declaration for one durable projection.
@@ -75,9 +75,9 @@ impl ProjectionDefinition {
     #[must_use]
     pub const fn included_in(self, preset: ProjectionPreset) -> bool {
         match (self.preset_membership, preset) {
-            (ProjectionPresetMembership::WalletAndComplete, _)
-            | (ProjectionPresetMembership::CompleteOnly, ProjectionPreset::Complete) => true,
-            (ProjectionPresetMembership::CompleteOnly, ProjectionPreset::Wallet) => false,
+            (ProjectionPresetMembership::WalletAndExplorer, _)
+            | (ProjectionPresetMembership::ExplorerOnly, ProjectionPreset::Explorer) => true,
+            (ProjectionPresetMembership::ExplorerOnly, ProjectionPreset::Wallet) => false,
         }
     }
 }
@@ -90,7 +90,7 @@ const fn optional(
         schema,
         role: ProjectionRole::OptionalProductView,
         recovery_source,
-        preset_membership: ProjectionPresetMembership::CompleteOnly,
+        preset_membership: ProjectionPresetMembership::ExplorerOnly,
         retention_authority: CanonicalRetentionAuthority::None,
     }
 }
@@ -160,14 +160,14 @@ const BUNDLED_PROJECTION_DEFINITIONS: &[ProjectionDefinition] = &[
         schema: TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
         role: ProjectionRole::WalletServing,
         recovery_source: ProjectionRecoverySource::CanonicalChainEvents,
-        preset_membership: ProjectionPresetMembership::WalletAndComplete,
+        preset_membership: ProjectionPresetMembership::WalletAndExplorer,
         retention_authority: CanonicalRetentionAuthority::None,
     },
     ProjectionDefinition {
         schema: TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
         role: ProjectionRole::WalletCorrectness,
         recovery_source: ProjectionRecoverySource::CanonicalChainEvents,
-        preset_membership: ProjectionPresetMembership::WalletAndComplete,
+        preset_membership: ProjectionPresetMembership::WalletAndExplorer,
         retention_authority: CanonicalRetentionAuthority::TransparentSpendFacts,
     },
     optional(

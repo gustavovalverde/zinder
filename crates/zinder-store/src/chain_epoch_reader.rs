@@ -18,6 +18,7 @@ use zinder_core::{
     TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentOutputArtifact, TransparentOutputEntry, TransparentSpendFact,
     TransparentUnspentOutput, TransparentUtxoSetSummary, TreeStateArtifact,
+    ValidatedCanonicalBlockReplay,
 };
 
 use crate::{
@@ -34,6 +35,9 @@ use crate::{
         read_compact_block_artifacts,
     },
     block_hash_index::{BlockHashLookup, read_block_hash_lookup},
+    block_replay::{
+        BlockReplayBatchRequest, BlockReplayStore, read_block_replay, read_block_replay_batch,
+    },
     block_value_pool_balances::{
         BlockValuePoolBalancesStore, read_block_value_pool_balances,
         read_block_value_pool_balances_in_range,
@@ -175,6 +179,35 @@ impl<'store> ChainEpochReader<'store> {
     ) -> Result<Vec<Option<BlockHeaderArtifact>>, StoreError> {
         self.ensure_history_height_available(block_range.start)?;
         read_block_header_artifacts(&self.read_view, self.chain_epoch, block_range)
+    }
+
+    /// Reads one complete semantic replay envelope at a canonical height.
+    pub fn block_replay_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ValidatedCanonicalBlockReplay>, StoreError> {
+        self.ensure_history_height_available(height)?;
+        self.read_at_pinned_secondary_epoch(|| {
+            read_block_replay(&self.read_view, self.chain_epoch, height)
+        })
+    }
+
+    /// Reads a bounded, ascending batch of complete semantic replay envelopes.
+    ///
+    /// The final batch is clipped to this reader's pinned visible tip. The
+    /// store resolves visibility with one ordered scan and fetches payloads
+    /// with one `multi_get`.
+    pub fn block_replay_batch(
+        &self,
+        request: BlockReplayBatchRequest,
+    ) -> Result<Vec<ValidatedCanonicalBlockReplay>, StoreError> {
+        request.ensure_within_limit()?;
+        if request.start_height <= self.chain_epoch.visible_tip_height {
+            self.ensure_history_height_available(request.start_height)?;
+        }
+        self.read_at_pinned_secondary_epoch(|| {
+            read_block_replay_batch(&self.read_view, self.chain_epoch, request)
+        })
     }
 
     /// Reads an optional raw block blob by height.
@@ -660,6 +693,22 @@ impl BlockHeaderStore for ChainEpochReader<'_> {
         block_range: BlockHeightRange,
     ) -> Result<Vec<Option<BlockHeaderArtifact>>, StoreError> {
         self.block_headers_in_range(block_range)
+    }
+}
+
+impl BlockReplayStore for ChainEpochReader<'_> {
+    fn block_replay_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ValidatedCanonicalBlockReplay>, StoreError> {
+        self.block_replay_at(height)
+    }
+
+    fn block_replay_batch(
+        &self,
+        request: BlockReplayBatchRequest,
+    ) -> Result<Vec<ValidatedCanonicalBlockReplay>, StoreError> {
+        self.block_replay_batch(request)
     }
 }
 

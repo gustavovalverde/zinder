@@ -14,8 +14,8 @@ use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
+    BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, Network, UnixTimestampMillis,
 };
 use zinder_ingest::IngestControlGrpcAdapter;
 use zinder_proto::v1::{
@@ -23,9 +23,11 @@ use zinder_proto::v1::{
     wallet::{self, ChainEventStreamFamily, ChainEventsRequest},
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainStoreOptions, EventStreamStartPosition, PrimaryChainStore,
-    ReorgWindowChange, StreamCursorTokenV1, event_stream_start_message,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions,
+    EventStreamStartPosition, PrimaryChainStore, ReorgWindowChange, StreamCursorTokenV1,
+    event_stream_start_message,
 };
+use zinder_testkit::encode_fixture_block_replay;
 
 /// Events committed before a `live_tail` subscribe are skipped; commits after
 /// it are delivered in sequence order.
@@ -265,9 +267,11 @@ fn commit_synthetic_epoch(
 ) -> Result<zinder_store::ChainEpochCommitOutcome> {
     let (chain_epoch, block, compact_block) =
         synthetic_epoch_with_safe_tip(chain_epoch_id, height, height, block_hash(height));
+    let replay_envelope = encode_fixture_block_replay(&block, &[]);
     Ok(store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
         vec![block],
+        vec![replay_envelope],
         vec![compact_block],
     ))?)
 }
@@ -279,9 +283,11 @@ fn commit_reorgable_chain_and_cursor(store: &PrimaryChainStore) -> Result<Stream
     commit_synthetic_epoch(store, 1, 1)?;
     let (second_epoch, second_block, second_compact_block) =
         synthetic_epoch_with_safe_tip(2, 2, 1, block_hash(2));
+    let second_replay_envelope = encode_fixture_block_replay(&second_block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         second_epoch,
         vec![second_block],
+        vec![second_replay_envelope],
         vec![second_compact_block],
     ))?;
 
@@ -300,10 +306,12 @@ fn commit_height_two_reorg(store: &PrimaryChainStore) -> Result<()> {
     let (mut replacement_epoch, replacement_block, replacement_compact_block) =
         synthetic_epoch_with_safe_tip(3, 2, 1, block_hash(20));
     replacement_epoch.created_at = UnixTimestampMillis::new(1_774_668_300_000);
+    let replacement_replay_envelope = encode_fixture_block_replay(&replacement_block, &[]);
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(
             replacement_epoch,
             vec![replacement_block],
+            vec![replacement_replay_envelope],
             vec![replacement_compact_block],
         )
         .with_reorg_window_change(ReorgWindowChange::Replace {
@@ -330,7 +338,7 @@ fn synthetic_epoch_with_safe_tip(
             visible_tip_hash: source_hash,
             settled_tip_height: BlockHeight::new(safe_tip_height),
             settled_tip_hash: block_hash(safe_tip_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),
         },
@@ -366,7 +374,11 @@ async fn spawn_ingest_control(store: PrimaryChainStore) -> Result<std::net::Sock
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let adapter = IngestControlGrpcAdapter::new(Network::ZcashRegtest, store);
+    let adapter = IngestControlGrpcAdapter::new(
+        Network::ZcashRegtest,
+        store,
+        zinder_runtime::Readiness::default(),
+    );
     tokio::spawn(async move {
         let _ = Server::builder()
             .add_service(adapter.into_server())

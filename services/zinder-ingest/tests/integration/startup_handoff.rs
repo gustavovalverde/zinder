@@ -64,9 +64,9 @@ fn committed_two_epoch_store() -> Result<StoreFixture> {
             ChainEpochArtifacts::new(
                 chain_epoch,
                 full.block_header_artifacts().split_off(appended_from),
+                full.block_replay_envelopes().split_off(appended_from),
                 full.compact_block_artifacts().split_off(appended_from),
             )
-            .with_block_blobs(full.block_blob_artifacts().split_off(appended_from))
             .with_reorg_window_change(ReorgWindowChange::Extend { block_range }),
         )
         .map_err(|error| eyre!("could not commit second chain epoch: {error}"))?;

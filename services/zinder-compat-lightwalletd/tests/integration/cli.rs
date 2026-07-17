@@ -12,10 +12,11 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("compat-print-config-store");
     let secondary_path = tempdir.path().join("compat-print-config-secondary");
+    let wallet_path = tempdir.path().join("compat-print-config-wallet");
     let config_path = tempdir.path().join("zinder-compat.toml");
     fs::write(
         &config_path,
-        compat_config_toml(&storage_path, &secondary_path)?,
+        compat_config_toml(&storage_path, &secondary_path, &wallet_path)?,
     )?;
 
     let output = zinder_compat_command()
@@ -41,6 +42,11 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
     );
     assert!(stdout.contains("[storage.canonical.rocksdb]"), "{stdout}");
     assert!(stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
+    assert!(stdout.contains("[wallet]"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("path = \"{}\"", path_str(&wallet_path)?)),
+        "{stdout}"
+    );
     assert!(stdout.contains("[ingest_control]"), "{stdout}");
     assert!(
         stdout.contains("addr = \"http://127.0.0.1:9100\""),
@@ -96,10 +102,11 @@ fn ingest_only_section_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("compat-node-source-store");
     let secondary_path = tempdir.path().join("compat-node-source-secondary");
+    let wallet_path = tempdir.path().join("compat-node-source-wallet");
     let config_path = tempdir.path().join("zinder-compat.toml");
     fs::write(
         &config_path,
-        compat_config_with_ingest_section_toml(&storage_path, &secondary_path)?,
+        compat_config_with_ingest_section_toml(&storage_path, &secondary_path, &wallet_path)?,
     )?;
 
     let output = zinder_compat_command()
@@ -118,10 +125,11 @@ fn derive_storage_section_is_accepted() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("compat-derive-store");
     let secondary_path = tempdir.path().join("compat-derive-secondary");
+    let wallet_path = tempdir.path().join("compat-derive-wallet");
     let config_path = tempdir.path().join("zinder-compat.toml");
     fs::write(
         &config_path,
-        compat_config_with_derive_storage_toml(&storage_path, &secondary_path)?,
+        compat_config_with_derive_storage_toml(&storage_path, &secondary_path, &wallet_path)?,
     )?;
 
     let output = zinder_compat_command()
@@ -138,26 +146,10 @@ fn derive_storage_section_is_accepted() -> eyre::Result<()> {
     Ok(())
 }
 
-fn compat_config_toml(storage_path: &Path, secondary_path: &Path) -> eyre::Result<String> {
-    Ok(format!(
-        r#"[network]
-name = "zcash-regtest"
-
-[storage]
-path = "{}"
-secondary_path = "{}"
-
-[compat]
-listen_addr = "127.0.0.1:9067"
-"#,
-        path_str(storage_path)?,
-        path_str(secondary_path)?,
-    ))
-}
-
-fn compat_config_with_derive_storage_toml(
+fn compat_config_toml(
     storage_path: &Path,
     secondary_path: &Path,
+    wallet_path: &Path,
 ) -> eyre::Result<String> {
     Ok(format!(
         r#"[network]
@@ -166,6 +158,34 @@ name = "zcash-regtest"
 [storage]
 path = "{}"
 secondary_path = "{}"
+
+[wallet]
+path = "{}"
+
+[compat]
+listen_addr = "127.0.0.1:9067"
+"#,
+        path_str(storage_path)?,
+        path_str(secondary_path)?,
+        path_str(wallet_path)?,
+    ))
+}
+
+fn compat_config_with_derive_storage_toml(
+    storage_path: &Path,
+    secondary_path: &Path,
+    wallet_path: &Path,
+) -> eyre::Result<String> {
+    Ok(format!(
+        r#"[network]
+name = "zcash-regtest"
+
+[storage]
+path = "{}"
+secondary_path = "{}"
+
+[wallet]
+path = "{}"
 
 [storage.derive.rocksdb]
 block_cache_bytes = 134217728
@@ -175,12 +195,14 @@ listen_addr = "127.0.0.1:9067"
 "#,
         path_str(storage_path)?,
         path_str(secondary_path)?,
+        path_str(wallet_path)?,
     ))
 }
 
 fn compat_config_with_ingest_section_toml(
     storage_path: &Path,
     secondary_path: &Path,
+    wallet_path: &Path,
 ) -> eyre::Result<String> {
     Ok(format!(
         r#"[network]
@@ -189,6 +211,9 @@ name = "zcash-regtest"
 [storage]
 path = "{}"
 secondary_path = "{}"
+
+[wallet]
+path = "{}"
 
 [compat]
 listen_addr = "127.0.0.1:9067"
@@ -201,10 +226,12 @@ source = "zebra-json-rpc"
 "#,
         path_str(storage_path)?,
         path_str(secondary_path)?,
+        path_str(wallet_path)?,
     ))
 }
 
 fn compat_config_without_secondary_toml(storage_path: &Path) -> eyre::Result<String> {
+    let wallet_path = storage_path.with_extension("wallet");
     Ok(format!(
         r#"[network]
 name = "zcash-regtest"
@@ -212,10 +239,14 @@ name = "zcash-regtest"
 [storage]
 path = "{}"
 
+[wallet]
+path = "{}"
+
 [compat]
 listen_addr = "127.0.0.1:9067"
 "#,
         path_str(storage_path)?,
+        path_str(&wallet_path)?,
     ))
 }
 

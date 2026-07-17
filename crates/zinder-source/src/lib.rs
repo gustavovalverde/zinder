@@ -3,7 +3,6 @@
 //! This crate normalizes upstream node observations into source-domain values. It
 //! does not decide canonical chain state and does not build durable artifacts.
 
-mod chain_checkpoint;
 mod json_rpc_mempool;
 mod mempool_source;
 mod node_auth;
@@ -19,12 +18,12 @@ mod source_tree_state;
 mod transparent_address;
 mod transport;
 mod upstream_health;
+mod zebra_indexer_block;
 mod zebra_indexer_chain_tip;
 mod zebra_indexer_mempool;
 mod zebra_json_rpc;
 mod zebra_ready_endpoint;
 
-pub use chain_checkpoint::SourceChainCheckpoint;
 pub use json_rpc_mempool::{
     DEFAULT_MEMPOOL_POLL_INTERVAL, JsonRpcMempoolSource, JsonRpcMempoolSourceOptions,
 };
@@ -67,6 +66,7 @@ pub use upstream_health::{
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
 };
+pub use zebra_indexer_block::{ZebraIndexerBlockSource, ZebraIndexerBlockSourceOptions};
 pub use zebra_indexer_chain_tip::{
     ChainTipNotification, ChainTipNotificationSource, ChainTipNotificationStream,
     ZebraIndexerChainTipSource, ZebraIndexerChainTipSourceOptions,

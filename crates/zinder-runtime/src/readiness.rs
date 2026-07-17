@@ -240,6 +240,18 @@ pub struct UpstreamHealth {
     pub reason: Cow<'static, str>,
 }
 
+impl From<&UpstreamNotReadyDetail> for ops_proto::UpstreamNotReadyDetail {
+    fn from(detail: &UpstreamNotReadyDetail) -> Self {
+        Self {
+            upstream_committed_height: detail.upstream_committed_height,
+            upstream_estimated_height: detail.upstream_estimated_height,
+            upstream_verification_progress: detail.upstream_verification_progress,
+            upstream_health_source: detail.upstream_health.source.to_owned(),
+            upstream_health_reason: detail.upstream_health.reason.clone().into_owned(),
+        }
+    }
+}
+
 impl NodeUnavailableDetail {
     /// Returns a detail snapshot for the first iteration of a new outage.
     ///
@@ -376,6 +388,16 @@ impl ReadinessCause {
                 | Self::MempoolHydrationLagging { .. }
         )
     }
+
+    const fn preserves_observed_target(&self) -> bool {
+        matches!(
+            self,
+            Self::CursorAtRisk { .. }
+                | Self::MempoolCursorAtRisk { .. }
+                | Self::MempoolSourceUnavailable
+                | Self::MempoolHydrationLagging { .. }
+        )
+    }
 }
 
 /// Snapshot of the current readiness state surfaced to operators.
@@ -459,18 +481,27 @@ impl Readiness {
     }
 
     /// Replaces the readiness cause and heights, preserving the ingest loop
-    /// phase.
+    /// phase and the last observed target across orthogonal warning states.
     ///
     /// `phase` is orthogonal to [`ReadinessCause`] and owned by the ingest
     /// classifier via [`Self::set_phase`]; cause writers (bulk-catchup batch
     /// boundary, upstream-outage backoff, retention warnings) build a fresh
     /// [`ReadinessState`] with no phase, so retaining the last-stamped phase
     /// keeps `/readyz` and the derive replay phase gate stable between
-    /// classifier stamps. An explicit [`ReadinessState::with_phase`] on
-    /// `state` overrides.
+    /// classifier stamps. Retention and mempool warnings do not observe an
+    /// upstream target, so they retain the preceding target through the
+    /// warning and its transition back to ready. An explicit
+    /// [`ReadinessState::with_phase`] on `state` overrides the phase.
     pub fn set(&self, state: ReadinessState) {
         let mut guard = self.inner.lock();
+        let mut state = state;
         let phase = state.phase.or(guard.phase);
+        let warning_replaces_chain_state = state.cause.preserves_observed_target();
+        let warning_cleared_to_ready = matches!(&state.cause, ReadinessCause::Ready)
+            && guard.cause.preserves_observed_target();
+        if warning_replaces_chain_state || warning_cleared_to_ready {
+            state.target_height = guard.target_height;
+        }
         *guard = state;
         guard.phase = phase;
     }
@@ -572,6 +603,21 @@ impl ReadinessState {
             cause: ReadinessCause::Ready,
             current_height,
             target_height: current_height,
+            phase: None,
+        }
+    }
+
+    /// Returns a ready ingest state with the independently observed upstream
+    /// target retained even when the allowed ready lag is nonzero.
+    #[must_use]
+    pub const fn ready_with_target(
+        current_height: Option<u32>,
+        target_height: Option<u32>,
+    ) -> Self {
+        Self {
+            cause: ReadinessCause::Ready,
+            current_height,
+            target_height,
             phase: None,
         }
     }
@@ -871,13 +917,7 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
             }
             ReadinessCause::UpstreamNotReady(detail) => {
                 ops_proto::readiness_cause_detail::Payload::UpstreamNotReady(
-                    ops_proto::UpstreamNotReadyDetail {
-                        upstream_committed_height: detail.upstream_committed_height,
-                        upstream_estimated_height: detail.upstream_estimated_height,
-                        upstream_verification_progress: detail.upstream_verification_progress,
-                        upstream_health_source: detail.upstream_health.source.to_owned(),
-                        upstream_health_reason: detail.upstream_health.reason.clone().into_owned(),
-                    },
+                    ops_proto::UpstreamNotReadyDetail::from(detail),
                 )
             }
             ReadinessCause::Starting
@@ -1439,6 +1479,20 @@ mod tests {
 
         readiness.set(ReadinessState::ready(Some(20)).with_phase(IngestPhase::FollowingTip));
         assert_eq!(readiness.report().phase, Some(IngestPhase::FollowingTip));
+    }
+
+    #[test]
+    fn ready_and_warning_transitions_preserve_observed_upstream_target() {
+        let readiness = Readiness::new(
+            ReadinessState::ready_with_target(Some(100), Some(105))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+
+        readiness.set(ReadinessState::cursor_at_risk(145, 168, Some(100)));
+        assert_eq!(readiness.report().target_height, Some(105));
+
+        readiness.set(ReadinessState::ready(Some(100)));
+        assert_eq!(readiness.report().target_height, Some(105));
     }
 
     #[test]
