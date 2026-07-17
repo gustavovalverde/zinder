@@ -45,6 +45,7 @@ jobs:
         uses: bufbuild/buf-setup-action@v1
         with:
           version: ${{ env.BUF_VERSION }}
+          github_token: ${{ github.token }}
 
       - name: Check native protobuf compatibility
         run: |
