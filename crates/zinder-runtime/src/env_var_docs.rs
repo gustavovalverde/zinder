@@ -715,7 +715,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Immutable raw-blob retention contract: `none`, `transactions`, or `all`. \
-                      Defaults to `none` for explicit coverage so fact-first indexing does not write \
+                      Defaults to `none` for explicit coverage so canonical indexing does not write \
                       raw block or transaction blobs unless a deployment explicitly needs raw export. \
                       Wallet-serving coverage defaults to `transactions` and rejects `none`, because \
                       lightwalletd transaction and transparent-history methods require retained bytes. \
