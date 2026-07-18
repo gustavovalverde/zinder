@@ -27,7 +27,7 @@ use zinder_wallet_projection::{
     WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity, WalletOutpointKey,
     WalletProjectionBuildState, WalletProjectionDigestBuilder, WalletProjectionEventCursor,
     WalletProjectionReadyEvidence, WalletProjectionRowFamily, WalletProjectionSourcePosition,
-    WalletReorgUndo, WalletSpentOutput, WalletStoreControl, WalletTransactionPosition,
+    WalletReorgUndo, WalletSpentOutput, WalletStoreControlRecord, WalletTransactionPosition,
     WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
@@ -326,7 +326,7 @@ impl RocksDbWalletStore {
             .writer_generation
             .checked_add(1)
             .ok_or(RocksDbWalletError::ProjectionTransitionGenerationOverflow)?;
-        let next_control = WalletStoreControl {
+        let next_control = WalletStoreControlRecord {
             network: self.control.network,
             supported_reorg_depth: self.control.supported_reorg_depth,
             writer_generation,

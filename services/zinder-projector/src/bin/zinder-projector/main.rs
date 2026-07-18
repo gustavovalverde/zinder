@@ -30,11 +30,11 @@ use zinder_wallet_rocksdb::{
     WalletProjectionBuildLeaseExecution, build_wallet_from_canonical_with_lease_and_heartbeat,
 };
 
-mod canonical_control;
+mod canonical_lease_client;
 mod config;
 mod projector_control;
 
-use canonical_control::{CanonicalRetentionLease, CanonicalRetentionLeaseClient};
+use canonical_lease_client::{CanonicalRetentionLease, CanonicalRetentionLeaseClient};
 use config::{ProjectorConfigOverrides, ProjectorError};
 use projector_control::{
     ProjectorControlCommand, ProjectorControlGrpcAdapter, projector_control_channel,

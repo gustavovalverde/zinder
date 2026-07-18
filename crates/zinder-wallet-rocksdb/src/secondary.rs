@@ -252,7 +252,7 @@ impl RocksDbWalletSecondary {
 }
 
 fn ready_evidence_from_control(
-    control: &zinder_wallet_projection::WalletStoreControl,
+    control: &zinder_wallet_projection::WalletStoreControlRecord,
     primary_path: &Path,
     expected_network: Network,
 ) -> Result<WalletProjectionReadyEvidence, RocksDbWalletError> {

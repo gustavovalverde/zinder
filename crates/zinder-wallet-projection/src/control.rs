@@ -458,7 +458,7 @@ pub enum WalletProjectionBuildState {
 
 /// Singleton durable control record for one wallet projection store.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WalletStoreControl {
+pub struct WalletStoreControlRecord {
     /// Network whose canonical facts produced the projection.
     pub network: Network,
     /// Maximum rollback depth represented by `reorg_undo`.
@@ -471,7 +471,7 @@ pub struct WalletStoreControl {
     pub build_state: WalletProjectionBuildState,
 }
 
-impl WalletStoreControl {
+impl WalletStoreControlRecord {
     /// Encodes the exact, single-version wallet control record.
     pub fn encode(&self) -> Result<Vec<u8>, WalletProjectionContractError> {
         if let WalletProjectionBuildState::Building(plan) = &self.build_state {
@@ -867,7 +867,9 @@ fn encode_block_id(block: BlockId, bytes: &mut Vec<u8>) {
     bytes.extend_from_slice(&block.hash.as_bytes());
 }
 
-fn validate_build_lease(control: &WalletStoreControl) -> Result<(), WalletProjectionContractError> {
+fn validate_build_lease(
+    control: &WalletStoreControlRecord,
+) -> Result<(), WalletProjectionContractError> {
     let Some(lease) = control.build_lease else {
         if matches!(control.build_state, WalletProjectionBuildState::Ready(_)) {
             return Ok(());
@@ -1043,8 +1045,8 @@ mod tests {
         }
     }
 
-    fn sample_control(build_state: WalletProjectionBuildState) -> WalletStoreControl {
-        WalletStoreControl {
+    fn sample_control(build_state: WalletProjectionBuildState) -> WalletStoreControlRecord {
+        WalletStoreControlRecord {
             network: Network::ZcashRegtest,
             supported_reorg_depth: 100,
             writer_generation: 0x0102_0304_0506_0708,
@@ -1065,7 +1067,7 @@ mod tests {
         pre_reset.extend_from_slice(&current[WALLET_PROJECTION_STORE_IDENTITY.len()..]);
 
         assert!(matches!(
-            WalletStoreControl::decode(&pre_reset),
+            WalletStoreControlRecord::decode(&pre_reset),
             Err(WalletProjectionContractError::UnsupportedEncodedValue {
                 field: "wallet projection schema version",
                 encoded: 0x2d70,
@@ -1103,7 +1105,7 @@ mod tests {
                 "012122232425262728"
             )
         );
-        assert_eq!(WalletStoreControl::decode(&encoded), Ok(control));
+        assert_eq!(WalletStoreControlRecord::decode(&encoded), Ok(control));
     }
 
     #[test]
@@ -1155,7 +1157,7 @@ mod tests {
         expected.extend_from_slice(evidence.utxo_summary.commitment.accumulator());
 
         assert_eq!(control.encode(), Ok(expected.clone()));
-        assert_eq!(WalletStoreControl::decode(&expected), Ok(control));
+        assert_eq!(WalletStoreControlRecord::decode(&expected), Ok(control));
     }
 
     #[test]
@@ -1176,7 +1178,7 @@ mod tests {
             7,
             Network::ZcashRegtest,
         );
-        let control = WalletStoreControl {
+        let control = WalletStoreControlRecord {
             network: Network::ZcashRegtest,
             supported_reorg_depth: 0,
             writer_generation: 7,
@@ -1188,7 +1190,7 @@ mod tests {
         let encoded = control
             .encode()
             .unwrap_or_else(|error| unreachable!("valid leased control: {error}"));
-        let decoded = WalletStoreControl::decode(&encoded)
+        let decoded = WalletStoreControlRecord::decode(&encoded)
             .unwrap_or_else(|error| unreachable!("leased control decode: {error}"));
         assert_eq!(decoded, control);
         assert_eq!(lease.version(), PROJECTION_BUILD_LEASE_VERSION);
@@ -1212,7 +1214,7 @@ mod tests {
         let schema_offset = WALLET_PROJECTION_STORE_IDENTITY.len();
         wrong_schema[schema_offset..schema_offset + 2].copy_from_slice(&5_u16.to_be_bytes());
         assert!(matches!(
-            WalletStoreControl::decode(&wrong_schema),
+            WalletStoreControlRecord::decode(&wrong_schema),
             Err(WalletProjectionContractError::UnsupportedEncodedValue { .. })
         ));
 
@@ -1221,14 +1223,14 @@ mod tests {
             WALLET_PROJECTION_STORE_IDENTITY.len() + 2 + 2 + 4 + 2 + 4 + 2 + 2 + 4 + 8;
         unknown_state[state_offset] = 9;
         assert!(matches!(
-            WalletStoreControl::decode(&unknown_state),
+            WalletStoreControlRecord::decode(&unknown_state),
             Err(WalletProjectionContractError::UnsupportedEncodedValue { .. })
         ));
 
         let mut trailing = encoded;
         trailing.push(0);
         assert!(matches!(
-            WalletStoreControl::decode(&trailing),
+            WalletStoreControlRecord::decode(&trailing),
             Err(WalletProjectionContractError::DurableTrailingBytes { .. })
         ));
     }
@@ -1285,7 +1287,7 @@ mod tests {
         evidence.source_sequence_digest = sequence_digest(1);
         evidence.settled_tip =
             BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([0x43; 32]));
-        let control = WalletStoreControl {
+        let control = WalletStoreControlRecord {
             network: Network::ZcashRegtest,
             supported_reorg_depth: 1,
             writer_generation: 1,
@@ -1303,7 +1305,7 @@ mod tests {
         evidence.source_sequence_digest = sequence_digest(3);
         evidence.settled_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0x32; 32]));
         evidence.row_counts.reorg_undo_count = 1;
-        let control = WalletStoreControl {
+        let control = WalletStoreControlRecord {
             network: Network::ZcashRegtest,
             supported_reorg_depth: 2,
             writer_generation: 1,

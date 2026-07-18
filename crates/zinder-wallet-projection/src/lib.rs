@@ -19,7 +19,7 @@ pub use control::{
     WalletCanonicalSourceIdentity, WalletProjectionBuildPlan, WalletProjectionBuildState,
     WalletProjectionDigest, WalletProjectionEventCursor, WalletProjectionFamilyRowCounts,
     WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
-    WalletProjectionSourcePosition, WalletStoreControl, WalletUtxoSetSummary,
+    WalletProjectionSourcePosition, WalletStoreControlRecord, WalletUtxoSetSummary,
 };
 pub use digest::{
     WALLET_PROJECTION_ACCUMULATOR_LEN, WALLET_PROJECTION_ACCUMULATOR_VERSION,

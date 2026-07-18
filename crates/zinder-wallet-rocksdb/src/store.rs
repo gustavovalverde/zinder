@@ -31,7 +31,7 @@ use zinder_wallet_projection::{
     WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
     WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildPlan,
     WalletProjectionBuildState, WalletProjectionDigestBuilder, WalletProjectionReadyEvidence,
-    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletStoreControl,
+    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletStoreControlRecord,
     WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
@@ -149,21 +149,21 @@ pub(crate) struct RocksDbWalletBuilder {
     bounded_open: BoundedRocksDbOpen,
     store_path: std::path::PathBuf,
     resource_budget: RocksDbResourceBudget,
-    control: WalletStoreControl,
+    control: WalletStoreControlRecord,
     lease: ProjectionBuildLease,
 }
 
 /// A cold-reopened BUILDING store whose rows have not yet been validated.
 pub(crate) struct ColdRocksDbWalletBuild {
     bounded_open: BoundedRocksDbOpen,
-    control: WalletStoreControl,
+    control: WalletStoreControlRecord,
     lease: ProjectionBuildLease,
 }
 
 /// A cold-validated BUILDING store carrying the evidence it may publish.
 pub(crate) struct ValidatedRocksDbWalletBuild {
     bounded_open: BoundedRocksDbOpen,
-    control: WalletStoreControl,
+    control: WalletStoreControlRecord,
     lease: ProjectionBuildLease,
     ready_evidence: WalletProjectionReadyEvidence,
     validation_evidence: WalletColdValidationEvidence,
@@ -194,7 +194,7 @@ pub(crate) struct WalletColdValidationEvidence {
 /// row codecs or mutating a store after admission.
 pub struct RocksDbWalletStore {
     pub(crate) bounded_open: BoundedRocksDbOpen,
-    pub(crate) control: WalletStoreControl,
+    pub(crate) control: WalletStoreControlRecord,
     pub(crate) ready_evidence: WalletProjectionReadyEvidence,
 }
 
@@ -235,7 +235,7 @@ impl RocksDbWalletBuildStore {
             wallet_column_family_descriptors,
         )
         .map_err(|source| RocksDbWalletError::rocksdb("fresh build-store open", source))?;
-        let control = WalletStoreControl {
+        let control = WalletStoreControlRecord {
             network,
             supported_reorg_depth,
             writer_generation: 0,
@@ -306,7 +306,7 @@ impl RocksDbWalletBuildStore {
             .checked_add(1)
             .ok_or(RocksDbWalletError::ProjectionBuildLeaseGenerationOverflow)?;
         let lease = ProjectionBuildLease::from_request(request, generation, self.network);
-        let next_control = WalletStoreControl {
+        let next_control = WalletStoreControlRecord {
             writer_generation: generation,
             build_lease: Some(lease),
             ..control
@@ -337,7 +337,7 @@ impl RocksDbWalletBuildStore {
             return Err(RocksDbWalletError::ProjectionBuildLeaseRenewalNotExtended);
         }
         let renewed = persisted.renewed(expires_at);
-        let next_control = WalletStoreControl {
+        let next_control = WalletStoreControlRecord {
             build_lease: Some(renewed),
             ..control
         };
@@ -359,7 +359,7 @@ impl RocksDbWalletBuildStore {
     ) -> Result<(), RocksDbWalletError> {
         let (bounded_open, control) = self.open_building_control()?;
         let _persisted = authorize_active_lease(&control, lease, now)?;
-        let next_control = WalletStoreControl {
+        let next_control = WalletStoreControlRecord {
             build_lease: None,
             ..control
         };
@@ -407,7 +407,7 @@ impl RocksDbWalletBuildStore {
 
     fn open_building_control(
         &self,
-    ) -> Result<(BoundedRocksDbOpen, WalletStoreControl), RocksDbWalletError> {
+    ) -> Result<(BoundedRocksDbOpen, WalletStoreControlRecord), RocksDbWalletError> {
         require_exact_column_families(&self.store_path)?;
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::ExistingPrimary {
@@ -649,7 +649,7 @@ impl ValidatedRocksDbWalletBuild {
             );
         }
         let ready_evidence = self.ready_evidence;
-        let ready_control = WalletStoreControl {
+        let ready_control = WalletStoreControlRecord {
             network: self.control.network,
             supported_reorg_depth: self.control.supported_reorg_depth,
             writer_generation: self.control.writer_generation,
@@ -1433,7 +1433,7 @@ fn require_exact_column_families(path: &Path) -> Result<(), RocksDbWalletError> 
 }
 
 fn require_building_control(
-    control: &WalletStoreControl,
+    control: &WalletStoreControlRecord,
     store_path: &Path,
     expected_network: Network,
 ) -> Result<(), RocksDbWalletError> {
@@ -1452,7 +1452,7 @@ fn require_building_control(
 }
 
 fn validate_lease_request(
-    control: &WalletStoreControl,
+    control: &WalletStoreControlRecord,
     request: ProjectionBuildLeaseRequest,
     now: UnixTimestampMillis,
 ) -> Result<(), RocksDbWalletError> {
@@ -1487,7 +1487,7 @@ fn validate_lease_request(
 }
 
 fn authorize_active_lease(
-    control: &WalletStoreControl,
+    control: &WalletStoreControlRecord,
     lease: ProjectionBuildLease,
     now: UnixTimestampMillis,
 ) -> Result<ProjectionBuildLease, RocksDbWalletError> {
@@ -1529,7 +1529,7 @@ fn authorize_active_lease(
 
 fn apply_build_lease_heartbeat(
     bounded_open: &BoundedRocksDbOpen,
-    control: &mut WalletStoreControl,
+    control: &mut WalletStoreControlRecord,
     lease: &mut ProjectionBuildLease,
     heartbeat: WalletBuildLeaseHeartbeat,
 ) -> Result<(), RocksDbWalletError> {
@@ -1547,7 +1547,7 @@ fn apply_build_lease_heartbeat(
         return Err(RocksDbWalletError::ProjectionBuildLeaseRenewalNotExtended);
     }
     let renewed = persisted_lease.renewed(renew_until);
-    let next_control = WalletStoreControl {
+    let next_control = WalletStoreControlRecord {
         build_lease: Some(renewed),
         ..persisted_control
     };
@@ -1569,7 +1569,7 @@ fn apply_build_lease_heartbeat(
 
 pub(crate) fn decode_only_control(
     bounded_open: &BoundedRocksDbOpen,
-) -> Result<WalletStoreControl, RocksDbWalletError> {
+) -> Result<WalletStoreControlRecord, RocksDbWalletError> {
     let mut iterator = bounded_open.db.iterator(IteratorMode::Start);
     let Some(first) = iterator.next() else {
         return Err(RocksDbWalletError::StoreControlMissing);
@@ -1579,12 +1579,12 @@ pub(crate) fn decode_only_control(
     if key.as_ref() != WALLET_STORE_CONTROL_KEY || iterator.next().is_some() {
         return Err(RocksDbWalletError::StoreControlCardinalityMismatch);
     }
-    WalletStoreControl::decode(&encoded).map_err(RocksDbWalletError::from)
+    WalletStoreControlRecord::decode(&encoded).map_err(RocksDbWalletError::from)
 }
 
 fn write_control_sync(
     bounded_open: &BoundedRocksDbOpen,
-    control: &WalletStoreControl,
+    control: &WalletStoreControlRecord,
 ) -> Result<(), RocksDbWalletError> {
     let encoded = control.encode()?;
     let mut batch = WriteBatch::default();

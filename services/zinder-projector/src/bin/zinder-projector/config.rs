@@ -123,7 +123,7 @@ pub(crate) enum ProjectorError {
     WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
 
     #[error(transparent)]
-    CanonicalControl(#[from] crate::canonical_control::CanonicalControlError),
+    CanonicalControl(#[from] crate::canonical_lease_client::CanonicalControlError),
 
     #[error("projector build task failed: {0}")]
     BuildTask(#[from] tokio::task::JoinError),
