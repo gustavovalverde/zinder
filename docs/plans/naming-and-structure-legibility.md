@@ -471,6 +471,33 @@ This sub-scope's deletion of `transaction_history_verifier.rs` (one of the
 eight backfill/verifier modules) also closes decision 15: there is no
 separate rename to make once its only caller is gone.
 
+Executed outcome: the sub-scope landed partially, and the partial result is
+accepted as correct. Deleted: `projection_startup.rs`, `retention.rs`,
+`mempool/orchestrator.rs`, six backfill/verifier modules, `ingest_loop.rs`'s
+orchestrator half, the §1.2 dead config surface, and the dead-cluster tests
+(~9,200 lines). Kept, against the audit's "zero callers" claim, with
+verified evidence: `ingest_control.rs` (constructed as the in-process gRPC
+test double by ~12 test files including all six `zinder-explorer` live
+federation suites, with no `CanonicalIngestControlGrpcAdapter`-based
+equivalent to migrate to), `derive_consumers.rs` (its store build/catch-up
+functions are called from `zinder-bench`'s production replay harness,
+`services/zinder-bench/src/replay.rs`), `derive_status_reader.rs`,
+`tip_follow.rs` (three live-network tests), and the two backfill modules
+`derive_consumers.rs` imports (`conventional_fee_distribution_backfill.rs`,
+`transaction_component_backfill.rs`). The audit's §1.1 claim was true of
+production wiring but wrong about tests and bench code. The kept cluster's
+deletion joins decision 21's explorer-cutover terminal cluster: the
+federation tests and bench harness that hold it alive are themselves
+pre-cutover surface.
+
+Two consequences for later phases: decision 9's precondition (reclaiming
+the plain `ingest_control.rs` name) is unfulfilled, so phase 5's
+`writer/ingest_control.rs` relies on directory namespacing to distinguish
+itself from the surviving crate-root `ingest_control.rs`; and the trimmed
+`ingest_loop.rs` no longer contains a loop (it holds eight public
+config/data types plus one gate helper), making its name a misnomer that
+phase 5 now owns renaming.
+
 ### 4b: `zinder-query` projection-reader surface (decision 20)
 
 New deletion scope owned by this plan:
@@ -526,7 +553,7 @@ re-exported):
 | `canonical_construction.rs` | `writer/construction.rs` | called from `canonical_runtime.rs`'s orchestration |
 | `canonical_control.rs` | `writer/control.rs` | `main.rs` calls `canonical_control_channel()` |
 | `canonical_follow.rs` | `writer/follow.rs` | `main.rs` imports `CanonicalFollowConfig` |
-| `canonical_ingest_control.rs` | `writer/ingest_control.rs` (after phase 4) | `main.rs` constructs `CanonicalIngestControlGrpcAdapter` |
+| `canonical_ingest_control.rs` | `writer/ingest_control.rs` — the surviving crate-root `ingest_control.rs` (phase 4a executed outcome) stays distinguishable through the `writer::` module path | `main.rs` constructs `CanonicalIngestControlGrpcAdapter` |
 | `canonical_runtime.rs` | `writer/mod.rs` | `main.rs` calls `run_canonical_runtime_with_control` |
 | `canonical_replay_verification.rs` | `replay_verification.rs` (crate-root sibling, not nested — see decision 8) | `main.rs`'s CLI dispatch calls `run_canonical_replay_verification` |
 
@@ -535,6 +562,16 @@ holding `abort_on_drop.rs`, `source_fetch.rs`, `watermark.rs` with no `//!`
 doc comments on any of the three) moves to `writer/construction/` and should
 gain doc comments as part of the same change, since the move already touches
 every import referencing it.
+
+This phase also renames the trimmed `ingest_loop.rs` (phase 4a's executed
+outcome left it with no loop: eight public config/data types —
+`IngestLoopConfig`, `PhasesConfig`, `IngestDeriveConfig`,
+`DeriveReplayPolicy`, `BulkCatchupConfig`, `TipFollowPhaseConfig`,
+`IngestModifiers`, `HistoricalWorkGate` — plus one gate helper). Rename the
+file to describe its content (`loop_config.rs` is the default; the
+implementer may choose better subject to the banned-forms list and must
+record the choice), and leave the type names themselves unchanged: they are
+public API whose renames are not this phase's scope.
 
 `run_canonical_runtime_with_control` and any other `canonical_runtime`-named
 public function should rename its `runtime` segment to `writer` for the same
