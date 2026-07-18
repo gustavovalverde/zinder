@@ -1397,13 +1397,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated =
-            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
-        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
-            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
-        ))?;
-        let store = validated.publish_baseline(publication)?;
+        let store = published_loaded_store(&store_path, BlockHeight::new(2))?;
         let expected_fence = store.event_fence();
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;

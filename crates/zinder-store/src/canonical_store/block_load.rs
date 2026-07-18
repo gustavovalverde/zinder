@@ -257,17 +257,14 @@ impl<'options> CanonicalBlockSstStager<'options> {
     fn stage(&mut self, block: CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
         validate_build_block(self.config.workload, self.config.build_plan, &block)?;
         let row = BlockSequenceRow::from_block(&block)?;
-        match &mut self.sequence {
-            Some(sequence) => sequence.append(row)?,
-            None => {
-                let retained_checkpoint_count = usize::try_from(
-                    u64::from(self.config.build_plan.reorg_policy().reorg_window_blocks()) + 1,
-                )
-                .map_err(|_| {
-                    CanonicalStoreError::block_load_sequence("reorg window exceeds usize")
-                })?;
-                self.sequence = Some(BlockSequence::new(row, retained_checkpoint_count)?);
-            }
+        if let Some(sequence) = &mut self.sequence {
+            sequence.append(row)?;
+        } else {
+            let retained_checkpoint_count = usize::try_from(
+                u64::from(self.config.build_plan.reorg_policy().reorg_window_blocks()) + 1,
+            )
+            .map_err(|_| CanonicalStoreError::block_load_sequence("reorg window exceeds usize"))?;
+            self.sequence = Some(BlockSequence::new(row, retained_checkpoint_count)?);
         }
         write_build_block(
             block,
