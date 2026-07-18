@@ -114,6 +114,7 @@ jobs:
         run: |
           scripts/test-container-resource-evidence.sh
           scripts/test-storage-benchmark-campaign-validator.sh
+          scripts/test-observability-smoke-safety.sh
           env \
             ZINDER_BENCH_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             ZINDER_BENCH_SOFTWARE_REVISION=ci \
@@ -133,8 +134,8 @@ jobs:
       - name: Test deployment Compose contract
         env:
           ZINDER_INGEST_IMAGE: zinder-ingest:ci-proof
-          ZINDER_QUERY_IMAGE: zinder-query:ci-proof
-          ZINDER_EXPLORER_IMAGE: zinder-explorer:ci-proof
+          ZINDER_PROJECTOR_IMAGE: zinder-projector:ci-proof
+          ZINDER_COMPAT_IMAGE: zinder-compat-lightwalletd:ci-proof
           ZINDER_SINGLE_HOST_DATA_VOLUME_NAME: zinder-ci-proof-data
           ZINDER_PROMETHEUS_VOLUME_NAME: zinder-ci-proof-prometheus
           ZINDER_GRAFANA_VOLUME_NAME: zinder-ci-proof-grafana
@@ -147,11 +148,13 @@ jobs:
             config --format json \
           | jq -e '
               .services["zinder-ingest"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-query"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-explorer"].command == ["--config", "/etc/zinder/config.toml"]
+              and .services["zinder-projector"].command == ["--config", "/etc/zinder/config.toml"]
+              and .services["zinder-compat-lightwalletd"].command == ["--config", "/etc/zinder/config.toml"]
               and .services["zinder-ingest"].image == "zinder-ingest:ci-proof"
-              and .services["zinder-query"].image == "zinder-query:ci-proof"
-              and .services["zinder-explorer"].image == "zinder-explorer:ci-proof"
+              and .services["zinder-projector"].image == "zinder-projector:ci-proof"
+              and .services["zinder-compat-lightwalletd"].image == "zinder-compat-lightwalletd:ci-proof"
+              and .services["zinder-projector"].network_mode == "service:zinder-ingest"
+              and .services["zinder-compat-lightwalletd"].network_mode == "service:zinder-ingest"
               and .volumes.data.name == "zinder-ci-proof-data"
               and .volumes.prometheus.name == "zinder-ci-proof-prometheus"
               and .volumes.grafana.name == "zinder-ci-proof-grafana"

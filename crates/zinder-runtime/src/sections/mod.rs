@@ -9,6 +9,7 @@
 pub mod defaults;
 mod ingest_control;
 mod ops;
+mod projector_control;
 mod retention;
 mod security;
 mod service;
@@ -20,6 +21,10 @@ pub use ingest_control::{
     resolve_ingest_control_writer,
 };
 pub use ops::{OpsSection, OpsToml, resolve_ops_listen_addr};
+pub use projector_control::{
+    ProjectorControlSection, ProjectorControlToml, ResolvedProjectorControl,
+    resolve_projector_control,
+};
 pub use retention::{ResolvedRetention, RetentionSection, RetentionToml, resolve_retention};
 pub use security::{
     DEFAULT_ALLOW_PUBLIC_BIND, SecuritySection, SecurityToml, resolve_allow_public_bind,

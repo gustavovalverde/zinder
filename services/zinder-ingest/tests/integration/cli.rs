@@ -7,15 +7,14 @@ use std::{error::Error, fs, path::Path, process::Command};
 
 use tempfile::tempdir;
 use zinder_core::{
-    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion, ChainEpoch,
-    ChainEpochId, Network, decode_canonical_block_replay, wire::encode_rpc_block_hash_hex,
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+    ChainEpochId, Network, decode_canonical_block_replay,
 };
 use zinder_derive::{
-    BLOCK_SUMMARY_CONSUMER_NAME, DeriveStore, DeriveStoreOptions,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    BLOCK_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
 };
-use zinder_store::{ChainStoreOptions, PrimaryChainStore, RawBlobRetention};
+use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::ChainFixture;
 
 #[test]
@@ -351,35 +350,6 @@ fn print_config_allows_disabled_ingest_control_for_one_shot_runs() -> Result<(),
 }
 
 #[test]
-fn backup_print_config_loads_config_file() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("backup-print-config-store");
-    let backup_path = tempdir.path().join("backup-print-config-checkpoint");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(
-        &config_path,
-        backup_config_toml(&storage_path, &backup_path)?,
-    )?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "backup",
-        ])
-        .output()?;
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("[backup]"));
-    assert!(stdout.contains(&format!("to_path = \"{}\"", path_str(&backup_path)?)));
-    assert!(stdout.contains("raw_blob_policy = \"none\""));
-
-    Ok(())
-}
-
-#[test]
 fn canonical_replay_verification_print_config_loads_secondary_path() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("verification-print-config-store");
@@ -465,117 +435,6 @@ fn canonical_replay_verification_scans_multiple_bounded_batches() -> Result<(), 
         hex::encode(expected_digest.as_bytes())
     );
     assert!(secondary_path.exists());
-
-    Ok(())
-}
-
-fn assert_complete_backup_manifest(
-    checkpoint_path: &Path,
-    expected_chain_epoch: ChainEpoch,
-) -> Result<(), Box<dyn Error>> {
-    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(
-        checkpoint_path.join("zinder-backup-manifest.json"),
-    )?)?;
-    assert_eq!(manifest["format_version"], 3);
-    assert_eq!(manifest["network"], "zcash-regtest");
-    assert_eq!(manifest["projection_preset"], "explorer");
-    assert_eq!(manifest["raw_blob_retention"], "all");
-    assert_eq!(
-        manifest["canonical_position"]["visible_tip_hash"],
-        encode_rpc_block_hash_hex(expected_chain_epoch.visible_tip_hash)
-    );
-    assert_eq!(
-        manifest["canonical_position"]["artifact_schema_version"],
-        expected_chain_epoch.artifact_schema_version.value()
-    );
-    let projections = manifest["projections"]
-        .as_array()
-        .ok_or("projection manifest must be an array")?;
-    assert_eq!(projections.len(), DeriveStore::bundled_consumers().len());
-    let block_summary = projections
-        .iter()
-        .find(|projection| projection["identity"] == BLOCK_SUMMARY_CONSUMER_NAME.as_str())
-        .ok_or("block-summary projection manifest missing")?;
-    assert_eq!(block_summary["state"], "exact");
-    assert!(block_summary["cursor"].is_string());
-    Ok(())
-}
-
-#[test]
-fn backup_creates_checkpoint_from_primary_store() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("backup-source-store");
-    let checkpoint_path = tempdir.path().join("backup-checkpoint");
-    let checkpoint_staging_path = checkpoint_path.with_extension("staging");
-    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::All)
-        .extend_blocks(1);
-    let artifacts = chain_fixture
-        .chain_epoch_artifacts(ChainEpochId::new(1))
-        .ok_or("chain fixture unexpectedly empty")?;
-    let expected_chain_epoch = artifacts.chain_epoch;
-    let expected_derive_cursor;
-
-    {
-        let store = PrimaryChainStore::open(
-            &storage_path,
-            ChainStoreOptions {
-                raw_blob_retention: RawBlobRetention::All,
-                ..ChainStoreOptions::for_network(Network::ZcashRegtest)
-            },
-        )?;
-        let commit = store.commit_chain_epoch(artifacts)?;
-        expected_derive_cursor = commit.event_envelope.cursor.as_bytes().to_vec();
-        let derive_store = DeriveStore::open(
-            DeriveStore::path_for_canonical(&storage_path),
-            DeriveStoreOptions {
-                consumers: DeriveStore::bundled_consumers(),
-                ..DeriveStoreOptions::default()
-            },
-        )?;
-        derive_store
-            .put_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME, &expected_derive_cursor)?;
-    }
-
-    let output = zinder_ingest_command()
-        .args([
-            "backup",
-            "--network",
-            "zcash-regtest",
-            "--storage-path",
-            path_str(&storage_path)?,
-            "--to",
-            path_str(&checkpoint_path)?,
-            "--raw-blob-policy",
-            "all",
-        ])
-        .output()?;
-
-    assert!(output.status.success(), "{output:?}");
-    let checkpoint = PrimaryChainStore::open(
-        &checkpoint_path,
-        ChainStoreOptions {
-            raw_blob_retention: RawBlobRetention::All,
-            ..ChainStoreOptions::for_network(Network::ZcashRegtest)
-        },
-    )?;
-    assert_eq!(
-        checkpoint.current_chain_epoch()?,
-        Some(expected_chain_epoch)
-    );
-    let derive_checkpoint = DeriveStore::open(
-        DeriveStore::path_for_canonical(&checkpoint_path),
-        DeriveStoreOptions {
-            consumers: DeriveStore::bundled_consumers(),
-            ..DeriveStoreOptions::default()
-        },
-    )?;
-    assert_eq!(
-        derive_checkpoint.get_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME)?,
-        Some(expected_derive_cursor)
-    );
-    assert!(!checkpoint_staging_path.exists());
-    assert_complete_backup_manifest(&checkpoint_path, expected_chain_epoch)?;
 
     Ok(())
 }
@@ -1375,22 +1234,6 @@ listen_addr = "127.0.0.1:9100"
 "#,
         path_str(cookie_path)?,
         path_str(storage_path)?,
-    ))
-}
-
-fn backup_config_toml(storage_path: &Path, backup_path: &Path) -> Result<String, Box<dyn Error>> {
-    Ok(format!(
-        r#"[network]
-name = "zcash-regtest"
-
-[storage]
-path = "{}"
-
-[backup]
-to_path = "{}"
-"#,
-        path_str(storage_path)?,
-        path_str(backup_path)?
     ))
 }
 

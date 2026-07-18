@@ -1,7 +1,12 @@
 //! Wallet query implementation over admitted version-1 canonical and wallet stores.
 
-use std::{collections::HashSet, io, num::NonZeroU16, sync::Arc};
+use std::{
+    collections::HashSet,
+    num::{NonZeroU16, NonZeroU32},
+    sync::Arc,
+};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use zinder_core::{
@@ -14,36 +19,25 @@ use zinder_core::{
 };
 use zinder_source::{TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
-    ArtifactFamily, ChainEventStreamFamily, EventStreamStartPosition, RocksDbCanonicalStore,
-    StreamCursorTokenV1,
+    ArtifactFamily, ChainEventStreamFamily, EventStreamStartPosition, StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{WalletAddressTransactionKey, WalletAddressUnspentOutputKey};
-use zinder_wallet_rocksdb::RocksDbWalletStore;
 
 use crate::{
     ArtifactKey, BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock,
-    CompactBlockRange, FullBlock, FullBlockStream, LatestBlock, LatestSafeBlock, QueryError,
-    RawTransaction, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi,
+    CompactBlockRange, FactFirstReadPair, FullBlock, FullBlockStream, LatestBlock, LatestSafeBlock,
+    QueryError, RawTransaction, SubtreeRoots, Transaction, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQueryApi,
 };
 
 const FACT_FIRST_HISTORY_PAGE_SIZE: NonZeroU16 = NonZeroU16::MAX;
 
-/// Exact wallet-projection position admitted with a fact-first query.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FactFirstWalletReadiness {
-    /// Canonical chain epoch represented by the wallet rows.
-    pub chain_epoch_id: ChainEpochId,
-    /// Canonical tip height represented by the wallet rows.
-    pub height: BlockHeight,
-}
-
 /// Exact-fence wallet query over the clean version-1 stores.
 #[derive(Clone)]
 pub struct FactFirstWalletQuery<Broadcaster> {
-    canonical_store: Arc<RocksDbCanonicalStore>,
-    wallet_store: Arc<RocksDbWalletStore>,
+    read_pairs: Arc<ArcSwap<FactFirstReadPair>>,
     broadcaster: Broadcaster,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     tree_state_upstream: Option<Arc<dyn TreeStateUpstream>>,
@@ -51,47 +45,34 @@ pub struct FactFirstWalletQuery<Broadcaster> {
 
 impl<Broadcaster> std::fmt::Debug for FactFirstWalletQuery<Broadcaster> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pair = self.capture_pair();
         formatter
             .debug_struct("FactFirstWalletQuery")
-            .field("canonical_fence", &self.canonical_store.event_fence())
-            .field(
-                "wallet_fence",
-                &self.wallet_store.ready_evidence().source_position,
-            )
+            .field("canonical_fence", &pair.canonical_fence())
+            .field("wallet_fence", &pair.wallet_source())
             .field("tree_state_upstream", &self.tree_state_upstream.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
-    /// Constructs a query only when both admitted stores describe one exact source fence.
-    pub fn new(
-        canonical_store: Arc<RocksDbCanonicalStore>,
-        wallet_store: Arc<RocksDbWalletStore>,
+    /// Builds a query over a swappable slot of already-admitted immutable pairs.
+    ///
+    /// Every [`WalletQueryApi`] method captures one `Arc` from this slot before
+    /// reading. A publisher can therefore atomically replace the pair without
+    /// changing the canonical or wallet reader observed by an in-flight request.
+    #[must_use]
+    pub fn from_read_pair_slot(
+        read_pairs: Arc<ArcSwap<FactFirstReadPair>>,
         broadcaster: Broadcaster,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    ) -> Result<Self, QueryError> {
-        let canonical_fence = canonical_store.event_fence();
-        let wallet_evidence = wallet_store.ready_evidence();
-        let wallet_position = wallet_evidence.source_position;
-        if wallet_position.chain_epoch_id != canonical_fence.chain_epoch_id()
-            || wallet_position.event_sequence != canonical_fence.chain_event_sequence()
-            || wallet_position.tip != canonical_fence.visible_tip()
-            || wallet_evidence.source_sequence_digest != canonical_fence.sequence_digest()
-        {
-            return Err(QueryError::WalletProjectionRead {
-                source: Box::new(io::Error::other(
-                    "version-1 wallet projection does not match the canonical event fence",
-                )),
-            });
-        }
-        Ok(Self {
-            canonical_store,
-            wallet_store,
+    ) -> Self {
+        Self {
+            read_pairs,
             broadcaster,
             network_upgrade_activations,
             tree_state_upstream: None,
-        })
+        }
     }
 
     /// Attaches the node-backed sparse tree-state fill path.
@@ -101,18 +82,15 @@ impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
         self
     }
 
-    /// Returns the exact wallet position proven during query construction.
-    #[must_use]
-    pub fn wallet_readiness(&self) -> FactFirstWalletReadiness {
-        let source = self.wallet_store.ready_evidence().source_position;
-        FactFirstWalletReadiness {
-            chain_epoch_id: source.chain_epoch_id,
-            height: source.tip.height,
-        }
+    fn capture_pair(&self) -> Arc<FactFirstReadPair> {
+        self.read_pairs.load_full()
     }
 
-    fn chain_epoch(&self, requested: Option<ChainEpochId>) -> Result<ChainEpoch, QueryError> {
-        let chain_epoch = self.canonical_store.chain_epoch()?;
+    fn chain_epoch(
+        pair: &FactFirstReadPair,
+        requested: Option<ChainEpochId>,
+    ) -> Result<ChainEpoch, QueryError> {
+        let chain_epoch = pair.canonical().chain_epoch()?;
         if requested.is_some_and(|requested| requested != chain_epoch.id) {
             return Err(QueryError::ChainEpochPinUnavailable {
                 chain_epoch_id: requested.unwrap_or(chain_epoch.id),
@@ -121,56 +99,21 @@ impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
         Ok(chain_epoch)
     }
 
-    fn block_id_at(&self, height: BlockHeight) -> Result<BlockId, QueryError> {
-        self.canonical_store
+    fn block_id_at(pair: &FactFirstReadPair, height: BlockHeight) -> Result<BlockId, QueryError> {
+        pair.canonical()
             .block_header_at(height)?
             .map(|header| BlockId::new(height, header.block_hash))
             .ok_or(QueryError::BlockNotInBestChain)
     }
-}
 
-#[async_trait]
-impl<Broadcaster> WalletQueryApi for FactFirstWalletQuery<Broadcaster>
-where
-    Broadcaster: TransactionBroadcaster + Clone,
-{
-    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
-        Ok((*self.network_upgrade_activations).clone())
-    }
-
-    async fn latest_block(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestBlock, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
-        Ok(LatestBlock {
-            height: chain_epoch.visible_tip_height,
-            block_hash: chain_epoch.visible_tip_hash,
-            chain_epoch,
-        })
-    }
-
-    async fn latest_safe_block(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestSafeBlock, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
-        Ok(LatestSafeBlock {
-            height: chain_epoch.settled_tip_height,
-            block_hash: chain_epoch.settled_tip_hash,
-            chain_epoch,
-        })
-    }
-
-    async fn block_id_by_selector(
-        &self,
+    fn resolve_block_id_by_selector(
+        pair: &FactFirstReadPair,
         selector: BlockSelector,
-        at_epoch_id: Option<ChainEpochId>,
+        chain_epoch: ChainEpoch,
     ) -> Result<BlockIdResponseValue, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
         let block_id = match selector {
             BlockSelector::Height(height) if height <= chain_epoch.visible_tip_height => {
-                self.block_id_at(height)?
+                Self::block_id_at(pair, height)?
             }
             BlockSelector::Hash(hash) if hash == chain_epoch.visible_tip_hash => {
                 BlockId::new(chain_epoch.visible_tip_height, hash)
@@ -189,15 +132,64 @@ where
             block_id,
         })
     }
+}
+
+#[async_trait]
+impl<Broadcaster> WalletQueryApi for FactFirstWalletQuery<Broadcaster>
+where
+    Broadcaster: TransactionBroadcaster + Clone,
+{
+    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
+        let _pair = self.capture_pair();
+        Ok((*self.network_upgrade_activations).clone())
+    }
+
+    async fn latest_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<LatestBlock, QueryError> {
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        Ok(LatestBlock {
+            height: chain_epoch.visible_tip_height,
+            block_hash: chain_epoch.visible_tip_hash,
+            chain_epoch,
+        })
+    }
+
+    async fn latest_safe_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<LatestSafeBlock, QueryError> {
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        Ok(LatestSafeBlock {
+            height: chain_epoch.settled_tip_height,
+            block_hash: chain_epoch.settled_tip_hash,
+            chain_epoch,
+        })
+    }
+
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockIdResponseValue, QueryError> {
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)
+    }
 
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderResponseValue, QueryError> {
-        let resolved = self.block_id_by_selector(selector, at_epoch_id).await?;
-        let block_header = self
-            .canonical_store
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let resolved = Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)?;
+        let block_header = pair
+            .canonical()
             .block_header_at(resolved.block_id.height)?
             .ok_or(QueryError::BlockNotInBestChain)?
             .into_header_info();
@@ -212,9 +204,10 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
-        let compact_block = self
-            .canonical_store
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let compact_block = pair
+            .canonical()
             .compact_block_at(height)?
             .ok_or_else(|| artifact_unavailable(ArtifactFamily::CompactBlock, height))?;
         Ok(CompactBlock {
@@ -228,14 +221,15 @@ where
         block_range: zinder_core::BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
         if block_range.start > block_range.end {
             return Err(QueryError::InvalidBlockRange {
                 start_height: block_range.start,
                 end_height: block_range.end,
             });
         }
-        let compact_blocks = self.canonical_store.compact_blocks_in_range(block_range)?;
+        let compact_blocks = pair.canonical().compact_blocks_in_range(block_range)?;
         Ok(CompactBlockRange {
             chain_epoch,
             block_range,
@@ -248,6 +242,7 @@ where
         height: BlockHeight,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlock, QueryError> {
+        let _pair = self.capture_pair();
         Err(artifact_unavailable(ArtifactFamily::BlockBlob, height))
     }
 
@@ -256,6 +251,7 @@ where
         block_range: zinder_core::BlockHeightRange,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlockStream, QueryError> {
+        let _pair = self.capture_pair();
         Err(artifact_unavailable(
             ArtifactFamily::BlockBlob,
             block_range.start,
@@ -267,19 +263,24 @@ where
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
-        let Some(location) = self.canonical_store.transaction_location(transaction_id)? else {
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        // READY admission requires the construction manifest's transaction-location
+        // and transaction-blob row counts to equal the authenticated source count;
+        // live append and replacement update both families in the canonical atomic
+        // batch. Under that admitted coverage contract, absence is a real miss.
+        let Some(location) = pair.canonical().transaction_location(transaction_id)? else {
             return Ok(TransactionStatus {
                 chain_epoch,
                 status: TxStatus::NotFound,
             });
         };
-        let header = self
-            .canonical_store
+        let header = pair
+            .canonical()
             .block_header_at(location.block_height)?
             .ok_or(QueryError::BlockNotInBestChain)?;
-        let raw_transaction_bytes = self
-            .canonical_store
+        let raw_transaction_bytes = pair
+            .canonical()
             .transaction_blob(location)?
             .map(|blob| blob.raw_transaction_bytes);
         let details = MinedDetails::from_response_epoch(
@@ -305,6 +306,7 @@ where
         _tx_index: u64,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Transaction, QueryError> {
+        let _pair = self.capture_pair();
         Err(artifact_unavailable(
             ArtifactFamily::TransactionLocation,
             height,
@@ -316,16 +318,17 @@ where
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
-        let location = self
-            .canonical_store
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let location = pair
+            .canonical()
             .transaction_location(transaction_id)?
             .ok_or_else(|| QueryError::ArtifactUnavailable {
                 family: ArtifactFamily::TransactionLocation,
                 key: ArtifactKey::TransactionId(transaction_id),
             })?;
-        let transaction = self
-            .canonical_store
+        let transaction = pair
+            .canonical()
             .transaction_blob(location)?
             .ok_or_else(|| QueryError::ArtifactUnavailable {
                 family: ArtifactFamily::TransactionBlob,
@@ -342,6 +345,7 @@ where
         _outpoints: Vec<TransparentOutPoint>,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentOutputsByOutpointResponse, QueryError> {
+        let _pair = self.capture_pair();
         Err(QueryError::DeriveUnavailable {
             capability: "fact-first transparent output lookup",
         })
@@ -352,6 +356,7 @@ where
         _outpoints: Vec<TransparentOutPoint>,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentSpendsByOutpointResponse, QueryError> {
+        let _pair = self.capture_pair();
         Err(QueryError::DeriveUnavailable {
             capability: "fact-first transparent spend lookup",
         })
@@ -362,6 +367,7 @@ where
         _outpoints: Vec<TransparentOutPoint>,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentUnspentOutputsByOutpointResponse, QueryError> {
+        let _pair = self.capture_pair();
         Err(QueryError::DeriveUnavailable {
             capability: "fact-first transparent outpoint lookup",
         })
@@ -372,11 +378,12 @@ where
         request: TransparentAddressUnspentOutputsRequest,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
         let mut outputs = Vec::new();
         let mut after: Option<WalletAddressUnspentOutputKey> = None;
         loop {
-            let page = self.wallet_store.address_unspent_outputs_page(
+            let page = pair.wallet().address_unspent_outputs_page(
                 request.address_script_hash,
                 after,
                 FACT_FIRST_HISTORY_PAGE_SIZE,
@@ -408,12 +415,13 @@ where
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError> {
+        let pair = self.capture_pair();
         if request.descending {
             return Err(QueryError::DeriveUnavailable {
                 capability: "descending fact-first transparent history",
             });
         }
-        let chain_epoch = self.chain_epoch(None)?;
+        let chain_epoch = Self::chain_epoch(&pair, None)?;
         let after = request
             .from_cursor
             .as_ref()
@@ -425,7 +433,7 @@ where
         let page_size =
             NonZeroU16::new(u16::try_from(request.max_entries.get()).unwrap_or(u16::MAX))
                 .unwrap_or(NonZeroU16::MAX);
-        let page = self.wallet_store.address_transaction_history_page(
+        let page = pair.wallet().address_transaction_history_page(
             request.address_script_hash,
             after,
             page_size,
@@ -461,7 +469,8 @@ where
         addresses: Vec<TransparentAddressScriptHash>,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressBalance, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
         if addresses.is_empty() {
             return Err(QueryError::TransparentBalanceAddressCountExceeded {
                 requested: 0,
@@ -471,8 +480,7 @@ where
         let addresses: HashSet<_> = addresses.into_iter().collect();
         let mut confirmed_zat = 0_u64;
         for address in &addresses {
-            confirmed_zat =
-                confirmed_zat.saturating_add(self.wallet_store.address_balance(*address)?);
+            confirmed_zat = confirmed_zat.saturating_add(pair.wallet().address_balance(*address)?);
         }
         Ok(TransparentAddressBalance {
             confirmed_zat,
@@ -487,6 +495,7 @@ where
         _at_epoch_id: Option<ChainEpochId>,
         _commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, QueryError> {
+        let _pair = self.capture_pair();
         Err(QueryError::DeriveUnavailable {
             capability: "fact-first native UTXO summary encoding",
         })
@@ -497,16 +506,17 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
-        let checkpoint = self
-            .canonical_store
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let checkpoint = pair
+            .canonical()
             .tree_state_checkpoint_at_or_before(height)?;
         if let Some(checkpoint) =
             checkpoint.filter(|checkpoint| checkpoint.block_id.height == height)
         {
             return tree_state_from_checkpoint(chain_epoch, &checkpoint);
         }
-        let block_id = self.block_id_at(height)?;
+        let block_id = Self::block_id_at(&pair, height)?;
         let upstream = self
             .tree_state_upstream
             .as_ref()
@@ -524,9 +534,10 @@ where
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
-        let checkpoint = self
-            .canonical_store
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let checkpoint = pair
+            .canonical()
             .tree_state_checkpoint_at_or_before(chain_epoch.visible_tip_height)?
             .ok_or_else(|| {
                 artifact_unavailable(ArtifactFamily::TreeState, chain_epoch.visible_tip_height)
@@ -539,8 +550,36 @@ where
         subtree_root_range: zinder_core::SubtreeRootRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError> {
-        let chain_epoch = self.chain_epoch(at_epoch_id)?;
-        let subtree_roots = self.canonical_store.subtree_roots(subtree_root_range)?;
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let completed_subtree_count = chain_epoch
+            .tip_metadata
+            .completed_subtree_count(subtree_root_range.protocol);
+        if subtree_root_range.start_index.value() >= completed_subtree_count {
+            return Ok(SubtreeRoots {
+                chain_epoch,
+                protocol: subtree_root_range.protocol,
+                start_index: subtree_root_range.start_index,
+                subtree_roots: Vec::new(),
+            });
+        }
+        let available_entries = completed_subtree_count
+            .saturating_sub(subtree_root_range.start_index.value())
+            .min(subtree_root_range.max_entries.get());
+        let available_entries =
+            NonZeroU32::new(available_entries).ok_or_else(|| QueryError::ArtifactUnavailable {
+                family: ArtifactFamily::SubtreeRoot,
+                key: ArtifactKey::SubtreeRootIndex {
+                    protocol: subtree_root_range.protocol,
+                    index: subtree_root_range.start_index,
+                },
+            })?;
+        let available_range = zinder_core::SubtreeRootRange::new(
+            subtree_root_range.protocol,
+            subtree_root_range.start_index,
+            available_entries,
+        );
+        let subtree_roots = pair.canonical().subtree_roots(available_range)?;
         Ok(SubtreeRoots {
             chain_epoch,
             protocol: subtree_root_range.protocol,
@@ -554,6 +593,7 @@ where
         _from_cursor: Option<StreamCursorTokenV1>,
         _family: ChainEventStreamFamily,
     ) -> Result<ChainEvents, QueryError> {
+        let _pair = self.capture_pair();
         Err(QueryError::UnsupportedChainEvent {
             event: "version-1 chain-event serving is not wired",
         })
@@ -564,6 +604,7 @@ where
         _start: EventStreamStartPosition,
         _requested_family: ChainEventStreamFamily,
     ) -> Result<zinder_store::ChainEventStreamResume, QueryError> {
+        let _pair = self.capture_pair();
         Err(QueryError::UnsupportedChainEvent {
             event: "version-1 chain-event serving is not wired",
         })
@@ -573,6 +614,7 @@ where
         &self,
         raw_transaction: RawTransactionBytes,
     ) -> Result<zinder_core::TransactionBroadcastResult, QueryError> {
+        let _pair = self.capture_pair();
         if raw_transaction.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
             return Err(QueryError::BroadcastTransactionTooLarge {
                 actual: raw_transaction.len(),

@@ -1,4 +1,7 @@
-use std::num::NonZeroU32;
+use std::{
+    num::NonZeroU32,
+    time::{Duration, Instant},
+};
 
 use rust_rocksdb::{DB, IteratorMode, ReadOptions, WriteBatch};
 use sha2::{Digest, Sha256};
@@ -10,6 +13,7 @@ use zinder_core::{
 use super::{
     CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
     block_load::{BLOCK_HEADER_VALUE_LEN, encode_block_position},
+    construction_manifest::CanonicalConstructionFamilyEvidence,
     rocksdb::{BLOCK_HEADER_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY},
 };
 
@@ -42,6 +46,30 @@ pub struct CanonicalSubtreeRootLoadEvidence {
     pub subtree_root_sequence_digest: [u8; 32],
 }
 
+pub(super) struct LoadedCanonicalSubtreeRoots {
+    pub(super) evidence: CanonicalSubtreeRootLoadEvidence,
+    pub(super) family_evidence: CanonicalConstructionFamilyEvidence,
+}
+
+pub(super) struct PersistedSubtreeRootValidation {
+    pub(super) evidence: CanonicalSubtreeRootLoadEvidence,
+    pub(super) family_evidence: CanonicalConstructionFamilyEvidence,
+}
+
+impl PersistedSubtreeRootValidation {
+    fn complete(
+        evidence: CanonicalSubtreeRootLoadEvidence,
+        family_evidence: CanonicalConstructionFamilyEvidence,
+        elapsed: Duration,
+    ) -> Self {
+        record_subtree_cold_family_scan(&family_evidence, elapsed);
+        Self {
+            evidence,
+            family_evidence,
+        }
+    }
+}
+
 pub(super) fn required_subtree_root_ranges(
     predecessor_tip_metadata: ChainTipMetadata,
     build_tip_metadata: ChainTipMetadata,
@@ -71,7 +99,7 @@ pub(super) fn load_subtree_roots(
     build_plan: &CanonicalStoreBuildPlan,
     block_evidence: &CanonicalBlockLoadEvidence,
     subtree_roots: impl IntoIterator<Item = CanonicalBuildSubtreeRoot>,
-) -> Result<CanonicalSubtreeRootLoadEvidence, CanonicalStoreError> {
+) -> Result<LoadedCanonicalSubtreeRoots, CanonicalStoreError> {
     let family = subtree_root_family(db)?;
     if let Some(first_row) = db.iterator_cf(&family, IteratorMode::Start).next() {
         first_row.map_err(|source| CanonicalStoreError::RocksDbOperation {
@@ -103,7 +131,11 @@ pub(super) fn load_subtree_roots(
                 source,
             })?;
     }
-    validate_persisted_subtree_roots(db, build_plan, &expected_rows)?;
+    let mut family_evidence =
+        CanonicalConstructionFamilyEvidence::accumulator(SUBTREE_ROOT_COLUMN_FAMILY);
+    for (key, encoded_root) in &expected_rows {
+        family_evidence.observe(key, encoded_root)?;
+    }
     let subtree_root_count = u64::try_from(expected_rows.len()).map_err(|_| {
         CanonicalStoreError::subtree_root_sequence("subtree-root count exceeds u64::MAX")
     })?;
@@ -117,10 +149,13 @@ pub(super) fn load_subtree_roots(
             CanonicalStoreError::subtree_root_sequence("subtree-root logical bytes exceed u64::MAX")
         })?;
     let subtree_root_sequence_digest = digest_subtree_root_rows(&expected_rows);
-    Ok(CanonicalSubtreeRootLoadEvidence {
-        subtree_root_count,
-        subtree_root_logical_bytes,
-        subtree_root_sequence_digest,
+    Ok(LoadedCanonicalSubtreeRoots {
+        evidence: CanonicalSubtreeRootLoadEvidence {
+            subtree_root_count,
+            subtree_root_logical_bytes,
+            subtree_root_sequence_digest,
+        },
+        family_evidence: family_evidence.finish(),
     })
 }
 
@@ -128,7 +163,8 @@ pub(super) fn validate_persisted_subtree_root_family(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,
     block_evidence: &CanonicalBlockLoadEvidence,
-) -> Result<CanonicalSubtreeRootLoadEvidence, CanonicalStoreError> {
+) -> Result<PersistedSubtreeRootValidation, CanonicalStoreError> {
+    let started_at = Instant::now();
     let family = subtree_root_family(db)?;
     let required_ranges = required_subtree_root_ranges(
         build_plan.history_predecessor().tip_metadata(),
@@ -145,6 +181,8 @@ pub(super) fn validate_persisted_subtree_root_family(
     digest.update(SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN);
     let mut subtree_root_count = 0_u64;
     let mut subtree_root_logical_bytes = 0_u64;
+    let mut family_evidence =
+        CanonicalConstructionFamilyEvidence::accumulator(SUBTREE_ROOT_COLUMN_FAMILY);
     for range in required_ranges {
         let mut previous_completion_height = None;
         for expected_index in range {
@@ -169,14 +207,11 @@ pub(super) fn validate_persisted_subtree_root_family(
             }
             digest.update(key.as_ref());
             digest.update(encoded_root.as_ref());
+            family_evidence.observe(key, encoded_root)?;
             subtree_root_count = subtree_root_count.checked_add(1).ok_or_else(|| {
                 CanonicalStoreError::subtree_root_sequence("subtree-root count exceeds u64::MAX")
             })?;
-            let row_bytes = u64::try_from(key.len() + encoded_root.len()).map_err(|_| {
-                CanonicalStoreError::subtree_root_sequence(
-                    "subtree-root row length exceeds u64::MAX",
-                )
-            })?;
+            let row_bytes = subtree_root_logical_row_bytes(key, encoded_root)?;
             subtree_root_logical_bytes = subtree_root_logical_bytes
                 .checked_add(row_bytes)
                 .ok_or_else(|| {
@@ -197,11 +232,46 @@ pub(super) fn validate_persisted_subtree_root_family(
             operation: "subtree-root publication readback",
             source,
         })?;
-    Ok(CanonicalSubtreeRootLoadEvidence {
+    let evidence = CanonicalSubtreeRootLoadEvidence {
         subtree_root_count,
         subtree_root_logical_bytes,
         subtree_root_sequence_digest: digest.finalize().into(),
+    };
+    Ok(PersistedSubtreeRootValidation::complete(
+        evidence,
+        family_evidence.finish(),
+        started_at.elapsed(),
+    ))
+}
+
+fn subtree_root_logical_row_bytes(
+    key: &[u8],
+    encoded_root: &[u8],
+) -> Result<u64, CanonicalStoreError> {
+    u64::try_from(key.len() + encoded_root.len()).map_err(|_| {
+        CanonicalStoreError::subtree_root_sequence("subtree-root row length exceeds u64::MAX")
     })
+}
+
+fn record_subtree_cold_family_scan(
+    evidence: &CanonicalConstructionFamilyEvidence,
+    elapsed: Duration,
+) {
+    metrics::histogram!(
+        "zinder_store_canonical_publication_family_scan_duration_seconds",
+        "family" => evidence.family
+    )
+    .record(elapsed);
+    metrics::counter!(
+        "zinder_store_canonical_publication_family_scan_rows_total",
+        "family" => evidence.family
+    )
+    .increment(evidence.row_count);
+    metrics::counter!(
+        "zinder_store_canonical_publication_family_scan_logical_bytes_total",
+        "family" => evidence.family
+    )
+    .increment(evidence.logical_bytes);
 }
 
 fn digest_subtree_root_rows(rows: &[EncodedSubtreeRoot]) -> [u8; 32] {
@@ -314,43 +384,6 @@ fn validate_source_subtree_root(
         return Err(CanonicalStoreError::subtree_root_sequence(format!(
             "{expected_protocol:?} subtree completion heights are not ascending"
         )));
-    }
-    Ok(())
-}
-
-fn validate_persisted_subtree_roots(
-    db: &DB,
-    build_plan: &CanonicalStoreBuildPlan,
-    expected_rows: &[EncodedSubtreeRoot],
-) -> Result<(), CanonicalStoreError> {
-    let family = subtree_root_family(db)?;
-    let mut persisted_rows = db.iterator_cf(&family, IteratorMode::Start);
-    for (expected_key, expected_value) in expected_rows {
-        let (persisted_key, persisted_value) = persisted_rows
-            .next()
-            .ok_or(CanonicalStoreError::SubtreeRootReadbackMismatch)?
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "subtree-root persisted readback",
-                source,
-            })?;
-        if persisted_key.as_ref() != expected_key || persisted_value.as_ref() != expected_value {
-            return Err(CanonicalStoreError::SubtreeRootReadbackMismatch);
-        }
-        let artifact = decode_subtree_root(expected_key, expected_value)?;
-        if artifact.completing_block_height < build_plan.history_bounds().first_available_height()
-            || artifact.completing_block_height > build_plan.build_tip().height
-            || retained_block_hash(db, artifact.completing_block_height)?
-                != artifact.completing_block_hash
-        {
-            return Err(CanonicalStoreError::SubtreeRootReadbackMismatch);
-        }
-    }
-    if let Some(extra_row) = persisted_rows.next() {
-        extra_row.map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "subtree-root persisted readback",
-            source,
-        })?;
-        return Err(CanonicalStoreError::SubtreeRootReadbackMismatch);
     }
     Ok(())
 }

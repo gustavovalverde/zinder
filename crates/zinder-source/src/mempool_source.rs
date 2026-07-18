@@ -32,6 +32,17 @@ use crate::SourceError;
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MempoolSourceEvent {
+    /// Control-plane marker emitted once the source has completed its
+    /// initial snapshot for this stream generation.
+    ///
+    /// This is not a mempool lifecycle transition and must never be
+    /// persisted in the canonical mempool-event log. Consumers use it as the
+    /// only proof that an empty or partially populated in-memory index may be
+    /// exposed to callers. Streaming sources open the change stream before
+    /// taking the snapshot and emit this marker only after replaying the
+    /// snapshot and the buffered change-stream prefix. Polling sources emit
+    /// it after their first fully successful poll.
+    InitialSnapshotComplete,
     /// New transaction admitted to the upstream mempool, with hydrated raw
     /// bytes.
     Added(MempoolSourceEntry),
@@ -187,9 +198,9 @@ impl MempoolHydrationFailureReason {
 /// Configured upstream mempool source for ingestion.
 ///
 /// Implementations encapsulate streaming or polling, raw-transaction
-/// hydration, and reconnect handling. The trait yields one event stream
-/// per call to [`MempoolSource::events`]; callers expecting durable
-/// reconnect must wrap the trait themselves.
+/// hydration, initial-snapshot completion, and reconnect handling. The trait
+/// yields one event stream per call to [`MempoolSource::events`]; callers
+/// expecting durable reconnect must wrap the trait themselves.
 #[async_trait]
 pub trait MempoolSource: Send + Sync + 'static {
     /// Returns the capabilities of this mempool source backend.
@@ -198,11 +209,14 @@ pub trait MempoolSource: Send + Sync + 'static {
     /// Opens a typed mempool source event stream.
     ///
     /// Returns a [`MempoolSourceEventStream`] that yields hydrated
-    /// [`MempoolSourceEvent`] values until the underlying source closes
-    /// or fails permanently. Transient transport failures are signalled
-    /// by a [`SourceError`] item in the stream; callers should reconnect
-    /// and snapshot the upstream mempool state on those failures because
-    /// the underlying broadcast channel may have lagged events.
+    /// [`MempoolSourceEvent`] values until the underlying source closes or
+    /// fails permanently. Each healthy stream generation emits exactly one
+    /// [`MempoolSourceEvent::InitialSnapshotComplete`] marker after its
+    /// initial snapshot is complete. Transient transport failures are
+    /// signalled by a [`SourceError`] item in the stream; callers should
+    /// reconnect and keep the previous snapshot unavailable until the next
+    /// generation's completion marker because the underlying broadcast
+    /// channel may have lagged events.
     async fn events(&self) -> Result<MempoolSourceEventStream, SourceError>;
 }
 

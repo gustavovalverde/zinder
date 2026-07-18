@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 validator="$repository_root/scripts/validate-storage-benchmark-campaign.sh"
+storage_lifecycle_validator="$repository_root/scripts/validate-rocksdb-storage-lifecycle-report.sh"
 scratch_directory="$(mktemp -d)"
 trap 'rm -rf "$scratch_directory"' EXIT
 
@@ -10,6 +11,17 @@ fail() {
   echo >&2 "storage benchmark campaign validator test failed: $*"
   exit 1
 }
+
+producer_report_format_version="$(sed -n \
+  's/^pub const REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
+  "$repository_root/services/zinder-bench/src/report.rs")"
+[[ "$producer_report_format_version" =~ ^[1-9][0-9]*$ ]] ||
+  fail "could not resolve the producer report format version"
+for report_validator in "$validator" "$storage_lifecycle_validator"; do
+  grep -Fq ".report_format_version == $producer_report_format_version" \
+    "$report_validator" ||
+    fail "$(basename "$report_validator") does not require producer report format $producer_report_format_version"
+done
 
 write_report() {
   local candidate="$1"
@@ -87,7 +99,7 @@ write_report() {
     ($candidate == "rocksdb-fact-first") as $is_rocksdb
     | {
         contract_identity: "benchmark-report",
-        report_format_version: 1,
+        report_format_version: 2,
         measurement_kind: "canonical-block-facts-round-trip",
         provenance: {
           benchmark_version: "0.1.0",

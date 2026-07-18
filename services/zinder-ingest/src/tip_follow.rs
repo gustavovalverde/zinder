@@ -121,7 +121,7 @@ pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainSto
 /// twice when the runtime needs the store for colocated control-plane RPCs.
 ///
 /// `mempool_ready_gate` is consulted when the lag-based computation would
-/// otherwise flip readiness to `Ready`. While the gate is unprimed, the
+/// otherwise flip readiness to `Ready`. While the gate is unhydrated, the
 /// readiness state stays in `Syncing` so consumers do not observe a
 /// "ready" writer that has not yet rebuilt its in-process mempool index.
 /// Pass `None` for callers that do not run the mempool orchestrator
@@ -378,7 +378,7 @@ fn set_tip_follow_readiness(
     mempool_ready_gate: Option<&MempoolReadyGate>,
 ) {
     let gated_state = if matches!(lag_state.cause, ReadinessCause::Ready)
-        && mempool_ready_gate.is_some_and(|gate| !gate.is_primed())
+        && mempool_ready_gate.is_some_and(|gate| !gate.is_hydrated())
     {
         ReadinessState::syncing(None, lag_state.current_height, lag_state.target_height)
     } else {

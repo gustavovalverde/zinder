@@ -34,8 +34,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
-    CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_VALUE_ENCODING_VERSION,
@@ -216,6 +216,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &network_upgrade_activations,
         genesis.block_time_seconds,
         fixed_build_tip,
+        CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
     )?;
     let canonical_store_initialization_started = Instant::now();
     let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -246,7 +247,9 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         canonical_load.builder.is_source_tip_checkpoint_confirmed();
 
     let canonical_cold_validation_started = Instant::now();
-    let validated_canonical = canonical_load.builder.validate_for_publication()?;
+    let validated_canonical = canonical_load
+        .builder
+        .prepare_cold_certified_publication()?;
     let canonical_cold_validation = canonical_cold_validation_started.elapsed();
 
     let canonical_ready_publication_started = Instant::now();
@@ -263,6 +266,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &validated.canonical_store,
         &network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
     let canonical_cold_reopen = canonical_cold_reopen_started.elapsed();
@@ -298,6 +302,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &validated.canonical_store,
         &network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
     let wallet_store = RocksDbWalletStore::open_ready(
@@ -311,13 +316,13 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let final_wallet_ready = wallet_store.ready_evidence();
     let wallet_cold_reopen_evidence_match = *final_wallet_ready == published_wallet_ready;
     let wallet_canonical_fence_match =
-        wallet_source_matches_canonical(final_wallet_ready, final_canonical_ready);
+        wallet_source_matches_canonical(final_wallet_ready, &final_canonical_ready);
     let wallet_storage_ready_seconds = wallet_started.elapsed().as_secs_f64();
     let total = total_started.elapsed();
     let wallet_physical_store_bytes = directory_bytes(&validated.wallet_store)?;
 
     let canonical_ready_summary = canonical_ready_summary(
-        published_canonical_ready,
+        &published_canonical_ready,
         &canonical_block_evidence,
         canonical_subtree_evidence,
         canonical_physical_store_bytes,
@@ -370,7 +375,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         contracts: StorageLifecycleContractSummary {
             canonical_store_identity: CANONICAL_STORE_IDENTITY,
             canonical_store_schema_version: CANONICAL_STORE_SCHEMA_VERSION,
-            wallet_store_identity: "wallet-projection",
+            wallet_store_identity: "wallet",
             wallet_store_schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
             wallet_projection_schema_version: WALLET_PROJECTION_SCHEMA_VERSION,
             wallet_value_encoding_version: WALLET_PROJECTION_VALUE_ENCODING_VERSION,
@@ -563,7 +568,7 @@ fn validate_source_block_identity(
     reason = "the summary maps distinct canonical lifecycle evidence without creating a second aggregate type"
 )]
 fn canonical_ready_summary(
-    ready: CanonicalStoreReadyEvidence,
+    ready: &CanonicalStoreReadyEvidence,
     block_load: &zinder_store::CanonicalBlockLoadEvidence,
     subtree_load: zinder_store::CanonicalSubtreeRootLoadEvidence,
     physical_store_bytes: u64,
@@ -705,7 +710,7 @@ fn variable_value_sort_evidence(
 
 fn wallet_source_matches_canonical(
     wallet: &zinder_wallet_projection::WalletProjectionReadyEvidence,
-    canonical: CanonicalStoreReadyEvidence,
+    canonical: &CanonicalStoreReadyEvidence,
 ) -> bool {
     let canonical_sequence_digest =
         CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(

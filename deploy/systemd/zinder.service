@@ -4,7 +4,7 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now zinder
 #
-# The compose file is expected at /etc/zinder/docker-compose.yml; adjust
+# The pinned release checkout is expected at /opt/zinder; adjust
 # WorkingDirectory below if your operator-chosen layout differs.
 
 [Unit]
@@ -16,16 +16,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/etc/zinder
+WorkingDirectory=/opt/zinder/deploy
 EnvironmentFile=-/etc/zinder/env
 
 # `docker compose up` blocks while the topology runs, so Type=simple is
 # correct. ExecStop tears down the topology on stop; ExecStartPre prunes
 # any stale containers so a half-restarted state does not strand the
 # named volume on a previous container's lifecycle.
-ExecStartPre=-/usr/bin/docker compose -f docker-compose.yml down --remove-orphans
-ExecStart=/usr/bin/docker compose -f docker-compose.yml up
-ExecStop=/usr/bin/docker compose -f docker-compose.yml down
+ExecStartPre=-/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml down --remove-orphans
+ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml up
+ExecStop=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml down
 
 Restart=on-failure
 RestartSec=30

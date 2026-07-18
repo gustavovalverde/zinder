@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     mem::size_of,
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroU64},
     path::Path,
     sync::Arc,
 };
@@ -13,26 +13,85 @@ use zinder_rocksdb::{SortedVariableValues, VariableValueSortEvidence, VariableVa
 use rust_rocksdb::{
     BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
     DEFAULT_COLUMN_FAMILY_NAME, Direction, FlushOptions, IngestExternalFileOptions, IteratorMode,
-    Options, ReadOptions, WriteBatch, WriteOptions,
+    Options, ReadOptions, WriteBatch, WriteOptions, checkpoint::Checkpoint,
 };
-use zinder_core::{BlockHeight, Network, TransparentAddressScriptHash, TransparentOutPoint};
+use zinder_core::{
+    BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsSequenceDigest, Network,
+    TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
+    ValidatedCanonicalBlockReplay,
+};
 use zinder_store::{
-    BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    build_block_based_table_factory, open_bounded_rocksdb,
+    BoundedRocksDbOpen, CanonicalEventFence, CanonicalRetainedEvent, CanonicalStoreError,
+    RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, build_block_based_table_factory,
+    open_bounded_rocksdb,
 };
 use zinder_wallet_projection::{
-    WALLET_PROJECTION_SCHEMA_VERSION, WALLET_STORE_CONTROL_KEY, WalletAddressBalance,
+    ProjectionBuildLease, ProjectionBuildLeaseRequest, WALLET_PROJECTION_SCHEMA_VERSION,
+    WALLET_PROJECTION_STORE_IDENTITY, WALLET_STORE_CONTROL_KEY, WalletAddressBalance,
     WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
     WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildPlan,
     WalletProjectionBuildState, WalletProjectionDigestBuilder, WalletProjectionReadyEvidence,
-    WalletProjectionRowFamily, WalletProjectionSourcePosition, WalletReorgUndo, WalletSpentOutput,
-    WalletStoreControl, WalletUnspentOutput, WalletUtxoSetSummary,
+    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletStoreControl,
+    WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
-use crate::{RocksDbWalletError, projection_load::PreparedWalletProjectionLoad};
+use crate::{
+    RocksDbWalletError, WalletBuildLeaseHeartbeat, projection_load::PreparedWalletProjectionLoad,
+};
 
 /// Exact clean wallet-store schema supported by this adapter.
 pub const WALLET_ROCKSDB_SCHEMA_VERSION: u16 = WALLET_PROJECTION_SCHEMA_VERSION;
+
+/// Cold-admitted identity and READY evidence for an owner-created wallet checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletOwnerCheckpointEvidence {
+    /// Exact `RocksDB` database identity captured from the owner before the
+    /// physical checkpoint was created and re-read from the cold checkpoint.
+    ///
+    /// This prevents a same-plan database swap between physical creation and
+    /// cold admission from being mistaken for the owner's immutable copy.
+    pub database_identity: Vec<u8>,
+    /// Exact physical store identity admitted from the checkpoint.
+    pub store_identity: &'static [u8],
+    /// Exact physical schema admitted from the checkpoint.
+    pub schema_version: u16,
+    /// Immutable network admitted from the checkpoint.
+    pub network: Network,
+    /// Persisted READY evidence read from the cold-opened checkpoint.
+    pub ready_evidence: WalletProjectionReadyEvidence,
+}
+
+/// Immutable context captured by a wallet owner during physical checkpoint
+/// creation.
+///
+/// The value grants no filesystem access and can only cold-admit a checkpoint
+/// whose database identity matches the source primary observed before the
+/// checkpoint call.
+#[derive(Clone, Debug)]
+pub struct WalletOwnerCheckpointAdmission {
+    network: Network,
+    database_identity: Vec<u8>,
+}
+
+/// Explicit bounded resources for one non-serving wallet recovery admission.
+///
+/// The caller owns `staging_path`; admission creates and removes only its
+/// sorter workspaces below that directory. A successful admission returns
+/// immutable evidence and never returns a query-serving or mutable store
+/// handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalletRecoveryAdmissionConfig<'staging> {
+    /// Bounded resources applied while the checkpoint is opened.
+    pub resource_budget: RocksDbResourceBudget,
+    /// Existing private directory used for bounded external-sort workspaces.
+    pub staging_path: &'staging Path,
+    /// Accounted memory ceiling applied independently to each validation sorter.
+    pub max_sort_memory_bytes_per_sorter: u64,
+    /// Temporary-run byte ceiling applied independently to each validation sorter.
+    pub max_temporary_file_bytes_per_sorter: u64,
+    /// Accounted memory ceiling for reconstructing retained reorg-undo effects.
+    pub max_accounted_reorg_undo_bytes: u64,
+}
 
 /// One bounded page of current outputs ordered by creation position and outpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +109,19 @@ pub struct WalletAddressTransactionHistoryPage {
     pub transactions: Vec<WalletAddressTransaction>,
     /// Exclusive continuation key to pass as `after` for the next page.
     pub next_page_after: Option<WalletAddressTransactionKey>,
+}
+
+/// Durable BUILDING wallet store and its lease-management boundary.
+///
+/// The value owns no open database handle. Each mutation cold-opens the
+/// singleton control record, synchronously replaces it, and closes again, so
+/// lease ownership survives process restarts and no caller can retain an
+/// untracked mutable database handle.
+#[derive(Clone, Debug)]
+pub struct RocksDbWalletBuildStore {
+    store_path: std::path::PathBuf,
+    resource_budget: RocksDbResourceBudget,
+    network: Network,
 }
 
 pub(crate) const TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY: &str = "transparent_unspent_output";
@@ -78,18 +150,21 @@ pub(crate) struct RocksDbWalletBuilder {
     store_path: std::path::PathBuf,
     resource_budget: RocksDbResourceBudget,
     control: WalletStoreControl,
+    lease: ProjectionBuildLease,
 }
 
 /// A cold-reopened BUILDING store whose rows have not yet been validated.
 pub(crate) struct ColdRocksDbWalletBuild {
     bounded_open: BoundedRocksDbOpen,
     control: WalletStoreControl,
+    lease: ProjectionBuildLease,
 }
 
 /// A cold-validated BUILDING store carrying the evidence it may publish.
 pub(crate) struct ValidatedRocksDbWalletBuild {
     bounded_open: BoundedRocksDbOpen,
     control: WalletStoreControl,
+    lease: ProjectionBuildLease,
     ready_evidence: WalletProjectionReadyEvidence,
     validation_evidence: WalletColdValidationEvidence,
 }
@@ -118,17 +193,31 @@ pub(crate) struct WalletColdValidationEvidence {
 /// The private database handle prevents consumers from bypassing the wallet
 /// row codecs or mutating a store after admission.
 pub struct RocksDbWalletStore {
-    bounded_open: BoundedRocksDbOpen,
-    control: WalletStoreControl,
-    ready_evidence: WalletProjectionReadyEvidence,
+    pub(crate) bounded_open: BoundedRocksDbOpen,
+    pub(crate) control: WalletStoreControl,
+    pub(crate) ready_evidence: WalletProjectionReadyEvidence,
 }
 
-impl RocksDbWalletBuilder {
-    /// Creates a fresh store and durably publishes its BUILDING plan.
-    pub(crate) fn create_fresh(
+/// A cold-admitted READY wallet held only for canonical following.
+///
+/// Unlike [`RocksDbWalletStore`], this type intentionally cannot serve query
+/// reads. It exposes the persisted source evidence and atomic following
+/// transitions, then requires an exact source match through
+/// [`Self::into_ready_store`] before it can become a query-serving store.
+pub struct RocksDbWalletFollowingStore {
+    store: RocksDbWalletStore,
+}
+
+impl RocksDbWalletBuildStore {
+    /// Creates a fresh, non-queryable BUILDING store without granting ownership.
+    ///
+    /// A caller must subsequently acquire a lease before writing or promoting
+    /// projection state. Existing stores, including older pre-release control
+    /// layouts, are refused rather than migrated.
+    pub fn create_fresh(
         path: impl AsRef<Path>,
         network: Network,
-        target_source_position: WalletProjectionSourcePosition,
+        target_source: WalletCanonicalSourceIdentity,
         supported_reorg_depth: u32,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, RocksDbWalletError> {
@@ -145,27 +234,264 @@ impl RocksDbWalletBuilder {
             resource_budget,
             wallet_column_family_descriptors,
         )
-        .map_err(|source| RocksDbWalletError::rocksdb("fresh open", source))?;
+        .map_err(|source| RocksDbWalletError::rocksdb("fresh build-store open", source))?;
         let control = WalletStoreControl {
             network,
             supported_reorg_depth,
-            writer_generation: 1,
+            writer_generation: 0,
+            build_lease: None,
             build_state: WalletProjectionBuildState::Building(
-                WalletProjectionBuildPlan::complete_history(target_source_position),
+                WalletProjectionBuildPlan::complete_history(target_source.source_position()),
             ),
         };
         write_control_sync(&bounded_open, &control)?;
+        drop(bounded_open);
+        Ok(Self {
+            store_path,
+            resource_budget,
+            network,
+        })
+    }
+
+    /// Reopens an existing BUILDING store after exact schema and network admission.
+    pub fn open(
+        path: impl AsRef<Path>,
+        expected_network: Network,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<Self, RocksDbWalletError> {
+        validate_resource_budget(resource_budget)?;
+        let path = path.as_ref();
+        let store_path =
+            fs::canonicalize(path).map_err(|source| RocksDbWalletError::PathUnavailable {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        require_exact_column_families(&store_path)?;
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary { path: &store_path },
+            resource_budget,
+            wallet_column_family_descriptors,
+        )
+        .map_err(|source| RocksDbWalletError::rocksdb("build-store reopen", source))?;
+        let control = decode_only_control(&bounded_open)?;
+        require_building_control(&control, &store_path, expected_network)?;
+        drop(bounded_open);
+        Ok(Self {
+            store_path,
+            resource_budget,
+            network: expected_network,
+        })
+    }
+
+    /// Acquires exclusive durable ownership when no active lease is present.
+    ///
+    /// An expired lease may be replaced by a new owner at a strictly higher
+    /// generation. An unexpired lease is never silently shared or stolen.
+    pub fn try_acquire_lease(
+        &self,
+        request: ProjectionBuildLeaseRequest,
+        now: UnixTimestampMillis,
+    ) -> Result<ProjectionBuildLease, RocksDbWalletError> {
+        let (bounded_open, control) = self.open_building_control()?;
+        validate_lease_request(&control, request, now)?;
+        if let Some(lease) = control.build_lease
+            && lease.expires_at() > now
+        {
+            return Err(RocksDbWalletError::ProjectionBuildLeaseHeld {
+                expires_at: lease.expires_at(),
+            });
+        }
+        let generation = control
+            .writer_generation
+            .checked_add(1)
+            .ok_or(RocksDbWalletError::ProjectionBuildLeaseGenerationOverflow)?;
+        let lease = ProjectionBuildLease::from_request(request, generation, self.network);
+        let next_control = WalletStoreControl {
+            writer_generation: generation,
+            build_lease: Some(lease),
+            ..control
+        };
+        write_control_sync(&bounded_open, &next_control)?;
+        let persisted = decode_only_control(&bounded_open)?;
+        if persisted != next_control {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "projection build lease differs after synchronous acquisition",
+            });
+        }
+        Ok(lease)
+    }
+
+    /// Extends an active lease owned by the supplied durable capability.
+    pub fn renew_lease(
+        &self,
+        lease: ProjectionBuildLease,
+        expires_at: UnixTimestampMillis,
+        now: UnixTimestampMillis,
+    ) -> Result<ProjectionBuildLease, RocksDbWalletError> {
+        let (bounded_open, control) = self.open_building_control()?;
+        let persisted = authorize_active_lease(&control, lease, now)?;
+        if expires_at <= now {
+            return Err(RocksDbWalletError::ProjectionBuildLeaseExpiryNotFuture);
+        }
+        if expires_at <= persisted.expires_at() {
+            return Err(RocksDbWalletError::ProjectionBuildLeaseRenewalNotExtended);
+        }
+        let renewed = persisted.renewed(expires_at);
+        let next_control = WalletStoreControl {
+            build_lease: Some(renewed),
+            ..control
+        };
+        write_control_sync(&bounded_open, &next_control)?;
+        let persisted_control = decode_only_control(&bounded_open)?;
+        if persisted_control != next_control {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "projection build lease differs after synchronous renewal",
+            });
+        }
+        Ok(renewed)
+    }
+
+    /// Releases an active lease without changing the BUILDING plan or generation.
+    pub fn release_lease(
+        &self,
+        lease: ProjectionBuildLease,
+        now: UnixTimestampMillis,
+    ) -> Result<(), RocksDbWalletError> {
+        let (bounded_open, control) = self.open_building_control()?;
+        let _persisted = authorize_active_lease(&control, lease, now)?;
+        let next_control = WalletStoreControl {
+            build_lease: None,
+            ..control
+        };
+        write_control_sync(&bounded_open, &next_control)?;
+        let persisted = decode_only_control(&bounded_open)?;
+        if persisted != next_control {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "projection build lease differs after synchronous release",
+            });
+        }
+        Ok(())
+    }
+
+    /// Deletes an exact admitted BUILDING store and its deterministic owned staging path.
+    ///
+    /// READY stores are refused. This operation deliberately provides the only
+    /// recovery path for an abandoned pre-release build, rather than allowing
+    /// callers to raw-delete ambiguous wallet paths.
+    pub fn discard_unpublished(self, now: UnixTimestampMillis) -> Result<(), RocksDbWalletError> {
+        let (bounded_open, control) = self.open_building_control()?;
+        require_building_control(&control, &self.store_path, self.network)?;
+        if let Some(lease) = control.build_lease
+            && lease.expires_at() > now
+        {
+            return Err(RocksDbWalletError::ProjectionBuildLeaseHeld {
+                expires_at: lease.expires_at(),
+            });
+        }
+        drop(bounded_open);
+
+        let staging_path = crate::build::projection_staging_path(&self.store_path);
+        if staging_path.exists() {
+            fs::remove_dir_all(&staging_path).map_err(|source| {
+                RocksDbWalletError::PathUnavailable {
+                    path: staging_path,
+                    source,
+                }
+            })?;
+        }
+        fs::remove_dir_all(&self.store_path).map_err(|source| RocksDbWalletError::PathUnavailable {
+            path: self.store_path,
+            source,
+        })
+    }
+
+    fn open_building_control(
+        &self,
+    ) -> Result<(BoundedRocksDbOpen, WalletStoreControl), RocksDbWalletError> {
+        require_exact_column_families(&self.store_path)?;
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary {
+                path: &self.store_path,
+            },
+            self.resource_budget,
+            wallet_column_family_descriptors,
+        )
+        .map_err(|source| RocksDbWalletError::rocksdb("build lease open", source))?;
+        let control = decode_only_control(&bounded_open)?;
+        require_building_control(&control, &self.store_path, self.network)?;
+        Ok((bounded_open, control))
+    }
+}
+
+impl RocksDbWalletBuilder {
+    /// Creates a fresh store and durably publishes its BUILDING plan.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "consuming the build-store capability makes one builder initialization an ownership boundary"
+    )]
+    pub(crate) fn create_fresh(
+        build_store: RocksDbWalletBuildStore,
+        lease_request: ProjectionBuildLeaseRequest,
+        now: UnixTimestampMillis,
+    ) -> Result<Self, RocksDbWalletError> {
+        let lease = build_store.try_acquire_lease(lease_request, now)?;
+        let store_path = build_store.store_path.clone();
+        let resource_budget = build_store.resource_budget;
+        let bounded_open = match open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary { path: &store_path },
+            resource_budget,
+            wallet_column_family_descriptors,
+        )
+        .map_err(|source| RocksDbWalletError::rocksdb("fresh leased build open", source))
+        {
+            Ok(bounded_open) => bounded_open,
+            Err(open_error) => {
+                let release_result = build_store.release_lease(lease, now);
+                return match release_result {
+                    Ok(())
+                    | Err(
+                        RocksDbWalletError::ProjectionBuildLeaseExpired { .. }
+                        | RocksDbWalletError::ProjectionBuildLeaseMissing
+                        | RocksDbWalletError::ProjectionBuildLeaseOwnerMismatch { .. }
+                        | RocksDbWalletError::ProjectionBuildLeaseGenerationMismatch { .. }
+                        | RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch { .. },
+                    ) => Err(open_error),
+                    Err(cleanup_error) => Err(RocksDbWalletError::BuildLeaseCleanup {
+                        build_error: Box::new(open_error),
+                        cleanup_error: Box::new(cleanup_error),
+                    }),
+                };
+            }
+        };
+        let control = decode_only_control(&bounded_open)?;
         Ok(Self {
             bounded_open,
             store_path,
             resource_budget,
             control,
+            lease,
         })
     }
 
     /// Returns column-family options identical to those used by the BUILDING store.
     pub(crate) fn data_options(&self) -> Options {
         wallet_data_options(&self.bounded_open.block_cache, self.resource_budget)
+    }
+
+    pub(crate) const fn lease(&self) -> ProjectionBuildLease {
+        self.lease
+    }
+
+    pub(crate) fn heartbeat(
+        &mut self,
+        heartbeat: WalletBuildLeaseHeartbeat,
+    ) -> Result<(), RocksDbWalletError> {
+        apply_build_lease_heartbeat(
+            &self.bounded_open,
+            &mut self.control,
+            &mut self.lease,
+            heartbeat,
+        )
     }
 
     /// Ingests six externally prepared SST families while the store is BUILDING.
@@ -219,6 +545,7 @@ impl RocksDbWalletBuilder {
         let store_path = self.store_path.clone();
         let resource_budget = self.resource_budget;
         let expected_control = self.control.clone();
+        let lease = self.lease;
         drop(self);
 
         require_exact_column_families(&store_path)?;
@@ -245,6 +572,7 @@ impl RocksDbWalletBuilder {
         Ok(ColdRocksDbWalletBuild {
             bounded_open,
             control: reopened_control,
+            lease,
         })
     }
 }
@@ -275,6 +603,7 @@ impl ColdRocksDbWalletBuild {
         Ok(ValidatedRocksDbWalletBuild {
             bounded_open: self.bounded_open,
             control: self.control,
+            lease: self.lease,
             ready_evidence,
             validation_evidence,
         })
@@ -287,13 +616,44 @@ impl ValidatedRocksDbWalletBuild {
         self.validation_evidence
     }
 
-    /// Atomically replaces BUILDING with the evidence established by cold validation.
-    pub(crate) fn publish_ready(self) -> Result<RocksDbWalletStore, RocksDbWalletError> {
+    pub(crate) const fn lease(&self) -> ProjectionBuildLease {
+        self.lease
+    }
+
+    pub(crate) fn heartbeat(
+        &mut self,
+        heartbeat: WalletBuildLeaseHeartbeat,
+    ) -> Result<(), RocksDbWalletError> {
+        apply_build_lease_heartbeat(
+            &self.bounded_open,
+            &mut self.control,
+            &mut self.lease,
+            heartbeat,
+        )
+    }
+
+    /// Atomically replaces a lease-authorized BUILDING control with cold-validated READY evidence.
+    pub(crate) fn publish_ready_at(
+        self,
+        now: UnixTimestampMillis,
+    ) -> Result<RocksDbWalletStore, RocksDbWalletError> {
+        let persisted_control = decode_only_control(&self.bounded_open)?;
+        let persisted_lease = authorize_active_lease(&persisted_control, self.lease, now)?;
+        if persisted_lease.pinned_canonical_anchor()
+            != WalletCanonicalSourceIdentity::from_ready_evidence(&self.ready_evidence)
+        {
+            return Err(
+                RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+                    reason: "READY evidence differs from the pinned canonical anchor",
+                },
+            );
+        }
         let ready_evidence = self.ready_evidence;
         let ready_control = WalletStoreControl {
             network: self.control.network,
             supported_reorg_depth: self.control.supported_reorg_depth,
             writer_generation: self.control.writer_generation,
+            build_lease: None,
             build_state: WalletProjectionBuildState::Ready(ready_evidence.clone()),
         };
         write_control_sync(&self.bounded_open, &ready_control)?;
@@ -319,6 +679,27 @@ impl RocksDbWalletStore {
         expected_source: WalletCanonicalSourceIdentity,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, RocksDbWalletError> {
+        Self::open_ready_for_following(path, expected_network, resource_budget)?
+            .into_ready_store(expected_source)
+    }
+
+    /// Cold-opens READY state for canonical following without serving it.
+    ///
+    /// This path performs the same exact on-disk schema, singleton-control,
+    /// network, READY lifecycle, and serialized-accumulator decoding as
+    /// [`Self::open_ready`], but deliberately does not compare the persisted
+    /// source fence with a potentially newer canonical writer. It does not
+    /// rescan the row families; full row-to-accumulator validation remains the
+    /// bounded BUILDING-to-READY publication check. The returned
+    /// [`RocksDbWalletFollowingStore`] exposes no query methods; callers must
+    /// converge it through retained canonical events and then call
+    /// [`RocksDbWalletFollowingStore::into_ready_store`] with an exact source
+    /// identity before serving queries.
+    pub fn open_ready_for_following(
+        path: impl AsRef<Path>,
+        expected_network: Network,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<RocksDbWalletFollowingStore, RocksDbWalletError> {
         validate_resource_budget(resource_budget)?;
         let path = path.as_ref();
         let store_path =
@@ -344,17 +725,12 @@ impl RocksDbWalletStore {
         let WalletProjectionBuildState::Ready(ready_evidence) = &control.build_state else {
             return Err(RocksDbWalletError::StoreNotReady { path: store_path });
         };
-        let observed_source = WalletCanonicalSourceIdentity::from_ready_evidence(ready_evidence);
-        if observed_source != expected_source {
-            return Err(RocksDbWalletError::CanonicalSourceMismatch {
-                expected: Box::new(expected_source),
-                observed: Box::new(observed_source),
-            });
-        }
-        Ok(Self {
-            bounded_open,
-            ready_evidence: ready_evidence.clone(),
-            control,
+        Ok(RocksDbWalletFollowingStore {
+            store: Self {
+                bounded_open,
+                ready_evidence: ready_evidence.clone(),
+                control,
+            },
         })
     }
 
@@ -634,7 +1010,356 @@ impl RocksDbWalletStore {
     }
 }
 
-fn wallet_column_family_descriptors(
+impl RocksDbWalletFollowingStore {
+    /// Cold-admits a restored READY wallet checkpoint without granting serving
+    /// or mutation authority.
+    ///
+    /// This recovery-only boundary opens the checkpoint under the caller's
+    /// bounded `RocksDB` budget, reads its physical database identity, and
+    /// performs the complete semantic row scan against its persisted READY
+    /// evidence. Callers must still compare the returned evidence with their
+    /// admitted recovery manifest before any restore, following, or promotion
+    /// transition.
+    pub fn cold_admit_recovery_checkpoint(
+        target: impl AsRef<Path>,
+        expected_network: Network,
+        config: WalletRecoveryAdmissionConfig<'_>,
+    ) -> Result<WalletOwnerCheckpointEvidence, RocksDbWalletError> {
+        validate_resource_budget(config.resource_budget)?;
+        let target = target.as_ref();
+        let cold_checkpoint = RocksDbWalletStore::open_ready_for_following(
+            target,
+            expected_network,
+            config.resource_budget,
+        )?;
+        let database_identity = cold_checkpoint
+            .store
+            .bounded_open
+            .db
+            .get_db_identity()
+            .map_err(|source| RocksDbWalletError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        let expected_control = cold_checkpoint.store.control.clone();
+        let ready_evidence = cold_checkpoint.store.ready_evidence().clone();
+        validate_ready_rows(
+            &cold_checkpoint.store.bounded_open,
+            expected_network,
+            &ready_evidence,
+            WalletColdValidationConfig {
+                staging_path: config.staging_path,
+                max_sort_memory_bytes_per_sorter: config.max_sort_memory_bytes_per_sorter,
+                max_temporary_file_bytes_per_sorter: config.max_temporary_file_bytes_per_sorter,
+                max_accounted_reorg_undo_bytes: config.max_accounted_reorg_undo_bytes,
+            },
+        )?;
+        let observed_control = decode_only_control(&cold_checkpoint.store.bounded_open)?;
+        let observed_identity = cold_checkpoint
+            .store
+            .bounded_open
+            .db
+            .get_db_identity()
+            .map_err(|source| RocksDbWalletError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        if observed_control != expected_control || observed_identity != database_identity {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "wallet checkpoint changed during recovery cold admission",
+            });
+        }
+        Ok(WalletOwnerCheckpointEvidence {
+            database_identity,
+            store_identity: WALLET_PROJECTION_STORE_IDENTITY,
+            schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
+            network: cold_checkpoint.network(),
+            ready_evidence,
+        })
+    }
+
+    /// Creates and cold-admits one physical checkpoint from this wallet owner.
+    ///
+    /// `target` must not exist. The returned identity and READY evidence are
+    /// read through exact cold admission of the completed checkpoint, never
+    /// copied from this live handle. This operation exists only on the
+    /// non-serving following owner; serving stores and secondaries expose no
+    /// checkpoint operation.
+    pub fn create_owner_checkpoint(
+        &mut self,
+        target: impl AsRef<Path>,
+        admission_resource_budget: RocksDbResourceBudget,
+    ) -> Result<WalletOwnerCheckpointEvidence, RocksDbWalletError> {
+        let target = target.as_ref();
+        let admission = self.create_owner_checkpoint_physical(target)?;
+        Self::cold_admit_owner_checkpoint(target, &admission, admission_resource_budget)
+    }
+
+    /// Creates the physical checkpoint while this following owner holds its
+    /// primary handle, then returns immutable cold-admission context.
+    ///
+    /// The context captures the source database identity before `RocksDB` starts
+    /// checkpoint creation. Callers that separate physical capture from cold
+    /// validation must retain this context and invoke
+    /// [`Self::cold_admit_owner_checkpoint`] for the same target.
+    pub fn create_owner_checkpoint_physical(
+        &mut self,
+        target: impl AsRef<Path>,
+    ) -> Result<WalletOwnerCheckpointAdmission, RocksDbWalletError> {
+        let target = target.as_ref();
+        require_absent_checkpoint_target(target)?;
+        let database_identity = self
+            .store
+            .bounded_open
+            .db
+            .get_db_identity()
+            .map_err(|source| RocksDbWalletError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        let checkpoint = Checkpoint::new(&self.store.bounded_open.db).map_err(|source| {
+            RocksDbWalletError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            }
+        })?;
+        checkpoint.create_checkpoint(target).map_err(|source| {
+            RocksDbWalletError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            }
+        })?;
+        Ok(WalletOwnerCheckpointAdmission {
+            network: self.network(),
+            database_identity,
+        })
+    }
+
+    /// Cold-admits one physical wallet checkpoint against immutable owner
+    /// context without reopening or retaining the source primary.
+    ///
+    /// The target's `RocksDB` database identity must exactly match the identity
+    /// captured before physical checkpoint creation. A replacement with equal
+    /// wallet READY evidence is therefore refused instead of being admitted.
+    pub fn cold_admit_owner_checkpoint(
+        target: impl AsRef<Path>,
+        admission: &WalletOwnerCheckpointAdmission,
+        admission_resource_budget: RocksDbResourceBudget,
+    ) -> Result<WalletOwnerCheckpointEvidence, RocksDbWalletError> {
+        validate_resource_budget(admission_resource_budget)?;
+        let target = target.as_ref();
+        let cold_checkpoint = RocksDbWalletStore::open_ready_for_following(
+            target,
+            admission.network,
+            admission_resource_budget,
+        )?;
+        let cold_database_identity = cold_checkpoint
+            .store
+            .bounded_open
+            .db
+            .get_db_identity()
+            .map_err(|source| RocksDbWalletError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        if cold_database_identity != admission.database_identity {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "checkpoint database identity differs from the physical owner checkpoint",
+            });
+        }
+        Ok(WalletOwnerCheckpointEvidence {
+            database_identity: cold_database_identity,
+            store_identity: WALLET_PROJECTION_STORE_IDENTITY,
+            schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
+            network: cold_checkpoint.network(),
+            ready_evidence: cold_checkpoint.ready_evidence().clone(),
+        })
+    }
+
+    /// Returns the persisted READY evidence that must be converged before serving.
+    #[must_use]
+    pub const fn ready_evidence(&self) -> &WalletProjectionReadyEvidence {
+        self.store.ready_evidence()
+    }
+
+    /// Returns the immutable network admitted from the persisted wallet control.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.store.network()
+    }
+
+    /// Returns one retained undo record so a follower can verify its common ancestor.
+    ///
+    /// This narrow inspection surface exposes no query reads or arbitrary row
+    /// access; it is only sufficient for a follower to choose the explicit
+    /// durable rollback suffix required by atomic reconciliation.
+    pub fn find_reorg_undo(
+        &self,
+        block_height: BlockHeight,
+    ) -> Result<Option<WalletReorgUndo>, RocksDbWalletError> {
+        self.store.find_reorg_undo(block_height)
+    }
+
+    /// Applies one exact canonical event while this handle remains non-serving.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the following API keeps its authenticated source, fence, settlement, budget, and replay input explicit"
+    )]
+    pub fn apply_canonical_event_range<I>(
+        &mut self,
+        expected_source: WalletCanonicalSourceIdentity,
+        event: CanonicalRetainedEvent,
+        resulting_fence: CanonicalEventFence,
+        resulting_settled_tip: BlockId,
+        max_logical_bytes: NonZeroU64,
+        replay_rows: I,
+    ) -> Result<(), RocksDbWalletError>
+    where
+        I: IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
+    {
+        self.store.apply_canonical_event_range(
+            expected_source,
+            event,
+            resulting_fence,
+            resulting_settled_tip,
+            max_logical_bytes,
+            replay_rows,
+        )
+    }
+
+    /// Applies one canonical event and abandons it before its atomic write on cancellation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the following API keeps its authenticated source, fence, settlement, budget, replay, and cancellation inputs explicit"
+    )]
+    pub fn apply_canonical_event_range_cancellable<I, Cancel>(
+        &mut self,
+        expected_source: WalletCanonicalSourceIdentity,
+        event: CanonicalRetainedEvent,
+        resulting_fence: CanonicalEventFence,
+        resulting_settled_tip: BlockId,
+        max_logical_bytes: NonZeroU64,
+        replay_rows: I,
+        cancelled_before_write: Cancel,
+    ) -> Result<(), RocksDbWalletError>
+    where
+        I: IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
+        Cancel: FnOnce() -> bool,
+    {
+        self.store.apply_canonical_event_range_cancellable(
+            expected_source,
+            event,
+            resulting_fence,
+            resulting_settled_tip,
+            max_logical_bytes,
+            replay_rows,
+            cancelled_before_write,
+        )
+    }
+
+    /// Reconciles this non-serving wallet directly to a current canonical fence.
+    ///
+    /// See [`RocksDbWalletStore::reconcile_canonical_event_sequence`] for the
+    /// retained-history, verified-ancestor, bounded-current-replay, and atomic
+    /// publication contract.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the following API keeps retained history, authenticated target, settlement, rollback, and replay inputs explicit"
+    )]
+    pub fn reconcile_canonical_event_sequence<I>(
+        &mut self,
+        expected_source: WalletCanonicalSourceIdentity,
+        retained_events: &[CanonicalRetainedEvent],
+        target_fence: CanonicalEventFence,
+        target_settled_tip: BlockId,
+        rollback_range: Option<BlockHeightRange>,
+        replay_range: BlockHeightRange,
+        max_logical_bytes: NonZeroU64,
+        replay_rows: I,
+    ) -> Result<(), RocksDbWalletError>
+    where
+        I: IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
+    {
+        self.store.reconcile_canonical_event_sequence(
+            expected_source,
+            retained_events,
+            target_fence,
+            target_settled_tip,
+            rollback_range,
+            replay_range,
+            max_logical_bytes,
+            replay_rows,
+        )
+    }
+
+    /// Reconciles this non-serving wallet and abandons before the atomic write on cancellation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the following API keeps retained history, authenticated target, settlement, rollback, replay, and cancellation inputs explicit"
+    )]
+    pub fn reconcile_canonical_event_sequence_cancellable<I, Cancel>(
+        &mut self,
+        expected_source: WalletCanonicalSourceIdentity,
+        retained_events: &[CanonicalRetainedEvent],
+        target_fence: CanonicalEventFence,
+        target_settled_tip: BlockId,
+        rollback_range: Option<BlockHeightRange>,
+        replay_range: BlockHeightRange,
+        max_logical_bytes: NonZeroU64,
+        replay_rows: I,
+        cancelled_before_write: Cancel,
+    ) -> Result<(), RocksDbWalletError>
+    where
+        I: IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
+        Cancel: FnOnce() -> bool,
+    {
+        self.store.reconcile_canonical_event_sequence_cancellable(
+            expected_source,
+            retained_events,
+            target_fence,
+            target_settled_tip,
+            rollback_range,
+            replay_range,
+            max_logical_bytes,
+            replay_rows,
+            cancelled_before_write,
+        )
+    }
+
+    /// Converts this following-only handle into a query-serving READY store.
+    ///
+    /// The caller supplies the canonical source identity it has independently
+    /// converged to. A mismatch fails closed and leaves no serving handle.
+    pub fn into_ready_store(
+        self,
+        expected_source: WalletCanonicalSourceIdentity,
+    ) -> Result<RocksDbWalletStore, RocksDbWalletError> {
+        let observed_source =
+            WalletCanonicalSourceIdentity::from_ready_evidence(self.store.ready_evidence());
+        if observed_source != expected_source {
+            return Err(RocksDbWalletError::CanonicalSourceMismatch {
+                expected: Box::new(expected_source),
+                observed: Box::new(observed_source),
+            });
+        }
+        Ok(self.store)
+    }
+}
+
+fn require_absent_checkpoint_target(path: &Path) -> Result<(), RocksDbWalletError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(RocksDbWalletError::CheckpointTargetExists {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(RocksDbWalletError::PathUnavailable {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+pub(crate) fn wallet_column_family_descriptors(
     block_cache: &Cache,
     resource_budget: RocksDbResourceBudget,
 ) -> Vec<ColumnFamilyDescriptor> {
@@ -657,7 +1382,7 @@ fn wallet_data_options(block_cache: &Cache, resource_budget: RocksDbResourceBudg
     options
 }
 
-fn validate_resource_budget(
+pub(crate) fn validate_resource_budget(
     resource_budget: RocksDbResourceBudget,
 ) -> Result<(), RocksDbWalletError> {
     resource_budget
@@ -688,7 +1413,7 @@ fn create_fresh_directory(path: &Path) -> Result<(), RocksDbWalletError> {
     }
 }
 
-fn required_column_family_names() -> Vec<String> {
+pub(crate) fn required_column_family_names() -> Vec<String> {
     std::iter::once(DEFAULT_COLUMN_FAMILY_NAME)
         .chain(WALLET_DATA_COLUMN_FAMILIES)
         .map(str::to_owned)
@@ -707,7 +1432,142 @@ fn require_exact_column_families(path: &Path) -> Result<(), RocksDbWalletError> 
     Ok(())
 }
 
-fn decode_only_control(
+fn require_building_control(
+    control: &WalletStoreControl,
+    store_path: &Path,
+    expected_network: Network,
+) -> Result<(), RocksDbWalletError> {
+    if control.network != expected_network {
+        return Err(RocksDbWalletError::NetworkMismatch {
+            expected: expected_network,
+            observed: control.network,
+        });
+    }
+    if !matches!(control.build_state, WalletProjectionBuildState::Building(_)) {
+        return Err(RocksDbWalletError::StoreNotReady {
+            path: store_path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_lease_request(
+    control: &WalletStoreControl,
+    request: ProjectionBuildLeaseRequest,
+    now: UnixTimestampMillis,
+) -> Result<(), RocksDbWalletError> {
+    if request.expires_at() <= now {
+        return Err(RocksDbWalletError::ProjectionBuildLeaseExpiryNotFuture);
+    }
+    let WalletProjectionBuildState::Building(plan) = &control.build_state else {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "projection build lease requires a BUILDING control record",
+        });
+    };
+    let canonical_anchor = request.pinned_canonical_anchor();
+    if canonical_anchor.source_position() != plan.target_source_position {
+        return Err(
+            RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+                reason: "requested source position differs from the BUILDING target",
+            },
+        );
+    }
+    if request
+        .retained_event_anchor()
+        .earliest_retained_event_sequence()
+        > canonical_anchor.source_position().event_sequence
+    {
+        return Err(
+            RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+                reason: "retained event anchor follows the pinned canonical event",
+            },
+        );
+    }
+    Ok(())
+}
+
+fn authorize_active_lease(
+    control: &WalletStoreControl,
+    lease: ProjectionBuildLease,
+    now: UnixTimestampMillis,
+) -> Result<ProjectionBuildLease, RocksDbWalletError> {
+    let persisted = control
+        .build_lease
+        .ok_or(RocksDbWalletError::ProjectionBuildLeaseMissing)?;
+    if persisted.owner() != lease.owner() {
+        return Err(RocksDbWalletError::ProjectionBuildLeaseOwnerMismatch {
+            expected: persisted.owner(),
+            observed: lease.owner(),
+        });
+    }
+    if persisted.generation() != lease.generation() {
+        return Err(RocksDbWalletError::ProjectionBuildLeaseGenerationMismatch {
+            expected: persisted.generation(),
+            observed: lease.generation(),
+        });
+    }
+    if persisted.pinned_canonical_anchor() != lease.pinned_canonical_anchor()
+        || persisted.retained_event_anchor() != lease.retained_event_anchor()
+        || persisted.expires_at() != lease.expires_at()
+        || persisted.network() != lease.network()
+        || persisted.projection_schema_version() != lease.projection_schema_version()
+        || persisted.version() != lease.version()
+    {
+        return Err(
+            RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+                reason: "supplied capability differs from durable lease identity",
+            },
+        );
+    }
+    if persisted.expires_at() <= now {
+        return Err(RocksDbWalletError::ProjectionBuildLeaseExpired {
+            expires_at: persisted.expires_at(),
+        });
+    }
+    Ok(persisted)
+}
+
+fn apply_build_lease_heartbeat(
+    bounded_open: &BoundedRocksDbOpen,
+    control: &mut WalletStoreControl,
+    lease: &mut ProjectionBuildLease,
+    heartbeat: WalletBuildLeaseHeartbeat,
+) -> Result<(), RocksDbWalletError> {
+    let persisted_control = decode_only_control(bounded_open)?;
+    let persisted_lease = authorize_active_lease(&persisted_control, *lease, heartbeat.now())?;
+    let Some(renew_until) = heartbeat.renew_until() else {
+        *control = persisted_control;
+        *lease = persisted_lease;
+        return Ok(());
+    };
+    if renew_until <= heartbeat.now() {
+        return Err(RocksDbWalletError::ProjectionBuildLeaseExpiryNotFuture);
+    }
+    if renew_until <= persisted_lease.expires_at() {
+        return Err(RocksDbWalletError::ProjectionBuildLeaseRenewalNotExtended);
+    }
+    let renewed = persisted_lease.renewed(renew_until);
+    let next_control = WalletStoreControl {
+        build_lease: Some(renewed),
+        ..persisted_control
+    };
+    write_control_sync(bounded_open, &next_control)?;
+    // Once the synchronous write succeeds, retain the new exact capability
+    // even if the defensive readback below fails. The outer build lifecycle
+    // can then release only this generation/expiry and cannot clear a
+    // successor lease after an admission race.
+    *lease = renewed;
+    let persisted_after_write = decode_only_control(bounded_open)?;
+    if persisted_after_write != next_control {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "projection build lease differs after in-process heartbeat renewal",
+        });
+    }
+    *control = next_control;
+    Ok(())
+}
+
+pub(crate) fn decode_only_control(
     bounded_open: &BoundedRocksDbOpen,
 ) -> Result<WalletStoreControl, RocksDbWalletError> {
     let mut iterator = bounded_open.db.iterator(IteratorMode::Start);
@@ -829,7 +1689,7 @@ struct ExpectedReorgUndoSuffix {
 
 impl ExpectedReorgUndoSuffix {
     fn new(
-        ready_tip: zinder_core::BlockId,
+        settled_tip: zinder_core::BlockId,
         undo_count: u64,
         max_accounted_bytes: u64,
     ) -> Result<Self, RocksDbWalletError> {
@@ -837,12 +1697,11 @@ impl ExpectedReorgUndoSuffix {
             undo_by_height: BTreeMap::new(),
             memory: AccountedValidationReorgUndoMemory::new(max_accounted_bytes),
         };
-        let first_height = u64::from(ready_tip.height.value())
-            .checked_sub(undo_count)
-            .and_then(|height| height.checked_add(1))
-            .ok_or(RocksDbWalletError::AdmissionChanged {
+        let first_height = u64::from(settled_tip.height.value()).checked_add(1).ok_or(
+            RocksDbWalletError::AdmissionChanged {
                 reason: "reorg undo suffix falls outside the READY source range",
-            })?;
+            },
+        )?;
         for offset in 0..undo_count {
             let height =
                 first_height
@@ -961,7 +1820,7 @@ fn validate_ready_rows(
         config.max_temporary_file_bytes_per_sorter,
     )?;
     let mut expected_undo = ExpectedReorgUndoSuffix::new(
-        evidence.source_position.tip,
+        evidence.settled_tip,
         counts.reorg_undo_count,
         config.max_accounted_reorg_undo_bytes,
     )?;
@@ -996,12 +1855,16 @@ fn validate_ready_rows(
         &mut digest,
         counts.reorg_undo_count,
         evidence.source_position.tip,
+        evidence.settled_tip,
+        evidence.source_sequence_digest,
         &expected_undo.undo_by_height,
     )?;
     let observed_row_counts = digest.row_counts();
+    let observed_accumulator = digest.accumulator().clone();
     let observed_digest = digest.finish();
     if observed_row_counts != evidence.row_counts
         || observed_digest != evidence.projection_digest
+        || observed_accumulator != evidence.projection_accumulator
         || utxo_summary != evidence.utxo_summary
     {
         return Err(RocksDbWalletError::AdmissionChanged {
@@ -1421,22 +2284,30 @@ fn increment_validation_count(
         })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one ordered suffix scan keeps READY floor, row effects, digest continuity, and tip evidence coupled"
+)]
 fn validate_reorg_undo_rows(
     bounded_open: &BoundedRocksDbOpen,
     digest: &mut WalletProjectionDigestBuilder,
     expected_count: u64,
     ready_tip: zinder_core::BlockId,
+    settled_tip: zinder_core::BlockId,
+    ready_source_sequence_digest: CanonicalBlockFactsSequenceDigest,
     expected_by_height: &BTreeMap<u32, ExpectedReorgUndoEffects>,
 ) -> Result<(), RocksDbWalletError> {
     let family = column_family(bounded_open, REORG_UNDO_COLUMN_FAMILY)?;
-    let first_height = u64::from(ready_tip.height.value())
-        .checked_sub(expected_count)
-        .and_then(|height| height.checked_add(1))
-        .ok_or(RocksDbWalletError::AdmissionChanged {
+    let first_height = u64::from(settled_tip.height.value()).checked_add(1).ok_or(
+        RocksDbWalletError::AdmissionChanged {
             reason: "reorg undo suffix falls outside the READY source range",
-        })?;
+        },
+    )?;
     let mut count = 0u64;
     let mut last_undo = None;
+    let mut previous_block = settled_tip;
+    let mut previous_source_sequence_digest = None;
     for row in
         bounded_open
             .db
@@ -1454,6 +2325,18 @@ fn validate_reorg_undo_rows(
         if u64::from(undo.block.height.value()) != expected_height {
             return Err(RocksDbWalletError::AdmissionChanged {
                 reason: "reorg undo rows are not the exact contiguous READY suffix",
+            });
+        }
+        if undo.parent_hash != previous_block.hash {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "reorg undo rows do not chain from the READY settled tip",
+            });
+        }
+        if previous_source_sequence_digest
+            .is_some_and(|digest| digest != undo.source_sequence_digest_before)
+        {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "reorg undo rows have disconnected source sequence digests",
             });
         }
         let expected = expected_by_height.get(&undo.block.height.value()).ok_or(
@@ -1488,6 +2371,8 @@ fn validate_reorg_undo_rows(
             .ok_or(RocksDbWalletError::AdmissionChanged {
                 reason: "reorg undo row count overflow",
             })?;
+        previous_block = undo.block;
+        previous_source_sequence_digest = Some(undo.source_sequence_digest_after);
         last_undo = Some(undo);
     }
     if count != expected_count
@@ -1504,10 +2389,16 @@ fn validate_reorg_undo_rows(
             reason: "tip reorg undo does not match the READY source tip",
         });
     }
+    if previous_source_sequence_digest.is_some_and(|digest| digest != ready_source_sequence_digest)
+    {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "tip reorg undo source digest does not match the READY source digest",
+        });
+    }
     Ok(())
 }
 
-fn column_family<'db>(
+pub(crate) fn column_family<'db>(
     bounded_open: &'db BoundedRocksDbOpen,
     name: &'static str,
 ) -> Result<Arc<BoundColumnFamily<'db>>, RocksDbWalletError> {
@@ -1531,10 +2422,12 @@ mod tests {
     use zinder_core::{
         BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
         CanonicalBlockFactsSequenceDigestVersion, ChainEpochId, TransactionId,
-        TransparentUtxoSetCommitment,
+        TransparentUtxoSetCommitment, UnixTimestampMillis,
     };
     use zinder_wallet_projection::{
-        WalletProjectionDigest, WalletProjectionFamilyRowCounts, WalletTransactionPosition,
+        ProjectionBuildLeaseRequest, ProjectionBuildOwner, WalletProjectionDigest,
+        WalletProjectionFamilyRowCounts, WalletProjectionRetainedEventAnchor,
+        WalletProjectionSourcePosition, WalletTransactionPosition,
     };
 
     use super::*;
@@ -1633,6 +2526,10 @@ mod tests {
         )
     }
 
+    fn settled_tip() -> BlockId {
+        BlockId::new(BlockHeight::new(0), Network::ZcashRegtest.genesis_hash())
+    }
+
     fn source_identity() -> WalletCanonicalSourceIdentity {
         WalletCanonicalSourceIdentity::new(
             source_position(),
@@ -1641,6 +2538,56 @@ mod tests {
                 1,
                 [0x77; 32],
             ),
+            source_position().tip,
+        )
+    }
+
+    fn valid_reorg_undo(block: BlockId) -> WalletReorgUndo {
+        WalletReorgUndo {
+            block,
+            parent_hash: Network::ZcashRegtest.genesis_hash(),
+            source_sequence_digest_before:
+                CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                    CanonicalBlockFactsSequenceDigestVersion::V1,
+                    0,
+                    [0x76; 32],
+                ),
+            source_sequence_digest_after: source_identity().source_sequence_digest(),
+            created_outpoints: Vec::new(),
+            spent_outpoints: Vec::new(),
+            address_transaction_keys: Vec::new(),
+        }
+    }
+
+    fn test_lease_request() -> ProjectionBuildLeaseRequest {
+        ProjectionBuildLeaseRequest::new(
+            ProjectionBuildOwner::from_bytes([0x55; 16]),
+            source_identity(),
+            WalletProjectionRetainedEventAnchor::new(
+                source_identity().source_position().event_sequence,
+            ),
+            UnixTimestampMillis::new(u64::MAX),
+        )
+    }
+
+    fn fresh_builder(
+        path: impl AsRef<Path>,
+        network: Network,
+        _target_source_position: WalletProjectionSourcePosition,
+        supported_reorg_depth: u32,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<RocksDbWalletBuilder, RocksDbWalletError> {
+        let build_store = RocksDbWalletBuildStore::create_fresh(
+            path,
+            network,
+            source_identity(),
+            supported_reorg_depth,
+            resource_budget,
+        )?;
+        RocksDbWalletBuilder::create_fresh(
+            build_store,
+            test_lease_request(),
+            UnixTimestampMillis::new(0),
         )
     }
 
@@ -1683,12 +2630,17 @@ mod tests {
         transactions
     }
 
-    fn projection_digest(
+    fn projection_evidence(
         unspent: &WalletUnspentOutput,
         spent: &WalletSpentOutput,
         balance: WalletAddressBalance,
-    ) -> Result<WalletProjectionDigest, zinder_wallet_projection::WalletProjectionContractError>
-    {
+    ) -> Result<
+        (
+            zinder_wallet_projection::WalletProjectionAccumulator,
+            WalletProjectionDigest,
+        ),
+        zinder_wallet_projection::WalletProjectionContractError,
+    > {
         let mut digest = WalletProjectionDigestBuilder::new();
         let unspent_key = WalletOutpointKey::new(unspent.outpoint);
         digest.append_row(
@@ -1721,7 +2673,7 @@ mod tests {
             &balance.encode_key(),
             &balance.encode_value(),
         )?;
-        Ok(digest.finish())
+        Ok(digest.finish_with_accumulator())
     }
 
     fn ready_evidence(
@@ -1741,6 +2693,8 @@ mod tests {
             script_pub_key: &unspent.script_pub_key,
             block_height: unspent.created_at.block.height,
         });
+        let (projection_accumulator, projection_digest) =
+            projection_evidence(unspent, spent, balance)?;
         Ok(WalletProjectionReadyEvidence {
             source_position: source_position(),
             source_sequence_digest:
@@ -1749,7 +2703,9 @@ mod tests {
                     1,
                     [0x77; 32],
                 ),
-            projection_digest: projection_digest(unspent, spent, balance)?,
+            settled_tip: source_position().tip,
+            projection_digest,
+            projection_accumulator,
             row_counts: WalletProjectionFamilyRowCounts {
                 transparent_unspent_output_count: 1,
                 transparent_unspent_output_by_address_count: 1,
@@ -1824,10 +2780,13 @@ mod tests {
             script_pub_key: &unspent.script_pub_key,
             block_height: unspent.created_at.block.height,
         });
+        let (projection_accumulator, projection_digest) = digest.finish_with_accumulator();
         Ok(WalletProjectionReadyEvidence {
             source_position: source_position(),
             source_sequence_digest: source_identity().source_sequence_digest(),
-            projection_digest: digest.finish(),
+            settled_tip: source_position().tip,
+            projection_digest,
+            projection_accumulator,
             row_counts: WalletProjectionFamilyRowCounts {
                 transparent_unspent_output_count: 1,
                 transparent_unspent_output_by_address_count: 1,
@@ -1948,9 +2907,11 @@ mod tests {
             )?;
         }
         prepared.row_counts = digest.row_counts();
-        prepared.projection_digest = digest.finish();
+        let (projection_accumulator, projection_digest) = digest.finish_with_accumulator();
+        prepared.projection_digest = projection_digest;
         evidence.row_counts = prepared.row_counts;
         evidence.projection_digest = prepared.projection_digest;
+        evidence.projection_accumulator = projection_accumulator;
         Ok(())
     }
 
@@ -2022,12 +2983,8 @@ mod tests {
             }
             SemanticTamper::IncorrectUndo => {
                 prepared.supported_reorg_depth = 1;
-                prepared.reorg_undo = vec![WalletReorgUndo {
-                    block: source_position().tip,
-                    created_outpoints: Vec::new(),
-                    spent_outpoints: Vec::new(),
-                    address_transaction_keys: Vec::new(),
-                }];
+                prepared.reorg_undo = vec![valid_reorg_undo(source_position().tip)];
+                evidence.settled_tip = settled_tip();
             }
         }
         refresh_prepared_evidence(prepared, evidence)?;
@@ -2039,7 +2996,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let path = temporary.path().join("wallet");
-        let builder = RocksDbWalletBuilder::create_fresh(
+        let builder = fresh_builder(
             &path,
             Network::ZcashRegtest,
             source_position(),
@@ -2049,7 +3006,7 @@ mod tests {
         drop(builder);
 
         assert!(matches!(
-            RocksDbWalletBuilder::create_fresh(
+            fresh_builder(
                 &path,
                 Network::ZcashRegtest,
                 source_position(),
@@ -2107,7 +3064,7 @@ mod tests {
             let mut evidence = ready_evidence(network, &unspent, &spent, balance)?;
             apply_semantic_tamper(tamper, &mut prepared, &mut evidence)?;
             let path = temporary.path().join(format!("wallet-{index}"));
-            let builder = RocksDbWalletBuilder::create_fresh(
+            let builder = fresh_builder(
                 path,
                 network,
                 source_position(),
@@ -2134,7 +3091,7 @@ mod tests {
     {
         let admitted_bytes = size_of::<(u32, ExpectedReorgUndoEffects)>();
         let memory_limit = u64::try_from(admitted_bytes)?;
-        let mut suffix = ExpectedReorgUndoSuffix::new(source_position().tip, 1, memory_limit)?;
+        let mut suffix = ExpectedReorgUndoSuffix::new(settled_tip(), 1, memory_limit)?;
         let output = sample_output(0x22, 12_345)?;
 
         assert!(matches!(
@@ -2156,7 +3113,7 @@ mod tests {
             .checked_add(size_of::<WalletOutpointKey>())
             .ok_or("test reorg undo memory overflow")?;
         let memory_limit = u64::try_from(admitted_bytes)?;
-        let mut suffix = ExpectedReorgUndoSuffix::new(source_position().tip, 1, memory_limit)?;
+        let mut suffix = ExpectedReorgUndoSuffix::new(settled_tip(), 1, memory_limit)?;
         let output = sample_output(0x22, 12_345)?;
 
         suffix.observe_created(&output)?;
@@ -2195,14 +3152,10 @@ mod tests {
         let mut prepared = semantic_validation_fixture(network, &unspent, &spent, balance)?;
         let mut evidence = ready_evidence(network, &unspent, &spent, balance)?;
         prepared.supported_reorg_depth = 1;
-        prepared.reorg_undo = vec![WalletReorgUndo {
-            block: source_position().tip,
-            created_outpoints: Vec::new(),
-            spent_outpoints: Vec::new(),
-            address_transaction_keys: Vec::new(),
-        }];
+        prepared.reorg_undo = vec![valid_reorg_undo(source_position().tip)];
+        evidence.settled_tip = settled_tip();
         refresh_prepared_evidence(&mut prepared, &mut evidence)?;
-        let builder = RocksDbWalletBuilder::create_fresh(
+        let builder = fresh_builder(
             temporary.path().join("wallet"),
             network,
             source_position(),
@@ -2242,7 +3195,7 @@ mod tests {
             address_script_hash: unspent.address_script_hash,
             balance_zat: unspent.value_zat,
         };
-        let builder = RocksDbWalletBuilder::create_fresh(
+        let builder = fresh_builder(
             &path,
             network,
             source_position(),
@@ -2255,7 +3208,7 @@ mod tests {
         let store = builder
             .reopen_for_validation()?
             .validate_rows(evidence.clone(), validation_config(temporary.path()))?
-            .publish_ready()?;
+            .publish_ready_at(UnixTimestampMillis::new(1))?;
 
         assert_eq!(store.ready_evidence(), &evidence);
         assert_eq!(
@@ -2281,6 +3234,107 @@ mod tests {
     }
 
     #[test]
+    fn recovery_cold_admission_requires_ready_rows_to_match_persisted_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let checkpoint_path = temporary.path().join("wallet-checkpoint");
+        let network = Network::ZcashRegtest;
+        let unspent = sample_output(0x22, 12_345)?;
+        let spent_source = sample_output(0x33, 45_678)?;
+        let spent = WalletSpentOutput::new(
+            spent_source,
+            WalletTransactionPosition::new(
+                TransactionId::from_bytes([0x44; 32]),
+                1,
+                source_position().tip,
+            ),
+            0,
+        );
+        let balance = WalletAddressBalance {
+            address_script_hash: unspent.address_script_hash,
+            balance_zat: unspent.value_zat,
+        };
+        let source_path = temporary.path().join("wallet-source");
+        let builder = fresh_builder(
+            &source_path,
+            network,
+            source_position(),
+            0,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let prepared = semantic_validation_fixture(network, &unspent, &spent, balance)?;
+        load_semantic_validation_fixture(&builder, &prepared)?;
+        let ready = ready_evidence(network, &unspent, &spent, balance)?;
+        drop(
+            builder
+                .reopen_for_validation()?
+                .validate_rows(ready, validation_config(temporary.path()))?
+                .publish_ready_at(UnixTimestampMillis::new(1))?,
+        );
+        let mut owner = RocksDbWalletStore::open_ready_for_following(
+            &source_path,
+            network,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let checkpoint = owner
+            .create_owner_checkpoint(&checkpoint_path, RocksDbResourceBudget::for_local_tests())?;
+        drop(owner);
+
+        let recovery_config = WalletRecoveryAdmissionConfig {
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            staging_path: temporary.path(),
+            max_sort_memory_bytes_per_sorter: TEST_VALIDATION_SORT_MEMORY_BYTES,
+            max_temporary_file_bytes_per_sorter: TEST_VALIDATION_TEMPORARY_FILE_BYTES,
+            max_accounted_reorg_undo_bytes: TEST_VALIDATION_REORG_UNDO_BYTES,
+        };
+        let admitted = RocksDbWalletFollowingStore::cold_admit_recovery_checkpoint(
+            &checkpoint_path,
+            network,
+            recovery_config,
+        )?;
+        assert_eq!(admitted, checkpoint);
+
+        delete_recovery_address_index_row(
+            &checkpoint_path,
+            prepared.unspent_output_by_address[0].as_bytes(),
+        )?;
+
+        assert!(matches!(
+            RocksDbWalletFollowingStore::cold_admit_recovery_checkpoint(
+                &checkpoint_path,
+                network,
+                recovery_config,
+            ),
+            Err(RocksDbWalletError::AdmissionChanged {
+                reason: "address unspent index does not exactly cover every primary unspent output"
+            })
+        ));
+        Ok(())
+    }
+
+    fn delete_recovery_address_index_row(
+        checkpoint_path: &Path,
+        address_index_key: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary {
+                path: checkpoint_path,
+            },
+            RocksDbResourceBudget::for_local_tests(),
+            wallet_column_family_descriptors,
+        )?;
+        let address_index = column_family(
+            &bounded_open,
+            TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+        )?;
+        bounded_open
+            .db
+            .delete_cf(&address_index, address_index_key)?;
+        drop(address_index);
+        Ok(())
+    }
+
+    #[test]
     fn ready_store_refuses_stale_source_position_or_digest()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
@@ -2301,7 +3355,7 @@ mod tests {
             address_script_hash: unspent.address_script_hash,
             balance_zat: unspent.value_zat,
         };
-        let builder = RocksDbWalletBuilder::create_fresh(
+        let builder = fresh_builder(
             &path,
             network,
             source_position(),
@@ -2315,7 +3369,7 @@ mod tests {
             builder
                 .reopen_for_validation()?
                 .validate_rows(evidence.clone(), validation_config(temporary.path()))?
-                .publish_ready()?,
+                .publish_ready_at(UnixTimestampMillis::new(1))?,
         );
         let stale_position = WalletCanonicalSourceIdentity::new(
             WalletProjectionSourcePosition::new(
@@ -2324,6 +3378,7 @@ mod tests {
                 2,
             ),
             evidence.source_sequence_digest,
+            evidence.settled_tip,
         );
         assert!(matches!(
             RocksDbWalletStore::open_ready(
@@ -2341,6 +3396,7 @@ mod tests {
                 1,
                 [0x88; 32],
             ),
+            evidence.settled_tip,
         );
         assert!(matches!(
             RocksDbWalletStore::open_ready(
@@ -2360,7 +3416,7 @@ mod tests {
         let temporary = TempDir::new()?;
         let network = Network::ZcashRegtest;
         let unspent = sample_output(0x66, 0)?;
-        let builder = RocksDbWalletBuilder::create_fresh(
+        let builder = fresh_builder(
             temporary.path().join("wallet"),
             network,
             source_position(),
@@ -2373,7 +3429,7 @@ mod tests {
         let store = builder
             .reopen_for_validation()?
             .validate_rows(evidence.clone(), validation_config(temporary.path()))?
-            .publish_ready()?;
+            .publish_ready_at(UnixTimestampMillis::new(1))?;
 
         assert_eq!(store.find_unspent_output(unspent.outpoint)?, Some(unspent));
         assert_eq!(

@@ -2,27 +2,27 @@ use prost::Message;
 use rust_rocksdb::{DB, WriteBatch, WriteOptions};
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
-    CanonicalBlockFactsSequenceDigestBuilder, ChainEpochId, CommitmentTreeAccumulator,
-    CommitmentTreeCheckpoint, NetworkUpgradeActivations,
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+    ChainEpochId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
     UnixTimestampMillis,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 
 use super::{
-    CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, RocksDbCanonicalStore,
+    CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalSequenceCheckpoint,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, RocksDbCanonicalStore,
     block_load::{
         encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
         encode_block_position, encode_transaction_location, encode_transaction_position,
         encode_tree_state_checkpoint, read_persisted_tip_checkpoint, read_persisted_tip_metadata,
         validate_live_block,
     },
-    block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+    block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, resume_persisted_sequence_checkpoint},
     control::encode_ready_store_control,
     publication::{
         column_family, encode_live_append_event, encode_live_chain_epoch, read_chain_epoch_tips,
-        validate_live_append_publication, validate_settled_tip,
+        validate_live_append_publication, validate_ready_sequence_checkpoint, validate_settled_tip,
     },
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
@@ -80,6 +80,24 @@ pub struct CanonicalEventFence {
 }
 
 impl CanonicalEventFence {
+    pub(super) const fn from_persisted_event(
+        chain_epoch_id: ChainEpochId,
+        chain_event_sequence: u64,
+        visible_tip: BlockId,
+        visible_block_count: u64,
+        sequence_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            chain_epoch_id,
+            chain_event_sequence,
+            visible_tip,
+            sequence_digest: CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                CanonicalBlockFactsSequenceDigestVersion::V1,
+                visible_block_count,
+                sequence_digest,
+            ),
+        }
+    }
     /// Returns the durable epoch containing this transition.
     #[must_use]
     pub const fn chain_epoch_id(self) -> ChainEpochId {
@@ -177,12 +195,12 @@ impl RocksDbCanonicalStore {
                 },
             )?;
         abort_at_live_commit_failpoint("after_atomic_write");
-        validate_live_commit_readback(&self.bounded_open.db, &prepared).map_err(|source| {
-            CanonicalStoreError::LiveCommitCompletedButUnverified {
+        validate_live_commit_readback(&self.bounded_open.db, &self.build_plan, &prepared).map_err(
+            |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
                 path: self.bounded_open.db.path().to_path_buf(),
                 reason: source.to_string(),
-            }
-        })?;
+            },
+        )?;
         self.ready_evidence = prepared.ready_evidence;
         Ok((self, prepared.outcome))
     }
@@ -190,7 +208,7 @@ impl RocksDbCanonicalStore {
     /// Returns the exact source fence authenticated by the READY control record.
     #[must_use]
     pub fn event_fence(&self) -> CanonicalEventFence {
-        event_fence_from_ready(self.ready_evidence)
+        event_fence_from_ready(&self.ready_evidence)
     }
 
     /// Reads the authenticated fence, settled tip, and exact visible-tip tree checkpoint.
@@ -251,20 +269,26 @@ impl PreparedLiveAppendCommit {
             ));
         }
         validate_live_block(store.workload, &append.block)?;
-        let visible_tip = validate_live_block_extension(store.ready_evidence, &append.block)?;
+        let visible_tip = validate_live_block_extension(&store.ready_evidence, &append.block)?;
         validate_live_checkpoint_transition(&anchor, &append.block, network_upgrade_activations)?;
         let tip_metadata = append.block.tip_metadata;
         let previous_epoch_id = store.ready_evidence.visible_epoch;
-        validate_live_settled_tip(
-            &store.bounded_open.db,
-            store.ready_evidence,
-            anchor.settled_tip(),
-            append.settled_tip,
+        let settlement = LiveSettlementTransition {
+            reorg_policy: store.reorg_policy(),
+            previous_settled_tip: anchor.settled_tip(),
+            settled_tip: append.settled_tip,
             visible_tip,
+        };
+        validate_live_settled_tip(&store.bounded_open.db, &store.ready_evidence, settlement)?;
+        let sequence_checkpoint = advance_settled_sequence_checkpoint(
+            &store.bounded_open.db,
+            &store.ready_evidence,
+            settlement,
+            &append.block,
         )?;
-        let (chain_epoch_id, chain_event_sequence) = next_live_fence(store.ready_evidence)?;
+        let (chain_epoch_id, chain_event_sequence) = next_live_fence(&store.ready_evidence)?;
         let (visible_block_count, visible_sequence_digest, visible_logical_fact_bytes) =
-            advance_visible_sequence(store.ready_evidence, &append.block)?;
+            advance_visible_sequence(&store.ready_evidence, &append.block)?;
         let ready_evidence = CanonicalStoreReadyEvidence {
             visible_tip,
             visible_epoch: chain_epoch_id,
@@ -272,13 +296,14 @@ impl PreparedLiveAppendCommit {
             visible_block_count,
             visible_sequence_digest,
             visible_logical_fact_bytes,
+            sequence_checkpoint,
             ..store.ready_evidence
         };
         let encoded_control = encode_ready_store_control(
             store.workload,
             &store.build_plan,
             store.cursor_auth_key,
-            ready_evidence,
+            &ready_evidence,
         )
         .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
         Ok(Self {
@@ -295,15 +320,14 @@ impl PreparedLiveAppendCommit {
             )
             .to_vec(),
             encoded_event: encode_live_append_event(
-                chain_epoch_id,
                 previous_epoch_id,
-                visible_tip.height,
+                event_fence_from_ready(&ready_evidence),
             )
             .to_vec(),
             encoded_control,
             ready_evidence,
             previous_epoch_id,
-            outcome: event_fence_from_ready(ready_evidence),
+            outcome: event_fence_from_ready(&ready_evidence),
         })
     }
 }
@@ -394,7 +418,9 @@ fn compact_commitment_bytes(
     })
 }
 
-fn event_fence_from_ready(ready_evidence: CanonicalStoreReadyEvidence) -> CanonicalEventFence {
+pub(super) fn event_fence_from_ready(
+    ready_evidence: &CanonicalStoreReadyEvidence,
+) -> CanonicalEventFence {
     CanonicalEventFence {
         chain_epoch_id: ready_evidence.visible_epoch,
         chain_event_sequence: ready_evidence.visible_event_sequence,
@@ -408,7 +434,7 @@ fn event_fence_from_ready(ready_evidence: CanonicalStoreReadyEvidence) -> Canoni
 }
 
 fn advance_visible_sequence(
-    ready_evidence: CanonicalStoreReadyEvidence,
+    ready_evidence: &CanonicalStoreReadyEvidence,
     block: &CanonicalBuildBlock,
 ) -> Result<(u64, [u8; 32], u64), CanonicalStoreError> {
     let admitted_prefix = CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
@@ -436,7 +462,7 @@ fn advance_visible_sequence(
 }
 
 fn validate_live_block_extension(
-    ready_evidence: CanonicalStoreReadyEvidence,
+    ready_evidence: &CanonicalStoreReadyEvidence,
     block: &CanonicalBuildBlock,
 ) -> Result<BlockId, CanonicalStoreError> {
     let previous_tip = ready_evidence.visible_tip;
@@ -455,8 +481,8 @@ fn validate_live_block_extension(
     Ok(BlockId::new(block_header.height, block_header.block_hash))
 }
 
-fn next_live_fence(
-    ready_evidence: CanonicalStoreReadyEvidence,
+pub(super) fn next_live_fence(
+    ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<(ChainEpochId, u64), CanonicalStoreError> {
     let chain_epoch_id = ready_evidence
         .visible_epoch
@@ -478,14 +504,52 @@ fn next_live_fence(
 
 fn validate_live_settled_tip(
     db: &DB,
-    mut ready_evidence: CanonicalStoreReadyEvidence,
-    previous_settled_tip: BlockId,
-    settled_tip: BlockId,
-    visible_tip: BlockId,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+    transition: LiveSettlementTransition,
 ) -> Result<(), CanonicalStoreError> {
+    let LiveSettlementTransition {
+        reorg_policy,
+        previous_settled_tip,
+        settled_tip,
+        visible_tip,
+    } = transition;
+    if ready_evidence.sequence_checkpoint.through() != previous_settled_tip {
+        return Err(CanonicalStoreError::live_commit(
+            "admitted sequence checkpoint does not match the previous settled tip",
+        ));
+    }
     if settled_tip.height < previous_settled_tip.height || settled_tip.height > visible_tip.height {
         return Err(CanonicalStoreError::live_commit(
             "settled tip must advance monotonically within visible history",
+        ));
+    }
+    let settled_lag = visible_tip
+        .height
+        .value()
+        .checked_sub(settled_tip.height.value())
+        .ok_or_else(|| CanonicalStoreError::live_commit("settled tip exceeds visible tip"))?;
+    if settled_lag > reorg_policy.reorg_window_blocks() {
+        return Err(CanonicalStoreError::live_commit(format!(
+            "visible tip exceeds its {}-block settlement window",
+            reorg_policy.reorg_window_blocks()
+        )));
+    }
+    let settlement_advance = settled_tip
+        .height
+        .value()
+        .checked_sub(previous_settled_tip.height.value())
+        .ok_or_else(|| CanonicalStoreError::live_commit("settled tip regressed"))?;
+    if settlement_advance > reorg_policy.reorg_window_blocks() {
+        return Err(CanonicalStoreError::live_commit(format!(
+            "settlement advance requires replaying {settlement_advance} blocks; maximum is {}",
+            reorg_policy.reorg_window_blocks()
+        )));
+    }
+    if settled_tip.height == previous_settled_tip.height
+        && settled_tip.hash != previous_settled_tip.hash
+    {
+        return Err(CanonicalStoreError::live_commit(
+            "unchanged settled height must retain its canonical hash",
         ));
     }
     if settled_tip.height == visible_tip.height {
@@ -496,16 +560,82 @@ fn validate_live_settled_tip(
         }
         return Ok(());
     }
-    ready_evidence.visible_tip = visible_tip;
-    validate_settled_tip(db, ready_evidence, settled_tip)
+    let mut visible_ready_evidence = *ready_evidence;
+    visible_ready_evidence.visible_tip = visible_tip;
+    validate_settled_tip(db, &visible_ready_evidence, settled_tip)
 }
 
-struct PreparedLiveBlockRows {
-    rows: Vec<PreparedLiveRow>,
+#[derive(Clone, Copy)]
+struct LiveSettlementTransition {
+    reorg_policy: super::CanonicalReorgPolicy,
+    previous_settled_tip: BlockId,
+    settled_tip: BlockId,
+    visible_tip: BlockId,
+}
+
+fn advance_settled_sequence_checkpoint(
+    db: &DB,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+    transition: LiveSettlementTransition,
+    block: &CanonicalBuildBlock,
+) -> Result<CanonicalSequenceCheckpoint, CanonicalStoreError> {
+    let LiveSettlementTransition {
+        reorg_policy,
+        settled_tip,
+        visible_tip,
+        ..
+    } = transition;
+    let previous = ready_evidence.sequence_checkpoint;
+    if settled_tip == previous.through() {
+        return Ok(previous);
+    }
+    let persisted_through = settled_tip.height.min(ready_evidence.visible_tip.height);
+    let mut checkpoint = resume_persisted_sequence_checkpoint(
+        db,
+        previous,
+        persisted_through,
+        reorg_policy.reorg_window_blocks(),
+    )?;
+    if settled_tip.height == visible_tip.height {
+        let mut digest_builder = CanonicalBlockFactsSequenceDigestBuilder::resume_from_prefix(
+            checkpoint.sequence_digest(),
+        );
+        digest_builder
+            .try_append(block.facts.digest(CanonicalBlockFactsDigestVersion::V1))
+            .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
+        let retained_block_count = checkpoint
+            .retained_block_count()
+            .checked_add(1)
+            .ok_or_else(|| CanonicalStoreError::live_commit("checkpoint count exceeds u64::MAX"))?;
+        let replay_bytes = u64::try_from(block.replay_envelope.as_bytes().len())
+            .map_err(|_| CanonicalStoreError::live_commit("live replay bytes exceed u64::MAX"))?;
+        let logical_replay_bytes = checkpoint
+            .logical_replay_bytes()
+            .checked_add(replay_bytes)
+            .ok_or_else(|| {
+                CanonicalStoreError::live_commit("checkpoint replay bytes exceed u64::MAX")
+            })?;
+        checkpoint = CanonicalSequenceCheckpoint::from_admitted_parts(
+            visible_tip,
+            retained_block_count,
+            digest_builder.finish(),
+            logical_replay_bytes,
+        );
+    }
+    if checkpoint.through() != settled_tip {
+        return Err(CanonicalStoreError::live_commit(
+            "settled sequence checkpoint does not end at the requested settled tip",
+        ));
+    }
+    Ok(checkpoint)
+}
+
+pub(super) struct PreparedLiveBlockRows {
+    pub(super) rows: Vec<PreparedLiveRow>,
 }
 
 impl PreparedLiveBlockRows {
-    fn from_block(
+    pub(super) fn from_block(
         block: CanonicalBuildBlock,
         previous_tip_metadata: zinder_core::ChainTipMetadata,
         subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
@@ -578,7 +708,11 @@ impl PreparedLiveBlockRows {
         Ok(Self { rows })
     }
 
-    fn put_into(&self, db: &DB, batch: &mut WriteBatch) -> Result<(), CanonicalStoreError> {
+    pub(super) fn put_into(
+        &self,
+        db: &DB,
+        batch: &mut WriteBatch,
+    ) -> Result<(), CanonicalStoreError> {
         for row in &self.rows {
             batch.put_cf(
                 &column_family(db, row.family)?,
@@ -589,7 +723,7 @@ impl PreparedLiveBlockRows {
         Ok(())
     }
 
-    fn validate_readback(&self, db: &DB) -> Result<(), CanonicalStoreError> {
+    pub(super) fn validate_readback(&self, db: &DB) -> Result<(), CanonicalStoreError> {
         for row in &self.rows {
             let observed = db
                 .get_cf(&column_family(db, row.family)?, &row.key)
@@ -714,10 +848,10 @@ impl PreparedLiveSubtreeRoots {
     }
 }
 
-struct PreparedLiveRow {
-    family: &'static str,
-    key: Vec<u8>,
-    encoded_value: Vec<u8>,
+pub(super) struct PreparedLiveRow {
+    pub(super) family: &'static str,
+    pub(super) key: Vec<u8>,
+    pub(super) encoded_value: Vec<u8>,
 }
 
 impl PreparedLiveRow {
@@ -736,6 +870,7 @@ impl PreparedLiveRow {
 
 fn validate_live_commit_readback(
     db: &DB,
+    build_plan: &super::CanonicalStoreBuildPlan,
     prepared: &PreparedLiveAppendCommit,
 ) -> Result<(), CanonicalStoreError> {
     prepared.block_rows.validate_readback(db)?;
@@ -771,7 +906,8 @@ fn validate_live_commit_readback(
             "epoch, event, or READY control differs after atomic live write",
         ));
     }
-    validate_live_append_publication(db, prepared.ready_evidence, prepared.previous_epoch_id)
+    validate_live_append_publication(db, &prepared.ready_evidence, prepared.previous_epoch_id)?;
+    validate_ready_sequence_checkpoint(db, build_plan, &prepared.ready_evidence)
 }
 
 #[cfg(test)]

@@ -165,6 +165,31 @@ async fn replay_reports_source_admission_and_delay_settings() -> Result<()> {
 }
 
 #[tokio::test]
+async fn replay_resolves_pipeline_watermarks_from_the_resource_envelope() -> Result<()> {
+    let fixture_directory = write_regtest_fixture()?;
+    let store_directory = tempdir()?;
+    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    config.cpu_limit_cores = Some(10.0);
+    config.memory_limit_bytes = Some(10 * 1024 * 1024 * 1024);
+    config.max_response_bytes = NonZeroU64::new(64 * 1024 * 1024);
+    config.source_fetch_max_in_flight_bytes = None;
+    config.block_prepare_memory_watermark_bytes = None;
+
+    let report = replay_fixture(config, None).await?;
+
+    assert_eq!(
+        report.replay.source_fetch_max_in_flight_bytes,
+        160 * 1024 * 1024
+    );
+    assert_eq!(
+        report.replay.block_prepare_memory_watermark_bytes,
+        160 * 1024 * 1024
+    );
+    assert_eq!(report.replay.block_prepare_concurrency, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn replay_rejects_source_segment_target_above_response_limit() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
     let store_directory = tempdir()?;
@@ -192,14 +217,12 @@ fn write_starting_checkpoint_manifest(
 ) -> Result<()> {
     std::fs::create_dir_all(store_path)?;
     let manifest = serde_json::json!({
-        "format_version": 2,
+        "format_version": 1,
         "network": "zcash-regtest",
-        "projection_preset": "wallet",
         "canonical_position": canonical_position,
-        "projections": []
     });
     std::fs::write(
-        store_path.join("zinder-backup-manifest.json"),
+        store_path.join("zinder-benchmark-starting-store.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
     Ok(())

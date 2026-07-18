@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Machine-readable report schema version.
-pub const REPORT_FORMAT_VERSION: u32 = 1;
+pub const REPORT_FORMAT_VERSION: u32 = 2;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 /// CPU envelope used to derive canonical fixture replay defaults.
@@ -97,6 +97,18 @@ const CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_COUNT: &str =
     "zinder_ingest_canonical_block_construction_stage_duration_seconds_count";
 const CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM: &str =
     "zinder_ingest_canonical_block_construction_stage_duration_seconds_sum";
+const CANONICAL_HISTORICAL_PREVOUT_READS_TOTAL: &str =
+    "zinder_ingest_canonical_historical_prevout_reads_total";
+const CANONICAL_CROSS_BLOCK_WALLET_READS_TOTAL: &str =
+    "zinder_ingest_canonical_cross_block_wallet_reads_total";
+const CANONICAL_PUBLICATION_FAMILY_SCAN_DURATION_COUNT: &str =
+    "zinder_store_canonical_publication_family_scan_duration_seconds_count";
+const CANONICAL_PUBLICATION_FAMILY_SCAN_DURATION_SUM: &str =
+    "zinder_store_canonical_publication_family_scan_duration_seconds_sum";
+const CANONICAL_PUBLICATION_FAMILY_SCAN_ROWS_TOTAL: &str =
+    "zinder_store_canonical_publication_family_scan_rows_total";
+const CANONICAL_PUBLICATION_FAMILY_SCAN_LOGICAL_BYTES_TOTAL: &str =
+    "zinder_store_canonical_publication_family_scan_logical_bytes_total";
 
 /// Fixture identity echoed into the report.
 #[derive(Clone, Debug, Serialize)]
@@ -582,6 +594,30 @@ pub struct StageDurationStat {
     pub call_count: u64,
     /// Cumulative histogram seconds across the invocations.
     pub task_seconds: f64,
+}
+
+/// Required proof that canonical construction did not cross a prohibited read boundary.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct CanonicalProhibitedReadSummary {
+    /// Historical canonical prevout reads; fact-first construction requires zero.
+    pub historical_prevout_read_count: u64,
+    /// Cross-block wallet-state reads; fact-first construction requires zero.
+    pub cross_block_wallet_read_count: u64,
+}
+
+/// Aggregated cache-bypassing publication scan evidence for one canonical family.
+#[derive(Clone, Debug, Serialize)]
+pub struct CanonicalPublicationFamilyScanStat {
+    /// Canonical column family scanned.
+    pub family: String,
+    /// Number of complete successful scans.
+    pub scan_count: u64,
+    /// Cumulative wall-clock seconds spent scanning the family.
+    pub scan_seconds: f64,
+    /// Cumulative rows observed across the scans.
+    pub row_count: u64,
+    /// Cumulative logical key-and-value bytes observed across the scans.
+    pub logical_bytes: u64,
 }
 
 /// One exported `RocksDB` statistics ticker.
@@ -1117,6 +1153,8 @@ pub struct RocksDbCanonicalFixtureReplayMeasurements {
     pub replay_plan_digest_sha256: String,
     /// Exact effective resource limits.
     pub resource_limits: RocksDbCanonicalFixtureReplayResourceLimits,
+    /// Publication-proof producer used by the fresh canonical build.
+    pub publication_proof_provenance: &'static str,
     /// Complete measured lifecycle seconds.
     pub total_seconds: f64,
     /// Block/SST/count evidence from the real canonical loader.
@@ -1152,6 +1190,8 @@ pub struct RocksDbCanonicalFixtureReplayReport {
     pub storage_candidate: StorageCandidateIdentity,
     /// Exact effective resource limits.
     pub resource_limits: RocksDbCanonicalFixtureReplayResourceLimits,
+    /// Publication-proof producer used by the fresh canonical build.
+    pub publication_proof_provenance: String,
     /// Complete measured lifecycle seconds.
     pub total_seconds: f64,
     /// End-to-end loaded blocks per second.
@@ -1164,6 +1204,10 @@ pub struct RocksDbCanonicalFixtureReplayReport {
     pub physical_store_bytes: u64,
     /// Source request, response, and adaptive-prefetch attribution.
     pub source_fetch_attribution: Option<SourceFetchAttributionSummary>,
+    /// Required zero-read evidence for the fact-first construction boundary.
+    pub prohibited_reads: Option<CanonicalProhibitedReadSummary>,
+    /// Full publication scans grouped by canonical family; empty for trusted fresh-writer proof.
+    pub publication_family_scans: Vec<CanonicalPublicationFamilyScanStat>,
     /// Per-stage bulk-pipeline head-of-line wait totals.
     pub head_of_line_wait: Vec<StageWaitStat>,
     /// Per-substage block preparation and canonical construction timing.
@@ -1775,8 +1819,58 @@ impl RocksDbCanonicalFixtureReplayReport {
         validate_canonical_fixture_source_attribution(
             self.source_load.block_count,
             self.source_fetch_attribution,
+        )?;
+        validate_canonical_fixture_prohibited_reads(self.prohibited_reads)?;
+        validate_canonical_fixture_publication_family_scans(
+            &self.publication_proof_provenance,
+            &self.publication_family_scans,
         )
     }
+}
+
+fn validate_canonical_fixture_prohibited_reads(
+    prohibited_reads: Option<CanonicalProhibitedReadSummary>,
+) -> Result<(), BenchError> {
+    let prohibited_reads = prohibited_reads
+        .ok_or_else(|| BenchError::acceptance_telemetry_missing("prohibited_reads"))?;
+    if prohibited_reads.historical_prevout_read_count != 0
+        || prohibited_reads.cross_block_wallet_read_count != 0
+    {
+        return Err(BenchError::acceptance_completion_mismatch(
+            "canonical fixture replay crossed a prohibited read boundary",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_fixture_publication_family_scans(
+    proof_provenance: &str,
+    scans: &[CanonicalPublicationFamilyScanStat],
+) -> Result<(), BenchError> {
+    if proof_provenance == "trusted-fresh-writer" {
+        if scans.is_empty() {
+            return Ok(());
+        }
+        return Err(BenchError::acceptance_completion_mismatch(
+            "trusted fresh-writer publication unexpectedly performed full family scans",
+        ));
+    }
+    if proof_provenance != "cold-certification" || scans.is_empty() {
+        return Err(BenchError::acceptance_completion_mismatch(
+            "canonical fixture replay publication proof provenance is invalid",
+        ));
+    }
+    if scans.iter().any(|scan| {
+        scan.family.is_empty()
+            || scan.scan_count == 0
+            || !scan.scan_seconds.is_finite()
+            || scan.scan_seconds < 0.0
+    }) {
+        return Err(BenchError::acceptance_completion_mismatch(
+            "canonical fixture replay publication-family scan attribution is invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_canonical_fixture_report_identity_and_resources(
@@ -1943,8 +2037,7 @@ impl RocksDbStorageLifecycleReport {
         if self.contracts.canonical_store_identity != zinder_store::CANONICAL_STORE_IDENTITY
             || self.contracts.canonical_store_schema_version
                 != zinder_store::CANONICAL_STORE_SCHEMA_VERSION
-            || self.contracts.canonical_store_schema_version != 1
-            || self.contracts.wallet_store_identity != "wallet-projection"
+            || self.contracts.wallet_store_identity != "wallet"
             || self.contracts.wallet_store_schema_version
                 != zinder_wallet_rocksdb::WALLET_ROCKSDB_SCHEMA_VERSION
             || self.contracts.wallet_store_schema_version != 1
@@ -1953,10 +2046,10 @@ impl RocksDbStorageLifecycleReport {
             || self.contracts.wallet_projection_schema_version != 1
             || self.contracts.wallet_value_encoding_version
                 != zinder_wallet_projection::WALLET_PROJECTION_VALUE_ENCODING_VERSION
-            || self.contracts.wallet_value_encoding_version != 1
+            || self.contracts.wallet_value_encoding_version != 2
         {
             return Err(BenchError::report_format(
-                "storage lifecycle report does not carry the current fixed version-1 contracts",
+                "storage lifecycle report does not carry the current fixed fact-first contracts",
             ));
         }
         if canonical.scope != "canonical-storage-ready"
@@ -2193,6 +2286,7 @@ pub fn build_rocksdb_canonical_fixture_replay_report(
         replay_plan_digest_sha256: measurements.replay_plan_digest_sha256,
         storage_candidate: StorageCandidateIdentity::rocksdb_canonical_fixture_replay(),
         resource_limits: measurements.resource_limits,
+        publication_proof_provenance: measurements.publication_proof_provenance.to_owned(),
         total_seconds: measurements.total_seconds,
         blocks_per_second,
         source_load: measurements.source_load,
@@ -2202,6 +2296,8 @@ pub fn build_rocksdb_canonical_fixture_replay_report(
             &samples,
             measurements.total_seconds,
         ),
+        prohibited_reads: aggregate_canonical_prohibited_reads(&samples),
+        publication_family_scans: aggregate_canonical_publication_family_scans(&samples),
         head_of_line_wait: aggregate_head_of_line_wait(&samples),
         stage_durations: aggregate_stage_durations(&samples),
         benchmark_client_peak_rss: measurements.benchmark_client_peak_rss,
@@ -2807,6 +2903,74 @@ fn aggregate_stage_durations(samples: &[MetricSample]) -> Vec<StageDurationStat>
         .collect()
 }
 
+fn aggregate_canonical_prohibited_reads(
+    samples: &[MetricSample],
+) -> Option<CanonicalProhibitedReadSummary> {
+    let historical_present = samples
+        .iter()
+        .any(|sample| sample.name == CANONICAL_HISTORICAL_PREVOUT_READS_TOTAL);
+    let cross_block_present = samples
+        .iter()
+        .any(|sample| sample.name == CANONICAL_CROSS_BLOCK_WALLET_READS_TOTAL);
+    if !historical_present || !cross_block_present {
+        return None;
+    }
+    Some(CanonicalProhibitedReadSummary {
+        historical_prevout_read_count: round_to_u64(sum_by_name(
+            samples,
+            CANONICAL_HISTORICAL_PREVOUT_READS_TOTAL,
+        )),
+        cross_block_wallet_read_count: round_to_u64(sum_by_name(
+            samples,
+            CANONICAL_CROSS_BLOCK_WALLET_READS_TOTAL,
+        )),
+    })
+}
+
+fn aggregate_canonical_publication_family_scans(
+    samples: &[MetricSample],
+) -> Vec<CanonicalPublicationFamilyScanStat> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut seconds: BTreeMap<String, f64> = BTreeMap::new();
+    let mut rows: BTreeMap<String, u64> = BTreeMap::new();
+    let mut logical_bytes: BTreeMap<String, u64> = BTreeMap::new();
+    for sample in samples {
+        let target = if sample.name == CANONICAL_PUBLICATION_FAMILY_SCAN_DURATION_COUNT {
+            Some(0_u8)
+        } else if sample.name == CANONICAL_PUBLICATION_FAMILY_SCAN_DURATION_SUM {
+            Some(1)
+        } else if sample.name == CANONICAL_PUBLICATION_FAMILY_SCAN_ROWS_TOTAL {
+            Some(2)
+        } else if sample.name == CANONICAL_PUBLICATION_FAMILY_SCAN_LOGICAL_BYTES_TOTAL {
+            Some(3)
+        } else {
+            None
+        };
+        let (Some(target), Some(family)) = (target, sample.label("family")) else {
+            continue;
+        };
+        match target {
+            0 => *counts.entry(family.to_owned()).or_insert(0) += round_to_u64(sample.reading),
+            1 => *seconds.entry(family.to_owned()).or_insert(0.0) += sample.reading,
+            2 => *rows.entry(family.to_owned()).or_insert(0) += round_to_u64(sample.reading),
+            _ => {
+                *logical_bytes.entry(family.to_owned()).or_insert(0) +=
+                    round_to_u64(sample.reading);
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(family, scan_count)| CanonicalPublicationFamilyScanStat {
+            scan_seconds: seconds.get(&family).copied().unwrap_or(0.0),
+            row_count: rows.get(&family).copied().unwrap_or(0),
+            logical_bytes: logical_bytes.get(&family).copied().unwrap_or(0),
+            family,
+            scan_count,
+        })
+        .collect()
+}
+
 fn aggregate_tickers(samples: &[MetricSample]) -> Vec<TickerStat> {
     let mut tickers: BTreeMap<(String, String), f64> = BTreeMap::new();
     for sample in samples {
@@ -2857,12 +3021,13 @@ mod tests {
     use super::{
         AcceptanceThresholds, CanonicalBlockFactsRoundTripMeasurements,
         CanonicalBlockFactsStorageEvidence, CanonicalFactSequenceDigestSummary,
-        CurrentSchemaFixtureReplayMeasurements, CurrentSchemaReplayWriterSettings,
-        FixtureCachePolicy, FixtureSummary, RocksDbCanonicalFixtureEventFenceSummary,
-        RocksDbCanonicalFixtureReadySummary, RocksDbCanonicalFixtureReplayMeasurements,
-        RocksDbCanonicalFixtureReplayResourceLimits, RocksDbCanonicalFixtureSourceLoadSummary,
-        RocksDbResourceBudgetSummary, StartingCanonicalState, StartingCanonicalStateKind,
-        StorageCandidateIdentity, StorageLifecycleBlockId, aggregate_stage_durations,
+        CanonicalPublicationFamilyScanStat, CurrentSchemaFixtureReplayMeasurements,
+        CurrentSchemaReplayWriterSettings, FixtureCachePolicy, FixtureSummary,
+        RocksDbCanonicalFixtureEventFenceSummary, RocksDbCanonicalFixtureReadySummary,
+        RocksDbCanonicalFixtureReplayMeasurements, RocksDbCanonicalFixtureReplayResourceLimits,
+        RocksDbCanonicalFixtureSourceLoadSummary, RocksDbResourceBudgetSummary,
+        StartingCanonicalState, StartingCanonicalStateKind, StorageCandidateIdentity,
+        StorageLifecycleBlockId, aggregate_stage_durations,
         build_canonical_block_facts_round_trip_report, build_current_schema_fixture_replay_report,
         build_rocksdb_canonical_fixture_replay_report, is_valid_benchmark_trial_id,
         parse_prometheus_samples,
@@ -2892,7 +3057,7 @@ mod tests {
         let report =
             build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
 
-        assert_eq!(report.report_format_version, 1);
+        assert_eq!(report.report_format_version, 2);
         assert_eq!(report.contract_identity, super::REPORT_CONTRACT_IDENTITY);
         assert_provenance_and_writer(&report);
         assert_eq!(report.provenance.run.trial_id.as_deref(), Some("trial-01"));
@@ -3105,8 +3270,78 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
         assert_eq!(source.retained_completed_response_bytes, 110_000_000);
         assert_eq!(source.source_watermark_blocked_count, 8);
         assert!((source.source_watermark_blocks_per_second - 0.8).abs() < f64::EPSILON);
+        let prohibited = inner
+            .prohibited_reads
+            .ok_or("prohibited read telemetry must be present")?;
+        assert_eq!(prohibited.historical_prevout_read_count, 0);
+        assert_eq!(prohibited.cross_block_wallet_read_count, 0);
+        assert_eq!(inner.publication_proof_provenance, "trusted-fresh-writer");
+        assert!(inner.publication_family_scans.is_empty());
         assert_eq!(inner.head_of_line_wait.len(), 1);
         assert_eq!(inner.stage_durations.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_canonical_fixture_report_requires_zero_prohibited_reads_and_exact_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let missing = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(
+                "zinder_ingest_source_request_total{operation=\"fetch_chain_segment\",status=\"ok\",error_class=\"none\"} 1\n\
+zinder_ingest_source_segment_connected_blocks_total 10\n\
+zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
+            ),
+        );
+        assert!(missing.validate().is_err());
+
+        let mut nonzero = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut nonzero else {
+            return Err("expected canonical fixture replay report".into());
+        };
+        inner
+            .prohibited_reads
+            .as_mut()
+            .ok_or("prohibited read telemetry must be present")?
+            .historical_prevout_read_count = 1;
+        assert!(nonzero.validate().is_err());
+
+        let mut unexpected_scan = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut unexpected_scan
+        else {
+            return Err("expected canonical fixture replay report".into());
+        };
+        inner
+            .publication_family_scans
+            .push(CanonicalPublicationFamilyScanStat {
+                family: "block_replay".to_owned(),
+                scan_count: 1,
+                scan_seconds: 0.1,
+                row_count: 10,
+                logical_bytes: 5_000,
+            });
+        assert!(unexpected_scan.validate().is_err());
+
+        let mut unknown_provenance = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut unknown_provenance
+        else {
+            return Err("expected canonical fixture replay report".into());
+        };
+        inner.publication_proof_provenance = "unknown".to_owned();
+        assert!(unknown_provenance.validate().is_err());
         Ok(())
     }
 
@@ -3445,6 +3680,7 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
                     zinder_store::RocksDbResourceBudget::canonical_writer_defaults(),
                 ),
             },
+            publication_proof_provenance: "trusted-fresh-writer",
             total_seconds: 10.0,
             source_load: RocksDbCanonicalFixtureSourceLoadSummary {
                 first_block: first_block.clone(),
@@ -3525,7 +3761,9 @@ zinder_ingest_bulk_pipeline_watermark_blocked_total{stage=\"source_fetch\"} 8\n\
 zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_count{stage=\"source_fetch\"} 2\n\
 zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum{stage=\"source_fetch\"} 4.5\n\
 zinder_ingest_canonical_block_construction_stage_duration_seconds_count{stage=\"block_parse\",status=\"ok\"} 10\n\
-zinder_ingest_canonical_block_construction_stage_duration_seconds_sum{stage=\"block_parse\",status=\"ok\"} 1.5\n"
+zinder_ingest_canonical_block_construction_stage_duration_seconds_sum{stage=\"block_parse\",status=\"ok\"} 1.5\n\
+zinder_ingest_canonical_historical_prevout_reads_total 0\n\
+zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
     }
 
     fn fixture_summary() -> FixtureSummary {

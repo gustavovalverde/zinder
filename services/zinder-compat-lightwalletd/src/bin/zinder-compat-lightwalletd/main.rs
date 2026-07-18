@@ -9,17 +9,16 @@ use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
-    Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
-    install_tracing_subscriber, spawn_ops_endpoint_for,
+    Readiness, ServiceIdentifier, StartupPhase, TrafficReadinessInterceptor,
+    cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
-use zinder_store::{CanonicalStoreWorkload, RocksDbCanonicalStore};
-use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionSourcePosition};
-use zinder_wallet_rocksdb::RocksDbWalletStore;
 
 mod config;
+mod frozen_pair;
 
 use config::{LightwalletdConfigError, LightwalletdConfigOverrides};
+use frozen_pair::{FrozenPairConfig, FrozenPairManager};
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -34,15 +33,18 @@ struct Cli {
     /// Network name, such as zcash-regtest.
     #[arg(long)]
     network: Option<String>,
-    /// Canonical Zinder store path opened by this compatibility process.
-    #[arg(long = "storage-path")]
-    storage_path: Option<PathBuf>,
-    /// Process-unique `RocksDB` secondary metadata path.
-    #[arg(long = "secondary-path")]
-    secondary_path: Option<PathBuf>,
-    /// Version-1 wallet projection store path opened by this compatibility process.
-    #[arg(long = "wallet-storage-path")]
-    wallet_storage_path: Option<PathBuf>,
+    /// Canonical primary path replicated only through an immutable secondary.
+    #[arg(long = "canonical-primary-path")]
+    canonical_primary_path: Option<PathBuf>,
+    /// Root containing this process's two canonical secondary generations.
+    #[arg(long = "canonical-secondary-root")]
+    canonical_secondary_root: Option<PathBuf>,
+    /// Wallet primary path replicated only through an immutable secondary.
+    #[arg(long = "wallet-primary-path")]
+    wallet_primary_path: Option<PathBuf>,
+    /// Root containing this process's two wallet secondary generations.
+    #[arg(long = "wallet-secondary-root")]
+    wallet_secondary_root: Option<PathBuf>,
     /// Private `zinder-ingest` control gRPC endpoint.
     #[arg(long = "ingest-control-addr")]
     ingest_control_addr: Option<String>,
@@ -53,6 +55,9 @@ struct Cli {
     /// Lightwalletd-compatible gRPC listen address, such as 127.0.0.1:9067.
     #[arg(long = "listen-addr")]
     listen_addr: Option<SocketAddr>,
+    /// Exact canonical replacement-depth identity expected from the writer.
+    #[arg(long = "reorg-window-blocks")]
+    reorg_window_blocks: Option<u32>,
     /// Operational HTTP endpoint listen address for /healthz, /readyz, /metrics.
     #[arg(long = "ops-listen-addr")]
     ops_listen_addr: Option<SocketAddr>,
@@ -166,28 +171,6 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let canonical_store = Arc::new(RocksDbCanonicalStore::open_ready(
-        &lightwalletd_config.storage.path,
-        &network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
-        lightwalletd_config.storage.canonical_rocksdb_budget,
-    )?);
-    let canonical_fence = canonical_store.event_fence();
-    let wallet_source = WalletCanonicalSourceIdentity::new(
-        WalletProjectionSourcePosition::new(
-            canonical_fence.chain_epoch_id(),
-            canonical_fence.visible_tip(),
-            canonical_fence.chain_event_sequence(),
-        ),
-        canonical_fence.sequence_digest(),
-    );
-    let wallet_store = Arc::new(RocksDbWalletStore::open_ready(
-        &lightwalletd_config.wallet_storage_path,
-        lightwalletd_config.network,
-        wallet_source,
-        lightwalletd_config.storage.derive_rocksdb_budget,
-    )?);
-    let visible_height = Some(canonical_fence.visible_tip().height.value());
     readiness.set_projection_workload(
         "wallet",
         vec![
@@ -195,21 +178,50 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             "transparent-utxo-v1".to_owned(),
         ],
     );
-    readiness.set(ReadinessState::ready(visible_height));
+    let (frozen_pair_manager, read_pairs) = FrozenPairManager::bootstrap(
+        FrozenPairConfig {
+            canonical_primary_path: lightwalletd_config.storage.path.clone(),
+            canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
+            wallet_primary_path: lightwalletd_config.wallet_primary_path.clone(),
+            wallet_secondary_root: lightwalletd_config.wallet_secondary_root.clone(),
+            network: lightwalletd_config.network,
+            network_upgrade_activations: Arc::clone(&network_upgrade_activations),
+            canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
+            canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
+            wallet_resource_budget: lightwalletd_config.storage.derive_rocksdb_budget,
+            catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
+            convergence_timeout: lightwalletd_config.storage.initial_catchup_timeout,
+            convergence_attempts: lightwalletd_config.pair_convergence_attempts,
+            replica_lag_threshold_chain_epochs: lightwalletd_config
+                .storage
+                .secondary_replica_lag_threshold_chain_epochs,
+        },
+        readiness.clone(),
+        &lightwalletd_config.ingest_control_addr,
+        lightwalletd_config.ingest_control_bearer_token.as_ref(),
+    )
+    .await?;
+    let visible_height = Some(
+        read_pairs
+            .load_full()
+            .canonical_fence()
+            .visible_tip()
+            .height
+            .value(),
+    );
     open_storage_phase.complete();
 
-    let mut wallet_query = zinder_query::FactFirstWalletQuery::new(
-        canonical_store,
-        wallet_store,
+    let mut wallet_query = zinder_query::FactFirstWalletQuery::from_read_pair_slot(
+        Arc::clone(&read_pairs),
         broadcaster,
         network_upgrade_activations.clone(),
-    )?;
+    );
     if let Some(tree_state_upstream) = tree_state_upstream {
         wallet_query = wallet_query.with_tree_state_upstream(tree_state_upstream);
     }
-    let fact_first_wallet_readiness = wallet_query.wallet_readiness();
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
+    let frozen_pair_handle = frozen_pair_manager.spawn(cancel.clone());
     let mempool_surface = Arc::new({
         let mut surface =
             IngestControlMempoolSurface::new(lightwalletd_config.ingest_control_addr.clone());
@@ -224,7 +236,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         cancel.clone(),
     );
     let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
-        .with_fact_first_wallet_readiness(fact_first_wallet_readiness)
+        .with_fact_first_read_pair_slot(read_pairs)
         .with_transparent_address_support()
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);
@@ -248,11 +260,26 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
 
+    let traffic_readiness = TrafficReadinessInterceptor::new(readiness.clone());
+    let reflection_readiness = TrafficReadinessInterceptor::new(readiness.clone());
+    let grpc_service = tonic::service::interceptor::InterceptedService::new(
+        grpc_adapter.into_server(),
+        traffic_readiness,
+    );
+    let reflection_service = tonic::service::interceptor::InterceptedService::new(
+        reflection_service,
+        reflection_readiness,
+    );
     let server_result = tonic::transport::Server::builder()
-        .add_service(grpc_adapter.into_server())
+        .add_service(grpc_service)
         .add_service(reflection_service)
-        .serve_with_shutdown(lightwalletd_config.listen_addr, cancel.cancelled_owned())
+        .serve_with_shutdown(
+            lightwalletd_config.listen_addr,
+            cancel.clone().cancelled_owned(),
+        )
         .await;
+
+    cancel.cancel();
 
     tracing::info!(
         target: "zinder::compat_lightwalletd",
@@ -280,6 +307,22 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             event = "tip_change_publisher_join_failed",
             error = %join_error,
             "tip-change publisher task did not exit cleanly",
+        ),
+    }
+
+    match frozen_pair_handle.await {
+        Ok(()) => {}
+        Err(join_error) if join_error.is_panic() => tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "frozen_pair_manager_panic",
+            error = %join_error,
+            "frozen pair manager task panicked"
+        ),
+        Err(join_error) => tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "frozen_pair_manager_join_failed",
+            error = %join_error,
+            "frozen pair manager task did not exit cleanly"
         ),
     }
 
@@ -333,14 +376,16 @@ impl From<Cli> for LightwalletdConfigOverrides {
     fn from(cli: Cli) -> Self {
         Self {
             network: cli.network,
-            storage_path: cli.storage_path,
-            secondary_path: cli.secondary_path,
-            wallet_storage_path: cli.wallet_storage_path,
+            canonical_primary_path: cli.canonical_primary_path,
+            canonical_secondary_root: cli.canonical_secondary_root,
+            wallet_primary_path: cli.wallet_primary_path,
+            wallet_secondary_root: cli.wallet_secondary_root,
             ingest_control_addr: cli.ingest_control_addr,
             ingest_control_bearer_token_path: cli.ingest_control_token_path,
             listen_addr: cli.listen_addr,
             ops_listen_addr: cli.ops_listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
+            reorg_window_blocks: cli.reorg_window_blocks,
         }
     }
 }

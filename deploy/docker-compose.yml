@@ -1,66 +1,43 @@
-# Reference Compose topology pairing zinder-ingest (writer), zinder-query
-# (wallet-facing reader), and zinder-explorer (explorer-facing reader)
-# against a single canonical volume.
+# Fact-first single-host wallet-serving topology.
 #
-# This composes per-service runtime targets from deploy/Dockerfile rather than
-# the single-container s6-overlay target. Both shapes are supported; use the
-# single-container image when you want one process tree, this Compose file when
-# you want separate containers with separate restart policies.
-
-# Per-network project name so the stack sits visually adjacent to its
-# Z3 binding in `docker compose ls` (zinder-testnet next to z3-testnet,
-# zinder-mainnet next to z3-mainnet). Without this, Compose defaults the
-# project name to the directory name (`deploy`), which is non-discoverable
-# and prone to collide across repos.
+# The three release runtimes share one host filesystem. zinder-ingest is the
+# only canonical writer, zinder-projector is the only wallet writer, and
+# zinder-compat-lightwalletd serves immutable canonical/wallet secondary pairs.
+# Projector and compat share ingest's network namespace so the authenticated
+# control plane remains loopback-only.
 name: zinder-${Z3_NETWORK_LOWER:-mainnet}
-#
-# Zcash upstream dependency
-# -------------------------
-# Zinder reads chain data from a Zebra full node. This compose attaches to
-# a running Z3 stack via Z3's published platform contract:
-# https://github.com/ZcashFoundation/z3 (docs/contract.md). Bring up Z3
-# first; then bring up zinder.
-#
-# Multi-network coexistence
-# -------------------------
-# Two zinder stacks (mainnet + testnet) can run side-by-side on one host.
-# Every container name, volume name, and internal network is scoped by the
-# project name (`zinder-${Z3_NETWORK_LOWER}`), and host ports are picked
-# from the env file: mainnet keeps the canonical ports (9100/9101/9068/
-# 9069/9105/9106/9095/3002); testnet receives a +10000 offset; regtest a
-# +20000 offset. See deploy/.env.testnet for the offset rationale.
-#
-# Use the per-network env helpers (recommended):
-#
-#   docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
-#   docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
-#
-# Each helper sets Z3_NETWORK_LOWER (picks the z3-<network> external network
-# and z3-<network>-cookie volume), ZINDER_NETWORK__NAME, the Zebra JSON-RPC
-# + indexer ports, and the per-network host-port offsets. The defaults below
-# match mainnet so omitting --env-file deploys the mainnet flavour.
-#
-# Reproducible canary or validation runs may pin ZINDER_INGEST_IMAGE,
-# ZINDER_QUERY_IMAGE, and ZINDER_EXPLORER_IMAGE to immutable current-branch
-# tags. They may also isolate state with ZINDER_SINGLE_HOST_DATA_VOLUME_NAME,
-# ZINDER_PROMETHEUS_VOLUME_NAME, ZINDER_GRAFANA_VOLUME_NAME, and
-# ZINDER_OBSERVABILITY_NETWORK_NAME. Normal deployments omit these overrides
-# and retain the stable per-network names below.
 
 networks:
   z3:
     external: true
     name: z3-${Z3_NETWORK_LOWER:-mainnet}
   observability:
-    # Override for isolated validation, canary, or side-by-side deployments.
-    # The default remains the stable per-network production name.
     name: ${ZINDER_OBSERVABILITY_NETWORK_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-observability}
 
 services:
-  # Unified ingest loop per ADR-0015. The single process classifies
-  # the gap to the upstream tip on every iteration and dispatches to
-  # AwaitingUpstream / BulkCatchup / FollowingTip; bulk catch-up is no
-  # longer a separate Compose service.
+  state-init:
+    image: debian:bookworm-slim
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    command:
+      [
+        "sh",
+        "-c",
+        "chown -R 1000:1000 /var/lib/zinder /var/lib/zinder/checkpoints",
+      ]
+    volumes:
+      - type: volume
+        source: data
+        target: /var/lib/zinder
+        volume:
+          nocopy: true
+      - type: volume
+        source: checkpoint-staging
+        target: /var/lib/zinder/checkpoints
+        volume:
+          nocopy: true
+
   zinder-ingest:
     image: ${ZINDER_INGEST_IMAGE:-zinder-ingest:latest}
     mem_limit: ${ZINDER_INGEST_MEMORY_LIMIT:-14g}
@@ -69,115 +46,107 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-ingest
     restart: on-failure
+    depends_on:
+      state-init:
+        condition: service_completed_successfully
     networks: [z3, observability]
     volumes:
       - data:/var/lib/zinder
+      - checkpoint-staging:/var/lib/zinder/checkpoints
       - ./config/ingest.toml:/etc/zinder/config.toml:ro
       - z3-cookie:/var/run/auth:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
-      # Default to Z3's in-network Zebra DNS name and per-network ports.
-      # Override these if attaching to a Zebra elsewhere or running mainnet.
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
-      # An empty override selects JSON-RPC polling instead of the optional
-      # Zebra streaming-indexer endpoint.
       ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR-http://zebra:8230}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
-      ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
-      ZINDER_STORAGE__RAW_BLOB_POLICY: ${ZINDER_STORAGE__RAW_BLOB_POLICY:-none}
-      # Operators switching to basic auth export ZINDER_NODE__AUTH__METHOD=basic
-      # plus ZINDER_NODE__AUTH__USERNAME/PASSWORD (or AUTH__COOKIE for an
-      # inline cookie). Empty values aren't safe to emit alongside cookie auth;
-      # the validator treats an empty username as "set" and rejects the mix.
+      # Namespace-wide binds are explicit deployment opt-ins. Host publication
+      # below remains loopback-only, while Prometheus reaches ops internally.
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9105"
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
     ports:
-      # ingest-control is internal-only; do not publish externally.
-      - "127.0.0.1:${ZINDER_INGEST_CONTROL_HOST_PORT:-9100}:9100"
       - "127.0.0.1:${ZINDER_INGEST_OPS_HOST_PORT:-9105}:9105"
+      - "127.0.0.1:${ZINDER_COMPAT_HOST_PORT:-9067}:9067"
+      - "127.0.0.1:${ZINDER_PROJECTOR_OPS_HOST_PORT:-9110}:9110"
+      - "127.0.0.1:${ZINDER_COMPAT_OPS_HOST_PORT:-9107}:9107"
     healthcheck:
-      # /healthz reports process liveness; /readyz reports sync progress
-      # (404 / 503 until caught up). Pinning the container healthcheck to
-      # /readyz would block dependent services for the full initial sync.
-      test: ["CMD", "curl", "-fsS", "http://localhost:9105/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9105/readyz"]
       interval: 30s
       timeout: 5s
       start_period: 60s
       retries: 3
 
-  zinder-query:
+  zinder-projector:
+    image: ${ZINDER_PROJECTOR_IMAGE:-zinder-projector:latest}
+    mem_limit: ${ZINDER_PROJECTOR_MEMORY_LIMIT:-10g}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-      target: zinder-query
-    image: ${ZINDER_QUERY_IMAGE:-zinder-query:latest}
-    mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-4g}
+      target: zinder-projector
     restart: on-failure
+    network_mode: "service:zinder-ingest"
     depends_on:
       zinder-ingest:
         condition: service_healthy
-    networks: [z3, observability]
     volumes:
       - data:/var/lib/zinder
-      - ./config/query.toml:/etc/zinder/config.toml:ro
+      - checkpoint-staging:/var/lib/zinder/checkpoints
+      - ./config/projector.toml:/etc/zinder/config.toml:ro
       - z3-cookie:/var/run/auth:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
-      ZINDER_NODE__AUTH__PATH: ${ZINDER_NODE__AUTH__PATH:-/var/run/auth/.cookie}
-      # Reader dials the writer's IngestControl gRPC; defaults match the
-      # in-network DNS name and port the writer publishes.
-      ZINDER_INGEST_CONTROL__ADDR: ${ZINDER_INGEST_CONTROL__ADDR:-http://zinder-ingest:9100}
-    ports:
-      - "${ZINDER_QUERY_HOST_PORT:-9101}:9101"
-      - "127.0.0.1:${ZINDER_QUERY_OPS_HOST_PORT:-9106}:9106"
+      ZINDER_PROJECTOR__BUILD_OWNER_HEX: ${ZINDER_PROJECTOR_BUILD_OWNER_HEX:?set a stable 32-character hexadecimal projector owner}
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9110"
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9106/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9110/readyz"]
       interval: 30s
       timeout: 5s
       start_period: 60s
       retries: 3
 
-  # Explorer-facing reader. Serves ExplorerQuery gRPC on 9068 (block
-  # summaries, transaction details, typed search, mempool views) per
-  # ADR-0009. Co-located with zinder-query on the same canonical volume;
-  # both attach as RocksDB secondaries. Consumed by zexplorer-style
-  # explorer frontends.
-  zinder-explorer:
+  zinder-compat-lightwalletd:
+    image: ${ZINDER_COMPAT_IMAGE:-zinder-compat-lightwalletd:latest}
+    mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-      target: zinder-explorer
-    image: ${ZINDER_EXPLORER_IMAGE:-zinder-explorer:latest}
-    mem_limit: ${ZINDER_EXPLORER_MEMORY_LIMIT:-4g}
+      target: zinder-compat-lightwalletd
     restart: on-failure
+    network_mode: "service:zinder-ingest"
     depends_on:
       zinder-ingest:
         condition: service_healthy
-    networks: [z3, observability]
+      zinder-projector:
+        condition: service_healthy
     volumes:
       - data:/var/lib/zinder
-      - ./config/explorer.toml:/etc/zinder/config.toml:ro
+      - ./config/compat-lightwalletd.toml:/etc/zinder/config.toml:ro
+      - z3-cookie:/var/run/auth:ro
+      - ${ZINDER_INGEST_CONTROL_SECRET_DIR:?set a directory containing ingest.token only}/ingest.token:/var/run/zinder-control/ingest.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
-      # Explorer delegates some reads to the wallet plane via in-network DNS.
-      ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT: ${ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT:-http://zinder-query:9101}
-    ports:
-      # ExplorerQuery gRPC published so cross-host clients can reach it.
-      - "${ZINDER_EXPLORER_HOST_PORT:-9068}:9068"
-      - "127.0.0.1:${ZINDER_EXPLORER_OPS_HOST_PORT:-9069}:9069"
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
+      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      ZINDER_COMPAT__LISTEN_ADDR: "[::]:9067"
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9107"
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9069/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9107/readyz"]
       interval: 30s
       timeout: 5s
       start_period: 60s
       retries: 3
 
-  # Always-on metrics collection. Scrapes zinder-ingest:9105 + zinder-query:9106
-  # + zinder-explorer:9069 over the project-scoped observability network.
-  # Survives every restart. ADR: docs/architecture/upstream-platform-binding.md.
   zinder-prometheus:
     image: prom/prometheus:v3.2.0
     mem_limit: ${ZINDER_PROMETHEUS_MEMORY_LIMIT:-1g}
@@ -200,10 +169,6 @@ services:
       timeout: 5s
       retries: 3
 
-  # Operator-facing dashboards. Opt-in via `--profile observability` because
-  # many operators feed metrics to a sibling Grafana (Z3, Datadog, Grafana
-  # Cloud) and don't want a second one. The minimum is "metrics are always
-  # collected by zinder-prometheus"; Grafana is the visualization bonus.
   zinder-grafana:
     image: grafana/grafana:11.5.1
     mem_limit: ${ZINDER_GRAFANA_MEMORY_LIMIT:-512m}
@@ -232,6 +197,8 @@ services:
 volumes:
   data:
     name: ${ZINDER_SINGLE_HOST_DATA_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-data}
+  checkpoint-staging:
+    name: ${ZINDER_CHECKPOINT_STAGING_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-checkpoints}
   prometheus:
     name: ${ZINDER_PROMETHEUS_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-prometheus}
   grafana:

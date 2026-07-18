@@ -39,7 +39,6 @@
 
 pub mod chain_fixture;
 pub mod commitment_tree_fixtures;
-pub mod deploy;
 pub mod derive_fixture;
 pub mod json_rpc_test_server;
 pub mod live;

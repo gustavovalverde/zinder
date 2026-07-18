@@ -121,8 +121,7 @@ pub struct ServerInfoSettings {
 ///
 /// Kept in this crate to avoid pulling the `zinder-source` crate's
 /// `NodeCapability` enum across every consumer of `ServerInfoSettings`.
-/// Operators set this from the live probe at startup (see
-/// `services/zinder-query/src/bin/zinder-query/main.rs`).
+/// The serving composition sets this from its startup-time live probe.
 #[derive(Clone, Debug, Default)]
 pub struct UpstreamNodeCapabilities {
     /// Node-reported semantic version when available.

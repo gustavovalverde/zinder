@@ -30,9 +30,9 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalEventFence,
-    CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    CanonicalSubtreeRootLoadEvidence, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence, RocksDbCanonicalBuilder,
+    RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 
 use crate::{
@@ -455,6 +455,7 @@ fn admit_canonical_fixture_replay(
         &activations,
         history_predecessor,
         manifest.tip_id()?,
+        CanonicalReorgPolicy::new(config.supported_reorg_depth)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &config.canonical_store_path,
@@ -522,7 +523,7 @@ fn publish_canonical_fixture(
     builder: RocksDbCanonicalBuilder,
     settled_tip: BlockId,
 ) -> Result<PublishedCanonicalFixtureEvidence, BenchError> {
-    let validated = builder.validate_for_publication()?;
+    let validated = builder.prepare_trusted_fresh_publication()?;
     let prepared_publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         settled_tip,
         UnixTimestampMillis::now(),
@@ -542,6 +543,7 @@ fn certify_reopened_canonical_fixture(
         &config.canonical_store_path,
         expected.activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(config.supported_reorg_depth)?,
         config.resource_budget,
     )?;
     let ready = reopened_store.ready_evidence();
@@ -600,7 +602,13 @@ pub fn replay_canonical_fixture_into_rocksdb(
         let pipeline_limits = validate_rocksdb_replay_config(&config)?;
         let admitted = admit_canonical_fixture_replay(&config)?;
         let fixture_source = admitted.fixture_source.clone();
-        replay_admitted_canonical_fixture(config, pipeline_limits, admitted, &fixture_source).await
+        Box::pin(replay_admitted_canonical_fixture(
+            config,
+            pipeline_limits,
+            admitted,
+            &fixture_source,
+        ))
+        .await
     }
     .boxed()
 }
@@ -620,8 +628,13 @@ pub fn replay_canonical_fixture_transport_into_rocksdb<S: NodeSource + Clone>(
         let admitted = admit_canonical_fixture_replay(&config)?;
         let authenticated_source =
             FixtureAuthenticatedBlockSource::new(admitted.fixture_source.clone(), transport_source);
-        replay_admitted_canonical_fixture(config, pipeline_limits, admitted, &authenticated_source)
-            .await
+        Box::pin(replay_admitted_canonical_fixture(
+            config,
+            pipeline_limits,
+            admitted,
+            &authenticated_source,
+        ))
+        .await
     }
     .boxed()
 }

@@ -1,7 +1,7 @@
 # RocksDB Storage Lifecycle
 
-This harness measures fresh version-1 canonical construction followed by fresh
-version-1 wallet construction against an already-synchronized Zebra. It reports
+This harness measures fresh canonical schema-v4 construction followed by fresh
+wallet schema-v1 construction against an already-synchronized Zebra. It reports
 the time to canonical `READY` and wallet `READY` as separate acceptance
 boundaries, then independently cold-opens both stores and verifies that the
 wallet source fence equals the canonical fence. It does not certify continuous
@@ -123,9 +123,10 @@ exits. The validator is independent of the Rust report validator and pins the
 closed version-1 JSON shape. It rejects evidence unless all of these conditions
 hold:
 
-- canonical, wallet-store, wallet-projection, value-encoding, replay, block
-  digest, sequence digest, report, and resource-evidence versions are exactly
-  1;
+- canonical physical schema 5, wallet-store and wallet-projection physical
+  schema 1, wallet value encoding 2, and replay, block digest, sequence digest,
+  and resource-evidence versions 1 are exact; the benchmark report contract is
+  version 2;
 - canonical `READY` covers the contiguous height-1-through-fixed-tip range,
   authenticates the source checkpoint, and survives a cold reopen;
 - wallet `READY` has the same epoch, event, tip, sequence digest, block count,

@@ -4,8 +4,6 @@ builder = "DOCKERFILE"
 # interpolation in `id`, so the Railway-friendly Dockerfile drops cache
 # mounts entirely. Local builds still use deploy/Dockerfile and keep
 # the templated cache hits. Services that want the per-service cache
-# can override RAILWAY_DOCKERFILE_PATH=deploy/Dockerfile.railway after
-# regenerating that file with the right service ID prefix.
 dockerfilePath = "deploy/Dockerfile.railway-nocache"
 
 [deploy]

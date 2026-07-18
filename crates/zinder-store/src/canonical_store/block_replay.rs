@@ -1,17 +1,32 @@
-use std::sync::Arc;
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use rust_rocksdb::{BoundColumnFamily, DB, DBRawIteratorWithThreadMode, ReadOptions};
 use zinder_core::{
-    BlockHash, BlockHeight, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
-    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestBuilder,
-    CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion,
-    ValidatedCanonicalBlockReplay, decode_canonical_block_replay,
+    BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter, BlockId,
+    CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
+    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalBlockReplayFormatVersion, ValidatedCanonicalBlockReplay,
+    decode_canonical_block_replay,
     wire::{decode_height_key_ascending, encode_height_key_ascending},
 };
 
-use super::{CanonicalBlockLoadEvidence, CanonicalStoreError, CanonicalStoreReadyEvidence};
+use super::{
+    CanonicalBlockLoadEvidence, CanonicalSequenceCheckpoint, CanonicalStoreError,
+    CanonicalStoreReadyEvidence, construction_manifest::CanonicalConstructionFamilyEvidence,
+};
 
 pub(super) const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
+
+/// Maximum rows returned by one incremental replay-range scan.
+///
+/// Projectors page retained events and apply committed ranges one at a time.
+/// This ceiling prevents a broad event or caller request from turning the
+/// incremental path back into an unbounded historical scan.
+pub const MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS: u32 = 4_096;
 
 /// One cache-bypassing, forward scan of the READY canonical replay family.
 ///
@@ -28,10 +43,120 @@ pub struct CanonicalReplayScan<'a> {
     finished: bool,
 }
 
+/// Bounded, connected replay rows inside one admitted canonical fence.
+///
+/// Unlike [`CanonicalReplayScan`], this iterator does not authenticate the
+/// complete historical prefix. The secondary or primary must already have
+/// admitted its READY publication. Every requested row is still decoded,
+/// version-checked, height-checked, and connected to the preceding canonical
+/// row so an incremental projection never accepts a gap or detached suffix.
+pub struct CanonicalReplayRangeScan<'a> {
+    db: &'a DB,
+    heights: BlockHeightRangeIter,
+    previous_hash: Option<BlockHash>,
+    first_retained_block: BlockId,
+    finished: bool,
+}
+
+impl<'a> CanonicalReplayRangeScan<'a> {
+    pub(super) fn new(
+        db: &'a DB,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+        range: BlockHeightRange,
+    ) -> Result<Self, CanonicalStoreError> {
+        validate_incremental_replay_range_bound(range)?;
+        if range.start <= range.end
+            && (range.start < ready_evidence.first_retained_block.height
+                || range.end > ready_evidence.visible_tip.height)
+        {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "requested replay range {}..={} is outside admitted canonical range {}..={}",
+                range.start.value(),
+                range.end.value(),
+                ready_evidence.first_retained_block.height.value(),
+                ready_evidence.visible_tip.height.value(),
+            )));
+        }
+        let previous_hash = if range.start <= range.end
+            && range.start > ready_evidence.first_retained_block.height
+        {
+            let predecessor_height = BlockHeight::new(range.start.value() - 1);
+            Some(
+                read_persisted_replay(db, predecessor_height)?
+                    .replay
+                    .facts()
+                    .block_header
+                    .block_hash,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            db,
+            heights: range.into_iter(),
+            previous_hash,
+            first_retained_block: ready_evidence.first_retained_block,
+            finished: false,
+        })
+    }
+}
+
+fn validate_incremental_replay_range_bound(
+    range: BlockHeightRange,
+) -> Result<(), CanonicalStoreError> {
+    let requested_block_count = range
+        .end
+        .value()
+        .checked_sub(range.start.value())
+        .and_then(|distance| distance.checked_add(1))
+        .unwrap_or(0);
+    if requested_block_count > MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS {
+        return Err(CanonicalStoreError::block_replay_sequence(format!(
+            "requested replay range has {requested_block_count} blocks; maximum is {MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS}"
+        )));
+    }
+    Ok(())
+}
+
+impl Iterator for CanonicalReplayRangeScan<'_> {
+    type Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let Some(height) = self.heights.next() else {
+            self.finished = true;
+            return None;
+        };
+        let replay = (|| {
+            let replay = read_persisted_replay(self.db, height)?.replay;
+            let header = &replay.facts().block_header;
+            match self.previous_hash {
+                Some(previous_hash) if header.parent_hash == previous_hash => {}
+                None if height == self.first_retained_block.height
+                    && header.block_hash == self.first_retained_block.hash => {}
+                Some(_) | None => {
+                    return Err(CanonicalStoreError::block_replay_sequence(format!(
+                        "requested replay range is detached at height {}",
+                        height.value()
+                    )));
+                }
+            }
+            self.previous_hash = Some(header.block_hash);
+            Ok(replay)
+        })();
+        if replay.is_err() {
+            self.finished = true;
+        }
+        Some(replay)
+    }
+}
+
 impl<'a> CanonicalReplayScan<'a> {
     pub(super) fn new(
         db: &'a DB,
-        ready_evidence: CanonicalStoreReadyEvidence,
+        ready_evidence: &CanonicalStoreReadyEvidence,
     ) -> Result<Self, CanonicalStoreError> {
         let block_replay = block_replay_column_family(db)?;
         let mut read_options = ReadOptions::default();
@@ -43,7 +168,7 @@ impl<'a> CanonicalReplayScan<'a> {
         ));
         Ok(Self {
             iterator,
-            ready_evidence,
+            ready_evidence: *ready_evidence,
             previous_block: None,
             observed_block_count: 0,
             sequence_digest_builder: Some(CanonicalBlockFactsSequenceDigestBuilder::new(
@@ -185,7 +310,7 @@ impl Iterator for CanonicalReplayScan<'_> {
 }
 
 /// Cache-bypassing semantic proof of the persisted replay family.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PersistedBlockReplayEvidence {
     pub(super) first_height: BlockHeight,
     pub(super) first_parent_hash: BlockHash,
@@ -199,19 +324,38 @@ pub(super) struct PersistedBlockReplayEvidence {
     pub(super) block_digest_version: CanonicalBlockFactsDigestVersion,
     pub(super) sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
     pub(super) sequence_digest: CanonicalBlockFactsSequenceDigest,
+    pub(super) family_evidence: CanonicalConstructionFamilyEvidence,
+    pub(super) elapsed: Duration,
+}
+
+pub(super) struct PersistedBlockReplayValidation {
+    pub(super) evidence: PersistedBlockReplayEvidence,
+    pub(super) retained_sequence_checkpoints: VecDeque<CanonicalSequenceCheckpoint>,
 }
 
 /// Decodes every persisted replay row without populating the block cache.
+#[cfg(test)]
 pub(super) fn validate_persisted_block_replays(
     db: &DB,
 ) -> Result<PersistedBlockReplayEvidence, CanonicalStoreError> {
+    Ok(validate_persisted_block_replays_with_checkpoints(db, 0)?.evidence)
+}
+
+pub(super) fn validate_persisted_block_replays_with_checkpoints(
+    db: &DB,
+    retained_checkpoint_count: usize,
+) -> Result<PersistedBlockReplayValidation, CanonicalStoreError> {
+    let started_at = Instant::now();
     let block_replay = block_replay_column_family(db)?;
     let mut read_options = ReadOptions::default();
     read_options.fill_cache(false);
     read_options.set_readahead_size(2 * 1024 * 1024);
     let mut iterator = db.raw_iterator_cf_opt(&block_replay, read_options);
     iterator.seek_to_first();
-    let mut sequence = None;
+    let mut sequence: Option<ReplaySequence> = None;
+    let mut family_evidence =
+        CanonicalConstructionFamilyEvidence::accumulator(BLOCK_REPLAY_COLUMN_FAMILY);
+    let mut retained_sequence_checkpoints = VecDeque::new();
     while iterator.valid() {
         let Some((key, encoded_replay)) = iterator.item() else {
             iterator
@@ -223,6 +367,7 @@ pub(super) fn validate_persisted_block_replays(
             break;
         };
         let (height, replay) = decode_persisted_replay(key, encoded_replay)?;
+        family_evidence.observe(key, encoded_replay)?;
         let facts = replay.facts();
         let replay_bytes = u64::try_from(encoded_replay.len()).map_err(|_| {
             CanonicalStoreError::block_replay_sequence("replay byte length exceeds u64::MAX")
@@ -244,9 +389,19 @@ pub(super) fn validate_persisted_block_replays(
             logical_family_bytes,
             replay_bytes,
         };
-        match &mut sequence {
-            None => sequence = Some(ReplaySequence::new(row)?),
-            Some(sequence) => sequence.append(row)?,
+        if let Some(sequence) = sequence.as_mut() {
+            sequence.append(row)?;
+        } else {
+            sequence = Some(ReplaySequence::new(row)?);
+        }
+        let sequence = sequence.as_ref().ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence("replay sequence state is absent")
+        })?;
+        if retained_checkpoint_count > 0 {
+            retained_sequence_checkpoints.push_back(sequence.sequence_checkpoint());
+            if retained_sequence_checkpoints.len() > retained_checkpoint_count {
+                retained_sequence_checkpoints.pop_front();
+            }
         }
         iterator.next();
     }
@@ -256,10 +411,109 @@ pub(super) fn validate_persisted_block_replays(
             operation: "block replay readback iteration",
             source,
         })?;
-    sequence.map(ReplaySequence::finish).ok_or_else(|| {
+    let mut evidence = sequence.map(ReplaySequence::finish).ok_or_else(|| {
         CanonicalStoreError::block_replay_sequence(
             "persisted block replay family must not be empty",
         )
+    })?;
+    evidence.family_evidence = family_evidence.finish();
+    evidence.elapsed = started_at.elapsed();
+    Ok(PersistedBlockReplayValidation {
+        evidence,
+        retained_sequence_checkpoints,
+    })
+}
+
+pub(super) fn resume_persisted_sequence_checkpoint(
+    db: &DB,
+    checkpoint: CanonicalSequenceCheckpoint,
+    through: BlockHeight,
+    maximum_replay_blocks: u32,
+) -> Result<CanonicalSequenceCheckpoint, CanonicalStoreError> {
+    let replay_block_count = through
+        .value()
+        .checked_sub(checkpoint.through().height.value())
+        .ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence(
+                "sequence checkpoint cannot resume backwards",
+            )
+        })?;
+    if replay_block_count > maximum_replay_blocks {
+        return Err(CanonicalStoreError::block_replay_sequence(format!(
+            "sequence checkpoint tail has {replay_block_count} blocks; maximum is {maximum_replay_blocks}"
+        )));
+    }
+    let mut digest_builder =
+        CanonicalBlockFactsSequenceDigestBuilder::resume_from_prefix(checkpoint.sequence_digest());
+    let mut retained_block_count = checkpoint.retained_block_count();
+    let mut logical_replay_bytes = checkpoint.logical_replay_bytes();
+    let mut previous_block = checkpoint.through();
+    let mut next_height = checkpoint.through().height.next();
+    while next_height.is_some_and(|height| height <= through) {
+        let height = next_height.ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence("sequence checkpoint height overflow")
+        })?;
+        let persisted = read_persisted_replay(db, height)?;
+        let facts = persisted.replay.facts();
+        if facts.block_header.parent_hash != previous_block.hash {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "block {} does not extend the sequence checkpoint",
+                height.value()
+            )));
+        }
+        digest_builder
+            .try_append(persisted.replay.reference_digest())
+            .map_err(|source| CanonicalStoreError::block_replay_sequence(source.to_string()))?;
+        retained_block_count = retained_block_count.checked_add(1).ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence("checkpoint block count exceeds u64::MAX")
+        })?;
+        logical_replay_bytes = logical_replay_bytes
+            .checked_add(persisted.logical_replay_bytes)
+            .ok_or_else(|| {
+                CanonicalStoreError::block_replay_sequence(
+                    "checkpoint replay bytes exceed u64::MAX",
+                )
+            })?;
+        previous_block = BlockId::new(height, facts.block_header.block_hash);
+        next_height = height.next();
+    }
+    Ok(CanonicalSequenceCheckpoint::from_admitted_parts(
+        previous_block,
+        retained_block_count,
+        digest_builder.finish(),
+        logical_replay_bytes,
+    ))
+}
+
+pub(super) struct PersistedReplayStep {
+    pub(super) replay: ValidatedCanonicalBlockReplay,
+    pub(super) logical_replay_bytes: u64,
+}
+
+pub(super) fn read_persisted_replay(
+    db: &DB,
+    height: BlockHeight,
+) -> Result<PersistedReplayStep, CanonicalStoreError> {
+    let key = encode_height_key_ascending(height);
+    let encoded_replay = db
+        .get_cf(&block_replay_column_family(db)?, key)
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "canonical replay checkpoint read",
+            source,
+        })?
+        .ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence(format!(
+                "canonical replay at height {} is absent",
+                height.value()
+            ))
+        })?;
+    let (_, replay) = decode_persisted_replay(&key, &encoded_replay)?;
+    let logical_replay_bytes = u64::try_from(encoded_replay.len()).map_err(|_| {
+        CanonicalStoreError::block_replay_sequence("replay byte length exceeds u64::MAX")
+    })?;
+    Ok(PersistedReplayStep {
+        replay,
+        logical_replay_bytes,
     })
 }
 
@@ -288,7 +542,7 @@ fn decode_persisted_replay(
 }
 
 impl PersistedBlockReplayEvidence {
-    pub(super) fn has_same_sequence(self, prepared: &CanonicalBlockLoadEvidence) -> bool {
+    pub(super) fn has_same_sequence(&self, prepared: &CanonicalBlockLoadEvidence) -> bool {
         let replay_counts_match = self.block_count == prepared.block_count
             && prepared.block_count == prepared.block_replay_count;
         let replay_logical_bytes_match =
@@ -400,6 +654,15 @@ impl ReplaySequence {
         Ok(())
     }
 
+    fn sequence_checkpoint(&self) -> CanonicalSequenceCheckpoint {
+        CanonicalSequenceCheckpoint::from_admitted_parts(
+            BlockId::new(self.tip_height, self.tip_hash),
+            self.block_count,
+            self.digest_builder.clone().finish(),
+            self.logical_replay_bytes,
+        )
+    }
+
     fn finish(self) -> PersistedBlockReplayEvidence {
         PersistedBlockReplayEvidence {
             first_height: self.first_height,
@@ -414,6 +677,11 @@ impl ReplaySequence {
             block_digest_version: CanonicalBlockFactsDigestVersion::V1,
             sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
             sequence_digest: self.digest_builder.finish(),
+            family_evidence: CanonicalConstructionFamilyEvidence::accumulator(
+                BLOCK_REPLAY_COLUMN_FAMILY,
+            )
+            .finish(),
+            elapsed: Duration::ZERO,
         }
     }
 }
@@ -430,4 +698,34 @@ fn validate_replay_versions(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_replay_range_enforces_the_exact_span_limit() {
+        let maximum_end = BlockHeight::new(MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS - 1);
+        assert!(
+            validate_incremental_replay_range_bound(BlockHeightRange::inclusive(
+                BlockHeight::new(0),
+                maximum_end,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_incremental_replay_range_bound(BlockHeightRange::inclusive(
+                BlockHeight::new(0),
+                BlockHeight::new(MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS),
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_incremental_replay_range_bound(BlockHeightRange::empty_at(BlockHeight::new(
+                10
+            ),))
+            .is_ok()
+        );
+    }
 }

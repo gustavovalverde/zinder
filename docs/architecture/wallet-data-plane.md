@@ -4,7 +4,10 @@ The wallet data plane is the part of Zinder that wallets and wallet-like applica
 
 ## Responsibility
 
-`zinder-query` owns the wallet data plane.
+The `zinder-query` library owns the wallet request, adapter, and error contract.
+`zinder-projector` owns the durable wallet state, and
+`zinder-compat-lightwalletd` is the only deployed wallet-facing runtime in the
+first fact-first release. The standalone native query binary is deleted.
 
 Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
 this plane is consumer-neutral. Mobile SDKs, lightwalletd clients, native

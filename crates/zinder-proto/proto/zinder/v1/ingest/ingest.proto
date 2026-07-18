@@ -91,6 +91,249 @@ message MempoolTransactionRequest {
   string transaction_id = 1;
 }
 
+// Exact authenticated fence published by the canonical version-1 writer.
+message CanonicalWriterFence {
+  uint64 chain_epoch_id = 1;
+  uint64 event_sequence = 2;
+  uint32 visible_tip_height = 3;
+  bytes visible_tip_hash = 4;
+  bytes canonical_sequence_digest = 5;
+  uint64 visible_block_count = 6;
+}
+
+// Status request for the fact-first canonical writer.
+message CanonicalWriterStatusRequest {}
+
+// Status used by projectors and secondary readers to authenticate their view.
+message CanonicalWriterStatusResponse {
+  string network_name = 1;
+  CanonicalWriterFence fence = 2;
+  uint64 oldest_retained_event_sequence = 3;
+}
+
+// Inclusive block-height range carried by one canonical transition.
+message CanonicalEventBlockRange {
+  uint32 start_height = 1;
+  uint32 end_height = 2;
+}
+
+// Exact transition category in the retained canonical event log.
+enum CanonicalRetainedEventKind {
+  CANONICAL_RETAINED_EVENT_KIND_UNSPECIFIED = 0;
+  CANONICAL_RETAINED_EVENT_KIND_COMMITTED = 1;
+  CANONICAL_RETAINED_EVENT_KIND_REORGED = 2;
+}
+
+// One validated event returned in durable sequence order.
+message CanonicalRetainedEvent {
+  bytes cursor = 1;
+  uint64 resulting_epoch_id = 2;
+  optional uint64 previous_epoch_id = 3;
+  CanonicalRetainedEventKind kind = 4;
+  optional CanonicalEventBlockRange reverted_range = 5;
+  CanonicalEventBlockRange committed_range = 6;
+  // Exact authenticated canonical state produced by this event. This is
+  // distinct from EventPage.writer_fence, which may describe a later event.
+  CanonicalWriterFence resulting_fence = 7;
+}
+
+// Bounded page request. An empty cursor starts at the retention floor.
+message CanonicalEventPageRequest {
+  bytes from_cursor = 1;
+  uint32 max_events = 2;
+}
+
+// Ordered retained events and the writer fence that bounded the page.
+message CanonicalEventPageResponse {
+  repeated CanonicalRetainedEvent events = 1;
+  CanonicalWriterFence writer_fence = 2;
+  uint64 oldest_retained_event_sequence = 3;
+}
+
+// Durable lease identity protecting one projection-construction anchor.
+message CanonicalProjectionBuildLease {
+  bytes lease_id = 1;
+  uint64 anchor_chain_epoch_id = 2;
+  bytes anchor_event_cursor = 3;
+  uint64 expires_at_unix_millis = 4;
+  uint64 generation = 5;
+}
+
+message AcquireCanonicalProjectionBuildLeaseRequest {
+  CanonicalProjectionBuildLease lease = 1;
+}
+
+message RenewCanonicalProjectionBuildLeaseRequest {
+  CanonicalProjectionBuildLease lease = 1;
+}
+
+message ReleaseCanonicalProjectionBuildLeaseRequest {
+  CanonicalProjectionBuildLease lease = 1;
+}
+
+message CanonicalProjectionBuildLeaseResponse {
+  CanonicalProjectionBuildLease lease = 1;
+}
+
+message ReleaseCanonicalProjectionBuildLeaseResponse {}
+
+// An opaque block identifier carried in checkpoint admission evidence. Hash
+// bytes use Zinder's native canonical block-hash byte order.
+message CanonicalCheckpointBlockId {
+  uint32 height = 1;
+  bytes hash = 2;
+}
+
+// Authenticated replay prefix retained at the settled checkpoint of a
+// cold-admitted canonical checkpoint.
+message CanonicalCheckpointSequenceEvidence {
+  CanonicalCheckpointBlockId through = 1;
+  uint64 retained_block_count = 2;
+  bytes sequence_digest = 3;
+  uint64 logical_replay_bytes = 4;
+}
+
+// One validated predecessor frontier committed by a canonical build plan.
+message CanonicalCheckpointFrontier {
+  bytes final_root = 1;
+  bytes final_state = 2;
+}
+
+// Typed predecessor checkpoint that seeds retained canonical history.
+message CanonicalCheckpointHistoryPredecessor {
+  CanonicalCheckpointBlockId block_id = 1;
+  uint32 block_time_seconds = 2;
+  CanonicalCheckpointFrontier sapling_frontier = 3;
+  CanonicalCheckpointFrontier orchard_frontier = 4;
+  CanonicalCheckpointFrontier ironwood_frontier = 5;
+}
+
+// Immutable canonical construction identity admitted from the checkpoint.
+// This includes the exact activation table, retention boundary, predecessor,
+// and fixed build tip; consumers need no pre-checkpoint status response to
+// bind a state-bundle manifest to this canonical artifact.
+message CanonicalOwnerCheckpointBuildPlanEvidence {
+  uint32 activation_fingerprint_version = 1;
+  bytes activation_fingerprint = 2;
+  uint32 reorg_window_blocks = 3;
+  CanonicalCheckpointBlockId history_preceding_checkpoint = 4;
+  CanonicalCheckpointHistoryPredecessor history_predecessor = 5;
+  CanonicalCheckpointBlockId build_tip = 6;
+}
+
+// Complete READY evidence cold-read from one owner-created canonical
+// checkpoint. This is intentionally evidence, not a filesystem handle or
+// path: consumers pair independently owned checkpoint artifacts by the
+// returned identity and authenticated canonical state.
+message CanonicalOwnerCheckpointReadyEvidence {
+  CanonicalCheckpointBlockId first_retained_block = 1;
+  CanonicalWriterFence visible_fence = 2;
+  uint32 block_digest_version = 3;
+  uint32 replay_format_version = 4;
+  uint32 sequence_digest_version = 5;
+  uint64 visible_logical_fact_bytes = 6;
+  CanonicalCheckpointSequenceEvidence sequence_checkpoint = 7;
+  // Immutable fresh-build construction-manifest format bound into READY.
+  uint32 construction_manifest_version = 8;
+  // Domain-separated SHA-256 of the complete construction-manifest sidecar.
+  bytes construction_manifest_sha256 = 9;
+}
+
+// Requests a canonical owner checkpoint by an opaque, operator-selected
+// candidate id. The writer resolves this identifier below its configured
+// checkpoint staging root; arbitrary filesystem paths are never accepted.
+message CreateCanonicalOwnerCheckpointRequest {
+  string candidate_id = 1;
+  // SHA-256 of the canonical realpath of the shared staging root. This is an
+  // opaque root-binding proof, not a path supplied by the client.
+  bytes staging_root_binding = 2;
+  // Exact writer fence the projector has authenticated against its wallet.
+  // The owner queue refuses a checkpoint if the canonical primary advanced.
+  CanonicalWriterFence expected_fence = 3;
+}
+
+// Cold-admitted canonical identity and READY evidence for one checkpoint.
+// `candidate_id` names the operator-selected staging entry; it is not a path.
+message CreateCanonicalOwnerCheckpointResponse {
+  string candidate_id = 1;
+  string store_identity = 2;
+  uint32 schema_version = 3;
+  string workload = 4;
+  string network_name = 5;
+  CanonicalOwnerCheckpointReadyEvidence ready_evidence = 6;
+  CanonicalOwnerCheckpointBuildPlanEvidence build_plan = 7;
+  // Exact RocksDB database identity cold-read from the physical checkpoint.
+  // Consumers bind it into their manifest and use it for exact path
+  // re-admission; it is opaque and is not filesystem authority.
+  bytes database_identity = 8;
+}
+
+// Re-admits an already-created canonical owner checkpoint at the fixed child
+// of an opaque staging candidate. The canonical owner resolves the path below
+// its own configured staging root; callers cannot provide filesystem paths.
+//
+// The expected database identity and visible fence must be the exact values
+// returned from CreateOwnerCheckpoint. The owner cold-opens the immutable
+// checkpoint again and rejects any path, identity, or fence drift before a
+// wallet checkpoint can be published.
+message ReadmitCanonicalOwnerCheckpointRequest {
+  string candidate_id = 1;
+  // SHA-256 of the canonical realpath of the shared staging root. This is an
+  // opaque root-binding proof, not a path supplied by the client.
+  bytes staging_root_binding = 2;
+  // Exact canonical visible fence returned by CreateOwnerCheckpoint.
+  CanonicalWriterFence expected_fence = 3;
+  // Exact RocksDB database identity returned by CreateOwnerCheckpoint.
+  bytes expected_database_identity = 4;
+}
+
+// Fact-first writer operations needed by projectors and secondary readers.
+// Every mutation is serialized by the canonical writer; clients never open a
+// second primary handle to acquire leases or change event retention.
+service CanonicalControl {
+  rpc WriterStatus(CanonicalWriterStatusRequest) returns (CanonicalWriterStatusResponse);
+  rpc EventPage(CanonicalEventPageRequest) returns (CanonicalEventPageResponse);
+  rpc CreateOwnerCheckpoint(CreateCanonicalOwnerCheckpointRequest)
+      returns (CreateCanonicalOwnerCheckpointResponse);
+  rpc ReadmitOwnerCheckpoint(ReadmitCanonicalOwnerCheckpointRequest)
+      returns (CreateCanonicalOwnerCheckpointResponse);
+  rpc AcquireProjectionBuildLease(AcquireCanonicalProjectionBuildLeaseRequest)
+      returns (CanonicalProjectionBuildLeaseResponse);
+  rpc RenewProjectionBuildLease(RenewCanonicalProjectionBuildLeaseRequest)
+      returns (CanonicalProjectionBuildLeaseResponse);
+  rpc ReleaseProjectionBuildLease(ReleaseCanonicalProjectionBuildLeaseRequest)
+      returns (ReleaseCanonicalProjectionBuildLeaseResponse);
+}
+
+// Requests a coherent, capture-only checkpoint bundle from the wallet
+// projection owner. `candidate_id` is opaque: it is never interpreted as a
+// filesystem path by the service.
+message CreateStateBundleCaptureRequest {
+  string candidate_id = 1;
+}
+
+// Identifies a state bundle that was fully captured and whose manifest was
+// published last. Archive, restore, and serving-lane activation are outside
+// this RPC's contract.
+message CreateStateBundleCaptureResponse {
+  string candidate_id = 1;
+  string state_bundle_identity = 2;
+  uint32 state_bundle_format_version = 3;
+  string topology = 4;
+  string network_name = 5;
+  uint64 chain_epoch_id = 6;
+  uint64 chain_event_sequence = 7;
+  uint32 visible_tip_height = 8;
+}
+
+// Private, loopback-only owner control plane for the running wallet
+// projector. It is deliberately separate from the public query and ops
+// planes, and must authenticate every request with a bearer token.
+service ProjectorControl {
+  rpc CreateStateBundleCapture(CreateStateBundleCaptureRequest)
+      returns (CreateStateBundleCaptureResponse);
+}
+
 // Private ingest control-plane RPCs for colocated read replicas.
 service IngestControl {
   // Returns the writer's identity and capability set in the cross-service

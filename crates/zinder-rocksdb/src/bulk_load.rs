@@ -9,6 +9,7 @@ use std::{
 };
 
 use rust_rocksdb::{Options, SstFileWriter};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod variable_value_sort;
@@ -92,7 +93,180 @@ pub struct SstFileSet {
     pub paths: Vec<PathBuf>,
     /// Total physical bytes occupied by `paths`.
     pub file_bytes: u64,
+    /// Cryptographic key/value evidence for every staged physical file.
+    pub files: Vec<SstFileEvidence>,
+    /// Whole-family evidence independent of physical SST rotation.
+    pub logical_family_evidence: OrderedKeyValueEvidence,
 }
+
+/// Immutable evidence for one complete ordered logical key/value family.
+///
+/// Logical bytes count exact key and value bytes, excluding the digest's
+/// framing. Empty families retain zero counts, absent boundary keys, and the
+/// digest of the family domain alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderedKeyValueEvidence {
+    /// Exact number of ordered key/value rows.
+    pub row_count: u64,
+    /// Sum of the exact key and value byte lengths.
+    pub logical_bytes: u64,
+    /// First key, or `None` when the family is empty.
+    pub first_key: Option<Vec<u8>>,
+    /// Last key, or `None` when the family is empty.
+    pub last_key: Option<Vec<u8>>,
+    /// SHA-256 of the version-1 domain followed by every exact ordered row.
+    ///
+    /// Each row is framed as the little-endian `u64` key length, key bytes,
+    /// little-endian `u64` value length, and value bytes.
+    pub ordered_key_value_digest: [u8; 32],
+}
+
+impl Default for OrderedKeyValueEvidence {
+    fn default() -> Self {
+        OrderedKeyValueEvidenceAccumulator::new().finish()
+    }
+}
+
+/// Accumulates rotation-independent evidence for an ordered logical family.
+pub struct OrderedKeyValueEvidenceAccumulator {
+    row_count: u64,
+    logical_bytes: u64,
+    first_key: Option<Vec<u8>>,
+    last_key: Option<Vec<u8>>,
+    digest: Sha256,
+}
+
+impl Default for OrderedKeyValueEvidenceAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OrderedKeyValueEvidenceAccumulator {
+    /// Creates empty evidence in the version-1 logical-family domain.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut digest = Sha256::new();
+        digest.update(ORDERED_KEY_VALUE_EVIDENCE_DIGEST_DOMAIN);
+        Self {
+            row_count: 0,
+            logical_bytes: 0,
+            first_key: None,
+            last_key: None,
+            digest,
+        }
+    }
+
+    /// Records one strictly increasing key and its exact encoded value.
+    pub fn record(&mut self, key: &[u8], encoded_value: &[u8]) -> Result<(), BulkLoadError> {
+        let update = self.prepare_update(key, encoded_value)?;
+        self.apply_update(update, key, encoded_value);
+        Ok(())
+    }
+
+    /// Finishes the complete ordered-family evidence.
+    #[must_use]
+    pub fn finish(self) -> OrderedKeyValueEvidence {
+        OrderedKeyValueEvidence {
+            row_count: self.row_count,
+            logical_bytes: self.logical_bytes,
+            first_key: self.first_key,
+            last_key: self.last_key,
+            ordered_key_value_digest: self.digest.finalize().into(),
+        }
+    }
+
+    fn prepare_update(
+        &self,
+        key: &[u8],
+        encoded_value: &[u8],
+    ) -> Result<OrderedKeyValueEvidenceUpdate, BulkLoadError> {
+        if self
+            .last_key
+            .as_deref()
+            .is_some_and(|previous| previous >= key)
+        {
+            return Err(BulkLoadError::invalid(
+                "ordered logical-family keys are duplicated or not strictly increasing",
+            ));
+        }
+        let row_logical_bytes = logical_row_bytes(key.len(), encoded_value.len())?;
+        let row_count = self
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| BulkLoadError::invalid("logical-family row count exceeds u64::MAX"))?;
+        let logical_bytes = self
+            .logical_bytes
+            .checked_add(row_logical_bytes)
+            .ok_or_else(|| BulkLoadError::invalid("logical-family bytes exceed u64::MAX"))?;
+        let key_length = u64::try_from(key.len())
+            .map_err(|_| BulkLoadError::invalid("SST key length exceeds u64::MAX"))?;
+        let encoded_value_length = u64::try_from(encoded_value.len())
+            .map_err(|_| BulkLoadError::invalid("SST value length exceeds u64::MAX"))?;
+        Ok(OrderedKeyValueEvidenceUpdate {
+            row_count,
+            logical_bytes,
+            row_logical_bytes,
+            key_length,
+            encoded_value_length,
+        })
+    }
+
+    fn apply_update(
+        &mut self,
+        update: OrderedKeyValueEvidenceUpdate,
+        key: &[u8],
+        encoded_value: &[u8],
+    ) {
+        self.row_count = update.row_count;
+        self.logical_bytes = update.logical_bytes;
+        if self.first_key.is_none() {
+            self.first_key = Some(key.to_vec());
+        }
+        self.last_key = Some(key.to_vec());
+        update_ordered_key_value_digest(
+            &mut self.digest,
+            update.key_length,
+            key,
+            update.encoded_value_length,
+            encoded_value,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OrderedKeyValueEvidenceUpdate {
+    row_count: u64,
+    logical_bytes: u64,
+    row_logical_bytes: u64,
+    key_length: u64,
+    encoded_value_length: u64,
+}
+
+/// Immutable evidence emitted while one staged external SST is written.
+///
+/// The digest is domain-separated and receives the length-prefixed key and
+/// value of each row in the exact writer order. The evidence is therefore
+/// available before ingestion without reading an SST back from disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SstFileEvidence {
+    /// Zero-based ordinal within its logical family.
+    pub ordinal: u64,
+    /// Physical file size after the writer closes the file.
+    pub file_bytes: u64,
+    /// Exact number of key/value rows in the file.
+    pub entry_count: u64,
+    /// First ordered key in the file.
+    pub first_key: Vec<u8>,
+    /// Last ordered key in the file.
+    pub last_key: Vec<u8>,
+    /// Version-1 domain-separated digest of every exact key/value row.
+    pub ordered_key_value_digest: [u8; 32],
+}
+
+const SST_FILE_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"zinder.rocksdb.staged-sst.v1\0";
+const ORDERED_KEY_VALUE_EVIDENCE_DIGEST_DOMAIN: &[u8] =
+    b"zinder.rocksdb.ordered-logical-family.v1\0";
 
 /// Writes strictly increasing opaque keys into bounded-size SST files.
 pub struct OrderedSstWriter<'options> {
@@ -104,9 +278,15 @@ pub struct OrderedSstWriter<'options> {
     current_path: Option<PathBuf>,
     current_logical_bytes: u64,
     next_file_index: u64,
-    previous_key: Option<Vec<u8>>,
     paths: Vec<PathBuf>,
     file_bytes: u64,
+    files: Vec<SstFileEvidence>,
+    logical_family_evidence: OrderedKeyValueEvidenceAccumulator,
+    current_entry_count: u64,
+    current_first_key: Option<Vec<u8>>,
+    current_last_key: Option<Vec<u8>>,
+    current_ordinal: Option<u64>,
+    current_digest: Option<Sha256>,
 }
 
 impl<'options> OrderedSstWriter<'options> {
@@ -131,24 +311,23 @@ impl<'options> OrderedSstWriter<'options> {
             current_path: None,
             current_logical_bytes: 0,
             next_file_index: 0,
-            previous_key: None,
             paths: Vec::new(),
             file_bytes: 0,
+            files: Vec::new(),
+            logical_family_evidence: OrderedKeyValueEvidenceAccumulator::new(),
+            current_entry_count: 0,
+            current_first_key: None,
+            current_last_key: None,
+            current_ordinal: None,
+            current_digest: None,
         })
     }
 
     /// Appends one key and value after verifying strict key order.
     pub fn put(&mut self, key: &[u8], encoded_value: &[u8]) -> Result<(), BulkLoadError> {
-        if self
-            .previous_key
-            .as_deref()
-            .is_some_and(|previous| previous >= key)
-        {
-            return Err(BulkLoadError::invalid(format!(
-                "{} keys are duplicated or not strictly increasing",
-                self.artifact_label
-            )));
-        }
+        let evidence_update = self
+            .logical_family_evidence
+            .prepare_update(key, encoded_value)?;
         if self.writer.is_some() && self.current_logical_bytes >= self.target_logical_bytes {
             self.finish_current()?;
         }
@@ -166,9 +345,28 @@ impl<'options> OrderedSstWriter<'options> {
             })?;
         self.current_logical_bytes = self
             .current_logical_bytes
-            .checked_add(logical_row_bytes(key.len(), encoded_value.len())?)
+            .checked_add(evidence_update.row_logical_bytes)
             .ok_or_else(|| BulkLoadError::invalid("current SST logical bytes exceed u64::MAX"))?;
-        self.previous_key = Some(key.to_vec());
+        self.current_entry_count = self
+            .current_entry_count
+            .checked_add(1)
+            .ok_or_else(|| BulkLoadError::invalid("SST entry count exceeds u64::MAX"))?;
+        if self.current_first_key.is_none() {
+            self.current_first_key = Some(key.to_vec());
+        }
+        self.current_last_key = Some(key.to_vec());
+        let digest = self.current_digest.as_mut().ok_or_else(|| {
+            BulkLoadError::invalid("ordered SST writer has no active evidence digest")
+        })?;
+        update_ordered_key_value_digest(
+            digest,
+            evidence_update.key_length,
+            key,
+            evidence_update.encoded_value_length,
+            encoded_value,
+        );
+        self.logical_family_evidence
+            .apply_update(evidence_update, key, encoded_value);
         Ok(())
     }
 
@@ -178,16 +376,17 @@ impl<'options> OrderedSstWriter<'options> {
         Ok(SstFileSet {
             paths: self.paths,
             file_bytes: self.file_bytes,
+            files: self.files,
+            logical_family_evidence: self.logical_family_evidence.finish(),
         })
     }
 
     fn open_next(&mut self) -> Result<(), BulkLoadError> {
-        let path = self.staging_path.join(format!(
-            "{}-{:08}.sst",
-            self.artifact_label, self.next_file_index
-        ));
-        self.next_file_index = self
-            .next_file_index
+        let ordinal = self.next_file_index;
+        let path = self
+            .staging_path
+            .join(format!("{}-{:08}.sst", self.artifact_label, ordinal));
+        self.next_file_index = ordinal
             .checked_add(1)
             .ok_or_else(|| BulkLoadError::invalid("SST file count exceeds u64::MAX"))?;
         let writer = SstFileWriter::create(self.options);
@@ -200,6 +399,14 @@ impl<'options> OrderedSstWriter<'options> {
         self.writer = Some(writer);
         self.current_path = Some(path);
         self.current_logical_bytes = 0;
+        self.current_entry_count = 0;
+        self.current_first_key = None;
+        self.current_last_key = None;
+        self.current_ordinal = Some(ordinal);
+        let mut digest = Sha256::new();
+        digest.update(SST_FILE_EVIDENCE_DIGEST_DOMAIN);
+        digest.update(ordinal.to_le_bytes());
+        self.current_digest = Some(digest);
         Ok(())
     }
 
@@ -224,9 +431,47 @@ impl<'options> OrderedSstWriter<'options> {
             .file_bytes
             .checked_add(file_bytes)
             .ok_or_else(|| BulkLoadError::invalid("total SST file bytes exceed u64::MAX"))?;
+        let ordinal = self
+            .current_ordinal
+            .take()
+            .ok_or_else(|| BulkLoadError::invalid("closed ordered SST has no evidence ordinal"))?;
+        let entry_count = self.current_entry_count;
+        let first_key = self
+            .current_first_key
+            .take()
+            .ok_or_else(|| BulkLoadError::invalid("closed ordered SST has no first key"))?;
+        let last_key = self
+            .current_last_key
+            .take()
+            .ok_or_else(|| BulkLoadError::invalid("closed ordered SST has no last key"))?;
+        let digest = self
+            .current_digest
+            .take()
+            .ok_or_else(|| BulkLoadError::invalid("closed ordered SST has no evidence digest"))?;
+        self.files.push(SstFileEvidence {
+            ordinal,
+            file_bytes,
+            entry_count,
+            first_key,
+            last_key,
+            ordered_key_value_digest: digest.finalize().into(),
+        });
         self.paths.push(path);
         Ok(())
     }
+}
+
+fn update_ordered_key_value_digest(
+    digest: &mut Sha256,
+    key_length: u64,
+    key: &[u8],
+    encoded_value_length: u64,
+    encoded_value: &[u8],
+) {
+    digest.update(key_length.to_le_bytes());
+    digest.update(key);
+    digest.update(encoded_value_length.to_le_bytes());
+    digest.update(encoded_value);
 }
 
 /// Bounded external sorter for opaque fixed-width records.
@@ -525,6 +770,22 @@ mod tests {
     }
 
     #[test]
+    fn ordered_family_evidence_rejects_non_increasing_keys_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut evidence = OrderedKeyValueEvidenceAccumulator::new();
+        evidence.record(b"b", b"two")?;
+        assert!(matches!(
+            evidence.record(b"a", b"one"),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+
+        let mut expected = OrderedKeyValueEvidenceAccumulator::new();
+        expected.record(b"b", b"two")?;
+        assert_eq!(evidence.finish(), expected.finish());
+        Ok(())
+    }
+
+    #[test]
     fn empty_fixed_record_sorter_still_rejects_zero_sst_target()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
@@ -534,6 +795,125 @@ mod tests {
             sorter.finish::<2>(&Options::default(), 0),
             Err(BulkLoadError::InvalidInput { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_sst_writer_records_domain_separated_per_file_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let options = Options::default();
+        let mut writer = OrderedSstWriter::new(temporary.path(), "evidence", &options, 2)?;
+        writer.put(b"a", b"1")?;
+        writer.put(b"b", b"22")?;
+        let files = writer.finish()?;
+
+        assert_eq!(files.files.len(), 2);
+        assert_eq!(files.files[0].ordinal, 0);
+        assert_eq!(files.files[0].entry_count, 1);
+        assert_eq!(files.files[0].first_key, b"a");
+        assert_eq!(files.files[0].last_key, b"a");
+        assert_eq!(
+            files.files[0].ordered_key_value_digest,
+            [
+                75, 165, 213, 127, 94, 102, 70, 148, 94, 23, 94, 209, 179, 67, 79, 62, 24, 149,
+                140, 126, 57, 10, 152, 114, 152, 56, 86, 58, 133, 19, 85, 98,
+            ]
+        );
+        assert_eq!(files.files[1].ordinal, 1);
+        assert_eq!(files.files[1].entry_count, 1);
+        assert_eq!(files.files[1].first_key, b"b");
+        assert_eq!(files.files[1].last_key, b"b");
+        assert!(files.files.iter().all(|file| file.file_bytes > 0));
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_family_evidence_is_independent_of_sst_rotation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let options = Options::default();
+        let rows = [
+            (b"a".as_slice(), b"1".as_slice()),
+            (b"b", b"2"),
+            (b"c", b"3"),
+        ];
+
+        let mut rotating = OrderedSstWriter::new(temporary.path(), "rotating", &options, 2)?;
+        let mut single = OrderedSstWriter::new(temporary.path(), "single", &options, 1_024)?;
+        for (key, value) in rows {
+            rotating.put(key, value)?;
+            single.put(key, value)?;
+        }
+        let rotating = rotating.finish()?;
+        let single = single.finish()?;
+
+        assert_eq!(rotating.files.len(), 3);
+        assert_eq!(single.files.len(), 1);
+        assert_eq!(
+            rotating.logical_family_evidence,
+            single.logical_family_evidence
+        );
+        assert_eq!(rotating.logical_family_evidence.row_count, 3);
+        assert_eq!(rotating.logical_family_evidence.logical_bytes, 6);
+        assert_eq!(
+            rotating.logical_family_evidence.first_key.as_deref(),
+            Some(b"a".as_slice())
+        );
+        assert_eq!(
+            rotating.logical_family_evidence.last_key.as_deref(),
+            Some(b"c".as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_sst_sets_retain_domain_separated_logical_family_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let options = Options::default();
+        let writer = OrderedSstWriter::new(temporary.path(), "empty-writer", &options, 1_024)?;
+        let writer_files = writer.finish()?;
+        let sorter = FixedRecordSorter::<4>::new(temporary.path(), "empty-sorter", 1)?;
+        let sorter_files = sorter.finish::<2>(&options, 1_024)?;
+        let mut digest = Sha256::new();
+        digest.update(ORDERED_KEY_VALUE_EVIDENCE_DIGEST_DOMAIN);
+        let empty_digest: [u8; 32] = digest.finalize().into();
+
+        for files in [writer_files, sorter_files] {
+            assert!(files.paths.is_empty());
+            assert!(files.files.is_empty());
+            assert_eq!(files.file_bytes, 0);
+            assert_eq!(files.logical_family_evidence.row_count, 0);
+            assert_eq!(files.logical_family_evidence.logical_bytes, 0);
+            assert_eq!(files.logical_family_evidence.first_key, None);
+            assert_eq!(files.logical_family_evidence.last_key, None);
+            assert_eq!(
+                files.logical_family_evidence.ordered_key_value_digest,
+                empty_digest
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_record_sorter_preserves_per_file_evidence_after_external_sort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let mut sorter = FixedRecordSorter::<4>::new(temporary.path(), "reverse", 1)?;
+        sorter.push([2, 0, 0, 2])?;
+        sorter.push([1, 0, 0, 1])?;
+        let files = sorter.finish::<2>(&Options::default(), 1_024)?;
+
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].entry_count, 2);
+        assert_eq!(files.files[0].first_key, [1, 0]);
+        assert_eq!(files.files[0].last_key, [2, 0]);
+        assert_ne!(files.files[0].ordered_key_value_digest, [0; 32]);
+        assert_eq!(files.logical_family_evidence.row_count, 2);
+        assert_eq!(files.logical_family_evidence.logical_bytes, 8);
+        assert_eq!(files.logical_family_evidence.first_key, Some(vec![1, 0]));
+        assert_eq!(files.logical_family_evidence.last_key, Some(vec![2, 0]));
         Ok(())
     }
 }

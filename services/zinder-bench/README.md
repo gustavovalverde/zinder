@@ -89,9 +89,11 @@ experiments, and `--source-segment-delay-millis` injects a fixed delay into each
 outer fixture segment response.
 
 This command certifies the exact captured bytes, replay-plan checkpoints,
-canonical READY fence, cold reopen, and full scan. It does not contact live
+canonical READY fence, cold reopen, full scan, explicit zero prohibited reads,
+and per-family cold publication scan attribution. It does not contact live
 Zebra and is not live-source, advancing-tip, restart, reorg, canary, or
-production certification.
+production certification. Physical read I/O and Linux peak RSS still require a
+runner that can expose them.
 
 ## 2. Snapshot the starting store
 
@@ -107,38 +109,38 @@ excluding its projection subdirectory:
 rsync -a --exclude '/derive/' /var/lib/zinder/ ./fixtures/store-149999/
 ```
 
-For a threshold-bearing run, take a consistent RocksDB checkpoint with the
-existing ingest backup command (hard-links, so it is cheap and space-light):
+For a threshold-bearing run, stop the canonical writer and clone its primary
+store while no Zinder process has it open:
 
 ```bash
-zinder-ingest backup \
-  --network zcash-mainnet \
-  --storage-path /var/lib/zinder \
-  --to ./fixtures/checkpoint-149999
-rsync -a --exclude '/derive/' \
-  ./fixtures/checkpoint-149999/ \
-  ./fixtures/store-149999/
+systemctl stop zinder
+rsync -a /var/lib/zinder/canonical/ ./fixtures/store-149999/
+systemctl start zinder
 ```
 
-The backup command creates a canonical-plus-projection bundle. Projection
-benchmarks require a fresh projection store for both fixed-range and
-retained-history construction, so every throwaway replay clone must exclude
-the bundle's `derive/` subdirectory. The harness rejects a pre-existing
-projection path instead of silently timing an incremental catch-up. The
-clone's canonical tip must equal `from_height - 1`. Replay writes into the
-clone, so use one throwaway copy per run (or per configuration in a sweep).
+This stopped-store copy is a benchmark fixture, not a production recovery
+artifact. Production recovery remains blocked until the canonical writer and
+wallet projector can publish and verify one coherent canonical schema-v4 and
+wallet schema-v1 checkpoint bundle. Projection benchmarks require a fresh
+projection store for both fixed-range and retained-history construction. The
+harness rejects a pre-existing projection path instead of silently timing an
+incremental catch-up. The clone's canonical tip must equal `from_height - 1`.
+Replay writes into the clone, so use one throwaway copy per run (or per
+configuration in a sweep).
 
-Threshold-bearing non-genesis ranges require the backup's raw
-`zinder-backup-manifest.json`. The harness hashes it before opening the store
-and verifies its network, `ChainEpochId`, tip height, tip hash, and artifact
-schema against the opened canonical store. A thresholded fixture beginning at
-height 1 instead requires a genuinely empty store and does not require a
-manifest. The report distinguishes `empty`, `checkpoint`, and
-`unverified-clone` starting states, so a missing manifest cannot masquerade as
-checkpoint provenance. The manifest proves the backup identity and logical
-starting position; it does not prove byte-identical SST layout or compaction
-state. Formal sweeps must create every throwaway arm from the same backup
-directory. Unthresholded manual clones may omit the manifest.
+Threshold-bearing non-genesis ranges require a benchmark-only
+`zinder-benchmark-starting-store.json` beside the cloned canonical store. The
+harness hashes it before opening the store and verifies its network,
+`ChainEpochId`, tip height, tip hash, and artifact schema against the opened
+canonical store. This manifest is recorded after making the stopped-store copy;
+it is not a recovery manifest. A thresholded fixture beginning at height 1
+instead requires a genuinely empty store and does not require a manifest. The
+report distinguishes `empty`, `checkpoint`, and `unverified-clone` starting
+states, so a missing manifest cannot masquerade as verified benchmark
+provenance. The manifest proves the clone's logical starting position; it does
+not prove byte-identical SST layout or compaction state. Formal sweeps must
+create every throwaway arm from the same stopped-store directory.
+Unthresholded manual clones may omit the manifest.
 
 When the harness runs inside Docker Desktop, place RocksDB stores on named
 Linux volumes rather than host bind mounts. The macOS virtiofs path can report
@@ -409,14 +411,14 @@ component diagnostics in the external resource artifacts.
 
 ## Report fields
 
-- `contract_identity`: exact benchmark report contract identity. Version 1 is
+- `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
 - `report_format_version`: machine-readable report contract version. The
-  closed measurement contract described here is version 1.
-- `measurement_kind`: either `current-schema-fixture-replay` or
-  `canonical-block-facts-round-trip`. The tagged shape prevents fact-only
-  evidence from acquiring placeholder lifecycle or current-schema telemetry
-  fields.
+  closed measurement contract described here is version 2.
+- `measurement_kind`: `current-schema-fixture-replay`,
+  `rocksdb-canonical-fixture-replay`, `canonical-block-facts-round-trip`, or a
+  storage-lifecycle report. The tagged shape prevents fact-only evidence from
+  acquiring placeholder lifecycle or current-schema telemetry fields.
 - `provenance`: benchmark version, software revision, immutable image identity,
   build target OS/architecture, structured runner identity and resources, plus
   `run.trial_id`, `run.fixture_cache_policy`, and binary-generated start and
@@ -456,6 +458,13 @@ component diagnostics in the external resource artifacts.
   because canceled in-flight requests do not expose trustworthy actual bytes.
   The object is `null` when no metrics recorder covered completed segment
   requests.
+- Canonical-fixture `prohibited_reads`: explicit counters for historical
+  prevout and cross-block wallet reads. Both metric series must be present and
+  zero; missing telemetry fails report validation.
+- Canonical-fixture `publication_proof_provenance` records either
+  `trusted-fresh-writer` or `cold-certification`. `publication_family_scans`
+  must be empty for the trusted fresh-writer path and must contain successful
+  cache-bypassing scans grouped by column family for cold certification.
 - `replay.starting_canonical_state`: the opened store's `chain_epoch_id`, tip
   height, RPC-order tip hash, artifact schema version, checkpoint-manifest
   SHA-256, and `empty`, `checkpoint`, or `unverified-clone` provenance kind.

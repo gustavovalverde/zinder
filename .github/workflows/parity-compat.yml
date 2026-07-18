@@ -138,9 +138,11 @@ jobs:
           tip=$(curl -sf -X POST -H 'content-type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
             "${ZEBRA_RPC_URL}" | sed -E 's/.*"result":[[:space:]]*([0-9]+).*/\1/')
-          # Bring ingest to the mined tip, then hand the fixed canonical fence
-          # to the one-shot wallet builder and compatibility service. Fact-first
-          # serving currently requires exclusive primary-store access.
+          # Bring ingest to the mined tip. The one-shot benchmark wallet builder
+          # still opens its input as a primary, so stop only long enough to make
+          # that fixture, then restore the writer before compat starts. Compat
+          # itself authenticates against the live writer and owns secondaries
+          # only; it must never take a primary handle.
           caught_up=""
           for _ in $(seq 1 90); do
             if grep -qE " visible_tip_height=${tip}( |$)" .tmp/ingest.log; then
@@ -163,13 +165,32 @@ jobs:
             --json-rpc-addr "${ZEBRA_RPC_URL}" \
             --canonical-store .tmp/parity-store \
             --wallet-store .tmp/parity-wallet-store > .tmp/wallet-rebuild.json
+
+          ZINDER_STORAGE__RAW_BLOB_POLICY=all ./target/release/zinder-ingest --network zcash-regtest \
+            --storage-path .tmp/parity-store > .tmp/ingest.log 2>&1 &
+          echo "ingest=$!" > .tmp/parity.pids
+          writer_restored=""
+          for _ in $(seq 1 90); do
+            if grep -qE " visible_tip_height=${tip}( |$)" .tmp/ingest.log; then
+              writer_restored=yes
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "${writer_restored}" ]; then
+            echo "ingest did not restore tip ${tip} after wallet build; last ingest log lines:" >&2
+            tail -n 30 .tmp/ingest.log >&2 || true
+            exit 1
+          fi
+
           ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
-            --storage-path .tmp/parity-store \
-            --secondary-path .tmp/parity-secondary-compat \
-            --wallet-storage-path .tmp/parity-wallet-store \
+            --canonical-primary-path .tmp/parity-store \
+            --canonical-secondary-root .tmp/parity-secondary-compat-canonical \
+            --wallet-primary-path .tmp/parity-wallet-store \
+            --wallet-secondary-root .tmp/parity-secondary-compat-wallet \
             --listen-addr 127.0.0.1:9087 \
             --node-json-rpc-addr http://127.0.0.1:39232 > .tmp/compat.log 2>&1 &
-          echo "compat=$!" > .tmp/parity.pids
+          echo "compat=$!" >> .tmp/parity.pids
           compat_ready=""
           for _ in $(seq 1 30); do
             if grep -q "compat_started" .tmp/compat.log; then

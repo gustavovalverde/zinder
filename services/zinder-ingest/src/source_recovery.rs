@@ -199,17 +199,11 @@ pub(crate) fn decide_recovery(
         | IngestError::SourceSegmentFetchTaskStopped { .. }
         | IngestError::DeriveDispatch(_)
         | IngestError::DeriveStore(_)
-        | IngestError::DeriveStoreMissing { .. }
         | IngestError::ProjectionStoreMissingForCanonical { .. }
         | IngestError::ProjectionStoreWithoutCanonicalHistory { .. }
-        | IngestError::ProjectionRetentionCoverageInsufficient { .. }
-        | IngestError::BackupCheckpointStagingExists { .. }
-        | IngestError::BackupCheckpointDestinationExists { .. }
-        | IngestError::BackupCheckpointInstall { .. }
-        | IngestError::BackupManifestEncode { .. }
-        | IngestError::BackupManifestDecode { .. }
-        | IngestError::BackupManifestIo { .. }
-        | IngestError::BackupCheckpointValidation { .. } => SourceRecoveryDecision::Exit,
+        | IngestError::ProjectionRetentionCoverageInsufficient { .. } => {
+            SourceRecoveryDecision::Exit
+        }
     }
 }
 

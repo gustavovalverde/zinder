@@ -210,14 +210,14 @@ In the `server_info` handler on `WalletQueryGrpcAdapter`: include the federated 
 
 ### F5. Readiness probe
 
-In the binary's startup (`services/zinder-query/src/bin/zinder-query/main.rs`): construct the readiness-gated client from its endpoint, bearer token, and target capability, then spawn a background probe that polls the derive service's `ServerInfo` and flips the readiness gauge.
+In the startup path of the serving composition that embeds `WalletQueryGrpcAdapter`: construct the readiness-gated client from its endpoint, bearer token, and target capability, then spawn a background probe that polls the derive service's `ServerInfo` and flips the readiness gauge.
 
 ### F6. Two capability strings per consumer
 
 File: `crates/zinder-proto/src/capabilities.rs`
 
 - `derive.<consumer>.server_info_v1`: advertised by the derive service's own `ServerInfo`; the readiness probe polls for this string.
-- `derive.<consumer>.<method>_v1`: advertised by `zinder-query` when the readiness gauge is `true`.
+- `derive.<consumer>.<method>_v1`: advertised by the composition serving `WalletQueryGrpcAdapter` when the readiness gauge is `true`.
 
 ### F7. Compat shim derive wiring (if applicable)
 

@@ -14,8 +14,11 @@ on:
       - "crates/**"
       - "services/**"
       - "deploy/Dockerfile"
+      - "deploy/Dockerfile.railway-nocache"
       - "deploy/docker-compose.yml"
-      - "deploy/single-container/**"
+      - "railway.toml"
+      - "scripts/validate-deployment-admission.sh"
+      - "scripts/test-deployment-admission.sh"
       - "buf.yaml"
       - ".github/workflows/build-images.yml"
   workflow_dispatch:
@@ -37,6 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify deployment admission
+        run: bash scripts/test-deployment-admission.sh
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -46,10 +52,8 @@ jobs:
 
           images=(
             "zinder-ingest:zinder-ingest:zinder-ingest"
-            "zinder-query:zinder-query:zinder-query"
+            "zinder-projector:zinder-projector:zinder-projector"
             "zinder-compat-lightwalletd:zinder-compat-lightwalletd:zinder-compat-lightwalletd"
-            "zinder-explorer:zinder-explorer:zinder-explorer"
-            "zinder:zinder-single-container:zinder-query"
           )
 
           for image in "${images[@]}"; do

@@ -1,18 +1,12 @@
 //! Configuration loading for the `zinder-ingest` binary.
 //!
-//! The ingest binary has two top-level config shapes:
-//!
-//! - [`IngestCommandConfig`] resolves the unified loop's input
-//!   (`zinder-ingest --config X` default invocation, and `zinder-ingest
-//!   probe`).
-//! - [`BackupCommandConfig`] resolves the `backup` subcommand. Backup
-//!   keeps its own command config because it does not run the loop.
+//! [`IngestCommandConfig`] resolves the unified loop's input
+//! (`zinder-ingest --config X` default invocation and `zinder-ingest probe`).
 
 use std::{
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
-    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -20,28 +14,26 @@ use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_derive::ProjectionPreset;
 use zinder_ingest::{
-    BulkCatchupConfig, CanonicalPipelineLimits, ChainEventRetentionConfig,
-    CommitmentRootBackfillConfig, ConventionalFeeDistributionBackfillConfig,
-    DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    BulkCatchupConfig, CanonicalPipelineLimits, CommitmentRootBackfillConfig,
+    ConventionalFeeDistributionBackfillConfig, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, DeriveReplayPolicy, IngestDeriveConfig, IngestError,
-    IngestLoopConfig, IngestModifiers, MempoolEventRetentionWorkerConfig, NodeSourceKind,
-    PaidFeeDistributionBackfillConfig, PhasesConfig, RawBlobPolicy, TipFollowPhaseConfig,
-    TransactionComponentBackfillConfig, TransactionHistoryVerifierConfig,
-    ValuePoolBalanceBackfillConfig, ValuePoolFlowBackfillConfig, container_memory_budget_bytes,
+    IngestLoopConfig, IngestModifiers, NodeSourceKind, PaidFeeDistributionBackfillConfig,
+    PhasesConfig, RawBlobPolicy, TipFollowPhaseConfig, TransactionComponentBackfillConfig,
+    TransactionHistoryVerifierConfig, ValuePoolBalanceBackfillConfig, ValuePoolFlowBackfillConfig,
+    container_memory_budget_bytes,
 };
 use zinder_runtime::{
-    BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlSection,
-    IngestControlWriterToml, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
-    PrimaryStorageSection, ResolvedIngestControlWriter, ResolvedPrimaryStorage, ResolvedRetention,
-    RetentionSection, RetentionToml, SecuritySection, SecurityToml, ServiceIdentifier,
-    StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
-    require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
-    resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
-    resolve_retention,
+    ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
+    NetworkToml, NodeToml, OpsSection, OpsToml, PrimaryStorageSection, ResolvedIngestControlWriter,
+    ResolvedPrimaryStorage, ResolvedRetention, RetentionSection, RetentionToml, SecuritySection,
+    SecurityToml, ServiceIdentifier, StorageRoleSection, StorageRoleToml, duration_as_millis_u64,
+    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_writer,
+    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
-use zinder_store::{MempoolEventRetentionConfig, RocksDbResourceBudget};
+use zinder_store::RocksDbResourceBudget;
 
 use crate::cli::parse::{
     parse_canonical_batch_max_blocks, parse_node_source, parse_poll_interval_ms,
@@ -134,31 +126,13 @@ pub(crate) struct IngestCommandConfig {
     pub(crate) coverage: IngestCoverage,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
-    pub(crate) ingest_control_bearer_token: Option<BearerToken>,
+    pub(crate) ingest_control_checkpoint_bearer_token_path: Option<PathBuf>,
+    pub(crate) ingest_control_bearer_token: Option<zinder_runtime::BearerToken>,
+    pub(crate) ingest_control_checkpoint_bearer_token: Option<zinder_runtime::BearerToken>,
+    pub(crate) ingest_control_checkpoint_staging_root: PathBuf,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) allow_public_bind: bool,
     pub(crate) retention: ResolvedRetention,
-}
-
-impl IngestCommandConfig {
-    pub(crate) fn chain_event_retention(&self) -> ChainEventRetentionConfig {
-        ChainEventRetentionConfig {
-            retention_window: self.retention.chain_event_window(),
-            check_interval: self.retention.chain_event_check_interval(),
-            cursor_at_risk_warning: self.retention.cursor_at_risk_warning(),
-        }
-    }
-
-    pub(crate) fn mempool_event_retention(&self) -> MempoolEventRetentionWorkerConfig {
-        MempoolEventRetentionWorkerConfig {
-            retention: MempoolEventRetentionConfig::new(
-                self.retention.mempool_mined_window(),
-                self.retention.mempool_invalidated_window(),
-            ),
-            check_interval: self.retention.mempool_check_interval(),
-            cursor_at_risk_warning: self.retention.mempool_cursor_at_risk_warning(),
-        }
-    }
 }
 
 /// Coverage policy applied to the [`IngestModifiers`] bootstrap path.
@@ -186,17 +160,6 @@ impl Default for IngestCoverage {
     fn default() -> Self {
         DEFAULT_INGEST_COVERAGE
     }
-}
-
-/// Fully loaded command configuration for `zinder-ingest backup`.
-#[derive(Debug)]
-pub(crate) struct BackupCommandConfig {
-    pub(crate) network: zinder_core::Network,
-    pub(crate) storage_path: PathBuf,
-    pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
-    pub(crate) derive_rocksdb_budget: RocksDbResourceBudget,
-    pub(crate) raw_blob_policy: RawBlobPolicy,
-    pub(crate) to_path: PathBuf,
 }
 
 /// Fully loaded command configuration for
@@ -241,16 +204,8 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) wallet_serving: Option<bool>,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
+    pub(crate) ingest_control_checkpoint_bearer_token_path: Option<PathBuf>,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
-}
-
-/// Command-line overrides for the backup command.
-#[derive(Debug, Default)]
-pub(crate) struct BackupConfigOverrides {
-    pub(crate) network: Option<String>,
-    pub(crate) storage_path: Option<PathBuf>,
-    pub(crate) to_path: Option<PathBuf>,
-    pub(crate) raw_blob_policy: Option<String>,
 }
 
 /// Command-line overrides for canonical replay verification.
@@ -280,22 +235,6 @@ pub(crate) enum IngestConfigError {
     CanonicalReplayVerification(
         #[from] crate::canonical_replay_verification::CanonicalReplayVerificationError,
     ),
-
-    #[error("failed to bind ingest-control endpoint at {listen_addr}: {source}")]
-    IngestControlBind {
-        listen_addr: SocketAddr,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("ingest-control endpoint failed: {source}")]
-    IngestControlTransport {
-        #[source]
-        source: tonic::transport::Error,
-    },
-
-    #[error("invalid ingest-control bearer token: {0}")]
-    BearerToken(#[from] BearerTokenError),
 }
 
 /// Loads and validates the unified ingest configuration.
@@ -553,6 +492,10 @@ pub(crate) fn load_ingest_config(
             "ingest_control.bearer_token_path",
             overrides.ingest_control_bearer_token_path,
         )?
+        .with_override_path_if(
+            "ingest_control.checkpoint_bearer_token_path",
+            overrides.ingest_control_checkpoint_bearer_token_path,
+        )?
         .with_override_if(
             "ops.listen_addr",
             overrides.ops_listen_addr.map(|addr| addr.to_string()),
@@ -560,23 +503,6 @@ pub(crate) fn load_ingest_config(
         .load()?;
 
     resolve_ingest_config(raw_config)
-}
-
-/// Loads and validates backup configuration.
-pub(crate) fn load_backup_config(
-    config_path: Option<PathBuf>,
-    overrides: BackupConfigOverrides,
-) -> Result<BackupCommandConfig, IngestConfigError> {
-    let raw_config: IngestConfig = ConfigLoader::new()
-        .with_file(config_path)
-        .with_zinder_env()?
-        .with_override_if("network.name", overrides.network)?
-        .with_override_path_if("storage.path", overrides.storage_path)?
-        .with_override_if("storage.raw_blob_policy", overrides.raw_blob_policy)?
-        .with_override_path_if("backup.to_path", overrides.to_path)?
-        .load()?;
-
-    resolve_backup_config(raw_config)
 }
 
 /// Loads and validates canonical replay verification configuration.
@@ -614,16 +540,6 @@ pub(crate) fn redacted_ingest_config_toml(
     ))
 }
 
-/// Renders the effective backup configuration in the accepted TOML
-/// shape.
-pub(crate) fn redacted_backup_config_toml(
-    config: &BackupCommandConfig,
-) -> Result<String, IngestConfigError> {
-    let rendered = toml::to_string(&RedactedBackupConfigToml::from_backup_config(config))
-        .map_err(|source| ConfigError::Render { source })?;
-    Ok(rendered)
-}
-
 /// Renders the effective canonical replay verification configuration in the
 /// accepted TOML shape.
 pub(crate) fn redacted_canonical_replay_verification_config_toml(
@@ -645,7 +561,6 @@ struct IngestConfig {
     ingest: IngestSection,
     ingest_control: IngestControlSection,
     retention: RetentionSection,
-    backup: BackupSection,
     security: SecuritySection,
 }
 
@@ -814,12 +729,6 @@ struct IngestModifiersSection {
     checkpoint_height: Option<u32>,
     allow_near_tip_finalize: Option<bool>,
     coverage: Option<IngestCoverage>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct BackupSection {
-    to_path: Option<PathBuf>,
 }
 
 const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
@@ -1239,6 +1148,9 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         listen_addr: ingest_control_listen_addr,
         bearer_token_path: ingest_control_bearer_token_path,
         bearer_token: ingest_control_bearer_token,
+        checkpoint_bearer_token: ingest_control_checkpoint_bearer_token,
+        checkpoint_bearer_token_path: ingest_control_checkpoint_bearer_token_path,
+        checkpoint_staging_root: ingest_control_checkpoint_staging_root,
     } = resolve_ingest_control_writer(config.ingest_control)?;
     let retention = resolve_retention(config.retention)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
@@ -1247,6 +1159,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         "ingest_control.listen_addr",
         ingest_control_listen_addr,
         allow_public_bind,
+    )?;
+    guard_ingest_control_bearer_token(
+        ingest_control_listen_addr,
+        ingest_control_bearer_token.as_ref(),
     )?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let modifiers = IngestModifiers {
@@ -1310,37 +1226,26 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         coverage,
         ingest_control_listen_addr,
         ingest_control_bearer_token_path,
+        ingest_control_checkpoint_bearer_token_path,
         ingest_control_bearer_token,
+        ingest_control_checkpoint_bearer_token,
+        ingest_control_checkpoint_staging_root,
         ops_listen_addr,
         allow_public_bind,
         retention,
     })
 }
 
-fn resolve_backup_config(config: IngestConfig) -> Result<BackupCommandConfig, IngestConfigError> {
-    let network = config.network.resolve()?;
-    let raw_blob_policy = resolve_raw_blob_policy(
-        config.ingest.modifiers.coverage.unwrap_or_default(),
-        config.storage.raw_blob_policy,
-    )?;
-    let ResolvedPrimaryStorage {
-        path: storage_path,
-        canonical_rocksdb_budget,
-        derive_rocksdb_budget,
-    } = resolve_primary_storage(config.storage.into_primary_storage())?;
-    let to_path = config
-        .backup
-        .to_path
-        .ok_or_else(|| ConfigError::missing_field("backup.to_path"))?;
-
-    Ok(BackupCommandConfig {
-        network,
-        storage_path,
-        canonical_rocksdb_budget,
-        derive_rocksdb_budget,
-        raw_blob_policy,
-        to_path,
-    })
+fn guard_ingest_control_bearer_token(
+    listen_addr: Option<SocketAddr>,
+    bearer_token: Option<&zinder_runtime::BearerToken>,
+) -> Result<(), ConfigError> {
+    if listen_addr.is_some_and(|address| !address.ip().is_loopback()) && bearer_token.is_none() {
+        return Err(ConfigError::invalid(
+            "ingest_control.listen_addr outside loopback requires ingest_control.bearer_token_path",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_canonical_replay_verification_config(
@@ -1390,13 +1295,6 @@ struct RedactedIngestConfigToml {
     ingest: IngestToml,
     ingest_control: IngestControlWriterToml,
     retention: RetentionToml,
-}
-
-#[derive(Serialize)]
-struct RedactedBackupConfigToml {
-    network: NetworkToml,
-    storage: IngestStorageToml,
-    backup: BackupToml,
 }
 
 #[derive(Serialize)]
@@ -1556,25 +1454,12 @@ impl RedactedIngestConfigToml {
             ingest_control: IngestControlWriterToml::from_resolved(
                 config.ingest_control_listen_addr,
                 config.ingest_control_bearer_token_path.as_deref(),
+                config
+                    .ingest_control_checkpoint_bearer_token_path
+                    .as_deref(),
+                &config.ingest_control_checkpoint_staging_root,
             ),
             retention: RetentionToml::from_resolved(config.retention),
-        }
-    }
-}
-
-impl RedactedBackupConfigToml {
-    fn from_backup_config(config: &BackupCommandConfig) -> Self {
-        Self {
-            network: NetworkToml::from_network(config.network),
-            storage: IngestStorageToml {
-                path: config.storage_path.display().to_string(),
-                canonical: StorageRoleToml::from_resolved(config.canonical_rocksdb_budget),
-                derive: StorageRoleToml::from_resolved(config.derive_rocksdb_budget),
-                raw_blob_policy: config.raw_blob_policy,
-            },
-            backup: BackupToml {
-                to_path: config.to_path.display().to_string(),
-            },
         }
     }
 }
@@ -1725,19 +1610,6 @@ struct IngestModifiersToml {
     allow_near_tip_finalize: bool,
     coverage: IngestCoverage,
 }
-
-#[derive(Serialize)]
-struct BackupToml {
-    to_path: String,
-}
-
-/// Re-export used by the `Duration` field above; the helper is the
-/// runtime crate's stable rendering for milliseconds.
-#[allow(
-    dead_code,
-    reason = "kept for forward-compat with code that touched it during refactor"
-)]
-const _: fn(Duration) -> u64 = duration_as_millis_u64;
 
 #[cfg(test)]
 mod tests {
@@ -1902,5 +1774,24 @@ mod tests {
         .err()
         .unwrap_or_else(|| ConfigError::invalid("zero history days was accepted"));
         assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn non_loopback_ingest_control_requires_bearer_token() {
+        let error =
+            guard_ingest_control_bearer_token(Some(SocketAddr::from(([0, 0, 0, 0], 8240))), None)
+                .err()
+                .unwrap_or_else(|| ConfigError::invalid("public ingest control was accepted"));
+
+        assert!(
+            error
+                .to_string()
+                .contains("outside loopback requires ingest_control.bearer_token_path")
+        );
+        assert!(guard_ingest_control_bearer_token(
+            Some(SocketAddr::from(([127, 0, 0, 1], 8240))),
+            None,
+        )
+        .is_ok());
     }
 }

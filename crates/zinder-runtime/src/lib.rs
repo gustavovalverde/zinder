@@ -35,7 +35,7 @@ mod transport;
 
 pub use auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
-    BearerTokenError, BearerTokenServerInterceptor,
+    BearerTokenError, BearerTokenServerInterceptor, bearer_metadata,
 };
 pub use bind_guard::{
     BindAddressClass, classify_bind_address, guard_optional_serving_bind, guard_serving_bind,
@@ -60,23 +60,24 @@ pub use ops_endpoint::{
 };
 pub use readiness::{
     IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessReport, ReadinessState,
-    UpstreamHealth, UpstreamNotReadyDetail,
+    TrafficReadinessInterceptor, UpstreamHealth, UpstreamNotReadyDetail,
 };
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{
     CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
     IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,
-    PrimaryStorageSection, PrimaryStorageToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, ResolvedIngestControlWriter, ResolvedPrimaryStorage,
-    ResolvedRetention, ResolvedSecondaryStorage, RetentionSection, RetentionToml,
-    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecondaryStorageSection,
-    SecondaryStorageToml, SecuritySection, SecurityToml, ServiceIdentifier, StorageRoleSection,
-    StorageRoleToml, defaults as section_defaults, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
-    resolve_canonical_writer_rocksdb_budget, resolve_derive_reader_rocksdb_budget,
-    resolve_derive_writer_rocksdb_budget, resolve_ingest_control_reader,
-    resolve_ingest_control_writer, resolve_ops_listen_addr, resolve_primary_storage,
-    resolve_retention, resolve_secondary_storage,
+    PrimaryStorageSection, PrimaryStorageToml, ProjectorControlSection, ProjectorControlToml,
+    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, ResolvedIngestControlWriter,
+    ResolvedPrimaryStorage, ResolvedProjectorControl, ResolvedRetention, ResolvedSecondaryStorage,
+    RetentionSection, RetentionToml, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
+    SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
+    ServiceIdentifier, StorageRoleSection, StorageRoleToml, defaults as section_defaults,
+    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_canonical_secondary_storage, resolve_canonical_writer_rocksdb_budget,
+    resolve_derive_reader_rocksdb_budget, resolve_derive_writer_rocksdb_budget,
+    resolve_ingest_control_reader, resolve_ingest_control_writer, resolve_ops_listen_addr,
+    resolve_primary_storage, resolve_projector_control, resolve_retention,
+    resolve_secondary_storage,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 pub use transport::{

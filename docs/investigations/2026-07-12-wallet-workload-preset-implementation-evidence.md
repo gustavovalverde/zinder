@@ -1,10 +1,16 @@
 # Wallet Workload Preset Implementation Evidence
 
-Status: Implemented and validated
+Status: Superseded historical evidence
 Date: 2026-07-12
 Author: Gustavo Valverde
 Requirements: `docs/prd/wallet-workload-presets.md`
 Plan: `docs/plans/wallet-workload-presets.md`
+
+The fact-first cutover in
+[`ADR-0035`](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
+supersedes this report's production composition and backup paths. The legacy
+backup command and bundled canonical-plus-derive manifest described below are
+deleted; this file remains only as evidence for the earlier implementation.
 
 This report records the evidence produced by the vertical slices of the wallet workload preset. The implementation exposes a fresh-store `wallet` or `explorer` choice, carries that choice through production composition and recovery, and keeps `explorer` as the default. The dense and recent fixed-input controls satisfy the public-selection gate; live evidence establishes the narrower boundaries that were exercised rather than treating the preset as blanket wallet certification.
 

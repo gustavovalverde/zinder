@@ -2,10 +2,17 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Accepted |
+| Status | Superseded in part by [ADR-0035](0035-fact-first-storage-selection-and-lifecycle.md) |
 | Product | Zinder |
 | Domain | Storage access, service topology, reader freshness |
 | Related | [Storage backend](../architecture/storage-backend.md), [Service boundaries](../architecture/service-boundaries.md), [Service operations](../architecture/service-operations.md) |
+
+ADR-0035 supersedes this ADR's bundled projection, native `zinder-query`
+runtime, and legacy backup decisions. The current topology uses independent
+canonical and wallet stores, `zinder-projector` for wallet construction and
+following, and `zinder-compat-lightwalletd` for request-scoped exact-pair
+serving. The epoch-bound secondary and single-writer principles remain in
+force.
 
 ## Context
 
@@ -102,16 +109,20 @@ RocksDB secondaries do not deliver live subscription semantics. The private inge
 
 - `IngestControl.ChainEvents` carries canonical chain-event envelopes.
 - `IngestControl.MempoolSnapshot` and `IngestControl.MempoolEvents` carry writer-owned mempool state.
-- `zinder-query` proxies native subscription RPCs to wallet clients.
+- The library-only native query adapter may proxy subscription RPCs in embedded
+  and test composition; the first fact-first production release exposes only
+  the compatibility surface.
 - `zinder-compat-lightwalletd` only exposes subscription-like behavior that exists in the vendored lightwalletd protocol.
 
 Read-only RPCs are served directly from the local secondary store. Live writer-owned state crosses `IngestControl`.
 
-## Backup
+## Backup (Superseded)
 
-`zinder-ingest backup --to <path>` uses the RocksDB Checkpoint API to create hardlinked point-in-time checkpoints of both the canonical store and the bundled derive store while the writer is live. The derive checkpoint is staged first, the canonical checkpoint is created second, and the staged derive checkpoint is installed under `<path>/derive`; this ordering can leave restored derive state slightly behind canonical state, but never ahead of it. Restore is operator-driven in v1: stop all processes, replace the storage path with a checkpoint, start the primary, then let readers reopen and catch up.
-
-Checkpoint readers are separate from production readers. They open frozen snapshots and must validate store identity, network, schema version, and visible epoch before serving data.
+This ADR originally coupled canonical and derive checkpoints. That command is
+deleted: it cannot authenticate the independent canonical schema-v4 and wallet
+schema-v1 stores at one fence. ADR-0035 now requires a coherent bundle and
+verified 10,000-block tail before any artifact can be admitted as a production
+backup.
 
 ## Consequences
 
@@ -122,7 +133,8 @@ Positive:
 - Query services can scale locally without owning schema migrations or upstream-node fallbacks.
 - The default reader staleness budget is small and observable.
 - Read paths and subscription paths are separated explicitly.
-- Backup uses a mature RocksDB primitive.
+- Frozen RocksDB checkpoints remain useful for fixtures and diagnostics; the
+  production backup decision is superseded by ADR-0035.
 
 Tradeoffs:
 

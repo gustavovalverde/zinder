@@ -2,7 +2,7 @@
 
 This directory contains the local Prometheus and Grafana stack used to inspect
 Zinder metrics while the binaries run on the host. The compose file intentionally
-does not containerize `zinder-ingest`, `zinder-query`, or
+does not containerize `zinder-ingest`, `zinder-projector`, or
 `zinder-compat-lightwalletd`: the smoke path should exercise the same Cargo-built
 binaries that developers use during T3 live testing.
 
@@ -13,16 +13,21 @@ against the selected local upstream node:
 
 1. Reads the selected Zebra node tip.
 2. Bulk-catches-up a fresh store from a checkpoint.
-3. Creates a RocksDB checkpoint backup and verifies that a restored
-   `zinder-query` process can serve the checkpointed tip.
-4. Starts `zinder-ingest`, `zinder-query`, and
+3. Records that restore is blocked because a coherent canonical-plus-wallet
+   bundle restore is not implemented.
+4. Starts `zinder-ingest`, `zinder-projector`, and
    `zinder-compat-lightwalletd` with `/metrics` endpoints.
-5. Attempts to mine one regtest block so the live ingest writer path records a
-   commit after startup.
-6. Calls the native `WalletQuery` API and the lightwalletd-compatible
-   `CompactTxStreamer` API with `grpcurl`.
-7. Waits for Prometheus scrapes, prints metric samples, and writes JSON and
-   Markdown readiness reports under `.tmp/observability/reports`.
+5. Requires ingest, projector, and compatibility `/readyz` responses before
+   sending traffic.
+6. Optionally mines explicitly requested regtest blocks so the live ingest
+   writer path records a commit after startup. Node mutation is disabled by
+   default.
+7. Calls the lightwalletd-compatible `CompactTxStreamer` API with `grpcurl`.
+8. Fails if Prometheus reports a traffic-blocking readiness cause or any of the
+   3 service scrape targets is unavailable.
+9. Archives JSON readiness samples, raw metrics, process logs, exact writer
+   fences, `GetLightdInfo`, the Zebra version, and the Git revision under
+   `.tmp/observability/reports/<run-id>-evidence`.
 
 This is a local observability smoke, not a benchmark. It proves the metrics are
 emitted, scrapeable, and usable for bottleneck investigation. Use the T2 perf
@@ -46,6 +51,7 @@ Required commands:
 - `grpcurl`
 - `jq`
 - `python3`
+- `ps`
 
 ## Run
 
@@ -53,12 +59,37 @@ Required commands:
 scripts/observability-smoke.sh run
 ```
 
+To exercise the advancing 3-process topology against regtest, enable the
+destructive certification phases explicitly:
+
+```bash
+ZINDER_OBSERVABILITY_CERTIFY_TOPOLOGY=1 \
+scripts/observability-smoke.sh run
+```
+
+The opt-in path pauses the projector while Zebra advances beyond the configured
+compatibility lag threshold, requires the typed `replica_lagging` readiness
+cause, resumes the projector, and waits for exact-pair recovery. It then
+restarts compatibility, projector, and ingest one at a time, requiring the
+complete readiness chain after each restart, before invalidating 1 regtest
+block and mining a 2-block replacement branch. The pass condition requires both
+the node and compatibility `GetBlock` to expose a different hash at the
+invalidated height, and requires the authenticated writer fence to advance onto
+the replacement branch.
+
+Before any mutation, the script checks the live node rather than trusting only
+the configured network name. Zebra uses the BIP70 chain name `test` for both
+testnet and regtest, so the check also requires the default regtest activation
+fingerprint, where every advertised upgrade activates at height 1, plus every
+RPC used by the certification. The script refuses mutation on a mismatched
+node, and refuses complete-topology certification on `calibrate`.
+
 The script leaves the services running so dashboards remain inspectable:
 
 - Prometheus: <http://127.0.0.1:9095>
 - Grafana: <http://127.0.0.1:3002>
 - Ingest metrics: <http://127.0.0.1:9190/metrics>
-- Query metrics: <http://127.0.0.1:9191/metrics>
+- Projector metrics: <http://127.0.0.1:9194/metrics>
 - Compat metrics: <http://127.0.0.1:9192/metrics>
 
 Grafana uses `admin/admin` by default. Override with
@@ -126,6 +157,19 @@ Reports are written to:
 - `.tmp/observability/reports/latest-readiness.md`
 - `.tmp/observability/reports/latest-calibration.json`
 - `.tmp/observability/reports/latest-calibration.md`
+- `.tmp/observability/reports/<run-id>-evidence/manifest.json`
+
+The evidence directory also contains every readiness transition sampled during
+lag, restart, and reorg phases, the remote mutation preflight, compact blocks
+before and after reorg, and writer fences before and after controlled changes. A
+failed certification can leave partial evidence in that directory and the live
+process logs under `.tmp/observability/logs`.
+
+The live smoke proves process and network lifecycle behavior. The deterministic
+`atomic_publication_keeps_a_retired_generation_until_every_request_arc_drains`
+test remains the gate for an old request retaining its original storage handles
+while a new pair is published; the shell smoke does not manufacture a delayed
+wallet request to duplicate that proof.
 
 ## Tunables
 
@@ -134,20 +178,28 @@ Reports are written to:
 | `ZINDER_OBSERVABILITY_NETWORK` | `zcash-regtest` | Network written to service configs. |
 | `ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS` | `50` | Blocks ingested after the checkpoint. |
 | `ZINDER_OBSERVABILITY_CANONICAL_BATCH_MAX_BLOCKS` | `25` | Maximum blocks per canonical bulk-catchup batch. |
-| `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` | `1` | Regtest blocks to mine after the ingest loop reaches the `TipFollow` phase. Set `0` to skip. |
+| `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` | `0` | Explicitly requested regtest blocks to mine after the ingest loop reaches the `TipFollow` phase. |
+| `ZINDER_OBSERVABILITY_CERTIFY_TOPOLOGY` | `0` | Set `1` on the `run` command to enable regtest-only lag, restart, and reorg certification. |
+| `ZINDER_OBSERVABILITY_COMPAT_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS` | `4` | Compatibility readiness threshold written to the generated config. |
+| `ZINDER_OBSERVABILITY_CERTIFICATION_LAG_BLOCKS` | Threshold plus `1` | Blocks mined while the projector is suspended; this must exceed the compatibility lag threshold. |
+| `ZINDER_OBSERVABILITY_WORK_DIR` | `.tmp/observability` | Absolute harness-owned directory for generated state, configs, logs, and evidence. |
 | `ZINDER_OBSERVABILITY_RESET` | `1` | Reset `.tmp/observability` before a run. |
-| `ZINDER_OBSERVABILITY_BACKUP_RESTORE` | `1` | Create a checkpoint backup and verify it through a restored query process. |
 | `ZINDER_OBSERVABILITY_RUNS` | `5` | Number of smoke repetitions for `calibrate`. |
 | `ZINDER_PROMETHEUS_PORT` | `9095` | Host Prometheus port. |
 | `ZINDER_GRAFANA_PORT` | `3002` | Host Grafana port. |
 | `ZINDER_OBSERVABILITY_INGEST_OPS_ADDR` | `0.0.0.0:9190` | Ingest `/metrics` bind address. |
-| `ZINDER_OBSERVABILITY_QUERY_OPS_ADDR` | `0.0.0.0:9191` | Query `/metrics` bind address. |
+| `ZINDER_OBSERVABILITY_PROJECTOR_OPS_ADDR` | `0.0.0.0:9194` | Projector `/metrics` bind address. |
 | `ZINDER_OBSERVABILITY_COMPAT_OPS_ADDR` | `0.0.0.0:9192` | Compat `/metrics` bind address. |
 
 The script writes generated configs and logs under `.tmp/observability`, which
 is ignored by Git. It strips `ZINDER_OBSERVABILITY_*` variables before launching
 Zinder binaries, so harness-control values cannot be mistaken for production
 configuration by the shared `ZINDER_*` config loader.
+
+Reset is allowed only for an absent or empty absolute work directory, or one
+already marked as owned by this harness. A non-empty unmarked override fails
+closed before any child path is removed; do not point the harness at a live
+Zinder store or a shared operator directory.
 
 ## Expected Signals
 
@@ -160,24 +212,23 @@ The smoke should produce samples for:
 - `zinder_ingest_commit_duration_seconds_count`
 - `zinder_ingest_writer_chain_epoch_id`
 - `zinder_ingest_writer_status_request_total`
-- `zinder_query_request_total`
-- `zinder_query_secondary_catchup_total`
-- `zinder_query_secondary_replica_lag_chain_epochs`
-- `zinder_query_writer_status_request_total`
+- `zinder_compat_lightwalletd_frozen_pair_publications_total`
+- `zinder_compat_lightwalletd_frozen_pair_convergence_total`
+- `zinder_compat_lightwalletd_frozen_pair_replica_lag_chain_epochs`
+- `zinder_compat_lightwalletd_writer_status_total`
 - `zinder_store_read_duration_seconds_count`
 - `zinder_store_visibility_seek_total`
 - `zinder_store_rocksdb_property`
 
-If the local node cannot mine regtest blocks, the ingest process still
+When block generation remains at its default of `0`, the ingest process still
 runs and node-poll metrics remain visible, but the live
 `zinder_ingest_commit_duration_seconds_count` sample may stay absent until a new
 block arrives.
 
-The default smoke run executes the one-shot `backup` command and verifies
-the restored checkpoint by serving `WalletQuery/LatestBlock` from it. Backup
-metrics may be absent from Prometheus because the backup process exits
-before a long-running scrape path exists; the readiness report records the
-backup-restore outcome directly.
+Restore is deliberately not exercised: no coherent canonical-plus-wallet
+bundle restore exists. The readiness report records that blocked boundary
+directly and the smoke does not synthesize a restore result from an incomplete
+store checkpoint.
 
 ## Alert Rules
 
@@ -202,12 +253,9 @@ should make writer, secondary-reader, and replica-lag failures easy to spot:
 - `Traffic-Blocking Services`: red when any service reports a readiness cause
   that should fail load-balancer readiness.
 - `Storage Access Availability`: red when writer-status serving, writer-status
-  fetching, or secondary visibility is unavailable over the last five minutes.
+  fetching, or frozen-pair readiness is unavailable over the last five minutes.
 - `Replica Lag`: chain-epoch lag from readiness and secondary catchup.
-- `Writer vs Reader Chain Epoch`: writer progress versus query-visible progress.
-- `Secondary Catchup P95`: catchup latency for the secondary reader.
-- `Storage Access Error Rate`: writer-status and secondary-catchup error rates.
+- `Canonical Writer Chain Epoch`: authenticated canonical-writer progress.
+- `Secondary Catchup P95`: catchup latency for the frozen compat reader pair.
+- `Storage Access Error Rate`: writer-status and frozen-pair catchup error rates.
   A flat zero line is the healthy state.
-- `Backup Outcomes`: optional backup command outcomes. The default smoke run
-  shows `not_exercised_by_smoke` because backup is a one-shot command and is
-  not part of the long-running scrape path.

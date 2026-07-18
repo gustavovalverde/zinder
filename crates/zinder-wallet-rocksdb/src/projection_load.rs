@@ -21,10 +21,10 @@ use zinder_rocksdb::{
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
     WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
-    WalletAddressUnspentOutputKey, WalletOutpointKey, WalletProjectionContractError,
-    WalletProjectionDigest, WalletProjectionDigestBuilder, WalletProjectionFamilyRowCounts,
-    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition,
-    WalletUnspentOutput, WalletUtxoSetSummary,
+    WalletAddressUnspentOutputKey, WalletOutpointKey, WalletProjectionAccumulator,
+    WalletProjectionContractError, WalletProjectionDigest, WalletProjectionDigestBuilder,
+    WalletProjectionFamilyRowCounts, WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput,
+    WalletTransactionPosition, WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
 use crate::{
@@ -50,6 +50,7 @@ pub(crate) struct ProjectionLoadConfig<'options> {
     pub(crate) staging_path: &'options Path,
     pub(crate) options: &'options Options,
     pub(crate) network: Network,
+    pub(crate) settled_tip: BlockId,
     pub(crate) supported_reorg_depth: u32,
     pub(crate) max_outpoint_sort_memory_bytes: u64,
     pub(crate) max_secondary_sort_memory_bytes_per_sorter: u64,
@@ -94,6 +95,7 @@ pub(crate) struct PreparedWalletProjectionLoad {
     pub(crate) tip: BlockId,
     pub(crate) source_sequence_digest: CanonicalBlockFactsSequenceDigest,
     pub(crate) projection_digest: WalletProjectionDigest,
+    pub(crate) projection_accumulator: WalletProjectionAccumulator,
     pub(crate) row_counts: WalletProjectionFamilyRowCounts,
     pub(crate) utxo_summary: WalletUtxoSetSummary,
     pub(crate) counters: WalletProjectionLoadCounters,
@@ -139,35 +141,49 @@ impl ProjectionSstEvidence {
 struct RetainedUndo {
     records: VecDeque<WalletReorgUndo>,
     supported_depth: usize,
+    settled_tip: BlockId,
+    tracking_current_block: bool,
     accounted_bytes: u64,
     peak_accounted_bytes: u64,
     max_accounted_bytes: u64,
 }
 
 impl RetainedUndo {
-    fn new(supported_depth: u32, max_accounted_bytes: u64) -> Self {
+    fn new(supported_depth: u32, settled_tip: BlockId, max_accounted_bytes: u64) -> Self {
         Self {
             records: VecDeque::new(),
             supported_depth: usize::try_from(supported_depth).unwrap_or(usize::MAX),
+            settled_tip,
+            tracking_current_block: false,
             accounted_bytes: 0,
             peak_accounted_bytes: 0,
             max_accounted_bytes,
         }
     }
 
-    fn begin_block(&mut self, block: BlockId) -> Result<(), RocksDbWalletError> {
-        if self.supported_depth == 0 {
+    fn begin_block(
+        &mut self,
+        block: BlockId,
+        parent_hash: BlockHash,
+        source_sequence_digest_before: CanonicalBlockFactsSequenceDigest,
+        source_sequence_digest_after: CanonicalBlockFactsSequenceDigest,
+    ) -> Result<(), RocksDbWalletError> {
+        self.tracking_current_block = false;
+        if block.height < self.settled_tip.height {
             return Ok(());
         }
-        while self.records.len() >= self.supported_depth {
-            let expired = self
-                .records
-                .pop_front()
-                .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
-            self.accounted_bytes = self
-                .accounted_bytes
-                .checked_sub(accounted_undo_bytes(&expired)?)
-                .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+        if block.height == self.settled_tip.height {
+            if block != self.settled_tip {
+                return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
+                    reason: "canonical replay settled-height block differs from the admitted settled tip",
+                });
+            }
+            return Ok(());
+        }
+        if self.supported_depth == 0 || self.records.len() >= self.supported_depth {
+            return Err(RocksDbWalletError::ProjectionRebuildRequired {
+                reason: "canonical unsettled suffix exceeds the wallet's configured undo capacity",
+            });
         }
         self.reserve(
             u64::try_from(size_of::<WalletReorgUndo>())
@@ -175,15 +191,19 @@ impl RetainedUndo {
         )?;
         self.records.push_back(WalletReorgUndo {
             block,
+            parent_hash,
+            source_sequence_digest_before,
+            source_sequence_digest_after,
             created_outpoints: Vec::new(),
             spent_outpoints: Vec::new(),
             address_transaction_keys: Vec::new(),
         });
+        self.tracking_current_block = true;
         Ok(())
     }
 
     fn add_created_outpoint(&mut self, key: WalletOutpointKey) -> Result<(), RocksDbWalletError> {
-        if self.supported_depth == 0 {
+        if !self.tracking_current_block {
             return Ok(());
         }
         self.reserve(
@@ -199,7 +219,7 @@ impl RetainedUndo {
     }
 
     fn add_spent_outpoint(&mut self, key: WalletOutpointKey) -> Result<(), RocksDbWalletError> {
-        if self.supported_depth == 0 {
+        if !self.tracking_current_block {
             return Ok(());
         }
         self.reserve(
@@ -215,7 +235,7 @@ impl RetainedUndo {
     }
 
     fn finish_block(&mut self) -> Result<(), RocksDbWalletError> {
-        if self.supported_depth == 0 {
+        if !self.tracking_current_block {
             return Ok(());
         }
         let undo = self
@@ -228,10 +248,16 @@ impl RetainedUndo {
     }
 
     fn reserve_transient(&mut self, additional_bytes: u64) -> Result<(), RocksDbWalletError> {
+        if !self.tracking_current_block {
+            return Ok(());
+        }
         self.reserve(additional_bytes)
     }
 
     fn release_transient(&mut self, bytes: u64) -> Result<(), RocksDbWalletError> {
+        if !self.tracking_current_block {
+            return Ok(());
+        }
         self.accounted_bytes = self
             .accounted_bytes
             .checked_sub(bytes)
@@ -293,6 +319,7 @@ pub(crate) fn write_projection_ssts(
     )?;
     let mut retained_undo = RetainedUndo::new(
         config.supported_reorg_depth,
+        config.settled_tip,
         config.max_accounted_reorg_undo_bytes,
     );
     let mut sequence_digest =
@@ -311,10 +338,17 @@ pub(crate) fn write_projection_ssts(
         let block = BlockId::new(facts.block_header.height, facts.block_header.block_hash);
         validate_next_block(previous_block, block, facts.block_header.parent_hash)?;
         first_block.get_or_insert(block);
+        let source_sequence_digest_before = sequence_digest.clone().finish();
         sequence_digest.try_append(reference_digest)?;
+        let source_sequence_digest_after = sequence_digest.clone().finish();
         scanned_block_count = increment(scanned_block_count)?;
 
-        retained_undo.begin_block(block)?;
+        retained_undo.begin_block(
+            block,
+            facts.block_header.parent_hash,
+            source_sequence_digest_before,
+            source_sequence_digest_after,
+        )?;
         let mut block_created_outpoints = BTreeSet::new();
         for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
             let tx_index_in_block = u32::try_from(transaction_index)
@@ -487,7 +521,7 @@ pub(crate) fn write_projection_ssts(
 
     let phase_started = Instant::now();
     let row_counts = digest.row_counts();
-    let projection_digest = digest.finish();
+    let (projection_accumulator, projection_digest) = digest.finish_with_accumulator();
     let logical_evidence = phase_started.elapsed();
     let artifacts = [
         (TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, unspent_files),
@@ -515,6 +549,7 @@ pub(crate) fn write_projection_ssts(
         tip,
         source_sequence_digest: sequence_digest.finish(),
         projection_digest,
+        projection_accumulator,
         row_counts,
         utxo_summary: WalletUtxoSetSummary {
             utxo_count,
@@ -929,32 +964,6 @@ fn decode_spend_trailer(encoded: &[u8]) -> Result<StagedSpend, RocksDbWalletErro
     })
 }
 
-fn accounted_undo_bytes(undo: &WalletReorgUndo) -> Result<u64, RocksDbWalletError> {
-    let bytes = size_of::<WalletReorgUndo>()
-        .checked_add(
-            undo.created_outpoints
-                .len()
-                .checked_mul(size_of::<WalletOutpointKey>())
-                .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?,
-        )
-        .and_then(|bytes| {
-            bytes.checked_add(
-                undo.spent_outpoints
-                    .len()
-                    .checked_mul(size_of::<WalletOutpointKey>())?,
-            )
-        })
-        .and_then(|bytes| {
-            bytes.checked_add(
-                undo.address_transaction_keys
-                    .len()
-                    .checked_mul(size_of::<WalletAddressTransactionKey>())?,
-            )
-        })
-        .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
-    u64::try_from(bytes).map_err(|_| RocksDbWalletError::ProjectionLoadAccountingOverflow)
-}
-
 fn increment(counter: u64) -> Result<u64, RocksDbWalletError> {
     counter
         .checked_add(1)
@@ -1064,7 +1073,12 @@ mod tests {
         ];
         let duplicate_spend_replays = validated_replays(&duplicate_spends)?;
         let duplicate_spend_result = write_projection_ssts(
-            test_config(temporary.path(), &options, TestByteLimits::default()),
+            test_config_with_settled_tip(
+                temporary.path(),
+                &options,
+                TestByteLimits::default(),
+                BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32])),
+            ),
             canonical_scan(duplicate_spend_replays),
         );
         assert!(matches!(
@@ -1152,6 +1166,10 @@ mod tests {
         assert_eq!(zero.row_counts, zero_oracle.row_counts());
         assert_eq!(zero.utxo_summary, zero_oracle.utxo_summary());
         assert_eq!(zero.projection_digest, zero_oracle.projection_digest()?);
+        assert_eq!(
+            zero.projection_accumulator,
+            zero_oracle.projection_accumulator()?
+        );
         assert_eq!(zero.row_counts.transparent_unspent_output_count, 1);
         assert_eq!(zero.row_counts.transparent_address_balance_count, 0);
 
@@ -1169,13 +1187,22 @@ mod tests {
             )],
         )];
         let mixed = write_projection_ssts(
-            test_config(temporary.path(), &options, TestByteLimits::default()),
+            test_config_with_settled_tip(
+                temporary.path(),
+                &options,
+                TestByteLimits::default(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xd1; 32])),
+            ),
             canonical_scan(validated_replays(&mixed_blocks)?),
         )?;
         let mixed_oracle = oracle_for(&mixed_blocks)?;
         assert_eq!(mixed.row_counts, mixed_oracle.row_counts());
         assert_eq!(mixed.utxo_summary, mixed_oracle.utxo_summary());
         assert_eq!(mixed.projection_digest, mixed_oracle.projection_digest()?);
+        assert_eq!(
+            mixed.projection_accumulator,
+            mixed_oracle.projection_accumulator()?
+        );
         assert_eq!(mixed.row_counts.transparent_unspent_output_count, 2);
         assert_eq!(mixed.row_counts.transparent_address_balance_count, 1);
         assert_eq!(mixed.utxo_summary.total_value_zat, 7);
@@ -1289,10 +1316,25 @@ mod tests {
         options: &'options Options,
         limits: TestByteLimits,
     ) -> ProjectionLoadConfig<'options> {
+        test_config_with_settled_tip(
+            staging_path,
+            options,
+            limits,
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xc1; 32])),
+        )
+    }
+
+    fn test_config_with_settled_tip<'options>(
+        staging_path: &'options Path,
+        options: &'options Options,
+        limits: TestByteLimits,
+        settled_tip: BlockId,
+    ) -> ProjectionLoadConfig<'options> {
         ProjectionLoadConfig {
             staging_path,
             options,
             network: Network::ZcashRegtest,
+            settled_tip,
             supported_reorg_depth: 0,
             max_outpoint_sort_memory_bytes: limits.outpoint_sort,
             max_secondary_sort_memory_bytes_per_sorter: limits.secondary_sort_per_sorter,

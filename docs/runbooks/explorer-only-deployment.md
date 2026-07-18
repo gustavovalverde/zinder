@@ -1,8 +1,11 @@
 # Explorer-only deployment
 
-Status: Stable
-Audience: operators standing up `zinder-explorer` against an existing
-`zinder-query` deployment.
+Status: Deferred until the post-wallet-cutover explorer migration
+Audience: maintainers planning the future `zinder-explorer` topology.
+
+The standalone query runtime and its release image are deleted. This runbook
+is retained only as input to Phase 9 of the fact-first wallet-serving plan; do
+not use it to deploy the first fact-first production release.
 
 This runbook covers the topology a block-explorer consumer expects in
 production: one `zinder-explorer` instance per region, federated to a

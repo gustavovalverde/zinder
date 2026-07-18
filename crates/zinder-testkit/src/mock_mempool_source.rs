@@ -82,6 +82,15 @@ impl MockMempoolSourceControl {
         self.push_result(Ok(MempoolSourceEvent::Added(entry)))
     }
 
+    /// Marks the currently scripted source generation as fully hydrated.
+    ///
+    /// The marker is a source-control event. It is intentionally distinct
+    /// from `Added`, `Invalidated`, and `Mined` so tests can prove that
+    /// consumers do not append it to durable mempool lifecycle history.
+    pub fn complete_initial_snapshot(&self) -> Result<(), MockMempoolSourceClosed> {
+        self.push_result(Ok(MempoolSourceEvent::InitialSnapshotComplete))
+    }
+
     /// Pushes an `Invalidated` event into the open stream.
     pub fn push_invalidated(
         &self,
@@ -193,6 +202,7 @@ mod tests {
         let mut stream = mock.events().await?;
 
         control.push_added(sample_entry(0x10))?;
+        control.complete_initial_snapshot()?;
         control.push_mined(
             TransactionId::from_bytes([0x11; 32]),
             BlockHeight::new(101),
@@ -204,7 +214,13 @@ mod tests {
         assert!(matches!(first_event, MempoolSourceEvent::Added(_)));
 
         let second_event = stream.next().await.ok_or("expected second event")??;
-        assert!(matches!(second_event, MempoolSourceEvent::Mined { .. }));
+        assert!(matches!(
+            second_event,
+            MempoolSourceEvent::InitialSnapshotComplete
+        ));
+
+        let third_event = stream.next().await.ok_or("expected third event")??;
+        assert!(matches!(third_event, MempoolSourceEvent::Mined { .. }));
 
         let after_close = stream.next().await;
         assert!(after_close.is_none());

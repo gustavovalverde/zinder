@@ -440,8 +440,14 @@ pub async fn load_fresh_canonical<Source>(
 where
     Source: NodeSource + Clone,
 {
+    register_fact_first_prohibited_read_metrics();
     let block_outcome = load_fresh_canonical_blocks(builder, source, config).await?;
     load_fresh_canonical_source_families(block_outcome, source, config).await
+}
+
+pub(crate) fn register_fact_first_prohibited_read_metrics() {
+    metrics::counter!("zinder_ingest_canonical_historical_prevout_reads_total").absolute(0);
+    metrics::counter!("zinder_ingest_canonical_cross_block_wallet_reads_total").absolute(0);
 }
 
 const fn raw_blob_policy_for_workload(workload: CanonicalStoreWorkload) -> RawBlobPolicy {

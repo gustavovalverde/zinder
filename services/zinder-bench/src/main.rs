@@ -32,6 +32,7 @@ use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSour
 #[path = "canonical_fact_round_trip/command.rs"]
 mod fact_round_trip_command;
 mod rocksdb_canonical_fixture_replay;
+mod rocksdb_compact_block_range;
 mod rocksdb_storage_lifecycle;
 mod rocksdb_wallet_rebuild;
 
@@ -39,6 +40,7 @@ use fact_round_trip_command::{CanonicalFactsRoundTripArgs, run_canonical_facts_r
 use rocksdb_canonical_fixture_replay::{
     RocksDbCanonicalFixtureReplayArgs, run_rocksdb_canonical_fixture_replay,
 };
+use rocksdb_compact_block_range::{RocksDbCompactBlockRangeArgs, run_rocksdb_compact_block_range};
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
 
@@ -82,6 +84,9 @@ enum Command {
     /// Rebuild and cold-admit a wallet store from an existing READY canonical store.
     #[command(name = "rocksdb-wallet-rebuild")]
     RocksDbWalletRebuild(RocksDbWalletRebuildArgs),
+    /// Measure version-1 compact-block ranges through an admitted secondary.
+    #[command(name = "rocksdb-compact-block-range")]
+    RocksDbCompactBlockRange(RocksDbCompactBlockRangeArgs),
 }
 
 #[derive(Args)]
@@ -352,6 +357,10 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             write_report_to_stdout(&encoded);
             Ok(())
         }
+        Command::RocksDbCompactBlockRange(args) => {
+            let output = run_rocksdb_compact_block_range(args)?;
+            emit_report(&output.report, output.report_path.as_deref())
+        }
     }
 }
 
@@ -503,7 +512,7 @@ fn canonical_fixture_replay_thresholds(
 }
 
 fn emit_report(
-    report: &BenchmarkReport,
+    report: &impl serde::Serialize,
     report_path: Option<&std::path::Path>,
 ) -> Result<(), BenchError> {
     let encoded = serde_json::to_vec_pretty(report)?;
@@ -686,6 +695,25 @@ mod tests {
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbWalletRebuild(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_compact_block_range_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "rocksdb-compact-block-range",
+            "--fixture",
+            "fixture",
+            "--canonical-store",
+            "canonical",
+            "--secondary-root",
+            "secondary",
+            "--software-revision",
+            "5079515",
+        ])?;
+
+        assert!(matches!(cli.command, Command::RocksDbCompactBlockRange(_)));
         Ok(())
     }
 

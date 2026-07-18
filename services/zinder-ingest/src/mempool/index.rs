@@ -12,16 +12,17 @@
 //! [`MempoolIndex::apply_invalidated`], [`MempoolIndex::apply_mined`]) take
 //! a write lock.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use thiserror::Error;
 use zinder_core::{
     MempoolEntry, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput,
     TransparentMempoolSpend, TransparentOutPoint, TransparentOutput, TransparentOutputEntry,
     UnixTimestampMillis,
 };
-use zinder_store::MempoolEventPosition;
+use zinder_store::{MempoolEvent, MempoolEventPosition};
 
 /// Outcome of applying a single source-observed event to the index.
 ///
@@ -36,6 +37,47 @@ pub enum MempoolApplyOutcome {
     /// Source observation was a no-op (e.g. duplicate `Added` for an
     /// already-known txid, or `Invalidated`/`Mined` for an unknown txid).
     NoChange,
+}
+
+/// Result of validating an index transition before durable event append.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MempoolIndexPreflight {
+    /// The matching in-memory mutation is guaranteed to change the index.
+    Apply,
+    /// The observation is already represented or names no live entry.
+    NoChange,
+}
+
+/// A source event cannot safely mutate the live transparent overlays.
+#[derive(Debug, Error)]
+pub(crate) enum MempoolIndexInvariantError {
+    /// A new entry would overwrite an output currently owned by another mempool transaction.
+    #[error("mempool output {outpoint:?} conflicts with an existing live entry")]
+    OutputCollision {
+        /// Output that would be overwritten.
+        outpoint: TransparentOutPoint,
+    },
+    /// A new entry would overwrite a spender currently indexed for one outpoint.
+    #[error("mempool spend {outpoint:?} conflicts with an existing live entry")]
+    SpendCollision {
+        /// Outpoint with multiple live spenders.
+        outpoint: TransparentOutPoint,
+    },
+    /// One source entry repeated an output outpoint internally.
+    #[error("mempool entry repeats output {outpoint:?}")]
+    DuplicateOutput {
+        /// Repeated output outpoint.
+        outpoint: TransparentOutPoint,
+    },
+    /// One source entry repeated a spent outpoint internally.
+    #[error("mempool entry repeats spend {outpoint:?}")]
+    DuplicateSpend {
+        /// Repeated spent outpoint.
+        outpoint: TransparentOutPoint,
+    },
+    /// A future source-event variant has no verified index transition.
+    #[error("mempool event variant is unsupported")]
+    UnsupportedEvent,
 }
 
 /// Deterministic page of live mempool entries.
@@ -89,6 +131,68 @@ impl MempoolIndex {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Validates a source transition before it is appended to the durable log.
+    ///
+    /// A caller that receives [`MempoolIndexPreflight::Apply`] can append the
+    /// matching event, then invoke the corresponding `apply_*` method without
+    /// risking a duplicate, missing entry, or transparent-overlay overwrite.
+    pub(crate) fn preflight_event(
+        &self,
+        event: &MempoolEvent,
+    ) -> Result<MempoolIndexPreflight, MempoolIndexInvariantError> {
+        let state = self.state.read();
+        match event {
+            MempoolEvent::Added { entry } => {
+                if state.entries.contains_key(&entry.transaction_id) {
+                    return Ok(MempoolIndexPreflight::NoChange);
+                }
+                let mut output_outpoints = HashSet::new();
+                for output in &entry.transparent_outputs {
+                    if !output_outpoints.insert(output.outpoint) {
+                        return Err(MempoolIndexInvariantError::DuplicateOutput {
+                            outpoint: output.outpoint,
+                        });
+                    }
+                    if state.output_by_outpoint.contains_key(&output.outpoint) {
+                        return Err(MempoolIndexInvariantError::OutputCollision {
+                            outpoint: output.outpoint,
+                        });
+                    }
+                }
+                let mut spent_outpoints = HashSet::new();
+                for spend in &entry.transparent_spends {
+                    if !spent_outpoints.insert(spend.spent_outpoint) {
+                        return Err(MempoolIndexInvariantError::DuplicateSpend {
+                            outpoint: spend.spent_outpoint,
+                        });
+                    }
+                    if state.spend_by_outpoint.contains_key(&spend.spent_outpoint) {
+                        return Err(MempoolIndexInvariantError::SpendCollision {
+                            outpoint: spend.spent_outpoint,
+                        });
+                    }
+                }
+                Ok(MempoolIndexPreflight::Apply)
+            }
+            MempoolEvent::Invalidated { transaction_id, .. }
+            | MempoolEvent::Mined { transaction_id, .. } => {
+                Ok(if state.entries.contains_key(transaction_id) {
+                    MempoolIndexPreflight::Apply
+                } else {
+                    MempoolIndexPreflight::NoChange
+                })
+            }
+            MempoolEvent::Suppressed { .. } => Ok(MempoolIndexPreflight::Apply),
+            _ => Err(MempoolIndexInvariantError::UnsupportedEvent),
+        }
+    }
+
+    /// Clears the process-local state before a source reseed after an
+    /// unexpected post-append divergence.
+    pub(crate) fn reset(&self) {
+        *self.state.write() = MempoolIndexState::default();
     }
 
     /// Inserts a hydrated entry, recording `applied_event` as the index's

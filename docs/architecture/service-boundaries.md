@@ -1,33 +1,22 @@
 # Service Boundaries
 
-Zinder is one product with multiple deployable services. The boundary rule is simple: the service that follows the chain writes canonical state, and the service that serves wallets reads epoch-bound state through a Zinder-owned read contract.
+Zinder is one product with three deployable services in the first fact-first
+release. The boundary rule is simple: ingest alone writes canonical facts,
+projector alone writes wallet state, and compatibility serves only a
+request-scoped exact pair of read-only canonical and wallet generations.
 
 ## Current Boundary Map
 
-| Boundary                     | Owns                                                                                                                    | Must Not Own                                                                    |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `zinder-ingest`              | Upstream node connections, unified ingest loop (bulk catch-up and tip-follow phases), reorg handling, canonical artifact commits, ingest-hosted derive commits, migrations | Public wallet traffic, user wallet secrets, explorer query serving              |
-| `zinder-query`               | Wallet-facing APIs, explorer read APIs, transaction broadcast facade, response consistency                              | Chain selection, canonical writes, migrations, derived-index repair             |
-| `zinder-compat-lightwalletd` | Vendored lightwalletd-compatible gRPC behavior, compatibility error mapping, protocol translation over `WalletQueryApi` | Upstream node calls, primary canonical storage, migrations, compact block construction |
-| `zinder-explorer`            | Explorer query serving, secondary derive-store reads, explorer-specific APIs and capability advertising                 | Wallet sync, canonical chain state, source truth, derive-store primary writes   |
-
-This table describes the schema-19 runtime. It is not the accepted fact-first
-ownership target because `zinder-ingest` still hosts projection writes.
-
-## Target Boundary Map
-
 | Boundary | Owns | Must not own |
 | --- | --- | --- |
-| `zinder-ingest` | Upstream connections, chain selection, canonical construction and following, reorg handling, and canonical publication | Wallet or explorer projection writes, public query traffic, or projection promotion |
-| `zinder-projector` | Build, verify, catch up, follow, and promote one selected wallet or explorer projection under an authenticated position and fence | Chain selection, canonical writes, source-node RPCs, or public query traffic |
-| `zinder-query` | Wallet-facing APIs and epoch-bound canonical plus exact wallet-projection reads | Chain selection, canonical writes, projection writes, migrations, or explorer analytics |
-| `zinder-explorer` | Explorer APIs and read-only composition of canonical, wallet, and explorer planes | Canonical, wallet, or explorer writes; source truth; or wallet sync orchestration |
-| Compatibility services | Stateless protocol translation over `WalletQuery` or `ExplorerQuery` | Direct storage access, source-node calls, migrations, or product-owned state |
+| `zinder-ingest` | Upstream connections, chain selection, canonical construction and following, reorg handling, canonical publication, durable chain and mempool event history | Wallet projection writes, public wallet traffic, or projection promotion |
+| `zinder-projector` | Fixed-fence wallet construction, continuous canonical-event following, settlement and bounded reorg reconciliation, wallet-store primary ownership | Chain selection, canonical writes, public traffic, or source-node RPCs |
+| `zinder-compat-lightwalletd` | Canonical and wallet secondaries, exact-pair admission and atomic generation replacement, vendored lightwalletd behavior, compatibility error mapping | Either primary store, source-node reads, migrations, or mixed-generation responses |
+| `zinder-query` library | `WalletQueryApi`, request types, native adapter code, and shared query error mapping | A standalone production listener, storage ownership, or lifecycle orchestration |
 
-These boundaries apply to both retained topologies. `rocksdb-single-host` may
-colocate the processes and stores on one host; `postgres-scale-out` may deploy
-them independently. Colocation does not merge readiness, restart, migration,
-or resource ownership.
+`zinder-explorer` and `zinder-compat-cipherscan` remain post-wallet-cutover
+work. They are workspace code but are not built into, configured by, or started
+by the first production release.
 
 ## Why This Split Exists
 
@@ -56,62 +45,47 @@ The services must not share:
 
 ## Storage Ownership
 
-The current implementation is the `rocksdb-single-host` topology. The accepted
-`postgres-scale-out` migration target preserves the ownership rules below while
-replacing RocksDB primary/secondary mechanics with fenced writers and
-request-scoped Postgres read sessions. [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-owns the two-topology contract.
+The current implementation and only release target is the
+`rocksdb-single-host` topology. `postgres-scale-out` remains diagnostic-only;
+its benchmarks preserve these ownership rules but do not create a production
+migration commitment. [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
+owns that boundary.
 
-`zinder-ingest` is the only writer to canonical chain storage; it opens `PrimaryChainStore` per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md). It also owns the derive-store primary for bundled explorer projections and runs the derive tailer over retained canonical events. The derive store remains separate from canonical storage and is rebuildable from canonical artifacts and retained events.
+`zinder-ingest` opens the canonical schema-v4 RocksDB store as its only primary.
+`zinder-projector` opens a canonical secondary and the wallet schema-v1 store
+as its only primary. `zinder-compat-lightwalletd` opens both stores as
+generation-specific secondaries, catches them up, validates their authenticated
+fence and wallet digest, and atomically publishes the pair. Requests retain one
+pair generation for their full lifetime, so refresh cannot mix stores beneath
+an in-flight response.
 
-`zinder-query` and `zinder-compat-lightwalletd` open the writer's canonical store path through `SecondaryChainStore`, using a process-unique `secondary_path` and replaying the writer's WAL on a configurable catchup interval. They also open the bundled derive store as a secondary when serving derive-backed wallet reads such as transparent-address transaction history. They may own separate operational caches. Those caches must be reconstructable and must not become a second source of chain truth.
-
-`zinder-explorer` opens the ingest-owned derive store as a `DeriveStore` secondary when it is available and serves explorer reads from that snapshot. If the derive store is absent, the explorer process still starts and advertises only capabilities that do not require derive storage. Derived storage is downstream materialized state, not canonical state. It may be stale, rebuilding, or disabled without making `zinder-query` unsafe for wallet sync. The `Derive*` SDK abstractions (`DeriveConsumer`, `DeriveStore`) describe the reusable pattern and stay derive-shaped so future consumers can link the same SDK; the product-facing binary, config namespace, capability prefix, and Prometheus prefix use the explorer namespace. See [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md).
+Canonical and wallet paths are siblings, not nested aliases. Each secondary
+path is process- and generation-specific. No release process opens the legacy
+derive store, and no compatibility fallback may reconstruct wallet rows or
+serve directly from a primary.
 
 ## Development Profile
 
-Zinder may provide a local command that runs ingest and query together:
-
-```text
-zinder dev
-```
-
-That command should be a composition layer. It should instantiate `zinder-ingest` and `zinder-query` through their production interfaces. It must not create a special local-only path that bypasses storage contracts, epochs, readiness checks, or reorg handling.
-
-Do not introduce a generic `zinder-serve` crate or service for this profile. If
-one process hosts multiple services locally, that process is composition glue;
-the product boundaries remain `zinder-ingest`, `zinder-query`, and
-`zinder-compat-lightwalletd`.
+Local composition starts the same ingest, projector, and compatibility
+binaries with regtest paths. It must preserve distinct store ownership,
+secondaries, exact-pair admission, readiness, and reorg behavior. Do not
+introduce a generic `zinder-serve` process or a local primary-read shortcut.
 
 ## Deployment Topologies
 
 ### `rocksdb-single-host`
 
-Minimum service set (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)):
+The production service set is:
 
 ```text
 zinder-ingest              -> canonical RocksDB (primary)
                            -> IngestControl.WriterStatus / ChainEvents -> [ingest_control] gRPC
-zinder-query               -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
-                           -> replica lag via ingest_control.addr
-                           -> proxy subscriptions to the private ingest-control endpoint
-zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path)
-                           -> derive RocksDB (secondary, secondary_path/derive)
-                           -> WalletQueryApi
-                           -> replica lag via ingest_control.addr
-                           -> proxy only subscription-like RPCs present in CompactTxStreamer
-                           -> CompactTxStreamer
-```
-
-Extended service set (adds the current derived plane):
-
-```text
-zinder-ingest              -> canonical RocksDB (primary)
-                           -> derive RocksDB (primary, nested under canonical storage path)
-zinder-query               -> canonical RocksDB (secondary, unique secondary_path) -> WalletQueryApi
-zinder-compat-lightwalletd -> canonical RocksDB (secondary, unique secondary_path)
-                           -> derive RocksDB (secondary, secondary_path/derive) -> WalletQueryApi -> CompactTxStreamer
-zinder-explorer            -> derive RocksDB (secondary when available, secondary_path/derive) -> ExplorerQuery
+zinder-projector           -> canonical RocksDB (secondary)
+                           -> wallet RocksDB (primary)
+                           -> IngestControl.WriterStatus / ChainEvents
+zinder-compat-lightwalletd -> canonical RocksDB (generation secondary)
+                           -> wallet RocksDB (generation secondary)
+                           -> exact pair -> WalletQueryApi -> CompactTxStreamer
 ```
 
 Read replicas are colocated with the writer on one shared-filesystem host.
@@ -119,18 +93,17 @@ Cross-host RocksDB replicas are out of scope; see
 [ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).
 This topology is production-supported and has no Postgres dependency.
 
-### `postgres-scale-out` target
+### `postgres-scale-out` diagnostic candidate
 
-This topology is not implemented or certified yet. Its accepted service shape
-keeps one fenced canonical writer while allowing projectors, query services,
-and Postgres replicas to deploy and scale independently:
+PostgreSQL is not an accepted production target until `rocksdb-single-host`
+passes its lifecycle and performance certification. Benchmarking may continue
+against the same fact-first schema, but it must not add runtime abstraction,
+compatibility branches, or deployment claims to this release.
 
 ```text
 zinder-ingest       -> Postgres canonical schema (one fenced active writer)
 zinder-projector    -> Postgres wallet or explorer schema (fenced per projection)
-zinder-query        -> epoch-bound canonical + wallet read sessions -> WalletQueryApi
-zinder-explorer     -> epoch-bound canonical + wallet + explorer reads -> ExplorerQuery
-compatibility edges -> WalletQueryApi / ExplorerQuery
+compatibility edge  -> epoch-bound canonical + wallet read session -> WalletQueryApi
 ```
 
 Role-scoped credentials, writer-generation fencing, replica-lag reporting,
@@ -143,7 +116,8 @@ after those gates and the shared lifecycle targets pass.
 - A single production daemon where query handlers call upstream node RPC directly.
 - A query service that writes missing blocks on demand.
 - A query service that opens the live canonical RocksDB database as **primary** in production. Secondary access is the production contract per ADR-0003.
-- A compatibility adapter that opens storage or calls upstream nodes instead of translating `WalletQueryApi`.
+- A compatibility adapter that opens either primary, mixes secondary
+  generations, reconstructs missing wallet state, or calls upstream nodes.
 - A generic `zinder-serve` boundary that hides which service owns ingestion,
   query, or compatibility behavior.
 - A derived explorer index that is required for wallet sync.

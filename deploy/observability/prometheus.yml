@@ -1,6 +1,6 @@
 # Scrape config for the deploy-mode observability (Prometheus running inside
 # deploy/docker-compose.yml, on the same Docker network as zinder-ingest and
-# zinder-query). The smoke-mode equivalent lives at
+# zinder-projector and zinder-compat-lightwalletd). The smoke-mode equivalent lives at
 # observability/prometheus/prometheus.yml and targets the local-binary ports
 # the smoke script spawns; this file targets the docker-compose service DNS.
 
@@ -19,25 +19,25 @@ scrape_configs:
           stack: "zinder"
           service: "zinder-ingest"
 
-  - job_name: "zinder-query"
+  - job_name: "zinder-projector"
     scrape_interval: 15s
     scrape_timeout: 10s
     metrics_path: "/metrics"
     static_configs:
-      - targets: ["zinder-query:9106"]
+      - targets: ["zinder-ingest:9110"]
         labels:
           stack: "zinder"
-          service: "zinder-query"
+          service: "zinder-projector"
 
-  - job_name: "zinder-explorer"
+  - job_name: "zinder-compat-lightwalletd"
     scrape_interval: 15s
     scrape_timeout: 10s
     metrics_path: "/metrics"
     static_configs:
-      - targets: ["zinder-explorer:9069"]
+      - targets: ["zinder-ingest:9107"]
         labels:
           stack: "zinder"
-          service: "zinder-explorer"
+          service: "zinder-compat-lightwalletd"
 
   - job_name: "prometheus"
     scrape_interval: 60s

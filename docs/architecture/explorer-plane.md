@@ -1,5 +1,10 @@
 # Explorer Plane
 
+The explorer plane is post-wallet-cutover architecture, not part of the first
+fact-first production release. Its query-runtime federation text is a future
+migration contract; no explorer or standalone query image is built or started
+by the current release topology.
+
 The explorer plane is the Zinder product surface for block explorers, dashboards, and analytics consumers. It serves UI-ready, API-ready, and agent-ready views over canonical chain artifacts and replayable event streams, with explicit freshness, typed unavailability, and capability-gated panels. It is owned by `zinder-explorer`.
 
 This document defines the boundary, wire vocabulary, capability namespace, freshness contract, and the rule that distinguishes explorer views from wallet views. It is the sibling document to [Wallet data plane](wallet-data-plane.md) and [Derive plane](derive-plane.md). The explorer plane exercises the derive-plane SDK; the derive plane defines that SDK.

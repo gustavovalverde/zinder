@@ -3,23 +3,31 @@
 The storage backend is the contract between chain ingestion, epoch-bound readers, migrations, and operational recovery. It is not a public table schema.
 
 This document describes the current `rocksdb-single-host` implementation.
-[ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) also
-accepts a `postgres-scale-out` topology, which remains a migration target until
-its concrete storage and lifecycle gates pass.
+[ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) permits
+continued `postgres-scale-out` diagnostics, but PostgreSQL is not a production
+migration target until this RocksDB topology passes its concrete storage and
+lifecycle gates.
 
 Event and reorg semantics live in [Chain events](chain-events.md).
 
 ## Ownership
 
-`zinder-ingest` owns the live canonical RocksDB database as the only primary writer. Production readers (`zinder-query`, `zinder-compat-lightwalletd`, `zinder-client::LocalChainIndex`) reach the same store through `SecondaryChainStore`, which implements `ChainEpochReadApi` over a RocksDB secondary instance. The full topology, catchup mechanism, lock semantics, and rolling-upgrade order live in [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
+`zinder-ingest` owns the live canonical RocksDB database as its only primary
+writer. `zinder-projector` reads canonical through a process-owned secondary
+and owns the independent wallet RocksDB primary. `zinder-compat-lightwalletd`
+opens generation-specific secondaries for both stores and serves only after
+their authenticated canonical fence and wallet source identity match. The full
+topology, catchup mechanism, lock semantics, and rolling-upgrade order live in
+[ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md).
 
 ```text
-zinder-ingest    -> RocksDB primary -> ChainEpochReadApi -> ChainEvent
-zinder-query     -> RocksDB secondary -> ChainEpochReadApi -> WalletQueryApi
-zinder-explorer    -> ChainEventEnvelope -> derived storage
+zinder-ingest              -> canonical RocksDB primary -> ChainEvent
+zinder-projector           -> canonical RocksDB secondary -> wallet RocksDB primary
+zinder-compat-lightwalletd -> canonical + wallet RocksDB secondaries -> exact pair -> WalletQueryApi
 ```
 
-Direct embedded reads outside that contract are allowed only for `zinder dev` composition, unit and integration tests, offline repair tools, and immutable RocksDB checkpoint readers.
+Direct embedded reads outside that contract are allowed only in unit and
+integration tests, offline diagnostic tools, and immutable fixture readers.
 
 ## Crate Responsibilities
 
@@ -60,7 +68,9 @@ values for monotonic ordering.
 
 `ChainEpochReader` is an in-process read view pinned to one `ChainEpoch`. It must not merge data from multiple epochs. Primary readers may use RocksDB snapshots; secondary readers are snapshotless because RocksDB-secondary does not support snapshots.
 
-`ChainEpochReadApi` is the internal service-to-service read API. It returns epoch-bound data to `zinder-query` without exposing RocksDB layout.
+`ChainEpochReadApi` is the internal read contract. It returns epoch-bound data
+to the projector, the compatibility composition, and embedded query-library
+tests without exposing RocksDB layout.
 
 `commit_chain_epoch` is the only operation that makes a new epoch visible. It must write all required artifacts and the visible epoch pointer atomically.
 
@@ -205,7 +215,7 @@ Reorg semantics and event vocabulary live in [Chain events](chain-events.md). At
 
 ## Schema Compatibility
 
-Stores validate schema at open. A store written with an `artifact_schema_version` above `MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION` returns `StoreError::SchemaTooNew`; a network or layout mismatch returns the matching `SchemaMismatch` or `ChainEpochNetworkMismatch` variant. Both surface as `SchemaMismatch` at the service boundary and fail readiness with `schema_mismatch`. `zinder-query` never mutates canonical storage on schema mismatch; the operator recreates the store from a fresh ingest run or an offline checkpoint.
+Stores validate schema at open. A store written with an `artifact_schema_version` above `MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION` returns `StoreError::SchemaTooNew`; a network or layout mismatch returns the matching `SchemaMismatch` or `ChainEpochNetworkMismatch` variant. Both surface as `SchemaMismatch` at the service boundary and fail readiness with `schema_mismatch`. No reader mutates canonical storage on schema mismatch; the operator recreates the store from a fresh ingest run or a certified coherent checkpoint bundle.
 
 Store schema 13 restores the wipe-and-resync posture for every earlier layout.
 Older releases could migrate metadata versions 10 and 11 in place, but those
@@ -250,9 +260,16 @@ available, so there is no in-place migration.
 
 ## Checkpoints and Backups
 
-RocksDB checkpoints are used for backups (`zinder-ingest backup --to <path>`), fixture capture, offline repair, and immutable analytics replicas. The backup command checkpoints the canonical store and the bundled derive store together, installing the derive checkpoint under the canonical checkpoint's `derive` subdirectory. Restore is "stop, replace, start" (operator procedure, no online restore in v1).
+RocksDB checkpoints remain valid for fixtures and offline diagnostics, but the
+legacy ingest backup command is deleted. It could not atomically authenticate
+the independent canonical schema-v4 and wallet schema-v1 stores. Production
+restore requires one coherent bundle carrying the exact canonical event fence
+and wallet digest; until that implementation and its restore-time gate pass,
+no checkpoint is admitted as a production backup.
 
-Checkpoint readers must open a documented manifest and validate store identity, network, schema versions, and visible epoch before serving data. They serve frozen snapshots; production read replicas instead open the live store as RocksDB-secondary per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) and replay the writer's WAL.
+Production read replicas open live stores as process-owned RocksDB secondaries
+per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md); a frozen
+checkpoint is never a substitute for freshness or exact-pair admission.
 
 ## Multi-Process Operations
 

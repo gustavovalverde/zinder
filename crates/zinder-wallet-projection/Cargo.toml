@@ -11,7 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-sha2.workspace = true
+blake2b_simd.workspace = true
 thiserror.workspace = true
 zinder-core.workspace = true
 

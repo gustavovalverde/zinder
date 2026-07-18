@@ -1,8 +1,0 @@
-#!/command/with-contenv sh
-#
-# Exiting 0 lets s6 respawn zinder-query in place. The platform does not
-# restart containers that terminate themselves, so an in-container respawn
-# is the only path back to a running service after a crash; the sleep
-# keeps a persistent failure from hot-looping.
-
-sleep 2

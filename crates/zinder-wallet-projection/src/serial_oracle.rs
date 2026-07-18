@@ -3,16 +3,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, CanonicalBlockFacts, Network, TransparentAddressScriptHash,
+    BlockHash, BlockHeight, BlockId, CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
+    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestBuilder,
+    CanonicalBlockFactsSequenceDigestVersion, Network, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentUtxoSetCommitment,
 };
 
 use crate::{
     WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
-    WalletOutpointKey, WalletProjectionContractError, WalletProjectionDigest,
-    WalletProjectionDigestBuilder, WalletProjectionFamilyRowCounts, WalletProjectionRowFamily,
-    WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition, WalletUnspentOutput,
-    WalletUtxoSetSummary,
+    WalletOutpointKey, WalletProjectionAccumulator, WalletProjectionContractError,
+    WalletProjectionDigest, WalletProjectionDigestBuilder, WalletProjectionFamilyRowCounts,
+    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition,
+    WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
 /// Small deterministic reference model for complete-history wallet projection.
@@ -24,6 +26,7 @@ use crate::{
 pub struct WalletProjectionSerialOracle {
     network: Network,
     last_projected_block: Option<BlockId>,
+    source_sequence_digest: CanonicalBlockFactsSequenceDigest,
     unspent_outputs: BTreeMap<WalletOutpointKey, WalletUnspentOutput>,
     spent_outputs: BTreeMap<WalletOutpointKey, WalletSpentOutput>,
     address_transactions: BTreeMap<WalletAddressTransactionKey, WalletAddressTransaction>,
@@ -48,6 +51,10 @@ impl WalletProjectionSerialOracle {
         Self {
             network,
             last_projected_block: None,
+            source_sequence_digest: CanonicalBlockFactsSequenceDigestBuilder::new(
+                CanonicalBlockFactsSequenceDigestVersion::V1,
+            )
+            .finish(),
             unspent_outputs: BTreeMap::new(),
             spent_outputs: BTreeMap::new(),
             address_transactions: BTreeMap::new(),
@@ -75,6 +82,12 @@ impl WalletProjectionSerialOracle {
     #[must_use]
     pub const fn last_projected_block(&self) -> Option<BlockId> {
         self.last_projected_block
+    }
+
+    /// Returns the exact ordered source digest through the current tip.
+    #[must_use]
+    pub const fn source_sequence_digest(&self) -> CanonicalBlockFactsSequenceDigest {
+        self.source_sequence_digest
     }
 
     /// Finds one currently unspent output.
@@ -136,10 +149,24 @@ impl WalletProjectionSerialOracle {
         }
     }
 
-    /// Commits every wallet query row in family and key order.
+    /// Rebuilds the full row accumulator from every logical wallet row.
+    pub fn projection_accumulator(
+        &self,
+    ) -> Result<WalletProjectionAccumulator, WalletProjectionContractError> {
+        let (accumulator, _digest) = self.projection_builder()?.finish_with_accumulator();
+        Ok(accumulator)
+    }
+
+    /// Derives the display digest from the same full accumulator contract.
     pub fn projection_digest(
         &self,
     ) -> Result<WalletProjectionDigest, WalletProjectionContractError> {
+        Ok(self.projection_builder()?.finish())
+    }
+
+    fn projection_builder(
+        &self,
+    ) -> Result<WalletProjectionDigestBuilder, WalletProjectionContractError> {
         let mut digest = WalletProjectionDigestBuilder::new();
 
         for (key, output) in &self.unspent_outputs {
@@ -194,7 +221,7 @@ impl WalletProjectionSerialOracle {
                 &undo.encode_value()?,
             )?;
         }
-        Ok(digest.finish())
+        Ok(digest)
     }
 
     #[allow(
@@ -207,6 +234,13 @@ impl WalletProjectionSerialOracle {
     ) -> Result<WalletReorgUndo, WalletProjectionContractError> {
         let block = BlockId::new(facts.block_header.height, facts.block_header.block_hash);
         self.validate_next_block(block, facts.block_header.parent_hash)?;
+        let source_sequence_digest_before = self.source_sequence_digest;
+        let mut source_sequence_digest =
+            CanonicalBlockFactsSequenceDigestBuilder::resume_from_prefix(
+                source_sequence_digest_before,
+            );
+        source_sequence_digest.try_append(facts.digest(CanonicalBlockFactsDigestVersion::V1))?;
+        let source_sequence_digest_after = source_sequence_digest.finish();
         let mut created_outpoints = Vec::new();
         let mut created_outpoint_keys = BTreeSet::new();
         let mut spent_outpoints = Vec::new();
@@ -290,11 +324,15 @@ impl WalletProjectionSerialOracle {
         }
 
         self.last_projected_block = Some(block);
+        self.source_sequence_digest = source_sequence_digest_after;
         created_outpoints.sort_unstable();
         spent_outpoints.sort_unstable();
         address_transaction_keys.sort_unstable();
         let undo = WalletReorgUndo {
             block,
+            parent_hash: facts.block_header.parent_hash,
+            source_sequence_digest_before,
+            source_sequence_digest_after,
             created_outpoints,
             spent_outpoints,
             address_transaction_keys,
@@ -640,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_oracle_digests_address_index_in_address_key_order() {
+    fn serial_oracle_accumulates_address_index_rows() {
         let first_transaction = TransactionId::from_bytes([0x01; 32]);
         let second_transaction = TransactionId::from_bytes([0x02; 32]);
         let block = block_facts_with_transactions(
@@ -694,7 +732,7 @@ mod tests {
                     .unwrap_or_else(|error| unreachable!("valid ordering digest: {error}"))
                     .as_bytes()
             ),
-            "d61ad1aa11ebeafadf370d0a5f55940c13f13da9f9d66a7f51d58e9c65d75a0c"
+            "dcdb04fc8570f5988946cfd7ea635dbb8e32dc3f98d98e48bdf15e2efd500b13"
         );
     }
 

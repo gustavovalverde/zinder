@@ -2,10 +2,14 @@
 
 ## Status
 
-Accepted.
+Superseded in part by
+[ADR-0035](0035-fact-first-storage-selection-and-lifecycle.md).
 
 ## Revision history
 
+- 2026-07-17: Recorded the fact-first runtime cutover. The native
+  `zinder-query`, `zinder-explorer`, and legacy backup command are no longer
+  production binaries; their private configuration sections are historical.
 - 2026-06-25: Added the `[security]` shared section and the public-bind
   refusal it carries (see [§Public-bind refusal](#public-bind-refusal)).
 
@@ -80,8 +84,10 @@ The eight shared sections at the time of writing are:
 - `[node]` and `[node.auth]` ([`NodeSection`](../../crates/zinder-source/src/node_target.rs),
   pre-existing in `zinder-source`)
 
-Per-service sections (`[ingest]`, `[backup]`, `[query]`, `[compat]`,
-`[explorer]`) stay private to their owning binary.
+Per-service sections stay private to their owning binary. The original
+`[backup]`, `[query]`, and `[explorer]` sections described here were removed by
+the fact-first runtime cutover; current production configuration uses
+`[ingest]`, `[projector]`, and `[compat]`.
 [ADR-0015](0015-unified-phase-driven-ingest.md) collapses the earlier
 `[bulk catchup]` and `[tip_follow]` writer-side splits into the
 sub-sectioned `[ingest.phases]`, `[ingest.bulk_catchup]`,
@@ -163,7 +169,7 @@ generic message.
 ## Consequences
 
 **For service authors.** Adding a new field to a shared section means
-editing one struct + one resolver. The four binaries pick it up by
+editing one struct + one resolver. Each participating binary picks it up by
 calling the existing `with_<name>_section` helper. Adding a new
 binary means listing its `ServiceIdentifier` variant and chaining the
 existing shared helpers; the schema is uniform by construction.
@@ -178,8 +184,7 @@ which binary they target.
 **For test authors.** Cross-field invariants on shared sections (e.g.,
 "retention warning lead time must be \u{2264} the retention window")
 live in the section's resolver and are exercised by the section's own
-unit tests; the four service test suites no longer carry parallel
-copies.
+unit tests; service test suites no longer carry parallel copies.
 
 **Breaking changes.** Adopting this ADR renamed several operator-facing
 keys; per the Zinder pre-release breaking-change policy there is no

@@ -66,16 +66,31 @@ roots, chain epochs, chain events, and mempool events. A structure-of-arrays
 encoding is an internal layout option only when a benchmark proves decoding or
 cache locality gains. It is not another public fact model.
 
-Every persisted contract introduced by this architecture starts at version 1:
-canonical RocksDB and PostgreSQL, wallet projection, explorer projection,
-canonical fact digest, replay envelope, backup manifest, fixture, benchmark
-report, and physical candidate schema. This is a clean identity reset, not a
-numeric rename. Persisted domain identities are `canonical`, `wallet`,
-`explorer`, and `state-bundle`; each record carries its exact format version
-and network before any data column family or table is created. A non-empty path
-without the expected identity, or with any version other than 1, is refused
-without mutation. Previous stores, backups, fixtures, and reports are
-intentionally unsupported and must be rebuilt or recaptured.
+Every persisted contract introduced by this architecture began at version 1 as
+a clean identity reset, not a numeric rename, and each version domain advances
+independently when its bytes change. The canonical fact digest and replay
+envelope remain version 1. The wallet row-value encoding is version 2 and its
+projection accumulator remains version 1. The current canonical RocksDB
+physical schema is version 5, the current wallet RocksDB physical schema under
+the `wallet` identity is version 1, and the benchmark report contract is
+version 2. Wallet schema 1 admits exactly canonical schema 5; the physical
+schema reset does not reset or alias the independent row-value or digest
+versions. Persisted domain identities are `canonical`, `wallet`, `explorer`,
+and `state-bundle`; each record carries its exact current format version and
+network before any data column family or table is created. A non-empty path
+without the expected identity or exact current version is refused without
+mutation. Previous stores, backups, fixtures, and reports are intentionally
+unsupported and must be rebuilt or recaptured.
+
+Canonical physical schema 5 `store_control` persists a nonzero
+`CanonicalReorgPolicy`, an authenticated settled-sequence checkpoint, and the
+version and SHA-256 identity of the immutable construction manifest. The
+configured reorg window is immutable store identity, not a mutable runtime
+tuning value. Builders require a validated policy before creating the path, and
+every serving reopen supplies the exact expected policy; an earlier physical
+schema, zero, or mismatched values fail admission without mutation. Readers do
+not infer or adopt the persisted policy, and the decoder has no compatibility
+path for earlier physical control bytes.
 
 The current ingest path parses a source block's serialized header prefix first
 so bulk catchup can validate identity and parent links without deserializing
@@ -101,11 +116,14 @@ The following lifecycles remain separate deep modules:
   indexes, and publishes a baseline epoch.
 - Projection construction builds an inactive read model using
   projection-owned bulk operations, validates it, catches up from its pinned
-  canonical epoch, and promotes it. Promotion requires a future durable,
-  expiring `ProjectionBuildLease` anchored to the pinned epoch and chain event;
-  event pruning must retain that anchor while the lease remains valid. The
-  current implementation has no persisted lease, renewal path, pruning floor,
-  or lease-guarded promotion.
+  canonical epoch, and promotes it. Promotion requires a durable, expiring
+  `ProjectionBuildLease` anchored to the pinned epoch and chain event. The
+  wallet build lease is persisted with generation-fenced acquire, renew,
+  release, and READY-promotion transitions. A separate durable canonical
+  retention lease keeps the pinned event at or above the pruning floor until
+  construction hands ownership to continuous following. Promotion fails
+  closed unless both lease capabilities still authorize the exact source
+  anchor.
 - Live following commits each visible canonical epoch or projection transition
   atomically under a durable writer generation.
 

@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BearerToken,
     config::{ConfigError, load_bearer_token, parse_socket_addr},
-    sections::defaults::{DEFAULT_INGEST_CONTROL_LISTEN_ADDR, DEFAULT_INGEST_CONTROL_READER_URL},
+    sections::defaults::{
+        DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT, DEFAULT_INGEST_CONTROL_LISTEN_ADDR,
+        DEFAULT_INGEST_CONTROL_READER_URL,
+    },
 };
 
 /// Raw `[ingest_control]` config section.
@@ -40,6 +43,13 @@ pub struct IngestControlSection {
     /// request when auth is enabled (ADR-0006). The writer reads this
     /// file to verify; the readers read the same file to present.
     pub bearer_token_path: Option<PathBuf>,
+    /// File containing the capability token required only for canonical owner
+    /// checkpoint creation. Reader-only compat processes must not receive it.
+    pub checkpoint_bearer_token_path: Option<PathBuf>,
+    /// Writer-owned directory below which canonical checkpoint candidates are
+    /// staged. The checkpoint control RPC accepts opaque identifiers only and
+    /// never accepts an arbitrary filesystem path.
+    pub checkpoint_staging_root: Option<PathBuf>,
 }
 
 /// Resolved writer-side ingest-control configuration.
@@ -52,6 +62,12 @@ pub struct ResolvedIngestControlWriter {
     pub bearer_token_path: Option<PathBuf>,
     /// Loaded bearer token, when [`Self::bearer_token_path`] is set.
     pub bearer_token: Option<BearerToken>,
+    /// Loaded method-level checkpoint capability token.
+    pub checkpoint_bearer_token: Option<BearerToken>,
+    /// Checkpoint capability-token file path, when configured.
+    pub checkpoint_bearer_token_path: Option<PathBuf>,
+    /// Root directory below which owner checkpoint candidates are created.
+    pub checkpoint_staging_root: PathBuf,
 }
 
 /// Resolved reader-side ingest-control configuration.
@@ -88,15 +104,22 @@ pub fn resolve_ingest_control_writer(
         )?)
     };
     let bearer_token = load_bearer_token(section.bearer_token_path.as_deref())?;
+    let checkpoint_bearer_token =
+        load_bearer_token(section.checkpoint_bearer_token_path.as_deref())?;
     Ok(ResolvedIngestControlWriter {
         listen_addr,
         bearer_token_path: section.bearer_token_path,
         bearer_token,
+        checkpoint_bearer_token,
+        checkpoint_bearer_token_path: section.checkpoint_bearer_token_path,
+        checkpoint_staging_root: section
+            .checkpoint_staging_root
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT)),
     })
 }
 
 /// Validates and resolves an [`IngestControlSection`] for a reader
-/// (`zinder-query`, `zinder-compat-lightwalletd`).
+/// (`zinder-projector`, `zinder-compat-lightwalletd`).
 ///
 /// An unset [`IngestControlSection::addr`] falls back to
 /// [`DEFAULT_INGEST_CONTROL_READER_URL`]. The URL is validated as a
@@ -132,6 +155,11 @@ pub struct IngestControlWriterToml {
     /// which file is in use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bearer_token_path: Option<String>,
+    /// Checkpoint capability-token path, never token material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_bearer_token_path: Option<String>,
+    /// Staging root used for canonical owner checkpoint candidates.
+    pub checkpoint_staging_root: String,
 }
 
 impl IngestControlWriterToml {
@@ -141,10 +169,15 @@ impl IngestControlWriterToml {
     pub fn from_resolved(
         listen_addr: Option<SocketAddr>,
         bearer_token_path: Option<&Path>,
+        checkpoint_bearer_token_path: Option<&Path>,
+        checkpoint_staging_root: &Path,
     ) -> Self {
         Self {
             listen_addr: listen_addr.map(|addr| addr.to_string()).unwrap_or_default(),
             bearer_token_path: bearer_token_path.map(|path| path.display().to_string()),
+            checkpoint_bearer_token_path: checkpoint_bearer_token_path
+                .map(|path| path.display().to_string()),
+            checkpoint_staging_root: checkpoint_staging_root.display().to_string(),
         }
     }
 }

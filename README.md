@@ -17,72 +17,57 @@ The deployment target is single-operator self-hosting backed by one Zebra node. 
 
 ## Quickstart
 
-Zinder reads chain data from a Zebra node managed by the [Z3 platform stack](https://github.com/ZcashFoundation/z3). Bring up Z3 first, then attach zinder. Both can run on a laptop; there is no separate Z3 instance to provision.
+The supported wallet-serving topology uses three independent release runtimes
+on one host filesystem: `zinder-ingest` owns canonical facts,
+`zinder-projector` owns the wallet projection, and
+`zinder-compat-lightwalletd` serves one immutable exact-fence pair. The
+superseded query, explorer, and mixed single-container images are not built or
+published by the release workflow.
 
-**Prerequisites.** Docker (or Docker Desktop) with Docker Compose v2, plus clones of this repo and [z3](https://github.com/ZcashFoundation/z3).
-
-**1. Bring up the Z3 stack** (one-time, from your Z3 checkout):
+Bring up a Zebra node through the [Z3 platform stack](https://github.com/ZcashFoundation/z3),
+then start Zinder from this checkout:
 
 ```bash
-# testnet (fast; ~10 GB chain)
-git clone https://github.com/ZcashFoundation/z3.git && cd z3
+# In the Z3 checkout.
 Z3_NETWORK=testnet docker compose up -d
 
-# or mainnet (~256 GB chain; expect a long initial sync)
-Z3_NETWORK=mainnet docker compose up -d
+# In the Zinder checkout.
+docker compose --env-file deploy/.env.testnet \
+  -f deploy/docker-compose.yml up -d --build
 ```
 
-This creates the `z3-<network>` Docker network and the `z3-<network>-cookie` volume that zinder attaches to. Zebra does not need to finish syncing first: zinder starts alongside it, reports `awaiting_upstream` until the node is ready, and proceeds on its own.
+The checked-in network files provide stable, non-secret projector lease
+identities for one lane per network. Override
+`ZINDER_PROJECTOR_BUILD_OWNER_HEX` with another 32-character hexadecimal
+value before starting a side-by-side rebuild lane.
 
-**2. Bring up zinder** (from this repo):
+The writer becomes ready only after canonical catch-up and a complete mempool
+snapshot. The projector remains unready until it has built or resumed a
+schema-v1 wallet store and reached the writer's authenticated event fence. The
+compatibility service becomes ready only after its canonical and wallet
+secondaries converge to one exact fence.
 
 ```bash
-# testnet
-docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
+# Testnet ports use the +10000 network offset.
+curl -fsS http://127.0.0.1:19105/readyz   # ingest
+curl -fsS http://127.0.0.1:19110/readyz   # projector
+curl -fsS http://127.0.0.1:19107/readyz   # compatibility reader
 
-# or mainnet
-docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
+grpcurl -plaintext -d '{}' 127.0.0.1:19067 \
+  cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
 ```
 
-The first `up -d` does two things in sequence:
+The compatibility port binds to host loopback. Terminate TLS, authentication,
+rate limits, and quotas in an operator-controlled proxy before exposing it.
+Fresh mainnet construction is still subject to the hard performance, capacity,
+coherent-restore, and independent-client gates in the
+[fact-first cutover plan](docs/plans/fact-first-wallet-serving-cutover.md);
+a green local Compose deployment is not by itself production certification.
 
-1. **Builds** `zinder-ingest:latest`, `zinder-query:latest`, and `zinder-explorer:latest` locally from the shared `deploy/Dockerfile` builder. The first target compiles every shipped runtime binary once; later targets reuse the same BuildKit Cargo cache.
-2. **Starts** `zinder-ingest`, `zinder-query`, and `zinder-explorer`. Expect the initial catch-up to take about 30 to 60 minutes on testnet and several hours on mainnet; it is done when the logs show `ingest_phase_changed` reaching `TipFollow`. Under the hood, the writer's unified ingest loop probes Zebra's tip, classifies the gap, and dispatches the right phase: `BulkCatchup` at 32-way pipelined fetches and up to 1,000 blocks per commit batch (each commit publishes a new chain epoch) on a cold store, then `TipFollow` automatically once the gap closes through the reorg window (the trailing ~100 blocks the network can still roll back). No bootstrap step, no separate one-shot service.
-
-From another terminal:
-
-```bash
-docker logs -f zinder-ingest                              # full event log
-docker logs zinder-ingest | grep ingest_phase_changed     # phase transitions
-```
-
-Subsequent `up -d` calls reuse the existing store. The loop picks up from wherever the writer left off: seconds of work in `TipFollow` after a brief restart; a return to `BulkCatchup` after a long absence until the gap closes.
-
-For the phase model, the upstream-sync diagnostic, alternative deployment shapes (bare-metal, Kubernetes), and forked-store recovery, see [Initial sync](docs/runbooks/initial-sync.md). For the architectural relationship between Zinder and Z3 (or any future upstream platform), see [node source boundary](docs/architecture/node-source-boundary.md); observability federation across the two stacks is covered in [service operations](docs/architecture/service-operations.md).
-
-**Observability is on by default.** Every `up -d` brings a `zinder-prometheus` container that scrapes the writer (`zinder-ingest:9105/metrics`) and the reader (`zinder-query:9106/metrics`) over a Zinder-owned Docker network. Metrics survive sync runs and restarts. Add `--profile observability` to also bring `zinder-grafana` (port 3002) with the bundled dashboards; skip the flag if you'd rather feed metrics into a sibling Grafana (Z3's, Grafana Cloud, etc.).
-
-**3. Verify both planes.** The commands below use mainnet ports; on testnet add 10000 (`19105`, `19106`, `19101`), on regtest add 20000:
-
-```bash
-# Writer: "ready" once the loop's BulkCatchup phase has filled the store and
-# the TipFollow phase has closed the last ~100 blocks of lag to Zebra's tip
-curl -sS http://127.0.0.1:9105/readyz
-# {"status":"ready","cause":"ready","current_height":4016431,"target_height":4016431}
-
-# Reader: always "ready" as soon as the writer has committed anything
-curl -sS http://127.0.0.1:9106/readyz
-# {"status":"ready","cause":"ready","current_height":4016431,"target_height":4016431}
-
-# Tail the writer as it follows the chain tip
-docker logs -f zinder-ingest
-```
-
-Point a wallet at `localhost:9101` (native `WalletQuery` gRPC) as soon as the reader is ready; the explorer plane serves `ExplorerQuery` on `9068`. To serve existing lightwalletd wallets, run the `zinder-compat-lightwalletd` service as well; the [single-container deployment](deploy/single-container/README.md) ships it in the bundled topology.
-
-**Multiple networks side-by-side.** Each `--env-file` produces an independently named stack (`zinder-mainnet`, `zinder-testnet`, `zinder-regtest`) with its own volumes and host ports. Mainnet uses the canonical ports above; testnet adds `+10000` (`19101`, `19106`, ...); regtest adds `+20000`. Bringing up another network is `docker compose --env-file deploy/.env.<network> -f deploy/docker-compose.yml up -d`; the existing stack keeps running.
-
-**Beyond Docker.** See the [VM runbook](docs/runbooks/deploying-on-a-vm.md) for systemd-managed deployments, the [Railway runbook](docs/runbooks/deploying-on-railway.md) for hosted topologies, and the [single-container](deploy/single-container/README.md) image when you want one process tree instead of two containers.
+For phase behavior and recovery, see
+[Initial sync](docs/runbooks/initial-sync.md). For the storage and publication
+lifecycle, see
+[ADR-0035](docs/adrs/0035-fact-first-storage-selection-and-lifecycle.md).
 
 ## Further reading
 
@@ -115,7 +100,7 @@ how canonical indexing, projection selection, and API serving fit together.
 - **Node source boundary** (`zinder-source`). All Zebra node coupling is isolated here. Adapters normalize upstream node observations into `NodeSource` values; no other crate imports Zebra or source-specific types, so a new source backend is a new module here rather than a workspace-wide refactor. See [node source boundary](docs/architecture/node-source-boundary.md).
 - **Chain ingestion plane** (`zinder-ingest`). The only writer to canonical storage. Owns the unified ingest loop (bulk catch-up and tip-follow phases), reorg handling, artifact builders, and the atomic chain-epoch commit (`commit_ingest_batch`) that makes a new epoch visible. See [chain ingestion](docs/architecture/chain-ingestion.md), [chain events](docs/architecture/chain-events.md), and [ADR-0015](docs/adrs/0015-unified-phase-driven-ingest.md).
 - **Canonical storage** (`zinder-store`). RocksDB-backed `PrimaryChainStore` and `SecondaryChainStore` role handles exposed to services through the domain-shaped `ChainEpochReadApi`. RocksDB types are private; the public read API is epoch-bound, so callers always resolve one `ChainEpoch` before reading any artifact. See [storage backend](docs/architecture/storage-backend.md) and [ADR-0003](docs/adrs/0003-canonical-storage-access-boundary.md).
-- **Wallet data plane** (`zinder-query`). Read-only wallet and application API over `WalletQueryApi`, served as the native `WalletQuery` gRPC service. Owns compact block ranges, tree state, subtree roots, transaction lookup, transaction broadcast, the public `ChainEvents` proxy, mempool snapshots/events, and transparent-address reads. Never calls upstream nodes, never writes storage, never custodies keys. See [wallet data plane](docs/architecture/wallet-data-plane.md).
+- **Wallet projection plane** (`zinder-projector`, `zinder-wallet-*`). The projector is the sole wallet-store writer. It constructs and continuously follows schema-v1 wallet state at authenticated canonical event fences; the query crate remains a Rust library contract consumed by compatibility, not a standalone production runtime. See [wallet data plane](docs/architecture/wallet-data-plane.md).
 - **Compatibility plane** (`zinder-compat-lightwalletd`, `zinder-compat-cipherscan`). Protocol-edge adapters preserve consumer contracts without shaping Zinder's native APIs around a product. The lightwalletd adapter translates `CompactTxStreamer` onto `WalletQueryApi`; the Cipherscan adapter translates REST and WebSocket contracts onto `ExplorerQuery` and `WalletQuery`. Neither owns canonical writes or parallel artifact construction. See [protocol boundary](docs/architecture/protocol-boundary.md) and the [Cipherscan adapter README](services/zinder-compat-cipherscan/README.md).
 - **Explorer plane** (`zinder-explorer`, optional). Serves block summaries, transaction details, typed search, mempool dashboards, and other explorer-shaped reads through `ExplorerQuery`. Owns materialized views (consuming canonical artifacts and the `ChainEvents` stream) that cannot affect canonical state; any derived view can be discarded and rebuilt from canonical artifacts. See [explorer plane](docs/architecture/explorer-plane.md) and [derive plane](docs/architecture/derive-plane.md) (the reusable SDK pattern this service exercises).
 
@@ -132,13 +117,16 @@ Domain crates under `crates/` define stable contracts with no service runtime:
 - `zinder-source`: upstream source adapters. Owns `NodeSource`, `NodeAuth`, `NodeCapabilities`, `ZebraJsonRpcSource`, `TransactionBroadcaster`.
 - `zinder-proto`: protocol ownership. Owns `.proto` files and tonic-generated modules under `v1::wallet`, private `v1::ingest`, and vendored `compat::lightwalletd`.
 
-Deployable services under `services/`:
+The first fact-first release builds these deployable services:
 
-- `zinder-ingest`: the only writer to canonical RocksDB. Owns the unified ingest loop (bulk-catchup + tip-follow phases, see [ADR-0015](docs/adrs/0015-unified-phase-driven-ingest.md)), backup checkpoints, artifact builders, the private writer-status endpoint, and the upstream-source config CLI.
-- `zinder-query`: read-only wallet and application API over `ChainEpochReadApi`. Provides `WalletQueryApi` (Rust) and `WalletQueryGrpcAdapter` (tonic).
-- `zinder-explorer`: read-only explorer API over canonical facts and replayable derive projections. Provides the native `ExplorerQuery` gRPC service.
+- `zinder-ingest`: the only writer to canonical RocksDB. Owns the unified ingest loop (bulk-catchup + tip-follow phases, see [ADR-0015](docs/adrs/0015-unified-phase-driven-ingest.md)), artifact builders, the private writer-status endpoint, and the upstream-source config CLI. Production recovery remains blocked until ingest and projector can publish one coherent canonical/wallet checkpoint bundle.
+- `zinder-projector`: the only writer to wallet RocksDB. Owns fixed-fence construction, continuous canonical-event following, settlement, and bounded reorg reconciliation.
 - `zinder-compat-lightwalletd`: translates the vendored lightwalletd `CompactTxStreamer` gRPC service to `WalletQueryApi`.
-- `zinder-compat-cipherscan`: translates Cipherscan REST and WebSocket contracts to `ExplorerQuery` and `WalletQuery`.
+
+`zinder-query` remains the internal Rust library for `WalletQueryApi`, request
+types, and adapters; its standalone binary is deleted. `zinder-explorer` and
+`zinder-compat-cipherscan` (the Cipherscan REST/WebSocket adapter) remain
+post-wallet-cutover work and are not release images.
 
 ## Validation Gate
 
@@ -157,7 +145,7 @@ cargo machete
 git diff --check
 ```
 
-`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory as documented in the [Testing Runbook](docs/runbooks/testing.md): T0 unit, T1 integration, T2 perf, T3 live/deploy, and T4 consumer certification. The `default`/`ci` profile runs T0 and database-free T1; `ci-postgres` runs the externally backed PostgreSQL driver test; `ci-perf` runs T2; `ci-live` runs upstream-node T3; `ci-zallet-live` runs the externally supplied Zallet adapter; `ci-deploy` runs Docker deployment smoke tests; and `ci-parity` runs T4. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
+`cargo nextest run` is the canonical workspace runner. Tests are tiered by directory as documented in the [Testing Runbook](docs/runbooks/testing.md): T0 unit, T1 integration, T2 perf, T3 live, and T4 consumer certification. The `default`/`ci` profile runs T0 and database-free T1; `ci-postgres` runs the externally backed PostgreSQL driver test; `ci-perf` runs T2; `ci-live` runs upstream-node T3; and `ci-parity` runs T4. `cargo test` continues to work as a libtest fallback (and is what `cargo mutants` shells), but is not the documented gate.
 
 Heavier probes for trust-sensitive storage or parser changes:
 
@@ -192,4 +180,4 @@ Use the local observability smoke when a change needs visible runtime evidence r
 scripts/observability-smoke.sh run
 ```
 
-It starts Prometheus and Grafana, runs the Zinder host binaries against the selected local node source, verifies checkpoint backup restore, generates native and lightwalletd-compatible gRPC traffic, prints the scraped metric samples, and writes readiness reports under `.tmp/observability/reports`. See [observability/README.md](observability/README.md) for public-network commands, calibration runs, ports, tunables, and the stop command.
+It starts Prometheus and Grafana, runs ingest, projector, and the lightwalletd compatibility service against the selected local node source, records that restore is blocked until coherent canonical-plus-wallet bundles exist, generates lightwalletd-compatible gRPC traffic, prints the scraped metric samples, and writes readiness reports under `.tmp/observability/reports`. See [observability/README.md](observability/README.md) for public-network commands, calibration runs, ports, tunables, and the stop command.

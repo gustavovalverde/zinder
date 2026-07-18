@@ -1,8 +1,9 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
+use parking_lot::Mutex;
 use rust_rocksdb::{
     Cache, ColumnFamilyDescriptor, DB, DBCompressionType, DEFAULT_COLUMN_FAMILY_NAME, IteratorMode,
-    Options, WriteBatch, WriteOptions,
+    Options, WriteBatch, WriteOptions, checkpoint::Checkpoint,
 };
 use zinder_core::{
     CanonicalHistoryBounds, Network, NetworkUpgradeActivations,
@@ -15,12 +16,55 @@ use crate::{
 };
 
 use super::{
-    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload,
+    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildState,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, CanonicalReplayScan},
+    construction_manifest::{
+        copy_construction_manifest, read_construction_manifest_binding,
+        validate_ready_construction_manifest,
+    },
     control::{DecodedStoreControl, decode_store_control, encode_building_store_control},
+    event_lifecycle::{
+        PROJECTION_BUILD_LEASE_GENERATION_KEY, RETENTION_FLOOR_KEY, is_projection_build_lease_key,
+    },
+    mempool_lifecycle::{
+        MEMPOOL_EVENT_RETENTION_FLOOR_KEY, MEMPOOL_EVENT_SEQUENCE_KEY,
+        validate_mempool_lifecycle_admission,
+    },
     publication::validate_ready_publication,
 };
+
+/// Cold-admitted identity and READY evidence for an owner-created canonical checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalOwnerCheckpointEvidence {
+    /// Exact `RocksDB` database identity captured before physical checkpoint
+    /// creation and re-read from the cold checkpoint.
+    pub database_identity: Vec<u8>,
+    /// Exact physical store identity admitted from the checkpoint.
+    pub store_identity: &'static str,
+    /// Exact physical schema admitted from the checkpoint.
+    pub schema_version: u16,
+    /// Immutable workload admitted from the checkpoint.
+    pub workload: CanonicalStoreWorkload,
+    /// Complete canonical construction identity admitted from the checkpoint.
+    pub build_plan: super::CanonicalStoreBuildPlan,
+    /// Persisted READY evidence read from the cold-opened checkpoint.
+    pub ready_evidence: CanonicalStoreReadyEvidence,
+}
+
+/// Immutable context captured by the canonical owner when it creates a
+/// physical checkpoint.
+///
+/// This opaque context lets a background worker cold-admit the immutable copy
+/// without reopening or retaining the writer's primary handle. It deliberately
+/// carries no filesystem authority and is only accepted by
+/// [`RocksDbCanonicalStore::cold_admit_owner_checkpoint`].
+#[derive(Clone, Debug)]
+pub struct CanonicalOwnerCheckpointAdmission {
+    workload: CanonicalStoreWorkload,
+    build_plan: super::CanonicalStoreBuildPlan,
+    database_identity: Vec<u8>,
+}
 
 pub(super) const STORE_CONTROL_KEY: &[u8] = b"store_control";
 pub(super) const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
@@ -57,6 +101,42 @@ pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 15] = [
     TRANSACTION_BLOB_COLUMN_FAMILY,
 ];
 
+#[derive(Clone, Copy)]
+pub(super) struct CanonicalStoreAdmissionExpectation {
+    network: Network,
+    activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+    workload: CanonicalStoreWorkload,
+    reorg_policy: super::CanonicalReorgPolicy,
+}
+
+impl CanonicalStoreAdmissionExpectation {
+    pub(super) fn from_activations(
+        activations: &NetworkUpgradeActivations,
+        workload: CanonicalStoreWorkload,
+        reorg_policy: super::CanonicalReorgPolicy,
+    ) -> Self {
+        Self {
+            network: activations.network(),
+            activations_fingerprint: activations
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+            workload,
+            reorg_policy,
+        }
+    }
+
+    pub(super) fn from_build_plan(
+        build_plan: &super::CanonicalStoreBuildPlan,
+        workload: CanonicalStoreWorkload,
+    ) -> Self {
+        Self {
+            network: build_plan.network(),
+            activations_fingerprint: build_plan.network_upgrade_activations_fingerprint(),
+            workload,
+            reorg_policy: build_plan.reorg_policy(),
+        }
+    }
+}
+
 /// One admitted READY canonical version-1 `RocksDB` store.
 ///
 /// Construction is owned exclusively by [`super::RocksDbCanonicalBuilder`].
@@ -67,6 +147,12 @@ pub struct RocksDbCanonicalStore {
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
+    /// Serializes retained-event, projection-lease, and mempool-log lifecycle changes.
+    ///
+    /// The primary handle owns every canonical mutation. Keeping this lock on
+    /// that handle makes the pruning floor and the durable lease set one
+    /// indivisible lifecycle boundary without exposing a second writer API.
+    pub(super) lifecycle_lock: Arc<Mutex<()>>,
 }
 
 impl RocksDbCanonicalStore {
@@ -75,14 +161,15 @@ impl RocksDbCanonicalStore {
         workload: CanonicalStoreWorkload,
         build_plan: super::CanonicalStoreBuildPlan,
         cursor_auth_key: [u8; 32],
-        ready_evidence: CanonicalStoreReadyEvidence,
+        ready_evidence: &CanonicalStoreReadyEvidence,
     ) -> Self {
         Self {
             bounded_open,
             workload,
             build_plan,
             cursor_auth_key,
-            ready_evidence,
+            ready_evidence: *ready_evidence,
+            lifecycle_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -90,26 +177,33 @@ impl RocksDbCanonicalStore {
     ///
     /// Admission validates the complete column-family set, singleton control
     /// key, identity, schema, exact network-upgrade activation table, workload,
-    /// source range, and readiness evidence before opening a writer that cannot
-    /// create data families.
+    /// canonical reorg policy, source range, and readiness evidence before
+    /// opening a writer that cannot create data families.
     pub fn open_ready(
         path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
         expected_workload: CanonicalStoreWorkload,
+        expected_reorg_policy: super::CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
         let path = path.as_ref();
-        let expected_network = expected_network_upgrade_activations.network();
-        let expected_activations_fingerprint = expected_network_upgrade_activations
-            .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+        let expectation = CanonicalStoreAdmissionExpectation::from_activations(
+            expected_network_upgrade_activations,
+            expected_workload,
+            expected_reorg_policy,
+        );
+        Self::open_ready_with_expectation(path, expectation, resource_budget)
+    }
+
+    fn open_ready_with_expectation(
+        path: &Path,
+        expectation: CanonicalStoreAdmissionExpectation,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<Self, CanonicalStoreError> {
         validate_resource_budget(resource_budget)?;
         let store_path = canonical_store_path(path)?;
-        let (admitted_database_identity, admitted_control) = admit_existing_store(
-            &store_path,
-            expected_network,
-            expected_activations_fingerprint,
-            expected_workload,
-        )?;
+        let (admitted_database_identity, admitted_control) =
+            admit_existing_store(&store_path, expectation)?;
         let CanonicalStoreBuildState::Ready(admitted_ready_evidence) = admitted_control.build_state
         else {
             return Err(CanonicalStoreError::StoreNotReady { path: store_path });
@@ -135,12 +229,12 @@ impl RocksDbCanonicalStore {
                 "database identity changed during admission",
             ));
         }
-        let opened_control = validate_open_store_control(
+        let opened_control =
+            validate_open_store_control(&bounded_open.db, &store_path, expectation)?;
+        validate_mempool_lifecycle_admission(
             &bounded_open.db,
-            &store_path,
-            expected_network,
-            expected_activations_fingerprint,
-            expected_workload,
+            opened_control.network,
+            opened_control.cursor_auth_key,
         )?;
         if opened_control != admitted_control {
             return Err(CanonicalStoreError::admission(
@@ -159,14 +253,140 @@ impl RocksDbCanonicalStore {
             ));
         }
         let build_plan = opened_control.build_plan;
-        validate_ready_publication(&bounded_open.db, &build_plan, opened_ready_evidence)?;
+        validate_ready_publication(&bounded_open.db, &build_plan, &opened_ready_evidence)?;
         Ok(Self {
             bounded_open,
-            workload: expected_workload,
+            workload: expectation.workload,
             build_plan,
             cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
+            lifecycle_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Creates and cold-admits one physical checkpoint from this canonical owner.
+    ///
+    /// `target` must not exist. The returned identity and READY evidence are
+    /// read through exact cold admission of the completed checkpoint, never
+    /// copied from this live handle. Requiring mutable access keeps this API on
+    /// the canonical owner's mutation surface; serving secondaries expose no
+    /// checkpoint operation.
+    pub fn create_owner_checkpoint(
+        &mut self,
+        target: impl AsRef<Path>,
+        admission_resource_budget: RocksDbResourceBudget,
+    ) -> Result<CanonicalOwnerCheckpointEvidence, CanonicalStoreError> {
+        let target = target.as_ref();
+        let admission = self.create_owner_checkpoint_physical(target)?;
+        Self::cold_admit_owner_checkpoint(target, &admission, admission_resource_budget)
+    }
+
+    /// Creates the physical checkpoint while the canonical owner holds the
+    /// primary handle, then returns immutable admission context.
+    ///
+    /// Callers must run [`Self::cold_admit_owner_checkpoint`] outside the
+    /// writer's serialization queue. A full canonical cold admission may scan
+    /// a mainnet-sized immutable copy for a long time; holding primary
+    /// ownership through that scan would stall live following.
+    pub fn create_owner_checkpoint_physical(
+        &mut self,
+        target: impl AsRef<Path>,
+    ) -> Result<CanonicalOwnerCheckpointAdmission, CanonicalStoreError> {
+        let target = target.as_ref();
+        require_absent_checkpoint_target(target)?;
+        let admission = self.owner_checkpoint_readmission(target)?;
+        let checkpoint = Checkpoint::new(&self.bounded_open.db).map_err(|source| {
+            CanonicalStoreError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            }
+        })?;
+        checkpoint.create_checkpoint(target).map_err(|source| {
+            CanonicalStoreError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            }
+        })?;
+        copy_construction_manifest(self.bounded_open.db.path(), target)?;
+        Ok(admission)
+    }
+
+    /// Captures an opaque primary-owner admission context for re-admitting an
+    /// existing physical checkpoint.
+    ///
+    /// The context contains no filesystem authority and can only be consumed
+    /// by [`Self::cold_admit_owner_checkpoint`], which still performs complete
+    /// cold admission. The canonical control owner obtains this context on its
+    /// serialized primary queue immediately before it re-admits a checkpoint;
+    /// secondaries never expose this operation.
+    pub fn owner_checkpoint_readmission(
+        &self,
+        target: impl AsRef<Path>,
+    ) -> Result<CanonicalOwnerCheckpointAdmission, CanonicalStoreError> {
+        let target = target.as_ref();
+        let database_identity = self.bounded_open.db.get_db_identity().map_err(|source| {
+            CanonicalStoreError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            }
+        })?;
+        Ok(CanonicalOwnerCheckpointAdmission {
+            workload: self.workload,
+            build_plan: self.build_plan.clone(),
+            database_identity,
+        })
+    }
+
+    /// Cold-admits an immutable owner-created checkpoint without opening or
+    /// retaining its source primary.
+    ///
+    /// This is intentionally a static operation so the expensive complete
+    /// readback runs independently of the canonical writer queue.
+    pub fn cold_admit_owner_checkpoint(
+        target: impl AsRef<Path>,
+        admission: &CanonicalOwnerCheckpointAdmission,
+        admission_resource_budget: RocksDbResourceBudget,
+    ) -> Result<CanonicalOwnerCheckpointEvidence, CanonicalStoreError> {
+        validate_resource_budget(admission_resource_budget)?;
+        let target = target.as_ref();
+        let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
+            &admission.build_plan,
+            admission.workload,
+        );
+        let cold_checkpoint =
+            Self::open_ready_with_expectation(target, expectation, admission_resource_budget)?;
+        let cold_database_identity =
+            cold_checkpoint
+                .bounded_open
+                .db
+                .get_db_identity()
+                .map_err(|source| CanonicalStoreError::CheckpointFailed {
+                    path: target.to_path_buf(),
+                    source,
+                })?;
+        if cold_database_identity != admission.database_identity {
+            return Err(CanonicalStoreError::admission(
+                target,
+                "checkpoint database identity differs from the physical owner checkpoint",
+            ));
+        }
+        Ok(CanonicalOwnerCheckpointEvidence {
+            database_identity: cold_database_identity,
+            store_identity: CANONICAL_STORE_IDENTITY,
+            schema_version: CANONICAL_STORE_SCHEMA_VERSION,
+            workload: cold_checkpoint.workload,
+            build_plan: cold_checkpoint.build_plan.clone(),
+            ready_evidence: cold_checkpoint.ready_evidence,
+        })
+    }
+
+    /// Reads the immutable construction-manifest identity without opening a
+    /// `RocksDB` primary. Archive packagers use this narrow descriptor to bind
+    /// a physical checkpoint to the first READY construction proof.
+    pub fn read_construction_manifest_binding(
+        path: impl AsRef<Path>,
+    ) -> Result<super::CanonicalConstructionManifestBinding, CanonicalStoreError> {
+        read_construction_manifest_binding(path.as_ref())
     }
 
     /// Returns the immutable network persisted by the store control record.
@@ -189,6 +409,12 @@ impl RocksDbCanonicalStore {
         self.workload
     }
 
+    /// Returns the immutable maximum supported canonical replacement depth.
+    #[must_use]
+    pub const fn reorg_policy(&self) -> super::CanonicalReorgPolicy {
+        self.build_plan.reorg_policy()
+    }
+
     /// Returns the durable boundary of intentionally retained history.
     #[must_use]
     pub const fn history_bounds(&self) -> CanonicalHistoryBounds {
@@ -207,19 +433,38 @@ impl RocksDbCanonicalStore {
         self.ready_evidence
     }
 
+    /// Returns the authenticated replay prefix through the settled tip.
+    #[must_use]
+    pub const fn sequence_checkpoint(&self) -> super::CanonicalSequenceCheckpoint {
+        self.ready_evidence.sequence_checkpoint
+    }
+
     /// Scans the complete published canonical replay exactly once in height order.
     ///
     /// The scan bypasses the `RocksDB` block cache, decodes and authenticates every
     /// replay row, and verifies the final count, tip, and ordered sequence digest
     /// against the READY record before it terminates successfully.
     pub fn scan_canonical_replay(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
-        CanonicalReplayScan::new(&self.bounded_open.db, self.ready_evidence)
+        CanonicalReplayScan::new(&self.bounded_open.db, &self.ready_evidence)
     }
 
     /// Returns the filesystem I/O mode selected by the bounded `RocksDB` open.
     #[must_use]
     pub const fn io_mode(&self) -> RocksDbIoMode {
         self.bounded_open.io_mode
+    }
+}
+
+fn require_absent_checkpoint_target(path: &Path) -> Result<(), CanonicalStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(CanonicalStoreError::CheckpointTargetExists {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CanonicalStoreError::PathUnavailable {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -317,9 +562,7 @@ pub(super) fn initialize_store_identity(
 
 pub(super) fn admit_existing_store(
     path: &Path,
-    expected_network: Network,
-    expected_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
-    expected_workload: CanonicalStoreWorkload,
+    expectation: CanonicalStoreAdmissionExpectation,
 ) -> Result<(Vec<u8>, DecodedStoreControl), CanonicalStoreError> {
     let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
         CanonicalStoreError::admission(path, format!("column-family discovery failed: {source}"))
@@ -329,13 +572,11 @@ pub(super) fn admit_existing_store(
         .map_err(|source| {
             CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
         })?;
-    let control = validate_open_store_control(
-        &db,
-        path,
-        expected_network,
-        expected_activations_fingerprint,
-        expected_workload,
-    )?;
+    let control = validate_open_store_control(&db, path, expectation)?;
+    if let CanonicalStoreBuildState::Ready(ready) = control.build_state {
+        validate_ready_construction_manifest(path, &ready)?;
+    }
+    validate_mempool_lifecycle_admission(&db, control.network, control.cursor_auth_key)?;
     let database_identity = db.get_db_identity().map_err(|source| {
         CanonicalStoreError::admission(path, format!("database identity read failed: {source}"))
     })?;
@@ -368,9 +609,7 @@ fn validate_exact_column_families(
 pub(super) fn validate_open_store_control(
     db: &DB,
     path: &Path,
-    expected_network: Network,
-    expected_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
-    expected_workload: CanonicalStoreWorkload,
+    expectation: CanonicalStoreAdmissionExpectation,
 ) -> Result<DecodedStoreControl, CanonicalStoreError> {
     let mut control = None;
     for row in db.iterator(IteratorMode::Start) {
@@ -382,6 +621,11 @@ pub(super) fn validate_open_store_control(
         })?;
         match key.as_ref() {
             STORE_CONTROL_KEY => control = Some(encoded_control),
+            RETENTION_FLOOR_KEY
+            | PROJECTION_BUILD_LEASE_GENERATION_KEY
+            | MEMPOOL_EVENT_SEQUENCE_KEY
+            | MEMPOOL_EVENT_RETENTION_FLOOR_KEY => {}
+            lease_key if is_projection_build_lease_key(lease_key) => {}
             unknown => {
                 return Err(CanonicalStoreError::admission(
                     path,
@@ -393,31 +637,41 @@ pub(super) fn validate_open_store_control(
     let control =
         control.ok_or_else(|| CanonicalStoreError::admission(path, "store identity is absent"))?;
     let persisted = decode_store_control(path, &control)?;
-    if persisted.network != expected_network {
+    if persisted.network != expectation.network {
         return Err(CanonicalStoreError::admission(
             path,
             format!(
-                "persisted network {:?} does not equal requested network {expected_network:?}",
-                persisted.network
+                "persisted network {:?} does not equal requested network {:?}",
+                persisted.network, expectation.network
             ),
         ));
     }
     let persisted_activations_fingerprint = persisted
         .build_plan
         .network_upgrade_activations_fingerprint();
-    if persisted_activations_fingerprint != expected_activations_fingerprint {
+    if persisted_activations_fingerprint != expectation.activations_fingerprint {
         return Err(CanonicalStoreError::admission(
             path,
             "persisted network upgrade activations do not equal the requested activation table",
         ));
     }
-    if persisted.workload != expected_workload {
+    if persisted.workload != expectation.workload {
         return Err(CanonicalStoreError::admission(
             path,
             format!(
                 "persisted workload {} does not equal requested workload {}",
                 persisted.workload.as_str(),
-                expected_workload.as_str()
+                expectation.workload.as_str()
+            ),
+        ));
+    }
+    if persisted.build_plan.reorg_policy() != expectation.reorg_policy {
+        return Err(CanonicalStoreError::admission(
+            path,
+            format!(
+                "persisted reorg window {} does not equal requested reorg window {}",
+                persisted.build_plan.reorg_policy().reorg_window_blocks(),
+                expectation.reorg_policy.reorg_window_blocks()
             ),
         ));
     }
@@ -431,8 +685,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildPlan,
-        RocksDbCanonicalBuilder,
+        CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalReorgPolicy,
+        CanonicalStoreBuildPlan, RocksDbCanonicalBuilder,
     };
 
     #[test]
@@ -473,6 +727,7 @@ mod tests {
             &path,
             &testnet_activations,
             CanonicalStoreWorkload::Explorer,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -486,6 +741,7 @@ mod tests {
             &path,
             &mainnet_activations,
             CanonicalStoreWorkload::Explorer,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -500,6 +756,7 @@ mod tests {
             &path,
             &testnet_activations,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -542,6 +799,7 @@ mod tests {
             &path,
             &shifted_activations,
             CanonicalStoreWorkload::Explorer,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -569,6 +827,7 @@ mod tests {
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -606,7 +865,7 @@ mod tests {
         let mut control = db.get(STORE_CONTROL_KEY)?.ok_or("control should exist")?;
         let schema_version_start = CANONICAL_STORE_IDENTITY.len();
         control[schema_version_start..schema_version_start + 2]
-            .copy_from_slice(&2_u16.to_le_bytes());
+            .copy_from_slice(&1_u16.to_le_bytes());
         db.put(STORE_CONTROL_KEY, &control)?;
         drop(db);
 
@@ -614,11 +873,17 @@ mod tests {
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
         .ok_or("another schema version should be rejected")?;
-        assert!(error.to_string().contains("schema version 2"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("schema version 1 does not equal required version 5"),
+            "{error}"
+        );
         assert_eq!(read_control(&path)?, control);
         Ok(())
     }
@@ -646,6 +911,7 @@ mod tests {
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -667,9 +933,9 @@ mod tests {
     }
 
     #[test]
-    fn contract_identity_and_schema_are_exactly_version_one() {
+    fn contract_identity_and_schema_are_exact() {
         assert_eq!(CANONICAL_STORE_IDENTITY, "canonical");
-        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 1);
+        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 5);
     }
 
     fn read_control(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -686,6 +952,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            CanonicalReorgPolicy::new(100)?,
         )?)
     }
 }

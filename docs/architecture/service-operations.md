@@ -58,7 +58,7 @@ Required readiness causes:
 - `storage_unavailable` — canonical RocksDB cannot answer or has lost the visible epoch pointer
 - `schema_mismatch` — Zinder's expected schema version differs from the persisted store's schema fingerprint
 - `reorg_window_exceeded` — the selected branch requires replacing data outside the configured reorg window; operator action required
-- `replica_lagging` — a `zinder-query` or `zinder-compat-lightwalletd` secondary RocksDB reader is behind the writer by more than `secondary_replica_lag_threshold_chain_epochs` (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)); reads still serve from the last replayed state. Usually self-heals within one catchup interval; persistent lag indicates the writer is offline or under load
+- `replica_lagging` — a projector or compatibility RocksDB secondary is behind its primary by more than the configured threshold (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)); compatibility remains not-ready until it can authenticate an exact canonical/wallet pair. Persistent lag indicates an owner is offline or under load
 - `writer_status_unavailable` — a secondary reader cannot reach `zinder-ingest`'s private ingest-control endpoint and has no cached writer epoch to compare against; verify `ingest_control.addr` and the ingest-control listener
 - `cursor_at_risk` — chain-event retention is approaching exhaustion under load (per [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure)); writes still commit and reads still serve, but long-running consumer cursors are at risk of expiry. Operators tune retention or drain consumers
 - `mempool_cursor_at_risk` — mempool-event retention is approaching exhaustion (per [ADR-0007 §Retention windows](../adrs/0007-mempool-topology-and-retention.md)); same posture as `cursor_at_risk` but on the `mempool_event` column family, with separate Mined/Invalidated/Added windows
@@ -66,7 +66,11 @@ Required readiness causes:
 - `mempool_hydration_lagging` — hydration of `MempoolChange::ADDED` notifications via `getrawtransaction` is falling behind the source's emission rate; the index and event log will skip events older than the lag threshold and surface them as missing rather than out-of-order. Operators check upstream JSON-RPC latency and the `zinder_node_request_duration_seconds{operation="get_raw_transaction"}` series
 - `shutting_down` — graceful shutdown in progress; new traffic is rejected
 
-`cursor_at_risk` and `mempool_*` causes are informational warnings, not traffic-blocking failures: load balancers and orchestrators should treat them as "drain or investigate, do not fail." `/readyz` still returns HTTP 200 and `"status": "ready"` for these causes, while the structured `cause` and `zinder_readiness_state` metric keep the operator-actionable signal visible. Health-check probes that flip to "unhealthy" on any non-`ready` cause will overreact to this signal. The intent is that operators see the warning before consumers are forcibly expired or mempool UX degrades.
+`cursor_at_risk` and `mempool_cursor_at_risk` are informational warnings, not
+traffic-blocking failures: load balancers should drain or investigate without
+marking the process unhealthy. Mempool source unavailability, incomplete
+hydration, and hydration lag are traffic-blocking for wallet readiness because
+publishing a partial generation as an empty mempool would be incorrect.
 
 `zinder-ingest` readiness is capped by upstream node readiness. If the selected upstream node cannot answer, reports not ready, lacks a required capability, or has unreadable cookie-auth material, Zinder reports a typed not-ready cause instead of accepting traffic.
 
@@ -199,25 +203,9 @@ Implemented baseline metrics:
 | `zinder_ingest_writer_status_request_duration_seconds` | histogram | `zinder-ingest` | Private writer-status RPC latency by status and error class. |
 | `zinder_ingest_writer_status_request_total` | counter | `zinder-ingest` | Private writer-status RPC count by status and error class. |
 | `zinder_ingest_writer_status_available` | gauge | `zinder-ingest` | Whether the latest writer-status RPC served successfully. |
-| `zinder_ingest_backup_duration_seconds` | histogram | `zinder-ingest` | RocksDB checkpoint creation latency by network, status, and error class. |
-| `zinder_ingest_backup_total` | counter | `zinder-ingest` | RocksDB checkpoint creation count by network, status, and error class. |
-| `zinder_ingest_backup_last_success_unix_seconds` | gauge | `zinder-ingest` | Unix timestamp of the latest successful checkpoint creation by network. |
-| `zinder_query_request_duration_seconds` | histogram | `zinder-query` | Wallet-query operation latency by operation, status, and error class. |
-| `zinder_query_request_total` | counter | `zinder-query` | Wallet-query operation count by operation, status, and error class. |
-| `zinder_query_compact_block_range_block_count` | histogram | `zinder-query` | Compact-block range size by status. |
-| `zinder_query_secondary_catchup_duration_seconds` | histogram | `zinder-query` | RocksDB secondary catchup pass latency by status and error class. |
-| `zinder_query_secondary_catchup_total` | counter | `zinder-query` | RocksDB secondary catchup pass count by status and error class. |
-| `zinder_query_secondary_has_visible_epoch` | gauge | `zinder-query` | Whether the secondary reader has replayed a visible chain epoch. |
-| `zinder_query_secondary_chain_epoch_id` | gauge | `zinder-query` | Latest chain-epoch id visible to the secondary reader, or `0` when none is visible. |
-| `zinder_query_secondary_tip_height` | gauge | `zinder-query` | Latest tip height visible to the secondary reader, or `0` when none is visible. |
-| `zinder_query_secondary_replica_lag_chain_epochs` | gauge | `zinder-query` | Chain-epoch distance between the writer status and the secondary reader. |
-| `zinder_query_writer_status_request_duration_seconds` | histogram | `zinder-query` | Client-side writer-status RPC latency by status and error class. |
-| `zinder_query_writer_status_request_total` | counter | `zinder-query` | Client-side writer-status RPC count by status and error class. |
-| `zinder_query_writer_status_available` | gauge | `zinder-query` | Whether the latest writer-status fetch succeeded. |
-| `zinder_query_writer_status_has_chain_epoch` | gauge | `zinder-query` | Whether the latest writer-status response carried a writer chain epoch. |
-| `zinder_query_writer_status_chain_epoch_id` | gauge | `zinder-query` | Latest writer chain-epoch id observed through writer status. |
-| `zinder_query_writer_status_tip_height` | gauge | `zinder-query` | Latest writer tip height observed through writer status. |
-| `zinder_query_writer_status_safe_tip_height` | gauge | `zinder-query` | Latest writer safe tip height observed through writer status. |
+| `zinder_query_request_duration_seconds` | histogram | `zinder-compat-lightwalletd` | Internal wallet-query operation latency by operation, status, and error class. |
+| `zinder_query_request_total` | counter | `zinder-compat-lightwalletd` | Internal wallet-query operation count by operation, status, and error class. |
+| `zinder_query_compact_block_range_block_count` | histogram | `zinder-compat-lightwalletd` | Compact-block range size by status. |
 | `zinder_store_read_duration_seconds` | histogram | `zinder-store` | RocksDB read latency by operation, column family, caller, and status. The `caller` label attributes the read to the pipeline stage that issued it: `query`, `block_prefetch`, `commit_fallback`, `retention_sweep`, or `derive_hydration`. |
 | `zinder_store_read_bytes_total` | counter | `zinder-store` | Bytes returned from successful RocksDB reads. |
 | `zinder_store_multi_get_key_count` | histogram | `zinder-store` | Key fanout for `multi_get` reads. |
@@ -247,15 +235,15 @@ Implemented baseline metrics:
 For local inspection and public-network baseline capture, use the host-binary
 smoke harness in [`observability/README.md`](../../observability/README.md). It
 starts Prometheus and Grafana through Docker Compose, runs the Zinder binaries
-against the selected local node source, verifies checkpoint backup restore,
-generates native and compatibility gRPC traffic, and writes readiness reports
-under `.tmp/observability/reports`.
+against the selected local node source, records that coherent restore is still
+blocked, generates lightwalletd-compatible gRPC traffic, and writes readiness
+reports under `.tmp/observability/reports`.
 
 The readiness report is the durable baseline artifact. It records the selected
 network, upstream node tip, checkpoint height, bulk-catchup range and duration,
 wallet query p95, source RPC p95, store read p95, secondary catchup p95,
-RocksDB compaction gauges, readiness lag, replica lag, and backup-restore
-outcome. Use
+RocksDB compaction gauges, readiness lag, replica lag, and the explicit restore
+status. Use
 `scripts/observability-smoke.sh calibrate` for repeated runs that aggregate P50,
 P95, P99, and worst-case values before updating performance-budget tables.
 
@@ -283,7 +271,7 @@ P95, P99, and worst-case values before updating performance-budget tables.
   `mempool_source_unavailable`, `mempool_hydration_lagging`, and
   `mempool_cursor_at_risk` readiness causes.
 
-`zinder-query` should expose:
+The internal native query library and compatibility adapter expose:
 
 - Request count by endpoint and status. The baseline metric is
   `zinder_query_request_total`.
@@ -294,9 +282,17 @@ P95, P99, and worst-case values before updating performance-budget tables.
 - Transaction broadcast result class.
 - Storage read latency and error class. The baseline metric is
   `zinder_store_read_duration_seconds`.
-- Secondary catchup lag (per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md)): current chain-epoch lag and time since last successful catchup.
+- Exact-pair publication, convergence outcome, catchup duration, and generation
+  drain pressure. The baseline metrics are
+  `zinder_compat_lightwalletd_frozen_pair_publications_total`,
+  `zinder_compat_lightwalletd_frozen_pair_convergence_total`,
+  `zinder_compat_lightwalletd_frozen_pair_catchup_duration_seconds`, and
+  `zinder_compat_lightwalletd_frozen_pair_generation_wait_total`.
+- Writer-status availability and exact-pair replica lag through
+  `zinder_compat_lightwalletd_writer_status_available` and
+  `zinder_compat_lightwalletd_frozen_pair_replica_lag_chain_epochs`.
 
-`zinder-explorer` should expose:
+The post-wallet explorer cutover should expose:
 
 - Last consumed epoch.
 - Derived-index lag.
@@ -319,9 +315,10 @@ observability.
 
 ### What Zinder ships
 
-`deploy/docker-compose.yml` includes a `zinder-prometheus` service
-that scrapes `zinder-ingest:9105`, `zinder-query:9106`, and
-`zinder-explorer:9069` over a project-scoped Docker network
+`deploy/docker-compose.yml` includes a `zinder-prometheus` service that scrapes
+ingest on port 9105, projector on port 9110, and compatibility on port 9107 over
+the single-host topology's network namespace and a project-scoped observability
+network.
 (`zinder-<network>-observability`). One Prometheus runs per zinder
 stack, so mainnet and testnet stay isolated and a single host can
 hold both. The service is always on: it comes up with every
@@ -565,85 +562,51 @@ must be non-zero. Shutdown is driven by a `CancellationToken`; the
 CLI root token is cancelled on `ctrl-c`, and the loop checks the
 token through `tokio::select!` instead of polling a boolean flag.
 
-`zinder-ingest backup --to <path>` uses `[network]` and `[storage]` plus a
-subcommand-specific `[backup] to_path` field when invoked through config. It
-resolves the same immutable `storage.raw_blob_policy` as the writer; direct CLI
-invocations use `--raw-blob-policy`. The selected value must match the store's
-persisted retention contract, so backup fails before checkpoint creation when
-an operator supplies a different policy. It
-detects the effective workload from the durable derive manifest, opens the
-canonical store as `PrimaryChainStore`, opens that selected derive store as
-primary, and creates RocksDB checkpoints for both stores; it does not
-connect to the upstream node. The published directory also contains
-`zinder-backup-manifest.json`, which binds the network, workload, immutable
-raw-blob retention, canonical history boundary, and every projection position
-to the reopened checkpoints.
-A projection is recorded as `behind` only when its authenticated cursor can
-resume from retained events, or a missing cursor can replay from the canonical
-history boundary. An expired cursor, a retained suffix without that boundary,
-or a wallet projection at the event tip without complete materialization proof
-prevents publication; an unrecoverable state is never serialized into a backup
-artifact.
+The legacy `zinder-ingest backup` command is deleted because it checkpointed a
+canonical store and bundled derive store at different instants and could not
+authenticate the independent schema-v1 wallet store. The replacement must
+publish one coherent canonical/wallet bundle with an exact event fence and
+wallet digest. Until that command and its 10,000-block-tail restore evidence
+exist, production restore is blocked rather than simulated with directory
+copies or a legacy manifest.
 
 ## Recovery
 
 Expected recovery behavior:
 
-- Restore a backup into a new working directory while all Zinder processes are
-  stopped, then start `zinder-ingest` before any reader. Before opening a
-  primary writer, ingest fully reopens and recomputes the pending backup
-  manifest. Successful admission atomically renames it to
-  `zinder-restore-admission.json`; later restarts validate that historical
-  record structurally without comparing its projection count or schema versions
-  to the running catalog. Current durable projection state then follows normal
-  schema reconciliation and remains the only readiness authority.
-  A pending and admitted record together, or any malformed or mismatched
-  record, fails closed. Pending restore admission compares the manifest's
-  raw-blob retention, the checkpoint's persisted retention signal, and the
-  configured writer policy before consuming the pending evidence. Later
-  restarts also reject a configured policy that differs from the admitted
-  retention contract.
-- Start query, compatibility, and explorer readers only after ingest admits the
-  restored pair. Manifest labels such as `exact` are historical evidence, not
-  capability state; each reader applies its normal schema, cursor, coverage,
-  and freshness checks.
+- Restore only a coherent canonical/wallet bundle produced by the future
+  current-schema checkpoint command. Start ingest, projector, and compatibility in
+  ownership order and require their normal schema, fence, lease, coverage, and
+  freshness checks. No ad hoc copy or historical derive manifest is admitted.
 
-- If `zinder-query` fails, restart it without affecting ingestion.
-- If `zinder-explorer` fails, mark derived indexes stale and rebuild or resume later.
+- If `zinder-projector` fails, restart it without affecting canonical ingestion or the last immutable compatibility pair.
+- If `zinder-compat-lightwalletd` fails, restart it without opening either primary store.
 - If `zinder-ingest` fails during an epoch commit, restart from the last committed epoch or fail with `storage_unavailable` or `schema_mismatch`.
 - If a reorg exceeds the configured window, fail closed and require operator action.
 
-Process supervision belongs to the deployment shape. The single-container image
-uses s6-overlay to respawn each failed long-running service in place after a
-short delay; one child failure does not terminate otherwise healthy sibling
-services. Per-service images delegate restart policy to the container
-orchestrator. In both shapes, repeated failures remain visible through logs and
-the affected service's liveness or readiness endpoint.
+Process supervision belongs to the deployment shape. The supported per-service
+images delegate restart policy to the container orchestrator. Repeated failures
+remain visible through logs and the affected service's liveness or readiness
+endpoint.
 
 ## Deployment Guidance
 
-The commands and process counts below describe the currently implemented
-`rocksdb-single-host` topology. It is production-supported and requires no
-Postgres service.
+The process counts below describe the implemented `rocksdb-single-host`
+wallet-serving topology. It requires no Postgres service, but production
+traffic remains gated by ADR-0035 lifecycle evidence.
 
 Minimum service set:
 
 ```text
 1 x zinder-ingest
-N x zinder-query
-0..N x zinder-compat-lightwalletd
+1 x zinder-projector
+N x zinder-compat-lightwalletd
 ```
 
-Optional explorer service set:
-
-```text
-1 x zinder-ingest
-N x zinder-query
-0..N x zinder-compat-lightwalletd
-M x zinder-explorer
-```
-
-Only one ingest writer should own a canonical storage namespace unless leader election and write fencing are explicitly designed.
+Only one ingest writer may own a canonical storage namespace, and only one
+projector may own a wallet storage namespace. Each compatibility process owns
+two bounded canonical-secondary generations and two bounded wallet-secondary
+generations.
 
 The accepted `postgres-scale-out` topology keeps one fenced active ingest
 writer while allowing projection workers, query replicas, and database replicas
@@ -654,27 +617,10 @@ pass.
 
 ### Native wallet clients
 
-A wallet that implements the native `WalletQuery` protocol connects to a
-separately run `zinder-query` process over gRPC:
-
-```text
-1 x zinder-ingest
-1 x zinder-query
-1 x native wallet client -> zinder-query
-```
-
-This is the recommended operator recipe because the wallet and the indexer do
-not share a store path. `zinder-query` owns RocksDB secondary catchup,
-writer-status checks, public `WalletQuery` gRPC, chain-event subscriptions,
-mempool proxying, `ServerInfo`, and broadcast forwarding. The wallet adapter
-only needs the query endpoint, configured network, and the native methods its
-backend abstraction consumes.
-
-Zinder's native channel is plaintext and unauthenticated by default, so a
-wallet either connects over loopback or a trusted LAN, or implements the TLS and
-authentication expected by the operator's proxy. `LocalChainIndex` remains
-available to colocated read-only Rust applications, but it cannot replace the
-endpoint-backed event, mempool, and broadcast methods a full wallet may need.
+The first fact-first production path publishes the lightwalletd-compatible
+endpoint only. The native `WalletQueryApi` remains an internal library and
+certification boundary. The superseded `zinder-query` binary and its runtime
+configuration have been deleted; operators cannot deploy it as a fallback.
 
 The canonical store directory is a security boundary. Zinder stores cursor authentication material inside the store so cursors fail closed when tampered with or replayed against another store. An actor with read access to the RocksDB directory can forge local cursor tokens, so production deployments must restrict filesystem permissions to the service operator account and backup system.
 
@@ -687,13 +633,12 @@ Caddy, nginx, or traefik terminates HTTPS and forwards h2c to the local compat
 process. Plaintext LAN endpoints are development-only for patched SDK demo apps
 and protocol debugging.
 
-The public wallet plane (`WalletQuery` on `zinder-query` and
-`CompactTxStreamer` on `zinder-compat-lightwalletd`) has no built-in
-authentication; operators terminate TLS and apply auth, rate-limiting, and
-per-tenant quotas at the reverse proxy.
+The public `CompactTxStreamer` plane on `zinder-compat-lightwalletd` has no
+built-in authentication; operators terminate TLS and apply auth, rate-limiting,
+and per-tenant quotas at the reverse proxy.
 
 The private `IngestControl` gRPC plane that ties `zinder-ingest`,
-`zinder-query`, and `zinder-compat-lightwalletd` together is plaintext h2c.
+`zinder-projector`, and `zinder-compat-lightwalletd` together is plaintext h2c.
 Zinder does not offer native TLS on this port. Per
 [ADR-0006](../adrs/0006-ingest-control-transport-security.md), the operator
 chooses one of three deployment patterns:
@@ -743,8 +688,6 @@ Tests are organized by **runtime mechanism**. Network choice (regtest, testnet, 
 | T1 PostgreSQL | disposable external PostgreSQL driver boundary | `services/zinder-bench/tests/integration/postgres_canonical_fact_round_trip.rs` | every PR (dedicated service) |
 | T2 perf | time-budgeted, no external state | `tests/perf/` | every PR (separate job) |
 | T3 live | real upstream node | `tests/live/` | nightly (regtest), weekly (testnet); mainnet runs against an operator-hosted Zebra |
-| T3 Zallet adapter | externally supplied Zallet adapter binary against Zinder's native contract | `crates/zinder-client/tests/live/zallet.rs` | adapter development / integration certification |
-| T3 deploy | Docker image and sidecar deployment smoke | `tests/deploy/` | nightly/release |
 | T4 parity | consumer-shaped public contract certification | `tests/parity/` | every PR |
 
 A test's tier is its directory. The directory listing is the tier inventory; filenames cannot lie.
@@ -753,4 +696,4 @@ T3 tests carry two gates: `#[ignore = LIVE_TEST_IGNORE_REASON]` plus a first-lin
 
 Test functions under `tests/live/` use plain `snake_case_describing_behavior` names. Do not include `live`, `regtest`, `testnet`, `mainnet`, or `z3` in the function name; the directory and runtime parameterization handle that.
 
-`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-postgres`, `ci-perf`, `ci-live`, `ci-zallet-live`, `ci-deploy`, `ci-parity`) live in `.config/nextest.toml`. Live-test gates read `ZINDER_NETWORK`; production binaries read `ZINDER_NETWORK__NAME` through the nested config loader. Both use the same `ZINDER_NODE__*` node schema. The full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by the [Testing Runbook](../runbooks/testing.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).
+`cargo nextest run` is the canonical runner. The profiles (`default`, `ci`, `ci-postgres`, `ci-perf`, `ci-live`, `ci-parity`) live in `.config/nextest.toml`. Live-test gates read `ZINDER_NETWORK`; production binaries read `ZINDER_NETWORK__NAME` through the nested config loader. Both use the same `ZINDER_NODE__*` node schema. The full schema, gating contract, runner profiles, `node-mutating` group, and CI cadence are owned by the [Testing Runbook](../runbooks/testing.md) and the canonical TOML in [Public interfaces §Configuration Conventions](public-interfaces.md#configuration-conventions).

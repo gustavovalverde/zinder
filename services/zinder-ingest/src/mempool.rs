@@ -7,11 +7,16 @@
 
 mod entry;
 mod index;
+mod live_owner;
 mod orchestrator;
 mod ready_gate;
 
 pub use entry::{MempoolEntryBuildError, build_mempool_entry};
+pub(crate) use index::MempoolIndexPreflight;
 pub use index::{MempoolApplyOutcome, MempoolIndex, MempoolSnapshotPage};
+pub use live_owner::{
+    FactFirstMempoolOwner, run_fact_first_mempool_owner, run_fact_first_mempool_retention,
+};
 pub use orchestrator::{
     MempoolOrchestratorError, MempoolOrchestratorEventOutcome, run_mempool_orchestrator,
 };
