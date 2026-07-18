@@ -2,7 +2,8 @@
 //!
 //! The artifact is a directory rather than an extractor-dependent archive.
 //! Its outer manifest is published last and commits every payload byte. A
-//! later consumer must call [`admit_recovery_archive`] before it opens either
+//! later consumer must call
+//! [`crate::recovery_archive::admit_recovery_archive`] before it opens either
 //! recovered store. The configured archive root is an operator-owned,
 //! exclusive root; the manifest seal detects post-publication mutation but is
 //! not a substitute for WORM storage when an operator requires physical media
