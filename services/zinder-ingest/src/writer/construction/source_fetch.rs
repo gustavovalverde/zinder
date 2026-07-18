@@ -1,3 +1,6 @@
+//! Ordered, connected block-segment fetching from the node source with
+//! adaptive concurrency, segment sizing, and byte-budget backpressure.
+
 use std::{
     collections::{BTreeMap, VecDeque},
     num::{NonZeroU32, NonZeroU64},
@@ -988,7 +991,7 @@ mod tests {
         SourceSegmentFeedbackAction, SourceSegmentSizer, apply_source_segment_feedback_action,
         source_prefetch_queue_accounting,
     };
-    use crate::canonical_construction::watermark::ByteWatermark;
+    use crate::writer::construction::watermark::ByteWatermark;
 
     #[test]
     fn response_too_large_feedback_retains_disjoint_future_source_prefetch()

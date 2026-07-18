@@ -204,14 +204,14 @@ pub(crate) enum IngestConfigError {
     Ingest(#[from] IngestError),
 
     #[error(transparent)]
-    CanonicalRuntime(#[from] zinder_ingest::CanonicalRuntimeError),
+    CanonicalWriter(#[from] zinder_ingest::CanonicalWriterError),
 
-    #[error("version-1 canonical runtime requires ingest.projection_preset=wallet")]
-    CanonicalRuntimeRequiresWallet,
+    #[error("version-1 canonical writer requires ingest.projection_preset=wallet")]
+    CanonicalWriterRequiresWallet,
 
     #[error(transparent)]
     CanonicalReplayVerification(
-        #[from] crate::canonical_replay_verification::CanonicalReplayVerificationError,
+        #[from] crate::replay_verification::CanonicalReplayVerificationError,
     ),
 }
 

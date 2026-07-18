@@ -1,3 +1,6 @@
+//! Per-stage byte-budget reservations that bound in-flight bytes and drive
+//! construction-pipeline backpressure.
+
 use std::{
     num::NonZeroU64,
     sync::{

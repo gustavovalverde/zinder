@@ -20,17 +20,16 @@ use zinder_store::{
 
 use crate::{
     CanonicalBlockConstructionError, CanonicalConstructionError, CommitmentTreeSizes, IngestError,
-    MempoolReadyGate, RawBlobPolicy,
-    canonical_construction::{
-        canonical_build_block, compact_block_commitments,
-        register_fact_first_prohibited_read_metrics,
-    },
-    canonical_control::{CanonicalControlCommand, handle_canonical_control_command},
-    position_canonical_block, prepare_canonical_block,
+    MempoolReadyGate, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
     source_recovery::{
         SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
         detail_for_ongoing_outage,
     },
+    writer::construction::{
+        canonical_build_block, compact_block_commitments,
+        register_fact_first_prohibited_read_metrics,
+    },
+    writer::control::{CanonicalControlCommand, handle_canonical_control_command},
 };
 
 /// Polling and bounded-source settings for version-1 canonical following.

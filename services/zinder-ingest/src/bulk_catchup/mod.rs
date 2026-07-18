@@ -17,11 +17,6 @@ use zinder_store::{
 };
 
 use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block};
-#[cfg(test)]
-use crate::canonical_construction::source_fetch::SourceSegmentPlan;
-use crate::canonical_construction::{
-    CanonicalPipelineLimits, source_fetch::SourceSegmentSizer, watermark::record_stage_duration,
-};
 use crate::chain_ingest::{
     IngestError, NodeSourceKind, canonical_writer_store_options, current_unix_millis,
     validate_writer_store_contract,
@@ -30,6 +25,11 @@ use crate::phase::current_chain_height;
 use crate::source_recovery::{
     SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
     detail_for_ongoing_outage,
+};
+#[cfg(test)]
+use crate::writer::construction::source_fetch::SourceSegmentPlan;
+use crate::writer::construction::{
+    CanonicalPipelineLimits, source_fetch::SourceSegmentSizer, watermark::record_stage_duration,
 };
 use block_prepare::{BulkCatchupBlockPrepareStreamConfig, build_block_prepare_stream};
 use commit_reassembly::run_commit_reassembly;

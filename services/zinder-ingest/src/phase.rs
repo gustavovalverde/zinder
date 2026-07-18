@@ -6,7 +6,9 @@
 //! [`IngestPhase::BulkCatchup`], and [`IngestPhase::FollowingTip`]. This
 //! module owns the pure-function classifier ([`classify_phase`]) plus the
 //! shared [`current_chain_height`] helper consumed by every phase handler.
-//! The handlers and the spawn-once orchestration live in `ingest_loop.rs`.
+//! Construction and follow phases are dispatched directly by `writer/mod.rs`
+//! and `writer/follow.rs`; [`classify_phase`] also backs the CLI `probe`
+//! diagnostic in `main.rs`.
 
 use zinder_runtime::IngestPhase;
 use zinder_store::PrimaryChainStore;

@@ -30,7 +30,7 @@ use zinder_store::{
     MempoolEventRetentionReport, StreamCursorTokenV1, mempool_event_envelope_message,
 };
 
-use crate::canonical_control::CanonicalControlHandle;
+use crate::writer::control::CanonicalControlHandle;
 
 use super::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolIndexPreflight,
@@ -910,12 +910,11 @@ mod tests {
     use zinder_testkit::{MockMempoolSource, MockMempoolSourceControl};
 
     use crate::{
-        MempoolReadyGate,
-        canonical_control::{
+        MempoolReadyGate, mempool_ready_channel,
+        writer::control::{
             CanonicalControlHandle, canonical_control_channel, handle_canonical_control_command,
             test_support::published_fixture_store,
         },
-        mempool_ready_channel,
     };
 
     use super::{FactFirstMempoolOwner, run_fact_first_mempool_owner};

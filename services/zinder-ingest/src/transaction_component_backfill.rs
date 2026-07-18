@@ -16,7 +16,7 @@ use zinder_store::PrimaryChainStore;
 use crate::{
     IngestError,
     derive_consumers::derive_projection_write_guard,
-    ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
+    loop_config::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
 };
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);

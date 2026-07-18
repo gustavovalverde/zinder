@@ -7,17 +7,12 @@
 mod artifact_builder;
 pub mod bench_support;
 mod bulk_catchup;
-mod canonical_construction;
-mod canonical_control;
-mod canonical_follow;
-mod canonical_ingest_control;
-mod canonical_runtime;
 mod chain_ingest;
 mod conventional_fee_distribution_backfill;
 mod derive_consumers;
 mod derive_status_reader;
 mod ingest_control;
-mod ingest_loop;
+mod loop_config;
 mod memory_pressure;
 mod mempool;
 mod phase;
@@ -26,6 +21,7 @@ mod tip_follow;
 mod transaction_component_backfill;
 mod transparent_address_ranking_snapshot;
 mod upstream_health_probe;
+mod writer;
 
 pub use artifact_builder::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
@@ -35,27 +31,6 @@ pub use artifact_builder::{
 pub use bulk_catchup::{
     BulkCatchupRunConfig, run_bulk_catchup, run_bulk_catchup_until_complete,
     run_bulk_catchup_with_store,
-};
-pub use canonical_construction::{
-    CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
-    CanonicalPipelineLimits, CanonicalPipelineLimitsError, CanonicalSourceLoadOutcome,
-    load_fresh_canonical, load_fresh_canonical_blocks, load_fresh_canonical_source_families,
-};
-pub use canonical_control::{
-    CANONICAL_CONTROL_COMMAND_CAPACITY, CanonicalCheckpointStagingRoot, CanonicalControlCommand,
-    CanonicalControlGrpcAdapter, CanonicalControlHandle, canonical_control_channel,
-};
-pub use canonical_follow::{
-    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, CanonicalReorgWindowExceeded,
-    follow_canonical_tip, follow_canonical_tip_with_control,
-};
-pub use canonical_ingest_control::{
-    CanonicalIngestControlGrpcAdapter,
-    MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as FACT_FIRST_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
-};
-pub use canonical_runtime::{
-    CanonicalRuntimeConfig, CanonicalRuntimeError, run_canonical_runtime,
-    run_canonical_runtime_with_control,
 };
 pub use chain_ingest::{
     DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
@@ -76,7 +51,7 @@ pub use derive_status_reader::{
     DeriveStatusReadError, DeriveStatusReader, RocksDbDeriveStatusReader,
 };
 pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
-pub use ingest_loop::{
+pub use loop_config::{
     BulkCatchupConfig, DeriveReplayPolicy, HistoricalWorkGate, IngestDeriveConfig,
     IngestLoopConfig, IngestModifiers, PhasesConfig, TipFollowPhaseConfig,
 };
@@ -101,4 +76,25 @@ pub use transparent_address_ranking_snapshot::{
     TransparentAddressRankingBootstrapOutcome, bootstrap_transparent_address_ranking,
 };
 pub use upstream_health_probe::spawn_upstream_health_probe_task;
+pub use writer::construction::{
+    CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
+    CanonicalPipelineLimits, CanonicalPipelineLimitsError, CanonicalSourceLoadOutcome,
+    load_fresh_canonical, load_fresh_canonical_blocks, load_fresh_canonical_source_families,
+};
+pub use writer::control::{
+    CANONICAL_CONTROL_COMMAND_CAPACITY, CanonicalCheckpointStagingRoot, CanonicalControlCommand,
+    CanonicalControlGrpcAdapter, CanonicalControlHandle, canonical_control_channel,
+};
+pub use writer::follow::{
+    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, CanonicalReorgWindowExceeded,
+    follow_canonical_tip, follow_canonical_tip_with_control,
+};
+pub use writer::ingest_control::{
+    CanonicalIngestControlGrpcAdapter,
+    MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as FACT_FIRST_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
+};
+pub use writer::{
+    CanonicalWriterConfig, CanonicalWriterError, run_canonical_writer,
+    run_canonical_writer_with_control,
+};
 pub use zinder_runtime::container_memory_budget_bytes;

@@ -17,16 +17,16 @@ use super::{
     record_bulk_pipeline_stage_duration, usize_to_u64_saturating,
 };
 use crate::artifact_builder::{CommitmentTreeSizes, position_canonical_block};
-use crate::canonical_construction::{
-    abort_on_drop::AbortOnDropTask,
-    watermark::{record_queue_depth, record_reorder_buffer},
-};
 use crate::chain_ingest::{
     CanonicalBatch, CanonicalBatchBudget, CanonicalBatchCloseTrigger, CanonicalBatchCost,
     IngestError, IngestRetryState, IngestSubtreeRootIndexes, commit_ingest_batch,
     current_unix_millis, next_chain_epoch_id, next_chain_epoch_id_after,
     observe_final_note_commitment_roots, populate_subtree_root_artifacts,
     record_ingest_batch_commit_trigger, record_ingest_batch_work_cost,
+};
+use crate::writer::construction::{
+    abort_on_drop::AbortOnDropTask,
+    watermark::{record_queue_depth, record_reorder_buffer},
 };
 
 #[allow(

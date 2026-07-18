@@ -40,7 +40,7 @@ use zinder_store::{
 
 use crate::{
     CanonicalControlHandle, FactFirstMempoolOwner,
-    canonical_control::{CanonicalIngestEvent, CanonicalWriterSnapshot},
+    writer::control::{CanonicalIngestEvent, CanonicalWriterSnapshot},
 };
 
 type IngestControlStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
@@ -678,7 +678,7 @@ mod tests {
 
     use crate::{
         CanonicalCheckpointStagingRoot, CanonicalControlGrpcAdapter, FactFirstMempoolOwner,
-        canonical_control::{
+        writer::control::{
             canonical_control_channel, handle_canonical_control_command,
             test_support::published_fixture_store,
         },
@@ -691,7 +691,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let previous_epoch = fixture_epoch(7, 100, 0x71);
         let resulting_epoch = fixture_epoch(8, 101, 0x81);
-        let event = crate::canonical_control::CanonicalIngestEvent {
+        let event = crate::writer::control::CanonicalIngestEvent {
             cursor: CanonicalEventCursor::at(23)?,
             kind: CanonicalEventKind::Reorged,
             resulting_epoch,

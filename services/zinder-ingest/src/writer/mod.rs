@@ -1,5 +1,10 @@
 //! Version-1 canonical construction, admission, and follower handoff.
 
+pub(crate) mod construction;
+pub(crate) mod control;
+pub(crate) mod follow;
+pub(crate) mod ingest_control;
+
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use thiserror::Error;
@@ -20,9 +25,9 @@ use crate::{
     follow_canonical_tip_with_control, load_fresh_canonical,
 };
 
-/// Complete concrete configuration for the first `RocksDB` single-host runtime.
+/// Complete concrete configuration for the first `RocksDB` single-host writer.
 #[derive(Clone, Debug)]
-pub struct CanonicalRuntimeConfig {
+pub struct CanonicalWriterConfig {
     /// Final version-1 canonical store path.
     pub storage_path: PathBuf,
     /// Bounded `RocksDB` resources for construction, following, and reopen.
@@ -37,12 +42,12 @@ pub struct CanonicalRuntimeConfig {
     pub follow: CanonicalFollowConfig,
 }
 
-/// Failure while opening or constructing the version-1 runtime.
+/// Failure while opening or constructing the version-1 writer.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum CanonicalRuntimeError {
+pub enum CanonicalWriterError {
     /// The configured store path could not be inspected.
-    #[error("canonical runtime path {path:?} is unavailable: {source}")]
+    #[error("canonical writer path {path:?} is unavailable: {source}")]
     PathUnavailable {
         /// Path being inspected or changed.
         path: PathBuf,
@@ -87,17 +92,17 @@ pub enum CanonicalRuntimeError {
 }
 
 /// Opens or freshly constructs the version-1 store, then follows Zebra.
-pub async fn run_canonical_runtime<Source>(
+pub async fn run_canonical_writer<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    config: CanonicalRuntimeConfig,
+    config: CanonicalWriterConfig,
     readiness: &Readiness,
     cancel: &CancellationToken,
-) -> Result<RocksDbCanonicalStore, CanonicalRuntimeError>
+) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
     Source: NodeSource + Clone,
 {
-    run_canonical_runtime_with_control(
+    run_canonical_writer_with_control(
         source,
         network_upgrade_activations,
         config,
@@ -112,16 +117,16 @@ where
 /// commands from the private canonical-control channel.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the controlled variant preserves the established runtime dependency boundary while adding only the optional owner command receiver"
+    reason = "the controlled variant preserves the established writer dependency boundary while adding only the optional owner command receiver"
 )]
-pub async fn run_canonical_runtime_with_control<Source>(
+pub async fn run_canonical_writer_with_control<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    config: CanonicalRuntimeConfig,
+    config: CanonicalWriterConfig,
     readiness: &Readiness,
     cancel: &CancellationToken,
     control_commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
-) -> Result<RocksDbCanonicalStore, CanonicalRuntimeError>
+) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
     Source: NodeSource + Clone,
 {
@@ -151,9 +156,9 @@ where
 async fn open_or_construct_canonical_store<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    config: &CanonicalRuntimeConfig,
+    config: &CanonicalWriterConfig,
     readiness: &Readiness,
-) -> Result<RocksDbCanonicalStore, CanonicalRuntimeError>
+) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
     Source: NodeSource + Clone,
 {
@@ -178,8 +183,8 @@ where
 
 fn open_existing_store(
     network_upgrade_activations: &NetworkUpgradeActivations,
-    config: &CanonicalRuntimeConfig,
-) -> Result<Option<RocksDbCanonicalStore>, CanonicalRuntimeError> {
+    config: &CanonicalWriterConfig,
+) -> Result<Option<RocksDbCanonicalStore>, CanonicalWriterError> {
     if !path_exists(&config.storage_path)? {
         return Ok(None);
     }
@@ -205,8 +210,8 @@ fn open_existing_store(
 fn recover_staged_store(
     staging_path: &std::path::Path,
     network_upgrade_activations: &NetworkUpgradeActivations,
-    config: &CanonicalRuntimeConfig,
-) -> Result<Option<RocksDbCanonicalStore>, CanonicalRuntimeError> {
+    config: &CanonicalWriterConfig,
+) -> Result<Option<RocksDbCanonicalStore>, CanonicalWriterError> {
     if !path_exists(staging_path)? {
         discard_unpublished_block_load_staging(staging_path)?;
         return Ok(None);
@@ -232,7 +237,7 @@ fn recover_staged_store(
                 config.resource_budget,
             )
             .map(Some)
-            .map_err(CanonicalRuntimeError::from)
+            .map_err(CanonicalWriterError::from)
         }
         Err(CanonicalStoreError::StoreNotReady { .. }) => {
             remove_unpublished_staging(staging_path)?;
@@ -244,9 +249,9 @@ fn recover_staged_store(
 
 fn remove_empty_construction_staging(
     staging_path: &std::path::Path,
-) -> Result<bool, CanonicalRuntimeError> {
+) -> Result<bool, CanonicalWriterError> {
     let mut entries = std::fs::read_dir(staging_path).map_err(|source| {
-        CanonicalRuntimeError::PathUnavailable {
+        CanonicalWriterError::PathUnavailable {
             path: staging_path.to_path_buf(),
             source,
         }
@@ -254,7 +259,7 @@ fn remove_empty_construction_staging(
     if entries
         .next()
         .transpose()
-        .map_err(|source| CanonicalRuntimeError::PathUnavailable {
+        .map_err(|source| CanonicalWriterError::PathUnavailable {
             path: staging_path.to_path_buf(),
             source,
         })?
@@ -263,7 +268,7 @@ fn remove_empty_construction_staging(
         return Ok(false);
     }
     discard_unpublished_block_load_staging(staging_path)?;
-    std::fs::remove_dir(staging_path).map_err(|source| CanonicalRuntimeError::PathUnavailable {
+    std::fs::remove_dir(staging_path).map_err(|source| CanonicalWriterError::PathUnavailable {
         path: staging_path.to_path_buf(),
         source,
     })?;
@@ -271,15 +276,15 @@ fn remove_empty_construction_staging(
         target: "zinder::ingest",
         event = "canonical_empty_construction_staging_removed",
         staging_path = %staging_path.display(),
-        "removed an empty runtime-owned construction staging directory"
+        "removed an empty writer-owned construction staging directory"
     );
     Ok(true)
 }
 
-fn remove_unpublished_staging(staging_path: &std::path::Path) -> Result<(), CanonicalRuntimeError> {
+fn remove_unpublished_staging(staging_path: &std::path::Path) -> Result<(), CanonicalWriterError> {
     discard_unpublished_block_load_staging(staging_path)?;
     std::fs::remove_dir_all(staging_path).map_err(|source| {
-        CanonicalRuntimeError::PathUnavailable {
+        CanonicalWriterError::PathUnavailable {
             path: staging_path.to_path_buf(),
             source,
         }
@@ -288,20 +293,20 @@ fn remove_unpublished_staging(staging_path: &std::path::Path) -> Result<(), Cano
         target: "zinder::ingest",
         event = "canonical_unpublished_construction_restarted",
         staging_path = %staging_path.display(),
-        "removed an unpublished runtime-owned construction staging directory"
+        "removed an unpublished writer-owned construction staging directory"
     );
     Ok(())
 }
 
 fn discard_unpublished_block_load_staging(
     staging_path: &std::path::Path,
-) -> Result<(), CanonicalRuntimeError> {
+) -> Result<(), CanonicalWriterError> {
     if RocksDbCanonicalBuilder::discard_unpublished_block_load_staging(staging_path)? {
         tracing::warn!(
             target: "zinder::ingest",
             event = "canonical_unpublished_block_load_staging_discarded",
             canonical_build_path = %staging_path.display(),
-            "discarded unpublished runtime-owned canonical block-load staging"
+            "discarded unpublished writer-owned canonical block-load staging"
         );
     }
     Ok(())
@@ -310,10 +315,10 @@ fn discard_unpublished_block_load_staging(
 async fn construct_fresh_store<Source>(
     source: &Source,
     network_upgrade_activations: &NetworkUpgradeActivations,
-    config: &CanonicalRuntimeConfig,
+    config: &CanonicalWriterConfig,
     readiness: &Readiness,
     staging_path: &std::path::Path,
-) -> Result<RocksDbCanonicalStore, CanonicalRuntimeError>
+) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
     Source: NodeSource + Clone,
 {
@@ -361,7 +366,7 @@ where
         config.resource_budget,
     )?;
     if store.event_fence() != published_fence {
-        return Err(CanonicalRuntimeError::InstalledFenceMismatch);
+        return Err(CanonicalWriterError::InstalledFenceMismatch);
     }
     tracing::info!(
         target: "zinder::ingest",
@@ -378,8 +383,8 @@ where
 async fn resolve_construction_range<Source>(
     source: &Source,
     network_upgrade_activations: &NetworkUpgradeActivations,
-    config: &CanonicalRuntimeConfig,
-) -> Result<(CanonicalStoreBuildPlan, BlockId, BlockId), CanonicalRuntimeError>
+    config: &CanonicalWriterConfig,
+) -> Result<(CanonicalStoreBuildPlan, BlockId, BlockId), CanonicalWriterError>
 where
     Source: NodeSource,
 {
@@ -393,7 +398,7 @@ where
     };
     let build_plan = if let Some(checkpoint_height) = config.checkpoint_height {
         if fixed_tip.height <= checkpoint_height {
-            return Err(CanonicalRuntimeError::CheckpointNotBehindSource {
+            return Err(CanonicalWriterError::CheckpointNotBehindSource {
                 checkpoint_height,
                 source_tip: fixed_tip,
             });
@@ -439,9 +444,9 @@ fn construction_staging_path(storage_path: &std::path::Path) -> PathBuf {
     PathBuf::from(staging_path)
 }
 
-fn path_exists(path: &std::path::Path) -> Result<bool, CanonicalRuntimeError> {
+fn path_exists(path: &std::path::Path) -> Result<bool, CanonicalWriterError> {
     path.try_exists()
-        .map_err(|source| CanonicalRuntimeError::PathUnavailable {
+        .map_err(|source| CanonicalWriterError::PathUnavailable {
             path: path.to_path_buf(),
             source,
         })
@@ -450,9 +455,9 @@ fn path_exists(path: &std::path::Path) -> Result<bool, CanonicalRuntimeError> {
 fn install_staged_store(
     staging_path: &std::path::Path,
     storage_path: &std::path::Path,
-) -> Result<(), CanonicalRuntimeError> {
+) -> Result<(), CanonicalWriterError> {
     std::fs::rename(staging_path, storage_path).map_err(|source| {
-        CanonicalRuntimeError::PathUnavailable {
+        CanonicalWriterError::PathUnavailable {
             path: storage_path.to_path_buf(),
             source,
         }

@@ -56,7 +56,7 @@ use crate::{
     DeriveReplayPolicy, IngestDeriveConfig, IngestError,
     chain_ingest::{ingest_error_class, outcome_status},
     conventional_fee_distribution_backfill::seed_conventional_fee_distribution_visible_tail,
-    ingest_loop::HistoricalWorkGate,
+    loop_config::HistoricalWorkGate,
     memory_pressure::RuntimeMemorySnapshot,
     transaction_component_backfill::seed_transaction_component_visible_tail,
 };

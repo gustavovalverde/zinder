@@ -30,15 +30,15 @@ use super::{
     record_bulk_pipeline_stage_duration, usize_to_u32_saturating, usize_to_u64_saturating,
 };
 use crate::artifact_builder::{PreparedCanonicalBlock, current_schema_transparent_outputs};
-use crate::canonical_construction::{
+use crate::chain_ingest::{
+    prefetched_spent_transparent_output_bytes, record_ingest_block_prepare_outcome,
+};
+use crate::writer::construction::{
     abort_on_drop::AbortOnDropTask,
     source_fetch::{
         CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
     },
     watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer},
-};
-use crate::chain_ingest::{
-    prefetched_spent_transparent_output_bytes, record_ingest_block_prepare_outcome,
 };
 
 const LIGHT_PREVOUT_COALESCE_DELAY: Duration = Duration::from_millis(2);

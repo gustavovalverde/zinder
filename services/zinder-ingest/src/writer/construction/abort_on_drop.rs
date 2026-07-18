@@ -1,3 +1,6 @@
+//! Spawned-task handle that aborts its task on drop, so a cancelled
+//! construction pipeline cannot leave detached work running.
+
 use std::future::Future;
 
 use tokio::task::{JoinError, JoinHandle};
