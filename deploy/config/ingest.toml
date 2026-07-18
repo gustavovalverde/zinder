@@ -1,9 +1,5 @@
-# zinder-ingest config. Tracked example; safe to edit. Docker Compose
-# mounts this file at /etc/zinder/config.toml.
-#
-# Env vars from deploy/.env.<network> (loaded via `--env-file`) override
-# anything below. The defaults here target Z3 mainnet and match what
-# `docker compose up` (without --env-file) produces.
+# Production-shaped fact-first canonical writer configuration for the
+# single-host Compose topology. Environment variables may override any field.
 
 [network]
 name = "zcash-mainnet"
@@ -19,112 +15,22 @@ method = "cookie"
 path = "/var/run/auth/.cookie"
 
 [storage]
-path = "/var/lib/zinder/store"
-
-# Bounded RocksDB resource budgets. Uncomment per role only when the host
-# memory envelope requires a different budget.
-# See docs/adrs/0020-bounded-rocksdb-resource-budget.md.
-# [storage.canonical.rocksdb]
-# block_cache_bytes = 536870912
-# max_wal_bytes = 268435456
-# max_open_files = 512
-# write_buffer_bytes = 16777216
-# max_write_buffer_count = 2
-#
-# [storage.derive.rocksdb]
-# block_cache_bytes = 134217728
-# max_wal_bytes = 67108864
-# max_open_files = 256
-# write_buffer_bytes = 8388608
-# max_write_buffer_count = 2
+path = "/var/lib/zinder/canonical"
+raw_blob_policy = "transactions"
 
 [ingest]
 source = "zebra-json-rpc"
 projection_preset = "wallet"
 reorg_window_blocks = 100
 
-[ingest.derive]
-# Derive replay is memory-bounded independently from canonical commit size.
-replay_batch_blocks = 500
-# Keep canonical fact writes ahead of rebuildable derive projections when the
-# process approaches its cgroup memory budget.
-replay_policy = "canonical-first"
-memory_degrade_ratio = 0.90
-memory_pause_ratio = 0.99
-memory_resume_ratio = 0.80
-min_replay_batch_blocks = 50
-
-[ingest.commitment_root_backfill]
-# This non-readiness-blocking task enriches settled historical blocks and
-# resumes from a durable contiguous coverage row after restart.
-enabled = true
-batch_blocks = 256
-fetch_concurrency = 8
-
-[ingest.conventional_fee_distribution_backfill]
-# Historical ZIP-317 conventional-fee distribution is resumable and does not
-# gate readiness.
-enabled = true
-batch_blocks = 256
-
-[ingest.paid_fee_distribution_backfill]
-# Seed the live exact-fee tail, then prepend settled history newest-first.
-# The durable target floor only moves earlier when history_days increases.
-enabled = true
-batch_blocks = 256
-fetch_concurrency = 8
-history_days = 365
-timestamp_safety_seconds = 7200
-
-[ingest.transaction_component_backfill]
-# This local-store backfill resumes from durable contiguous coverage and does
-# not gate readiness.
-enabled = true
-batch_blocks = 256
-
-[ingest.transaction_history_verifier]
-# Verify transaction-history rows against canonical transaction context without
-# gating readiness.
-enabled = true
-batch_blocks = 256
-
-[ingest.value_pool_flow_backfill]
-# Seed the live canonical flow tail, then prepend source-hydrated history.
-# Coverage and restart progress are durable; this task does not gate readiness.
-enabled = true
-batch_blocks = 256
-fetch_concurrency = 8
-
-[ingest.value_pool_balance_backfill]
-# Scan every canonical height but fetch only one authoritative cumulative
-# snapshot per observed UTC day, plus every replaceable live-tail block.
-enabled = true
-batch_blocks = 10000
-fetch_concurrency = 8
-
-[ingest.bulk_catchup]
-canonical_batch_max_blocks = 1000
-canonical_batch_max_artifact_bytes = 536870912
-canonical_batch_max_estimated_write_bytes = 536870912
-canonical_batch_min_blocks_before_estimated_write_close = 100
-# Source-fetch and block-preparation limits resolve from the container memory,
-# logical CPU count, and node response cap. Set individual fields only for a
-# measured diagnostic override.
-commit_reassembly_max_queued_artifact_bytes = 536870912
-# Force a RocksDB flush every N committed epochs (≈ N × canonical_batch_max_blocks
-# blocks). Caps the live WAL by writer cadence and bounds crash-recovery
-# RAM. Default is 5; uncomment to override. See
-# docs/runbooks/bulk-catchup-oom-recovery.md.
-# flush_interval_epochs = 5
-
-[ingest.tip_follow]
-poll_interval_ms = 2000
+[ingest.modifiers]
+coverage = "wallet-serving"
 
 [ingest_control]
-listen_addr = "0.0.0.0:9100"
+listen_addr = "127.0.0.1:9100"
+checkpoint_staging_root = "/var/lib/zinder/checkpoints"
+bearer_token_path = "/var/run/zinder-control/ingest.token"
+checkpoint_bearer_token_path = "/var/run/zinder-checkpoint/checkpoint.token"
 
-# Required because the listen addresses above bind unspecified/public
-# interfaces. Zinder ships no server TLS (ADR-0006); front these ports with a
-# reverse proxy. Without this the binary refuses to start.
-[security]
-allow_public_bind = true
+[ops]
+listen_addr = "127.0.0.1:9105"

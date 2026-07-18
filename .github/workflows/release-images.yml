@@ -1,7 +1,9 @@
 name: release-images
 
-# Build and push each service Docker image plus the single-container image to
-# ghcr.io when a release tag lands. Use workflow_dispatch to dry-run.
+# Build and push only the fact-first wallet-serving service images to ghcr.io
+# when a release tag lands. The legacy query/explorer owners and mixed
+# single-container bundle are intentionally not release artifacts. Use
+# workflow_dispatch to dry-run.
 #
 # Tag convention:
 #   - tag is `v<semver>` (e.g. `v0.2.0`)
@@ -32,8 +34,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  deployment-admission:
+    name: deployment admission
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Verify release topology admission
+        run: bash scripts/test-deployment-admission.sh
+
   build:
     name: build images (${{ matrix.platform.name }})
+    needs: deployment-admission
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -74,10 +88,8 @@ jobs:
 
           images=(
             "zinder-ingest:zinder-ingest"
-            "zinder-query:zinder-query"
+            "zinder-projector:zinder-projector"
             "zinder-compat-lightwalletd:zinder-compat-lightwalletd"
-            "zinder-explorer:zinder-explorer"
-            "zinder:zinder-single-container"
           )
 
           for image in "${images[@]}"; do
@@ -122,10 +134,8 @@ jobs:
       matrix:
         image:
           - zinder-ingest
-          - zinder-query
+          - zinder-projector
           - zinder-compat-lightwalletd
-          - zinder-explorer
-          - zinder
     steps:
       - name: Resolve image and tags
         id: tags
