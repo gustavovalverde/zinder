@@ -1,4 +1,7 @@
-use std::num::NonZeroU32;
+use std::{
+    num::NonZeroU32,
+    time::{Duration, Instant},
+};
 
 use rust_rocksdb::{DB, IteratorMode, ReadOptions, WriteBatch};
 use sha2::{Digest, Sha256};
@@ -10,6 +13,7 @@ use zinder_core::{
 use super::{
     CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
     block_load::{BLOCK_HEADER_VALUE_LEN, encode_block_position},
+    construction_manifest::CanonicalColdFamilyEvidence,
     rocksdb::{BLOCK_HEADER_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY},
 };
 
@@ -40,6 +44,25 @@ pub struct CanonicalSubtreeRootLoadEvidence {
     pub subtree_root_logical_bytes: u64,
     /// Version-1 SHA-256 digest of every exact persisted key and value in order.
     pub subtree_root_sequence_digest: [u8; 32],
+}
+
+pub(super) struct PersistedSubtreeRootValidation {
+    pub(super) evidence: CanonicalSubtreeRootLoadEvidence,
+    pub(super) family_evidence: CanonicalColdFamilyEvidence,
+}
+
+impl PersistedSubtreeRootValidation {
+    fn complete(
+        evidence: CanonicalSubtreeRootLoadEvidence,
+        family_evidence: CanonicalColdFamilyEvidence,
+        elapsed: Duration,
+    ) -> Self {
+        record_subtree_cold_family_scan(&family_evidence, elapsed);
+        Self {
+            evidence,
+            family_evidence,
+        }
+    }
 }
 
 pub(super) fn required_subtree_root_ranges(
@@ -128,7 +151,8 @@ pub(super) fn validate_persisted_subtree_root_family(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,
     block_evidence: &CanonicalBlockLoadEvidence,
-) -> Result<CanonicalSubtreeRootLoadEvidence, CanonicalStoreError> {
+) -> Result<PersistedSubtreeRootValidation, CanonicalStoreError> {
+    let started_at = Instant::now();
     let family = subtree_root_family(db)?;
     let required_ranges = required_subtree_root_ranges(
         build_plan.history_predecessor().tip_metadata(),
@@ -145,6 +169,7 @@ pub(super) fn validate_persisted_subtree_root_family(
     digest.update(SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN);
     let mut subtree_root_count = 0_u64;
     let mut subtree_root_logical_bytes = 0_u64;
+    let mut family_evidence = CanonicalColdFamilyEvidence::accumulator(SUBTREE_ROOT_COLUMN_FAMILY);
     for range in required_ranges {
         let mut previous_completion_height = None;
         for expected_index in range {
@@ -169,6 +194,7 @@ pub(super) fn validate_persisted_subtree_root_family(
             }
             digest.update(key.as_ref());
             digest.update(encoded_root.as_ref());
+            family_evidence.observe(key, encoded_root)?;
             subtree_root_count = subtree_root_count.checked_add(1).ok_or_else(|| {
                 CanonicalStoreError::subtree_root_sequence("subtree-root count exceeds u64::MAX")
             })?;
@@ -197,11 +223,34 @@ pub(super) fn validate_persisted_subtree_root_family(
             operation: "subtree-root publication readback",
             source,
         })?;
-    Ok(CanonicalSubtreeRootLoadEvidence {
+    let evidence = CanonicalSubtreeRootLoadEvidence {
         subtree_root_count,
         subtree_root_logical_bytes,
         subtree_root_sequence_digest: digest.finalize().into(),
-    })
+    };
+    Ok(PersistedSubtreeRootValidation::complete(
+        evidence,
+        family_evidence.finish(),
+        started_at.elapsed(),
+    ))
+}
+
+fn record_subtree_cold_family_scan(evidence: &CanonicalColdFamilyEvidence, elapsed: Duration) {
+    metrics::histogram!(
+        "zinder_store_canonical_publication_family_scan_duration_seconds",
+        "family" => evidence.family
+    )
+    .record(elapsed);
+    metrics::counter!(
+        "zinder_store_canonical_publication_family_scan_rows_total",
+        "family" => evidence.family
+    )
+    .increment(evidence.row_count);
+    metrics::counter!(
+        "zinder_store_canonical_publication_family_scan_logical_bytes_total",
+        "family" => evidence.family
+    )
+    .increment(evidence.logical_bytes);
 }
 
 fn digest_subtree_root_rows(rows: &[EncodedSubtreeRoot]) -> [u8; 32] {

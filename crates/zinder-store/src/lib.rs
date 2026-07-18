@@ -44,12 +44,19 @@ pub use block_value_pool_balances::BlockValuePoolBalancesStore;
 pub use canonical_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalAppendAnchor,
     CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalBuildBlock,
-    CanonicalBuildSubtreeRoot, CanonicalEventFence, CanonicalLiveAppend, CanonicalReplayScan,
-    CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
-    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence, PreparedCanonicalBaselinePublication,
-    RocksDbCanonicalBuilder, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
-    ValidatedRocksDbCanonicalBuild,
+    CanonicalBuildSubtreeRoot, CanonicalConstructionManifestBinding, CanonicalEventCursor,
+    CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
+    CanonicalEventRetentionReport, CanonicalLiveAppend, CanonicalLiveReplacement,
+    CanonicalMempoolSnapshotStart, CanonicalOwnerCheckpointAdmission,
+    CanonicalOwnerCheckpointEvidence, CanonicalReorgPolicy, CanonicalReplacementBlock,
+    CanonicalReplayRangeScan, CanonicalReplayScan, CanonicalRetainedEvent,
+    CanonicalSecondaryCatchupOutcome, CanonicalSequenceCheckpoint, CanonicalStoreBuildError,
+    CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalSubtreeRootLoadEvidence, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    PreparedCanonicalBaselinePublication, ProjectionBuildAnchor, ProjectionBuildLease,
+    ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE, ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;

@@ -10,9 +10,9 @@ use super::{
     CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
     block_load::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
-        CanonicalBlockSstConfig, CanonicalBuildBlock, REVERSE_INDEX_SORT_MEMORY_BYTES,
-        canonical_block_families_are_empty, ingest_canonical_block_ssts,
-        validate_source_tip_checkpoint, write_canonical_block_ssts,
+        CanonicalBlockSstConfig, CanonicalBuildBlock, CanonicalStagedSstEvidence,
+        REVERSE_INDEX_SORT_MEMORY_BYTES, canonical_block_families_are_empty,
+        ingest_canonical_block_ssts, validate_source_tip_checkpoint, write_canonical_block_ssts,
     },
     rocksdb::{
         canonical_column_family_descriptors, canonical_data_options, canonical_store_path,
@@ -36,6 +36,7 @@ pub struct RocksDbCanonicalBuilder {
     pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: CanonicalStoreBuildPlan,
     pub(super) canonical_block_evidence: Option<CanonicalBlockLoadEvidence>,
+    pub(super) canonical_block_staged_ssts: Option<Vec<CanonicalStagedSstEvidence>>,
     pub(super) subtree_root_evidence: Option<CanonicalSubtreeRootLoadEvidence>,
     pub(super) confirmed_source_tip_checkpoint: Option<zinder_core::CommitmentTreeCheckpoint>,
     pub(super) cursor_auth_key: [u8; 32],
@@ -78,6 +79,7 @@ impl RocksDbCanonicalBuilder {
             workload,
             build_plan,
             canonical_block_evidence: None,
+            canonical_block_staged_ssts: None,
             subtree_root_evidence: None,
             confirmed_source_tip_checkpoint: None,
             cursor_auth_key,
@@ -176,10 +178,11 @@ impl RocksDbCanonicalBuilder {
             blocks,
         )?;
         validate_block_load_range(&self.build_plan, &prepared.evidence)?;
-        let evidence = ingest_canonical_block_ssts(&self.bounded_open.db, prepared)?;
+        let ingested = ingest_canonical_block_ssts(&self.bounded_open.db, prepared)?;
         staging.remove()?;
-        self.canonical_block_evidence = Some(evidence);
-        Ok(evidence)
+        self.canonical_block_evidence = Some(ingested.evidence);
+        self.canonical_block_staged_ssts = Some(ingested.staged_ssts);
+        Ok(ingested.evidence)
     }
 
     /// Returns the exact non-empty source ranges required after the block load.
@@ -330,6 +333,7 @@ impl Drop for FreshCanonicalBlockStaging {
 mod tests {
     use std::{
         env,
+        num::NonZeroU32,
         path::Path,
         process::{Command, Stdio},
     };
@@ -338,13 +342,16 @@ mod tests {
     use rust_rocksdb::DB;
     use tempfile::TempDir;
     use zinder_core::{
-        BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
-        CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
-        CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds, CanonicalTransactionFacts,
-        ChainEpochId, ChainTipMetadata, CompactBlockArtifact, LockTime, PrivacyShape,
+        BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId,
+        CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
+        CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
+        CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds,
+        CanonicalTransactionFacts, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
+        DisplacedBlockArchiveCoverage, FinalNoteCommitmentRoot, LockTime, PrivacyShape,
         SerializedBytesDigest, TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
         TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
-        TransactionVersion, UnsupportedSection, encode_canonical_block_replay,
+        TransactionVersion, TransparentAddressScriptHash, TransparentOutputFact,
+        UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
         wire::encode_internal_block_hash,
     };
 
@@ -352,13 +359,22 @@ mod tests {
     use crate::canonical_store::{
         block_load::canonical_block_families_are_empty,
         block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, validate_persisted_block_replays},
+        construction_manifest::CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME,
         control::{decode_store_control, encode_ready_store_control},
+        displaced_archive::{
+            encode_test_archive_record, encode_test_archive_state, encode_test_event_context,
+            encode_test_hash_pointer_rows, encode_test_order_key,
+        },
+        publication::{encode_live_chain_epoch, encode_live_event},
         rocksdb::{
             BLOCK_HASH_INDEX_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
-            CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY, STORE_CONTROL_KEY,
+            CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY,
+            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
         },
     };
-    use crate::{CanonicalStoreBuildState, RocksDbCanonicalStore};
+    use crate::{
+        CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildState, RocksDbCanonicalStore,
+    };
 
     const PUBLICATION_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_FAILPOINT";
     const PUBLICATION_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_STORE_PATH";
@@ -516,6 +532,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -558,20 +575,49 @@ mod tests {
         ))?;
         let published = validated.publish_baseline(publication)?;
 
+        assert_ready_construction_manifest_binding(&store_path, &published)?;
+
         assert_eq!(published.ready_evidence().visible_epoch.value(), 1);
         assert_eq!(published.ready_evidence().visible_block_count, 2);
+        assert_eq!(
+            published.sequence_checkpoint().through(),
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32]))
+        );
+        assert_eq!(published.sequence_checkpoint().retained_block_count(), 1);
+        assert_eq!(published.displaced_block_count()?, 0);
+        assert_eq!(published.displaced_block_archive_coverage()?, None);
         assert_eq!(
             published.ready_evidence().visible_tip.height,
             BlockHeight::new(2)
         );
         drop(published);
+
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let mismatch = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(101)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("reorg-window mismatch must fail closed")?;
+        assert!(
+            mismatch
+                .to_string()
+                .contains("persisted reorg window 100 does not equal requested reorg window 101")
+        );
+
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
-            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            &activations,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(reopened.ready_evidence().visible_epoch.value(), 1);
+        assert_eq!(reopened.reorg_policy().reorg_window_blocks(), 100);
         assert_eq!(
             reopened.ready_evidence().visible_tip.hash,
             BlockHash::from_bytes([2; 32])
@@ -588,6 +634,333 @@ mod tests {
             replayed_blocks[1].facts().block_header.block_hash,
             BlockHash::from_bytes([2; 32])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_admission_fails_closed_on_missing_or_tampered_construction_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let published = validated.publish_baseline(publication)?;
+        let binding = published.ready_evidence().construction_manifest_sha256;
+        drop(published);
+
+        let manifest_path = store_path.join("canonical-construction-manifest.v1.json");
+        std::fs::remove_file(&manifest_path)?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let missing = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("READY admission must reject a missing construction manifest")?;
+        assert!(
+            missing
+                .to_string()
+                .contains("canonical-construction-manifest.v1.json")
+        );
+
+        std::fs::write(&manifest_path, b"{}")?;
+        let tampered = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("READY admission must reject a tampered construction manifest")?;
+        assert!(tampered.to_string().contains("construction manifest"));
+        assert_ne!(binding, [0; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn displaced_archive_public_reads_derive_facts_and_preserve_exact_newest_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_store_with_displaced_archive(&store_path)?;
+        for family_name in [CHAIN_EVENT_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY] {
+            let family = store
+                .bounded_open
+                .db
+                .cf_handle(family_name)
+                .ok_or("canonical transition family absent")?;
+            store
+                .bounded_open
+                .db
+                .delete_cf(&family, 2_u64.to_be_bytes())?;
+        }
+        store.bounded_open.db.flush_wal(true)?;
+        let coverage = DisplacedBlockArchiveCoverage {
+            activation_event_sequence: 2,
+            activation_epoch: ChainEpochId::new(2),
+            activated_at: UnixTimestampMillis::new(1_750_000_000_002),
+        };
+
+        assert_eq!(store.displaced_block_count()?, 2);
+        assert_eq!(store.displaced_block_archive_coverage()?, Some(coverage));
+
+        let page = store.displaced_block_page(None, NonZeroU32::new(1).ok_or("zero limit")?)?;
+        assert_eq!(page.blocks.len(), 1);
+        assert!(page.has_more);
+        let newest = &page.blocks[0];
+        assert_eq!(newest.header.height, BlockHeight::new(2));
+        assert_eq!(newest.block_hash, BlockHash::from_bytes([22; 32]));
+        assert_eq!(
+            newest.transaction_ids,
+            vec![TransactionId::from_bytes([9; 32])]
+        );
+        assert_eq!(newest.coinbase_outputs.len(), 1);
+        assert_eq!(newest.coinbase_outputs[0].output_index, 0);
+        assert_eq!(newest.coinbase_outputs[0].value_zat, 42);
+        assert_eq!(newest.coinbase_outputs[0].script_pub_key, vec![0x51]);
+        assert_eq!(newest.raw_block_bytes, Some(vec![6, 7, 8]));
+        assert_eq!(
+            newest
+                .final_note_commitment_roots
+                .ok_or("final roots absent")?
+                .sapling,
+            Some(FinalNoteCommitmentRoot::from_bytes([31; 32]))
+        );
+
+        let cursor = page.next_cursor.ok_or("lookahead page cursor absent")?;
+        let older =
+            store.displaced_block_page(Some(&cursor), NonZeroU32::new(1).ok_or("zero limit")?)?;
+        assert_eq!(older.blocks.len(), 1);
+        assert_eq!(older.blocks[0].header.height, BlockHeight::new(1));
+        assert!(!older.has_more);
+        assert!(older.next_cursor.is_none());
+
+        assert_eq!(
+            store
+                .displaced_block_by_hash(BlockHash::from_bytes([11; 32]))?
+                .ok_or("hash detail absent")?
+                .header
+                .height,
+            BlockHeight::new(1)
+        );
+        let event = store.displaced_blocks_for_event(2, NonZeroU32::new(1).ok_or("zero limit")?)?;
+        assert_eq!(event.len(), 1);
+        assert_eq!(event[0].header.height, BlockHeight::new(2));
+        assert!(
+            store
+                .newest_displaced_blocks(NonZeroU32::new(4_097).ok_or("zero oversized limit")?)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the corruption matrix keeps independent fail-closed archive mutations together"
+    )]
+    fn displaced_archive_public_reads_fail_closed_on_pointer_and_raw_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_store_with_displaced_archive(&store_path)?;
+        let archive_family = store
+            .bounded_open
+            .db
+            .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
+            .ok_or("archive family absent")?;
+        let (pointer_key, original_pointer) =
+            encode_test_hash_pointer_rows(2, BlockHeight::new(1), BlockHash::from_bytes([11; 32]));
+        let (_, wrong_pointer) =
+            encode_test_hash_pointer_rows(2, BlockHeight::new(2), BlockHash::from_bytes([11; 32]));
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, &pointer_key, wrong_pointer)?;
+        let pointer_error = store
+            .displaced_block_by_hash(BlockHash::from_bytes([11; 32]))
+            .err()
+            .ok_or("mislinked hash pointer must fail")?;
+        assert!(pointer_error.to_string().contains("pointer"));
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, &pointer_key, original_pointer)?;
+
+        let event_range =
+            zinder_core::BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2));
+        let (context_key, original_context) = encode_test_event_context(
+            2,
+            event_range,
+            ChainEpochId::new(2),
+            UnixTimestampMillis::new(1_750_000_000_002),
+            2,
+        );
+        store
+            .bounded_open
+            .db
+            .delete_cf(&archive_family, &context_key)?;
+        let context_error = store
+            .displaced_block_archive_coverage()
+            .err()
+            .ok_or("missing event context must fail")?;
+        assert!(context_error.to_string().contains("context row is absent"));
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, &context_key, &original_context)?;
+
+        let (_, swapped_context) = encode_test_event_context(
+            3,
+            event_range,
+            ChainEpochId::new(3),
+            UnixTimestampMillis::new(1_750_000_000_002),
+            2,
+        );
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, &context_key, swapped_context)?;
+        let swapped_error = store
+            .displaced_block_archive_coverage()
+            .err()
+            .ok_or("context moved under a different sequence must fail")?;
+        assert!(swapped_error.to_string().contains("matching nonzero"));
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, &context_key, &original_context)?;
+
+        let coverage = DisplacedBlockArchiveCoverage {
+            activation_event_sequence: 2,
+            activation_epoch: ChainEpochId::new(2),
+            activated_at: UnixTimestampMillis::new(1_750_000_000_002),
+        };
+        let original_state = encode_test_archive_state(coverage, 2);
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            [0x00],
+            encode_test_archive_state(coverage, 1),
+        )?;
+        let state_error = store
+            .displaced_block_count()
+            .err()
+            .ok_or("state count below activation rows must fail")?;
+        assert!(state_error.to_string().contains("smaller"));
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, [0x00], original_state)?;
+
+        let first_key =
+            encode_test_order_key(2, BlockHeight::new(1), BlockHash::from_bytes([11; 32]));
+        store
+            .bounded_open
+            .db
+            .delete_cf(&archive_family, &first_key)?;
+        let range_error = store
+            .displaced_blocks_for_event(2, NonZeroU32::new(2).ok_or("zero limit")?)
+            .err()
+            .ok_or("missing exact event row must fail")?;
+        assert!(range_error.to_string().contains("exactly cover"));
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            first_key,
+            encode_test_archive_record(
+                displaced_archive_block_one()?,
+                ChainEpochId::new(2),
+                UnixTimestampMillis::new(1_750_000_000_002),
+                None,
+                None,
+            )?,
+        )?;
+
+        let extra_replay =
+            displaced_archive_coinbase_replay(BlockHeight::new(3), [33; 32], [22; 32])?;
+        let extra_key =
+            encode_test_order_key(2, BlockHeight::new(3), BlockHash::from_bytes([33; 32]));
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            &extra_key,
+            encode_test_archive_record(
+                extra_replay,
+                ChainEpochId::new(2),
+                UnixTimestampMillis::new(1_750_000_000_002),
+                None,
+                None,
+            )?,
+        )?;
+        let extra_error = store
+            .displaced_blocks_for_event(2, NonZeroU32::new(2).ok_or("zero limit")?)
+            .err()
+            .ok_or("extra event row above the reverted range must fail")?;
+        assert!(extra_error.to_string().contains("canonical reorg event"));
+        store
+            .bounded_open
+            .db
+            .delete_cf(&archive_family, extra_key)?;
+
+        let (raw_mismatch_replay, _) = displaced_archive_block_two()?;
+        let roots = displaced_archive_roots();
+        let second_key =
+            encode_test_order_key(2, BlockHeight::new(2), BlockHash::from_bytes([22; 32]));
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            &second_key,
+            encode_test_archive_record(
+                raw_mismatch_replay,
+                ChainEpochId::new(2),
+                UnixTimestampMillis::new(1_750_000_000_002),
+                Some(vec![0]),
+                Some(roots),
+            )?,
+        )?;
+        let raw_error = store
+            .newest_displaced_blocks(NonZeroU32::new(2).ok_or("zero limit")?)
+            .err()
+            .ok_or("raw digest mismatch must fail")?;
+        assert!(raw_error.to_string().contains("raw block bytes"));
+        let (second_replay, second_raw_block_bytes) = displaced_archive_block_two()?;
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            second_key,
+            encode_test_archive_record(
+                second_replay,
+                ChainEpochId::new(2),
+                UnixTimestampMillis::new(1_750_000_000_002),
+                Some(second_raw_block_bytes),
+                Some(roots),
+            )?,
+        )?;
+
+        overwrite_second_archive_replay(
+            &store,
+            replay(BlockHeight::new(2), [22; 32], [11; 32]).into_bytes(),
+        )?;
+        let zero_coinbase_error = store
+            .newest_displaced_blocks(NonZeroU32::new(1).ok_or("zero limit")?)
+            .err()
+            .ok_or("archive replay without coinbase must fail")?;
+        assert!(
+            zero_coinbase_error
+                .to_string()
+                .contains("no first coinbase")
+        );
+
+        overwrite_second_archive_replay(&store, displaced_archive_late_coinbase_replay()?)?;
+        let late_coinbase_error = store
+            .newest_displaced_blocks(NonZeroU32::new(1).ok_or("zero limit")?)
+            .err()
+            .ok_or("archive replay with a late coinbase must fail")?;
+        assert!(late_coinbase_error.to_string().contains("tx[0]"));
         Ok(())
     }
 
@@ -653,21 +1026,16 @@ mod tests {
 
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
-            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            &activations,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(
             reopened.ready_evidence().visible_epoch,
             outcome.chain_epoch_id()
         );
-        assert_eq!(
-            reopened
-                .scan_canonical_replay()?
-                .collect::<Result<Vec<_>, _>>()?
-                .len(),
-            3
-        );
+        assert_eq!(canonical_replay_count(&reopened)?, 3);
         let expected_fence = reopened.event_fence();
         let mut block_four = canonical_build_block(BlockHeight::new(4), [4; 32], [3; 32]);
         add_tree_state_checkpoint(&mut block_four)?;
@@ -686,17 +1054,201 @@ mod tests {
         drop(store);
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
-            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            &activations,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
+        assert_eq!(canonical_replay_count(&reopened)?, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn settled_sequence_checkpoint_advances_with_window_two_and_resumes_after_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated =
+            complete_loaded_builder_with_reorg_window(&store_path, 2, BlockHeight::new(2))?
+                .validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let mut store = validated.publish_baseline(publication)?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+
+        for (height, settled_height) in [(3_u32, 1_u32), (4, 2), (5, 3)] {
+            let height_byte = u8::try_from(height)?;
+            let parent_byte = u8::try_from(height.saturating_sub(1))?;
+            let mut block = canonical_build_block(
+                BlockHeight::new(height),
+                [height_byte; 32],
+                [parent_byte; 32],
+            );
+            add_tree_state_checkpoint(&mut block)?;
+            let expected_fence = store.event_fence();
+            let (next, _) = store.commit_live_append(
+                crate::CanonicalLiveAppend::new(
+                    expected_fence,
+                    block,
+                    Vec::new(),
+                    BlockId::new(
+                        BlockHeight::new(settled_height),
+                        BlockHash::from_bytes([u8::try_from(settled_height)?; 32]),
+                    ),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_000_000 + u64::from(height)),
+                ),
+                &activations,
+            )?;
+            store = next;
+        }
         assert_eq!(
-            reopened
-                .scan_canonical_replay()?
-                .collect::<Result<Vec<_>, _>>()?
-                .len(),
-            4
+            store.sequence_checkpoint().through(),
+            BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32]))
         );
+        assert_eq!(store.sequence_checkpoint().retained_block_count(), 3);
+        drop(store);
+        assert_reopened_window_two_checkpoint(&store_path, &activations)?;
+        Ok(())
+    }
+
+    #[test]
+    fn live_append_rejects_a_hash_change_at_the_unchanged_settled_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated =
+            complete_loaded_builder_with_reorg_window(&store_path, 2, BlockHeight::new(2))?
+                .validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let expected_fence = store.event_fence();
+        let mut block = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
+        add_tree_state_checkpoint(&mut block)?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+
+        let error = store
+            .commit_live_append(
+                crate::CanonicalLiveAppend::new(
+                    expected_fence,
+                    block,
+                    Vec::new(),
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([9; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_000_003),
+                ),
+                &activations,
+            )
+            .err()
+            .ok_or("unchanged settled height with a different hash must fail")?;
+        assert!(error.to_string().contains("retain its canonical hash"));
+
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(2)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(reopened.event_fence(), expected_fence);
+        Ok(())
+    }
+
+    #[test]
+    fn baseline_rejects_settlement_beyond_the_reorg_window_without_rebuilding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated =
+            complete_loaded_builder_with_reorg_window(&store_path, 1, BlockHeight::new(3))?
+                .validate_for_publication()?;
+
+        let error = validated
+            .prepare_baseline(crate::CanonicalBaselinePublication::new(
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+            ))
+            .err()
+            .ok_or("baseline settlement beyond the reorg window must fail")?;
+
+        assert!(error.to_string().contains("reorg window is 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpointed_history_sequence_checkpoint_counts_only_retained_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let predecessor = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
+        let mut builder = create_building_store(
+            &store_path,
+            CanonicalHistoryBounds::checkpointed(predecessor)?,
+        )?;
+        let mut block = canonical_build_block(BlockHeight::new(100), [10; 32], [9; 32]);
+        add_tree_state_checkpoint(&mut block)?;
+        let expected_replay_bytes = u64::try_from(block.replay_envelope.as_bytes().len())?;
+        builder.bulk_load_blocks([Ok::<_, std::io::Error>(block)])?;
+        builder.load_subtree_roots(std::iter::empty())?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+            100,
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(100)),
+        ))?;
+        let validated = builder.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+
+        assert_eq!(store.sequence_checkpoint().retained_block_count(), 1);
+        assert_eq!(
+            store.sequence_checkpoint().logical_replay_bytes(),
+            expected_replay_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_open_bounded_proof_rejects_every_checkpoint_field_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        for corruption in 0_u8..4 {
+            let store_path = temporary.path().join(format!("canonical-{corruption}"));
+            let validated =
+                complete_loaded_builder_with_reorg_window(&store_path, 2, BlockHeight::new(2))?
+                    .validate_for_publication()?;
+            let publication =
+                validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+                ))?;
+            drop(validated.publish_baseline(publication)?);
+
+            rewrite_corrupted_sequence_checkpoint(&store_path, corruption)?;
+
+            assert!(
+                RocksDbCanonicalStore::open_ready(
+                    &store_path,
+                    &activations,
+                    CanonicalStoreWorkload::Wallet,
+                    CanonicalReorgPolicy::new(2)?,
+                    RocksDbResourceBudget::for_local_tests(),
+                )
+                .is_err(),
+                "checkpoint corruption {corruption} must fail admission"
+            );
+        }
         Ok(())
     }
 
@@ -724,6 +1276,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(reopened.append_anchor()?, expected_anchor);
@@ -766,6 +1319,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         let mut block_three = canonical_build_block(BlockHeight::new(3), [3; 32], [2; 32]);
@@ -799,6 +1353,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(
@@ -854,6 +1409,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(
@@ -920,6 +1476,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(
@@ -975,6 +1532,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(
@@ -1026,6 +1584,7 @@ mod tests {
             &before_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(before.event_fence().chain_epoch_id(), ChainEpochId::new(1));
@@ -1037,6 +1596,7 @@ mod tests {
             &after_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(after.event_fence().chain_epoch_id(), ChainEpochId::new(2));
@@ -1079,6 +1639,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -1109,11 +1670,19 @@ mod tests {
             "after_flush",
             "after_builder_drop",
             "after_cold_validation",
+            "after_construction_manifest",
             "before_atomic_write",
         ] {
             let store_path = temporary.path().join(failpoint);
             run_publication_crash_child(&store_path, failpoint)?;
             assert_building_without_baseline(&store_path)?;
+            if failpoint == "after_construction_manifest"
+                && !store_path
+                    .join(CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME)
+                    .is_file()
+            {
+                return Err("sidecar must be durable before the READY transition".into());
+            }
         }
 
         let committed_path = temporary.path().join("after_atomic_write");
@@ -1122,6 +1691,7 @@ mod tests {
             &committed_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(reopened.ready_evidence().visible_epoch.value(), 1);
@@ -1165,6 +1735,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -1210,7 +1781,7 @@ mod tests {
                 decoded_control.workload,
                 &decoded_control.build_plan,
                 decoded_control.cursor_auth_key,
-                wrong_evidence,
+                &wrong_evidence,
             )?,
         )?;
         db.flush_wal(true)?;
@@ -1220,6 +1791,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -1258,6 +1830,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         Ok(())
@@ -1274,6 +1847,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            CanonicalReorgPolicy::new(100)?,
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
@@ -1341,6 +1915,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([2; 32])),
+            CanonicalReorgPolicy::new(100)?,
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
@@ -1469,7 +2044,12 @@ mod tests {
         let mut missing_checkpoint_store = RocksDbCanonicalBuilder::create_fresh(
             &missing_checkpoint_path,
             CanonicalStoreWorkload::Wallet,
-            CanonicalStoreBuildPlan::complete(&activations, 0, tip)?,
+            CanonicalStoreBuildPlan::complete(
+                &activations,
+                0,
+                tip,
+                CanonicalReorgPolicy::new(100)?,
+            )?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         let missing_checkpoint = canonical_build_block(
@@ -1490,7 +2070,12 @@ mod tests {
         let mut wallet_roots_store = RocksDbCanonicalBuilder::create_fresh(
             &wallet_roots_path,
             CanonicalStoreWorkload::Wallet,
-            CanonicalStoreBuildPlan::complete(&activations, 0, tip)?,
+            CanonicalStoreBuildPlan::complete(
+                &activations,
+                0,
+                tip,
+                CanonicalReorgPolicy::new(100)?,
+            )?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         let mut wallet_roots = canonical_build_block(
@@ -1622,6 +2207,7 @@ mod tests {
                         ),
                     ),
                     BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+                    CanonicalReorgPolicy::new(100)?,
                 )?
             }
         };
@@ -1633,26 +2219,86 @@ mod tests {
         )?)
     }
 
+    fn assert_ready_construction_manifest_binding(
+        store_path: &Path,
+        store: &RocksDbCanonicalStore,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(store.ready_evidence().construction_manifest_version, 1);
+        assert!(
+            store
+                .ready_evidence()
+                .construction_manifest_sha256
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        assert!(
+            store_path
+                .join("canonical-construction-manifest.v1.json")
+                .is_file()
+        );
+        let manifest_binding =
+            RocksDbCanonicalStore::read_construction_manifest_binding(store_path)?;
+        assert_eq!(manifest_binding.version, 1);
+        assert_eq!(
+            manifest_binding.sha256,
+            store.ready_evidence().construction_manifest_sha256
+        );
+        Ok(())
+    }
+
     fn complete_loaded_builder(
         path: &Path,
     ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
-        let mut store = create_building_store(path, CanonicalHistoryBounds::complete())?;
-        let first = canonical_build_block(
-            BlockHeight::new(1),
-            [1; 32],
-            Network::ZcashTestnet.genesis_hash().as_bytes(),
-        );
-        let mut tip = canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32]);
-        add_tree_state_checkpoint(&mut tip)?;
-        store.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok(tip)])?;
+        complete_loaded_builder_with_reorg_window(path, 100, BlockHeight::new(2))
+    }
+
+    fn complete_loaded_builder_with_reorg_window(
+        path: &Path,
+        reorg_window_blocks: u32,
+        build_tip_height: BlockHeight,
+    ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let build_tip_byte = u8::try_from(build_tip_height.value())?;
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            BlockId::new(
+                build_tip_height,
+                BlockHash::from_bytes([build_tip_byte; 32]),
+            ),
+            CanonicalReorgPolicy::new(reorg_window_blocks)?,
+        )?;
+        let mut store = RocksDbCanonicalBuilder::create_fresh(
+            path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let mut blocks = Vec::new();
+        for height in 1..=build_tip_height.value() {
+            let block_hash = u8::try_from(height)?;
+            let parent_hash = if height == 1 {
+                Network::ZcashTestnet.genesis_hash().as_bytes()
+            } else {
+                [u8::try_from(height - 1)?; 32]
+            };
+            let mut block =
+                canonical_build_block(BlockHeight::new(height), [block_hash; 32], parent_hash);
+            if height == build_tip_height.value() {
+                add_tree_state_checkpoint(&mut block)?;
+            }
+            blocks.push(Ok::<_, std::io::Error>(block));
+        }
+        store.bulk_load_blocks(blocks)?;
         store.load_subtree_roots(std::iter::empty())?;
         store.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
-            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
-            2,
-            crate::canonical_store::test_checkpoint_frontiers(
-                &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-                BlockHeight::new(2),
+            BlockId::new(
+                build_tip_height,
+                BlockHash::from_bytes([build_tip_byte; 32]),
             ),
+            build_tip_height.value(),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, build_tip_height),
         ))?;
         Ok(store)
     }
@@ -1704,6 +2350,7 @@ mod tests {
             store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
@@ -1738,7 +2385,141 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            CanonicalReorgPolicy::new(100)?,
         )?)
+    }
+
+    fn canonical_replay_count(
+        store: &RocksDbCanonicalStore,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(store
+            .scan_canonical_replay()?
+            .collect::<Result<Vec<_>, _>>()?
+            .len())
+    }
+
+    fn assert_reopened_window_two_checkpoint(
+        store_path: &Path,
+        activations: &zinder_core::NetworkUpgradeActivations,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let reopened = RocksDbCanonicalStore::open_ready(
+            store_path,
+            activations,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(2)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let checkpoint = reopened.sequence_checkpoint();
+        let replayed = reopened
+            .scan_canonical_replay()?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut serial_prefix = CanonicalBlockFactsSequenceDigestBuilder::new(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+        );
+        let mut prefix_bytes = 0_u64;
+        for replay in replayed.iter().take(3) {
+            serial_prefix.try_append(replay.reference_digest())?;
+            let encoded = encode_canonical_block_replay(
+                replay.facts(),
+                replay.format_version(),
+                replay.reference_digest().version(),
+            );
+            prefix_bytes = prefix_bytes
+                .checked_add(u64::try_from(encoded.as_bytes().len())?)
+                .ok_or("serial prefix bytes overflow")?;
+        }
+        assert_eq!(checkpoint.sequence_digest(), serial_prefix.finish());
+        assert_eq!(checkpoint.logical_replay_bytes(), prefix_bytes);
+
+        let mut resumed = CanonicalBlockFactsSequenceDigestBuilder::resume_from_prefix(
+            checkpoint.sequence_digest(),
+        );
+        for replay in replayed.iter().skip(3) {
+            resumed.try_append(replay.reference_digest())?;
+        }
+        assert_eq!(resumed.finish(), reopened.event_fence().sequence_digest());
+        Ok(())
+    }
+
+    fn rewrite_corrupted_sequence_checkpoint(
+        store_path: &Path,
+        corruption: u8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let column_families = DB::list_cf(&rust_rocksdb::Options::default(), store_path)?;
+        let db = DB::open_cf(
+            &rust_rocksdb::Options::default(),
+            store_path,
+            &column_families,
+        )?;
+        let encoded = db
+            .get(STORE_CONTROL_KEY)?
+            .ok_or("READY control is absent")?;
+        let decoded = decode_store_control(store_path, &encoded)?;
+        let CanonicalStoreBuildState::Ready(mut evidence) = decoded.build_state else {
+            return Err("published control must be READY".into());
+        };
+        evidence.sequence_checkpoint =
+            corrupted_sequence_checkpoint(evidence.sequence_checkpoint, corruption);
+        db.put(
+            STORE_CONTROL_KEY,
+            encode_ready_store_control(
+                decoded.workload,
+                &decoded.build_plan,
+                decoded.cursor_auth_key,
+                &evidence,
+            )?,
+        )?;
+        db.flush_wal(true)?;
+        Ok(())
+    }
+
+    fn corrupted_sequence_checkpoint(
+        checkpoint: crate::CanonicalSequenceCheckpoint,
+        corruption: u8,
+    ) -> crate::CanonicalSequenceCheckpoint {
+        let (through, retained_count, digest, logical_bytes) = match corruption {
+            0 => (
+                BlockId::new(checkpoint.through().height, BlockHash::from_bytes([9; 32])),
+                checkpoint.retained_block_count(),
+                checkpoint.sequence_digest(),
+                checkpoint.logical_replay_bytes(),
+            ),
+            1 => {
+                let count = checkpoint.retained_block_count() + 1;
+                (
+                    checkpoint.through(),
+                    count,
+                    CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                        checkpoint.sequence_digest().version(),
+                        count,
+                        checkpoint.sequence_digest().as_bytes(),
+                    ),
+                    checkpoint.logical_replay_bytes(),
+                )
+            }
+            2 => (
+                checkpoint.through(),
+                checkpoint.retained_block_count(),
+                CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                    checkpoint.sequence_digest().version(),
+                    checkpoint.retained_block_count(),
+                    [9; 32],
+                ),
+                checkpoint.logical_replay_bytes(),
+            ),
+            _ => (
+                checkpoint.through(),
+                checkpoint.retained_block_count(),
+                checkpoint.sequence_digest(),
+                checkpoint.logical_replay_bytes() + 1,
+            ),
+        };
+        crate::CanonicalSequenceCheckpoint::from_admitted_parts(
+            through,
+            retained_count,
+            digest,
+            logical_bytes,
+        )
     }
 
     fn replay(
@@ -1883,6 +2664,232 @@ mod tests {
             CanonicalBlockFactsDigestVersion::V1,
         );
         block
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exact archive fixture writes every versioned row explicitly"
+    )]
+    fn published_store_with_displaced_archive(
+        store_path: &Path,
+    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+        let validated = complete_loaded_builder(store_path)?.validate_for_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let epoch = ChainEpochId::new(2);
+        let displaced_at = UnixTimestampMillis::new(1_750_000_000_002);
+        let event_range =
+            zinder_core::BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2));
+        let epoch_family = store
+            .bounded_open
+            .db
+            .cf_handle(CHAIN_EPOCH_COLUMN_FAMILY)
+            .ok_or("chain epoch family absent")?;
+        let event_family = store
+            .bounded_open
+            .db
+            .cf_handle(CHAIN_EVENT_COLUMN_FAMILY)
+            .ok_or("chain event family absent")?;
+        let archive_family = store
+            .bounded_open
+            .db
+            .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
+            .ok_or("archive family absent")?;
+        store.bounded_open.db.put_cf(
+            &epoch_family,
+            epoch.value().to_be_bytes(),
+            encode_live_chain_epoch(
+                BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([32; 32])),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([31; 32])),
+                ChainTipMetadata::new(7, 8, 9),
+                displaced_at,
+            ),
+        )?;
+        store.bounded_open.db.put_cf(
+            &event_family,
+            epoch.value().to_be_bytes(),
+            encode_live_event(
+                epoch,
+                ChainEpochId::new(1),
+                Some(event_range),
+                event_range,
+                CanonicalEventFence::from_persisted_event(
+                    epoch,
+                    epoch.value(),
+                    BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([32; 32])),
+                    2,
+                    [9; 32],
+                ),
+            ),
+        )?;
+        let coverage = DisplacedBlockArchiveCoverage {
+            activation_event_sequence: 2,
+            activation_epoch: epoch,
+            activated_at: displaced_at,
+        };
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            [0x00],
+            encode_test_archive_state(coverage, 2),
+        )?;
+        let (event_context_key, event_context) =
+            encode_test_event_context(2, event_range, epoch, displaced_at, 2);
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, event_context_key, event_context)?;
+
+        let first_replay = displaced_archive_block_one()?;
+        let first_key =
+            encode_test_order_key(2, BlockHeight::new(1), BlockHash::from_bytes([11; 32]));
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            first_key,
+            encode_test_archive_record(first_replay, epoch, displaced_at, None, None)?,
+        )?;
+        let (first_pointer_key, first_pointer) =
+            encode_test_hash_pointer_rows(2, BlockHeight::new(1), BlockHash::from_bytes([11; 32]));
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, first_pointer_key, first_pointer)?;
+
+        let (second_replay, raw_block_bytes) = displaced_archive_block_two()?;
+        let second_key =
+            encode_test_order_key(2, BlockHeight::new(2), BlockHash::from_bytes([22; 32]));
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            second_key,
+            encode_test_archive_record(
+                second_replay,
+                epoch,
+                displaced_at,
+                Some(raw_block_bytes),
+                Some(displaced_archive_roots()),
+            )?,
+        )?;
+        let (second_pointer_key, second_pointer) =
+            encode_test_hash_pointer_rows(2, BlockHeight::new(2), BlockHash::from_bytes([22; 32]));
+        store
+            .bounded_open
+            .db
+            .put_cf(&archive_family, second_pointer_key, second_pointer)?;
+        store.bounded_open.db.flush_wal(true)?;
+        drop(archive_family);
+        drop(event_family);
+        drop(epoch_family);
+        Ok(store)
+    }
+
+    fn displaced_archive_block_two() -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        let mut block =
+            canonical_build_block_with_raw_blobs(BlockHeight::new(2), [22; 32], [11; 32]);
+        let transaction = block
+            .facts
+            .transactions
+            .first_mut()
+            .ok_or("archive transaction fixture absent")?;
+        transaction.public_facts.is_coinbase = true;
+        transaction
+            .transparent_outputs
+            .push(TransparentOutputFact::new(
+                0,
+                42,
+                [0x51],
+                TransparentAddressScriptHash::of_script_pub_key(&[0x51]),
+            ));
+        let replay = encode_canonical_block_replay(
+            &block.facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        )
+        .into_bytes();
+        let raw_block_bytes = block
+            .block_blob
+            .ok_or("archive raw block fixture absent")?
+            .raw_block_bytes;
+        Ok((replay, raw_block_bytes))
+    }
+
+    fn displaced_archive_block_one() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        displaced_archive_coinbase_replay(BlockHeight::new(1), [11; 32], [0; 32])
+    }
+
+    fn displaced_archive_coinbase_replay(
+        height: BlockHeight,
+        block_hash: [u8; 32],
+        parent_hash: [u8; 32],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut block = canonical_build_block_with_raw_blobs(height, block_hash, parent_hash);
+        block
+            .facts
+            .transactions
+            .first_mut()
+            .ok_or("archive transaction fixture absent")?
+            .public_facts
+            .is_coinbase = true;
+        Ok(encode_canonical_block_replay(
+            &block.facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        )
+        .into_bytes())
+    }
+
+    fn displaced_archive_late_coinbase_replay() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut block =
+            canonical_build_block_with_raw_blobs(BlockHeight::new(2), [22; 32], [11; 32]);
+        let mut late_coinbase = block
+            .facts
+            .transactions
+            .first()
+            .cloned()
+            .ok_or("archive transaction fixture absent")?;
+        late_coinbase.public_facts.transaction_id = TransactionId::from_bytes([10; 32]);
+        late_coinbase.public_facts.is_coinbase = true;
+        block.facts.transactions.push(late_coinbase);
+        Ok(encode_canonical_block_replay(
+            &block.facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        )
+        .into_bytes())
+    }
+
+    fn overwrite_second_archive_replay(
+        store: &RocksDbCanonicalStore,
+        replay_bytes: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let archive_family = store
+            .bounded_open
+            .db
+            .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
+            .ok_or("archive family absent")?;
+        store.bounded_open.db.put_cf(
+            &archive_family,
+            encode_test_order_key(2, BlockHeight::new(2), BlockHash::from_bytes([22; 32])),
+            encode_test_archive_record(
+                replay_bytes,
+                ChainEpochId::new(2),
+                UnixTimestampMillis::new(1_750_000_000_002),
+                None,
+                None,
+            )?,
+        )?;
+        Ok(())
+    }
+
+    fn displaced_archive_roots() -> BlockFinalNoteCommitmentRoots {
+        BlockFinalNoteCommitmentRoots::new(
+            BlockHeight::new(2),
+            BlockHash::from_bytes([22; 32]),
+            Some(FinalNoteCommitmentRoot::from_bytes([31; 32])),
+            None,
+            Some(FinalNoteCommitmentRoot::from_bytes([33; 32])),
+        )
     }
 
     fn add_tree_state_checkpoint(

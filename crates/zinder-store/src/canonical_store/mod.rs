@@ -7,18 +7,26 @@
 mod block_load;
 mod block_replay;
 mod builder;
+mod construction_manifest;
 mod control;
+mod displaced_archive;
+mod event_lifecycle;
 mod live_commit;
+mod live_replacement;
+#[cfg(test)]
+mod live_replacement_tests;
+mod mempool_lifecycle;
 mod publication;
 mod reader;
 mod rocksdb;
+mod secondary;
 mod subtree_load;
 
-use std::{io, path::PathBuf};
+use std::{io, num::NonZeroU32, path::PathBuf};
 
 use thiserror::Error;
 use zinder_core::{
-    BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
+    BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
     CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
     MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, NetworkUpgradeActivations,
@@ -27,20 +35,40 @@ use zinder_core::{
 };
 
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
-pub use block_replay::CanonicalReplayScan;
+pub use block_replay::{
+    CanonicalReplayRangeScan, CanonicalReplayScan, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+};
 pub use builder::RocksDbCanonicalBuilder;
+pub use construction_manifest::CanonicalConstructionManifestBinding;
+pub use event_lifecycle::{
+    CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
+    CanonicalEventRetentionReport, CanonicalRetainedEvent, ProjectionBuildAnchor,
+    ProjectionBuildLease, ProjectionBuildLeaseId,
+};
 pub use live_commit::{CanonicalAppendAnchor, CanonicalEventFence, CanonicalLiveAppend};
+pub use live_replacement::{CanonicalLiveReplacement, CanonicalReplacementBlock};
+pub use mempool_lifecycle::CanonicalMempoolSnapshotStart;
 pub use publication::{
     CanonicalBaselinePublication, PreparedCanonicalBaselinePublication,
     ValidatedRocksDbCanonicalBuild,
 };
 pub use rocksdb::RocksDbCanonicalStore;
+pub use rocksdb::{CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence};
+pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
 pub use subtree_load::{CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence};
 
 /// Exact persisted identity of the clean canonical store.
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// Exact physical schema accepted by this canonical store implementation.
-pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
+///
+/// Schema 2 adds the immutable reorg policy and authenticated settled-sequence
+/// checkpoint to the control record. Schema 3 adds the retention-floor and
+/// generation-bearing projection-build lease control records. Schema 4 makes
+/// every retained event carry its exact authenticated resulting fence. Schema 5
+/// binds a complete construction manifest into every READY control record.
+/// Earlier stores are refused and rebuilt; there is no compatibility decoder
+/// or migration path.
+pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 5;
 /// Global block-height cadence for typed commitment-tree checkpoints.
 ///
 /// A checkpoint at least every 100 blocks keeps wallet rewind anchors within the
@@ -49,6 +77,30 @@ pub const TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
 
 const REQUIRED_CANONICAL_NETWORK_UPGRADES: [&str; 5] =
     ["Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy"];
+
+/// Immutable replacement-depth identity for one canonical store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalReorgPolicy {
+    reorg_window_blocks: NonZeroU32,
+}
+
+impl CanonicalReorgPolicy {
+    /// Validates an exact nonzero canonical replacement depth.
+    pub const fn new(reorg_window_blocks: u32) -> Result<Self, CanonicalStoreBuildPlanError> {
+        let Some(reorg_window_blocks) = NonZeroU32::new(reorg_window_blocks) else {
+            return Err(CanonicalStoreBuildPlanError::ZeroReorgWindowBlocks);
+        };
+        Ok(Self {
+            reorg_window_blocks,
+        })
+    }
+
+    /// Returns the maximum supported replacement depth in blocks.
+    #[must_use]
+    pub const fn reorg_window_blocks(self) -> u32 {
+        self.reorg_window_blocks.get()
+    }
+}
 
 /// Fixed source-chain range for one fresh canonical construction.
 ///
@@ -60,6 +112,7 @@ const REQUIRED_CANONICAL_NETWORK_UPGRADES: [&str; 5] =
 pub struct CanonicalStoreBuildPlan {
     network: zinder_core::Network,
     network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+    reorg_policy: CanonicalReorgPolicy,
     history_bounds: zinder_core::CanonicalHistoryBounds,
     history_predecessor: CommitmentTreeCheckpoint,
     build_tip: BlockId,
@@ -71,21 +124,24 @@ impl CanonicalStoreBuildPlan {
         network_upgrade_activations: &NetworkUpgradeActivations,
         genesis_block_time_seconds: u32,
         build_tip: BlockId,
+        reorg_policy: CanonicalReorgPolicy,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         validate_required_network_upgrades(network_upgrade_activations)?;
         let network = network_upgrade_activations.network();
-        Self::from_parts(
+        Self {
             network,
-            network_upgrade_activations
+            network_upgrade_activations_fingerprint: network_upgrade_activations
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
-            zinder_core::CanonicalHistoryBounds::complete(),
-            CommitmentTreeCheckpoint::new(
+            reorg_policy,
+            history_bounds: zinder_core::CanonicalHistoryBounds::complete(),
+            history_predecessor: CommitmentTreeCheckpoint::new(
                 BlockId::new(BlockHeight::new(0), network.genesis_hash()),
                 genesis_block_time_seconds,
                 CommitmentTreeFrontiers::default(),
             ),
             build_tip,
-        )
+        }
+        .validate()
     }
 
     /// Builds a plan retaining blocks immediately after `checkpoint` through `build_tip`.
@@ -93,6 +149,7 @@ impl CanonicalStoreBuildPlan {
         network_upgrade_activations: &NetworkUpgradeActivations,
         checkpoint: CommitmentTreeCheckpoint,
         build_tip: BlockId,
+        reorg_policy: CanonicalReorgPolicy,
     ) -> Result<Self, CanonicalStoreBuildPlanError> {
         validate_required_network_upgrades(network_upgrade_activations)?;
         if checkpoint.block_id.height.value() == 0 {
@@ -105,30 +162,26 @@ impl CanonicalStoreBuildPlan {
             checkpoint.block_id,
             &checkpoint.frontiers,
         )?;
-        Self::from_parts(
-            network_upgrade_activations.network(),
-            network_upgrade_activations
+        Self {
+            network: network_upgrade_activations.network(),
+            network_upgrade_activations_fingerprint: network_upgrade_activations
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+            reorg_policy,
             history_bounds,
-            checkpoint,
+            history_predecessor: checkpoint,
             build_tip,
-        )
+        }
+        .validate()
     }
 
-    pub(super) fn from_parts(
-        network: zinder_core::Network,
-        network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
-        history_bounds: zinder_core::CanonicalHistoryBounds,
-        history_predecessor: CommitmentTreeCheckpoint,
-        build_tip: BlockId,
-    ) -> Result<Self, CanonicalStoreBuildPlanError> {
-        match history_bounds.preceding_checkpoint() {
-            None if history_predecessor.block_id
-                != BlockId::new(BlockHeight::new(0), network.genesis_hash()) =>
+    pub(super) fn validate(self) -> Result<Self, CanonicalStoreBuildPlanError> {
+        match self.history_bounds.preceding_checkpoint() {
+            None if self.history_predecessor.block_id
+                != BlockId::new(BlockHeight::new(0), self.network.genesis_hash()) =>
             {
                 return Err(CanonicalStoreBuildPlanError::InvalidHistoryPredecessor);
             }
-            Some(checkpoint) if history_predecessor.block_id != checkpoint => {
+            Some(checkpoint) if self.history_predecessor.block_id != checkpoint => {
                 return Err(CanonicalStoreBuildPlanError::InvalidHistoryPredecessor);
             }
             Some(checkpoint) if checkpoint.height.value() == 0 => {
@@ -136,8 +189,8 @@ impl CanonicalStoreBuildPlan {
             }
             None | Some(_) => {}
         }
-        if history_bounds.preceding_checkpoint().is_none()
-            && history_predecessor.frontiers != CommitmentTreeFrontiers::default()
+        if self.history_bounds.preceding_checkpoint().is_none()
+            && self.history_predecessor.frontiers != CommitmentTreeFrontiers::default()
         {
             return Err(CanonicalStoreBuildPlanError::CompleteHistoryHasFrontiers);
         }
@@ -146,7 +199,7 @@ impl CanonicalStoreBuildPlan {
             ShieldedProtocol::Orchard,
             ShieldedProtocol::Ironwood,
         ] {
-            if let Some(frontier) = history_predecessor.frontiers.get(protocol)
+            if let Some(frontier) = self.history_predecessor.frontiers.get(protocol)
                 && frontier.final_state_bytes().len()
                     > MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES
             {
@@ -156,20 +209,14 @@ impl CanonicalStoreBuildPlan {
                 });
             }
         }
-        let first_available_height = history_bounds.first_available_height();
-        if build_tip.height.value() < first_available_height.value() {
+        let first_available_height = self.history_bounds.first_available_height();
+        if self.build_tip.height.value() < first_available_height.value() {
             return Err(CanonicalStoreBuildPlanError::BuildTipPrecedesHistory {
-                build_tip: build_tip.height.value(),
+                build_tip: self.build_tip.height.value(),
                 first_available_height: first_available_height.value(),
             });
         }
-        Ok(Self {
-            network,
-            network_upgrade_activations_fingerprint,
-            history_bounds,
-            history_predecessor,
-            build_tip,
-        })
+        Ok(self)
     }
 
     /// Returns the immutable network for this build.
@@ -184,6 +231,12 @@ impl CanonicalStoreBuildPlan {
         &self,
     ) -> NetworkUpgradeActivationsFingerprint {
         self.network_upgrade_activations_fingerprint
+    }
+
+    /// Returns the immutable canonical replacement policy.
+    #[must_use]
+    pub const fn reorg_policy(&self) -> CanonicalReorgPolicy {
+        self.reorg_policy
     }
 
     /// Returns the durable boundary of intentionally retained history.
@@ -208,6 +261,9 @@ impl CanonicalStoreBuildPlan {
 /// Invalid source-chain range for canonical construction.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CanonicalStoreBuildPlanError {
+    /// Canonical replacement must retain at least one displaced block.
+    #[error("canonical build reorg window must be greater than zero")]
+    ZeroReorgWindowBlocks,
     /// The node activation table cannot interpret the universal v3-v4 history baseline.
     #[error("canonical build activation table is missing required network upgrade {name}")]
     MissingRequiredNetworkUpgrade {
@@ -345,11 +401,68 @@ impl CanonicalStoreWorkload {
 
 /// Durable construction state of a canonical store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "READY carries fixed-size admission evidence by value so store-control decoding remains allocation-free and the evidence can be copied atomically with its fence"
+)]
 pub enum CanonicalStoreBuildState {
     /// Data families are inactive and may still be under construction.
     Building,
     /// Every required family was validated and the baseline epoch is visible.
     Ready(CanonicalStoreReadyEvidence),
+}
+
+/// Authenticated canonical replay prefix through the durable settled tip.
+///
+/// This checkpoint is the only resumable prefix admitted by the version-1
+/// store. Its count starts at the first retained block, and its logical byte
+/// total counts replay-envelope values only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalSequenceCheckpoint {
+    through: BlockId,
+    retained_block_count: u64,
+    sequence_digest: CanonicalBlockFactsSequenceDigest,
+    logical_replay_bytes: u64,
+}
+
+impl CanonicalSequenceCheckpoint {
+    pub(super) const fn from_admitted_parts(
+        through: BlockId,
+        retained_block_count: u64,
+        sequence_digest: CanonicalBlockFactsSequenceDigest,
+        logical_replay_bytes: u64,
+    ) -> Self {
+        Self {
+            through,
+            retained_block_count,
+            sequence_digest,
+            logical_replay_bytes,
+        }
+    }
+
+    /// Returns the last retained block authenticated by this prefix.
+    #[must_use]
+    pub const fn through(self) -> BlockId {
+        self.through
+    }
+
+    /// Returns the retained block count from the first stored block through `through`.
+    #[must_use]
+    pub const fn retained_block_count(self) -> u64 {
+        self.retained_block_count
+    }
+
+    /// Returns the typed ordered digest through `through`.
+    #[must_use]
+    pub const fn sequence_digest(self) -> CanonicalBlockFactsSequenceDigest {
+        self.sequence_digest
+    }
+
+    /// Returns cumulative replay-envelope value bytes through `through`.
+    #[must_use]
+    pub const fn logical_replay_bytes(self) -> u64 {
+        self.logical_replay_bytes
+    }
 }
 
 /// Validation evidence that makes a constructed canonical store visible.
@@ -375,6 +488,14 @@ pub struct CanonicalStoreReadyEvidence {
     pub visible_sequence_digest: [u8; 32],
     /// Total semantic replay-envelope bytes through `visible_tip`.
     pub visible_logical_fact_bytes: u64,
+    /// Resumable authenticated replay prefix through the settled tip.
+    pub sequence_checkpoint: CanonicalSequenceCheckpoint,
+    /// Exact version of the immutable construction manifest that certified the
+    /// original fresh build before its first READY transition.
+    pub construction_manifest_version: u16,
+    /// SHA-256 of the immutable construction manifest written before the first
+    /// READY transition. This value is retained unchanged through following.
+    pub construction_manifest_sha256: [u8; 32],
 }
 
 /// Failure to create or admit a clean canonical store.
@@ -393,6 +514,23 @@ pub enum CanonicalStoreError {
     PathNotFresh {
         /// Existing path refused by the builder.
         path: PathBuf,
+    },
+
+    /// An owner checkpoint was pointed at a path that already exists.
+    #[error("canonical owner checkpoint requires an absent target path: {path:?}")]
+    CheckpointTargetExists {
+        /// Existing path preserved without mutation.
+        path: PathBuf,
+    },
+
+    /// The concrete `RocksDB` checkpoint operation failed.
+    #[error("canonical owner checkpoint at {path:?} failed")]
+    CheckpointFailed {
+        /// Requested checkpoint target.
+        path: PathBuf,
+        /// Underlying `RocksDB` checkpoint failure.
+        #[source]
+        source: rust_rocksdb::Error,
     },
 
     /// A prior process left the deterministic canonical block staging directory.
@@ -569,6 +707,121 @@ pub enum CanonicalStoreError {
         /// Immediate verification failure.
         reason: String,
     },
+
+    /// A canonical displaced-fact archive key, value, link, or event fence is invalid.
+    #[error("canonical displaced archive refused: {reason}")]
+    DisplacedArchiveInvalid {
+        /// Exact archive invariant that failed.
+        reason: String,
+    },
+
+    /// A persisted canonical event cursor names history older than the retained floor.
+    #[error(
+        "canonical event cursor expired: event sequence {event_sequence}, oldest retained {oldest_retained_sequence}"
+    )]
+    CanonicalEventCursorExpired {
+        /// Persisted cursor sequence.
+        event_sequence: u64,
+        /// Inclusive oldest retained event sequence.
+        oldest_retained_sequence: u64,
+    },
+
+    /// A persisted canonical event cursor has an unsupported encoding version.
+    #[error("canonical event cursor version {version} is unsupported")]
+    CanonicalEventCursorUnknownVersion {
+        /// Encoded cursor version.
+        version: u8,
+    },
+
+    /// A persisted canonical event cursor cannot identify an exact retained position.
+    #[error("canonical event cursor is malformed: {reason}")]
+    CanonicalEventCursorMalformed {
+        /// Stable validation reason.
+        reason: &'static str,
+    },
+
+    /// A retained canonical event record has an unsupported version.
+    #[error("canonical event {event_sequence} has unsupported version {version}")]
+    CanonicalEventVersionUnsupported {
+        /// Event row sequence.
+        event_sequence: u64,
+        /// Encoded record version.
+        version: u8,
+    },
+
+    /// A retained canonical event record has an invalid range or transition shape.
+    #[error("canonical event {event_sequence} is malformed: {reason}")]
+    CanonicalEventRecordMalformed {
+        /// Event row sequence.
+        event_sequence: u64,
+        /// Stable validation reason.
+        reason: &'static str,
+    },
+
+    /// A retained canonical event refers to an epoch whose immutable row is absent.
+    #[error("canonical epoch {epoch_id} is not retained")]
+    CanonicalEpochNotRetained {
+        /// Exact epoch identity requested by a retained transition.
+        epoch_id: u64,
+    },
+
+    /// A persisted mempool-event cursor is older than the durable retention floor.
+    #[error(
+        "mempool event cursor expired: event sequence {event_sequence}, oldest retained {oldest_retained_sequence}"
+    )]
+    MempoolEventCursorExpired {
+        /// Persisted cursor sequence.
+        event_sequence: u64,
+        /// Inclusive oldest retained event sequence.
+        oldest_retained_sequence: u64,
+    },
+
+    /// A persisted mempool-event cursor does not authenticate an exact retained event.
+    #[error("mempool event cursor is invalid: {reason}")]
+    MempoolEventCursorInvalid {
+        /// Stable validation reason.
+        reason: &'static str,
+    },
+
+    /// A mempool-snapshot paging cursor does not authenticate its anchor.
+    #[error("mempool snapshot page cursor is invalid: {reason}")]
+    MempoolSnapshotCursorInvalid {
+        /// Stable validation reason.
+        reason: &'static str,
+    },
+
+    /// A mempool-snapshot paging cursor names an event sequence beyond the durable head.
+    #[error(
+        "mempool snapshot page cursor expired: cursor anchor sequence {anchor_event_sequence}, current {current_event_sequence}"
+    )]
+    MempoolSnapshotCursorExpired {
+        /// Cursor anchor sequence.
+        anchor_event_sequence: u64,
+        /// Current durable mempool-event sequence.
+        current_event_sequence: u64,
+    },
+
+    /// The durable mempool event sequence cannot advance further.
+    #[error("mempool event sequence overflow")]
+    MempoolEventSequenceOverflow,
+
+    /// A durable mempool-event key, envelope, or head pointer is invalid.
+    #[error("mempool event log is invalid: {reason}")]
+    MempoolEventLogInvalid {
+        /// Exact invariant that failed.
+        reason: String,
+    },
+
+    /// A projection-build lease cannot preserve a valid retained-event anchor.
+    #[error("projection build lease is invalid: {reason}")]
+    ProjectionBuildLeaseInvalid {
+        /// Stable validation reason.
+        reason: &'static str,
+    },
+
+    /// A projection-build lease was used after its durable expiry.
+    #[error("projection build lease has expired")]
+    ProjectionBuildLeaseExpired,
 }
 
 impl CanonicalStoreError {
@@ -618,6 +871,12 @@ impl CanonicalStoreError {
 
     fn publication(reason: impl Into<String>) -> Self {
         Self::PublicationRefused {
+            reason: reason.into(),
+        }
+    }
+
+    fn displaced_archive(reason: impl Into<String>) -> Self {
+        Self::DisplacedArchiveInvalid {
             reason: reason.into(),
         }
     }
@@ -716,7 +975,12 @@ mod tests {
         let network = zinder_core::Network::ZcashTestnet;
         let activations = test_network_upgrade_activations(network)?;
         let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
-        let plan = CanonicalStoreBuildPlan::complete(&activations, 1_234, build_tip)?;
+        let plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            1_234,
+            build_tip,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
         assert_eq!(plan.network(), network);
         assert_eq!(
             plan.network_upgrade_activations_fingerprint(),
@@ -736,15 +1000,27 @@ mod tests {
             &CommitmentTreeFrontiers::default()
         );
         assert_eq!(plan.build_tip(), build_tip);
+        assert_eq!(plan.reorg_policy().reorg_window_blocks(), 100);
         Ok(())
     }
 
     #[test]
-    fn build_plan_rejects_incomplete_activation_table() {
+    fn reorg_policy_rejects_zero_window() {
+        let error = CanonicalReorgPolicy::new(0).err();
+
+        assert_eq!(
+            error,
+            Some(CanonicalStoreBuildPlanError::ZeroReorgWindowBlocks)
+        );
+    }
+
+    #[test]
+    fn build_plan_rejects_incomplete_activation_table() -> Result<(), Box<dyn std::error::Error>> {
         let error = CanonicalStoreBuildPlan::complete(
             &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
             0,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            CanonicalReorgPolicy::new(100)?,
         )
         .err();
         assert_eq!(
@@ -753,6 +1029,7 @@ mod tests {
                 CanonicalStoreBuildPlanError::MissingRequiredNetworkUpgrade { name: "Overwinter" }
             )
         );
+        Ok(())
     }
 
     #[test]
@@ -765,7 +1042,12 @@ mod tests {
         )?;
         let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
 
-        let plan = CanonicalStoreBuildPlan::complete(&canopy_only_activations, 0, build_tip)?;
+        let plan = CanonicalStoreBuildPlan::complete(
+            &canopy_only_activations,
+            0,
+            build_tip,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
 
         assert_eq!(plan.build_tip(), build_tip);
         Ok(())
@@ -778,6 +1060,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
+            CanonicalReorgPolicy::new(100)?,
         )
         .err();
         assert!(matches!(
@@ -801,6 +1084,7 @@ mod tests {
                 CommitmentTreeFrontiers::default(),
             ),
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
+            CanonicalReorgPolicy::new(100)?,
         )
         .err();
         assert_eq!(
@@ -819,6 +1103,7 @@ mod tests {
             &activations,
             CommitmentTreeCheckpoint::new(checkpoint, 1_234, checkpoint_frontiers.clone()),
             BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+            CanonicalReorgPolicy::new(100)?,
         )?;
 
         assert_eq!(plan.history_predecessor().block_id, checkpoint);
@@ -832,11 +1117,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let network = zinder_core::Network::ZcashTestnet;
         let activations = test_network_upgrade_activations(network)?;
-        let error = CanonicalStoreBuildPlan::from_parts(
+        let error = CanonicalStoreBuildPlan {
             network,
-            activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
-            zinder_core::CanonicalHistoryBounds::complete(),
-            CommitmentTreeCheckpoint::new(
+            network_upgrade_activations_fingerprint: activations
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            history_bounds: zinder_core::CanonicalHistoryBounds::complete(),
+            history_predecessor: CommitmentTreeCheckpoint::new(
                 BlockId::new(BlockHeight::new(0), network.genesis_hash()),
                 0,
                 CommitmentTreeFrontiers::from_validated_parts(
@@ -845,8 +1132,9 @@ mod tests {
                     None,
                 ),
             ),
-            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-        )
+            build_tip: BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+        }
+        .validate()
         .err();
 
         assert_eq!(
@@ -866,6 +1154,7 @@ mod tests {
                 &activations,
                 CommitmentTreeCheckpoint::new(genesis, 0, CommitmentTreeFrontiers::default(),),
                 BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                CanonicalReorgPolicy::new(100)?,
             )
             .err(),
             Some(CanonicalStoreBuildPlanError::CheckpointAtGenesis)
@@ -877,6 +1166,7 @@ mod tests {
                 &activations,
                 CommitmentTreeCheckpoint::new(checkpoint, 0, CommitmentTreeFrontiers::default(),),
                 BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32])),
+                CanonicalReorgPolicy::new(100)?,
             )
             .err(),
             Some(

@@ -13,17 +13,17 @@ use zinder_core::{
     TransactionBlobArtifact,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
-use zinder_rocksdb::{FixedRecordSorter, OrderedSstWriter, SstFileSet, fixed_record_capacity};
-
-use self::codec::{
-    BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN,
-    decode_block_final_note_commitment_roots,
+use zinder_rocksdb::{
+    FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
 };
 
+use self::codec::{BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN};
+
 pub(super) use self::codec::{
-    BLOCK_HEADER_VALUE_LEN, decode_tree_state_checkpoint, encode_block_final_note_commitment_roots,
-    encode_block_hash_location, encode_block_header, encode_block_position,
-    encode_transaction_location, encode_transaction_position, encode_tree_state_checkpoint,
+    BLOCK_HEADER_VALUE_LEN, decode_block_final_note_commitment_roots, decode_tree_state_checkpoint,
+    encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
+    encode_block_position, encode_transaction_location, encode_transaction_position,
+    encode_tree_state_checkpoint,
 };
 
 use super::{
@@ -145,6 +145,13 @@ pub(super) struct PreparedCanonicalBlockLoad {
     pub(super) evidence: CanonicalBlockLoadEvidence,
 }
 
+/// Per-file physical evidence emitted by the bounded staging writers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CanonicalStagedSstEvidence {
+    pub(super) family: &'static str,
+    pub(super) file: SstFileEvidence,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct CanonicalBlockSstConfig<'options> {
     pub(super) staging_path: &'options Path,
@@ -158,6 +165,7 @@ pub(super) struct CanonicalBlockSstConfig<'options> {
 struct PreparedColumnFamily {
     name: &'static str,
     paths: Vec<PathBuf>,
+    staged_ssts: Vec<CanonicalStagedSstEvidence>,
 }
 
 pub(super) fn write_canonical_block_ssts<SourceError>(
@@ -316,42 +324,44 @@ fn prepare_canonical_block_load(
     artifacts: CanonicalBlockSstArtifacts,
     predecessor_checkpoint_logical_bytes: u64,
 ) -> Result<PreparedCanonicalBlockLoad, CanonicalStoreError> {
-    let families = vec![
-        PreparedColumnFamily::new(BLOCK_HEADER_COLUMN_FAMILY, artifacts.header.paths),
-        PreparedColumnFamily::new(BLOCK_HASH_INDEX_COLUMN_FAMILY, artifacts.block_hash.paths),
-        PreparedColumnFamily::new(BLOCK_REPLAY_COLUMN_FAMILY, artifacts.replay.paths),
-        PreparedColumnFamily::new(COMPACT_BLOCK_COLUMN_FAMILY, artifacts.compact.paths),
-        PreparedColumnFamily::new(
-            TRANSACTION_LOCATION_COLUMN_FAMILY,
-            artifacts.transaction_location.paths,
-        ),
-        PreparedColumnFamily::new(
-            TRANSACTION_BLOB_COLUMN_FAMILY,
-            artifacts.transaction_blob.paths,
-        ),
-        PreparedColumnFamily::new(BLOCK_BLOB_COLUMN_FAMILY, artifacts.block_blob.paths),
-        PreparedColumnFamily::new(
-            TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-            artifacts.tree_state_checkpoint.paths,
-        ),
-        PreparedColumnFamily::new(
-            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-            artifacts.block_final_note_commitment_roots.paths,
-        ),
-    ];
+    let CanonicalBlockSstArtifacts {
+        header,
+        block_hash,
+        replay,
+        compact,
+        transaction_location,
+        transaction_blob,
+        block_blob,
+        tree_state_checkpoint,
+        block_final_note_commitment_roots,
+    } = artifacts;
     let sst_file_bytes = [
-        artifacts.header.file_bytes,
-        artifacts.block_hash.file_bytes,
-        artifacts.replay.file_bytes,
-        artifacts.compact.file_bytes,
-        artifacts.transaction_location.file_bytes,
-        artifacts.transaction_blob.file_bytes,
-        artifacts.block_blob.file_bytes,
-        artifacts.tree_state_checkpoint.file_bytes,
-        artifacts.block_final_note_commitment_roots.file_bytes,
+        header.file_bytes,
+        block_hash.file_bytes,
+        replay.file_bytes,
+        compact.file_bytes,
+        transaction_location.file_bytes,
+        transaction_blob.file_bytes,
+        block_blob.file_bytes,
+        tree_state_checkpoint.file_bytes,
+        block_final_note_commitment_roots.file_bytes,
     ]
     .into_iter()
     .try_fold(0_u64, checked_add_sst_bytes)?;
+    let families = vec![
+        PreparedColumnFamily::new(BLOCK_HEADER_COLUMN_FAMILY, header),
+        PreparedColumnFamily::new(BLOCK_HASH_INDEX_COLUMN_FAMILY, block_hash),
+        PreparedColumnFamily::new(BLOCK_REPLAY_COLUMN_FAMILY, replay),
+        PreparedColumnFamily::new(COMPACT_BLOCK_COLUMN_FAMILY, compact),
+        PreparedColumnFamily::new(TRANSACTION_LOCATION_COLUMN_FAMILY, transaction_location),
+        PreparedColumnFamily::new(TRANSACTION_BLOB_COLUMN_FAMILY, transaction_blob),
+        PreparedColumnFamily::new(BLOCK_BLOB_COLUMN_FAMILY, block_blob),
+        PreparedColumnFamily::new(TREE_STATE_CHECKPOINT_COLUMN_FAMILY, tree_state_checkpoint),
+        PreparedColumnFamily::new(
+            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+            block_final_note_commitment_roots,
+        ),
+    ];
     let sst_file_count = families.iter().try_fold(0_u64, |count, family| {
         let family_count = u64::try_from(family.paths.len()).map_err(|_| {
             CanonicalStoreError::block_load_sequence("SST file count exceeds u64::MAX")
@@ -439,7 +449,8 @@ fn write_build_block(
 pub(super) fn ingest_canonical_block_ssts(
     db: &DB,
     prepared: PreparedCanonicalBlockLoad,
-) -> Result<CanonicalBlockLoadEvidence, CanonicalStoreError> {
+) -> Result<IngestedCanonicalBlockLoad, CanonicalStoreError> {
+    let mut staged_ssts = Vec::new();
     for family in prepared.families {
         if family.paths.is_empty() {
             continue;
@@ -460,8 +471,17 @@ pub(super) fn ingest_canonical_block_ssts(
                 operation: "canonical block-family external SST ingestion",
                 source,
             })?;
+        staged_ssts.extend(family.staged_ssts);
     }
-    Ok(prepared.evidence)
+    Ok(IngestedCanonicalBlockLoad {
+        evidence: prepared.evidence,
+        staged_ssts,
+    })
+}
+
+pub(super) struct IngestedCanonicalBlockLoad {
+    pub(super) evidence: CanonicalBlockLoadEvidence,
+    pub(super) staged_ssts: Vec<CanonicalStagedSstEvidence>,
 }
 
 pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, CanonicalStoreError> {
@@ -1335,8 +1355,17 @@ impl BlockSequence {
 }
 
 impl PreparedColumnFamily {
-    fn new(name: &'static str, paths: Vec<PathBuf>) -> Self {
-        Self { name, paths }
+    fn new(name: &'static str, files: SstFileSet) -> Self {
+        let staged_ssts = files
+            .files
+            .into_iter()
+            .map(|file| CanonicalStagedSstEvidence { family: name, file })
+            .collect();
+        Self {
+            name,
+            paths: files.paths,
+            staged_ssts,
+        }
     }
 }
 

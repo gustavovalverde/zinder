@@ -1,16 +1,17 @@
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
-    CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion,
-    CanonicalHistoryBounds, ChainEpochId, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
-    CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
-    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, Network, NetworkUpgradeActivationsFingerprint,
-    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
+    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds, ChainEpochId,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+    FinalNoteCommitmentRoot, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, Network,
+    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
+    ShieldedProtocol,
 };
 
 use super::{
-    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildPlan,
-    CanonicalStoreBuildPlanError, CanonicalStoreBuildState, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalSequenceCheckpoint,
+    CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
 };
 
 const BUILDING_STATE: u8 = 1;
@@ -24,12 +25,14 @@ const FRONTIER_PRESENT: u8 = 1;
 const ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH: usize = 2 + 32;
 const HISTORY_FIXED_FIELDS_LENGTH: usize = 1 + 4 + 32 + 4 + 3;
 const BUILD_TIP_FIELDS_LENGTH: usize = 4 + 32;
-const READY_FIELDS_LENGTH: usize = 4 + 32 + 4 + 32 + 8 + 8 + 8 + 2 + 4 + 2 + 32 + 8;
+const READY_FIELDS_LENGTH: usize =
+    4 + 32 + 4 + 32 + 8 + 8 + 8 + 2 + 4 + 2 + 32 + 8 + 4 + 32 + 8 + 2 + 32 + 8 + 2 + 32;
 const STORE_CONTROL_MINIMUM_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + 2
     + 4
     + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
     + 1
+    + 4
     + HISTORY_FIXED_FIELDS_LENGTH
     + BUILD_TIP_FIELDS_LENGTH
     + 32
@@ -60,7 +63,7 @@ pub(super) fn encode_ready_store_control(
     workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
-    ready_evidence: CanonicalStoreReadyEvidence,
+    ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
     let mut encoded = encode_store_control_prefix(workload, build_plan, cursor_auth_key)?;
     encoded.push(READY_STATE);
@@ -82,6 +85,15 @@ pub(super) fn encode_ready_store_control(
     encoded.extend_from_slice(&ready_evidence.sequence_digest_version.value().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.visible_sequence_digest);
     encoded.extend_from_slice(&ready_evidence.visible_logical_fact_bytes.to_le_bytes());
+    let checkpoint = ready_evidence.sequence_checkpoint;
+    encoded.extend_from_slice(&checkpoint.through().height.value().to_le_bytes());
+    encoded.extend_from_slice(&checkpoint.through().hash.as_bytes());
+    encoded.extend_from_slice(&checkpoint.retained_block_count().to_le_bytes());
+    encoded.extend_from_slice(&checkpoint.sequence_digest().version().value().to_le_bytes());
+    encoded.extend_from_slice(&checkpoint.sequence_digest().as_bytes());
+    encoded.extend_from_slice(&checkpoint.logical_replay_bytes().to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.construction_manifest_version.to_le_bytes());
+    encoded.extend_from_slice(&ready_evidence.construction_manifest_sha256);
     Ok(encoded)
 }
 
@@ -101,6 +113,12 @@ fn encode_store_control_prefix(
         CanonicalStoreWorkload::Wallet => WALLET_WORKLOAD,
         CanonicalStoreWorkload::Explorer => EXPLORER_WORKLOAD,
     });
+    encoded.extend_from_slice(
+        &build_plan
+            .reorg_policy()
+            .reorg_window_blocks()
+            .to_le_bytes(),
+    );
     match build_plan.history_bounds().preceding_checkpoint() {
         None => {
             encoded.push(COMPLETE_HISTORY);
@@ -201,18 +219,23 @@ pub(super) fn decode_store_control(
             ));
         }
     };
+    let reorg_policy =
+        super::CanonicalReorgPolicy::new(decoder.read_u32("reorg window blocks")?)
+            .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
     let (history_bounds, history_predecessor) = decode_history_bounds(&mut decoder)?;
     let build_tip = BlockId::new(
         BlockHeight::new(decoder.read_u32("build tip height")?),
         BlockHash::from_bytes(decoder.read_array::<32>("build tip hash")?),
     );
-    let build_plan = CanonicalStoreBuildPlan::from_parts(
+    let build_plan = CanonicalStoreBuildPlan {
         network,
         network_upgrade_activations_fingerprint,
+        reorg_policy,
         history_bounds,
         history_predecessor,
         build_tip,
-    )
+    }
+    .validate()
     .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
     let cursor_auth_key = decoder.read_array::<32>("cursor authentication key")?;
     let build_state = match decoder.read_u8("build state")? {
@@ -381,6 +404,13 @@ impl<'encoded> Decoder<'encoded> {
         .map_err(|source| CanonicalStoreError::admission(self.path, source.to_string()))?;
         let visible_sequence_digest = self.read_array::<32>("visible sequence digest")?;
         let visible_logical_fact_bytes = self.read_u64("visible logical fact bytes")?;
+        let sequence_checkpoint = self.decode_sequence_checkpoint(
+            first_height,
+            visible_tip_height,
+            visible_logical_fact_bytes,
+        )?;
+        let construction_manifest_version = self.read_u16("construction manifest version")?;
+        let construction_manifest_sha256 = self.read_array::<32>("construction manifest digest")?;
 
         let expected_block_count = visible_tip_height
             .checked_sub(first_height)
@@ -390,11 +420,9 @@ impl<'encoded> Decoder<'encoded> {
             && visible_event_sequence == 1
             && visible_tip_height == build_tip.height.value()
             && visible_tip_hash == build_tip.hash.as_bytes();
-        let live_pointer_advances_baseline = visible_epoch > 1
-            && visible_event_sequence == visible_epoch
-            && visible_tip_height > build_tip.height.value();
+        let live_pointer_is_exact = visible_epoch > 1 && visible_event_sequence == visible_epoch;
         if first_height != history_bounds.first_available_height().value()
-            || !(baseline_pointer_is_exact || live_pointer_advances_baseline)
+            || !(baseline_pointer_is_exact || live_pointer_is_exact)
             || expected_block_count != Some(visible_block_count)
         {
             return Err(CanonicalStoreError::admission(
@@ -408,15 +436,13 @@ impl<'encoded> Decoder<'encoded> {
                 "ready store control is missing validation evidence",
             ));
         }
-        if block_digest_version != CanonicalBlockFactsDigestVersion::V1
-            || replay_format_version != CanonicalBlockReplayFormatVersion::V1
-            || sequence_digest_version != CanonicalBlockFactsSequenceDigestVersion::V1
-        {
-            return Err(CanonicalStoreError::admission(
-                self.path,
-                "ready store control contracts must all be version 1",
-            ));
-        }
+        self.validate_ready_contract_versions(
+            block_digest_version,
+            replay_format_version,
+            sequence_digest_version,
+            construction_manifest_version,
+            &construction_manifest_sha256,
+        )?;
         Ok(CanonicalStoreReadyEvidence {
             first_retained_block: BlockId::new(
                 BlockHeight::new(first_height),
@@ -434,7 +460,77 @@ impl<'encoded> Decoder<'encoded> {
             sequence_digest_version,
             visible_sequence_digest,
             visible_logical_fact_bytes,
+            sequence_checkpoint,
+            construction_manifest_version,
+            construction_manifest_sha256,
         })
+    }
+
+    fn validate_ready_contract_versions(
+        &self,
+        block_digest_version: CanonicalBlockFactsDigestVersion,
+        replay_format_version: CanonicalBlockReplayFormatVersion,
+        sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
+        construction_manifest_version: u16,
+        construction_manifest_sha256: &[u8; 32],
+    ) -> Result<(), CanonicalStoreError> {
+        if block_digest_version != CanonicalBlockFactsDigestVersion::V1
+            || replay_format_version != CanonicalBlockReplayFormatVersion::V1
+            || sequence_digest_version != CanonicalBlockFactsSequenceDigestVersion::V1
+            || construction_manifest_version != 1
+            || construction_manifest_sha256.iter().all(|byte| *byte == 0)
+        {
+            return Err(CanonicalStoreError::admission(
+                self.path,
+                "ready store control contracts must all be version 1",
+            ));
+        }
+        Ok(())
+    }
+
+    fn decode_sequence_checkpoint(
+        &mut self,
+        first_height: u32,
+        visible_tip_height: u32,
+        visible_logical_replay_bytes: u64,
+    ) -> Result<CanonicalSequenceCheckpoint, CanonicalStoreError> {
+        let through_height = self.read_u32("checkpoint through height")?;
+        let through_hash = self.read_array::<32>("checkpoint through hash")?;
+        let retained_block_count = self.read_u64("checkpoint retained block count")?;
+        let digest_version = CanonicalBlockFactsSequenceDigestVersion::try_from(
+            self.read_u16("checkpoint sequence digest version")?,
+        )
+        .map_err(|source| CanonicalStoreError::admission(self.path, source.to_string()))?;
+        let digest = self.read_array::<32>("checkpoint sequence digest")?;
+        let logical_replay_bytes = self.read_u64("checkpoint logical replay bytes")?;
+        let expected_count = through_height
+            .checked_sub(first_height)
+            .map(u64::from)
+            .and_then(|height_span| height_span.checked_add(1));
+        if through_height > visible_tip_height
+            || expected_count != Some(retained_block_count)
+            || logical_replay_bytes == 0
+            || logical_replay_bytes > visible_logical_replay_bytes
+            || digest_version != CanonicalBlockFactsSequenceDigestVersion::V1
+        {
+            return Err(CanonicalStoreError::admission(
+                self.path,
+                "ready store control has an invalid sequence checkpoint",
+            ));
+        }
+        Ok(CanonicalSequenceCheckpoint::from_admitted_parts(
+            BlockId::new(
+                BlockHeight::new(through_height),
+                BlockHash::from_bytes(through_hash),
+            ),
+            retained_block_count,
+            CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                digest_version,
+                retained_block_count,
+                digest,
+            ),
+            logical_replay_bytes,
+        ))
     }
 
     fn reject_nonzero_building_fields(&mut self) -> Result<(), CanonicalStoreError> {
@@ -504,9 +600,10 @@ impl<'encoded> Decoder<'encoded> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{num::NonZeroU32, path::Path};
 
     use super::*;
+    use crate::CanonicalReorgPolicy;
 
     const CURSOR_AUTH_KEY: [u8; 32] = [7; 32];
     const ACTIVATIONS_FINGERPRINT: NetworkUpgradeActivationsFingerprint =
@@ -539,8 +636,28 @@ mod tests {
                         build_state: CanonicalStoreBuildState::Building,
                     }
                 );
+                assert_eq!(
+                    decode_store_control(Path::new("canonical"), &encoded)?
+                        .build_plan
+                        .reorg_policy()
+                        .reorg_window_blocks(),
+                    1
+                );
             }
         }
+
+        let reorg_window_offset =
+            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1;
+        let mut zero_reorg_window = encode_building_store_control(
+            CanonicalStoreWorkload::Wallet,
+            &complete_build_plan(Network::ZcashTestnet),
+            CURSOR_AUTH_KEY,
+        )?;
+        zero_reorg_window[reorg_window_offset..reorg_window_offset + 4].fill(0);
+        let zero_error = decode_store_control(Path::new("canonical"), &zero_reorg_window)
+            .err()
+            .ok_or("zero persisted reorg window must fail closed")?;
+        assert!(zero_error.to_string().contains("greater than zero"));
 
         let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
         let history_bounds = CanonicalHistoryBounds::checkpointed(checkpoint)?;
@@ -587,7 +704,7 @@ mod tests {
                 decoded_ready.workload,
                 &decoded_ready.build_plan,
                 decoded_ready.cursor_auth_key,
-                ready_evidence,
+                &ready_evidence,
             )?,
             encoded
         );
@@ -606,6 +723,7 @@ mod tests {
             + 4
             + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
             + 1
+            + 4
             + HISTORY_FIXED_FIELDS_LENGTH
             + BUILD_TIP_FIELDS_LENGTH
             + 32
@@ -650,7 +768,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the table enumerates each version-1 control field that must fail closed"
+        reason = "the table enumerates each current control field that must fail closed"
     )]
     fn malformed_control_variants_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
         let build_plan = complete_build_plan(Network::ZcashTestnet);
@@ -664,7 +782,7 @@ mod tests {
         let activations_fingerprint_version = network_start + 4;
         let workload_offset =
             activations_fingerprint_version + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH;
-        let history_kind = workload_offset + 1;
+        let history_kind = workload_offset + 1 + 4;
         let sapling_frontier_presence = history_kind + 1 + 4 + 32 + 4;
         let build_tip = history_kind + HISTORY_FIXED_FIELDS_LENGTH;
         let cursor_auth_key = build_tip + BUILD_TIP_FIELDS_LENGTH;
@@ -675,6 +793,14 @@ mod tests {
                 let mut encoded = base.clone();
                 encoded[0] ^= 0xff;
                 (encoded, "identity")
+            },
+            {
+                let mut encoded = base.clone();
+                encoded[identity_end..identity_end + 2].copy_from_slice(&1_u16.to_le_bytes());
+                (
+                    encoded,
+                    "store schema version 1 does not equal required version 5",
+                )
             },
             {
                 let mut encoded = base.clone();
@@ -753,7 +879,7 @@ mod tests {
             CURSOR_AUTH_KEY,
         )?;
         let history_kind =
-            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1;
+            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1 + 4;
         let sapling_presence = history_kind + 1 + 4 + 32 + 4;
         assert_eq!(encoded[sapling_presence], FRONTIER_PRESENT);
         let sapling_root = sapling_presence + 1;
@@ -785,6 +911,7 @@ mod tests {
         encoded.extend_from_slice(&ACTIVATIONS_FINGERPRINT.version().value().to_le_bytes());
         encoded.extend_from_slice(&ACTIVATIONS_FINGERPRINT.as_bytes());
         encoded.push(EXPLORER_WORKLOAD);
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
         encoded.push(COMPLETE_HISTORY);
         encoded.extend_from_slice(&0_u32.to_le_bytes());
         encoded.extend_from_slice(&Network::ZcashTestnet.genesis_hash().as_bytes());
@@ -812,6 +939,18 @@ mod tests {
         );
         encoded.extend_from_slice(&[3; 32]);
         encoded.extend_from_slice(&1_u64.to_le_bytes());
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&[1; 32]);
+        encoded.extend_from_slice(&1_u64.to_le_bytes());
+        encoded.extend_from_slice(
+            &CanonicalBlockFactsSequenceDigestVersion::V1
+                .value()
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&[5; 32]);
+        encoded.extend_from_slice(&1_u64.to_le_bytes());
+        encoded.extend_from_slice(&1_u16.to_le_bytes());
+        encoded.extend_from_slice(&[6; 32]);
         assert_eq!(encoded.len(), STORE_CONTROL_MINIMUM_LENGTH);
         encoded
     }
@@ -836,6 +975,18 @@ mod tests {
                 sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
                 visible_sequence_digest: [3; 32],
                 visible_logical_fact_bytes: 1,
+                sequence_checkpoint: CanonicalSequenceCheckpoint::from_admitted_parts(
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    1,
+                    CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                        CanonicalBlockFactsSequenceDigestVersion::V1,
+                        1,
+                        [5; 32],
+                    ),
+                    1,
+                ),
+                construction_manifest_version: 1,
+                construction_manifest_sha256: [6; 32],
             }),
         }
     }
@@ -844,6 +995,9 @@ mod tests {
         CanonicalStoreBuildPlan {
             network,
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
+            reorg_policy: CanonicalReorgPolicy {
+                reorg_window_blocks: NonZeroU32::MIN,
+            },
             history_bounds: CanonicalHistoryBounds::complete(),
             history_predecessor: CommitmentTreeCheckpoint::new(
                 BlockId::new(BlockHeight::new(0), network.genesis_hash()),
@@ -861,6 +1015,9 @@ mod tests {
         CanonicalStoreBuildPlan {
             network: Network::ZcashTestnet,
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
+            reorg_policy: CanonicalReorgPolicy {
+                reorg_window_blocks: NonZeroU32::MIN,
+            },
             history_bounds,
             history_predecessor: CommitmentTreeCheckpoint::new(
                 checkpoint,

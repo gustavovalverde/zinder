@@ -9,6 +9,7 @@ use std::{
 };
 
 use rust_rocksdb::{Options, SstFileWriter};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod variable_value_sort;
@@ -92,7 +93,32 @@ pub struct SstFileSet {
     pub paths: Vec<PathBuf>,
     /// Total physical bytes occupied by `paths`.
     pub file_bytes: u64,
+    /// Cryptographic key/value evidence for every staged physical file.
+    pub files: Vec<SstFileEvidence>,
 }
+
+/// Immutable evidence emitted while one staged external SST is written.
+///
+/// The digest is domain-separated and receives the length-prefixed key and
+/// value of each row in the exact writer order. The evidence is therefore
+/// available before ingestion without reading an SST back from disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SstFileEvidence {
+    /// Zero-based ordinal within its logical family.
+    pub ordinal: u64,
+    /// Physical file size after the writer closes the file.
+    pub file_bytes: u64,
+    /// Exact number of key/value rows in the file.
+    pub entry_count: u64,
+    /// First ordered key in the file.
+    pub first_key: Vec<u8>,
+    /// Last ordered key in the file.
+    pub last_key: Vec<u8>,
+    /// Version-1 domain-separated digest of every exact key/value row.
+    pub ordered_key_value_digest: [u8; 32],
+}
+
+const SST_FILE_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"zinder.rocksdb.staged-sst.v1\0";
 
 /// Writes strictly increasing opaque keys into bounded-size SST files.
 pub struct OrderedSstWriter<'options> {
@@ -107,6 +133,12 @@ pub struct OrderedSstWriter<'options> {
     previous_key: Option<Vec<u8>>,
     paths: Vec<PathBuf>,
     file_bytes: u64,
+    files: Vec<SstFileEvidence>,
+    current_entry_count: u64,
+    current_first_key: Option<Vec<u8>>,
+    current_last_key: Option<Vec<u8>>,
+    current_ordinal: Option<u64>,
+    current_digest: Option<Sha256>,
 }
 
 impl<'options> OrderedSstWriter<'options> {
@@ -134,6 +166,12 @@ impl<'options> OrderedSstWriter<'options> {
             previous_key: None,
             paths: Vec::new(),
             file_bytes: 0,
+            files: Vec::new(),
+            current_entry_count: 0,
+            current_first_key: None,
+            current_last_key: None,
+            current_ordinal: None,
+            current_digest: None,
         })
     }
 
@@ -168,6 +206,18 @@ impl<'options> OrderedSstWriter<'options> {
             .current_logical_bytes
             .checked_add(logical_row_bytes(key.len(), encoded_value.len())?)
             .ok_or_else(|| BulkLoadError::invalid("current SST logical bytes exceed u64::MAX"))?;
+        self.current_entry_count = self
+            .current_entry_count
+            .checked_add(1)
+            .ok_or_else(|| BulkLoadError::invalid("SST entry count exceeds u64::MAX"))?;
+        if self.current_first_key.is_none() {
+            self.current_first_key = Some(key.to_vec());
+        }
+        self.current_last_key = Some(key.to_vec());
+        let digest = self.current_digest.as_mut().ok_or_else(|| {
+            BulkLoadError::invalid("ordered SST writer has no active evidence digest")
+        })?;
+        update_sst_file_digest(digest, key, encoded_value)?;
         self.previous_key = Some(key.to_vec());
         Ok(())
     }
@@ -178,16 +228,16 @@ impl<'options> OrderedSstWriter<'options> {
         Ok(SstFileSet {
             paths: self.paths,
             file_bytes: self.file_bytes,
+            files: self.files,
         })
     }
 
     fn open_next(&mut self) -> Result<(), BulkLoadError> {
-        let path = self.staging_path.join(format!(
-            "{}-{:08}.sst",
-            self.artifact_label, self.next_file_index
-        ));
-        self.next_file_index = self
-            .next_file_index
+        let ordinal = self.next_file_index;
+        let path = self
+            .staging_path
+            .join(format!("{}-{:08}.sst", self.artifact_label, ordinal));
+        self.next_file_index = ordinal
             .checked_add(1)
             .ok_or_else(|| BulkLoadError::invalid("SST file count exceeds u64::MAX"))?;
         let writer = SstFileWriter::create(self.options);
@@ -200,6 +250,14 @@ impl<'options> OrderedSstWriter<'options> {
         self.writer = Some(writer);
         self.current_path = Some(path);
         self.current_logical_bytes = 0;
+        self.current_entry_count = 0;
+        self.current_first_key = None;
+        self.current_last_key = None;
+        self.current_ordinal = Some(ordinal);
+        let mut digest = Sha256::new();
+        digest.update(SST_FILE_EVIDENCE_DIGEST_DOMAIN);
+        digest.update(ordinal.to_le_bytes());
+        self.current_digest = Some(digest);
         Ok(())
     }
 
@@ -224,9 +282,50 @@ impl<'options> OrderedSstWriter<'options> {
             .file_bytes
             .checked_add(file_bytes)
             .ok_or_else(|| BulkLoadError::invalid("total SST file bytes exceed u64::MAX"))?;
+        let ordinal = self
+            .current_ordinal
+            .take()
+            .ok_or_else(|| BulkLoadError::invalid("closed ordered SST has no evidence ordinal"))?;
+        let entry_count = self.current_entry_count;
+        let first_key = self
+            .current_first_key
+            .take()
+            .ok_or_else(|| BulkLoadError::invalid("closed ordered SST has no first key"))?;
+        let last_key = self
+            .current_last_key
+            .take()
+            .ok_or_else(|| BulkLoadError::invalid("closed ordered SST has no last key"))?;
+        let digest = self
+            .current_digest
+            .take()
+            .ok_or_else(|| BulkLoadError::invalid("closed ordered SST has no evidence digest"))?;
+        self.files.push(SstFileEvidence {
+            ordinal,
+            file_bytes,
+            entry_count,
+            first_key,
+            last_key,
+            ordered_key_value_digest: digest.finalize().into(),
+        });
         self.paths.push(path);
         Ok(())
     }
+}
+
+fn update_sst_file_digest(
+    digest: &mut Sha256,
+    key: &[u8],
+    encoded_value: &[u8],
+) -> Result<(), BulkLoadError> {
+    let key_length = u64::try_from(key.len())
+        .map_err(|_| BulkLoadError::invalid("SST key length exceeds u64::MAX"))?;
+    let encoded_value_length = u64::try_from(encoded_value.len())
+        .map_err(|_| BulkLoadError::invalid("SST value length exceeds u64::MAX"))?;
+    digest.update(key_length.to_le_bytes());
+    digest.update(key);
+    digest.update(encoded_value_length.to_le_bytes());
+    digest.update(encoded_value);
+    Ok(())
 }
 
 /// Bounded external sorter for opaque fixed-width records.
@@ -534,6 +633,53 @@ mod tests {
             sorter.finish::<2>(&Options::default(), 0),
             Err(BulkLoadError::InvalidInput { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_sst_writer_records_domain_separated_per_file_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let options = Options::default();
+        let mut writer = OrderedSstWriter::new(temporary.path(), "evidence", &options, 2)?;
+        writer.put(b"a", b"1")?;
+        writer.put(b"b", b"22")?;
+        let files = writer.finish()?;
+
+        assert_eq!(files.files.len(), 2);
+        assert_eq!(files.files[0].ordinal, 0);
+        assert_eq!(files.files[0].entry_count, 1);
+        assert_eq!(files.files[0].first_key, b"a");
+        assert_eq!(files.files[0].last_key, b"a");
+        assert_eq!(
+            files.files[0].ordered_key_value_digest,
+            [
+                75, 165, 213, 127, 94, 102, 70, 148, 94, 23, 94, 209, 179, 67, 79, 62, 24, 149,
+                140, 126, 57, 10, 152, 114, 152, 56, 86, 58, 133, 19, 85, 98,
+            ]
+        );
+        assert_eq!(files.files[1].ordinal, 1);
+        assert_eq!(files.files[1].entry_count, 1);
+        assert_eq!(files.files[1].first_key, b"b");
+        assert_eq!(files.files[1].last_key, b"b");
+        assert!(files.files.iter().all(|file| file.file_bytes > 0));
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_record_sorter_preserves_per_file_evidence_after_external_sort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let mut sorter = FixedRecordSorter::<4>::new(temporary.path(), "reverse", 1)?;
+        sorter.push([2, 0, 0, 2])?;
+        sorter.push([1, 0, 0, 1])?;
+        let files = sorter.finish::<2>(&Options::default(), 1_024)?;
+
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].entry_count, 2);
+        assert_eq!(files.files[0].first_key, [1, 0]);
+        assert_eq!(files.files[0].last_key, [2, 0]);
+        assert_ne!(files.files[0].ordered_key_value_digest, [0; 32]);
         Ok(())
     }
 }

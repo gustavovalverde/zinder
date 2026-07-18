@@ -178,7 +178,7 @@ pub(in crate::canonical_store) fn encode_block_final_note_commitment_roots(
 }
 
 /// Decodes one exact v1 block-root value and restores key/header-owned identity.
-pub(super) fn decode_block_final_note_commitment_roots(
+pub(in crate::canonical_store) fn decode_block_final_note_commitment_roots(
     height: BlockHeight,
     block_hash: BlockHash,
     encoded: &[u8],
