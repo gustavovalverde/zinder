@@ -30,7 +30,7 @@ use zinder_store::{
 use zinder_wallet_projection::{
     ProjectionBuildLeaseRequest, ProjectionBuildOwner, WALLET_PROJECTION_STORE_IDENTITY,
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
-    WalletProjectionFamilyRowCounts, WalletProjectionRetainedEventAnchor,
+    WalletOutpointKey, WalletProjectionFamilyRowCounts, WalletProjectionRetainedEventAnchor,
     WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
@@ -728,7 +728,14 @@ fn incremental_cancellation_and_collapsed_reconciliation_match_a_cold_wallet_pro
     let retained_events = retained_events_after(&secondary, source_after_collapsed_reconciliation)?;
     assert_eq!(retained_events.len(), 1);
     assert_eq!(retained_events[0].resulting_fence(), second_reorg_fence);
-    assert!(wallet.find_reorg_undo(BlockHeight::new(4))?.is_some());
+    let replacement_undo = wallet
+        .find_reorg_undo(BlockHeight::new(4))?
+        .ok_or("replacement undo must exist before the second reorg")?;
+    assert!(
+        replacement_undo
+            .spent_outpoints
+            .contains(&WalletOutpointKey::new(fixture.final_primary_unspent))
+    );
     wallet.reconcile_canonical_event_sequence(
         source_after_collapsed_reconciliation,
         &retained_events,
@@ -756,11 +763,22 @@ fn incremental_cancellation_and_collapsed_reconciliation_match_a_cold_wallet_pro
             .find_unspent_output(fixture.final_secondary_unspent)?
             .is_some()
     );
+    let restored_primary = wallet
+        .find_unspent_output(fixture.final_primary_unspent)?
+        .ok_or("second reorg must restore the prior unspent output")?;
     assert!(
         wallet
-            .find_unspent_output(fixture.final_primary_unspent)?
-            .is_some()
+            .find_spent_output(fixture.final_primary_unspent)?
+            .is_none()
     );
+    assert_eq!(
+        wallet.find_unspent_output_by_address_key(WalletAddressUnspentOutputKey::new(
+            &restored_primary,
+        ))?,
+        Some(restored_primary)
+    );
+    assert_eq!(wallet.address_balance(fixture.address_a)?, 18);
+    assert_eq!(wallet.address_balance(fixture.address_b)?, 8);
     drop(canonical_store);
     Ok(())
 }

@@ -1407,7 +1407,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         }
         self.validate_add_unspent(output)?;
         let encoded = output.encode_value()?;
-        self.insert_row(
+        self.insert_row_after_absence_observed(
             WalletProjectionRowFamily::TransparentUnspentOutput,
             TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
             key.as_bytes(),
@@ -1453,13 +1453,13 @@ impl<'store> WalletTransitionPlanner<'store> {
             });
         }
         self.validate_remove_unspent(output)?;
-        self.remove_row(
+        self.remove_row_after_value_observed(
             WalletProjectionRowFamily::TransparentUnspentOutput,
             TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
             key.as_bytes(),
-            &encoded,
+            &observed,
         )?;
-        self.remove_row(
+        self.remove_row_after_value_observed(
             WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
             TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
             address_key.as_bytes(),
@@ -1478,7 +1478,7 @@ impl<'store> WalletTransitionPlanner<'store> {
             );
         }
         let encoded = spent.encode_value()?;
-        self.insert_row(
+        self.insert_row_after_absence_observed(
             WalletProjectionRowFamily::TransparentSpentOutput,
             TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
             key.as_bytes(),
@@ -1496,7 +1496,7 @@ impl<'store> WalletTransitionPlanner<'store> {
                 reason: "wallet spent output is absent while reversing a reorg",
             })?;
         let spent = WalletSpentOutput::decode_value(key, &encoded)?;
-        self.remove_row(
+        self.remove_row_after_value_observed(
             WalletProjectionRowFamily::TransparentSpentOutput,
             TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
             key.as_bytes(),
@@ -1537,7 +1537,7 @@ impl<'store> WalletTransitionPlanner<'store> {
                 reason: "wallet undo address transaction belongs to a different block",
             });
         }
-        self.remove_row(
+        self.remove_row_after_value_observed(
             WalletProjectionRowFamily::TransparentAddressTransaction,
             TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
             key.as_bytes(),
@@ -1719,6 +1719,16 @@ impl<'store> WalletTransitionPlanner<'store> {
                 reason: "wallet transition attempts to overwrite an existing logical row",
             });
         }
+        self.insert_row_after_absence_observed(family, column_family_name, key, encoded_value)
+    }
+
+    fn insert_row_after_absence_observed(
+        &mut self,
+        family: WalletProjectionRowFamily,
+        column_family_name: &'static str,
+        key: &[u8],
+        encoded_value: Vec<u8>,
+    ) -> Result<(), RocksDbWalletError> {
         self.accumulator.append_row(family, key, &encoded_value)?;
         self.accumulator_row_counts = self.accumulator.row_counts();
         self.put_raw(column_family_name, key, encoded_value)
@@ -1741,7 +1751,17 @@ impl<'store> WalletTransitionPlanner<'store> {
                 reason: "wallet transition logical row differs from its expected durable bytes",
             });
         }
-        self.accumulator.remove_row(family, key, expected_value)?;
+        self.remove_row_after_value_observed(family, column_family_name, key, expected_value)
+    }
+
+    fn remove_row_after_value_observed(
+        &mut self,
+        family: WalletProjectionRowFamily,
+        column_family_name: &'static str,
+        key: &[u8],
+        observed_value: &[u8],
+    ) -> Result<(), RocksDbWalletError> {
+        self.accumulator.remove_row(family, key, observed_value)?;
         self.accumulator_row_counts = self.accumulator.row_counts();
         self.delete_raw(column_family_name, key)
     }
