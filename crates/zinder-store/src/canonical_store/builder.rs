@@ -376,9 +376,9 @@ mod tests {
         },
         publication::{encode_live_chain_epoch, encode_live_event},
         rocksdb::{
-            BLOCK_HASH_INDEX_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
-            CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY,
-            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
+            BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
+            CANONICAL_DATA_COLUMN_FAMILIES, CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY,
+            COMPACT_BLOCK_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
         },
     };
     use crate::{
@@ -646,6 +646,53 @@ mod tests {
             replayed_blocks[1].facts().block_header.block_hash,
             BlockHash::from_bytes([2; 32])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_block_range_refuses_missing_interior_payload_or_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (family_name, expected_error) in [
+            (
+                COMPACT_BLOCK_COLUMN_FAMILY,
+                "compact block at height 2 is absent",
+            ),
+            (BLOCK_HEADER_COLUMN_FAMILY, "compact block header is absent"),
+        ] {
+            let temporary = TempDir::new()?;
+            let store_path = temporary.path().join("canonical");
+            let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
+            let range =
+                zinder_core::BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+
+            let before = store.compact_blocks_in_range(range)?;
+            assert_eq!(
+                before
+                    .iter()
+                    .map(|block| block.height.value())
+                    .collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+
+            let family = store
+                .bounded_open
+                .db
+                .cf_handle(family_name)
+                .ok_or("compact-block test family is absent")?;
+            store.bounded_open.db.delete_cf(
+                &family,
+                crate::canonical_store::block_load::encode_block_position(BlockHeight::new(2)),
+            )?;
+
+            let error = store
+                .compact_blocks_in_range(range)
+                .err()
+                .ok_or("an interior compact-block gap must fail closed")?;
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected missing-row error: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -2325,6 +2372,29 @@ mod tests {
         path: &Path,
     ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
         complete_loaded_builder_with_reorg_window(path, 100, BlockHeight::new(2))
+    }
+
+    fn published_loaded_store(
+        path: &Path,
+        build_tip_height: BlockHeight,
+    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+        let builder = complete_loaded_builder_with_reorg_window(path, 100, build_tip_height)?;
+        let settled_height = BlockHeight::new(
+            build_tip_height
+                .value()
+                .checked_sub(1)
+                .ok_or("published test store requires a non-genesis tip")?,
+        );
+        let settled_hash_byte = u8::try_from(settled_height.value())?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(
+                settled_height,
+                BlockHash::from_bytes([settled_hash_byte; 32]),
+            ),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        Ok(validated.publish_baseline(publication)?)
     }
 
     fn complete_loaded_builder_with_reorg_window(

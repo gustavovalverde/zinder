@@ -27,6 +27,7 @@ use super::{
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
 const TRANSACTION_LOCATION_VALUE_BYTES: usize = 40;
+const COMPACT_BLOCK_MULTI_GET_BATCH_SIZE: usize = 1_024;
 
 trait CanonicalServingRead {
     fn serving_open(&self) -> &BoundedRocksDbOpen;
@@ -214,17 +215,73 @@ fn read_compact_blocks_in_range(
     store: &impl CanonicalServingRead,
     range: zinder_core::BlockHeightRange,
 ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-    range
-        .into_iter()
-        .map(|height| {
-            read_compact_block_at(store, height)?.ok_or_else(|| {
+    let mut blocks = Vec::new();
+    let mut heights = Vec::with_capacity(COMPACT_BLOCK_MULTI_GET_BATCH_SIZE);
+    for height in range {
+        heights.push(height);
+        if heights.len() == COMPACT_BLOCK_MULTI_GET_BATCH_SIZE {
+            append_compact_block_batch(store, &heights, &mut blocks)?;
+            heights.clear();
+        }
+    }
+    append_compact_block_batch(store, &heights, &mut blocks)?;
+    Ok(blocks)
+}
+
+fn append_compact_block_batch(
+    store: &impl CanonicalServingRead,
+    heights: &[BlockHeight],
+    blocks: &mut Vec<CompactBlockArtifact>,
+) -> Result<(), CanonicalStoreError> {
+    if heights.is_empty() {
+        return Ok(());
+    }
+    let compact_family = column_family(&store.serving_open().db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let header_family = column_family(&store.serving_open().db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let keys = heights
+        .iter()
+        .copied()
+        .map(encode_block_position)
+        .collect::<Vec<_>>();
+    let compact_rows = store.serving_open().db.batched_multi_get_cf_slice(
+        &compact_family,
+        keys.iter().map(<[u8; 4]>::as_slice),
+        true,
+    );
+    let header_rows = store.serving_open().db.batched_multi_get_cf_slice(
+        &header_family,
+        keys.iter().map(<[u8; 4]>::as_slice),
+        true,
+    );
+
+    for ((height, compact_row), header_row) in
+        heights.iter().copied().zip(compact_rows).zip(header_rows)
+    {
+        let payload_bytes = compact_row
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "compact block read",
+                source,
+            })?
+            .ok_or_else(|| {
                 CanonicalStoreError::publication(format!(
                     "compact block at height {} is absent",
                     height.value()
                 ))
-            })
-        })
-        .collect()
+            })?;
+        let encoded_header = header_row
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "block header read",
+                source,
+            })?
+            .ok_or_else(|| CanonicalStoreError::publication("compact block header is absent"))?;
+        let header = decode_block_header(height, &encoded_header)?;
+        blocks.push(CompactBlockArtifact::new(
+            height,
+            header.block_hash,
+            payload_bytes.to_vec(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_transaction_location(
