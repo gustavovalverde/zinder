@@ -3,8 +3,8 @@
 use std::{io, path::PathBuf};
 
 use thiserror::Error;
+use zinder_bulk_load::BulkLoadError;
 use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis};
-use zinder_rocksdb::BulkLoadError;
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
     ProjectionBuildOwner, WalletCanonicalSourceIdentity, WalletProjectionContractError,

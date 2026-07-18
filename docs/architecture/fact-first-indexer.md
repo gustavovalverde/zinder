@@ -65,7 +65,7 @@ uncertified.
 | One-pass wallet canonical family load | Landed and live-tested | One parse fans into header, hash index, replay, transaction location, compact block, and transaction blobs; a release container loaded one million real testnet blocks in 95.335 seconds while remaining below 100 MiB observed memory |
 | Version-1 wallet row contracts and serial oracle | Landed | 6 query-owned row families, exact durable codecs, deterministic projection evidence, and bounded reorg undo are independent of the storage engine |
 | RocksDB wallet construction | Production loader landed and testnet storage-certified | A fresh identity-scoped version-1 store uses bounded external runs and ordered SST ingestion, moves from `BUILDING` through cold semantic validation to `READY`, and reproduces its exact canonical source fence after a final cold reopen. The full-tip testnet build used zero historical prevout and validation random reads |
-| Shared RocksDB bulk-load mechanics | Landed | `zinder-rocksdb` owns bounded fixed-record runs, capped merge fan-in, strict ordered SST emission, and physical errors without owning a domain schema or publication lifecycle |
+| Shared RocksDB bulk-load mechanics | Landed | `zinder-bulk-load` owns bounded fixed-record runs, capped merge fan-in, strict ordered SST emission, and physical errors without owning a domain schema or publication lifecycle |
 | Production wallet bulk loader | RocksDB landed; PostgreSQL pending | Shared fixed- and variable-record runs, capped merge fan-in, wallet outpoint reduction, six-family SST ingestion, and bounded cold validation are implemented and full-tip tested. PostgreSQL still needs its concrete `COPY`, native join, and index-build path |
 | `postgres-scale-out` runtime composition | Not implemented | No production schema ownership, TLS, fencing, replica reads, failover, or readiness contract |
 | Complete lifecycle certification | RocksDB storage construction and append-only service following passed on testnet | Full fixed-tip canonical and wallet construction passed under an exact Docker resource envelope. A separate real-service tracer proved checkpointed construction, append-only following, source recovery, and restart. Query serving, restore, reorg, client parity, mainnet, Railway, and the PostgreSQL topology remain open |
@@ -261,7 +261,7 @@ workload's direct and reverse-index families. Height- and position-ordered
 families rotate bounded SST files directly; the two random-key indexes use
 bounded fixed-record sort runs with a capped merge fan-in, so raw transaction
 and block payloads never enter the sort. The RocksDB-specific run and SST
-mechanics live in `zinder-rocksdb`; canonical key codecs, family assignment,
+mechanics live in `zinder-bulk-load`; canonical key codecs, family assignment,
 ingestion, and readiness remain in `zinder-store`. Every family is staged
 before RocksDB ingestion begins, and the store remains `BUILDING` throughout,
 so a partial ingestion is never servable.

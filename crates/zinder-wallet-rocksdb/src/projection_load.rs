@@ -8,15 +8,15 @@ use std::{
 };
 
 use rust_rocksdb::Options;
+use zinder_bulk_load::{
+    OrderedSstWriter, SortedVariableValues, SstFileSet, VariableValueSortEvidence,
+    VariableValueSorter,
+};
 use zinder_core::wire::UtxoSetCommitmentElement;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion, Network,
     TransactionId, TransparentUtxoSetCommitment, ValidatedCanonicalBlockReplay,
-};
-use zinder_rocksdb::{
-    OrderedSstWriter, SortedVariableValues, SstFileSet, VariableValueSortEvidence,
-    VariableValueSorter,
 };
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
@@ -975,6 +975,7 @@ mod tests {
     use std::{error::Error, path::Path};
 
     use tempfile::TempDir;
+    use zinder_bulk_load::BulkLoadError;
     use zinder_core::{
         BlockHeaderArtifact, CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
         CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts, LockTime, PrivacyShape,
@@ -983,7 +984,6 @@ mod tests {
         TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
         decode_canonical_block_replay, encode_canonical_block_replay,
     };
-    use zinder_rocksdb::BulkLoadError;
     use zinder_wallet_projection::WalletProjectionSerialOracle;
 
     use super::*;

@@ -8,7 +8,7 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use zinder_rocksdb::{SortedVariableValues, VariableValueSortEvidence, VariableValueSorter};
+use zinder_bulk_load::{SortedVariableValues, VariableValueSortEvidence, VariableValueSorter};
 
 use rust_rocksdb::{
     BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
@@ -2229,7 +2229,7 @@ fn validate_address_transaction_rows(
 fn validate_expected_address_transaction<I, Key, Value>(
     rows: &mut I,
     digest: &mut WalletProjectionDigestBuilder,
-    expected: &zinder_rocksdb::VariableValueRecord<ADDRESS_TRANSACTION_KEY_BYTES>,
+    expected: &zinder_bulk_load::VariableValueRecord<ADDRESS_TRANSACTION_KEY_BYTES>,
     count: &mut u64,
 ) -> Result<(), RocksDbWalletError>
 where

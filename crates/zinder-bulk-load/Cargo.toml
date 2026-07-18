@@ -1,7 +1,7 @@
 [package]
-name = "zinder-rocksdb"
+name = "zinder-bulk-load"
 version = "0.1.0"
-description = "Shared RocksDB infrastructure for Zinder storage engines"
+description = "Bulk-load and SST mechanics shared by Zinder storage engines"
 edition.workspace = true
 readme = "../../README.md"
 keywords = ["zcash", "indexer", "rocksdb"]

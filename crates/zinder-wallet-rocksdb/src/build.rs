@@ -7,11 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use zinder_bulk_load::VariableValueSortEvidence;
 use zinder_core::{
     BlockId, CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, Network,
     UnixTimestampMillis,
 };
-use zinder_rocksdb::VariableValueSortEvidence;
 use zinder_store::{
     CanonicalReplayScan, CanonicalStoreError, CanonicalStoreReadyEvidence,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,

@@ -5677,16 +5677,26 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "zinder-bulk-load",
  "zinder-core",
  "zinder-derive",
  "zinder-ingest",
  "zinder-proto",
- "zinder-rocksdb",
  "zinder-source",
  "zinder-store",
  "zinder-testkit",
  "zinder-wallet-projection",
  "zinder-wallet-rocksdb",
+]
+
+[[package]]
+name = "zinder-bulk-load"
+version = "0.1.0"
+dependencies = [
+ "rust-rocksdb",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5971,16 +5981,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zinder-rocksdb"
-version = "0.1.0"
-dependencies = [
- "rust-rocksdb",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "zinder-runtime"
 version = "0.1.0"
 dependencies = [
@@ -6073,9 +6073,9 @@ dependencies = [
  "tonic",
  "tonic-types",
  "tracing",
+ "zinder-bulk-load",
  "zinder-core",
  "zinder-proto",
- "zinder-rocksdb",
 ]
 
 [[package]]
@@ -6129,9 +6129,9 @@ dependencies = [
  "rust-rocksdb",
  "tempfile",
  "thiserror 2.0.18",
+ "zinder-bulk-load",
  "zinder-core",
  "zinder-proto",
- "zinder-rocksdb",
  "zinder-store",
  "zinder-wallet-projection",
 ]

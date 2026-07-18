@@ -884,33 +884,33 @@ impl CanonicalStoreError {
     }
 }
 
-impl From<zinder_rocksdb::BulkLoadError> for CanonicalStoreError {
-    fn from(source: zinder_rocksdb::BulkLoadError) -> Self {
+impl From<zinder_bulk_load::BulkLoadError> for CanonicalStoreError {
+    fn from(source: zinder_bulk_load::BulkLoadError) -> Self {
         match source {
-            zinder_rocksdb::BulkLoadError::InvalidInput { reason } => {
+            zinder_bulk_load::BulkLoadError::InvalidInput { reason } => {
                 Self::block_load_sequence(reason)
             }
-            zinder_rocksdb::BulkLoadError::AccountedMemoryLimit {
+            zinder_bulk_load::BulkLoadError::AccountedMemoryLimit {
                 limit_bytes,
                 required_bytes,
             } => Self::block_load_sequence(format!(
                 "bulk-load records require {required_bytes} accounted bytes, limit is {limit_bytes}"
             )),
-            zinder_rocksdb::BulkLoadError::TemporaryFileLimit {
+            zinder_bulk_load::BulkLoadError::TemporaryFileLimit {
                 limit_bytes,
                 required_bytes,
             } => Self::block_load_sequence(format!(
                 "bulk-load runs require {required_bytes} temporary bytes, limit is {limit_bytes}"
             )),
-            zinder_rocksdb::BulkLoadError::MemoryAllocation { operation, source } => {
+            zinder_bulk_load::BulkLoadError::MemoryAllocation { operation, source } => {
                 Self::block_load_sequence(format!(
                     "bulk-load {operation} allocation failed: {source}"
                 ))
             }
-            zinder_rocksdb::BulkLoadError::PathUnavailable { path, source } => {
+            zinder_bulk_load::BulkLoadError::PathUnavailable { path, source } => {
                 Self::PathUnavailable { path, source }
             }
-            zinder_rocksdb::BulkLoadError::RocksDbOperation { operation, source } => {
+            zinder_bulk_load::BulkLoadError::RocksDbOperation { operation, source } => {
                 Self::RocksDbOperation { operation, source }
             }
         }

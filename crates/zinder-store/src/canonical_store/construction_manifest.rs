@@ -14,10 +14,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zinder_core::{BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier, ShieldedProtocol};
-use zinder_rocksdb::{
+use zinder_bulk_load::{
     OrderedKeyValueEvidence, OrderedKeyValueEvidenceAccumulator, SstFileEvidence,
 };
+use zinder_core::{BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier, ShieldedProtocol};
 
 use super::{
     CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,

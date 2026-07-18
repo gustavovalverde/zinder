@@ -694,7 +694,7 @@ fn wallet_phase_durations(report: &RocksDbWalletBuildReport) -> WalletStoragePha
 }
 
 fn variable_value_sort_evidence(
-    evidence: zinder_rocksdb::VariableValueSortEvidence,
+    evidence: zinder_bulk_load::VariableValueSortEvidence,
 ) -> WalletVariableValueSortEvidence {
     WalletVariableValueSortEvidence {
         record_count: evidence.record_count,

@@ -1,4 +1,4 @@
-//! RocksDB-specific infrastructure shared by Zinder storage engines.
+//! Bulk-loading and SST mechanics shared by Zinder storage engines.
 //!
 //! This crate owns physical bulk-loading mechanics, not domain schemas,
 //! publication state, source fences, or cross-engine storage abstractions.
