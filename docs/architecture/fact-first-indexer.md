@@ -547,8 +547,9 @@ fact-first throughput evidence.
 
 In the target architecture, `zinder-explorer` remains a reader and API service
 rather than becoming another indexer, while `zinder-ingest` remains
-source-to-canonical only. An independent `zinder-projector` process will own
-build, verify, catch-up, follow, and promotion for one selected projection.
+source-to-canonical only. Wallet-store construction, following, and promotion belong to
+`zinder-projector`; each explorer projection owns its own build, verify,
+catch-up, follow, and promotion process, independent of `zinder-projector`.
 `rocksdb-single-host` may colocate these processes on one host; a certified
 `postgres-scale-out` composition will preserve independent role credentials
 and deployment boundaries. Both contracts retain explicit readiness and
@@ -558,7 +559,7 @@ restart ownership.
 
 | Consumer | Canonical or live data | Wallet projection data | Explorer projection or external data |
 | --- | --- | --- | --- |
-| Zally native adapter | visible and safe tips, compact blocks, tree state, subtree roots, transaction status, chain events, mempool, and broadcast | transparent unspent outputs | none |
+| Zally native adapter | visible_tip and settled_tip, compact blocks, tree state, subtree roots, transaction status, chain events, mempool, and broadcast | transparent unspent outputs | none |
 | lightwalletd compatibility | latest block, compact block ranges, transaction bytes and status, tree state, subtree roots, mempool, server info, and broadcast | transparent address transaction ids, balances, and UTXOs | none |
 | Zexplorer | chain freshness, block identity, transaction facts, raw blobs when enabled, chain and mempool events | transparent balance, UTXOs, spent-output enrichment, and address activity | summaries, recent history, search indexes, fees, value pools, rankings, production, migration, reorg, and other analytics |
 | Cipherscan compatibility | chain info, blocks, transactions, raw bytes when enabled, mempool, broadcast, and freshness | address detail and transparent enrichment | rankings, mining and pool analytics, privacy and cross-chain aggregates; market prices, labels, names, and product formulas remain adapter or Cipherscan-owned |

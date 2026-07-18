@@ -262,7 +262,9 @@ available, so there is no in-place migration.
 
 RocksDB checkpoints remain valid for fixtures and offline diagnostics, but the
 legacy ingest backup command is deleted. It could not atomically authenticate
-the independent canonical schema-v4 and wallet schema-v1 stores. Production
+the independent canonical schema-v4 and wallet schema-v1 stores (these
+storage-identity generations are a separate axis from the store schema and
+artifact schema counters described above). Production
 restore requires one coherent bundle carrying the exact canonical event fence
 and wallet digest; until that implementation and its restore-time gate pass,
 no checkpoint is admitted as a production backup.

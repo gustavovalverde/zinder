@@ -51,7 +51,9 @@ its benchmarks preserve these ownership rules but do not create a production
 migration commitment. [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
 owns that boundary.
 
-`zinder-ingest` opens the canonical schema-v4 RocksDB store as its only primary.
+`zinder-ingest` opens the canonical schema-v4 RocksDB store as its only primary
+(schema-v4 is the storage-identity generation, a separate axis from the
+RocksDB store-schema migration counter `public-interfaces.md` documents).
 `zinder-projector` opens a canonical secondary and the wallet schema-v1 store
 as its only primary. `zinder-compat-lightwalletd` opens both stores as
 generation-specific secondaries, catches them up, validates their authenticated

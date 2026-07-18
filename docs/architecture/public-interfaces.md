@@ -36,6 +36,7 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 |------|---------|
 | `Zinder` | The product |
 | `zinder-ingest` | Production service that owns chain ingestion and canonical writes |
+| `zinder-projector` | Production service that owns wallet-store construction, following, and reconciliation |
 | `zinder-query` | Internal Rust library that defines wallet query types, adapters, and error mapping for compatibility serving |
 | `zinder-compat-lightwalletd` | Compatibility adapter that serves vendored lightwalletd gRPC over `WalletQueryApi` |
 | `zinder-explorer` | Optional service for explorer-shaped reads and replayable derived indexes ([ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md)) |
@@ -83,7 +84,9 @@ The four chain heights share one naming axis so the reorg-vs-replay distinction 
 | `NetworkUpgradeActivation` | One entry in a `NetworkUpgradeActivations` table: `{ branch_id: u32, activation_height: BlockHeight, name: String }`, name carried verbatim from `getblockchaininfo.upgrades` |
 
 The current canonical admission floor is store schema 14 and artifact schema
-19. An older volume fails closed at open and requires a fresh rebuild or, when
+19 (the RocksDB store-schema migration counter, a separate axis from the
+storage-identity generation `service-boundaries.md` calls schema-v4). An
+older volume fails closed at open and requires a fresh rebuild or, when
 available, a separately certified snapshot; primary open does not create the
 missing replay column family in an existing store.
 

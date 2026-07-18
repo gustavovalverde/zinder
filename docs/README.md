@@ -66,6 +66,9 @@ This documentation set defines Zinder's product scope, integration contracts, se
 - [ADR-0030: Compatible canonical artifact enrichment](adrs/0030-compatible-canonical-artifact-enrichment.md)
 - [ADR-0031: Projection checkpoints and backfill coverage](adrs/0031-projection-checkpoints-and-backfill-coverage.md)
 - [ADR-0032: Writer-owned displaced-block archive](adrs/0032-writer-owned-displaced-block-archive.md)
+- [ADR-0033: Time-indexed block production](adrs/0033-time-indexed-block-production.md)
+- [ADR-0034: Exclusive index-build stages and block-local spend replay](adrs/0034-exclusive-index-build-stages-and-block-local-spend-replay.md)
+- [ADR-0035: Fact-first storage topologies and lifecycle targets](adrs/0035-fact-first-storage-selection-and-lifecycle.md)
 
 ## Reference
 
