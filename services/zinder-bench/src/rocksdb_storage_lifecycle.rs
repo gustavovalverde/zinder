@@ -247,7 +247,9 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         canonical_load.builder.is_source_tip_checkpoint_confirmed();
 
     let canonical_cold_validation_started = Instant::now();
-    let validated_canonical = canonical_load.builder.validate_for_publication()?;
+    let validated_canonical = canonical_load
+        .builder
+        .prepare_cold_certified_publication()?;
     let canonical_cold_validation = canonical_cold_validation_started.elapsed();
 
     let canonical_ready_publication_started = Instant::now();

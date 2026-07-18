@@ -420,6 +420,7 @@ fn replay_measurements(
         replay_plan_fixture_manifest_sha256: measured.outcome.fixture_manifest_digest_sha256,
         replay_plan_digest_sha256: measured.outcome.replay_plan_digest_sha256,
         resource_limits: resource_limits(validated, measured.resource_budget),
+        publication_proof_provenance: "trusted-fresh-writer",
         total_seconds: measured.total_seconds,
         source_load,
         canonical_ready,

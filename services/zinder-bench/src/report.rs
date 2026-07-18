@@ -607,7 +607,7 @@ pub struct CanonicalProhibitedReadSummary {
 
 /// Aggregated cache-bypassing publication scan evidence for one canonical family.
 #[derive(Clone, Debug, Serialize)]
-pub struct CanonicalColdFamilyScanStat {
+pub struct CanonicalPublicationFamilyScanStat {
     /// Canonical column family scanned.
     pub family: String,
     /// Number of complete successful scans.
@@ -1153,6 +1153,8 @@ pub struct RocksDbCanonicalFixtureReplayMeasurements {
     pub replay_plan_digest_sha256: String,
     /// Exact effective resource limits.
     pub resource_limits: RocksDbCanonicalFixtureReplayResourceLimits,
+    /// Publication-proof producer used by the fresh canonical build.
+    pub publication_proof_provenance: &'static str,
     /// Complete measured lifecycle seconds.
     pub total_seconds: f64,
     /// Block/SST/count evidence from the real canonical loader.
@@ -1188,6 +1190,8 @@ pub struct RocksDbCanonicalFixtureReplayReport {
     pub storage_candidate: StorageCandidateIdentity,
     /// Exact effective resource limits.
     pub resource_limits: RocksDbCanonicalFixtureReplayResourceLimits,
+    /// Publication-proof producer used by the fresh canonical build.
+    pub publication_proof_provenance: String,
     /// Complete measured lifecycle seconds.
     pub total_seconds: f64,
     /// End-to-end loaded blocks per second.
@@ -1202,8 +1206,8 @@ pub struct RocksDbCanonicalFixtureReplayReport {
     pub source_fetch_attribution: Option<SourceFetchAttributionSummary>,
     /// Required zero-read evidence for the fact-first construction boundary.
     pub prohibited_reads: Option<CanonicalProhibitedReadSummary>,
-    /// Complete cold publication scans grouped by canonical family.
-    pub cold_family_scans: Vec<CanonicalColdFamilyScanStat>,
+    /// Full publication scans grouped by canonical family; empty for trusted fresh-writer proof.
+    pub publication_family_scans: Vec<CanonicalPublicationFamilyScanStat>,
     /// Per-stage bulk-pipeline head-of-line wait totals.
     pub head_of_line_wait: Vec<StageWaitStat>,
     /// Per-substage block preparation and canonical construction timing.
@@ -1817,7 +1821,10 @@ impl RocksDbCanonicalFixtureReplayReport {
             self.source_fetch_attribution,
         )?;
         validate_canonical_fixture_prohibited_reads(self.prohibited_reads)?;
-        validate_canonical_fixture_cold_family_scans(&self.cold_family_scans)
+        validate_canonical_fixture_publication_family_scans(
+            &self.publication_proof_provenance,
+            &self.publication_family_scans,
+        )
     }
 }
 
@@ -1836,12 +1843,21 @@ fn validate_canonical_fixture_prohibited_reads(
     Ok(())
 }
 
-fn validate_canonical_fixture_cold_family_scans(
-    scans: &[CanonicalColdFamilyScanStat],
+fn validate_canonical_fixture_publication_family_scans(
+    proof_provenance: &str,
+    scans: &[CanonicalPublicationFamilyScanStat],
 ) -> Result<(), BenchError> {
-    if scans.is_empty() {
-        return Err(BenchError::acceptance_telemetry_missing(
-            "cold_family_scans",
+    if proof_provenance == "trusted-fresh-writer" {
+        if scans.is_empty() {
+            return Ok(());
+        }
+        return Err(BenchError::acceptance_completion_mismatch(
+            "trusted fresh-writer publication unexpectedly performed full family scans",
+        ));
+    }
+    if proof_provenance != "cold-certification" || scans.is_empty() {
+        return Err(BenchError::acceptance_completion_mismatch(
+            "canonical fixture replay publication proof provenance is invalid",
         ));
     }
     if scans.iter().any(|scan| {
@@ -1851,7 +1867,7 @@ fn validate_canonical_fixture_cold_family_scans(
             || scan.scan_seconds < 0.0
     }) {
         return Err(BenchError::acceptance_completion_mismatch(
-            "canonical fixture replay cold-family scan attribution is invalid",
+            "canonical fixture replay publication-family scan attribution is invalid",
         ));
     }
     Ok(())
@@ -2270,6 +2286,7 @@ pub fn build_rocksdb_canonical_fixture_replay_report(
         replay_plan_digest_sha256: measurements.replay_plan_digest_sha256,
         storage_candidate: StorageCandidateIdentity::rocksdb_canonical_fixture_replay(),
         resource_limits: measurements.resource_limits,
+        publication_proof_provenance: measurements.publication_proof_provenance.to_owned(),
         total_seconds: measurements.total_seconds,
         blocks_per_second,
         source_load: measurements.source_load,
@@ -2280,7 +2297,7 @@ pub fn build_rocksdb_canonical_fixture_replay_report(
             measurements.total_seconds,
         ),
         prohibited_reads: aggregate_canonical_prohibited_reads(&samples),
-        cold_family_scans: aggregate_canonical_cold_family_scans(&samples),
+        publication_family_scans: aggregate_canonical_publication_family_scans(&samples),
         head_of_line_wait: aggregate_head_of_line_wait(&samples),
         stage_durations: aggregate_stage_durations(&samples),
         benchmark_client_peak_rss: measurements.benchmark_client_peak_rss,
@@ -2910,9 +2927,9 @@ fn aggregate_canonical_prohibited_reads(
     })
 }
 
-fn aggregate_canonical_cold_family_scans(
+fn aggregate_canonical_publication_family_scans(
     samples: &[MetricSample],
-) -> Vec<CanonicalColdFamilyScanStat> {
+) -> Vec<CanonicalPublicationFamilyScanStat> {
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut seconds: BTreeMap<String, f64> = BTreeMap::new();
     let mut rows: BTreeMap<String, u64> = BTreeMap::new();
@@ -2944,7 +2961,7 @@ fn aggregate_canonical_cold_family_scans(
     }
     counts
         .into_iter()
-        .map(|(family, scan_count)| CanonicalColdFamilyScanStat {
+        .map(|(family, scan_count)| CanonicalPublicationFamilyScanStat {
             scan_seconds: seconds.get(&family).copied().unwrap_or(0.0),
             row_count: rows.get(&family).copied().unwrap_or(0),
             logical_bytes: logical_bytes.get(&family).copied().unwrap_or(0),
@@ -3257,18 +3274,15 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
             .ok_or("prohibited read telemetry must be present")?;
         assert_eq!(prohibited.historical_prevout_read_count, 0);
         assert_eq!(prohibited.cross_block_wallet_read_count, 0);
-        assert_eq!(inner.cold_family_scans.len(), 1);
-        assert_eq!(inner.cold_family_scans[0].family, "block_replay");
-        assert_eq!(inner.cold_family_scans[0].scan_count, 1);
-        assert_eq!(inner.cold_family_scans[0].row_count, 10);
-        assert_eq!(inner.cold_family_scans[0].logical_bytes, 5_000);
+        assert_eq!(inner.publication_proof_provenance, "trusted-fresh-writer");
+        assert!(inner.publication_family_scans.is_empty());
         assert_eq!(inner.head_of_line_wait.len(), 1);
         assert_eq!(inner.stage_durations.len(), 1);
         Ok(())
     }
 
     #[test]
-    fn rocksdb_canonical_fixture_report_requires_zero_prohibited_reads_and_cold_scans()
+    fn rocksdb_canonical_fixture_report_requires_zero_prohibited_reads_and_exact_provenance()
     -> Result<(), Box<dyn std::error::Error>> {
         let missing = build_rocksdb_canonical_fixture_replay_report(
             fixture_summary(),
@@ -3295,6 +3309,38 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
             .ok_or("prohibited read telemetry must be present")?
             .historical_prevout_read_count = 1;
         assert!(nonzero.validate().is_err());
+
+        let mut unexpected_scan = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut unexpected_scan
+        else {
+            return Err("expected canonical fixture replay report".into());
+        };
+        inner
+            .publication_family_scans
+            .push(CanonicalPublicationFamilyScanStat {
+                family: "block_replay".to_owned(),
+                scan_count: 1,
+                scan_seconds: 0.1,
+                row_count: 10,
+                logical_bytes: 5_000,
+            });
+        assert!(unexpected_scan.validate().is_err());
+
+        let mut unknown_provenance = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut unknown_provenance
+        else {
+            return Err("expected canonical fixture replay report".into());
+        };
+        inner.publication_proof_provenance = "unknown".to_owned();
+        assert!(unknown_provenance.validate().is_err());
         Ok(())
     }
 
@@ -3633,6 +3679,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                     zinder_store::RocksDbResourceBudget::canonical_writer_defaults(),
                 ),
             },
+            publication_proof_provenance: "trusted-fresh-writer",
             total_seconds: 10.0,
             source_load: RocksDbCanonicalFixtureSourceLoadSummary {
                 first_block: first_block.clone(),
@@ -3715,11 +3762,7 @@ zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum{stage=\"source_fetch\"
 zinder_ingest_canonical_block_construction_stage_duration_seconds_count{stage=\"block_parse\",status=\"ok\"} 10\n\
 zinder_ingest_canonical_block_construction_stage_duration_seconds_sum{stage=\"block_parse\",status=\"ok\"} 1.5\n\
 zinder_ingest_canonical_historical_prevout_reads_total 0\n\
-zinder_ingest_canonical_cross_block_wallet_reads_total 0\n\
-zinder_store_canonical_publication_family_scan_duration_seconds_count{family=\"block_replay\"} 1\n\
-zinder_store_canonical_publication_family_scan_duration_seconds_sum{family=\"block_replay\"} 0.25\n\
-zinder_store_canonical_publication_family_scan_rows_total{family=\"block_replay\"} 10\n\
-zinder_store_canonical_publication_family_scan_logical_bytes_total{family=\"block_replay\"} 5000\n"
+zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
     }
 
     fn fixture_summary() -> FixtureSummary {

@@ -461,9 +461,10 @@ component diagnostics in the external resource artifacts.
 - Canonical-fixture `prohibited_reads`: explicit counters for historical
   prevout and cross-block wallet reads. Both metric series must be present and
   zero; missing telemetry fails report validation.
-- Canonical-fixture `cold_family_scans`: successful cache-bypassing publication
-  scans grouped by column family, with scan count, wall time, rows, and logical
-  key-and-value bytes. Missing scan telemetry fails report validation.
+- Canonical-fixture `publication_proof_provenance` records either
+  `trusted-fresh-writer` or `cold-certification`. `publication_family_scans`
+  must be empty for the trusted fresh-writer path and must contain successful
+  cache-bypassing scans grouped by column family for cold certification.
 - `replay.starting_canonical_state`: the opened store's `chain_epoch_id`, tip
   height, RPC-order tip hash, artifact schema version, checkpoint-manifest
   SHA-256, and `empty`, `checkpoint`, or `unverified-clone` provenance kind.

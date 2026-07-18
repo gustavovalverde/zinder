@@ -523,7 +523,7 @@ fn publish_canonical_fixture(
     builder: RocksDbCanonicalBuilder,
     settled_tip: BlockId,
 ) -> Result<PublishedCanonicalFixtureEvidence, BenchError> {
-    let validated = builder.validate_for_publication()?;
+    let validated = builder.prepare_trusted_fresh_publication()?;
     let prepared_publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         settled_tip,
         UnixTimestampMillis::now(),
