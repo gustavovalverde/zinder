@@ -139,6 +139,23 @@ impl WalletBuildLeaseHeartbeat {
     }
 }
 
+fn default_build_lease_heartbeat(
+    now: UnixTimestampMillis,
+    current_expires_at: UnixTimestampMillis,
+) -> WalletBuildLeaseHeartbeat {
+    let desired_expires_at = now
+        .value()
+        .saturating_add(DEFAULT_BUILD_LEASE_DURATION_MILLIS);
+    let renew_until = UnixTimestampMillis::new(
+        desired_expires_at.max(current_expires_at.value().saturating_add(1)),
+    );
+    if renew_until <= current_expires_at {
+        WalletBuildLeaseHeartbeat::at(now)
+    } else {
+        WalletBuildLeaseHeartbeat::renew(now, renew_until)
+    }
+}
+
 impl WalletProjectionReplaySource for RocksDbCanonicalStore {
     fn wallet_projection_network(&self) -> zinder_core::Network {
         self.network()
@@ -470,17 +487,10 @@ pub fn build_wallet_from_canonical_with_lease<Source>(
 where
     Source: WalletProjectionReplaySource + ?Sized,
 {
-    let mut default_heartbeat =
-        |_: WalletBuildLeasePhase, _: zinder_wallet_projection::ProjectionBuildLease| {
-            let now = UnixTimestampMillis::now();
-            Ok(WalletBuildLeaseHeartbeat::renew(
-                now,
-                UnixTimestampMillis::new(
-                    now.value()
-                        .saturating_add(DEFAULT_BUILD_LEASE_DURATION_MILLIS),
-                ),
-            ))
-        };
+    let mut default_heartbeat = |_: WalletBuildLeasePhase, lease: ProjectionBuildLease| {
+        let now = UnixTimestampMillis::now();
+        Ok(default_build_lease_heartbeat(now, lease.expires_at()))
+    };
     build_wallet_from_canonical_with_lease_and_heartbeat(
         canonical_store,
         wallet_path,
@@ -819,6 +829,21 @@ impl Drop for FreshWalletProjectionStaging {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_heartbeat_strictly_extends_an_equal_expiry() {
+        let now = UnixTimestampMillis::new(10);
+        let current_expires_at = UnixTimestampMillis::new(
+            now.value()
+                .saturating_add(DEFAULT_BUILD_LEASE_DURATION_MILLIS),
+        );
+        let expected_expires_at = UnixTimestampMillis::new(current_expires_at.value() + 1);
+
+        assert_eq!(
+            default_build_lease_heartbeat(now, current_expires_at),
+            WalletBuildLeaseHeartbeat::renew(now, expected_expires_at)
+        );
+    }
 
     #[test]
     fn projection_staging_path_is_a_sibling_for_trailing_separators() {
