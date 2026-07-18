@@ -165,8 +165,6 @@ Implemented baseline metrics:
 | `zinder_ingest_projection_write_operations_total` | counter | `zinder-ingest` | Successful write-batch operations attributed to stable projection identity and chain- or mempool-event source. Cursor operations are included because they commit in the same atomic batch. |
 | `zinder_ingest_projection_write_bytes_total` | counter | `zinder-ingest` | Serialized successful write-batch bytes attributed to stable projection identity and event source. |
 | `zinder_ingest_projection_dispatch_duration_seconds` | histogram | `zinder-ingest` | Time spent applying one event and staging rows by stable projection identity and event source. |
-| `zinder_ingest_projection_startup_recovery_duration_seconds` | histogram | `zinder-ingest` | Total selected startup recovery duration attributed to each active projection identity and final status. Shared replay is intentionally visible on every selected projection because startup does not report success until the selected set reaches the handoff boundary. |
-| `zinder_ingest_projection_startup_recovery_total` | counter | `zinder-ingest` | Startup recovery attempts by selected projection identity and final status. |
 | `zinder_ingest_canonical_lag_blocks` | gauge | `zinder-ingest` | Chain-catchup lag between the upstream tip and the canonical writer tip, saturating at zero. Distinct from `zinder_ingest_derive_replay_lag_blocks`, which measures derive-vs-canonical freshness, not chain catchup. |
 | `zinder_ingest_derive_replay_budget_state` | gauge | `zinder-ingest` | Current derive replay memory-budget state by state label: `normal`, `degraded`, or `paused`. |
 | `zinder_ingest_derive_replay_effective_batch_blocks` | gauge | `zinder-ingest` | Effective replay batch size after memory degradation. |
@@ -228,7 +226,6 @@ Implemented baseline metrics:
 | `zinder_mempool_hydration_failures_total` | counter | `zinder-source` | Mempool `Added` observations the source could not hydrate by reason (transient JSON-RPC failure, payload too large, unknown txid races). |
 | `zinder_mempool_source_errors_total` | counter | `zinder-source` | Mempool source error items by kind (`stream_item`, `connect`); a non-zero rate is the input signal for `mempool_source_unavailable` readiness. |
 | `zinder_mempool_events_pruned_total` | counter | `zinder-store` | Mempool events pruned by the retention worker by kind (`added`, `invalidated`, `mined`); the cumulative health signal for two-tier retention. |
-| `zinder_mempool_event_retention_oldest_age_seconds` | gauge | `zinder-store` | Age of the oldest retained mempool event in seconds; together with the per-variant retention windows in [ADR-0007](../adrs/0007-mempool-topology-and-retention.md), drives `mempool_cursor_at_risk` readiness. |
 | `zinder_mempool_event_retention_oldest_sequence` | gauge | `zinder-store` | Oldest retained mempool-event sequence number; cursor consumers below this floor receive `MempoolCursorExpired`. |
 | `zinder_mempool_snapshot_age_seconds` | gauge | `zinder-ingest` | Wall-clock age of the most recent `WalletQuery.MempoolSnapshot` response; published by the ingest control adapter for clients deciding whether to fall through to `MempoolEvents`. |
 
@@ -265,7 +262,6 @@ P95, P99, and worst-case values before updating performance-budget tables.
   `zinder_mempool_source_errors_total`,
   `zinder_mempool_hydration_failures_total`,
   `zinder_mempool_events_pruned_total`,
-  `zinder_mempool_event_retention_oldest_age_seconds`,
   `zinder_mempool_event_retention_oldest_sequence`, and
   `zinder_mempool_snapshot_age_seconds`. These drive the
   `mempool_source_unavailable`, `mempool_hydration_lagging`, and

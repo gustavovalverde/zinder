@@ -64,13 +64,13 @@ The defaults are calibrated for two distinct consumer expectations:
 - A wallet that comes back online after a brief disconnect (minutes) must be able to resume the stream and see the `Mined` event for the transaction it broadcast. 60 minutes covers normal mobile-wallet reconnect behavior plus margin.
 - A wallet that wants to detect "my submitted transaction was rejected by the network" needs `Invalidated` events to outlive a typical user-driven retry cadence. 24 hours covers the case where a user submits, closes the app, returns the next morning, and expects to see whether the transaction is still pending or has been evicted.
 
-`spawn_mempool_event_retention_task` runs the pruner. It emits three readiness causes:
+`run_mempool_retention` runs the pruner. Its retention state feeds three readiness causes:
 
-- `MempoolCursorAtRisk { oldest_age_seconds, oldest_sequence }` when the oldest retained sequence is approaching its window. The threshold is configurable; the default is to flip when 80 % of the shorter window has elapsed.
+- `MempoolCursorAtRisk { oldest_retained_age_minutes, retention_minutes }` when the oldest retained event is approaching its window. The threshold is configurable; the default is to flip when 80 % of the shorter window has elapsed.
 - `MempoolSourceUnavailable` when the source stream emits `MempoolStreamUnavailable { is_retryable: false }` or when the source has been down longer than the source-availability threshold.
-- `MempoolHydrationLagging { hydration_lag_seconds }` when `getrawtransaction` hydration falls behind the source's `Added` emission rate beyond the lag threshold.
+- `MempoolHydrationLagging { recent_hydration_failures }` when `getrawtransaction` hydration falls behind the source's `Added` emission rate beyond the lag threshold.
 
-These three causes are documented in [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness). The corresponding metrics (`zinder_mempool_events_pruned_total`, `zinder_mempool_event_retention_oldest_age_seconds`, `zinder_mempool_event_retention_oldest_sequence`, `zinder_mempool_snapshot_age_seconds`) are documented in the [Metrics table](../architecture/service-operations.md#metrics).
+These three causes are documented in [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness). The corresponding metrics (`zinder_mempool_events_pruned_total`, `zinder_mempool_event_retention_oldest_sequence`, `zinder_mempool_snapshot_age_seconds`) are documented in the [Metrics table](../architecture/service-operations.md#metrics).
 
 Cursor expiration on read is a hard stop, not a warning. A consumer whose `from_cursor` is below `oldest_retained_mempool_event_sequence` receives `MempoolCursorExpired` carrying the current floor, mapped to gRPC `FailedPrecondition` with a `PreconditionFailure` detail. The consumer must resnapshot, not retry the same cursor.
 

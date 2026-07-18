@@ -4,6 +4,10 @@
 
 Accepted.
 
+## Revision history
+
+- The unified ingest loop this ADR designed now lives in the canonical writer runtime described by [ADR-0035](0035-fact-first-storage-selection-and-lifecycle.md) (`services/zinder-ingest/src/writer/`). `classify_phase` remains as designed, in `services/zinder-ingest/src/phase.rs`, read by `main.rs`'s probe diagnostic and by `loop_config.rs`'s `HistoricalWorkGate`.
+
 ## Context
 
 Operators starting `zinder-ingest tip-follow` against an empty store on
@@ -490,7 +494,7 @@ afterwards.
 
 Loop module:
 
-- New module `services/zinder-ingest/src/ingest_loop.rs` with
+- New module `services/zinder-ingest/src/phase.rs` with
   `classify_phase`, the three phase handlers (`AwaitingUpstream`,
   `BulkCatchup`, `FollowingTip`), and the spawn-once gates for the
   mempool orchestrator, retention worker, and chain-tip notification
