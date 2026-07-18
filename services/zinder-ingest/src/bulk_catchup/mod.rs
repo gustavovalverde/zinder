@@ -1590,7 +1590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_fetch_refetches_future_ranges_after_ordered_response_split()
+    async fn source_fetch_retains_disjoint_future_ranges_after_ordered_response_split()
     -> Result<(), Box<dyn Error>> {
         let requested_segments = Arc::new(Mutex::new(Vec::new()));
         let completed_segments = Arc::new(Mutex::new(Vec::new()));
@@ -1606,8 +1606,8 @@ mod tests {
             BlockHeight::new(1),
         )));
         // Make the initial admission use the normal steady-state prefetch path.
-        // The head response below is deliberately denser and must re-plan all
-        // un-emitted ranges at one block each.
+        // The head response below is deliberately denser and splits upstream,
+        // but its already-admitted disjoint future ranges remain valid.
         source_segment_sizer.lock().record_segment(
             BlockHeight::new(1),
             SourceChainSegmentStats::from_response_payload_bytes(4 * 1024 * 1024)
@@ -1646,14 +1646,31 @@ mod tests {
 
         assert_eq!(observed_heights, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let requested_segments = requested_segments.lock().clone();
-        assert!(
-            requested_segments.contains(&(BlockHeight::new(3), 1)),
-            "expected the split feedback to re-fetch height 3 with the reduced plan; requests: {requested_segments:?}"
+        let originally_admitted_ranges = [
+            (BlockHeight::new(1), 2),
+            (BlockHeight::new(3), 2),
+            (BlockHeight::new(5), 2),
+            (BlockHeight::new(7), 2),
+        ];
+        assert_eq!(
+            requested_segments.len(),
+            originally_admitted_ranges.len(),
+            "expected no split-triggered re-fetches; requests: {requested_segments:?}"
         );
+        for expected_range in originally_admitted_ranges {
+            assert_eq!(
+                requested_segments
+                    .iter()
+                    .filter(|request| **request == expected_range)
+                    .count(),
+                1,
+                "expected each initially admitted disjoint range exactly once; requests: {requested_segments:?}"
+            );
+        }
         let completed_segments = completed_segments.lock().clone();
         assert!(
-            !completed_segments.contains(&(BlockHeight::new(3), 2)),
-            "expected the stale prefetched range to be cancelled before completion; completions: {completed_segments:?}"
+            completed_segments.contains(&(BlockHeight::new(3), 2)),
+            "expected the prefetched range to be retained through completion; completions: {completed_segments:?}"
         );
 
         Ok(())
@@ -2836,9 +2853,8 @@ mod tests {
                 .push((start_height, max_connected_blocks));
 
             if start_height != BlockHeight::new(1) && max_connected_blocks == 2 {
-                // These are the stale prefetches admitted before the split
-                // feedback from height 1. The stream must abort them before
-                // they can complete.
+                // These disjoint prefetches are admitted before height 1
+                // reports its split. The stream must retain them.
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
 

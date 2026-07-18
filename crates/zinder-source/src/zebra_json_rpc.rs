@@ -563,12 +563,28 @@ impl ZebraJsonRpcSource {
                     else {
                         return Err(error);
                     };
+                    let retry_accounting =
+                        offending_range_split_retry_accounting(range_start, range_end);
+                    // A child that is still oversized returns through this branch,
+                    // so recursive splits add their own requests and block attempts.
                     metrics::counter!(
                         "zinder_node_source_segment_split_total",
                         "source" => "zebra_json_rpc",
                         "reason" => "response_too_large"
                     )
                     .increment(1);
+                    metrics::counter!(
+                        "zinder_node_source_segment_offending_range_retry_requests_total",
+                        "source" => "zebra_json_rpc",
+                        "reason" => "response_too_large"
+                    )
+                    .increment(retry_accounting.request_count);
+                    metrics::counter!(
+                        "zinder_node_source_segment_offending_range_retry_blocks_total",
+                        "source" => "zebra_json_rpc",
+                        "reason" => "response_too_large"
+                    )
+                    .increment(retry_accounting.block_count);
                     stats = stats.with_added_splits(1);
                     tracing::warn!(
                         target: "zinder::source",
@@ -1381,6 +1397,32 @@ fn split_inclusive_height_range(
     let left_end = BlockHeight::new(midpoint);
     let right_start = left_end.next()?;
     Some(((start_height, left_end), (right_start, end_height)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OffendingRangeSplitRetryAccounting {
+    request_count: u64,
+    block_count: u64,
+}
+
+fn offending_range_split_retry_accounting(
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+) -> OffendingRangeSplitRetryAccounting {
+    let block_count = if end_height < start_height {
+        0
+    } else {
+        u64::from(
+            end_height
+                .value()
+                .saturating_sub(start_height.value())
+                .saturating_add(1),
+        )
+    };
+    OffendingRangeSplitRetryAccounting {
+        request_count: 2,
+        block_count,
+    }
 }
 
 fn next_batch_value<'a>(
@@ -2228,6 +2270,22 @@ mod tests {
                 max_response_bytes,
             } if max_response_bytes == DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES.get()
         ));
+    }
+
+    #[test]
+    fn offending_range_split_retry_accounting_counts_child_requests_and_union_blocks() {
+        let parent =
+            offending_range_split_retry_accounting(BlockHeight::new(10), BlockHeight::new(15));
+        assert_eq!(parent.request_count, 2);
+        assert_eq!(parent.block_count, 6);
+
+        let recursively_split_child =
+            offending_range_split_retry_accounting(BlockHeight::new(10), BlockHeight::new(12));
+        assert_eq!(
+            parent.request_count + recursively_split_child.request_count,
+            4
+        );
+        assert_eq!(parent.block_count + recursively_split_child.block_count, 9);
     }
 
     #[test]

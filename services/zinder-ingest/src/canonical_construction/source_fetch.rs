@@ -347,86 +347,76 @@ fn insert_completed_source_segment<Source>(
 
 /// Applies completed segment feedback after the head range is emitted in order.
 ///
-/// Density feedback changes only the unscheduled frontier. An oversized
-/// response proves the outstanding request widths stale, so those ranges are
-/// canceled and fetched again with the updated size.
+/// Feedback changes only the unscheduled frontier.
+///
+/// The source adapter splits and retries an oversized request before returning
+/// its completed segment. Future ranges were requested from disjoint cursors,
+/// so they remain valid after the sizer shrinks. Retaining them also retains
+/// their byte reservations until ordered emission.
 fn apply_source_segment_feedback_action<Source>(
-    state: &mut SourceBlockStreamState<'_, Source>,
+    state: &SourceBlockStreamState<'_, Source>,
     action: SourceSegmentFeedbackAction,
 ) {
-    match action {
-        SourceSegmentFeedbackAction::DensityShrink => retain_future_source_prefetch(state),
-        SourceSegmentFeedbackAction::ResponseTooLarge => restart_future_source_prefetch(state),
+    retain_future_source_prefetch(state, action.metric_label());
+    if action == SourceSegmentFeedbackAction::ResponseTooLarge {
+        record_zero_disjoint_prefetch_work();
     }
 }
 
-fn retain_future_source_prefetch<Source>(state: &SourceBlockStreamState<'_, Source>) {
+fn retain_future_source_prefetch<Source>(
+    state: &SourceBlockStreamState<'_, Source>,
+    reason: &'static str,
+) {
     // Retained ranges stay bounded by their live reservations and are still
     // parent-link validated only when emitted in height order.
     let retained = source_prefetch_queue_accounting(state);
     metrics::counter!(
         "zinder_ingest_source_segment_prefetch_retained_completed_segments_total",
-        "reason" => "density"
+        "reason" => reason
     )
     .increment(retained.completed_segment_count);
     metrics::counter!(
         "zinder_ingest_source_segment_prefetch_retained_in_flight_segments_total",
-        "reason" => "density"
+        "reason" => reason
     )
     .increment(retained.in_flight_segment_count);
     metrics::counter!(
         "zinder_ingest_source_segment_prefetch_retained_completed_response_bytes_total",
-        "reason" => "density"
+        "reason" => reason
     )
     .increment(retained.completed_response_bytes);
     tracing::info!(
         event = "source_segment_prefetch_retained",
-        reason = "density",
+        reason,
         next_fetch_height = ?state.next_fetch_height,
         retained_in_flight_segments = retained.in_flight_segment_count,
         retained_completed_segments = retained.completed_segment_count,
         retained_completed_response_bytes = retained.completed_response_bytes,
-        "retained bounded source prefetch after density adjustment"
+        "retained bounded source prefetch after source segment size adjustment"
     );
 }
 
-fn restart_future_source_prefetch<Source>(state: &mut SourceBlockStreamState<'_, Source>) {
-    let discard_accounting = source_prefetch_queue_accounting(state);
-    state.in_flight_segments = FuturesUnordered::new();
-    state.completed_segments.clear();
-    state.completed_segment_bytes = 0;
-    state.next_fetch_height = state.next_emit_height;
-    state.source_head_of_line_started_at = None;
+fn record_zero_disjoint_prefetch_work() {
     metrics::counter!(
-        "zinder_ingest_source_segment_prefetch_restarts_total",
+        "zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_segments_total",
         "reason" => "response_too_large"
     )
-    .increment(1);
+    .increment(0);
     metrics::counter!(
-        "zinder_ingest_source_segment_prefetch_discarded_completed_segments_total",
+        "zinder_ingest_source_segment_disjoint_prefetch_discarded_in_flight_segments_total",
         "reason" => "response_too_large"
     )
-    .increment(discard_accounting.completed_segment_count);
+    .increment(0);
     metrics::counter!(
-        "zinder_ingest_source_segment_prefetch_discarded_in_flight_segments_total",
+        "zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_bytes_total",
         "reason" => "response_too_large"
     )
-    .increment(discard_accounting.in_flight_segment_count);
+    .increment(0);
     metrics::counter!(
-        "zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total",
+        "zinder_ingest_source_segment_disjoint_prefetch_refetched_blocks_total",
         "reason" => "response_too_large"
     )
-    .increment(discard_accounting.completed_response_bytes);
-    tracing::info!(
-        event = "source_segment_prefetch_restarted",
-        reason = "response_too_large",
-        next_fetch_height = ?state.next_fetch_height,
-        discarded_in_flight_segments = discard_accounting.in_flight_segment_count,
-        discarded_completed_segments = discard_accounting.completed_segment_count,
-        discarded_completed_response_bytes = discard_accounting.completed_response_bytes,
-        "discarded stale source prefetches after ordered segment feedback"
-    );
-    record_source_fetch_queue_state(state);
+    .increment(0);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1001,33 +991,37 @@ mod tests {
     use crate::canonical_construction::watermark::ByteWatermark;
 
     #[test]
-    fn response_too_large_feedback_discards_future_source_prefetch()
+    fn response_too_large_feedback_retains_disjoint_future_source_prefetch()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut state = test_source_prefetch_state()?;
+        let state = test_source_prefetch_state()?;
         let accounting = source_prefetch_queue_accounting(&state);
 
         assert_eq!(accounting.completed_segment_count, 2);
         assert_eq!(accounting.in_flight_segment_count, 1);
         assert_eq!(accounting.completed_response_bytes, 30);
-        apply_source_segment_feedback_action(
-            &mut state,
-            SourceSegmentFeedbackAction::ResponseTooLarge,
+        let watermark_before_feedback = state.source_fetch_watermark.snapshot();
+        assert_eq!(watermark_before_feedback.reserved_bytes, 70);
+        assert_eq!(watermark_before_feedback.reservations, 3);
+        apply_source_segment_feedback_action(&state, SourceSegmentFeedbackAction::ResponseTooLarge);
+        let retained = source_prefetch_queue_accounting(&state);
+        assert_eq!(retained.completed_segment_count, 2);
+        assert_eq!(retained.in_flight_segment_count, 1);
+        assert_eq!(retained.completed_response_bytes, 30);
+        assert_eq!(state.completed_segment_bytes, 30);
+        assert_eq!(state.next_emit_height, Some(BlockHeight::new(3)));
+        assert_eq!(state.next_fetch_height, Some(BlockHeight::new(5)));
+        assert_eq!(
+            state.source_fetch_watermark.snapshot(),
+            watermark_before_feedback
         );
-        assert!(state.completed_segments.is_empty());
-        assert!(state.in_flight_segments.is_empty());
-        assert_eq!(state.completed_segment_bytes, 0);
-        assert_eq!(state.next_fetch_height, Some(BlockHeight::new(3)));
         Ok(())
     }
 
     #[test]
     fn density_feedback_retains_future_source_prefetch() -> Result<(), Box<dyn std::error::Error>> {
-        let mut state = test_source_prefetch_state()?;
+        let state = test_source_prefetch_state()?;
 
-        apply_source_segment_feedback_action(
-            &mut state,
-            SourceSegmentFeedbackAction::DensityShrink,
-        );
+        apply_source_segment_feedback_action(&state, SourceSegmentFeedbackAction::DensityShrink);
 
         let accounting = source_prefetch_queue_accounting(&state);
         assert_eq!(accounting.completed_segment_count, 2);
@@ -1080,6 +1074,9 @@ mod tests {
         let second_reservation = source_fetch_watermark
             .try_reserve(20)
             .ok_or("second test reservation should fit")?;
+        let in_flight_reservation = source_fetch_watermark
+            .try_reserve(40)
+            .ok_or("in-flight test reservation should fit")?;
         let mut completed_segments = BTreeMap::new();
         completed_segments.insert(
             BlockHeight::new(3),
@@ -1104,8 +1101,13 @@ mod tests {
             },
         );
         let in_flight_segments = FuturesUnordered::new();
-        in_flight_segments
-            .push(future::pending::<Result<PrefetchedSourceSegment, crate::IngestError>>().boxed());
+        in_flight_segments.push(
+            async move {
+                let _reservation = in_flight_reservation;
+                future::pending::<Result<PrefetchedSourceSegment, crate::IngestError>>().await
+            }
+            .boxed(),
+        );
         Ok(SourceBlockStreamState {
             source: &SOURCE,
             request_timeout: std::time::Duration::from_secs(1),
