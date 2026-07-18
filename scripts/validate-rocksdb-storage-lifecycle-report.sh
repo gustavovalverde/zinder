@@ -250,7 +250,7 @@ jq -e \
       "wallet_storage_ready"
     ])
     and .contract_identity == "benchmark-report"
-    and .report_format_version == 1
+    and .report_format_version == 2
     and .measurement_kind == "rocksdb-storage-lifecycle"
     and (.storage_candidate
       | exact_keys([
@@ -332,11 +332,11 @@ jq -e \
           "wallet_value_encoding_version"
         ])
       and .canonical_store_identity == "canonical"
-      and .canonical_store_schema_version == 1
-      and .wallet_store_identity == "wallet-projection"
+      and .canonical_store_schema_version == 4
+      and .wallet_store_identity == "wallet"
       and .wallet_store_schema_version == 1
       and .wallet_projection_schema_version == 1
-      and .wallet_value_encoding_version == 1)
+      and .wallet_value_encoding_version == 2)
     and (.resource_limits
       | exact_keys([
           "block_prepare_concurrency",

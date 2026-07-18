@@ -6,13 +6,13 @@
 //! `open_primary_derive_store_for_canonical`) is already part of the crate's
 //! public surface; this module adds only the one thing the harness cannot
 //! assemble on its own: a [`BulkCatchupRunConfig`] filled with
-//! production-representative bulk-catchup defaults so the benchmark varies only
-//! the knobs under measurement (prepare concurrency, cache size, range).
+//! resource-resolved bulk-catchup defaults so the benchmark varies only the
+//! knobs under measurement (prepare concurrency, cache size, range).
 //!
-//! The fixed replay knobs are grouped in [`CanonicalPipelineLimits`], the same
-//! value consumed by runtime bulk catchup. Benchmark-specific values remain
-//! explicit because fixture sweeps are diagnostic rather than deployment
-//! certification.
+//! The base replay limits are resolved with [`CanonicalPipelineLimits::resolve`],
+//! the same resolver consumed by runtime bulk catchup. Fixture-specific
+//! overrides remain explicit because fixture sweeps are diagnostic rather than
+//! deployment certification.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -36,16 +36,6 @@ use crate::{
 pub const BENCH_CANONICAL_BATCH_MAX_BLOCKS: u32 = 1_000;
 /// Maximum in-memory canonical artifact bytes accumulated before commit.
 pub const BENCH_CANONICAL_BATCH_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
-/// Maximum connected blocks requested from the source in one segment.
-pub const BENCH_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 16;
-/// Target source response payload bytes for adaptive segment sizing.
-pub const BENCH_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
-/// Maximum concurrent source segment fetches.
-pub const BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
-/// Maximum reserved response bytes across source fetches.
-pub const BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 384 * 1024 * 1024;
-/// Admission watermark for active prepare peaks and completed resident data.
-pub const BENCH_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 512 * 1024 * 1024;
 /// Maximum safe-tip artifact bytes queued while the previous batch commits.
 pub const BENCH_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 /// Force a `RocksDB` flush every N committed epochs.
@@ -87,7 +77,7 @@ const fn nz64(candidate: u64) -> NonZeroU64 {
 /// Measured-and-varied inputs for a fixed-range benchmark run.
 ///
 /// Every field the benchmark sweeps is explicit here; the rest of the
-/// bulk-catchup configuration is filled from the `BENCH_*` defaults by
+/// bulk-catchup configuration is resource-resolved by
 /// [`bench_bulk_catchup_run_config`].
 #[derive(Clone, Debug)]
 pub struct BenchBulkCatchupParams {
@@ -101,6 +91,14 @@ pub struct BenchBulkCatchupParams {
     pub to_height: BlockHeight,
     /// Parallel canonical block-prepare slots (the primary sweep knob).
     pub block_prepare_concurrency: NonZeroU32,
+    /// Logical CPU count of the measured runtime envelope. The benchmark can
+    /// override the resolved concurrency with `block_prepare_concurrency`.
+    pub logical_core_count: NonZeroU32,
+    /// Memory budget of the measured runtime envelope, when the runner makes
+    /// one available.
+    pub memory_budget_bytes: Option<NonZeroU64>,
+    /// Maximum source response accepted by the measured run.
+    pub max_response_bytes: NonZeroU64,
     /// Bounded `RocksDB` budget applied to the canonical store (the cache-size
     /// sweep knob).
     pub canonical_rocksdb_budget: RocksDbResourceBudget,
@@ -122,8 +120,16 @@ pub fn bench_bulk_catchup_run_config(params: BenchBulkCatchupParams) -> BulkCatc
         BENCH_PLACEHOLDER_JSON_RPC_ADDR.to_owned(),
         NodeAuth::None,
         Duration::from_secs(BENCH_NODE_REQUEST_TIMEOUT_SECS),
-        nz64(BENCH_MAX_RESPONSE_BYTES),
+        params.max_response_bytes,
     );
+    let mut pipeline_limits = CanonicalPipelineLimits::resolve(
+        params.memory_budget_bytes,
+        params.logical_core_count,
+        params.max_response_bytes,
+    );
+    // Production resolves resource defaults first, then applies explicit
+    // configuration. The benchmark's concurrency sweep has the same shape.
+    pipeline_limits.block_prepare_concurrency = params.block_prepare_concurrency;
     BulkCatchupRunConfig {
         node,
         node_source: NodeSourceKind::ZebraJsonRpc,
@@ -142,15 +148,7 @@ pub fn bench_bulk_catchup_run_config(params: BenchBulkCatchupParams) -> BulkCatc
         canonical_batch_min_blocks_before_estimated_write_close: nz32(
             DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         ),
-        pipeline_limits: CanonicalPipelineLimits {
-            max_response_bytes: nz64(BENCH_MAX_RESPONSE_BYTES),
-            source_segment_max_blocks: nz32(BENCH_SOURCE_SEGMENT_MAX_BLOCKS),
-            source_segment_target_response_bytes: nz64(BENCH_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES),
-            source_fetch_max_in_flight_requests: nz32(BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS),
-            source_fetch_max_in_flight_bytes: nz64(BENCH_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES),
-            block_prepare_concurrency: params.block_prepare_concurrency,
-            block_prepare_memory_watermark_bytes: nz64(BENCH_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES),
-        },
+        pipeline_limits,
         commit_reassembly_max_queued_artifact_bytes: nz64(
             BENCH_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES,
         ),
@@ -177,5 +175,79 @@ pub fn bench_derive_config() -> IngestDeriveConfig {
         memory_resume_ratio: BENCH_DERIVE_MEMORY_RESUME_RATIO,
         min_replay_batch_blocks: nz32(BENCH_DERIVE_MIN_REPLAY_BATCH_BLOCKS),
         startup_handoff_lag_blocks: BENCH_DERIVE_STARTUP_HANDOFF_LAG_BLOCKS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        num::{NonZeroU32, NonZeroU64},
+        path::PathBuf,
+        sync::Arc,
+    };
+
+    use zinder_testkit::sample_regtest_upgrade_activations;
+
+    use super::{BenchBulkCatchupParams, bench_bulk_catchup_run_config};
+    use crate::RawBlobPolicy;
+    use zinder_core::{BlockHeight, Network};
+    use zinder_store::RocksDbResourceBudget;
+
+    fn params(memory_budget_bytes: Option<NonZeroU64>) -> BenchBulkCatchupParams {
+        BenchBulkCatchupParams {
+            network: Network::ZcashRegtest,
+            storage_path: PathBuf::from("/benchmark-store"),
+            from_height: BlockHeight::new(1),
+            to_height: BlockHeight::new(2),
+            block_prepare_concurrency: NonZeroU32::new(3).unwrap_or(NonZeroU32::MIN),
+            logical_core_count: NonZeroU32::new(10).unwrap_or(NonZeroU32::MIN),
+            memory_budget_bytes,
+            max_response_bytes: NonZeroU64::new(64 * 1024 * 1024).unwrap_or(NonZeroU64::MIN),
+            canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
+            raw_blob_policy: RawBlobPolicy::None,
+            network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
+        }
+    }
+
+    #[test]
+    fn resolves_pipeline_memory_limits_from_the_explicit_runtime_envelope() {
+        let config =
+            bench_bulk_catchup_run_config(params(NonZeroU64::new(10 * 1024 * 1024 * 1024)));
+
+        assert_eq!(
+            config
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes
+                .get(),
+            160 * 1024 * 1024
+        );
+        assert_eq!(
+            config
+                .pipeline_limits
+                .block_prepare_memory_watermark_bytes
+                .get(),
+            160 * 1024 * 1024
+        );
+        assert_eq!(config.pipeline_limits.block_prepare_concurrency.get(), 3);
+    }
+
+    #[test]
+    fn retains_runtime_fallbacks_when_no_memory_envelope_is_available() {
+        let config = bench_bulk_catchup_run_config(params(None));
+
+        assert_eq!(
+            config
+                .pipeline_limits
+                .source_fetch_max_in_flight_bytes
+                .get(),
+            384 * 1024 * 1024
+        );
+        assert_eq!(
+            config
+                .pipeline_limits
+                .block_prepare_memory_watermark_bytes
+                .get(),
+            512 * 1024 * 1024
+        );
     }
 }

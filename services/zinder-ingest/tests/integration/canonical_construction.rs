@@ -31,8 +31,8 @@ use zinder_source::{
     SourceError,
 };
 use zinder_store::{
-    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
@@ -154,6 +154,7 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
         &store_path,
         &regtest_activations(),
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )
     .err()
@@ -213,6 +214,7 @@ async fn load_ironwood_fixture(
             predecessor_frontiers,
         ),
         fixed_tip,
+        CanonicalReorgPolicy::new(100)?,
     )?;
     let temporary = TempDir::new()?;
     let store_path = temporary.path().join("canonical");
@@ -267,6 +269,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
+        CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
     let temporary = TempDir::new()?;
@@ -302,6 +305,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
         &store_path,
         &regtest_activations(),
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )
     .err()
@@ -336,6 +340,7 @@ async fn canonical_source_families_authenticate_empty_subtree_ranges_and_fixed_t
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
+        CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
     let source_checkpoint = CommitmentTreeCheckpoint::new(
@@ -380,6 +385,7 @@ async fn canonical_construction_rejects_source_blocks_from_another_network()
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
+        CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
     let temporary = TempDir::new()?;
@@ -441,6 +447,7 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
         &store_activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
+        CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
     let temporary = TempDir::new()?;

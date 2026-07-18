@@ -14,8 +14,11 @@ use sha2::{Digest, Sha256};
 use zinder_core::{ChainEpoch, UnixTimestampMillis, wire::encode_rpc_block_hash_hex};
 use zinder_derive::{DeriveStore, ProjectionPreset, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME};
 use zinder_ingest::{
-    CanonicalPipelineLimits, RawBlobPolicy,
-    bench_support::{BenchBulkCatchupParams, bench_bulk_catchup_run_config, bench_derive_config},
+    BulkCatchupRunConfig, CanonicalPipelineLimits, RawBlobPolicy,
+    bench_support::{
+        BENCH_MAX_RESPONSE_BYTES, BenchBulkCatchupParams, bench_bulk_catchup_run_config,
+        bench_derive_config,
+    },
     bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical,
     open_primary_derive_store_for_canonical_with_projection_preset, run_bulk_catchup_with_store,
 };
@@ -219,8 +222,8 @@ struct ReplayRunMeasurements {
     completed_at_unix_millis: u64,
 }
 
-const STARTING_CHECKPOINT_MANIFEST_FILE_NAME: &str = "zinder-backup-manifest.json";
-const STARTING_CHECKPOINT_MANIFEST_FORMAT_VERSION: u32 = 2;
+const STARTING_CHECKPOINT_MANIFEST_FILE_NAME: &str = "zinder-benchmark-starting-store.json";
+const STARTING_CHECKPOINT_MANIFEST_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 struct StartingCheckpointManifest {
@@ -284,18 +287,13 @@ pub async fn replay_fixture(
     )?;
     let projection_replay_start_cursor = prepare_projection_replay(&config, &store)?;
 
-    let mut run_config = bench_bulk_catchup_run_config(BenchBulkCatchupParams {
+    let run_config = benchmark_run_config(
+        &config,
+        &manifest,
         network,
-        storage_path: config.store_path.clone(),
-        from_height: zinder_core::BlockHeight::new(manifest.from_height),
-        to_height: zinder_core::BlockHeight::new(manifest.to_height),
-        block_prepare_concurrency: config.block_prepare_concurrency,
-        canonical_rocksdb_budget: canonical_options.rocksdb_resource_budget,
-        raw_blob_policy: RawBlobPolicy::None,
-        network_upgrade_activations: activations,
-    });
-    run_config.pipeline_limits =
-        resolve_replay_pipeline_limits(&config, run_config.pipeline_limits)?;
+        activations,
+        canonical_options.rocksdb_resource_budget,
+    )?;
 
     let started_at = Instant::now();
     run_bulk_catchup_with_store(&run_config, &source, &store).await?;
@@ -346,6 +344,58 @@ fn open_replay_source(
         manifest,
         Duration::from_millis(config.source_segment_delay_millis),
     )
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the validated positive finite CPU limit is rounded up and capped before conversion"
+)]
+fn logical_core_count_from_limit(cpu_limit_cores: Option<f64>, fallback: NonZeroU32) -> NonZeroU32 {
+    let Some(cpu_limit_cores) = cpu_limit_cores else {
+        return fallback;
+    };
+    let logical_core_count = cpu_limit_cores.ceil().min(f64::from(u32::MAX)) as u32;
+    NonZeroU32::new(logical_core_count).unwrap_or(fallback)
+}
+
+fn benchmark_pipeline_resource_inputs(
+    config: &ReplayConfig,
+) -> (NonZeroU32, Option<NonZeroU64>, NonZeroU64) {
+    (
+        logical_core_count_from_limit(config.cpu_limit_cores, config.block_prepare_concurrency),
+        config.memory_limit_bytes.and_then(NonZeroU64::new),
+        config.max_response_bytes.unwrap_or_else(|| {
+            NonZeroU64::new(BENCH_MAX_RESPONSE_BYTES).unwrap_or(NonZeroU64::MIN)
+        }),
+    )
+}
+
+fn benchmark_run_config(
+    config: &ReplayConfig,
+    manifest: &FixtureManifest,
+    network: zinder_core::Network,
+    network_upgrade_activations: Arc<zinder_core::NetworkUpgradeActivations>,
+    canonical_rocksdb_budget: RocksDbResourceBudget,
+) -> Result<BulkCatchupRunConfig, BenchError> {
+    let (logical_core_count, memory_budget_bytes, max_response_bytes) =
+        benchmark_pipeline_resource_inputs(config);
+    let mut run_config = bench_bulk_catchup_run_config(BenchBulkCatchupParams {
+        network,
+        storage_path: config.store_path.clone(),
+        from_height: zinder_core::BlockHeight::new(manifest.from_height),
+        to_height: zinder_core::BlockHeight::new(manifest.to_height),
+        block_prepare_concurrency: config.block_prepare_concurrency,
+        logical_core_count,
+        memory_budget_bytes,
+        max_response_bytes,
+        canonical_rocksdb_budget,
+        raw_blob_policy: RawBlobPolicy::None,
+        network_upgrade_activations,
+    });
+    run_config.pipeline_limits =
+        resolve_replay_pipeline_limits(config, run_config.pipeline_limits)?;
+    Ok(run_config)
 }
 
 fn resolve_replay_pipeline_limits(
@@ -493,7 +543,7 @@ fn read_starting_checkpoint_manifest(
     let manifest: StartingCheckpointManifest =
         serde_json::from_slice(&raw_manifest).map_err(|source| {
             BenchError::starting_checkpoint_manifest(format!(
-                "{} is not a valid backup manifest: {source}",
+                "{} is not a valid benchmark starting-store manifest: {source}",
                 manifest_path.display()
             ))
         })?;

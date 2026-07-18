@@ -22,7 +22,7 @@ use zinder_ingest::{
 };
 use zinder_source::NodeSource;
 use zinder_store::{
-    CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
+    CanonicalBlockLoadEvidence, CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError,
     CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbIoMode,
     RocksDbResourceBudget,
 };
@@ -64,7 +64,12 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
     let checkpoint = source
         .fetch_chain_checkpoint(checkpoint_height, &activations)
         .await?;
-    let build_plan = CanonicalStoreBuildPlan::checkpointed(&activations, checkpoint, fixed_tip)?;
+    let build_plan = CanonicalStoreBuildPlan::checkpointed(
+        &activations,
+        checkpoint,
+        fixed_tip,
+        CanonicalReorgPolicy::new(100)?,
+    )?;
     let temporary = tempdir()?;
     let store_path = temporary.path().join("canonical");
     let resource_budget = RocksDbResourceBudget::canonical_writer_defaults();
@@ -89,6 +94,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
         &store_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(100)?,
         resource_budget,
     )
     .err()

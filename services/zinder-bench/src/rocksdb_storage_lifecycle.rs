@@ -34,8 +34,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
-    CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_VALUE_ENCODING_VERSION,
@@ -216,6 +216,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &network_upgrade_activations,
         genesis.block_time_seconds,
         fixed_build_tip,
+        CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
     )?;
     let canonical_store_initialization_started = Instant::now();
     let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -263,6 +264,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &validated.canonical_store,
         &network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
     let canonical_cold_reopen = canonical_cold_reopen_started.elapsed();
@@ -298,6 +300,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &validated.canonical_store,
         &network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
     let wallet_store = RocksDbWalletStore::open_ready(
@@ -370,7 +373,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         contracts: StorageLifecycleContractSummary {
             canonical_store_identity: CANONICAL_STORE_IDENTITY,
             canonical_store_schema_version: CANONICAL_STORE_SCHEMA_VERSION,
-            wallet_store_identity: "wallet-projection",
+            wallet_store_identity: "wallet",
             wallet_store_schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
             wallet_projection_schema_version: WALLET_PROJECTION_SCHEMA_VERSION,
             wallet_value_encoding_version: WALLET_PROJECTION_VALUE_ENCODING_VERSION,

@@ -95,7 +95,7 @@ validate_report() {
       and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
       and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
     .contract_identity == "benchmark-report"
-    and .report_format_version == 1
+    and .report_format_version == 2
     and .measurement_kind == "canonical-block-facts-round-trip"
     and .storage_candidate.id == $candidate
     and .storage_candidate.canonical_engine == $engine
