@@ -88,8 +88,12 @@ Current integration references and API support material:
 
 ## Plans
 
+- [Developer documentation strategy](plans/developer-documentation-strategy.md): reader journeys, information architecture, writing standards, design direction, Fumadocs delivery, and quality gates for a public Zinder documentation portal.
+- [Fact-first simplification audit](plans/fact-first-simplification-audit.md): reuse, simplification, efficiency, and altitude findings across the canonical store, wallet storage, and fact-first services, with dead-code deletion sequencing.
+- [Fact-first wallet-serving cutover](plans/fact-first-wallet-serving-cutover.md): evidence-backed implementation order for canonical reorgs, wallet projection following, secondary serving, live mempool behavior, operator composition, and independent-client certification.
 - [Lightwalletd compatibility certification](plans/lightwalletd-compatibility-certification.md): bounded, evidence-backed replacement claims for the compatibility adapter.
 - [Native indexer projections merge](plans/native-indexer-projections-merge.md): native-only scope, schema ladder, coverage matrix, review sequence, and merge constraints for this branch.
+- [Naming and structure legibility](plans/naming-and-structure-legibility.md): deletion-first naming plan covering the derive-plane/wallet-projection vocabulary overlap, the retirement of "fact-first" as a migration label, the production-dead projection-reader surface, the legacy chain-store engine's terminal deletion target, `canonical`/`writer` module grouping, and stale orientation docs on this branch.
 - [Wallet workload presets](plans/wallet-workload-presets.md): investigation findings, invariants, tracer-bullet phases, stop conditions, and requirement traceability for the wallet workload PRD.
 
 ## Runbooks
