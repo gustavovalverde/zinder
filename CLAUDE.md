@@ -63,9 +63,7 @@ ZINDER_TEST_LIVE=1 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, three tests skip:
-`zebra_indexer_mempool_*` and
-`mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state`.
+Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, the `zebra_indexer_mempool_*` tests skip.
 
 Testnet (Z3 stack with cookie auth):
 

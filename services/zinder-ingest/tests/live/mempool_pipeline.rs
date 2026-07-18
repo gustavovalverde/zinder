@@ -3,7 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::time::Duration;
 
 use eyre::{Result, eyre};
 use prost::Message;
@@ -13,26 +13,13 @@ use zinder_core::{
     AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
     RawTransactionBytes, TransactionId, UnixTimestampMillis,
 };
-use zinder_ingest::{MempoolIndex, build_mempool_entry, run_mempool_orchestrator};
+use zinder_ingest::{MempoolIndex, build_mempool_entry};
 use zinder_proto::compat::lightwalletd::CompactTx;
 use zinder_source::{
-    MempoolSourceEntry, NodeSource, ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions,
-    ZebraIndexerSourceTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+    MempoolSourceEntry, NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
 use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
-use zinder_testkit::StoreFixture;
 use zinder_testkit::live::{LiveTestEnv, init, require_live, require_live_for};
-
-fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
-    Ok(zinder_derive::DeriveStore::open(
-        zinder_derive::DeriveStore::path_for_canonical(storage_path),
-        zinder_derive::DeriveStoreOptions {
-            sync_writes: false,
-            consumers: &[],
-            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-        },
-    )?)
-}
 
 /// Validates canonical hydration from a real Zebra-emitted transaction.
 ///
@@ -165,99 +152,6 @@ fn synthetic_chain_epoch_at(network: Network, tip_height: BlockHeight) -> ChainE
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_700_000_000_000),
     }
-}
-
-/// Validates the orchestrator wiring against a live Zebra indexer.
-///
-/// `ZebraIndexerMempoolSource` → `run_mempool_orchestrator` →
-/// `MempoolIndex` + canonical mempool-event store must run cleanly for a few
-/// seconds.
-///
-/// The task must not panic, hang, or surface fatal errors.
-///
-/// This is a smoke test for the streaming integration: no transactions are
-/// expected on an idle regtest mempool, so the test verifies the loop stays
-/// alive (orchestrator task not finished) and that any events that do fire
-/// reach the in-memory state through the canonical pipeline.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state() -> Result<()> {
-    let _guard = init();
-    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
-        return Ok(());
-    };
-    let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
-        return Ok(());
-    };
-
-    let store_fixture = StoreFixture::with_single_block(env.network())?;
-    let chain_store = store_fixture.chain_store().clone();
-    let derive_store = test_derive_store(store_fixture.tempdir_path())?;
-    let mempool_index = MempoolIndex::new();
-    let mempool_source: Arc<ZebraIndexerMempoolSource> =
-        Arc::new(build_indexer_mempool_source(&env, indexer_endpoint_url)?);
-
-    let orchestrator_index = mempool_index.clone();
-    let chain_store_for_orchestrator = chain_store.clone();
-    let derive_store_for_orchestrator = derive_store.clone();
-    let orchestrator_handle = tokio::spawn(async move {
-        run_mempool_orchestrator(
-            mempool_source,
-            chain_store_for_orchestrator,
-            derive_store_for_orchestrator,
-            orchestrator_index,
-            |_outcome| {},
-        )
-        .await
-    });
-
-    // Run the orchestrator long enough to confirm the source is wired up
-    // without immediately erroring; on an idle regtest mempool no events
-    // fire so the index/log stay empty.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(
-        !orchestrator_handle.is_finished(),
-        "orchestrator should still be running on an idle mempool but the task already returned"
-    );
-
-    orchestrator_handle.abort();
-    match orchestrator_handle.await {
-        Ok(orchestrator_outcome) => {
-            return Err(eyre!(
-                "orchestrator returned before abort took effect: {orchestrator_outcome:?}"
-            ));
-        }
-        Err(join_error) if join_error.is_cancelled() => {}
-        Err(join_error) => {
-            return Err(eyre!(
-                "orchestrator task did not cancel cleanly: {join_error}"
-            ));
-        }
-    }
-
-    assert_eq!(
-        mempool_index.entry_count(),
-        0,
-        "idle regtest mempool should not have applied any entries to the index"
-    );
-    let retention = chain_store.mempool_event_retention_report()?;
-    assert_eq!(
-        retention.retained_event_count, 0,
-        "idle regtest mempool should not have appended any envelopes to the event store"
-    );
-    Ok(())
-}
-
-fn build_indexer_mempool_source(
-    env: &LiveTestEnv,
-    indexer_endpoint_url: String,
-) -> Result<ZebraIndexerMempoolSource> {
-    let hydration_json_rpc = json_rpc_source(env)?;
-    Ok(ZebraIndexerMempoolSource::with_options(
-        ZebraIndexerSourceTarget::new(indexer_endpoint_url),
-        hydration_json_rpc,
-        ZebraIndexerMempoolSourceOptions::default(),
-    ))
 }
 
 /// Proves end-to-end mempool persistence with real Zebra-emitted bytes.

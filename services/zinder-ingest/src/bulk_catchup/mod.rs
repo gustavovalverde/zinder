@@ -33,7 +33,6 @@ use crate::source_recovery::{
 };
 use block_prepare::{BulkCatchupBlockPrepareStreamConfig, build_block_prepare_stream};
 use commit_reassembly::run_commit_reassembly;
-pub(crate) use flush::flush_pending_bulk_catchup_writes;
 
 #[cfg(test)]
 use crate::artifact_builder::{CommitmentTreeSizes, PreparedCanonicalBlock};
@@ -170,7 +169,6 @@ impl BulkCatchupFlushState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BulkCatchupCompletionFlush {
     FlushPending,
-    PreservePending,
 }
 
 impl BulkCatchupCompletionFlush {
@@ -327,23 +325,6 @@ where
         readiness,
         &mut flush_state,
         BulkCatchupCompletionFlush::FlushPending,
-    )
-    .await
-}
-
-pub(crate) async fn run_bulk_catchup_until_complete_with_flush_state<Source>(
-    run: BulkCatchupRunContext<'_, Source>,
-    readiness: &Readiness,
-    flush_state: &mut BulkCatchupFlushState,
-) -> Result<Option<ChainEpochCommitOutcome>, IngestError>
-where
-    Source: NodeSource + Clone,
-{
-    run_bulk_catchup_until_complete_inner(
-        &run,
-        readiness,
-        flush_state,
-        BulkCatchupCompletionFlush::PreservePending,
     )
     .await
 }

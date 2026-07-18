@@ -34,24 +34,22 @@ use zinder_derive::{
     COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
     ChainEventDispatchInputs, CommitmentRootSearchConsumer, ConsumerProjectionState,
     ConventionalFeeDistributionConsumer, DeriveConsumerName, DeriveStore, DeriveStoreOptions,
-    IronwoodMigrationConsumer, MEMPOOL_EVENT_COUNTS_CONSUMER_NAME, MempoolConsumerEvent,
-    MempoolConsumerEventVariant, MempoolEventCountsConsumer, PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
-    PaidFeeDistributionConsumer, ProjectionPreset, ProjectionWriteMeasurement,
-    RecentTransactionsConsumer, ReorgIncidentsConsumer,
-    TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
-    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
-    TransactionComponentSummaryConsumer, TransactionFeesConsumer, TransactionHistoryConsumer,
-    TransactionIntrinsicValueBalanceFacts, TransparentAddressActivityConsumer,
-    TransparentAddressDeltasConsumer, TransparentAddressRankingConsumer,
-    TransparentAddressTransactionHistoryConsumer, TransparentOutpointSpendConsumer,
-    TransparentSpendFacts, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, ValuePoolFlowHistoryConsumer,
+    IronwoodMigrationConsumer, PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PaidFeeDistributionConsumer,
+    ProjectionPreset, ProjectionWriteMeasurement, RecentTransactionsConsumer,
+    ReorgIncidentsConsumer, TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionComponentSummaryConsumer,
+    TransactionFeesConsumer, TransactionHistoryConsumer, TransactionIntrinsicValueBalanceFacts,
+    TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
+    TransparentAddressRankingConsumer, TransparentAddressTransactionHistoryConsumer,
+    TransparentOutpointSpendConsumer, TransparentSpendFacts, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
+    ValuePoolFlowHistoryConsumer,
 };
 use zinder_proto::v1::wallet::{DeriveHealth, DeriveStatus};
 use zinder_runtime::{IngestPhase, Readiness};
 use zinder_store::{
-    ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, MempoolEvent, MempoolEventEnvelope,
-    PrimaryChainStore, RocksDbResourceBudget, StoreReadCaller, StreamCursorTokenV1,
-    TransparentSpendReplayBlock,
+    ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, PrimaryChainStore,
+    RocksDbResourceBudget, StoreReadCaller, StreamCursorTokenV1, TransparentSpendReplayBlock,
 };
 
 use crate::{
@@ -69,7 +67,6 @@ const DERIVE_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS: &str = "build_block_contexts";
 const DERIVE_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS: &str = "read_transparent_spend_facts";
 const DERIVE_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
 const PROJECTION_WRITE_SOURCE_CHAIN_EVENT: &str = "chain_event";
-const PROJECTION_WRITE_SOURCE_MEMPOOL_EVENT: &str = "mempool_event";
 static DERIVE_PROJECTION_WRITE_LOCK: Mutex<()> = parking_lot::const_mutex(());
 
 pub(crate) fn derive_projection_write_guard() -> MutexGuard<'static, ()> {
@@ -2228,91 +2225,6 @@ pub(crate) fn dispatch_chain_event(
     Ok(())
 }
 
-/// Dispatches one committed mempool event into ingest-owned derive
-/// consumers.
-pub(crate) fn dispatch_mempool_event(
-    derive_store: &DeriveStore,
-    envelope: &MempoolEventEnvelope,
-) -> Result<(), IngestError> {
-    if !derive_store.has_consumer(MEMPOOL_EVENT_COUNTS_CONSUMER_NAME) {
-        return Ok(());
-    }
-    match &envelope.event {
-        MempoolEvent::Added { entry } => {
-            let transaction_id = entry.transaction_id.as_bytes();
-            let event = MempoolConsumerEvent::new(
-                envelope.event_sequence,
-                envelope.source_observed_unix_millis,
-                MempoolConsumerEventVariant::Added {
-                    transaction_id: &transaction_id,
-                    raw_transaction_bytes: entry.raw_transaction_bytes.as_slice(),
-                },
-            );
-            apply_mempool_event(derive_store, &event, envelope.cursor.as_bytes())
-        }
-        MempoolEvent::Invalidated { transaction_id, .. } => {
-            let transaction_id = transaction_id.as_bytes();
-            let event = MempoolConsumerEvent::new(
-                envelope.event_sequence,
-                envelope.source_observed_unix_millis,
-                MempoolConsumerEventVariant::Invalidated {
-                    transaction_id: &transaction_id,
-                },
-            );
-            apply_mempool_event(derive_store, &event, envelope.cursor.as_bytes())
-        }
-        MempoolEvent::Mined {
-            transaction_id,
-            mined_height,
-            block_hash,
-        } => {
-            let transaction_id = transaction_id.as_bytes();
-            let block_hash = block_hash.as_bytes();
-            let event = MempoolConsumerEvent::new(
-                envelope.event_sequence,
-                envelope.source_observed_unix_millis,
-                MempoolConsumerEventVariant::Mined {
-                    transaction_id: &transaction_id,
-                    mined_height: *mined_height,
-                    block_hash: &block_hash,
-                },
-            );
-            apply_mempool_event(derive_store, &event, envelope.cursor.as_bytes())
-        }
-        MempoolEvent::Suppressed { transaction_id } => {
-            let transaction_id = transaction_id.as_bytes();
-            let event = MempoolConsumerEvent::new(
-                envelope.event_sequence,
-                envelope.source_observed_unix_millis,
-                MempoolConsumerEventVariant::Suppressed {
-                    transaction_id: &transaction_id,
-                },
-            );
-            apply_mempool_event(derive_store, &event, envelope.cursor.as_bytes())
-        }
-        _ => Err(IngestError::DeriveDispatch(
-            "unsupported mempool event variant".to_owned(),
-        )),
-    }
-}
-
-fn apply_mempool_event(
-    derive_store: &DeriveStore,
-    event: &MempoolConsumerEvent<'_>,
-    cursor_bytes: &[u8],
-) -> Result<(), IngestError> {
-    let mut event_counts = MempoolEventCountsConsumer::new();
-    let measurement = derive_store
-        .write_mempool_event(&mut event_counts, event, cursor_bytes)
-        .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
-    record_projection_write_measurements(
-        std::slice::from_ref(&measurement),
-        PROJECTION_WRITE_SOURCE_MEMPOOL_EVENT,
-        0,
-    );
-    Ok(())
-}
-
 /// Hydrates one current canonical range for cursor-neutral startup projections.
 pub(crate) async fn read_current_block_context_batch(
     chain_store: &PrimaryChainStore,
@@ -3086,22 +2998,6 @@ mod tests {
             },
         )?;
         Ok((tempdir, store))
-    }
-
-    #[test]
-    fn wallet_preset_ignores_optional_mempool_projection() -> Result<(), IngestError> {
-        let (_tempdir, store) = wallet_derive_store()?;
-        let envelope = MempoolEventEnvelope {
-            cursor: StreamCursorTokenV1::from_bytes(vec![0xA5; 64]),
-            event_sequence: 1,
-            source_observed_unix_millis: 1,
-            event: MempoolEvent::Suppressed {
-                transaction_id: TransactionId::from_bytes([0x42; 32]),
-            },
-        };
-
-        dispatch_mempool_event(&store, &envelope)?;
-        Ok(())
     }
 
     #[test]
