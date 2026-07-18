@@ -1,8 +1,9 @@
-//! Exact version-1 wallet projection query rows and durable byte layouts.
+//! Exact version-2 wallet projection query rows and durable byte layouts.
 
 use zinder_core::wire::UtxoSetCommitmentElement;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, Network, TransactionId, TransparentAddressScriptHash,
+    BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
+    CanonicalBlockFactsSequenceDigestVersion, Network, TransactionId, TransparentAddressScriptHash,
     TransparentOutPoint,
 };
 
@@ -14,6 +15,8 @@ const ADDRESS_UNSPENT_OUTPUT_KEY_LEN: usize = 72;
 const ADDRESS_TRANSACTION_KEY_LEN: usize = 40;
 const UNSPENT_OUTPUT_FIXED_VALUE_LEN: usize = 84;
 const SPENT_OUTPUT_TRAILER_LEN: usize = 76;
+const SOURCE_SEQUENCE_DIGEST_ENCODED_LEN: usize = 2 + 8 + 32;
+const REORG_UNDO_FIXED_VALUE_LEN: usize = 32 + 32 + (SOURCE_SEQUENCE_DIGEST_ENCODED_LEN * 2) + 12;
 
 /// Position of one transaction in the canonical chain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -543,6 +546,12 @@ impl WalletAddressBalance {
 pub struct WalletReorgUndo {
     /// Canonical block whose wallet changes this record reverses.
     pub block: BlockId,
+    /// Parent hash the reverted block was validated against.
+    pub parent_hash: BlockHash,
+    /// Exact source digest immediately before this block was applied.
+    pub source_sequence_digest_before: CanonicalBlockFactsSequenceDigest,
+    /// Exact source digest immediately after this block was applied.
+    pub source_sequence_digest_after: CanonicalBlockFactsSequenceDigest,
     /// Outputs created by this block.
     pub created_outpoints: Vec<WalletOutpointKey>,
     /// Prior outputs spent by this block.
@@ -558,8 +567,9 @@ impl WalletReorgUndo {
         self.block.height.value().to_be_bytes()
     }
 
-    /// Encodes the exact version-1 undo value.
+    /// Encodes the exact version-2 undo value.
     pub fn encode_value(&self) -> Result<Vec<u8>, WalletProjectionContractError> {
+        self.validate_source_sequence_bounds()?;
         validate_strict_key_order(&self.created_outpoints, "reorg_undo created outpoint list")?;
         validate_strict_key_order(&self.spent_outpoints, "reorg_undo spent outpoint list")?;
         validate_strict_key_order(
@@ -574,6 +584,9 @@ impl WalletReorgUndo {
         )?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.block.hash.as_bytes());
+        bytes.extend_from_slice(&self.parent_hash.as_bytes());
+        encode_source_sequence_digest(self.source_sequence_digest_before, &mut bytes);
+        encode_source_sequence_digest(self.source_sequence_digest_after, &mut bytes);
         bytes.extend_from_slice(&created_count.to_be_bytes());
         for key in &self.created_outpoints {
             bytes.extend_from_slice(key.as_bytes());
@@ -589,19 +602,25 @@ impl WalletReorgUndo {
         Ok(bytes)
     }
 
-    /// Decodes one exact version-1 reorg-undo row.
+    /// Decodes one exact version-2 reorg-undo row.
     pub fn decode(key: &[u8], encoded: &[u8]) -> Result<Self, WalletProjectionContractError> {
         let height = BlockHeight::new(u32::from_be_bytes(fixed_array::<4>(key, "reorg_undo key")?));
-        if encoded.len() < 36 {
+        if encoded.len() < REORG_UNDO_FIXED_VALUE_LEN {
             return Err(WalletProjectionContractError::DurableValueTooShort {
                 field: "reorg_undo value",
-                minimum: 36,
+                minimum: REORG_UNDO_FIXED_VALUE_LEN,
                 actual: encoded.len(),
             });
         }
         let block_hash =
             BlockHash::from_bytes(array_at::<32>(encoded, 0, "reorg_undo block hash")?);
-        let mut offset = 32;
+        let parent_hash =
+            BlockHash::from_bytes(array_at::<32>(encoded, 32, "reorg_undo parent hash")?);
+        let mut offset = 64;
+        let source_sequence_digest_before =
+            decode_source_sequence_digest(encoded, &mut offset, "reorg_undo source digest before")?;
+        let source_sequence_digest_after =
+            decode_source_sequence_digest(encoded, &mut offset, "reorg_undo source digest after")?;
         let created_outpoints =
             decode_outpoint_list(encoded, &mut offset, "reorg_undo created outpoint list")?;
         let spent_outpoints =
@@ -616,13 +635,72 @@ impl WalletReorgUndo {
                 field: "reorg_undo value",
             });
         }
-        Ok(Self {
+        let undo = Self {
             block: BlockId::new(height, block_hash),
+            parent_hash,
+            source_sequence_digest_before,
+            source_sequence_digest_after,
             created_outpoints,
             spent_outpoints,
             address_transaction_keys,
-        })
+        };
+        undo.validate_source_sequence_bounds()?;
+        Ok(undo)
     }
+
+    fn validate_source_sequence_bounds(&self) -> Result<(), WalletProjectionContractError> {
+        if self.source_sequence_digest_before.version()
+            != CanonicalBlockFactsSequenceDigestVersion::V1
+            || self.source_sequence_digest_after.version()
+                != CanonicalBlockFactsSequenceDigestVersion::V1
+        {
+            return Err(WalletProjectionContractError::ReorgUndoSourceSequenceVersionMismatch);
+        }
+        if self
+            .source_sequence_digest_before
+            .block_count()
+            .checked_add(1)
+            != Some(self.source_sequence_digest_after.block_count())
+        {
+            return Err(WalletProjectionContractError::ReorgUndoSourceSequenceLengthMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn encode_source_sequence_digest(digest: CanonicalBlockFactsSequenceDigest, bytes: &mut Vec<u8>) {
+    bytes.extend_from_slice(&digest.version().value().to_be_bytes());
+    bytes.extend_from_slice(&digest.block_count().to_be_bytes());
+    bytes.extend_from_slice(&digest.as_bytes());
+}
+
+fn decode_source_sequence_digest(
+    encoded: &[u8],
+    offset: &mut usize,
+    field: &'static str,
+) -> Result<CanonicalBlockFactsSequenceDigest, WalletProjectionContractError> {
+    let version = u16::from_be_bytes(array_at::<2>(encoded, *offset, field)?);
+    *offset = offset
+        .checked_add(2)
+        .ok_or(WalletProjectionContractError::DurableLengthPrefixMismatch { field })?;
+    if version != CanonicalBlockFactsSequenceDigestVersion::V1.value() {
+        return Err(WalletProjectionContractError::ReorgUndoSourceSequenceVersionMismatch);
+    }
+    let block_count = u64::from_be_bytes(array_at::<8>(encoded, *offset, field)?);
+    *offset = offset
+        .checked_add(8)
+        .ok_or(WalletProjectionContractError::DurableLengthPrefixMismatch { field })?;
+    let digest = array_at::<32>(encoded, *offset, field)?;
+    *offset = offset
+        .checked_add(32)
+        .ok_or(WalletProjectionContractError::DurableLengthPrefixMismatch { field })?;
+    Ok(
+        CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+            block_count,
+            digest,
+        ),
+    )
 }
 
 fn fixed_array<const LEN: usize>(
@@ -754,6 +832,34 @@ mod tests {
         .unwrap_or_else(|error| unreachable!("valid sample output: {error}"))
     }
 
+    fn undo_for(
+        block: BlockId,
+        created_outpoints: Vec<WalletOutpointKey>,
+        spent_outpoints: Vec<WalletOutpointKey>,
+        address_transaction_keys: Vec<WalletAddressTransactionKey>,
+    ) -> WalletReorgUndo {
+        let before_count = u64::from(block.height.value().saturating_sub(1));
+        WalletReorgUndo {
+            block,
+            parent_hash: BlockHash::from_bytes([0x44; 32]),
+            source_sequence_digest_before:
+                CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                    CanonicalBlockFactsSequenceDigestVersion::V1,
+                    before_count,
+                    [0x55; 32],
+                ),
+            source_sequence_digest_after:
+                CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                    CanonicalBlockFactsSequenceDigestVersion::V1,
+                    before_count.saturating_add(1),
+                    [0x66; 32],
+                ),
+            created_outpoints,
+            spent_outpoints,
+            address_transaction_keys,
+        }
+    }
+
     #[test]
     fn outpoint_and_address_keys_have_exact_version_one_bytes() {
         let output = sample_unspent_output();
@@ -831,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn address_transaction_balance_and_undo_have_exact_version_one_bytes() {
+    fn address_transaction_balance_and_undo_have_exact_version_two_bytes() {
         let address = TransparentAddressScriptHash::from_bytes([0x22; 32]);
         let address_transaction_key =
             WalletAddressTransactionKey::new(address, BlockHeight::new(0x0a0b_0c0d), 0x1112_1314);
@@ -862,35 +968,55 @@ mod tests {
         assert_eq!(hex::encode(balance.encode_key()), "22".repeat(32));
         assert_eq!(hex::encode(balance.encode_value()), "0102030405060708");
 
-        let undo = WalletReorgUndo {
-            block: BlockId::new(
+        let undo = undo_for(
+            BlockId::new(
                 BlockHeight::new(0x0a0b_0c0d),
                 BlockHash::from_bytes([0x33; 32]),
             ),
-            created_outpoints: vec![WalletOutpointKey::new(sample_outpoint())],
-            spent_outpoints: vec![WalletOutpointKey::new(sample_outpoint())],
-            address_transaction_keys: vec![address_transaction_key],
-        };
-        assert_eq!(hex::encode(undo.encode_key()), "0a0b0c0d");
-        assert_eq!(
-            hex::encode(
-                undo.encode_value()
-                    .unwrap_or_else(|error| unreachable!("valid sample undo: {error}"))
-            ),
-            concat!(
-                "3333333333333333333333333333333333333333333333333333333333333333",
-                "00000001",
-                "1111111111111111111111111111111111111111111111111111111111111111",
-                "01020304",
-                "00000001",
-                "1111111111111111111111111111111111111111111111111111111111111111",
-                "01020304",
-                "00000001",
-                "2222222222222222222222222222222222222222222222222222222222222222",
-                "0a0b0c0d",
-                "11121314"
-            )
+            vec![WalletOutpointKey::new(sample_outpoint())],
+            vec![WalletOutpointKey::new(sample_outpoint())],
+            vec![address_transaction_key],
         );
+        assert_eq!(hex::encode(undo.encode_key()), "0a0b0c0d");
+        let encoded = undo
+            .encode_value()
+            .unwrap_or_else(|error| unreachable!("valid sample undo: {error}"));
+        assert_eq!(&encoded[..32], &undo.block.hash.as_bytes());
+        assert_eq!(&encoded[32..64], &undo.parent_hash.as_bytes());
+        assert_eq!(
+            WalletReorgUndo::decode(&undo.encode_key(), &encoded),
+            Ok(undo)
+        );
+    }
+
+    #[test]
+    fn reorg_undo_accepts_checkpoint_relative_source_counts()
+    -> Result<(), WalletProjectionContractError> {
+        let undo = WalletReorgUndo {
+            block: BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([0x77; 32])),
+            parent_hash: BlockHash::from_bytes([0x76; 32]),
+            source_sequence_digest_before:
+                CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                    CanonicalBlockFactsSequenceDigestVersion::V1,
+                    0,
+                    [0x75; 32],
+                ),
+            source_sequence_digest_after:
+                CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                    CanonicalBlockFactsSequenceDigestVersion::V1,
+                    1,
+                    [0x74; 32],
+                ),
+            created_outpoints: Vec::new(),
+            spent_outpoints: Vec::new(),
+            address_transaction_keys: Vec::new(),
+        };
+
+        assert_eq!(
+            WalletReorgUndo::decode(&undo.encode_key(), &undo.encode_value()?)?,
+            undo
+        );
+        Ok(())
     }
 
     #[test]
@@ -968,12 +1094,12 @@ mod tests {
             balance
         );
 
-        let undo = WalletReorgUndo {
-            block: unspent_output.created_at.block,
-            created_outpoints: vec![outpoint_key],
-            spent_outpoints: Vec::new(),
-            address_transaction_keys: vec![address_transaction_key],
-        };
+        let undo = undo_for(
+            unspent_output.created_at.block,
+            vec![outpoint_key],
+            Vec::new(),
+            vec![address_transaction_key],
+        );
         assert_eq!(
             WalletReorgUndo::decode(&undo.encode_key(), &undo.encode_value()?)?,
             undo
@@ -1002,12 +1128,12 @@ mod tests {
             output.created_at.block.height,
             output.created_at.tx_index_in_block,
         );
-        let undo = WalletReorgUndo {
-            block: output.created_at.block,
-            created_outpoints: vec![outpoint_key, outpoint_key],
-            spent_outpoints: Vec::new(),
-            address_transaction_keys: vec![address_transaction_key],
-        };
+        let undo = undo_for(
+            output.created_at.block,
+            vec![outpoint_key, outpoint_key],
+            Vec::new(),
+            vec![address_transaction_key],
+        );
         assert!(matches!(
             undo.encode_value(),
             Err(WalletProjectionContractError::DurableKeyOrder { .. })
@@ -1023,12 +1149,12 @@ mod tests {
             TransactionId::from_bytes([0x22; 32]),
             0,
         ));
-        let undo = WalletReorgUndo {
-            block: output.created_at.block,
-            created_outpoints: vec![higher_key, lower_key],
-            spent_outpoints: Vec::new(),
-            address_transaction_keys: Vec::new(),
-        };
+        let undo = undo_for(
+            output.created_at.block,
+            vec![higher_key, lower_key],
+            Vec::new(),
+            Vec::new(),
+        );
 
         assert!(matches!(
             undo.encode_value(),

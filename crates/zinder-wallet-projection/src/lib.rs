@@ -1,4 +1,4 @@
-//! Version-1 wallet projection contracts independent of storage engines.
+//! Wallet projection contracts independent of storage engines.
 //!
 //! This crate owns the exact durable keys and values needed by wallet-facing
 //! reads. It does not depend on canonical-store readers or the legacy derive
@@ -15,11 +15,16 @@ mod serial_oracle;
 
 pub use contract_error::WalletProjectionContractError;
 pub use control::{
+    ProjectionBuildLease, ProjectionBuildLeaseRequest, ProjectionBuildOwner,
     WalletCanonicalSourceIdentity, WalletProjectionBuildPlan, WalletProjectionBuildState,
-    WalletProjectionDigest, WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
+    WalletProjectionDigest, WalletProjectionEventCursor, WalletProjectionFamilyRowCounts,
+    WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
     WalletProjectionSourcePosition, WalletStoreControl, WalletUtxoSetSummary,
 };
-pub use digest::{WalletProjectionDigestBuilder, WalletProjectionRowFamily};
+pub use digest::{
+    WALLET_PROJECTION_ACCUMULATOR_LEN, WALLET_PROJECTION_ACCUMULATOR_VERSION,
+    WalletProjectionAccumulator, WalletProjectionDigestBuilder, WalletProjectionRowFamily,
+};
 pub use rows::{
     WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
     WalletAddressUnspentOutputKey, WalletOutpointKey, WalletReorgUndo, WalletSpentOutput,
@@ -27,14 +32,17 @@ pub use rows::{
 };
 pub use serial_oracle::WalletProjectionSerialOracle;
 
-/// Initial and only wallet projection schema version.
+/// Physical wallet schema version under the clean `wallet` identity.
 pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 1;
 
-/// Initial and only wallet projection value-encoding version.
-pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 1;
+/// Wallet projection row-value encoding version with source-bound reorg undo.
+pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 2;
+
+/// Version of the durable projection-build lease embedded in store control.
+pub const PROJECTION_BUILD_LEASE_VERSION: u16 = 1;
 
 /// Canonical store schema admitted by this projection schema.
-pub const REQUIRED_CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
+pub const REQUIRED_CANONICAL_STORE_SCHEMA_VERSION: u16 = 4;
 
 /// Canonical replay format admitted by this projection schema.
 pub const REQUIRED_CANONICAL_REPLAY_FORMAT_VERSION: u32 = 1;
@@ -49,4 +57,4 @@ pub const REQUIRED_CANONICAL_SEQUENCE_DIGEST_VERSION: u16 = 1;
 pub const WALLET_STORE_CONTROL_KEY: &[u8] = b"store_control";
 
 /// Persisted identity admitted as a wallet projection store.
-pub const WALLET_PROJECTION_STORE_IDENTITY: &[u8] = b"wallet-projection";
+pub const WALLET_PROJECTION_STORE_IDENTITY: &[u8] = b"wallet";

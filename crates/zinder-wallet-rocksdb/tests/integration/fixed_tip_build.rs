@@ -1,30 +1,356 @@
-use std::num::NonZeroU16;
+use std::{
+    fs,
+    num::{NonZeroU16, NonZeroU32, NonZeroU64},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 use prost::Message;
 use tempfile::TempDir;
 use zinder_core::{
-    BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
-    CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts,
-    ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId,
-    LockTime, Network, NetworkUpgradeActivation, NetworkUpgradeActivations, PrivacyShape,
-    SerializedBytesDigest, TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFacts,
+    CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
+    CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts, ChainTipMetadata,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId, LockTime, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, PrivacyShape, SerializedBytesDigest,
+    TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
     TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
     TransactionVersion, TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
     TransparentOutputFact, UnixTimestampMillis, encode_canonical_block_replay,
 };
 use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
+    CanonicalBuildBlock, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend,
+    CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
+    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
-    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletOutpointKey,
-    WalletProjectionFamilyRowCounts,
+    ProjectionBuildLeaseRequest, ProjectionBuildOwner, WALLET_PROJECTION_STORE_IDENTITY,
+    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
+    WalletProjectionFamilyRowCounts, WalletProjectionRetainedEventAnchor,
+    WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
-    RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletStore,
-    build_wallet_from_canonical,
+    RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildStore,
+    RocksDbWalletError, RocksDbWalletFollowingStore, RocksDbWalletStore,
+    WALLET_ROCKSDB_SCHEMA_VERSION, WalletBuildLeaseHeartbeat, WalletBuildLeasePhase,
+    WalletProjectionBuildLeaseExecution, build_wallet_from_canonical,
+    build_wallet_from_canonical_with_lease_and_heartbeat,
+    validate_wallet_projection_pre_promotion_fence,
 };
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the owner-checkpoint round trip keeps both stores and their shared advancement fence in one causal proof"
+)]
+fn owner_checkpoints_are_cold_admitted_and_remain_exact_after_sources_advance()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let activations = inactive_upgrade_activations()?;
+    let mut canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let canonical_before = canonical_store.ready_evidence();
+    let wallet_path = temporary.path().join("wallet-checkpoint-source");
+    let wallet_outcome = build_wallet_from_canonical(
+        &canonical_store,
+        &wallet_path,
+        RocksDbWalletBuildOptions {
+            supported_reorg_depth: 2,
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    let wallet_before = wallet_outcome.store.ready_evidence().clone();
+    let wallet_source_before = wallet_outcome.report.canonical_source_identity();
+    drop(wallet_outcome.store);
+    let mut wallet_store = RocksDbWalletStore::open_ready_for_following(
+        &wallet_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let canonical_existing_target = temporary.path().join("canonical-existing-target");
+    fs::create_dir(&canonical_existing_target)?;
+    let canonical_sentinel = canonical_existing_target.join("sentinel");
+    fs::write(&canonical_sentinel, b"canonical-target-must-remain")?;
+    assert!(matches!(
+        canonical_store.create_owner_checkpoint(
+            &canonical_existing_target,
+            RocksDbResourceBudget::for_local_tests(),
+        ),
+        Err(CanonicalStoreError::CheckpointTargetExists { ref path })
+            if path == &canonical_existing_target
+    ));
+    assert_eq!(
+        fs::read(&canonical_sentinel)?,
+        b"canonical-target-must-remain"
+    );
+    assert_eq!(fs::read_dir(&canonical_existing_target)?.count(), 1);
+
+    let wallet_existing_target = temporary.path().join("wallet-existing-target");
+    fs::create_dir(&wallet_existing_target)?;
+    let wallet_sentinel = wallet_existing_target.join("sentinel");
+    fs::write(&wallet_sentinel, b"wallet-target-must-remain")?;
+    assert!(matches!(
+        wallet_store.create_owner_checkpoint(
+            &wallet_existing_target,
+            RocksDbResourceBudget::for_local_tests(),
+        ),
+        Err(RocksDbWalletError::CheckpointTargetExists { ref path })
+            if path == &wallet_existing_target
+    ));
+    assert_eq!(fs::read(&wallet_sentinel)?, b"wallet-target-must-remain");
+    assert_eq!(fs::read_dir(&wallet_existing_target)?.count(), 1);
+
+    let canonical_checkpoint_path = temporary.path().join("canonical-checkpoint");
+    let canonical_checkpoint = canonical_store.create_owner_checkpoint(
+        &canonical_checkpoint_path,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(
+        canonical_checkpoint.store_identity,
+        CANONICAL_STORE_IDENTITY
+    );
+    assert_eq!(
+        canonical_checkpoint.schema_version,
+        CANONICAL_STORE_SCHEMA_VERSION
+    );
+    assert_eq!(canonical_checkpoint.ready_evidence, canonical_before);
+    assert_eq!(canonical_checkpoint.workload, canonical_store.workload());
+    assert_eq!(
+        canonical_checkpoint.build_plan,
+        *canonical_store.build_plan()
+    );
+
+    let wallet_checkpoint_path = temporary.path().join("wallet-checkpoint");
+    let wallet_checkpoint = wallet_store.create_owner_checkpoint(
+        &wallet_checkpoint_path,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(
+        wallet_checkpoint.store_identity,
+        WALLET_PROJECTION_STORE_IDENTITY
+    );
+    assert_eq!(
+        wallet_checkpoint.schema_version,
+        WALLET_ROCKSDB_SCHEMA_VERSION
+    );
+    assert_eq!(wallet_checkpoint.network, Network::ZcashRegtest);
+    assert_eq!(wallet_checkpoint.ready_evidence, wallet_before);
+
+    let initial_fence = canonical_store.event_fence();
+    let appended = block_facts(
+        4,
+        [0xc3; 32],
+        [0xc4; 32],
+        vec![transaction_facts(
+            TransactionId::from_bytes([0x40; 32]),
+            true,
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            vec![TransparentOutputFact::new(0, 1, [0x60], fixture.address_a)],
+        )],
+    );
+    let (canonical_store, append_fence) = canonical_store.commit_live_append(
+        CanonicalLiveAppend::new(
+            initial_fence,
+            canonical_build_block(appended, true),
+            Vec::new(),
+            initial_fence.visible_tip(),
+            UnixTimestampMillis::new(1_750_000_000_100),
+        ),
+        &activations,
+    )?;
+    assert_ne!(canonical_store.ready_evidence(), canonical_before);
+
+    let secondary =
+        open_incremental_secondary(&temporary, "canonical-secondary-checkpoint", &activations)?;
+    apply_current_retained_event(
+        &mut wallet_store,
+        &secondary,
+        wallet_source_before,
+        append_fence,
+    )?;
+    assert_ne!(wallet_store.ready_evidence(), &wallet_before);
+
+    let cold_canonical_checkpoint = RocksDbCanonicalStore::open_ready(
+        &canonical_checkpoint_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(100)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(
+        cold_canonical_checkpoint.ready_evidence(),
+        canonical_checkpoint.ready_evidence
+    );
+    assert_eq!(
+        cold_canonical_checkpoint.build_plan(),
+        &canonical_checkpoint.build_plan
+    );
+    let cold_wallet_checkpoint = RocksDbWalletStore::open_ready_for_following(
+        &wallet_checkpoint_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(
+        cold_wallet_checkpoint.ready_evidence(),
+        &wallet_checkpoint.ready_evidence
+    );
+    assert_eq!(
+        WalletCanonicalSourceIdentity::from_ready_evidence(cold_wallet_checkpoint.ready_evidence()),
+        wallet_source_before
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_checkpoints_refuse_and_preserve_broken_symlink_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let mut canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let wallet_path = temporary.path().join("wallet-checkpoint-source");
+    let wallet_outcome = build_wallet_from_canonical(
+        &canonical_store,
+        &wallet_path,
+        RocksDbWalletBuildOptions {
+            supported_reorg_depth: 2,
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    drop(wallet_outcome.store);
+    let mut wallet_store = RocksDbWalletStore::open_ready_for_following(
+        &wallet_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let canonical_missing_target = temporary.path().join("canonical-missing-checkpoint");
+    let canonical_checkpoint_target = temporary.path().join("canonical-checkpoint-link");
+    symlink(&canonical_missing_target, &canonical_checkpoint_target)?;
+    assert!(matches!(
+        canonical_store.create_owner_checkpoint(
+            &canonical_checkpoint_target,
+            RocksDbResourceBudget::for_local_tests(),
+        ),
+        Err(CanonicalStoreError::CheckpointTargetExists { ref path })
+            if path == &canonical_checkpoint_target
+    ));
+    assert_eq!(
+        fs::read_link(&canonical_checkpoint_target)?,
+        canonical_missing_target
+    );
+    assert!(
+        fs::symlink_metadata(&canonical_checkpoint_target)?
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!canonical_missing_target.exists());
+
+    let wallet_missing_target = temporary.path().join("wallet-missing-checkpoint");
+    let wallet_checkpoint_target = temporary.path().join("wallet-checkpoint-link");
+    symlink(&wallet_missing_target, &wallet_checkpoint_target)?;
+    assert!(matches!(
+        wallet_store.create_owner_checkpoint(
+            &wallet_checkpoint_target,
+            RocksDbResourceBudget::for_local_tests(),
+        ),
+        Err(RocksDbWalletError::CheckpointTargetExists { ref path })
+            if path == &wallet_checkpoint_target
+    ));
+    assert_eq!(
+        fs::read_link(&wallet_checkpoint_target)?,
+        wallet_missing_target
+    );
+    assert!(
+        fs::symlink_metadata(&wallet_checkpoint_target)?
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!wallet_missing_target.exists());
+    Ok(())
+}
+
+#[test]
+fn owner_checkpoint_cold_admission_refuses_a_replaced_same_plan_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+
+    let source_path = temporary.path().join("wallet-checkpoint-source");
+    let source_outcome = build_wallet_from_canonical(
+        &canonical_store,
+        &source_path,
+        RocksDbWalletBuildOptions {
+            supported_reorg_depth: 2,
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    let source_ready = source_outcome.store.ready_evidence().clone();
+    drop(source_outcome.store);
+    let mut source = RocksDbWalletStore::open_ready_for_following(
+        &source_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let replacement_path = temporary.path().join("wallet-checkpoint-replacement");
+    let replacement_outcome = build_wallet_from_canonical(
+        &canonical_store,
+        &replacement_path,
+        RocksDbWalletBuildOptions {
+            supported_reorg_depth: 2,
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    let replacement_ready = replacement_outcome.store.ready_evidence().clone();
+    assert_eq!(replacement_ready, source_ready);
+    drop(replacement_outcome.store);
+    let mut replacement = RocksDbWalletStore::open_ready_for_following(
+        &replacement_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let candidate = temporary.path().join("candidate");
+    fs::create_dir(&candidate)?;
+    let target = candidate.join("wallet.rocksdb");
+    let admission = source.create_owner_checkpoint_physical(&target)?;
+    let replacement_target = temporary.path().join("replacement-checkpoint");
+    let _replacement_admission =
+        replacement.create_owner_checkpoint_physical(&replacement_target)?;
+    fs::remove_dir_all(&target)?;
+    fs::rename(&replacement_target, &target)?;
+
+    let error = RocksDbWalletFollowingStore::cold_admit_owner_checkpoint(
+        &target,
+        &admission,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or("replaced wallet checkpoint unexpectedly passed cold admission")?;
+    assert!(matches!(
+        error,
+        RocksDbWalletError::AdmissionChanged {
+            reason: "checkpoint database identity differs from the physical owner checkpoint"
+        }
+    ));
+    let preserved = RocksDbWalletStore::open_ready_for_following(
+        &target,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(preserved.ready_evidence(), &replacement_ready);
+    Ok(())
+}
 
 #[test]
 fn fixed_tip_build_matches_exact_version_one_wallet_contract()
@@ -63,6 +389,605 @@ fn fixed_tip_build_matches_exact_version_one_wallet_contract()
         reopened.ready_evidence().source_sequence_digest,
         expected_source.source_sequence_digest()
     );
+    Ok(())
+}
+
+#[test]
+fn closed_canonical_primary_secondary_build_matches_primary_oracle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let options = RocksDbWalletBuildOptions {
+        max_secondary_sort_memory_bytes_per_sorter: 128,
+        supported_reorg_depth: 2,
+        ..RocksDbWalletBuildOptions::for_local_tests()
+    };
+    let primary_outcome = build_wallet_from_canonical(
+        &canonical_store,
+        temporary.path().join("wallet-primary"),
+        options,
+    )?;
+    let primary_report = primary_outcome.report.clone();
+    drop(primary_outcome.store);
+    drop(canonical_store);
+
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        temporary.path().join("canonical"),
+        temporary.path().join("canonical-secondary"),
+        &inactive_upgrade_activations()?,
+        CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(100)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let lease_request = ProjectionBuildLeaseRequest::new(
+        ProjectionBuildOwner::from_bytes([0x77; 16]),
+        primary_report.canonical_source_identity(),
+        WalletProjectionRetainedEventAnchor::new(1),
+        UnixTimestampMillis::new(u64::MAX),
+    );
+    let mut heartbeat = |_, _| Ok(WalletBuildLeaseHeartbeat::at(UnixTimestampMillis::new(1)));
+    let secondary_outcome = build_wallet_from_canonical_with_lease_and_heartbeat(
+        &secondary,
+        temporary.path().join("wallet-secondary"),
+        options,
+        WalletProjectionBuildLeaseExecution::new(lease_request, UnixTimestampMillis::new(0)),
+        &mut heartbeat,
+    )?;
+
+    assert_eq!(
+        secondary_outcome.report.source_position,
+        primary_report.source_position
+    );
+    assert_eq!(
+        secondary_outcome.report.source_sequence_digest,
+        primary_report.source_sequence_digest
+    );
+    assert_eq!(
+        secondary_outcome.report.projection_digest,
+        primary_report.projection_digest
+    );
+    assert_eq!(
+        secondary_outcome.report.row_counts,
+        primary_report.row_counts
+    );
+    assert_eq!(
+        secondary_outcome.report.utxo_summary,
+        primary_report.utxo_summary
+    );
+    assert_store(&secondary_outcome, &fixture)?;
+    Ok(())
+}
+
+#[test]
+fn cancelled_build_releases_its_exact_lease_for_immediate_discard_and_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let wallet_path = temporary.path().join("wallet-cancelled");
+    let options = RocksDbWalletBuildOptions::for_local_tests();
+    let mut heartbeat = |phase, _| {
+        if phase == WalletBuildLeasePhase::Initialized {
+            return Err(RocksDbWalletError::ProjectionBuildCancelled);
+        }
+        Ok(WalletBuildLeaseHeartbeat::at(UnixTimestampMillis::new(1)))
+    };
+
+    assert!(matches!(
+        build_wallet_from_canonical_with_lease_and_heartbeat(
+            &canonical_store,
+            &wallet_path,
+            options,
+            build_lease_execution(&canonical_store),
+            &mut heartbeat,
+        ),
+        Err(RocksDbWalletError::ProjectionBuildCancelled)
+    ));
+
+    RocksDbWalletBuildStore::open(
+        &wallet_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?
+    .discard_unpublished(UnixTimestampMillis::new(1))?;
+    assert!(!wallet_path.exists());
+    let retry = build_wallet_from_canonical(&canonical_store, &wallet_path, options)?;
+    assert_store(&retry, &fixture)?;
+    Ok(())
+}
+
+#[test]
+fn pre_promotion_error_releases_its_exact_lease_for_immediate_discard_and_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let wallet_path = temporary.path().join("wallet-pre-promotion-error");
+    let options = RocksDbWalletBuildOptions::for_local_tests();
+    let mut heartbeat = |phase, lease| {
+        if phase == WalletBuildLeasePhase::BeforePromotion {
+            validate_wallet_projection_pre_promotion_fence(&canonical_store, lease)?;
+            return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
+                reason: "test pre-promotion rejection",
+            });
+        }
+        Ok(WalletBuildLeaseHeartbeat::at(UnixTimestampMillis::new(1)))
+    };
+
+    assert!(matches!(
+        build_wallet_from_canonical_with_lease_and_heartbeat(
+            &canonical_store,
+            &wallet_path,
+            options,
+            build_lease_execution(&canonical_store),
+            &mut heartbeat,
+        ),
+        Err(RocksDbWalletError::CanonicalSourceFenceMismatch { .. })
+    ));
+
+    RocksDbWalletBuildStore::open(
+        &wallet_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?
+    .discard_unpublished(UnixTimestampMillis::new(1))?;
+    assert!(!wallet_path.exists());
+    let retry = build_wallet_from_canonical(&canonical_store, &wallet_path, options)?;
+    assert_store(&retry, &fixture)?;
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the end-to-end follower test keeps cancellation, collapsed reconciliation, and cold-build equality in one causal scenario"
+)]
+fn incremental_cancellation_and_collapsed_reconciliation_match_a_cold_wallet_projection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let activations = inactive_upgrade_activations()?;
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let options = RocksDbWalletBuildOptions {
+        supported_reorg_depth: 2,
+        ..RocksDbWalletBuildOptions::for_local_tests()
+    };
+    let wallet_path = temporary.path().join("wallet-incremental");
+    let initial = build_wallet_from_canonical(&canonical_store, &wallet_path, options)?;
+    let initial_source = initial.report.canonical_source_identity();
+    let wallet = initial.store;
+    let initial_fence = canonical_store.event_fence();
+    let appended = block_facts(
+        4,
+        [0xc3; 32],
+        [0xc4; 32],
+        vec![
+            transaction_facts(
+                TransactionId::from_bytes([0x40; 32]),
+                true,
+                vec![TransparentInputFact::new(
+                    0,
+                    TransparentOutPoint::COINBASE_SENTINEL,
+                )],
+                vec![TransparentOutputFact::new(0, 1, [0x60], fixture.address_a)],
+            ),
+            transaction_facts(
+                TransactionId::from_bytes([0x41; 32]),
+                false,
+                vec![TransparentInputFact::new(
+                    0,
+                    fixture.final_secondary_unspent,
+                )],
+                vec![TransparentOutputFact::new(0, 4, [0x61], fixture.address_b)],
+            ),
+        ],
+    );
+    let (canonical_store, append_fence) = canonical_store.commit_live_append(
+        CanonicalLiveAppend::new(
+            initial_fence,
+            canonical_build_block(appended, true),
+            Vec::new(),
+            initial_fence.visible_tip(),
+            UnixTimestampMillis::new(1_750_000_000_001),
+        ),
+        &activations,
+    )?;
+    drop(wallet);
+    let mut wallet = RocksDbWalletStore::open_ready_for_following(
+        &wallet_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(
+        zinder_wallet_projection::WalletCanonicalSourceIdentity::from_ready_evidence(
+            wallet.ready_evidence(),
+        ),
+        initial_source
+    );
+    let secondary =
+        open_incremental_secondary(&temporary, "canonical-secondary-append", &activations)?;
+    let append_event = retained_event_for_fence(&secondary, append_fence)?;
+    let before_cancellation = wallet.ready_evidence().clone();
+    assert!(matches!(
+        wallet.apply_canonical_event_range(
+            initial_source,
+            append_event,
+            append_fence,
+            secondary.ready_evidence().sequence_checkpoint.through(),
+            NonZeroU64::MIN,
+            secondary.scan_canonical_replay_range(append_event.committed_range())?,
+        ),
+        Err(RocksDbWalletError::TransitionLogicalByteLimit { .. })
+    ));
+    assert_eq!(wallet.ready_evidence(), &before_cancellation);
+    assert!(matches!(
+        wallet.apply_canonical_event_range_cancellable(
+            initial_source,
+            append_event,
+            append_fence,
+            secondary.ready_evidence().sequence_checkpoint.through(),
+            transition_logical_byte_limit(),
+            secondary.scan_canonical_replay_range(append_event.committed_range())?,
+            || true,
+        ),
+        Err(RocksDbWalletError::ProjectionTransitionCancelled)
+    ));
+    assert_eq!(wallet.ready_evidence(), &before_cancellation);
+    drop(secondary);
+
+    let replacement = block_facts(
+        4,
+        [0xc3; 32],
+        [0xd4; 32],
+        vec![
+            transaction_facts(
+                TransactionId::from_bytes([0x43; 32]),
+                true,
+                vec![TransparentInputFact::new(
+                    0,
+                    TransparentOutPoint::COINBASE_SENTINEL,
+                )],
+                vec![TransparentOutputFact::new(0, 2, [0x63], fixture.address_b)],
+            ),
+            transaction_facts(
+                TransactionId::from_bytes([0x42; 32]),
+                false,
+                vec![TransparentInputFact::new(0, fixture.final_primary_unspent)],
+                vec![TransparentOutputFact::new(0, 9, [0x62], fixture.address_a)],
+            ),
+        ],
+    );
+    let (canonical_store, reorg_fence) = canonical_store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            append_fence,
+            vec![CanonicalReplacementBlock::new(
+                canonical_build_block(replacement, true),
+                Vec::new(),
+            )],
+            UnixTimestampMillis::new(1_750_000_000_002),
+        ),
+        &activations,
+    )?;
+    let secondary =
+        open_incremental_secondary(&temporary, "canonical-secondary-reorg", &activations)?;
+    let retained_events = retained_events_after(&secondary, initial_source)?;
+    assert_eq!(retained_events.len(), 2);
+    assert_eq!(retained_events[0].resulting_fence(), append_fence);
+    assert_eq!(retained_events[1].resulting_fence(), reorg_fence);
+    let replay_range = BlockHeightRange::inclusive(BlockHeight::new(4), BlockHeight::new(4));
+    assert_eq!(retained_events[1].committed_range(), replay_range);
+    wallet.reconcile_canonical_event_sequence(
+        initial_source,
+        &retained_events,
+        reorg_fence,
+        secondary.ready_evidence().sequence_checkpoint.through(),
+        None,
+        replay_range,
+        transition_logical_byte_limit(),
+        secondary.scan_canonical_replay_range(replay_range)?,
+    )?;
+    assert_eq!(
+        wallet.ready_evidence().source_position.tip,
+        reorg_fence.visible_tip()
+    );
+    let source_after_collapsed_reconciliation =
+        WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+    drop(secondary);
+
+    // The follower now contains the first replacement's height-four undo row.
+    // Replacing that current suffix exercises direct reconciliation with a
+    // verified non-empty durable rollback rather than an append-only replay.
+    let second_replacement = block_facts(
+        4,
+        [0xc3; 32],
+        [0xe4; 32],
+        vec![transaction_facts(
+            TransactionId::from_bytes([0x44; 32]),
+            true,
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            vec![TransparentOutputFact::new(0, 6, [0x64], fixture.address_a)],
+        )],
+    );
+    let (canonical_store, second_reorg_fence) = canonical_store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            reorg_fence,
+            vec![CanonicalReplacementBlock::new(
+                canonical_build_block(second_replacement, true),
+                Vec::new(),
+            )],
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    let secondary =
+        open_incremental_secondary(&temporary, "canonical-secondary-second-reorg", &activations)?;
+    let retained_events = retained_events_after(&secondary, source_after_collapsed_reconciliation)?;
+    assert_eq!(retained_events.len(), 1);
+    assert_eq!(retained_events[0].resulting_fence(), second_reorg_fence);
+    assert!(wallet.find_reorg_undo(BlockHeight::new(4))?.is_some());
+    wallet.reconcile_canonical_event_sequence(
+        source_after_collapsed_reconciliation,
+        &retained_events,
+        second_reorg_fence,
+        secondary.ready_evidence().sequence_checkpoint.through(),
+        Some(replay_range),
+        replay_range,
+        transition_logical_byte_limit(),
+        secondary.scan_canonical_replay_range(replay_range)?,
+    )?;
+    assert_eq!(
+        wallet.ready_evidence().source_position.tip,
+        second_reorg_fence.visible_tip()
+    );
+
+    let cold = build_wallet_from_canonical(
+        &secondary,
+        temporary.path().join("wallet-cold-reorg"),
+        options,
+    )?;
+    let wallet = wallet.into_ready_store(cold.report.canonical_source_identity())?;
+    assert_eq!(wallet.ready_evidence(), cold.store.ready_evidence());
+    assert!(
+        wallet
+            .find_unspent_output(fixture.final_secondary_unspent)?
+            .is_some()
+    );
+    assert!(
+        wallet
+            .find_unspent_output(fixture.final_primary_unspent)?
+            .is_some()
+    );
+    drop(canonical_store);
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the end-to-end settlement test keeps suffix shrink, repeated reorg, reopen, and cold-build equality in one causal scenario"
+)]
+fn shortened_maximum_depth_replacements_keep_a_usable_suffix_and_match_a_cold_rebuild()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let activations = inactive_upgrade_activations()?;
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let options = RocksDbWalletBuildOptions {
+        supported_reorg_depth: 2,
+        ..RocksDbWalletBuildOptions::for_local_tests()
+    };
+    let wallet_path = temporary.path().join("wallet-shortened-replacement");
+    let initial = build_wallet_from_canonical(&canonical_store, &wallet_path, options)?;
+    let initial_source = initial.report.canonical_source_identity();
+    drop(initial.store);
+    let mut wallet = RocksDbWalletStore::open_ready_for_following(
+        &wallet_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let initial_fence = canonical_store.event_fence();
+    let appended_four = block_facts(
+        4,
+        [0xc3; 32],
+        [0xc4; 32],
+        vec![transaction_facts(
+            TransactionId::from_bytes([0x70; 32]),
+            true,
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            vec![TransparentOutputFact::new(0, 4, [0x70], fixture.address_a)],
+        )],
+    );
+    let (canonical_store, appended_four_fence) = canonical_store.commit_live_append(
+        CanonicalLiveAppend::new(
+            initial_fence,
+            canonical_build_block(appended_four, true),
+            Vec::new(),
+            initial_fence.visible_tip(),
+            UnixTimestampMillis::new(1_750_000_000_010),
+        ),
+        &activations,
+    )?;
+    let secondary = open_incremental_secondary(
+        &temporary,
+        "canonical-secondary-shortened-append-four",
+        &activations,
+    )?;
+    apply_current_retained_event(&mut wallet, &secondary, initial_source, appended_four_fence)?;
+    assert_eq!(
+        wallet.ready_evidence().settled_tip,
+        initial_fence.visible_tip()
+    );
+    assert_eq!(wallet.ready_evidence().row_counts.reorg_undo_count, 1);
+    let source_after_four =
+        WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+    drop(secondary);
+
+    let appended_five = block_facts(
+        5,
+        [0xc4; 32],
+        [0xc5; 32],
+        vec![transaction_facts(
+            TransactionId::from_bytes([0x71; 32]),
+            true,
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            vec![TransparentOutputFact::new(0, 5, [0x71], fixture.address_b)],
+        )],
+    );
+    let (canonical_store, appended_five_fence) = canonical_store.commit_live_append(
+        CanonicalLiveAppend::new(
+            appended_four_fence,
+            canonical_build_block(appended_five, true),
+            Vec::new(),
+            initial_fence.visible_tip(),
+            UnixTimestampMillis::new(1_750_000_000_011),
+        ),
+        &activations,
+    )?;
+    let secondary = open_incremental_secondary(
+        &temporary,
+        "canonical-secondary-shortened-append-five",
+        &activations,
+    )?;
+    apply_current_retained_event(
+        &mut wallet,
+        &secondary,
+        source_after_four,
+        appended_five_fence,
+    )?;
+    assert_eq!(
+        wallet.ready_evidence().settled_tip,
+        initial_fence.visible_tip()
+    );
+    assert_eq!(wallet.ready_evidence().row_counts.reorg_undo_count, 2);
+    let source_after_five =
+        WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+    drop(secondary);
+
+    // Canonical may shrink a maximum-depth suffix. The retained prefix through
+    // the settled tip is pruned atomically, leaving exactly the new unsettled
+    // suffix rather than an absolute-height-sized undo window.
+    let first_shortened = block_facts(
+        4,
+        [0xc3; 32],
+        [0xd4; 32],
+        vec![transaction_facts(
+            TransactionId::from_bytes([0x72; 32]),
+            true,
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            vec![TransparentOutputFact::new(0, 6, [0x72], fixture.address_a)],
+        )],
+    );
+    let (canonical_store, first_shortened_fence) = canonical_store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            appended_five_fence,
+            vec![CanonicalReplacementBlock::new(
+                canonical_build_block(first_shortened, true),
+                Vec::new(),
+            )],
+            UnixTimestampMillis::new(1_750_000_000_012),
+        ),
+        &activations,
+    )?;
+    let secondary = open_incremental_secondary(
+        &temporary,
+        "canonical-secondary-first-shortened-replacement",
+        &activations,
+    )?;
+    apply_current_retained_event(
+        &mut wallet,
+        &secondary,
+        source_after_five,
+        first_shortened_fence,
+    )?;
+    assert_eq!(wallet.ready_evidence().row_counts.reorg_undo_count, 1);
+    assert_eq!(
+        wallet.ready_evidence().settled_tip,
+        initial_fence.visible_tip()
+    );
+    assert!(wallet.find_reorg_undo(BlockHeight::new(4))?.is_some());
+    assert!(wallet.find_reorg_undo(BlockHeight::new(3))?.is_none());
+    let source_after_first_shortening =
+        WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+    drop(secondary);
+
+    // A later reorg wholly inside that retained suffix remains incremental.
+    let repeated_shortened = block_facts(
+        4,
+        [0xc3; 32],
+        [0xe4; 32],
+        vec![transaction_facts(
+            TransactionId::from_bytes([0x73; 32]),
+            true,
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            vec![TransparentOutputFact::new(0, 7, [0x73], fixture.address_b)],
+        )],
+    );
+    let (canonical_store, repeated_shortened_fence) = canonical_store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            first_shortened_fence,
+            vec![CanonicalReplacementBlock::new(
+                canonical_build_block(repeated_shortened, true),
+                Vec::new(),
+            )],
+            UnixTimestampMillis::new(1_750_000_000_013),
+        ),
+        &activations,
+    )?;
+    let secondary = open_incremental_secondary(
+        &temporary,
+        "canonical-secondary-repeated-shortened-replacement",
+        &activations,
+    )?;
+    apply_current_retained_event(
+        &mut wallet,
+        &secondary,
+        source_after_first_shortening,
+        repeated_shortened_fence,
+    )?;
+    assert_eq!(wallet.ready_evidence().row_counts.reorg_undo_count, 1);
+    assert_eq!(
+        wallet.ready_evidence().settled_tip,
+        initial_fence.visible_tip()
+    );
+    let expected_ready_evidence = wallet.ready_evidence().clone();
+    drop(wallet);
+    let wallet = RocksDbWalletStore::open_ready_for_following(
+        &wallet_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(wallet.ready_evidence(), &expected_ready_evidence);
+    let cold_after_repeated = build_wallet_from_canonical(
+        &secondary,
+        temporary
+            .path()
+            .join("wallet-cold-after-repeated-shortening"),
+        options,
+    )?;
+    assert_eq!(
+        wallet.ready_evidence(),
+        cold_after_repeated.store.ready_evidence()
+    );
+    drop(cold_after_repeated.store);
+    drop(secondary);
+    drop(canonical_store);
     Ok(())
 }
 
@@ -111,7 +1036,12 @@ fn build_ready_canonical_store(
     fixture: &WalletBaselineFixture,
 ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
     let tip = block_id(&fixture.blocks[2]);
-    let build_plan = CanonicalStoreBuildPlan::complete(&inactive_upgrade_activations()?, 0, tip)?;
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        &inactive_upgrade_activations()?,
+        0,
+        tip,
+        CanonicalReorgPolicy::new(100)?,
+    )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
         CanonicalStoreWorkload::Wallet,
@@ -136,6 +1066,97 @@ fn build_ready_canonical_store(
     Ok(validated.publish_baseline(publication)?)
 }
 
+fn open_incremental_secondary(
+    temporary: &TempDir,
+    secondary_name: &str,
+    activations: &NetworkUpgradeActivations,
+) -> Result<RocksDbCanonicalSecondary, Box<dyn std::error::Error>> {
+    Ok(RocksDbCanonicalSecondary::open_ready(
+        temporary.path().join("canonical"),
+        temporary.path().join(secondary_name),
+        activations,
+        CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(100)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?)
+}
+
+fn retained_event_for_fence(
+    secondary: &RocksDbCanonicalSecondary,
+    fence: CanonicalEventFence,
+) -> Result<zinder_store::CanonicalRetainedEvent, Box<dyn std::error::Error>> {
+    secondary
+        .canonical_event_history(CanonicalEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(16).ok_or("canonical event test page limit must be non-zero")?,
+        ))?
+        .into_iter()
+        .find(|event| event.cursor().event_sequence() == fence.chain_event_sequence())
+        .ok_or_else(|| "retained canonical event for test fence is absent".into())
+}
+
+fn retained_events_after(
+    secondary: &RocksDbCanonicalSecondary,
+    source: WalletCanonicalSourceIdentity,
+) -> Result<Vec<zinder_store::CanonicalRetainedEvent>, Box<dyn std::error::Error>> {
+    let cursor = source.source_position().event_cursor.as_bytes();
+    Ok(
+        secondary.canonical_event_history(CanonicalEventHistoryRequest::new(
+            Some(&cursor),
+            NonZeroU32::new(16).ok_or("canonical event test page limit must be non-zero")?,
+        ))?,
+    )
+}
+
+fn apply_current_retained_event(
+    wallet: &mut RocksDbWalletFollowingStore,
+    secondary: &RocksDbCanonicalSecondary,
+    expected_source: WalletCanonicalSourceIdentity,
+    fence: CanonicalEventFence,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let event = retained_event_for_fence(secondary, fence)?;
+    let replay_range = event.committed_range();
+    wallet.apply_canonical_event_range(
+        expected_source,
+        event,
+        fence,
+        secondary.ready_evidence().sequence_checkpoint.through(),
+        transition_logical_byte_limit(),
+        secondary.scan_canonical_replay_range(replay_range)?,
+    )?;
+    Ok(())
+}
+
+fn transition_logical_byte_limit() -> NonZeroU64 {
+    NonZeroU64::new(512 * 1024 * 1024).unwrap_or(NonZeroU64::MIN)
+}
+
+fn build_lease_execution(
+    canonical_store: &RocksDbCanonicalStore,
+) -> WalletProjectionBuildLeaseExecution {
+    let ready = canonical_store.ready_evidence();
+    let source = WalletCanonicalSourceIdentity::new(
+        WalletProjectionSourcePosition::new(
+            ready.visible_epoch,
+            ready.visible_tip,
+            ready.visible_event_sequence,
+        ),
+        CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            ready.sequence_digest_version,
+            ready.visible_block_count,
+            ready.visible_sequence_digest,
+        ),
+        ready.sequence_checkpoint.through(),
+    );
+    let lease_request = ProjectionBuildLeaseRequest::new(
+        ProjectionBuildOwner::from_bytes([0x91; 16]),
+        source,
+        WalletProjectionRetainedEventAnchor::new(ready.visible_event_sequence),
+        UnixTimestampMillis::new(u64::MAX),
+    );
+    WalletProjectionBuildLeaseExecution::new(lease_request, UnixTimestampMillis::new(0))
+}
+
 fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
     assert_eq!(
         outcome.report.row_counts,
@@ -145,17 +1166,21 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
             transparent_spent_output_count: 2,
             transparent_address_transaction_count: 6,
             transparent_address_balance_count: 2,
-            reorg_undo_count: 2,
+            reorg_undo_count: 0,
         }
+    );
+    assert_eq!(
+        outcome.report.settled_tip,
+        outcome.report.source_position.tip
     );
     assert_eq!(outcome.report.utxo_summary.utxo_count, 4);
     assert_eq!(outcome.report.utxo_summary.total_value_zat, 20);
     assert_eq!(
         outcome.report.projection_digest.as_bytes(),
         [
-            0x32, 0xfc, 0x0e, 0xd4, 0xa1, 0x61, 0x2b, 0xbf, 0x74, 0x0f, 0x56, 0xef, 0x3d, 0xcc,
-            0x16, 0xd8, 0x89, 0x61, 0x3b, 0x6b, 0x38, 0x3c, 0xab, 0xb8, 0x57, 0x73, 0x7f, 0xa1,
-            0xa6, 0xa9, 0x0b, 0x0f,
+            0x00, 0x68, 0xe0, 0x28, 0x2d, 0x7f, 0x1e, 0xd5, 0x05, 0x78, 0xf5, 0x29, 0x5c, 0x9e,
+            0x12, 0x04, 0x48, 0x4d, 0x2b, 0x41, 0xe9, 0x8b, 0x5d, 0x72, 0x2d, 0x52, 0x21, 0xc9,
+            0xa5, 0x8b, 0x7d, 0xeb,
         ]
     );
     assert_eq!(outcome.report.scanned_block_count, 3);
@@ -180,11 +1205,11 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
             .initial_run_count
             > 1
     );
-    assert!(
+    assert_eq!(
         outcome
             .report
-            .cold_validation_peak_accounted_reorg_undo_bytes
-            > 0
+            .cold_validation_peak_accounted_reorg_undo_bytes,
+        0
     );
     assert!(
         outcome
@@ -248,20 +1273,15 @@ fn assert_store(
             .find_address_transaction(address_transaction_key)?
             .is_some()
     );
-    let tip_undo = outcome
-        .store
-        .find_reorg_undo(BlockHeight::new(3))?
-        .ok_or("tip undo must exist")?;
-    assert_eq!(tip_undo.created_outpoints.len(), 3);
-    assert!(tip_undo.spent_outpoints.is_empty());
-    assert_eq!(tip_undo.address_transaction_keys.len(), 3);
     assert_eq!(
-        tip_undo.created_outpoints,
-        vec![
-            WalletOutpointKey::new(fixture.same_block_spent),
-            WalletOutpointKey::new(fixture.final_primary_unspent),
-            WalletOutpointKey::new(fixture.final_secondary_unspent),
-        ]
+        outcome.store.ready_evidence().settled_tip,
+        outcome.report.source_position.tip
+    );
+    assert!(
+        outcome
+            .store
+            .find_reorg_undo(BlockHeight::new(3))?
+            .is_none()
     );
     assert_address_pages(outcome, fixture)?;
     Ok(())

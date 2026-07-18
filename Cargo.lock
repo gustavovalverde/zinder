@@ -5713,7 +5713,6 @@ dependencies = [
  "zinder-derive",
  "zinder-proto",
  "zinder-query",
- "zinder-source",
  "zinder-store",
  "zinder-testkit",
 ]
@@ -5749,11 +5748,13 @@ dependencies = [
 name = "zinder-compat-lightwalletd"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "clap",
  "config",
  "eyre",
  "hex",
+ "metrics",
  "parking_lot",
  "prost",
  "secrecy",
@@ -5859,7 +5860,6 @@ name = "zinder-ingest"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
  "clap",
  "config",
  "eyre",
@@ -5894,6 +5894,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinder-projector"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "eyre",
+ "getrandom 0.4.3",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml",
+ "tonic",
+ "tracing",
+ "zinder-core",
+ "zinder-proto",
+ "zinder-runtime",
+ "zinder-source",
+ "zinder-store",
+ "zinder-testkit",
+ "zinder-wallet-projection",
+ "zinder-wallet-rocksdb",
+]
+
+[[package]]
 name = "zinder-proto"
 version = "0.1.0"
 dependencies = [
@@ -5912,27 +5941,23 @@ dependencies = [
 name = "zinder-query"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
- "clap",
- "config",
  "eyre",
  "hex",
  "metrics",
  "parking_lot",
  "prost",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
- "toml",
  "tonic",
  "tonic-health",
  "tonic-reflection",
  "tonic-types",
- "tracing",
  "zebra-chain",
  "zinder-core",
  "zinder-derive",
@@ -5950,6 +5975,7 @@ name = "zinder-rocksdb"
 version = "0.1.0"
 dependencies = [
  "rust-rocksdb",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -6037,6 +6063,8 @@ dependencies = [
  "parking_lot",
  "prost",
  "rust-rocksdb",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
@@ -6086,8 +6114,8 @@ dependencies = [
 name = "zinder-wallet-projection"
 version = "0.1.0"
 dependencies = [
+ "blake2b_simd",
  "hex",
- "sha2 0.10.9",
  "thiserror 2.0.18",
  "zinder-core",
 ]

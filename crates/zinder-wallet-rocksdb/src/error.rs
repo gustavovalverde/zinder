@@ -3,10 +3,12 @@
 use std::{io, path::PathBuf};
 
 use thiserror::Error;
-use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network};
+use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis};
 use zinder_rocksdb::BulkLoadError;
 use zinder_store::CanonicalStoreError;
-use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionContractError};
+use zinder_wallet_projection::{
+    ProjectionBuildOwner, WalletCanonicalSourceIdentity, WalletProjectionContractError,
+};
 
 /// Failure to create, publish, admit, or query a version-1 wallet store.
 #[derive(Debug, Error)]
@@ -52,6 +54,21 @@ pub enum RocksDbWalletError {
     PathNotFresh {
         /// Rejected build path.
         path: PathBuf,
+    },
+    /// An owner checkpoint was pointed at a path that already exists.
+    #[error("wallet owner checkpoint requires an absent target path: {path}")]
+    CheckpointTargetExists {
+        /// Existing path preserved without mutation.
+        path: PathBuf,
+    },
+    /// The concrete `RocksDB` checkpoint operation failed.
+    #[error("wallet owner checkpoint at {path} failed: {source}")]
+    CheckpointFailed {
+        /// Requested checkpoint target.
+        path: PathBuf,
+        /// Underlying `RocksDB` checkpoint failure.
+        #[source]
+        source: rust_rocksdb::Error,
     },
     /// A deterministic sibling projection-load staging path already exists.
     #[error(
@@ -131,6 +148,108 @@ pub enum RocksDbWalletError {
         /// Canonical identity committed by the READY wallet control record.
         observed: Box<WalletCanonicalSourceIdentity>,
     },
+    /// A different owner holds an unexpired durable projection-build lease.
+    #[error("wallet projection build lease is held until {expires_at:?}")]
+    ProjectionBuildLeaseHeld {
+        /// The first instant at which takeover may be attempted.
+        expires_at: UnixTimestampMillis,
+    },
+    /// The supplied lease is no longer live at the caller's explicit clock.
+    #[error("wallet projection build lease expired at {expires_at:?}")]
+    ProjectionBuildLeaseExpired {
+        /// Durable expiry bound that was reached.
+        expires_at: UnixTimestampMillis,
+    },
+    /// The caller supplied a non-future expiry for an acquire or renewal.
+    #[error("wallet projection build lease expiry must be after the supplied clock")]
+    ProjectionBuildLeaseExpiryNotFuture,
+    /// A lease renewal did not extend the existing durable expiry.
+    #[error("wallet projection build lease renewal must extend the durable expiry")]
+    ProjectionBuildLeaseRenewalNotExtended,
+    /// The supplied capability is owned by a different process identity.
+    #[error("wallet projection build lease owner does not match the durable owner")]
+    ProjectionBuildLeaseOwnerMismatch {
+        /// Owner identity persisted by the active lease.
+        expected: ProjectionBuildOwner,
+        /// Owner identity supplied by the caller.
+        observed: ProjectionBuildOwner,
+    },
+    /// The supplied capability belongs to an obsolete ownership generation.
+    #[error("wallet projection build lease generation does not match the durable generation")]
+    ProjectionBuildLeaseGenerationMismatch {
+        /// Monotonic generation persisted by the active lease.
+        expected: u64,
+        /// Generation supplied by the caller.
+        observed: u64,
+    },
+    /// A requested or promoted source differs from the durable lease anchor.
+    #[error("wallet projection build lease canonical anchor mismatch: {reason}")]
+    ProjectionBuildLeaseCanonicalAnchorMismatch {
+        /// Stable source-anchor mismatch reason.
+        reason: &'static str,
+    },
+    /// A control record has no active build lease to authorize the mutation.
+    #[error("wallet projection build lease is absent")]
+    ProjectionBuildLeaseMissing,
+    /// The monotonic lease-generation domain is exhausted.
+    #[error("wallet projection build lease generation exceeds u64::MAX")]
+    ProjectionBuildLeaseGenerationOverflow,
+    /// A caller stopped a projection build before READY promotion.
+    #[error("wallet projection build was cancelled")]
+    ProjectionBuildCancelled,
+    /// A failed pre-promotion build could not clear its own exact durable lease.
+    #[error(
+        "wallet projection build failed ({build_error}) and exact lease cleanup failed ({cleanup_error})"
+    )]
+    BuildLeaseCleanup {
+        /// The original build failure that triggered cleanup.
+        build_error: Box<Self>,
+        /// The failure while releasing only the acquired lease capability.
+        cleanup_error: Box<Self>,
+    },
+    /// A caller stopped an incremental wallet transition before its atomic write.
+    #[error("wallet projection transition was cancelled before its atomic write")]
+    ProjectionTransitionCancelled,
+    /// A transition budget exceeds the hard maximum safe in-process plan size.
+    #[error(
+        "wallet projection transition logical-byte limit {requested_bytes} exceeds the maximum {maximum_bytes}"
+    )]
+    InvalidTransitionLogicalByteLimit {
+        /// Caller-requested logical-byte ceiling.
+        requested_bytes: u64,
+        /// Hard implementation maximum.
+        maximum_bytes: u64,
+    },
+    /// A planned transition would exceed its accounted batch-and-overlay ceiling.
+    #[error(
+        "wallet projection transition requires at least {required_bytes} accounted logical bytes, limit is {limit_bytes}"
+    )]
+    TransitionLogicalByteLimit {
+        /// Caller-supplied hard ceiling.
+        limit_bytes: u64,
+        /// Minimum logical bytes required by the refused planned mutation.
+        required_bytes: u64,
+    },
+    /// Checked logical-byte accounting exceeded the `u64` domain.
+    #[error("wallet projection transition logical-byte accounting exceeds u64::MAX")]
+    TransitionLogicalByteAccountingOverflow,
+    /// The current wallet undo suffix cannot safely represent a valid canonical rewind.
+    #[error(
+        "wallet projection rebuild is required before following this canonical transition: {reason}"
+    )]
+    ProjectionRebuildRequired {
+        /// Stable rebuild trigger suitable for operator and projector policy.
+        reason: &'static str,
+    },
+    /// A canonical event, fence, replay range, or durable wallet row was inconsistent.
+    #[error("wallet projection transition was rejected: {reason}")]
+    ProjectionTransitionRejected {
+        /// Stable rejection reason.
+        reason: &'static str,
+    },
+    /// The wallet primary's monotonic transition generation is exhausted.
+    #[error("wallet projection transition generation exceeds u64::MAX")]
+    ProjectionTransitionGenerationOverflow,
     /// A page continuation belongs to an address other than the requested address.
     #[error("wallet RocksDB {index} continuation belongs to a different address")]
     ContinuationAddressMismatch {

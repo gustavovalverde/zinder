@@ -73,12 +73,52 @@ pub enum WalletProjectionContractError {
         /// Durable record being decoded.
         field: &'static str,
     },
-    /// Projection digest rows are not strictly ordered by durable key.
-    #[error("wallet projection digest row keys must be strictly increasing")]
-    ProjectionDigestKeyOrder,
-    /// A projection digest family contains more than `u64::MAX` rows.
-    #[error("wallet projection digest family row count exceeds u64::MAX")]
+    /// A projection accumulator family contains more than `u64::MAX` rows.
+    #[error("wallet projection accumulator family row count exceeds u64::MAX")]
     ProjectionDigestRowCountOverflow,
+    /// A projection accumulator removal was attempted from an empty family.
+    #[error("wallet projection accumulator family row count underflow")]
+    ProjectionDigestRowCountUnderflow,
+    /// A persisted projection accumulator uses an unsupported algorithm version.
+    #[error("wallet projection accumulator has unsupported version {encoded}")]
+    UnsupportedProjectionAccumulatorVersion {
+        /// Unsupported durable accumulator version.
+        encoded: u64,
+    },
+    /// A persisted projection accumulator has the wrong exact byte length.
+    #[error(
+        "wallet projection accumulator has invalid byte length; expected {expected}, observed {actual}"
+    )]
+    ProjectionAccumulatorLengthMismatch {
+        /// Required accumulator byte length.
+        expected: usize,
+        /// Observed durable byte length.
+        actual: usize,
+    },
+    /// READY evidence's display digest is not derived from its full accumulator.
+    #[error("wallet projection display digest does not match its full accumulator")]
+    ProjectionAccumulatorDigestMismatch,
+    /// A persisted wallet event cursor uses an unsupported version.
+    #[error("wallet projection event cursor has unsupported version {encoded}")]
+    UnsupportedWalletProjectionEventCursorVersion {
+        /// Unsupported durable cursor version.
+        encoded: u64,
+    },
+    /// A wallet event cursor must name a nonzero retained event sequence.
+    #[error("wallet projection event cursor must name a nonzero event sequence")]
+    WalletProjectionEventCursorZeroSequence,
+    /// A source position's event cursor and event sequence differ.
+    #[error("wallet projection source position event cursor does not match its event sequence")]
+    WalletProjectionEventCursorSequenceMismatch,
+    /// A reorg undo record has an unsupported source-sequence digest version.
+    #[error("wallet reorg undo source sequence digest must use version 1")]
+    ReorgUndoSourceSequenceVersionMismatch,
+    /// A reorg undo record's source sequence does not advance exactly once.
+    #[error("wallet reorg undo source sequence digests do not differ by one block")]
+    ReorgUndoSourceSequenceLengthMismatch,
+    /// The wallet projection source sequence exceeded its `u64` count domain.
+    #[error(transparent)]
+    SourceSequenceLength(#[from] zinder_core::CanonicalBlockFactsSequenceLengthOverflow),
     /// A canonical block does not extend the oracle's current tip.
     #[error("canonical block does not extend the wallet projection serial oracle")]
     NonContiguousBlock,
@@ -121,11 +161,14 @@ pub enum WalletProjectionContractError {
     /// The ready UTXO count must equal the unspent-output row count.
     #[error("wallet UTXO count does not match the unspent-output row count")]
     ReadyUtxoCountMismatch,
-    /// The ready undo family must cover the configured tip window exactly.
-    #[error("wallet reorg-undo count does not match its supported depth")]
+    /// The ready undo family must cover the unsettled canonical suffix exactly.
+    #[error("wallet reorg-undo count does not match the unsettled canonical suffix")]
     ReadyReorgUndoCountMismatch,
-    /// The source sequence must contain one digest for every projected height.
-    #[error("wallet source sequence length does not match its projected tip")]
+    /// The canonical settled tip is not an ancestor of the ready visible tip.
+    #[error("wallet settled tip lies outside the ready canonical source range")]
+    ReadySettledTipOutsideSourceRange,
+    /// The source sequence does not contain the retained tip block.
+    #[error("wallet source sequence must contain at least one retained tip block")]
     ReadySourceSequenceLengthMismatch,
     /// Version 1 accepts only canonical sequence digest version 1.
     #[error("wallet source sequence digest must use version 1")]
@@ -133,6 +176,30 @@ pub enum WalletProjectionContractError {
     /// Version 1 requires an `LtHash16` UTXO commitment.
     #[error("wallet readiness requires the LtHash16 UTXO commitment scheme")]
     ReadyUtxoCommitmentSchemeMismatch,
+    /// A persisted build lease uses an unsupported lease encoding version.
+    #[error("wallet projection build lease has unsupported version {encoded}")]
+    UnsupportedProjectionBuildLeaseVersion {
+        /// Unsupported durable lease version.
+        encoded: u64,
+    },
+    /// A persisted lease does not name the wallet projection schema that contains it.
+    #[error("wallet projection build lease schema does not match store schema")]
+    ProjectionBuildLeaseSchemaMismatch,
+    /// A persisted lease belongs to a different network than its store control.
+    #[error("wallet projection build lease network does not match store control")]
+    ProjectionBuildLeaseNetworkMismatch,
+    /// A persisted lease and singleton control record disagree about writer generation.
+    #[error("wallet projection build lease generation does not match store control")]
+    ProjectionBuildLeaseGenerationMismatch,
+    /// A persisted lease is not anchored at the BUILDING plan's canonical target.
+    #[error("wallet projection build lease canonical anchor does not match the BUILDING plan")]
+    ProjectionBuildLeaseCanonicalAnchorMismatch,
+    /// A retained event anchor follows the canonical anchor it is meant to resume from.
+    #[error("wallet projection retained event anchor follows its canonical anchor")]
+    ProjectionBuildLeaseRetainedEventAnchorMismatch,
+    /// READY state must not retain a build lease after atomic promotion.
+    #[error("READY wallet projection control must not retain a build lease")]
+    ReadyControlRetainsBuildLease,
 }
 
 pub(crate) fn encoded_len(

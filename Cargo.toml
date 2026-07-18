@@ -16,6 +16,7 @@ members = [
     "services/zinder-compat-cipherscan",
     "services/zinder-explorer",
     "services/zinder-ingest",
+    "services/zinder-projector",
     "services/zinder-query",
     "vendor/postgres-protocol",
 ]
@@ -39,6 +40,7 @@ color-eyre = { version = "0.6.5", default-features = false, features = ["track-c
 config = { version = "0.15.25", default-features = false, features = ["toml"] }
 eyre = "0.6.12"
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+getrandom = { version = "0.4.2", features = ["std"] }
 hex = "0.4.3"
 hmac = "0.12.1"
 http-body-util = "0.1"
@@ -84,6 +86,7 @@ zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
 zinder-derive = { path = "crates/zinder-derive" }
 zinder-explorer = { path = "services/zinder-explorer" }
 zinder-ingest = { path = "services/zinder-ingest" }
+zinder-projector = { path = "services/zinder-projector" }
 zinder-proto = { path = "crates/zinder-proto" }
 zinder-rocksdb = { path = "crates/zinder-rocksdb" }
 zinder-query = { path = "services/zinder-query" }
