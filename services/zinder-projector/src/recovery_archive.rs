@@ -44,6 +44,7 @@ pub const MAX_RECOVERY_ARCHIVE_TOTAL_BYTES: u64 = 1_024 * 1024 * 1024 * 1024;
 pub const MAX_RECOVERY_ARCHIVE_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 const RECOVERY_ARCHIVE_TEMPORARY_FILE_NAME: &str = ".recovery-archive.json.incomplete";
+const RECOVERY_ARCHIVE_FILE_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Immutable-at-admission descriptor for one byte-verified recovery artifact.
 ///
@@ -318,7 +319,33 @@ pub fn admit_recovery_archive(
         "configured recovery archive root",
     )?;
     let root = archive_root.join(candidate_id);
-    require_directory(&root, "recovery archive candidate")?;
+    let manifest = admit_recovery_archive_outer(&root, candidate_id, expected_network)?;
+    let state_bundle = admit_recovery_archive_state_bundle(&root, &manifest, expected_network)?;
+    let construction_binding = RocksDbCanonicalStore::read_construction_manifest_binding(
+        root.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME),
+    )
+    .map_err(RecoveryArchiveError::ConstructionManifest)?;
+    require_construction_manifest_binding(&state_bundle, construction_binding)?;
+    require_contract(
+        state_bundle.canonical_checkpoint_database_identity_sha256()
+            == manifest.canonical_checkpoint_database_identity_sha256,
+        "recovery archive canonical checkpoint identity does not match the inner manifest",
+    )?;
+    require_contract(
+        state_bundle.wallet_checkpoint_database_identity_sha256()
+            == manifest.wallet_checkpoint_database_identity_sha256,
+        "recovery archive wallet checkpoint identity does not match the inner manifest",
+    )?;
+    let root = fs::canonicalize(&root).map_err(|source| RecoveryArchiveError::io(&root, source))?;
+    Ok(AdmittedRecoveryArchive { root, manifest })
+}
+
+fn admit_recovery_archive_outer(
+    root: &Path,
+    candidate_id: &str,
+    expected_network: Network,
+) -> Result<RecoveryArchiveManifest, RecoveryArchiveError> {
+    require_directory(root, "recovery archive candidate")?;
     let manifest_path = root.join(RECOVERY_ARCHIVE_MANIFEST_FILE_NAME);
     require_regular_file(&manifest_path, "recovery archive manifest")?;
     require_not_hard_link(&manifest_path, "recovery archive manifest")?;
@@ -342,13 +369,21 @@ pub fn admit_recovery_archive(
         parse_network(&manifest.network) == Some(expected_network),
         "recovery archive network does not match",
     )?;
-    let observed_files = collect_payload_files(&root, true)?;
+    let observed_files = collect_payload_files(root, true)?;
     require_contract(
         observed_files == manifest.payload_files,
         "recovery archive payload bytes do not match the outer manifest",
     )?;
+    Ok(manifest)
+}
+
+fn admit_recovery_archive_state_bundle(
+    root: &Path,
+    manifest: &RecoveryArchiveManifest,
+    expected_network: Network,
+) -> Result<StateBundleManifest, RecoveryArchiveError> {
     let state_bundle = StateBundleManifest::read_with_additional_root_entries(
-        &root,
+        root,
         expected_network,
         &[RECOVERY_ARCHIVE_MANIFEST_FILE_NAME],
     )?;
@@ -376,23 +411,7 @@ pub fn admit_recovery_archive(
             == manifest.canonical_construction_manifest_sha256,
         "recovery archive construction-manifest SHA-256 does not match the inner manifest",
     )?;
-    let construction_binding = RocksDbCanonicalStore::read_construction_manifest_binding(
-        root.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME),
-    )
-    .map_err(RecoveryArchiveError::ConstructionManifest)?;
-    require_construction_manifest_binding(&state_bundle, construction_binding)?;
-    require_contract(
-        state_bundle.canonical_checkpoint_database_identity_sha256()
-            == manifest.canonical_checkpoint_database_identity_sha256,
-        "recovery archive canonical checkpoint identity does not match the inner manifest",
-    )?;
-    require_contract(
-        state_bundle.wallet_checkpoint_database_identity_sha256()
-            == manifest.wallet_checkpoint_database_identity_sha256,
-        "recovery archive wallet checkpoint identity does not match the inner manifest",
-    )?;
-    let root = fs::canonicalize(&root).map_err(|source| RecoveryArchiveError::io(&root, source))?;
-    Ok(AdmittedRecoveryArchive { root, manifest })
+    Ok(state_bundle)
 }
 
 /// Recovery packaging or byte-admission failure.
@@ -524,7 +543,7 @@ fn copy_directory(
         .map_err(|source_error| RecoveryArchiveError::io(source, source_error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source_error| RecoveryArchiveError::io(source, source_error))?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(fs::DirEntry::file_name);
     for entry in entries {
         let name = entry.file_name();
         validate_component_name(&name)?;
@@ -579,7 +598,7 @@ fn copy_regular_file(
         .map_err(|source_error| RecoveryArchiveError::io(target, source_error))?;
     let mut digest = Sha256::new();
     let mut byte_length = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; RECOVERY_ARCHIVE_FILE_BUFFER_BYTES];
     loop {
         let read = input
             .read(&mut buffer)
@@ -659,7 +678,7 @@ fn collect_directory(
         .map_err(|source| RecoveryArchiveError::io(directory, source))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| RecoveryArchiveError::io(directory, source))?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(fs::DirEntry::file_name);
     for entry in entries {
         let name = entry.file_name();
         validate_component_name(&name)?;
@@ -707,7 +726,7 @@ fn collect_regular_file(
     require_not_hard_link_metadata(path, &opened, "recovery payload file")?;
     let mut digest = Sha256::new();
     let mut byte_length = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; RECOVERY_ARCHIVE_FILE_BUFFER_BYTES];
     loop {
         let read = file
             .read(&mut buffer)
@@ -993,14 +1012,19 @@ fn validate_payload_path(path: &str) -> Result<(), RecoveryArchiveError> {
         .next()
         .and_then(|component| match component {
             Component::Normal(component) => component.to_str(),
-            _ => None,
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => None,
         });
     require_contract(
         matches!(
             first,
-            Some(CANONICAL_CHECKPOINT_DIRECTORY_NAME)
-                | Some(WALLET_CHECKPOINT_DIRECTORY_NAME)
-                | Some(STATE_BUNDLE_MANIFEST_FILE_NAME)
+            Some(
+                CANONICAL_CHECKPOINT_DIRECTORY_NAME
+                    | WALLET_CHECKPOINT_DIRECTORY_NAME
+                    | STATE_BUNDLE_MANIFEST_FILE_NAME
+            )
         ),
         "recovery payload path is outside the fixed archive layout",
     )?;

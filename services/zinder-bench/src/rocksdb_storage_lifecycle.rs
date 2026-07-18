@@ -314,13 +314,13 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let final_wallet_ready = wallet_store.ready_evidence();
     let wallet_cold_reopen_evidence_match = *final_wallet_ready == published_wallet_ready;
     let wallet_canonical_fence_match =
-        wallet_source_matches_canonical(final_wallet_ready, final_canonical_ready);
+        wallet_source_matches_canonical(final_wallet_ready, &final_canonical_ready);
     let wallet_storage_ready_seconds = wallet_started.elapsed().as_secs_f64();
     let total = total_started.elapsed();
     let wallet_physical_store_bytes = directory_bytes(&validated.wallet_store)?;
 
     let canonical_ready_summary = canonical_ready_summary(
-        published_canonical_ready,
+        &published_canonical_ready,
         &canonical_block_evidence,
         canonical_subtree_evidence,
         canonical_physical_store_bytes,
@@ -566,7 +566,7 @@ fn validate_source_block_identity(
     reason = "the summary maps distinct canonical lifecycle evidence without creating a second aggregate type"
 )]
 fn canonical_ready_summary(
-    ready: CanonicalStoreReadyEvidence,
+    ready: &CanonicalStoreReadyEvidence,
     block_load: &zinder_store::CanonicalBlockLoadEvidence,
     subtree_load: zinder_store::CanonicalSubtreeRootLoadEvidence,
     physical_store_bytes: u64,
@@ -708,7 +708,7 @@ fn variable_value_sort_evidence(
 
 fn wallet_source_matches_canonical(
     wallet: &zinder_wallet_projection::WalletProjectionReadyEvidence,
-    canonical: CanonicalStoreReadyEvidence,
+    canonical: &CanonicalStoreReadyEvidence,
 ) -> bool {
     let canonical_sequence_digest =
         CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(

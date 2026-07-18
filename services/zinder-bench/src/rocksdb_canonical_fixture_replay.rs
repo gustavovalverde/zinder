@@ -515,7 +515,7 @@ fn ready_summary(
         visible_event_sequence: reopened.visible_event_sequence,
         visible_block_count: reopened.visible_block_count,
         replay_format_version: reopened.replay_format_version.value(),
-        sequence_digest: ready_sequence_digest(reopened),
+        sequence_digest: ready_sequence_digest(&reopened),
         logical_replay_bytes: reopened.visible_logical_fact_bytes,
         settled_tip: block_id(outcome.settled_tip),
         event_fence: RocksDbCanonicalFixtureEventFenceSummary {
@@ -537,7 +537,9 @@ fn ready_summary(
     }
 }
 
-fn ready_sequence_digest(ready: CanonicalStoreReadyEvidence) -> CanonicalFactSequenceDigestSummary {
+fn ready_sequence_digest(
+    ready: &CanonicalStoreReadyEvidence,
+) -> CanonicalFactSequenceDigestSummary {
     CanonicalFactSequenceDigestSummary {
         block_digest_version: ready.block_digest_version.value(),
         sequence_digest_version: ready.sequence_digest_version.value(),

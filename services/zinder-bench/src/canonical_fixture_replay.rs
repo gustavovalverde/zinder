@@ -602,7 +602,13 @@ pub fn replay_canonical_fixture_into_rocksdb(
         let pipeline_limits = validate_rocksdb_replay_config(&config)?;
         let admitted = admit_canonical_fixture_replay(&config)?;
         let fixture_source = admitted.fixture_source.clone();
-        replay_admitted_canonical_fixture(config, pipeline_limits, admitted, &fixture_source).await
+        Box::pin(replay_admitted_canonical_fixture(
+            config,
+            pipeline_limits,
+            admitted,
+            &fixture_source,
+        ))
+        .await
     }
     .boxed()
 }
@@ -622,8 +628,13 @@ pub fn replay_canonical_fixture_transport_into_rocksdb<S: NodeSource + Clone>(
         let admitted = admit_canonical_fixture_replay(&config)?;
         let authenticated_source =
             FixtureAuthenticatedBlockSource::new(admitted.fixture_source.clone(), transport_source);
-        replay_admitted_canonical_fixture(config, pipeline_limits, admitted, &authenticated_source)
-            .await
+        Box::pin(replay_admitted_canonical_fixture(
+            config,
+            pipeline_limits,
+            admitted,
+            &authenticated_source,
+        ))
+        .await
     }
     .boxed()
 }

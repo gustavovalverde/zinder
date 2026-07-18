@@ -240,7 +240,7 @@ async fn run_owned_projector(
     )
     .await?;
     let canonical_ready = converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
-    let expected_wallet_source = canonical_source_identity(canonical_ready);
+    let expected_wallet_source = canonical_source_identity(&canonical_ready);
 
     if config.wallet_path.exists() {
         match RocksDbWalletStore::open_ready_for_following(
@@ -539,7 +539,7 @@ async fn run_continuous_wallet_following(
 
         let canonical_ready =
             converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
-        let target_source = canonical_source_identity(canonical_ready);
+        let target_source = canonical_source_identity(&canonical_ready);
         let target_fence = canonical.event_fence();
         let wallet_source =
             WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
@@ -554,7 +554,7 @@ async fn run_continuous_wallet_following(
             if renewed {
                 let post_renewal_canonical =
                     converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
-                if wallet_source != canonical_source_identity(post_renewal_canonical) {
+                if wallet_source != canonical_source_identity(&post_renewal_canonical) {
                     continue;
                 }
             }
@@ -889,7 +889,7 @@ async fn bootstrap_resumed_wallet_following(
         }
         let canonical_ready =
             converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
-        let target_source = canonical_source_identity(canonical_ready);
+        let target_source = canonical_source_identity(&canonical_ready);
         set_following_syncing(readiness, wallet_source, target_source);
         let retained_events = match fetch_retained_event_page_to_target(
             &mut canonical_control,
@@ -940,7 +940,7 @@ async fn bootstrap_resumed_wallet_following(
         }
         let canonical_ready =
             converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
-        let target_source = canonical_source_identity(canonical_ready);
+        let target_source = canonical_source_identity(&canonical_ready);
         set_following_syncing(readiness, wallet_source, target_source);
         let retained_events = match fetch_retained_event_page_to_target(
             &mut canonical_control,
@@ -1443,7 +1443,7 @@ async fn converge_on_writer_fence(
         canonical.try_catch_up()?;
         let ready = canonical.ready_evidence();
         let status = control.writer_status().await?;
-        if writer_status_matches(status, ready, canonical.network()) {
+        if writer_status_matches(status, &ready, canonical.network()) {
             return Ok(ready);
         }
         tokio::time::sleep(CANONICAL_FENCE_CONVERGENCE_DELAY).await;
@@ -1453,7 +1453,7 @@ async fn converge_on_writer_fence(
 
 fn writer_status_matches(
     status: zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
-    ready: CanonicalStoreReadyEvidence,
+    ready: &CanonicalStoreReadyEvidence,
     network: zinder_core::Network,
 ) -> bool {
     writer_status_matches_source(status, canonical_source_identity(ready), network)
@@ -1477,7 +1477,7 @@ fn writer_status_matches_source(
         && fence.canonical_sequence_digest == expected.source_sequence_digest().as_bytes()
 }
 
-fn canonical_source_identity(ready: CanonicalStoreReadyEvidence) -> WalletCanonicalSourceIdentity {
+fn canonical_source_identity(ready: &CanonicalStoreReadyEvidence) -> WalletCanonicalSourceIdentity {
     WalletCanonicalSourceIdentity::new(
         WalletProjectionSourcePosition::new(
             ready.visible_epoch,

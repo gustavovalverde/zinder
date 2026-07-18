@@ -436,14 +436,7 @@ impl<'encoded> Decoder<'encoded> {
                 "ready store control is missing validation evidence",
             ));
         }
-        self.validate_ready_contract_versions(
-            block_digest_version,
-            replay_format_version,
-            sequence_digest_version,
-            construction_manifest_version,
-            &construction_manifest_sha256,
-        )?;
-        Ok(CanonicalStoreReadyEvidence {
+        let ready_evidence = CanonicalStoreReadyEvidence {
             first_retained_block: BlockId::new(
                 BlockHeight::new(first_height),
                 BlockHash::from_bytes(first_hash),
@@ -463,22 +456,24 @@ impl<'encoded> Decoder<'encoded> {
             sequence_checkpoint,
             construction_manifest_version,
             construction_manifest_sha256,
-        })
+        };
+        self.validate_ready_contract_versions(&ready_evidence)?;
+        Ok(ready_evidence)
     }
 
     fn validate_ready_contract_versions(
         &self,
-        block_digest_version: CanonicalBlockFactsDigestVersion,
-        replay_format_version: CanonicalBlockReplayFormatVersion,
-        sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
-        construction_manifest_version: u16,
-        construction_manifest_sha256: &[u8; 32],
+        ready_evidence: &CanonicalStoreReadyEvidence,
     ) -> Result<(), CanonicalStoreError> {
-        if block_digest_version != CanonicalBlockFactsDigestVersion::V1
-            || replay_format_version != CanonicalBlockReplayFormatVersion::V1
-            || sequence_digest_version != CanonicalBlockFactsSequenceDigestVersion::V1
-            || construction_manifest_version != 1
-            || construction_manifest_sha256.iter().all(|byte| *byte == 0)
+        if ready_evidence.block_digest_version != CanonicalBlockFactsDigestVersion::V1
+            || ready_evidence.replay_format_version != CanonicalBlockReplayFormatVersion::V1
+            || ready_evidence.sequence_digest_version
+                != CanonicalBlockFactsSequenceDigestVersion::V1
+            || ready_evidence.construction_manifest_version != 1
+            || ready_evidence
+                .construction_manifest_sha256
+                .iter()
+                .all(|byte| *byte == 0)
         {
             return Err(CanonicalStoreError::admission(
                 self.path,

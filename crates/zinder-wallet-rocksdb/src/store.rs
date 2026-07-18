@@ -3268,7 +3268,7 @@ mod tests {
         drop(
             builder
                 .reopen_for_validation()?
-                .validate_rows(ready.clone(), validation_config(temporary.path()))?
+                .validate_rows(ready, validation_config(temporary.path()))?
                 .publish_ready_at(UnixTimestampMillis::new(1))?,
         );
         let mut owner = RocksDbWalletStore::open_ready_for_following(
@@ -3294,23 +3294,10 @@ mod tests {
         )?;
         assert_eq!(admitted, checkpoint);
 
-        let bounded_open = open_bounded_rocksdb(
-            RocksDbOpenRole::ExistingPrimary {
-                path: &checkpoint_path,
-            },
-            RocksDbResourceBudget::for_local_tests(),
-            wallet_column_family_descriptors,
-        )?;
-        let address_index = column_family(
-            &bounded_open,
-            TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
-        )?;
-        bounded_open.db.delete_cf(
-            &address_index,
+        delete_recovery_address_index_row(
+            &checkpoint_path,
             prepared.unspent_output_by_address[0].as_bytes(),
         )?;
-        drop(address_index);
-        drop(bounded_open);
 
         assert!(matches!(
             RocksDbWalletFollowingStore::cold_admit_recovery_checkpoint(
@@ -3322,6 +3309,28 @@ mod tests {
                 reason: "address unspent index does not exactly cover every primary unspent output"
             })
         ));
+        Ok(())
+    }
+
+    fn delete_recovery_address_index_row(
+        checkpoint_path: &Path,
+        address_index_key: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary {
+                path: checkpoint_path,
+            },
+            RocksDbResourceBudget::for_local_tests(),
+            wallet_column_family_descriptors,
+        )?;
+        let address_index = column_family(
+            &bounded_open,
+            TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+        )?;
+        bounded_open
+            .db
+            .delete_cf(&address_index, address_index_key)?;
+        drop(address_index);
         Ok(())
     }
 

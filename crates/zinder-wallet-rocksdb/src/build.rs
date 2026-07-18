@@ -185,7 +185,7 @@ where
             observed: canonical_store.wallet_projection_network(),
         });
     }
-    let observed = canonical_source_identity(canonical_store.wallet_projection_ready_evidence());
+    let observed = canonical_source_identity(&canonical_store.wallet_projection_ready_evidence());
     if observed != lease.pinned_canonical_anchor() {
         return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
             reason: "canonical source changed before wallet READY promotion",
@@ -435,7 +435,7 @@ where
     Source: WalletProjectionReplaySource + ?Sized,
 {
     let canonical_ready = canonical_store.wallet_projection_ready_evidence();
-    let source_identity = canonical_source_identity(canonical_ready);
+    let source_identity = canonical_source_identity(&canonical_ready);
     let now = UnixTimestampMillis::now();
     let lease_request = ProjectionBuildLeaseRequest::new(
         default_build_owner(now),
@@ -524,7 +524,7 @@ where
         canonical_ready.visible_tip,
         canonical_ready.visible_event_sequence,
     );
-    let source_identity = canonical_source_identity(canonical_ready);
+    let source_identity = canonical_source_identity(&canonical_ready);
     if lease_request.pinned_canonical_anchor() != source_identity {
         return Err(
             RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
@@ -584,7 +584,7 @@ where
             return Err(error);
         }
         lease_cleanup.arm(builder.lease(), replay_heartbeat.now());
-        validate_canonical_fence(&prepared, canonical_ready)?;
+        validate_canonical_fence(&prepared, &canonical_ready)?;
 
         let ready_evidence = WalletProjectionReadyEvidence {
             source_position,
@@ -711,7 +711,7 @@ where
 }
 
 fn canonical_source_identity(
-    evidence: CanonicalStoreReadyEvidence,
+    evidence: &CanonicalStoreReadyEvidence,
 ) -> WalletCanonicalSourceIdentity {
     WalletCanonicalSourceIdentity::new(
         WalletProjectionSourcePosition::new(
@@ -737,7 +737,7 @@ fn default_build_owner(now: UnixTimestampMillis) -> ProjectionBuildOwner {
 
 fn validate_canonical_fence(
     prepared: &PreparedWalletProjectionLoad,
-    ready: zinder_store::CanonicalStoreReadyEvidence,
+    ready: &zinder_store::CanonicalStoreReadyEvidence,
 ) -> Result<(), RocksDbWalletError> {
     let expected_sequence_digest =
         CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(

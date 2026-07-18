@@ -1145,7 +1145,7 @@ fn owner_checkpoint_response(
         schema_version: u32::from(evidence.schema_version),
         workload: evidence.workload.as_str().to_owned(),
         network_name: encode_zinder_native_chain_name(evidence.build_plan.network()).to_owned(),
-        ready_evidence: Some(checkpoint_ready_evidence_message(evidence.ready_evidence)),
+        ready_evidence: Some(checkpoint_ready_evidence_message(&evidence.ready_evidence)),
         build_plan: Some(checkpoint_build_plan_message(&evidence.build_plan)),
         database_identity: evidence.database_identity.clone(),
     }
@@ -1166,7 +1166,7 @@ fn verify_owner_checkpoint_readmission(
             "canonical checkpoint database identity changed before wallet checkpoint capture",
         ));
     }
-    let observed_fence = checkpoint_ready_evidence_message(evidence.ready_evidence)
+    let observed_fence = checkpoint_ready_evidence_message(&evidence.ready_evidence)
         .visible_fence
         .ok_or_else(|| {
             Status::internal("canonical checkpoint cold admission omitted its visible fence")
@@ -1180,7 +1180,7 @@ fn verify_owner_checkpoint_readmission(
 }
 
 fn checkpoint_ready_evidence_message(
-    evidence: zinder_store::CanonicalStoreReadyEvidence,
+    evidence: &zinder_store::CanonicalStoreReadyEvidence,
 ) -> CanonicalOwnerCheckpointReadyEvidence {
     let sequence_checkpoint = evidence.sequence_checkpoint;
     CanonicalOwnerCheckpointReadyEvidence {

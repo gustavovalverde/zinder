@@ -238,7 +238,7 @@ impl StateBundleManifest {
         expected_network: Network,
         additional_root_entries: &[&str],
     ) -> Result<Self, StateBundleError> {
-        let root = resolve_existing_directory(root.as_ref(), "state-bundle root")?;
+        let root = resolve_existing_directory(root, "state-bundle root")?;
         let manifest_path = root.join(STATE_BUNDLE_MANIFEST_FILE_NAME);
         require_regular_file(&manifest_path, "state-bundle manifest")?;
         let metadata = fs::metadata(&manifest_path)
@@ -677,7 +677,7 @@ impl TryFrom<CreateCanonicalOwnerCheckpointResponse> for CanonicalCheckpointAdmi
             store_identity,
             schema_version,
             network,
-            ready,
+            &ready,
             build_plan,
         );
         Ok(Self {
@@ -875,7 +875,7 @@ fn assemble_canonical_admission(
     store_identity: String,
     schema_version: u16,
     network: Network,
-    ready: DecodedCanonicalReadyEvidence,
+    ready: &DecodedCanonicalReadyEvidence,
     build_plan: CanonicalBuildPlanAdmission,
 ) -> CanonicalAdmission {
     CanonicalAdmission {
@@ -2197,6 +2197,15 @@ mod tests {
         assert_eq!(admitted.candidate_id(), "bundle-a");
         assert_eq!(admitted.admission, sample_canonical_admission(7));
 
+        assert_checkpoint_response_rejects_invalid_identity(&response);
+        assert_checkpoint_response_rejects_invalid_build_plan(&response)?;
+        assert_checkpoint_response_rejects_invalid_ready_evidence(response)?;
+        Ok(())
+    }
+
+    fn assert_checkpoint_response_rejects_invalid_identity(
+        response: &CreateCanonicalOwnerCheckpointResponse,
+    ) {
         let mut wrong_schema = response.clone();
         wrong_schema.schema_version = 3;
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(wrong_schema).is_err());
@@ -2212,7 +2221,11 @@ mod tests {
         let mut missing_database_identity = response.clone();
         missing_database_identity.database_identity.clear();
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(missing_database_identity).is_err());
+    }
 
+    fn assert_checkpoint_response_rejects_invalid_build_plan(
+        response: &CreateCanonicalOwnerCheckpointResponse,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut wrong_fingerprint_version = response.clone();
         wrong_fingerprint_version
             .build_plan
@@ -2266,7 +2279,12 @@ mod tests {
             .ok_or("sample response must contain build-plan evidence")?
             .build_tip = None;
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(missing_build_tip).is_err());
+        Ok(())
+    }
 
+    fn assert_checkpoint_response_rejects_invalid_ready_evidence(
+        response: CreateCanonicalOwnerCheckpointResponse,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut malformed_digest = response;
         malformed_digest
             .ready_evidence

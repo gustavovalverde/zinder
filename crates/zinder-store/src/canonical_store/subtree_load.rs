@@ -198,11 +198,7 @@ pub(super) fn validate_persisted_subtree_root_family(
             subtree_root_count = subtree_root_count.checked_add(1).ok_or_else(|| {
                 CanonicalStoreError::subtree_root_sequence("subtree-root count exceeds u64::MAX")
             })?;
-            let row_bytes = u64::try_from(key.len() + encoded_root.len()).map_err(|_| {
-                CanonicalStoreError::subtree_root_sequence(
-                    "subtree-root row length exceeds u64::MAX",
-                )
-            })?;
+            let row_bytes = subtree_root_logical_row_bytes(key, encoded_root)?;
             subtree_root_logical_bytes = subtree_root_logical_bytes
                 .checked_add(row_bytes)
                 .ok_or_else(|| {
@@ -233,6 +229,15 @@ pub(super) fn validate_persisted_subtree_root_family(
         family_evidence.finish(),
         started_at.elapsed(),
     ))
+}
+
+fn subtree_root_logical_row_bytes(
+    key: &[u8],
+    encoded_root: &[u8],
+) -> Result<u64, CanonicalStoreError> {
+    u64::try_from(key.len() + encoded_root.len()).map_err(|_| {
+        CanonicalStoreError::subtree_root_sequence("subtree-root row length exceeds u64::MAX")
+    })
 }
 
 fn record_subtree_cold_family_scan(evidence: &CanonicalColdFamilyEvidence, elapsed: Duration) {
