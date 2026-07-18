@@ -84,7 +84,7 @@ below for the full contract.
 
 ## PostgreSQL driver integration gate
 
-Run after changing the fact-first PostgreSQL path, its driver dependencies, or
+Run after changing the canonical-fact PostgreSQL path, its driver dependencies, or
 the benchmark database configuration. The URL must identify a fresh disposable
 database because the test deliberately leaves its completed schema in place and
 then proves reuse is rejected.
@@ -950,7 +950,7 @@ explorer.migration.denominations_v1
 
 The wallet rows above describe the internal native query contract consumed by
 the compatibility adapter. Explorer rows belong to the separate post-wallet
-cutover and are not published by the first fact-first production topology.
+cutover and are not published by the first version-1 production topology.
 
 ## Failure interpretation reference
 

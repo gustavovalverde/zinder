@@ -1,6 +1,6 @@
 # Railway canonical canary
 
-Railway is not an admitted fact-first wallet-serving topology. Its services do
+Railway is not an admitted wallet-serving topology. Its services do
 not provide the shared host filesystem required by the current
 `rocksdb-single-host` lifecycle, and the deleted mixed single-container
 runtime combined canonical-v1 ingest with superseded readers. The checked-in
@@ -64,7 +64,7 @@ restore, TLS routing, capacity, or independent-client gates.
 
 ## References
 
-- [Fact-first wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
+- [Wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
 - [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
 - [Single-VM deployment](deploying-on-a-vm.md)
 - [Public environment-variable contract](../architecture/public-interfaces.md#environment-variable-mapping)

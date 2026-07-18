@@ -1,7 +1,7 @@
 # Explorer Plane
 
 The explorer plane is post-wallet-cutover architecture, not part of the first
-fact-first production release. Its query-runtime federation text is a future
+version-1 production release. Its query-runtime federation text is a future
 migration contract; no explorer or standalone query image is built or started
 by the current release topology.
 

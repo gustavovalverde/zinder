@@ -30,14 +30,10 @@ use zinder_store::{
     StreamCursorTokenV1,
 };
 
-mod fact_first;
-mod fact_first_pair;
 mod grpc;
+mod pair_serving;
+mod read_pair;
 
-pub use fact_first::FactFirstWalletQuery;
-pub use fact_first_pair::{
-    FactFirstCanonicalRead, FactFirstPairAdmissionError, FactFirstReadPair, FactFirstWalletRead,
-};
 pub use grpc::{
     ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
     address_lookup_to_script_hash, block_header_by_selector_response,
@@ -52,6 +48,8 @@ pub use grpc::{
     transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
     tree_state_at_response,
 };
+pub use pair_serving::ExactPairWalletQuery;
+pub use read_pair::{ExactReadPair, PairCanonicalRead, PairWalletRead, ReadPairAdmissionError};
 /// Wallet-facing read API backed by epoch-bound canonical reads.
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves to

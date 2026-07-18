@@ -10,11 +10,10 @@ use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
     CanonicalCheckpointStagingRoot, CanonicalConstructionConfig, CanonicalControlCommand,
     CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
-    CanonicalWriterConfig, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, FactFirstMempoolOwner,
-    IngestError, IngestModifiers, NodeSourceKind, canonical_control_channel, classify_phase,
-    mempool_ready_channel, run_canonical_writer_with_control, run_fact_first_mempool_owner,
-    run_fact_first_mempool_retention, spawn_runtime_memory_metrics_task,
-    spawn_upstream_health_probe_task,
+    CanonicalWriterConfig, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, IngestError, IngestModifiers,
+    LiveMempoolOwner, NodeSourceKind, canonical_control_channel, classify_phase,
+    mempool_ready_channel, run_canonical_writer_with_control, run_live_mempool_owner,
+    run_mempool_retention, spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
 };
 use zinder_runtime::{
     OpsEndpointHandle, Readiness, ReadinessState, ServiceIdentifier, StartupPhase,
@@ -354,12 +353,11 @@ fn spawn_canonical_control_tasks(
 ) -> CanonicalControlTasks {
     if let Some(listen_addr) = command_config.ingest_control_listen_addr {
         let (canonical_control_handle, canonical_control_commands) = canonical_control_channel();
-        let mempool_owner = FactFirstMempoolOwner::default();
+        let mempool_owner = LiveMempoolOwner::default();
         let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
         writer_config.follow.mempool_ready_gate = Some(mempool_ready_gate);
-        let mempool_source =
-            build_fact_first_mempool_source(&command_config.loop_config.node, source);
-        let mempool_owner_task = tokio::spawn(run_fact_first_mempool_owner(
+        let mempool_source = build_live_mempool_source(&command_config.loop_config.node, source);
+        let mempool_owner_task = tokio::spawn(run_live_mempool_owner(
             mempool_source,
             canonical_control_handle.clone(),
             mempool_owner.clone(),
@@ -370,7 +368,7 @@ fn spawn_canonical_control_tasks(
             command_config.retention.mempool_mined_window(),
             command_config.retention.mempool_invalidated_window(),
         );
-        let mempool_retention_task = tokio::spawn(run_fact_first_mempool_retention(
+        let mempool_retention_task = tokio::spawn(run_mempool_retention(
             canonical_control_handle.clone(),
             mempool_owner.clone(),
             mempool_retention,
@@ -483,9 +481,9 @@ async fn shutdown_ingest_tasks(
     {
         tracing::warn!(
             target: "zinder::ingest",
-            event = "fact_first_mempool_owner_join_failed",
+            event = "mempool_owner_join_failed",
             error = %join_error,
-            "fact-first mempool owner did not shut down cleanly"
+            "live mempool owner did not shut down cleanly"
         );
     }
     if let Some(mempool_retention_task) = control_tasks.mempool_retention.take()
@@ -493,9 +491,9 @@ async fn shutdown_ingest_tasks(
     {
         tracing::warn!(
             target: "zinder::ingest",
-            event = "fact_first_mempool_retention_join_failed",
+            event = "mempool_retention_join_failed",
             error = %join_error,
-            "fact-first mempool retention task did not shut down cleanly"
+            "mempool retention task did not shut down cleanly"
         );
     }
     if let Err(join_error) = memory_metrics_handle.await {
@@ -710,7 +708,7 @@ fn zebra_json_rpc_source_for_target(
     }
 }
 
-fn build_fact_first_mempool_source(
+fn build_live_mempool_source(
     node_target: &NodeTarget,
     json_rpc: &ZebraJsonRpcSource,
 ) -> Arc<dyn MempoolSource> {

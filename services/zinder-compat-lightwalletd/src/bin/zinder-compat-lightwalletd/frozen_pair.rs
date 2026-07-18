@@ -22,9 +22,7 @@ use zinder_proto::v1::ingest::{
     CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
     canonical_control_client::CanonicalControlClient,
 };
-use zinder_query::{
-    FactFirstCanonicalRead, FactFirstPairAdmissionError, FactFirstReadPair, FactFirstWalletRead,
-};
+use zinder_query::{ExactReadPair, PairCanonicalRead, PairWalletRead, ReadPairAdmissionError};
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, Readiness, ReadinessCause,
     ReadinessState, connect_zinder_grpc,
@@ -58,7 +56,7 @@ pub(crate) struct FrozenPairConfig {
 }
 
 /// Slot captured once by each request before it reads canonical or wallet data.
-pub(crate) type FrozenPairSlot = Arc<ArcSwap<FactFirstReadPair>>;
+pub(crate) type FrozenPairSlot = Arc<ArcSwap<ExactReadPair>>;
 
 /// Errors that stop bootstrap or make a refresh generation ineligible.
 #[derive(Debug, Error)]
@@ -112,7 +110,7 @@ pub(crate) enum FrozenPairError {
         last_outcome: PairConvergence,
     },
     /// Pair construction changed after pre-publication validation.
-    #[error("fact-first pair changed during publication: {0}")]
+    #[error("exact read pair changed during publication: {0}")]
     PairPublication(zinder_query::QueryError),
 }
 
@@ -373,7 +371,7 @@ impl FrozenPairManager {
         else {
             return Err(FrozenPairError::CandidateUnavailable { generation });
         };
-        match FactFirstReadPair::validate_readers(&candidate.canonical, &candidate.wallet) {
+        match ExactReadPair::validate_readers(&candidate.canonical, &candidate.wallet) {
             Ok(()) => Ok(Ok(())),
             Err(error) => Ok(Err(classify_pair_admission(&error))),
         }
@@ -400,10 +398,10 @@ impl FrozenPairManager {
         let SecondaryGenerationState::Candidate { candidate } = state else {
             return Err(FrozenPairError::CandidateUnavailable { generation });
         };
-        let canonical: Arc<dyn FactFirstCanonicalRead> = Arc::new(candidate.canonical);
-        let wallet: Arc<dyn FactFirstWalletRead> = Arc::new(candidate.wallet);
+        let canonical: Arc<dyn PairCanonicalRead> = Arc::new(candidate.canonical);
+        let wallet: Arc<dyn PairWalletRead> = Arc::new(candidate.wallet);
         let pair = Arc::new(
-            FactFirstReadPair::new(canonical, wallet).map_err(FrozenPairError::PairPublication)?,
+            ExactReadPair::new(canonical, wallet).map_err(FrozenPairError::PairPublication)?,
         );
         publish_immutable_pair(&mut self.read_pairs, Arc::clone(&pair));
         self.generations[generation].state = SecondaryGenerationState::Published {
@@ -427,7 +425,7 @@ impl FrozenPairManager {
 
     fn update_active_readiness(
         &self,
-        active_pair: &FactFirstReadPair,
+        active_pair: &ExactReadPair,
         writer_status: &CanonicalWriterStatusResponse,
     ) -> Result<ActiveWriterRelation, FrozenPairError> {
         let Some(writer_fence) = writer_status.fence.as_ref() else {
@@ -527,7 +525,7 @@ enum SecondaryGenerationState {
         candidate: Box<SecondaryPairCandidate>,
     },
     Published {
-        lease: GenerationLease<FactFirstReadPair>,
+        lease: GenerationLease<ExactReadPair>,
     },
 }
 
@@ -610,9 +608,9 @@ impl CanonicalWriterStatusClient {
     }
 }
 
-fn classify_pair_admission(error: &FactFirstPairAdmissionError) -> PairConvergence {
+fn classify_pair_admission(error: &ReadPairAdmissionError) -> PairConvergence {
     match error {
-        FactFirstPairAdmissionError::WalletSourceMismatch { canonical, wallet } => {
+        ReadPairAdmissionError::WalletSourceMismatch { canonical, wallet } => {
             let canonical_event_sequence = canonical.source_position().event_sequence;
             let wallet_event_sequence = wallet.source_position().event_sequence;
             match canonical_event_sequence.cmp(&wallet_event_sequence) {
@@ -621,11 +619,9 @@ fn classify_pair_admission(error: &FactFirstPairAdmissionError) -> PairConvergen
                 std::cmp::Ordering::Equal => PairConvergence::SchemaOrFenceMismatch,
             }
         }
-        FactFirstPairAdmissionError::NetworkMismatch { .. }
-        | FactFirstPairAdmissionError::CanonicalRead { .. }
-        | FactFirstPairAdmissionError::CanonicalFenceMismatch => {
-            PairConvergence::SchemaOrFenceMismatch
-        }
+        ReadPairAdmissionError::NetworkMismatch { .. }
+        | ReadPairAdmissionError::CanonicalRead { .. }
+        | ReadPairAdmissionError::CanonicalFenceMismatch => PairConvergence::SchemaOrFenceMismatch,
     }
 }
 
@@ -803,7 +799,7 @@ mod tests {
     fn equal_cursor_but_mutated_pair_evidence_is_a_schema_or_fence_mismatch() {
         let canonical = source_identity(3, 0x33);
         let wallet = source_identity(3, 0x44);
-        let error = zinder_query::FactFirstPairAdmissionError::WalletSourceMismatch {
+        let error = zinder_query::ReadPairAdmissionError::WalletSourceMismatch {
             canonical: Box::new(canonical),
             wallet: Box::new(wallet),
         };

@@ -25,29 +25,29 @@ use zinder_wallet_projection::{WalletAddressTransactionKey, WalletAddressUnspent
 
 use crate::{
     ArtifactKey, BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock,
-    CompactBlockRange, FactFirstReadPair, FullBlock, FullBlockStream, LatestBlock, LatestSafeBlock,
+    CompactBlockRange, ExactReadPair, FullBlock, FullBlockStream, LatestBlock, LatestSafeBlock,
     QueryError, RawTransaction, SubtreeRoots, Transaction, TransactionStatus,
     TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
     WalletQueryApi,
 };
 
-const FACT_FIRST_HISTORY_PAGE_SIZE: NonZeroU16 = NonZeroU16::MAX;
+const WALLET_READ_PAGE_SIZE: NonZeroU16 = NonZeroU16::MAX;
 
 /// Exact-fence wallet query over the clean version-1 stores.
 #[derive(Clone)]
-pub struct FactFirstWalletQuery<Broadcaster> {
-    read_pairs: Arc<ArcSwap<FactFirstReadPair>>,
+pub struct ExactPairWalletQuery<Broadcaster> {
+    read_pairs: Arc<ArcSwap<ExactReadPair>>,
     broadcaster: Broadcaster,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     tree_state_upstream: Option<Arc<dyn TreeStateUpstream>>,
 }
 
-impl<Broadcaster> std::fmt::Debug for FactFirstWalletQuery<Broadcaster> {
+impl<Broadcaster> std::fmt::Debug for ExactPairWalletQuery<Broadcaster> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let pair = self.capture_pair();
         formatter
-            .debug_struct("FactFirstWalletQuery")
+            .debug_struct("ExactPairWalletQuery")
             .field("canonical_fence", &pair.canonical_fence())
             .field("wallet_fence", &pair.wallet_source())
             .field("tree_state_upstream", &self.tree_state_upstream.is_some())
@@ -55,7 +55,7 @@ impl<Broadcaster> std::fmt::Debug for FactFirstWalletQuery<Broadcaster> {
     }
 }
 
-impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
+impl<Broadcaster> ExactPairWalletQuery<Broadcaster> {
     /// Builds a query over a swappable slot of already-admitted immutable pairs.
     ///
     /// Every [`WalletQueryApi`] method captures one `Arc` from this slot before
@@ -63,7 +63,7 @@ impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
     /// changing the canonical or wallet reader observed by an in-flight request.
     #[must_use]
     pub fn from_read_pair_slot(
-        read_pairs: Arc<ArcSwap<FactFirstReadPair>>,
+        read_pairs: Arc<ArcSwap<ExactReadPair>>,
         broadcaster: Broadcaster,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     ) -> Self {
@@ -82,12 +82,12 @@ impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
         self
     }
 
-    fn capture_pair(&self) -> Arc<FactFirstReadPair> {
+    fn capture_pair(&self) -> Arc<ExactReadPair> {
         self.read_pairs.load_full()
     }
 
     fn chain_epoch(
-        pair: &FactFirstReadPair,
+        pair: &ExactReadPair,
         requested: Option<ChainEpochId>,
     ) -> Result<ChainEpoch, QueryError> {
         let chain_epoch = pair.canonical().chain_epoch()?;
@@ -99,7 +99,7 @@ impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
         Ok(chain_epoch)
     }
 
-    fn block_id_at(pair: &FactFirstReadPair, height: BlockHeight) -> Result<BlockId, QueryError> {
+    fn block_id_at(pair: &ExactReadPair, height: BlockHeight) -> Result<BlockId, QueryError> {
         pair.canonical()
             .block_header_at(height)?
             .map(|header| BlockId::new(height, header.block_hash))
@@ -107,7 +107,7 @@ impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
     }
 
     fn resolve_block_id_by_selector(
-        pair: &FactFirstReadPair,
+        pair: &ExactReadPair,
         selector: BlockSelector,
         chain_epoch: ChainEpoch,
     ) -> Result<BlockIdResponseValue, QueryError> {
@@ -135,7 +135,7 @@ impl<Broadcaster> FactFirstWalletQuery<Broadcaster> {
 }
 
 #[async_trait]
-impl<Broadcaster> WalletQueryApi for FactFirstWalletQuery<Broadcaster>
+impl<Broadcaster> WalletQueryApi for ExactPairWalletQuery<Broadcaster>
 where
     Broadcaster: TransactionBroadcaster + Clone,
 {
@@ -347,7 +347,7 @@ where
     ) -> Result<TransparentOutputsByOutpointResponse, QueryError> {
         let _pair = self.capture_pair();
         Err(QueryError::DeriveUnavailable {
-            capability: "fact-first transparent output lookup",
+            capability: "version-1 transparent output lookup",
         })
     }
 
@@ -358,7 +358,7 @@ where
     ) -> Result<TransparentSpendsByOutpointResponse, QueryError> {
         let _pair = self.capture_pair();
         Err(QueryError::DeriveUnavailable {
-            capability: "fact-first transparent spend lookup",
+            capability: "version-1 transparent spend lookup",
         })
     }
 
@@ -369,7 +369,7 @@ where
     ) -> Result<TransparentUnspentOutputsByOutpointResponse, QueryError> {
         let _pair = self.capture_pair();
         Err(QueryError::DeriveUnavailable {
-            capability: "fact-first transparent outpoint lookup",
+            capability: "version-1 transparent outpoint lookup",
         })
     }
 
@@ -386,7 +386,7 @@ where
             let page = pair.wallet().address_unspent_outputs_page(
                 request.address_script_hash,
                 after,
-                FACT_FIRST_HISTORY_PAGE_SIZE,
+                WALLET_READ_PAGE_SIZE,
             )?;
             outputs.extend(page.outputs.into_iter().filter_map(|output| {
                 (output.created_at.block.height >= request.start_height).then(|| {
@@ -418,7 +418,7 @@ where
         let pair = self.capture_pair();
         if request.descending {
             return Err(QueryError::DeriveUnavailable {
-                capability: "descending fact-first transparent history",
+                capability: "descending version-1 transparent history",
             });
         }
         let chain_epoch = Self::chain_epoch(&pair, None)?;
@@ -497,7 +497,7 @@ where
     ) -> Result<TransparentUtxoSetSummary, QueryError> {
         let _pair = self.capture_pair();
         Err(QueryError::DeriveUnavailable {
-            capability: "fact-first native UTXO summary encoding",
+            capability: "version-1 native UTXO summary encoding",
         })
     }
 

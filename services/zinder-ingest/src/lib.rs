@@ -59,9 +59,9 @@ pub use memory_pressure::{
     DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,
 };
 pub use mempool::{
-    FactFirstMempoolOwner, MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex,
-    MempoolReadyGate, MempoolReadySignal, MempoolSnapshotPage, build_mempool_entry,
-    mempool_ready_channel, run_fact_first_mempool_owner, run_fact_first_mempool_retention,
+    LiveMempoolOwner, MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolReadyGate,
+    MempoolReadySignal, MempoolSnapshotPage, build_mempool_entry, mempool_ready_channel,
+    run_live_mempool_owner, run_mempool_retention,
 };
 pub use phase::{classify_phase, current_chain_height};
 pub use tip_follow::{
@@ -91,7 +91,7 @@ pub use writer::follow::{
 };
 pub use writer::ingest_control::{
     CanonicalIngestControlGrpcAdapter,
-    MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as FACT_FIRST_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
+    MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as CANONICAL_WRITER_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
 };
 pub use writer::{
     CanonicalWriterConfig, CanonicalWriterError, run_canonical_writer,

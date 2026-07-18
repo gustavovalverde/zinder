@@ -1,4 +1,4 @@
-//! Fact-first live mempool ownership backed by the canonical event log.
+//! Live mempool ownership backed by the canonical event log.
 //!
 //! The mutable [`MempoolIndex`] remains process-local for low-latency wallet
 //! overlays. Its resumable history, cursor head, and retention floor live in
@@ -80,14 +80,14 @@ impl StagedMempoolGeneration {
 
 /// Snapshot page read under the same gate as durable event append and index mutation.
 #[derive(Clone, Debug)]
-pub(crate) struct FactFirstMempoolSnapshotPage {
+pub(crate) struct LiveMempoolSnapshotPage {
     pub(crate) entries: Vec<Arc<MempoolEntry>>,
     pub(crate) events_resume_cursor: Vec<u8>,
     pub(crate) snapshot_age_millis: u64,
     pub(crate) next_cursor: Vec<u8>,
 }
 
-/// Fact-first ownership state visible to the private control surface.
+/// Live mempool ownership state visible to the private control surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MempoolOwnerState {
     /// A source generation is building an in-memory snapshot that must not be
@@ -101,7 +101,7 @@ enum MempoolOwnerState {
 
 /// Process-local live index with a serialized durable-log handoff.
 #[derive(Clone)]
-pub struct FactFirstMempoolOwner {
+pub struct LiveMempoolOwner {
     index: MempoolIndex,
     /// Serializes preflight, durable append, index mutation, event-page reads,
     /// and snapshot anchoring. No public response can observe an event between
@@ -111,7 +111,7 @@ pub struct FactFirstMempoolOwner {
     staged_generation: Arc<ParkingMutex<Option<StagedMempoolGeneration>>>,
 }
 
-impl FactFirstMempoolOwner {
+impl LiveMempoolOwner {
     /// Creates an empty live index backed by the configured canonical writer.
     #[must_use]
     pub fn new() -> Self {
@@ -185,7 +185,7 @@ impl FactFirstMempoolOwner {
         canonical: &CanonicalControlHandle,
         max_entries: u32,
         from_cursor: Vec<u8>,
-    ) -> Result<FactFirstMempoolSnapshotPage, Status> {
+    ) -> Result<LiveMempoolSnapshotPage, Status> {
         self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
         self.require_serving()?;
@@ -207,7 +207,7 @@ impl FactFirstMempoolOwner {
         let snapshot_age_millis = UnixTimestampMillis::now()
             .value()
             .saturating_sub(snapshot.last_updated_at.value());
-        Ok(FactFirstMempoolSnapshotPage {
+        Ok(LiveMempoolSnapshotPage {
             entries: snapshot.entries,
             events_resume_cursor: start
                 .events_resume_cursor()
@@ -533,7 +533,7 @@ impl FactFirstMempoolOwner {
     }
 }
 
-impl Default for FactFirstMempoolOwner {
+impl Default for LiveMempoolOwner {
     fn default() -> Self {
         Self::new()
     }
@@ -547,10 +547,10 @@ impl Default for FactFirstMempoolOwner {
 /// transitions remain staged until their snapshot-complete marker. If the
 /// impossible post-append mismatch is detected, the public index is withdrawn
 /// and the source stream is reopened from a fresh snapshot.
-pub async fn run_fact_first_mempool_owner(
+pub async fn run_live_mempool_owner(
     source: Arc<dyn MempoolSource>,
     canonical: CanonicalControlHandle,
-    owner: FactFirstMempoolOwner,
+    owner: LiveMempoolOwner,
     mempool_ready_signal: MempoolReadySignal,
     cancel: CancellationToken,
 ) {
@@ -579,7 +579,7 @@ enum MempoolOwnerLoopOutcome {
 }
 
 async fn restore_durable_mempool_index(
-    owner: &FactFirstMempoolOwner,
+    owner: &LiveMempoolOwner,
     canonical: &CanonicalControlHandle,
     mempool_ready_signal: &MempoolReadySignal,
     cancel: &CancellationToken,
@@ -591,9 +591,9 @@ async fn restore_durable_mempool_index(
                 mempool_ready_signal.set_hydrating();
                 tracing::warn!(
                     target: "zinder::ingest",
-                    event = "fact_first_mempool_durable_replay_failed",
+                    event = "mempool_durable_replay_failed",
                     code = ?status.code(),
-                    "fact-first mempool owner could not reconstruct its durable live state"
+                    "live mempool owner could not reconstruct its durable live state"
                 );
                 if wait_or_cancel(cancel, MEMPOOL_RECONNECT_BACKOFF).await {
                     return false;
@@ -606,7 +606,7 @@ async fn restore_durable_mempool_index(
 async fn run_source_generation(
     source: &Arc<dyn MempoolSource>,
     canonical: &CanonicalControlHandle,
-    owner: &FactFirstMempoolOwner,
+    owner: &LiveMempoolOwner,
     mempool_ready_signal: &MempoolReadySignal,
     cancel: &CancellationToken,
 ) -> MempoolOwnerLoopOutcome {
@@ -619,8 +619,8 @@ async fn run_source_generation(
         Ok(event_stream) => {
             tracing::info!(
                 target: "zinder::ingest",
-                event = "fact_first_mempool_source_opened",
-                "fact-first mempool source stream opened"
+                event = "mempool_source_opened",
+                "live mempool source stream opened"
             );
             event_stream
         }
@@ -639,7 +639,7 @@ async fn run_source_generation(
 async fn consume_source_events(
     mut event_stream: zinder_source::MempoolSourceEventStream,
     canonical: &CanonicalControlHandle,
-    owner: &FactFirstMempoolOwner,
+    owner: &LiveMempoolOwner,
     mempool_ready_signal: &MempoolReadySignal,
     cancel: &CancellationToken,
 ) -> MempoolOwnerLoopOutcome {
@@ -651,8 +651,8 @@ async fn consume_source_events(
         let Some(source_event) = source_event else {
             tracing::warn!(
                 target: "zinder::ingest",
-                event = "fact_first_mempool_source_closed",
-                "fact-first mempool source stream closed; reconnecting"
+                event = "mempool_source_closed",
+                "live mempool source stream closed; reconnecting"
             );
             return MempoolOwnerLoopOutcome::Rebuild;
         };
@@ -661,17 +661,17 @@ async fn consume_source_events(
                 if let Err(status) = owner.complete_hydration(canonical).await {
                     tracing::warn!(
                         target: "zinder::ingest",
-                        event = "fact_first_mempool_snapshot_marker_rejected",
+                        event = "mempool_snapshot_marker_rejected",
                         code = ?status.code(),
-                        "fact-first mempool source completion marker was rejected"
+                        "live mempool source completion marker was rejected"
                     );
                     return MempoolOwnerLoopOutcome::Rebuild;
                 }
                 mempool_ready_signal.set_ready();
                 tracing::info!(
                     target: "zinder::ingest",
-                    event = "fact_first_mempool_snapshot_complete",
-                    "fact-first mempool snapshot completed; live reads are available"
+                    event = "mempool_snapshot_complete",
+                    "live mempool snapshot completed; live reads are available"
                 );
             }
             Ok(source_event) => {
@@ -680,9 +680,9 @@ async fn consume_source_events(
                 {
                     tracing::warn!(
                         target: "zinder::ingest",
-                        event = "fact_first_mempool_event_rejected",
+                        event = "mempool_event_rejected",
                         code = ?status.code(),
-                        "fact-first mempool source event was not published"
+                        "live mempool source event was not published"
                     );
                     return MempoolOwnerLoopOutcome::Rebuild;
                 }
@@ -695,9 +695,9 @@ async fn consume_source_events(
                 .increment(1);
                 tracing::warn!(
                     target: "zinder::ingest",
-                    event = "fact_first_mempool_source_item_error",
+                    event = "mempool_source_item_error",
                     error = %error,
-                    "fact-first mempool source emitted an error item"
+                    "live mempool source emitted an error item"
                 );
                 return MempoolOwnerLoopOutcome::Rebuild;
             }
@@ -706,7 +706,7 @@ async fn consume_source_events(
 }
 
 async fn withdraw_and_wait_for_mempool_rebuild(
-    owner: &FactFirstMempoolOwner,
+    owner: &LiveMempoolOwner,
     mempool_ready_signal: &MempoolReadySignal,
     cancel: &CancellationToken,
 ) -> bool {
@@ -714,16 +714,16 @@ async fn withdraw_and_wait_for_mempool_rebuild(
     mempool_ready_signal.set_hydrating();
     tracing::error!(
         target: "zinder::ingest",
-        event = "fact_first_mempool_index_rebuild_required",
+        event = "mempool_index_rebuild_required",
         "withdrew live mempool reads until the source reseeds the index"
     );
     !wait_or_cancel(cancel, MEMPOOL_RECONNECT_BACKOFF).await
 }
 
 /// Runs the durable mempool-event retention loop through the canonical writer.
-pub async fn run_fact_first_mempool_retention(
+pub async fn run_mempool_retention(
     canonical: CanonicalControlHandle,
-    owner: FactFirstMempoolOwner,
+    owner: LiveMempoolOwner,
     retention: MempoolEventRetentionConfig,
     check_interval: Duration,
     cancel: CancellationToken,
@@ -735,7 +735,7 @@ pub async fn run_fact_first_mempool_retention(
                 if let Err(status) = owner.prune_events(&canonical, UnixTimestampMillis::now(), retention).await {
                     tracing::warn!(
                         target: "zinder::ingest",
-                        event = "fact_first_mempool_event_retention_failed",
+                        event = "mempool_event_retention_failed",
                         code = ?status.code(),
                         "durable mempool-event retention pass failed"
                     );
@@ -746,7 +746,7 @@ pub async fn run_fact_first_mempool_retention(
 }
 
 async fn apply_source_event(
-    owner: &FactFirstMempoolOwner,
+    owner: &LiveMempoolOwner,
     canonical: &CanonicalControlHandle,
     cancel: &CancellationToken,
     source_event: MempoolSourceEvent,
@@ -811,7 +811,7 @@ async fn wait_for_canonical_epoch(
             Err(status) => {
                 tracing::debug!(
                     target: "zinder::ingest",
-                    event = "fact_first_mempool_waiting_for_canonical_writer",
+                    event = "mempool_waiting_for_canonical_writer",
                     code = ?status.code(),
                     "mempool owner is waiting for the canonical writer command channel"
                 );
@@ -884,9 +884,9 @@ fn record_source_open_failure(error: &SourceError) {
     .increment(1);
     tracing::warn!(
         target: "zinder::ingest",
-        event = "fact_first_mempool_source_open_failed",
+        event = "mempool_source_open_failed",
         error = %error,
-        "fact-first mempool source could not open; reconnecting"
+        "live mempool source could not open; reconnecting"
     );
 }
 
@@ -917,7 +917,7 @@ mod tests {
         },
     };
 
-    use super::{FactFirstMempoolOwner, run_fact_first_mempool_owner};
+    use super::{LiveMempoolOwner, run_live_mempool_owner};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn source_snapshot_marker_hides_partial_hydration_and_reconnect_gap()
@@ -931,10 +931,10 @@ mod tests {
             }
         });
         let (source, source_control) = MockMempoolSource::streaming();
-        let owner = FactFirstMempoolOwner::default();
+        let owner = LiveMempoolOwner::default();
         let (ready_signal, ready_gate) = mempool_ready_channel();
         let cancel = CancellationToken::new();
-        let owner_task = tokio::spawn(run_fact_first_mempool_owner(
+        let owner_task = tokio::spawn(run_live_mempool_owner(
             Arc::new(source),
             canonical.clone(),
             owner.clone(),
@@ -971,7 +971,7 @@ mod tests {
 
     async fn assert_partial_snapshot_is_private(
         source_control: &MockMempoolSourceControl,
-        owner: &FactFirstMempoolOwner,
+        owner: &LiveMempoolOwner,
         ready_gate: &MempoolReadyGate,
         canonical: &CanonicalControlHandle,
     ) -> Result<(), Box<dyn Error>> {
@@ -1012,7 +1012,7 @@ mod tests {
 
     async fn complete_initial_generation(
         source_control: &MockMempoolSourceControl,
-        owner: &FactFirstMempoolOwner,
+        owner: &LiveMempoolOwner,
         ready_gate: &MempoolReadyGate,
         canonical: &CanonicalControlHandle,
     ) -> Result<zinder_store::StreamCursorTokenV1, Box<dyn Error>> {
@@ -1045,7 +1045,7 @@ mod tests {
 
     async fn reconcile_empty_snapshot(
         source_control: &MockMempoolSourceControl,
-        owner: &FactFirstMempoolOwner,
+        owner: &LiveMempoolOwner,
         ready_gate: &MempoolReadyGate,
         canonical: &CanonicalControlHandle,
         first_generation_cursor: &[u8],
@@ -1079,7 +1079,7 @@ mod tests {
 
     async fn assert_abandoned_generation_is_not_durable(
         source_control: &MockMempoolSourceControl,
-        owner: &FactFirstMempoolOwner,
+        owner: &LiveMempoolOwner,
         ready_gate: &MempoolReadyGate,
         canonical: &CanonicalControlHandle,
     ) -> Result<(), Box<dyn Error>> {
@@ -1129,10 +1129,10 @@ mod tests {
         });
 
         let (first_source, first_source_control) = MockMempoolSource::streaming();
-        let first_owner = FactFirstMempoolOwner::default();
+        let first_owner = LiveMempoolOwner::default();
         let (first_ready_signal, first_ready_gate) = mempool_ready_channel();
         let first_cancel = CancellationToken::new();
-        let first_owner_task = tokio::spawn(run_fact_first_mempool_owner(
+        let first_owner_task = tokio::spawn(run_live_mempool_owner(
             Arc::new(first_source),
             canonical.clone(),
             first_owner.clone(),
@@ -1159,10 +1159,10 @@ mod tests {
         drop(first_owner);
 
         let (second_source, second_source_control) = MockMempoolSource::streaming();
-        let second_owner = FactFirstMempoolOwner::default();
+        let second_owner = LiveMempoolOwner::default();
         let (second_ready_signal, second_ready_gate) = mempool_ready_channel();
         let second_cancel = CancellationToken::new();
-        let second_owner_task = tokio::spawn(run_fact_first_mempool_owner(
+        let second_owner_task = tokio::spawn(run_live_mempool_owner(
             Arc::new(second_source),
             canonical.clone(),
             second_owner.clone(),
@@ -1234,14 +1234,14 @@ mod tests {
     }
 
     async fn wait_for_staged_entries(
-        owner: &FactFirstMempoolOwner,
+        owner: &LiveMempoolOwner,
         expected_entry_count: usize,
     ) -> Result<(), Box<dyn Error>> {
         wait_until(|| owner.staged_entry_count() == expected_entry_count).await
     }
 
     async fn wait_for_serving(
-        owner: &FactFirstMempoolOwner,
+        owner: &LiveMempoolOwner,
         expected: bool,
     ) -> Result<(), Box<dyn Error>> {
         wait_until(|| owner.is_serving() == expected).await
@@ -1258,7 +1258,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !condition() {
             if std::time::Instant::now() > deadline {
-                return Err("timed out waiting for fact-first mempool owner state".into());
+                return Err("timed out waiting for live mempool owner state".into());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

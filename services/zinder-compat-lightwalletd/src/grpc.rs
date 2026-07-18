@@ -27,7 +27,7 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    FactFirstReadPair, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
+    ExactReadPair, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
     WalletQueryApi, address_lookup_to_script_hash, status_from_query_error,
 };
@@ -91,7 +91,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     options: LightwalletdCompatibilityOptions,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
-    fact_first_read_pairs: Option<Arc<ArcSwap<FactFirstReadPair>>>,
+    read_pairs: Option<Arc<ArcSwap<ExactReadPair>>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
@@ -103,10 +103,7 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("options", &self.options)
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
-            .field(
-                "fact_first_read_pairs",
-                &self.fact_first_read_pairs.is_some(),
-            )
+            .field("read_pairs", &self.read_pairs.is_some())
             .field(
                 "network_upgrade_activations",
                 &self.network_upgrade_activations.network(),
@@ -153,7 +150,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             options,
             mempool_surface: None,
             tip_change_watcher: None,
-            fact_first_read_pairs: None,
+            read_pairs: None,
             network_upgrade_activations,
         }
     }
@@ -174,17 +171,14 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
-    /// Supplies the atomically swappable, immutable fact-first read pairs.
+    /// Supplies the atomically swappable, immutable exact read pairs.
     ///
     /// `GetLightdInfo` captures this slot at call time rather than retaining a
     /// startup snapshot, so its transparent-address claim cannot outlive a
     /// canonical/wallet pair generation.
     #[must_use]
-    pub fn with_fact_first_read_pair_slot(
-        mut self,
-        read_pairs: Arc<ArcSwap<FactFirstReadPair>>,
-    ) -> Self {
-        self.fact_first_read_pairs = Some(read_pairs);
+    pub fn with_read_pair_slot(mut self, read_pairs: Arc<ArcSwap<ExactReadPair>>) -> Self {
+        self.read_pairs = Some(read_pairs);
         self
     }
 
@@ -802,7 +796,7 @@ where
 
         let transparent_address_support = if !self.options.transparent_address_support {
             false
-        } else if let Some(read_pairs) = &self.fact_first_read_pairs {
+        } else if let Some(read_pairs) = &self.read_pairs {
             let source_position = read_pairs.load_full().wallet_source().source_position();
             source_position.chain_epoch_id == latest_block.chain_epoch.id
                 && source_position.tip.height == latest_block.height

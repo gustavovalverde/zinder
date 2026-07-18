@@ -26,8 +26,7 @@ use crate::{
         detail_for_ongoing_outage,
     },
     writer::construction::{
-        canonical_build_block, compact_block_commitments,
-        register_fact_first_prohibited_read_metrics,
+        canonical_build_block, compact_block_commitments, register_prohibited_read_metrics,
     },
     writer::control::{CanonicalControlCommand, handle_canonical_control_command},
 };
@@ -352,7 +351,7 @@ async fn follow_canonical_tip_controlled<Source>(
 where
     Source: NodeSource,
 {
-    register_fact_first_prohibited_read_metrics();
+    register_prohibited_read_metrics();
     follower.readiness.set_phase(IngestPhase::FollowingTip);
     let mut source_outage = None;
     let mut next_event_retention_check = std::time::Instant::now();

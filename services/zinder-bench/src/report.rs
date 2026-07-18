@@ -276,9 +276,9 @@ impl StorageCandidateIdentity {
         }
     }
 
-    /// Identifies the diagnostic fact-first `RocksDB` round-trip arm.
+    /// Identifies the diagnostic canonical-fact `RocksDB` round-trip arm.
     #[must_use]
-    pub const fn rocksdb_fact_first() -> Self {
+    pub const fn rocksdb_canonical_fact_round_trip() -> Self {
         Self {
             id: "rocksdb-fact-first",
             canonical_engine: "rocksdb",
@@ -288,9 +288,9 @@ impl StorageCandidateIdentity {
         }
     }
 
-    /// Identifies the diagnostic fact-first Postgres round-trip arm.
+    /// Identifies the diagnostic canonical-fact Postgres round-trip arm.
     #[must_use]
-    pub const fn postgres_fact_first() -> Self {
+    pub const fn postgres_canonical_fact_round_trip() -> Self {
         Self {
             id: "postgres-fact-first",
             canonical_engine: "postgres",
@@ -599,9 +599,9 @@ pub struct StageDurationStat {
 /// Required proof that canonical construction did not cross a prohibited read boundary.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct CanonicalProhibitedReadSummary {
-    /// Historical canonical prevout reads; fact-first construction requires zero.
+    /// Historical canonical prevout reads; canonical construction requires zero.
     pub historical_prevout_read_count: u64,
-    /// Cross-block wallet-state reads; fact-first construction requires zero.
+    /// Cross-block wallet-state reads; canonical construction requires zero.
     pub cross_block_wallet_read_count: u64,
 }
 
@@ -782,7 +782,7 @@ pub struct PostgresBenchmarkRuntimeEvidence {
     pub database_memory_limit_bytes: Option<u64>,
 }
 
-/// Engine-specific settings and physical write evidence for one fact-first arm.
+/// Engine-specific settings and physical write evidence for one canonical-fact round-trip arm.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "engine", rename_all = "kebab-case")]
 pub enum CanonicalBlockFactsStorageEvidence {
@@ -1204,7 +1204,7 @@ pub struct RocksDbCanonicalFixtureReplayReport {
     pub physical_store_bytes: u64,
     /// Source request, response, and adaptive-prefetch attribution.
     pub source_fetch_attribution: Option<SourceFetchAttributionSummary>,
-    /// Required zero-read evidence for the fact-first construction boundary.
+    /// Required zero-read evidence for the canonical construction boundary.
     pub prohibited_reads: Option<CanonicalProhibitedReadSummary>,
     /// Full publication scans grouped by canonical family; empty for trusted fresh-writer proof.
     pub publication_family_scans: Vec<CanonicalPublicationFamilyScanStat>,
@@ -1734,7 +1734,7 @@ impl BenchmarkReport {
         }
     }
 
-    /// Returns the fact round-trip measurement when this is a fact-first arm.
+    /// Returns the fact round-trip measurement when this is a canonical-fact round-trip arm.
     #[must_use]
     pub const fn canonical_block_facts_round_trip(
         &self,
@@ -2049,7 +2049,7 @@ impl RocksDbStorageLifecycleReport {
             || self.contracts.wallet_value_encoding_version != 2
         {
             return Err(BenchError::report_format(
-                "storage lifecycle report does not carry the current fixed fact-first contracts",
+                "storage lifecycle report does not carry the current fixed version-1 storage contracts",
             ));
         }
         if canonical.scope != "canonical-storage-ready"
@@ -3564,7 +3564,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                     bytes: None,
                     source: PEAK_RSS_SOURCE_UNAVAILABLE,
                 },
-                storage_candidate: StorageCandidateIdentity::rocksdb_fact_first(),
+                storage_candidate: StorageCandidateIdentity::rocksdb_canonical_fact_round_trip(),
                 software_revision: None,
                 trial_id: Some("trial-01".to_owned()),
                 fixture_cache_policy: Some(FixtureCachePolicy::Warm),

@@ -623,7 +623,7 @@ The table below lists the `ZINDER_*` variables every Zinder binary advertises. T
 | `ZINDER_STORAGE__DERIVE__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.derive.rocksdb.memtable_budget_bytes` | Derive-store total RocksDB memtable budget across column families. Defaults to 536870912 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__DERIVE__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.derive.rocksdb.statistics_level` | Derive-store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md). |
-| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Immutable raw-blob retention contract: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so fact-first indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because lightwalletd transaction and transparent-history methods require retained bytes. The first canonical commit fixes historical coverage; changing a non-empty store requires a rebuild. |
+| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Immutable raw-blob retention contract: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so canonical indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because lightwalletd transaction and transparent-history methods require retained bytes. The first canonical commit fixes historical coverage; changing a non-empty store requires a rebuild. |
 | `ZINDER_INGEST__PROJECTION_PRESET` | zinder-ingest | Optional | `ingest.projection_preset` | Closed derive workload: `"wallet"` or `"explorer"`. Defaults to `"explorer"`. Selection is supported only when creating a fresh canonical-plus-projection store. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds finalization, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical-store replacement-depth identity expected by the compatibility reader. It must match the writer's `ingest.reorg_window_blocks`; admission fails closed on mismatch. Must be greater than zero. Defaults to 100. |
@@ -1054,7 +1054,7 @@ while let Some(envelope) = events.next().await {
 ```
 
 `subscription_endpoint` is an internal/test native-contract option. The first
-fact-first production release does not publish a standalone native query
+version-1 production release does not publish a standalone native query
 endpoint; wallets use `zinder-compat-lightwalletd`, and projector/compatibility
 consume the authenticated ingest control plane directly.
 

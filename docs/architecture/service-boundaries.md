@@ -1,6 +1,6 @@
 # Service Boundaries
 
-Zinder is one product with three deployable services in the first fact-first
+Zinder is one product with three deployable services in the first version-1
 release. The boundary rule is simple: ingest alone writes canonical facts,
 projector alone writes wallet state, and compatibility serves only a
 request-scoped exact pair of read-only canonical and wallet generations.
@@ -99,7 +99,7 @@ This topology is production-supported and has no Postgres dependency.
 
 PostgreSQL is not an accepted production target until `rocksdb-single-host`
 passes its lifecycle and performance certification. Benchmarking may continue
-against the same fact-first schema, but it must not add runtime abstraction,
+against the same canonical schema, but it must not add runtime abstraction,
 compatibility branches, or deployment claims to this release.
 
 ```text

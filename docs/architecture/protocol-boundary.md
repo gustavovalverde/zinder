@@ -6,7 +6,7 @@ This document owns the wire-schema boundary. Source adapters live in [Node sourc
 
 ## Protocol Surfaces
 
-Zinder defines four protocol families. The first fact-first production release
+Zinder defines four protocol families. The first version-1 production release
 deploys the private ingest-control and lightwalletd compatibility surfaces; the
 native wallet service remains a library and test contract without a standalone
 runtime.
@@ -56,7 +56,7 @@ Storage-control protobuf records that never cross a service or API boundary may 
 The `zinder-query` library implements the native `WalletQuery` protobuf adapter
 over the Rust `WalletQueryApi` boundary. The standalone `zinder-query` binary
 has been deleted; this surface is available only to embedded composition and
-contract tests in the first fact-first production release.
+contract tests in the first version-1 production release.
 
 `service WalletQuery` is defined in `zinder/v1/wallet/wallet.proto`. Tonic
 server/client code is generated only for the native Zinder service; the
@@ -151,7 +151,7 @@ Every chain-dependent response either binds to one `ChainEpoch` or explicitly sa
 `ChainEpochReadApi` is the internal read surface for epoch-bound canonical
 reads. It exposes retained chain-event history to `IngestControl.ChainEvents`.
 The native `WalletQuery.ChainEvents` adapter remains available for embedded and
-integration-test composition, but the production fact-first runtime does not
+integration-test composition, but the production version-1 runtime does not
 publish a standalone native stream. Production wallet serving is provided by
 `zinder-compat-lightwalletd` over one request-scoped exact canonical and wallet
 secondary pair.
@@ -265,7 +265,7 @@ Wallets that need to disable transaction submission can wire `WalletQuery` with
 `()` as the broadcaster, in which case `SendTransaction` returns
 `Code::FailedPrecondition` with a `TransactionBroadcastDisabled` reason.
 
-The adapter remains embeddable in tests, but the first fact-first production
+The adapter remains embeddable in tests, but the first version-1 production
 topology deploys `zinder-compat-lightwalletd` as the dedicated public wallet
 boundary over immutable canonical and wallet secondary pairs. It owns no
 canonical or wallet writes.

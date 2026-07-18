@@ -211,7 +211,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
     open_storage_phase.complete();
 
-    let mut wallet_query = zinder_query::FactFirstWalletQuery::from_read_pair_slot(
+    let mut wallet_query = zinder_query::ExactPairWalletQuery::from_read_pair_slot(
         Arc::clone(&read_pairs),
         broadcaster,
         network_upgrade_activations.clone(),
@@ -236,7 +236,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         cancel.clone(),
     );
     let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
-        .with_fact_first_read_pair_slot(read_pairs)
+        .with_read_pair_slot(read_pairs)
         .with_transparent_address_support()
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);

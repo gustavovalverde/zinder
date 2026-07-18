@@ -1,4 +1,4 @@
-//! Fact-first `IngestControl` composition over the canonical writer channel.
+//! Version-1 `IngestControl` composition over the canonical writer channel.
 //!
 //! This adapter never opens a canonical primary or a derive store. Exact
 //! writer status and tip-event replay are serviced by the follower that owns
@@ -39,7 +39,7 @@ use zinder_store::{
 };
 
 use crate::{
-    CanonicalControlHandle, FactFirstMempoolOwner,
+    CanonicalControlHandle, LiveMempoolOwner,
     writer::control::{CanonicalIngestEvent, CanonicalWriterSnapshot},
 };
 
@@ -61,7 +61,7 @@ const EVENT_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub struct CanonicalIngestControlGrpcAdapter {
     network: Network,
     canonical: CanonicalControlHandle,
-    mempool: FactFirstMempoolOwner,
+    mempool: LiveMempoolOwner,
     node_source: Arc<dyn NodeSource>,
     bearer_token: Option<BearerToken>,
     readiness: Readiness,
@@ -74,7 +74,7 @@ impl CanonicalIngestControlGrpcAdapter {
     pub fn new(
         network: Network,
         canonical: CanonicalControlHandle,
-        mempool: FactFirstMempoolOwner,
+        mempool: LiveMempoolOwner,
         node_source: Arc<dyn NodeSource>,
         readiness: Readiness,
     ) -> Self {
@@ -165,12 +165,12 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         let request = request.into_inner();
         if request.family != wallet::ChainEventStreamFamily::Tip as i32 {
             return Err(Status::unimplemented(
-                "fact-first ingest control supports only the tip chain-event family",
+                "version-1 ingest control supports only the tip chain-event family",
             ));
         }
         if !request.address_filter.is_empty() {
             return Err(Status::unimplemented(
-                "fact-first ingest control does not retain address-filtered chain events",
+                "version-1 ingest control does not retain address-filtered chain events",
             ));
         }
         let after_cursor = match request
@@ -261,7 +261,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         let request = request.into_inner();
         if request.family != wallet::MempoolEventStreamFamily::Mempool as i32 {
             return Err(Status::unimplemented(
-                "fact-first ingest control supports only the mempool event family",
+                "version-1 ingest control supports only the mempool event family",
             ));
         }
         let start = event_stream_start_from_message(request.start)
@@ -414,7 +414,7 @@ fn spawn_chain_event_stream(
 }
 
 fn spawn_mempool_event_stream(
-    mempool: FactFirstMempoolOwner,
+    mempool: LiveMempoolOwner,
     canonical: CanonicalControlHandle,
     mut after_cursor: Option<zinder_store::StreamCursorTokenV1>,
 ) -> MempoolEventsStream {
@@ -622,7 +622,7 @@ fn script_hash_from_lookup(
             Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
         }
         wallet::address_lookup::Selector::Address(_) => Err(Status::unimplemented(
-            "fact-first ingest control accepts only the script_hash address selector",
+            "version-1 ingest control accepts only the script_hash address selector",
         )),
     }
 }
@@ -677,7 +677,7 @@ mod tests {
     };
 
     use crate::{
-        CanonicalCheckpointStagingRoot, CanonicalControlGrpcAdapter, FactFirstMempoolOwner,
+        CanonicalCheckpointStagingRoot, CanonicalControlGrpcAdapter, LiveMempoolOwner,
         writer::control::{
             canonical_control_channel, handle_canonical_control_command,
             test_support::published_fixture_store,
@@ -729,7 +729,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn shared_listener_authenticates_both_control_surfaces_and_serves_fact_first_history()
+    async fn shared_listener_authenticates_both_control_surfaces_and_serves_history()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = shared_control_fixture().await?;
         assert_control_authentication(&mut fixture.canonical_client, &mut fixture.ingest_client)
@@ -776,7 +776,7 @@ mod tests {
             }
         });
 
-        let owner = FactFirstMempoolOwner::default();
+        let owner = LiveMempoolOwner::default();
         let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
         owner
             .apply_event(

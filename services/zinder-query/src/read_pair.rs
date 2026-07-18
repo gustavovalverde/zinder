@@ -1,4 +1,4 @@
-//! Immutable, exact-fence read pairs for fact-first wallet serving.
+//! Immutable, exact-fence read pairs for version-1 wallet serving.
 
 use std::{fmt, io, num::NonZeroU16, sync::Arc};
 
@@ -23,8 +23,8 @@ use crate::QueryError;
 /// Read-only canonical facts held at one immutable admitted fence.
 ///
 /// Implementations must never catch up or otherwise mutate their observed
-/// fence while a caller holds the same instance in a [`FactFirstReadPair`].
-pub trait FactFirstCanonicalRead: Send + Sync + 'static {
+/// fence while a caller holds the same instance in a [`ExactReadPair`].
+pub trait PairCanonicalRead: Send + Sync + 'static {
     /// Returns the immutable network admitted by this canonical reader.
     fn network(&self) -> Network;
 
@@ -86,8 +86,8 @@ pub trait FactFirstCanonicalRead: Send + Sync + 'static {
 /// Read-only wallet facts held at one immutable READY source identity.
 ///
 /// Implementations must never follow a primary or mutate their observed READY
-/// evidence while a caller holds the instance in a [`FactFirstReadPair`].
-pub trait FactFirstWalletRead: Send + Sync + 'static {
+/// evidence while a caller holds the instance in a [`ExactReadPair`].
+pub trait PairWalletRead: Send + Sync + 'static {
     /// Returns the immutable wallet network admitted from store control.
     fn network(&self) -> Network;
 
@@ -124,7 +124,7 @@ pub trait FactFirstWalletRead: Send + Sync + 'static {
 /// malformed admitted evidence before deciding readiness. Query construction
 /// maps it to a fail-closed request error.
 #[derive(Debug, Error)]
-pub enum FactFirstPairAdmissionError {
+pub enum ReadPairAdmissionError {
     /// The independently admitted readers committed different networks.
     #[error("canonical and wallet readers have different admitted networks")]
     NetworkMismatch {
@@ -134,7 +134,7 @@ pub enum FactFirstPairAdmissionError {
         wallet: Network,
     },
     /// The canonical reader could not decode its visible epoch.
-    #[error("canonical reader failed while validating a fact-first pair")]
+    #[error("canonical reader failed while validating an exact read pair")]
     CanonicalRead {
         /// Exact canonical storage failure.
         #[source]
@@ -155,7 +155,7 @@ pub enum FactFirstPairAdmissionError {
 
 macro_rules! impl_canonical_read {
     ($store:ty) => {
-        impl FactFirstCanonicalRead for $store {
+        impl PairCanonicalRead for $store {
             fn network(&self) -> Network {
                 self.network()
             }
@@ -229,7 +229,7 @@ macro_rules! impl_canonical_read {
 
 impl_canonical_read!(RocksDbCanonicalSecondary);
 
-impl FactFirstWalletRead for RocksDbWalletSecondary {
+impl PairWalletRead for RocksDbWalletSecondary {
     fn network(&self) -> Network {
         self.network()
     }
@@ -269,18 +269,18 @@ impl FactFirstWalletRead for RocksDbWalletSecondary {
 /// Pair construction validates network, epoch, event cursor, visible tip,
 /// sequence digest, and settled tip. Callers can safely hold an `Arc` to this
 /// pair for an entire request while a different generation catches up.
-pub struct FactFirstReadPair {
-    canonical: Arc<dyn FactFirstCanonicalRead>,
-    wallet: Arc<dyn FactFirstWalletRead>,
+pub struct ExactReadPair {
+    canonical: Arc<dyn PairCanonicalRead>,
+    wallet: Arc<dyn PairWalletRead>,
     canonical_fence: CanonicalEventFence,
     wallet_source: WalletCanonicalSourceIdentity,
 }
 
-impl FactFirstReadPair {
+impl ExactReadPair {
     /// Creates an immutable pair only when both readers prove one exact source.
     pub fn new(
-        canonical: Arc<dyn FactFirstCanonicalRead>,
-        wallet: Arc<dyn FactFirstWalletRead>,
+        canonical: Arc<dyn PairCanonicalRead>,
+        wallet: Arc<dyn PairWalletRead>,
     ) -> Result<Self, QueryError> {
         Self::validate_readers(canonical.as_ref(), wallet.as_ref())
             .map_err(|error| pair_admission_query_error(&error))?;
@@ -300,11 +300,11 @@ impl FactFirstReadPair {
     /// admitted network, epoch, event cursor, visible tip, sequence digest,
     /// and settlement boundary without retaining either reader.
     pub fn validate_readers(
-        canonical: &(dyn FactFirstCanonicalRead + 'static),
-        wallet: &(dyn FactFirstWalletRead + 'static),
-    ) -> Result<(), FactFirstPairAdmissionError> {
+        canonical: &(dyn PairCanonicalRead + 'static),
+        wallet: &(dyn PairWalletRead + 'static),
+    ) -> Result<(), ReadPairAdmissionError> {
         if canonical.network() != wallet.network() {
-            return Err(FactFirstPairAdmissionError::NetworkMismatch {
+            return Err(ReadPairAdmissionError::NetworkMismatch {
                 canonical: canonical.network(),
                 wallet: wallet.network(),
             });
@@ -312,7 +312,7 @@ impl FactFirstReadPair {
         let canonical_fence = canonical.event_fence();
         let canonical_epoch = canonical
             .chain_epoch()
-            .map_err(|source| FactFirstPairAdmissionError::CanonicalRead { source })?;
+            .map_err(|source| ReadPairAdmissionError::CanonicalRead { source })?;
         let canonical_visible_tip = BlockId::new(
             canonical_epoch.visible_tip_height,
             canonical_epoch.visible_tip_hash,
@@ -321,7 +321,7 @@ impl FactFirstReadPair {
             || canonical_epoch.id != canonical_fence.chain_epoch_id()
             || canonical_visible_tip != canonical_fence.visible_tip()
         {
-            return Err(FactFirstPairAdmissionError::CanonicalFenceMismatch);
+            return Err(ReadPairAdmissionError::CanonicalFenceMismatch);
         }
         let canonical_source = WalletCanonicalSourceIdentity::new(
             WalletProjectionSourcePosition::new(
@@ -338,7 +338,7 @@ impl FactFirstReadPair {
         let wallet_source =
             WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
         if wallet_source != canonical_source {
-            return Err(FactFirstPairAdmissionError::WalletSourceMismatch {
+            return Err(ReadPairAdmissionError::WalletSourceMismatch {
                 canonical: Box::new(canonical_source),
                 wallet: Box::new(wallet_source),
             });
@@ -348,13 +348,13 @@ impl FactFirstReadPair {
 
     /// Returns the canonical reader frozen for this pair's entire lifetime.
     #[must_use]
-    pub fn canonical(&self) -> &(dyn FactFirstCanonicalRead + 'static) {
+    pub fn canonical(&self) -> &(dyn PairCanonicalRead + 'static) {
         self.canonical.as_ref()
     }
 
     /// Returns the wallet reader frozen for this pair's entire lifetime.
     #[must_use]
-    pub fn wallet(&self) -> &(dyn FactFirstWalletRead + 'static) {
+    pub fn wallet(&self) -> &(dyn PairWalletRead + 'static) {
         self.wallet.as_ref()
     }
 
@@ -371,17 +371,17 @@ impl FactFirstReadPair {
     }
 }
 
-impl fmt::Debug for FactFirstReadPair {
+impl fmt::Debug for ExactReadPair {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("FactFirstReadPair")
+            .debug_struct("ExactReadPair")
             .field("canonical_fence", &self.canonical_fence)
             .field("wallet_source", &self.wallet_source)
             .finish_non_exhaustive()
     }
 }
 
-fn pair_admission_query_error(error: &FactFirstPairAdmissionError) -> QueryError {
+fn pair_admission_query_error(error: &ReadPairAdmissionError) -> QueryError {
     QueryError::WalletProjectionRead {
         source: Box::new(io::Error::other(error.to_string())),
     }

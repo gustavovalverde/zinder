@@ -1,4 +1,4 @@
-# Deploying the fact-first wallet service on one VM
+# Deploying the wallet service on one VM
 
 This runbook operates the supported `rocksdb-single-host` wallet-serving
 topology. Three independent processes share one host filesystem:
@@ -11,7 +11,7 @@ A successful deployment is a canary until the release's mainnet construction,
 wallet-build, coherent-restore, capacity, replacement, and independent-client
 gates have current evidence. See
 [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) and the
-[fact-first cutover plan](../plans/fact-first-wallet-serving-cutover.md).
+[wallet-serving cutover plan](../plans/fact-first-wallet-serving-cutover.md).
 
 ## Prerequisites
 
@@ -263,4 +263,4 @@ canaries, not a production certification claim.
 - [Initial sync](initial-sync.md)
 - [Testing](testing.md)
 - [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-- [Fact-first wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
+- [Wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)

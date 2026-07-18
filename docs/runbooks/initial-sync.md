@@ -166,12 +166,12 @@ The measured mainnet canary took about 7 hours 47 minutes for canonical
 construction and validation, so the current code and deployment shape must not
 be described as production-certified until that performance gate and the
 restore/capacity/client gates are closed. See
-[`fact-first-wallet-serving-cutover.md`](../plans/fact-first-wallet-serving-cutover.md)
+[the wallet-serving cutover plan](../plans/fact-first-wallet-serving-cutover.md)
 for the current evidence and execution order.
 
 ## References
 
 - [ADR-0035: Fact-first storage selection and lifecycle](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-- [Fact-first wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
+- [Wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
 - [Deploying on a VM](deploying-on-a-vm.md)
 - [Testing](testing.md)

@@ -61,7 +61,7 @@ The compatibility port binds to host loopback. Terminate TLS, authentication,
 rate limits, and quotas in an operator-controlled proxy before exposing it.
 Fresh mainnet construction is still subject to the hard performance, capacity,
 coherent-restore, and independent-client gates in the
-[fact-first cutover plan](docs/plans/fact-first-wallet-serving-cutover.md);
+[wallet-serving cutover plan](docs/plans/fact-first-wallet-serving-cutover.md);
 a green local Compose deployment is not by itself production certification.
 
 For phase behavior and recovery, see
@@ -92,7 +92,7 @@ flowchart LR
     APIs --> Consumers["Wallets · applications · explorers"]
 ```
 
-The [fact-first architecture](docs/architecture/fact-first-indexer.md) explains
+The [indexer architecture](docs/architecture/fact-first-indexer.md) explains
 how canonical indexing, projection selection, and API serving fit together.
 
 ### Planes
@@ -117,7 +117,7 @@ Domain crates under `crates/` define stable contracts with no service runtime:
 - `zinder-source`: upstream source adapters. Owns `NodeSource`, `NodeAuth`, `NodeCapabilities`, `ZebraJsonRpcSource`, `TransactionBroadcaster`.
 - `zinder-proto`: protocol ownership. Owns `.proto` files and tonic-generated modules under `v1::wallet`, private `v1::ingest`, and vendored `compat::lightwalletd`.
 
-The first fact-first release builds these deployable services:
+The first version-1 release builds these deployable services:
 
 - `zinder-ingest`: the only writer to canonical RocksDB. Owns the unified ingest loop (bulk-catchup + tip-follow phases, see [ADR-0015](docs/adrs/0015-unified-phase-driven-ingest.md)), artifact builders, the private writer-status endpoint, and the upstream-source config CLI. Production recovery remains blocked until ingest and projector can publish one coherent canonical/wallet checkpoint bundle.
 - `zinder-projector`: the only writer to wallet RocksDB. Owns fixed-fence construction, continuous canonical-event following, settlement, and bounded reorg reconciliation.

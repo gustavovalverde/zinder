@@ -617,7 +617,7 @@ pass.
 
 ### Native wallet clients
 
-The first fact-first production path publishes the lightwalletd-compatible
+The first version-1 production path publishes the lightwalletd-compatible
 endpoint only. The native `WalletQueryApi` remains an internal library and
 certification boundary. The superseded `zinder-query` binary and its runtime
 configuration have been deleted; operators cannot deploy it as a fallback.
