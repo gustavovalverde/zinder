@@ -1,7 +1,7 @@
 //! Shared-secret bearer-token authentication for private gRPC control planes.
 //!
 //! The `IngestControl` gRPC service exposes mempool state and chain events
-//! to colocated `zinder-query` and `zinder-compat-lightwalletd` processes.
+//! to colocated `zinder-projector` and `zinder-compat-lightwalletd` processes.
 //! Operators that run those processes on a separate host (or any network
 //! that is not strictly localhost / VPN-only) need authentication on the
 //! control plane. This module provides the minimum viable surface:
@@ -76,6 +76,31 @@ impl BearerToken {
             .as_bytes()
             .ct_eq(candidate.as_bytes())
             .into()
+    }
+
+    /// Verifies one `Bearer <token>` metadata value without exposing the
+    /// configured secret. Private method-level capabilities use this when a
+    /// service deliberately gives a more privileged RPC a separate token.
+    pub fn verify_bearer_metadata(
+        &self,
+        metadata_value: Option<&tonic::metadata::AsciiMetadataValue>,
+        header_name: &'static str,
+    ) -> Result<(), Status> {
+        let metadata_value = metadata_value
+            .ok_or_else(|| Status::unauthenticated(format!("missing {header_name} header")))?;
+        let header_string = metadata_value
+            .to_str()
+            .map_err(|_| Status::unauthenticated(format!("{header_name} header is not ASCII")))?;
+        let claimed = header_string.strip_prefix("Bearer ").ok_or_else(|| {
+            Status::unauthenticated(format!("{header_name} header missing Bearer scheme"))
+        })?;
+        if self.matches(claimed) {
+            Ok(())
+        } else {
+            Err(Status::unauthenticated(format!(
+                "invalid {header_name} token"
+            )))
+        }
     }
 }
 
@@ -179,7 +204,7 @@ impl BearerTokenClientInterceptor {
     /// Creates a client-side interceptor.
     pub fn new(token: Option<&BearerToken>) -> Result<Self, BearerTokenError> {
         let metadata_value = match token {
-            Some(token) => Some(format_bearer_metadata(token)?),
+            Some(token) => Some(bearer_metadata(token)?),
             None => None,
         };
         Ok(Self { metadata_value })
@@ -197,7 +222,11 @@ impl tonic::service::Interceptor for BearerTokenClientInterceptor {
     }
 }
 
-fn format_bearer_metadata(
+/// Builds an opaque `Bearer` metadata value without exposing token text.
+///
+/// Used for a dedicated method-level capability header when a control plane
+/// needs stronger authority than its ordinary authenticated RPCs.
+pub fn bearer_metadata(
     token: &BearerToken,
 ) -> Result<tonic::metadata::AsciiMetadataValue, BearerTokenError> {
     let formatted = format!("Bearer {}", token.expose_for_metadata());

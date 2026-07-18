@@ -142,15 +142,6 @@ pub enum IngestError {
     #[error(transparent)]
     DeriveStore(#[from] zinder_derive::DeriveStoreError),
 
-    /// Backup requires the derive store created by the ingest writer.
-    #[error(
-        "derive store is missing at {path:?}; backup would be incomplete without the derive checkpoint"
-    )]
-    DeriveStoreMissing {
-        /// Expected derive store path.
-        path: PathBuf,
-    },
-
     /// Canonical history exists without the projection store that previously
     /// consumed it, so a derive-only rebuild cannot be proven safe.
     #[error(
@@ -191,75 +182,6 @@ pub enum IngestError {
         coverage_through: Option<u32>,
         /// Whether writer open would clear the existing projection.
         destructive_rebuild: bool,
-    },
-
-    /// Backup bundle staging path already exists, so the command cannot know
-    /// whether replacing it would discard operator-owned data.
-    #[error("backup checkpoint staging path already exists at {path:?}")]
-    BackupCheckpointStagingExists {
-        /// Existing staging path.
-        path: PathBuf,
-    },
-
-    /// Backup destination already exists and is never replaced implicitly.
-    #[error("backup checkpoint destination already exists at {path:?}")]
-    BackupCheckpointDestinationExists {
-        /// Existing destination path.
-        path: PathBuf,
-    },
-
-    /// Backup could not atomically publish the staged canonical, projection,
-    /// and manifest bundle.
-    #[error("failed to install backup checkpoint from {from_path:?} to {to_path:?}: {source}")]
-    BackupCheckpointInstall {
-        /// Temporary bundle path.
-        from_path: PathBuf,
-        /// Final checkpoint bundle path.
-        to_path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// Backup manifest could not be encoded.
-    #[error("failed to encode backup manifest: {source}")]
-    BackupManifestEncode {
-        /// JSON encoding failure.
-        #[source]
-        source: serde_json::Error,
-    },
-
-    /// A backup or restore manifest could not be decoded into the supported
-    /// structural contract.
-    #[error("failed to decode backup or restore manifest at {path:?}: {source}")]
-    BackupManifestDecode {
-        /// Manifest path being validated.
-        path: PathBuf,
-        /// JSON decoding or structural-shape failure.
-        #[source]
-        source: serde_json::Error,
-    },
-
-    /// A backup or restore manifest disagrees with the checkpoint bundle it
-    /// describes.
-    #[error("backup or restore checkpoint validation failed at {path:?}: {reason}")]
-    BackupCheckpointValidation {
-        /// Staged bundle path being validated.
-        path: PathBuf,
-        /// Stable human-readable validation failure.
-        reason: String,
-    },
-
-    /// Backup or restore manifest filesystem operation failed.
-    #[error("backup or restore manifest {operation} failed at {path:?}: {source}")]
-    BackupManifestIo {
-        /// Filesystem operation being attempted.
-        operation: &'static str,
-        /// Path the operation targeted.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: std::io::Error,
     },
 
     /// Internal batching produced an empty commit.
@@ -1798,7 +1720,6 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",
         Some(IngestError::DeriveStore(_)) => "derive_store",
-        Some(IngestError::DeriveStoreMissing { .. }) => "derive_store_missing",
         Some(IngestError::ProjectionStoreMissingForCanonical { .. }) => {
             "projection_store_missing_for_canonical"
         }
@@ -1808,17 +1729,6 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::ProjectionRetentionCoverageInsufficient { .. }) => {
             "projection_retention_coverage_insufficient"
         }
-        Some(IngestError::BackupCheckpointStagingExists { .. }) => {
-            "backup_checkpoint_staging_exists"
-        }
-        Some(IngestError::BackupCheckpointDestinationExists { .. }) => {
-            "backup_checkpoint_destination_exists"
-        }
-        Some(IngestError::BackupCheckpointInstall { .. }) => "backup_checkpoint_install",
-        Some(IngestError::BackupManifestEncode { .. }) => "backup_manifest_encode",
-        Some(IngestError::BackupManifestDecode { .. }) => "backup_manifest_decode",
-        Some(IngestError::BackupManifestIo { .. }) => "backup_manifest_io",
-        Some(IngestError::BackupCheckpointValidation { .. }) => "backup_checkpoint_validation",
     }
 }
 

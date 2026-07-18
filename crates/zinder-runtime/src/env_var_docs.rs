@@ -84,7 +84,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "network.name",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -99,7 +99,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.json_rpc_addr",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -123,7 +123,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.method",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -136,7 +136,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.username",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -149,7 +149,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.password",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -162,7 +162,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.path",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -175,7 +175,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.cookie",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -190,7 +190,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.request_timeout_secs",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -203,7 +203,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.max_response_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -216,7 +216,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.broadcast_timeout_secs",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -271,7 +271,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "ops.listen_addr",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -279,16 +279,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Listen address for the operational HTTP endpoint \
                       (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service \
-                      loopback address (`127.0.0.1:9105` ingest, `9106` query, `9107` \
-                      compat, `9069` explorer). Set to an empty string to disable the \
-                      endpoint entirely.",
+                      loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9107` \
+                      compat, `9069` explorer). Set to an empty string to \
+                      disable the endpoint entirely.",
     },
     EnvVarDoc {
         name: "ZINDER_SECURITY__ALLOW_PUBLIC_BIND",
         toml_path: "security.allow_public_bind",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -315,7 +315,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_INGEST_CONTROL__ADDR",
         toml_path: "ingest_control.addr",
-        used_by: &["zinder-query", "zinder-compat-lightwalletd"],
+        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "URL of the colocated IngestControl writer (`http://host:port`). Readers \
@@ -327,7 +327,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "ingest_control.bearer_token_path",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
         ],
         requirement: Requirement::ConditionalOn("ingest enforces auth"),
@@ -338,11 +338,64 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       rejected at config load.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST_CONTROL__CHECKPOINT_STAGING_ROOT",
+        toml_path: "ingest_control.checkpoint_staging_root",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Directory containing freshly prepared state-bundle candidate directories. \
+                      CanonicalControl accepts only an opaque candidate id and creates its \
+                      canonical checkpoint at `<root>/<candidate-id>/canonical.rocksdb`; \
+                      production mounts this path from a dedicated staging volume into ingest \
+                      and projector only, never compatibility. Defaults to \
+                      `/var/lib/zinder/checkpoints`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
+        toml_path: "ingest_control.checkpoint_bearer_token_path",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::ConditionalOn("canonical checkpoint capture is enabled"),
+        sensitive: false,
+        description: "Path to the separate method-level token required by \
+                      CanonicalControl.CreateOwnerCheckpoint and ReadmitOwnerCheckpoint. Mount \
+                      this file only into ingest and projector; ordinary ingest-control readers, \
+                      including compat, must not receive it.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR",
+        toml_path: "projector_control.listen_addr",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Loopback-only private ProjectorControl gRPC endpoint for coherent capture. \
+                      Empty or unset disables it; an enabled endpoint requires \
+                      projector_control.bearer_token_path.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH",
+        toml_path: "projector_control.bearer_token_path",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::ConditionalOn("projector control is enabled"),
+        sensitive: false,
+        description: "Path to the token required by ProjectorControl and presented as the \
+                      canonical checkpoint capability. Mount it only into projector and ingest; \
+                      it is never read by compat.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT",
+        toml_path: "projector_control.checkpoint_staging_root",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Shared candidate root whose realpath must match \
+                      ingest_control.checkpoint_staging_root. The projector sends only a SHA-256 \
+                      root binding to canonical control, never a path.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__PATH",
         toml_path: "storage.path",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -356,7 +409,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.secondary_path",
         used_by: &[
             "zinder-ingest (verify-canonical-replay only)",
-            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -368,11 +420,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
         toml_path: "storage.initial_catchup_timeout_ms",
-        used_by: &[
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
+        used_by: &["zinder-compat-lightwalletd", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum startup RocksDB secondary catchup duration before a reader starts \
@@ -380,11 +428,57 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       30000.",
     },
     EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL_PATH",
+        toml_path: "storage.canonical_path",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Canonical primary RocksDB path the projector opens as a read-only \
+                      secondary. Defaults to `/var/lib/zinder/canonical`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__CANONICAL_SECONDARY_PATH",
+        toml_path: "storage.canonical_secondary_path",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Projector-local RocksDB secondary metadata directory for canonical \
+                      reads. Defaults to `/var/lib/zinder/projector/canonical-secondary`; never \
+                      share it with another process.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__WALLET_PATH",
+        toml_path: "storage.wallet_path",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Wallet-projection RocksDB primary path owned exclusively by the \
+                      projector. Defaults to `/var/lib/zinder/wallet`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_WALLET__PATH",
+        toml_path: "wallet.path",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Wallet-projection RocksDB primary path the compatibility server opens as \
+                      a read-only secondary.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_WALLET__SECONDARY_PATH",
+        toml_path: "wallet.secondary_path",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Compatibility-server root for immutable wallet-secondary generations. \
+                      Must be distinct from every primary and canonical-secondary path.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES",
         toml_path: "storage.canonical.rocksdb.block_cache_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -398,7 +492,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.canonical.rocksdb.max_wal_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -412,7 +506,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.canonical.rocksdb.max_open_files",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -426,7 +520,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.canonical.rocksdb.write_buffer_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -440,7 +534,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.canonical.rocksdb.max_write_buffer_count",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -454,7 +548,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.canonical.rocksdb.max_background_jobs",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -468,7 +562,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.canonical.rocksdb.memtable_budget_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -482,7 +576,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.canonical.rocksdb.statistics_level",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -496,7 +590,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.derive.rocksdb.block_cache_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -510,7 +604,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.derive.rocksdb.max_wal_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -524,7 +618,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.derive.rocksdb.max_open_files",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -538,7 +632,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.derive.rocksdb.write_buffer_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -552,7 +646,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.derive.rocksdb.max_write_buffer_count",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -566,7 +660,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.derive.rocksdb.max_background_jobs",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -580,7 +674,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.derive.rocksdb.memtable_budget_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -594,7 +688,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.derive.rocksdb.statistics_level",
         used_by: &[
             "zinder-ingest",
-            "zinder-query",
+            "zinder-projector",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -647,6 +741,108 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Chain-truth invariant: how deep the live reorg window extends. Bounds \
                       finalization, classifier default, and replacement traversal. Must be \
                       greater than zero. Defaults to 100.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+        toml_path: "compat.reorg_window_blocks",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Exact canonical-store replacement-depth identity expected by the \
+                      compatibility reader. It must match the writer's \
+                      `ingest.reorg_window_blocks`; admission fails closed on mismatch. Must be \
+                      greater than zero. Defaults to 100.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
+        toml_path: "compat.pair_convergence_attempts",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Bounded attempts to catch canonical and wallet secondaries to one exact \
+                      authenticated publication fence before reporting replica lag. Defaults to \
+                      12 and must not exceed 64.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS",
+        toml_path: "projector.reorg_window_blocks",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Wallet undo suffix depth and expected canonical replacement policy. Must \
+                      match the canonical writer. Defaults to 100.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__BUILD_OWNER_HEX",
+        toml_path: "projector.build_owner_hex",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Stable 16-byte wallet-build lease owner encoded as exactly 32 hexadecimal \
+                      characters. Use a distinct value for each concurrently provisioned lane.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__LEASE_DURATION_SECONDS",
+        toml_path: "projector.lease_duration_seconds",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Wallet-build and canonical-retention lease duration in seconds. Must be at \
+                      least 14400 so a durable construction phase cannot outlive its lease.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__BUILD__MAX_OUTPOINT_SORT_MEMORY_BYTES",
+        toml_path: "projector.build.max_outpoint_sort_memory_bytes",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Memory ceiling for the wallet builder's outpoint sorter. Defaults to \
+                      4294967296.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__BUILD__MAX_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER",
+        toml_path: "projector.build.max_secondary_sort_memory_bytes_per_sorter",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Memory ceiling for each wallet secondary-index sorter. Defaults to \
+                      1073741824.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER",
+        toml_path: "projector.build.max_temporary_file_bytes_per_sorter",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Temporary spill-file ceiling for each wallet builder sorter. Defaults to \
+                      68719476736.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__BUILD__SST_TARGET_LOGICAL_BYTES",
+        toml_path: "projector.build.sst_target_logical_bytes",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Target logical payload per externally built wallet SST file. Defaults to \
+                      134217728.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__BUILD__MAX_ACCOUNTED_REORG_UNDO_BYTES",
+        toml_path: "projector.build.max_accounted_reorg_undo_bytes",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum logical wallet undo bytes admitted during fixed-tip construction. \
+                      Defaults to 536870912.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES",
+        toml_path: "projector.follow.max_transition_logical_bytes",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum logical planner and write-batch bytes for one atomic wallet \
+                      following transition. Defaults to 536870912.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__PHASES__CATCHUP_THRESHOLD_BLOCKS",
@@ -905,12 +1101,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS",
         toml_path: "retention.chain_event_retention_hours",
-        used_by: &["zinder-ingest", "zinder-query"],
+        used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Chain-event retention window in hours, enforced by `zinder-ingest` and \
-                      advertised by `zinder-query` through `ServerInfo`. Defaults to 168 (7 days). \
-                      `0` disables eviction.",
+        description: "Chain-event retention window in hours, enforced by `zinder-ingest`. \
+                      Defaults to 168 (7 days). `0` disables eviction.",
     },
     EnvVarDoc {
         name: "ZINDER_RETENTION__CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS",
@@ -933,20 +1128,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_RETENTION__MEMPOOL_MINED_RETENTION_MINUTES",
         toml_path: "retention.mempool_mined_retention_minutes",
-        used_by: &["zinder-ingest", "zinder-query"],
+        used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Mined-mempool retention window in minutes, enforced by `zinder-ingest` and \
-                      advertised by `zinder-query`. Defaults to 60. `0` disables retention.",
+        description: "Mined-mempool retention window in minutes, enforced by `zinder-ingest`. \
+                      Defaults to 60. `0` disables retention.",
     },
     EnvVarDoc {
         name: "ZINDER_RETENTION__MEMPOOL_INVALIDATED_RETENTION_HOURS",
         toml_path: "retention.mempool_invalidated_retention_hours",
-        used_by: &["zinder-ingest", "zinder-query"],
+        used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Invalidated-mempool retention window in hours, enforced by `zinder-ingest` \
-                      and advertised by `zinder-query`. Defaults to 24. `0` disables retention.",
+        description: "Invalidated-mempool retention window in hours, enforced by `zinder-ingest`. \
+                      Defaults to 24. `0` disables retention.",
     },
     EnvVarDoc {
         name: "ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS",

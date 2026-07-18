@@ -9,7 +9,9 @@ pub mod bench_support;
 mod block_production_time_backfill;
 mod bulk_catchup;
 mod canonical_construction;
+mod canonical_control;
 mod canonical_follow;
+mod canonical_ingest_control;
 mod canonical_runtime;
 mod chain_ingest;
 mod commitment_root_backfill;
@@ -48,10 +50,22 @@ pub use canonical_construction::{
     CanonicalPipelineLimits, CanonicalPipelineLimitsError, CanonicalSourceLoadOutcome,
     load_fresh_canonical, load_fresh_canonical_blocks, load_fresh_canonical_source_families,
 };
-pub use canonical_follow::{
-    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, follow_canonical_tip,
+pub use canonical_control::{
+    CANONICAL_CONTROL_COMMAND_CAPACITY, CanonicalCheckpointStagingRoot, CanonicalControlCommand,
+    CanonicalControlGrpcAdapter, CanonicalControlHandle, canonical_control_channel,
 };
-pub use canonical_runtime::{CanonicalRuntimeConfig, CanonicalRuntimeError, run_canonical_runtime};
+pub use canonical_follow::{
+    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, CanonicalReorgWindowExceeded,
+    follow_canonical_tip, follow_canonical_tip_with_control,
+};
+pub use canonical_ingest_control::{
+    CanonicalIngestControlGrpcAdapter,
+    MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as FACT_FIRST_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
+};
+pub use canonical_runtime::{
+    CanonicalRuntimeConfig, CanonicalRuntimeError, run_canonical_runtime,
+    run_canonical_runtime_with_control,
+};
 pub use chain_ingest::{
     DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, IngestError, NodeSourceKind,
@@ -84,9 +98,10 @@ pub use memory_pressure::{
     DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,
 };
 pub use mempool::{
-    MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolOrchestratorError,
-    MempoolOrchestratorEventOutcome, MempoolReadyGate, MempoolReadySignal, MempoolSnapshotPage,
-    build_mempool_entry, mempool_ready_channel, run_mempool_orchestrator,
+    FactFirstMempoolOwner, MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex,
+    MempoolOrchestratorError, MempoolOrchestratorEventOutcome, MempoolReadyGate,
+    MempoolReadySignal, MempoolSnapshotPage, build_mempool_entry, mempool_ready_channel,
+    run_fact_first_mempool_owner, run_fact_first_mempool_retention, run_mempool_orchestrator,
 };
 pub use paid_fee_distribution_backfill::{
     PaidFeeDistributionBackfillConfig, PaidFeeDistributionBackfillContext,

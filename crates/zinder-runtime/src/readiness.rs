@@ -13,6 +13,7 @@ use std::{borrow::Cow, sync::Arc};
 
 use parking_lot::Mutex;
 use serde::Serialize;
+use tonic::{Request, Status, service::Interceptor};
 use zinder_proto::v1::{ingest as ingest_proto, ops as ops_proto};
 
 /// Current phase of the unified ingest loop ([ADR-0015]).
@@ -562,6 +563,36 @@ impl Readiness {
     }
 }
 
+/// Rejects new gRPC requests while the shared runtime readiness state blocks traffic.
+///
+/// The interceptor samples readiness once when a request begins. Existing streaming
+/// requests keep their established immutable view and may drain after readiness changes.
+/// Warning states that explicitly permit traffic remain admitted.
+#[derive(Clone, Debug)]
+pub struct TrafficReadinessInterceptor {
+    readiness: Readiness,
+}
+
+impl TrafficReadinessInterceptor {
+    /// Creates a request gate over the service's shared readiness handle.
+    #[must_use]
+    pub const fn new(readiness: Readiness) -> Self {
+        Self { readiness }
+    }
+}
+
+impl Interceptor for TrafficReadinessInterceptor {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        if self.readiness.report().is_ready {
+            Ok(request)
+        } else {
+            Err(Status::unavailable(
+                "service is not ready to accept new traffic",
+            ))
+        }
+    }
+}
+
 /// Mutable readiness state owned by the service's runtime task.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadinessState {
@@ -964,6 +995,32 @@ mod tests {
         assert!(report.is_ready);
         assert!(matches!(report.cause, ReadinessCause::Ready));
         assert_eq!(report.current_height, Some(10));
+    }
+
+    #[test]
+    fn traffic_interceptor_tracks_blocking_and_warning_readiness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = Readiness::default();
+        let mut interceptor = TrafficReadinessInterceptor::new(readiness.clone());
+        let blocked = interceptor
+            .call(Request::new(()))
+            .err()
+            .ok_or("starting readiness must reject new traffic")?;
+        assert_eq!(blocked.code(), tonic::Code::Unavailable);
+
+        readiness.set(ReadinessState::ready(Some(100)));
+        interceptor.call(Request::new(()))?;
+
+        readiness.set(ReadinessState::cursor_at_risk(145, 168, Some(100)));
+        interceptor.call(Request::new(()))?;
+
+        readiness.set(ReadinessState::replica_lagging(3, Some(100)));
+        let blocked = interceptor
+            .call(Request::new(()))
+            .err()
+            .ok_or("replica lag readiness must reject new traffic")?;
+        assert_eq!(blocked.code(), tonic::Code::Unavailable);
+        Ok(())
     }
 
     #[test]

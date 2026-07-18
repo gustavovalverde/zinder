@@ -7,7 +7,8 @@
 //!   stamped with the current visible [`ChainEpoch`].
 //! - Applies the resulting [`MempoolEvent`] to the live [`MempoolIndex`]
 //!   and persists it via [`PrimaryChainStore::append_mempool_event`].
-//! - Emits readiness signals on hydration failures and source closures.
+//! - Forwards source snapshot-completion control events without writing them
+//!   to the canonical mempool-event log.
 //!
 //! The orchestrator owns no state beyond its handles; it is safe to drop
 //! and re-create when the writer reconfigures the source.
@@ -32,6 +33,11 @@ pub enum MempoolOrchestratorEventOutcome {
     /// draining the stream. Emitted exactly once per `run_mempool_orchestrator`
     /// invocation, before any per-event outcome.
     SourceStreamOpened,
+    /// The source completed its initial snapshot for this stream generation.
+    ///
+    /// This is a control-plane outcome only. It never corresponds to a
+    /// durable mempool lifecycle envelope.
+    InitialSnapshotComplete,
     /// Event was applied to both the live index and the event log.
     Applied,
     /// Source observation was a no-op (duplicate Added or unknown txid).
@@ -98,6 +104,9 @@ pub async fn run_mempool_orchestrator(
 
     while let Some(event_result) = event_stream.next().await {
         let outcome = match event_result {
+            Ok(MempoolSourceEvent::InitialSnapshotComplete) => {
+                MempoolOrchestratorEventOutcome::InitialSnapshotComplete
+            }
             Ok(source_event) => {
                 let visible_chain_epoch = chain_store
                     .current_chain_epoch()
@@ -225,7 +234,9 @@ fn canonical_event_from_source(
             mined_height,
             block_hash,
         }),
-        _ => Err(MempoolHydrationFailureReason::UnknownSourceEventVariant),
+        MempoolSourceEvent::InitialSnapshotComplete | _ => {
+            Err(MempoolHydrationFailureReason::UnknownSourceEventVariant)
+        }
     }
 }
 

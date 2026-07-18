@@ -1,56 +1,42 @@
 //! Zinder ingestion command-line entry point.
 
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-    process::ExitCode,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::{Parser, Subcommand};
-use tokio::{net::TcpListener, task::JoinHandle};
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
-    CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalRuntimeConfig,
-    DEFAULT_DERIVE_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    DeriveStatusReader, HistoricalWorkGate, IngestControlGrpcAdapter, IngestError, IngestModifiers,
-    MempoolIndex, MempoolOrchestratorEventOutcome, MempoolReadySignal, NodeSourceKind,
-    ProjectionStartupInputs, ProjectionStartupPlan, ProjectionStartupSettings,
-    RocksDbDeriveStatusReader, TipFollowSubsystems, TipFollowSubsystemsLauncher, classify_phase,
-    current_chain_height, mempool_ready_channel,
-    open_primary_derive_store_for_canonical_with_projection_preset, run_canonical_runtime,
-    run_ingest_loop, run_mempool_orchestrator, spawn_chain_event_retention_task,
-    spawn_derive_replay_budget_metrics_task, spawn_mempool_event_retention_task,
-    spawn_runtime_memory_metrics_task, spawn_transparent_retention_task,
+    CanonicalCheckpointStagingRoot, CanonicalConstructionConfig, CanonicalControlCommand,
+    CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
+    CanonicalRuntimeConfig, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, FactFirstMempoolOwner,
+    IngestError, IngestModifiers, NodeSourceKind, canonical_control_channel, classify_phase,
+    mempool_ready_channel, run_canonical_runtime_with_control, run_fact_first_mempool_owner,
+    run_fact_first_mempool_retention, spawn_runtime_memory_metrics_task,
     spawn_upstream_health_probe_task,
 };
 use zinder_runtime::{
-    IngestPhase, Readiness, ReadinessCause, ReadinessState, ServiceIdentifier, StartupPhase,
+    OpsEndpointHandle, Readiness, ReadinessState, ServiceIdentifier, StartupPhase,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
     spawn_ops_endpoint_for,
 };
 use zinder_source::{
-    ChainTipNotificationSource, JsonRpcMempoolSource, MempoolSource, NodeCapabilities,
-    NodeCapability, NodeSource, NodeTarget, ZebraIndexerChainTipSource, ZebraIndexerMempoolSource,
-    ZebraIndexerSourceTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+    JsonRpcMempoolSource, MempoolSource, NodeCapabilities, NodeCapability, NodeSource, NodeTarget,
+    ZebraIndexerMempoolSource, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
+    ZebraJsonRpcSourceOptions,
 };
-use zinder_store::{ChainStoreOptions, PrimaryChainStore, SecondaryChainStore};
+use zinder_store::{ChainStoreOptions, MempoolEventRetentionConfig, SecondaryChainStore};
 
 use crate::config::{
-    BackupConfigOverrides, CanonicalReplayVerificationConfigOverrides, IngestCommandConfig,
-    IngestConfigError, IngestConfigOverrides, IngestCoverage,
+    CanonicalReplayVerificationConfigOverrides, IngestCommandConfig, IngestConfigError,
+    IngestConfigOverrides, IngestCoverage,
 };
 
-mod backup;
 mod canonical_replay_verification;
 mod cli;
 mod config;
 
-const MEMPOOL_ORCHESTRATOR_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::JsonRpc,
     NodeCapability::BestChainBlocks,
@@ -176,27 +162,9 @@ enum Command {
     /// upstream-health snapshot, then exit. Diagnostic only; does not ingest
     /// or commit chain data.
     Probe,
-    /// Create a point-in-time `RocksDB` checkpoint of the canonical store.
-    Backup(BackupArgs),
     /// Check replay-envelope integrity and canonical-header parity through a
     /// reader-local `RocksDB` secondary.
     VerifyCanonicalReplay(CanonicalReplayVerificationArgs),
-}
-
-#[derive(Parser)]
-struct BackupArgs {
-    /// Network name, such as zcash-regtest.
-    #[arg(long)]
-    network: Option<String>,
-    /// Canonical Zinder store path.
-    #[arg(long = "storage-path")]
-    storage_path: Option<PathBuf>,
-    /// Destination directory for the `RocksDB` checkpoint.
-    #[arg(long = "to")]
-    to_path: Option<PathBuf>,
-    /// Immutable raw-blob contract used when the canonical store was created.
-    #[arg(long = "raw-blob-policy")]
-    raw_blob_policy: Option<String>,
 }
 
 #[derive(Parser)]
@@ -225,111 +193,7 @@ async fn main() -> ExitCode {
         return run_print_config(cli);
     }
 
-    run_runtime(cli).await
-}
-
-#[allow(
-    clippy::print_stdout,
-    reason = "--print-config is a structured TOML data dump, not a log event"
-)]
-fn run_print_config(cli: Cli) -> ExitCode {
-    let overrides = ingest_overrides(&cli);
-    let config_path = cli.config_path.clone();
-    let render_result = match cli.command {
-        None | Some(Command::Probe) => print_ingest_config(config_path, overrides),
-        Some(Command::Backup(args)) => print_backup_config(config_path, args),
-        Some(Command::VerifyCanonicalReplay(args)) => {
-            print_canonical_replay_verification_config(config_path, args)
-        }
-    };
-
-    match render_result {
-        Ok(rendered_toml) => {
-            println!("{rendered_toml}");
-            ExitCode::SUCCESS
-        }
-        Err(error) => emit_runtime_error(&error),
-    }
-}
-
-async fn run_runtime(cli: Cli) -> ExitCode {
-    let ops_listen_addr_override = cli.ops_listen_addr;
-    let overrides = ingest_overrides_with_ops(&cli, ops_listen_addr_override);
-    let config_path = cli.config_path.clone();
-    let runtime_result = match cli.command {
-        Some(Command::Backup(args)) => run_backup(config_path, args),
-        Some(Command::Probe) => run_probe(config_path, overrides).await,
-        Some(Command::VerifyCanonicalReplay(args)) => {
-            run_canonical_replay_verification(config_path, args)
-        }
-        None => run_ingest(config_path, overrides).await,
-    };
-
-    match runtime_result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => emit_runtime_error(&error),
-    }
-}
-
-fn emit_runtime_error(error: &IngestConfigError) -> ExitCode {
-    tracing::error!(
-        target: "zinder::ingest",
-        event = "ingest_run_failed",
-        error = %error,
-        "ingest run failed"
-    );
-    ExitCode::FAILURE
-}
-
-fn projection_identity_strings(preset: zinder_derive::ProjectionPreset) -> Vec<String> {
-    preset
-        .consumer_schemas()
-        .iter()
-        .map(|schema| schema.name.as_str().to_owned())
-        .collect()
-}
-
-fn ingest_overrides(cli: &Cli) -> IngestConfigOverrides {
-    ingest_overrides_with_ops(cli, None)
-}
-
-fn ingest_overrides_with_ops(
-    cli: &Cli,
-    ops_listen_addr_override: Option<SocketAddr>,
-) -> IngestConfigOverrides {
-    IngestConfigOverrides {
-        network: cli.network.clone(),
-        node_source: cli.node_source.clone(),
-        json_rpc_addr: cli.json_rpc_addr.clone(),
-        node_auth_method: cli.node_auth_method.clone(),
-        node_auth_username: cli.node_auth_username.clone(),
-        node_auth_path: cli.node_auth_path.clone(),
-        storage_path: cli.storage_path.clone(),
-        projection_preset: cli.projection_preset.clone(),
-        request_timeout_secs: cli.request_timeout_secs,
-        max_response_bytes: cli.max_response_bytes,
-        reorg_window_blocks: cli.reorg_window_blocks,
-        catchup_threshold_blocks: cli.catchup_threshold_blocks,
-        canonical_batch_max_blocks: cli.canonical_batch_max_blocks,
-        canonical_batch_max_artifact_bytes: cli.canonical_batch_max_artifact_bytes,
-        canonical_batch_max_estimated_write_bytes: cli.canonical_batch_max_estimated_write_bytes,
-        canonical_batch_min_blocks_before_estimated_write_close: cli
-            .canonical_batch_min_blocks_before_estimated_write_close,
-        source_segment_max_blocks: cli.source_segment_max_blocks,
-        source_segment_target_response_bytes: cli.source_segment_target_response_bytes,
-        source_fetch_max_in_flight_requests: cli.source_fetch_max_in_flight_requests,
-        source_fetch_max_in_flight_bytes: cli.source_fetch_max_in_flight_bytes,
-        block_prepare_concurrency: cli.block_prepare_concurrency,
-        poll_interval_ms: cli.poll_interval_ms,
-        lag_threshold_blocks: cli.lag_threshold_blocks,
-        target_height: cli.target_height,
-        checkpoint_height: cli.checkpoint_height,
-        allow_near_tip_finalize: cli.allow_near_tip_finalize.then_some(true),
-        wallet_serving: cli.wallet_serving.then_some(true),
-        ingest_control_listen_addr: cli.ingest_control_listen_addr,
-        ingest_control_bearer_token_path: cli.ingest_control_token_path.clone(),
-        ops_listen_addr: ops_listen_addr_override,
-    }
+    Box::pin(run_runtime(cli)).await
 }
 
 #[allow(
@@ -357,6 +221,8 @@ async fn run_probe(
         &loop_config.storage_path,
         &activations,
         zinder_store::CanonicalStoreWorkload::Wallet,
+        zinder_store::CanonicalReorgPolicy::new(loop_config.reorg_window_blocks)
+            .map_err(zinder_ingest::CanonicalRuntimeError::from)?,
         loop_config.canonical_rocksdb_budget,
     )
     .map_err(zinder_ingest::CanonicalRuntimeError::from)
@@ -438,18 +304,200 @@ async fn run_ingest(
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
 
-    let runtime_config =
+    let mut runtime_config =
         canonical_runtime_config(&command_config, Arc::clone(&network_upgrade_activations));
-    log_canonical_runtime_start(&command_config, &runtime_config);
-    let runtime_result = run_canonical_runtime(
+    let mut canonical_control_tasks = spawn_canonical_control_tasks(
+        &command_config,
         &source,
-        network_upgrade_activations,
-        runtime_config,
         &readiness,
         &cancel,
+        &mut runtime_config,
+    );
+    log_canonical_runtime_start(&command_config, &runtime_config);
+    let runtime_result = run_supervised_canonical_runtime(
+        &source,
+        CanonicalRuntimeInputs {
+            network_upgrade_activations,
+            runtime_config,
+        },
+        &readiness,
+        &cancel,
+        &mut canonical_control_tasks,
     )
     .await;
+    shutdown_ingest_tasks(
+        &cancel,
+        canonical_control_tasks,
+        memory_metrics_handle,
+        ops_handle,
+    )
+    .await;
+    runtime_result.map_err(IngestConfigError::from)
+}
+
+type CanonicalControlServer = JoinHandle<Result<(), tonic::transport::Error>>;
+
+struct CanonicalControlTasks {
+    server: Option<CanonicalControlServer>,
+    commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
+    mempool_owner: Option<JoinHandle<()>>,
+    mempool_retention: Option<JoinHandle<()>>,
+    server_completed: bool,
+}
+
+fn spawn_canonical_control_tasks(
+    command_config: &IngestCommandConfig,
+    source: &ZebraJsonRpcSource,
+    readiness: &Readiness,
+    cancel: &CancellationToken,
+    runtime_config: &mut CanonicalRuntimeConfig,
+) -> CanonicalControlTasks {
+    if let Some(listen_addr) = command_config.ingest_control_listen_addr {
+        let (canonical_control_handle, canonical_control_commands) = canonical_control_channel();
+        let mempool_owner = FactFirstMempoolOwner::default();
+        let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
+        runtime_config.follow.mempool_ready_gate = Some(mempool_ready_gate);
+        let mempool_source =
+            build_fact_first_mempool_source(&command_config.loop_config.node, source);
+        let mempool_owner_task = tokio::spawn(run_fact_first_mempool_owner(
+            mempool_source,
+            canonical_control_handle.clone(),
+            mempool_owner.clone(),
+            mempool_ready_signal,
+            cancel.clone(),
+        ));
+        let mempool_retention = MempoolEventRetentionConfig::new(
+            command_config.retention.mempool_mined_window(),
+            command_config.retention.mempool_invalidated_window(),
+        );
+        let mempool_retention_task = tokio::spawn(run_fact_first_mempool_retention(
+            canonical_control_handle.clone(),
+            mempool_owner.clone(),
+            mempool_retention,
+            command_config.retention.mempool_check_interval(),
+            cancel.clone(),
+        ));
+        let canonical_adapter = CanonicalControlGrpcAdapter::new(
+            canonical_control_handle.clone(),
+            CanonicalCheckpointStagingRoot::new(
+                command_config
+                    .ingest_control_checkpoint_staging_root
+                    .clone(),
+            ),
+            command_config.loop_config.canonical_rocksdb_budget,
+        )
+        .with_bearer_token(command_config.ingest_control_bearer_token.clone())
+        .with_checkpoint_bearer_token(
+            command_config
+                .ingest_control_checkpoint_bearer_token
+                .clone(),
+        );
+        let node_source: Arc<dyn NodeSource> = Arc::new(source.clone());
+        let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
+            command_config.loop_config.node.network,
+            canonical_control_handle,
+            mempool_owner,
+            node_source,
+            readiness.clone(),
+        )
+        .with_bearer_token(command_config.ingest_control_bearer_token.clone());
+        let server_cancel = cancel.clone();
+        let canonical_control_server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(canonical_adapter.into_server())
+                .add_service(ingest_adapter.into_server())
+                .serve_with_shutdown(listen_addr, server_cancel.cancelled_owned())
+                .await
+        });
+        CanonicalControlTasks {
+            server: Some(canonical_control_server),
+            commands: Some(canonical_control_commands),
+            mempool_owner: Some(mempool_owner_task),
+            mempool_retention: Some(mempool_retention_task),
+            server_completed: false,
+        }
+    } else {
+        CanonicalControlTasks {
+            server: None,
+            commands: None,
+            mempool_owner: None,
+            mempool_retention: None,
+            server_completed: false,
+        }
+    }
+}
+
+struct CanonicalRuntimeInputs {
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    runtime_config: CanonicalRuntimeConfig,
+}
+
+async fn run_supervised_canonical_runtime(
+    source: &ZebraJsonRpcSource,
+    inputs: CanonicalRuntimeInputs,
+    readiness: &Readiness,
+    cancel: &CancellationToken,
+    control_tasks: &mut CanonicalControlTasks,
+) -> Result<(), zinder_ingest::CanonicalRuntimeError> {
+    let runtime = run_canonical_runtime_with_control(
+        source,
+        inputs.network_upgrade_activations,
+        inputs.runtime_config,
+        readiness,
+        cancel,
+        control_tasks.commands.take(),
+    );
+    tokio::pin!(runtime);
+    let runtime_result = if let Some(canonical_control_server) = control_tasks.server.as_mut() {
+        tokio::select! {
+            runtime_result = &mut runtime => runtime_result,
+            server_result = canonical_control_server => {
+                control_tasks.server_completed = true;
+                cancel.cancel();
+                let reason = match server_result {
+                    Ok(Ok(())) => "canonical control server stopped unexpectedly".to_owned(),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(error) => error.to_string(),
+                };
+                Err(zinder_ingest::CanonicalRuntimeError::ControlServer { reason })
+            }
+        }
+    } else {
+        runtime.await
+    };
+    runtime_result.map(drop)
+}
+
+async fn shutdown_ingest_tasks(
+    cancel: &CancellationToken,
+    mut control_tasks: CanonicalControlTasks,
+    memory_metrics_handle: JoinHandle<()>,
+    ops_handle: Option<OpsEndpointHandle>,
+) {
     cancel.cancel();
+    if !control_tasks.server_completed {
+        await_canonical_control_server_shutdown(control_tasks.server.take()).await;
+    }
+    if let Some(mempool_owner_task) = control_tasks.mempool_owner.take()
+        && let Err(join_error) = mempool_owner_task.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "fact_first_mempool_owner_join_failed",
+            error = %join_error,
+            "fact-first mempool owner did not shut down cleanly"
+        );
+    }
+    if let Some(mempool_retention_task) = control_tasks.mempool_retention.take()
+        && let Err(join_error) = mempool_retention_task.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "fact_first_mempool_retention_join_failed",
+            error = %join_error,
+            "fact-first mempool retention task did not shut down cleanly"
+        );
+    }
     if let Err(join_error) = memory_metrics_handle.await {
         tracing::warn!(
             target: "zinder::ingest",
@@ -461,7 +509,20 @@ async fn run_ingest(
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
-    runtime_result.map(drop).map_err(IngestConfigError::from)
+}
+
+async fn await_canonical_control_server_shutdown(server: Option<CanonicalControlServer>) {
+    let Some(server) = server else {
+        return;
+    };
+    if let Err(join_error) = server.await {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "canonical_control_server_join_failed",
+            error = %join_error,
+            "canonical control server did not shut down cleanly"
+        );
+    }
 }
 
 fn canonical_runtime_config(
@@ -483,6 +544,9 @@ fn canonical_runtime_config(
             poll_interval: command_config.loop_config.tip_follow.poll_interval,
             lag_threshold_blocks: command_config.loop_config.tip_follow.lag_threshold_blocks,
             target_height: command_config.loop_config.modifiers.target_height,
+            event_retention_window: command_config.retention.chain_event_window(),
+            event_retention_check_interval: command_config.retention.chain_event_check_interval(),
+            mempool_ready_gate: None,
         },
     }
 }
@@ -506,506 +570,6 @@ fn log_canonical_runtime_start(
         cross_block_wallet_reads = 0_u64,
         "version-1 canonical runtime started without legacy storage composition"
     );
-}
-
-#[allow(
-    dead_code,
-    clippy::too_many_lines,
-    reason = "the legacy composition remains source-only until later ADR-0035 slices rewire every query consumer; the default runtime has no selector or call path to it"
-)]
-async fn run_legacy_ingest_composition(
-    config_path: Option<PathBuf>,
-    overrides: IngestConfigOverrides,
-) -> Result<(), IngestConfigError> {
-    let load_config_phase = StartupPhase::LoadConfig.start();
-    let mut command_config = match config::load_ingest_config(config_path, overrides) {
-        Ok(cfg) => {
-            load_config_phase.complete();
-            cfg
-        }
-        Err(error) => {
-            load_config_phase.fail(&error);
-            return Err(error);
-        }
-    };
-
-    let readiness = Readiness::default();
-    readiness.set_projection_workload(
-        command_config.projection_preset.as_str(),
-        projection_identity_strings(command_config.projection_preset),
-    );
-    let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::Ingest,
-        command_config.ops_listen_addr,
-        env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(command_config.loop_config.node.network),
-        readiness.clone(),
-        zinder_proto::capabilities::always_on_capability_strings(
-            zinder_proto::capabilities::CapabilitySurface::Ingest,
-        ),
-    );
-
-    let connect_node_phase = StartupPhase::ConnectNode.start();
-    let source = match zebra_json_rpc_source_for_target(
-        command_config.loop_config.node_source,
-        &command_config.loop_config.node,
-    ) {
-        Ok(source) => {
-            connect_node_phase.complete();
-            source
-        }
-        Err(error) => {
-            connect_node_phase.fail(&error);
-            start_api_phase.fail(&error);
-            return Err(error);
-        }
-    };
-
-    let check_schema_phase = StartupPhase::CheckSchema.start();
-    match ensure_node_capabilities(&source, &readiness).await {
-        Ok(_capabilities) => {}
-        Err(error) => {
-            check_schema_phase.fail(&error);
-            start_api_phase.fail(&error);
-            return Err(error);
-        }
-    }
-    let network_upgrade_activations = match source
-        .discover_network_upgrade_activations("zinder-ingest")
-        .await
-    {
-        Ok(activations) => activations,
-        Err(error) => {
-            let wrapped: IngestConfigError = IngestError::from(error).into();
-            check_schema_phase.fail(&wrapped);
-            start_api_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
-    check_schema_phase.complete();
-
-    let recover_state_phase = StartupPhase::RecoverState.start();
-    if let Err(error) =
-        resolve_wallet_serving_modifiers(&mut command_config, &network_upgrade_activations)
-    {
-        recover_state_phase.fail(&error);
-        start_api_phase.fail(&error);
-        return Err(error);
-    }
-    if let Some(checkpoint_height) = command_config.loop_config.modifiers.checkpoint_height {
-        let checkpoint = match source
-            .fetch_chain_checkpoint(checkpoint_height, &network_upgrade_activations)
-            .await
-        {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => {
-                let wrapped: IngestConfigError = IngestError::from(error).into();
-                recover_state_phase.fail(&wrapped);
-                start_api_phase.fail(&wrapped);
-                return Err(wrapped);
-            }
-        };
-        let checkpoint_tip_metadata = checkpoint.tip_metadata();
-        tracing::info!(
-            target: "zinder::ingest",
-            event = "ingest_checkpoint_resolved",
-            checkpoint_height = checkpoint.block_id.height.value(),
-            sapling_commitment_tree_size = checkpoint_tip_metadata.sapling_commitment_tree_size,
-            orchard_commitment_tree_size = checkpoint_tip_metadata.orchard_commitment_tree_size,
-            ironwood_commitment_tree_size = checkpoint_tip_metadata.ironwood_commitment_tree_size,
-            "fetched bootstrap checkpoint from upstream node"
-        );
-        command_config.loop_config.modifiers.checkpoint = Some(checkpoint);
-    }
-    recover_state_phase.complete();
-
-    let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-
-    let open_storage_phase = StartupPhase::OpenStorage.start();
-    let projection_startup_plan =
-        ProjectionStartupPlan::for_preset(command_config.projection_preset);
-    let restore_admission = match backup::admit_restore_bundle_if_present(
-        &command_config.loop_config.storage_path,
-        backup::RestoreAdmissionOptions {
-            network: command_config.loop_config.node.network,
-            projection_preset: projection_startup_plan.preset(),
-            canonical_rocksdb_budget: command_config.loop_config.canonical_rocksdb_budget,
-            derive_rocksdb_budget: command_config.loop_config.derive_rocksdb_budget,
-            raw_blob_policy: command_config.loop_config.raw_blob_policy,
-        },
-    ) {
-        Ok(admission) => admission,
-        Err(error) => {
-            let wrapped: IngestConfigError = error.into();
-            open_storage_phase.fail(&wrapped);
-            start_api_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
-    if restore_admission != backup::RestoreAdmission::NotApplicable {
-        tracing::info!(
-            target: "zinder::ingest",
-            event = "restore_bundle_admitted",
-            admission = ?restore_admission,
-            storage_path = %command_config.loop_config.storage_path.display(),
-            "validated restored canonical and projection bundle before writer open"
-        );
-    }
-    let store_options = command_config.loop_config.canonical_store_options();
-    let store =
-        match PrimaryChainStore::open(&command_config.loop_config.storage_path, store_options) {
-            Ok(store) => store,
-            Err(error) => {
-                let wrapped: IngestConfigError = IngestError::from(error).into();
-                open_storage_phase.fail(&wrapped);
-                start_api_phase.fail(&wrapped);
-                return Err(wrapped);
-            }
-        };
-    let configured_checkpoint = command_config
-        .loop_config
-        .modifiers
-        .checkpoint
-        .as_ref()
-        .map(|checkpoint| checkpoint.block_id);
-    if let Err(error) = store.reconcile_canonical_history_bounds(configured_checkpoint) {
-        let wrapped: IngestConfigError = IngestError::from(error).into();
-        open_storage_phase.fail(&wrapped);
-        start_api_phase.fail(&wrapped);
-        return Err(wrapped);
-    }
-    if let Err(error) = projection_startup_plan
-        .preflight_storage_pair(&store, &command_config.loop_config.storage_path)
-    {
-        let wrapped: IngestConfigError = error.into();
-        open_storage_phase.fail(&wrapped);
-        start_api_phase.fail(&wrapped);
-        return Err(wrapped);
-    }
-    let derive_store = match open_primary_derive_store_for_canonical_with_projection_preset(
-        &command_config.loop_config.storage_path,
-        command_config.loop_config.derive_rocksdb_budget,
-        projection_startup_plan.preset(),
-    ) {
-        Ok(store) => store,
-        Err(error) => {
-            let wrapped: IngestConfigError = IngestError::from(error).into();
-            open_storage_phase.fail(&wrapped);
-            start_api_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
-    let startup_phase = match source.tip_id().await {
-        Ok(upstream_tip) => classify_phase(
-            current_chain_height(&store),
-            upstream_tip.height.value(),
-            command_config.loop_config.phases.catchup_threshold_blocks,
-        ),
-        Err(error) => {
-            tracing::warn!(
-                target: "zinder::ingest",
-                event = "startup_ingest_phase_observation_failed",
-                error = %error,
-                "startup could not classify canonical lag; derive replay remains fail-closed until the unified loop retries"
-            );
-            IngestPhase::BulkCatchup
-        }
-    };
-    readiness.set_phase(startup_phase);
-    tracing::info!(
-        target: "zinder::ingest",
-        event = "startup_ingest_phase_classified",
-        phase = ?startup_phase,
-        "classified ingest phase before admitting startup derive work"
-    );
-    let historical_work_gate = HistoricalWorkGate::new(readiness.clone());
-    let projection_runtime = match projection_startup_plan
-        .start(ProjectionStartupInputs {
-            settings: ProjectionStartupSettings {
-                derive: command_config.loop_config.derive,
-                commitment_root_backfill: command_config.loop_config.commitment_root_backfill,
-                conventional_fee_distribution_backfill: command_config
-                    .conventional_fee_distribution_backfill,
-                paid_fee_distribution_backfill: command_config.paid_fee_distribution_backfill,
-                transaction_component_backfill: command_config.transaction_component_backfill,
-                transaction_history_verifier: command_config.transaction_history_verifier,
-                value_pool_flow_backfill: command_config.value_pool_flow_backfill,
-                value_pool_balance_backfill: command_config.value_pool_balance_backfill,
-            },
-            request_timeout: command_config.loop_config.node.request_timeout,
-            activations: Arc::clone(&network_upgrade_activations),
-            source: Arc::new(source.clone()),
-            chain_store: &store,
-            derive_store: &derive_store,
-            historical_work_gate: &historical_work_gate,
-            cancel: &cancel,
-        })
-        .await
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let wrapped: IngestConfigError = error.into();
-            open_storage_phase.fail(&wrapped);
-            start_api_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
-    let memory_metrics_handle =
-        spawn_runtime_memory_metrics_task(DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, cancel.clone());
-    let derive_replay_budget_metrics_handle = spawn_derive_replay_budget_metrics_task(
-        command_config.loop_config.derive,
-        DEFAULT_DERIVE_TAILER_POLL_INTERVAL,
-        DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-        readiness.clone(),
-        cancel.clone(),
-    );
-    let transparent_retention_handle = spawn_transparent_retention_task(
-        store.clone(),
-        historical_work_gate.clone(),
-        cancel.clone(),
-    );
-    open_storage_phase.complete();
-
-    let mempool_index = MempoolIndex::new();
-    let ingest_control_handle = if let Some(listen_addr) = command_config.ingest_control_listen_addr
-    {
-        Some(
-            spawn_ingest_control_endpoint(IngestControlEndpointSpec {
-                listen_addr,
-                network: command_config.loop_config.node.network,
-                store: store.clone(),
-                derive_status_reader: Arc::new(RocksDbDeriveStatusReader::new(
-                    derive_store.clone(),
-                )),
-                readiness: readiness.clone(),
-                mempool_index: mempool_index.clone(),
-                node_source: Some(Arc::new(source.clone())),
-                projection_preset: projection_startup_plan.preset(),
-                bearer_token: command_config.ingest_control_bearer_token.clone(),
-                cancel: cancel.clone(),
-            })
-            .await?,
-        )
-    } else {
-        tracing::info!(
-            target: "zinder::ingest",
-            event = "ingest_control_endpoint_disabled",
-            "ingest-control endpoint disabled by configuration"
-        );
-        None
-    };
-    let _upstream_health_probe_handle = spawn_upstream_health_probe_for(
-        &command_config.loop_config.node,
-        &source,
-        readiness.clone(),
-        cancel.clone(),
-    );
-
-    start_api_phase.complete();
-    StartupPhase::Ready.start().complete();
-    readiness.set(ReadinessState::syncing(None, None, None));
-
-    tracing::info!(
-        target: "zinder::ingest",
-        event = "ingest_loop_started",
-        network = encode_zinder_native_chain_name(command_config.loop_config.node.network),
-        json_rpc_addr = command_config.loop_config.node.json_rpc_addr.as_str(),
-        reorg_window_blocks = command_config.loop_config.reorg_window_blocks,
-        projection_preset = projection_startup_plan.preset().as_str(),
-        projection_identities = ?projection_identity_strings(projection_startup_plan.preset()),
-        catchup_threshold_blocks = command_config.loop_config.phases.catchup_threshold_blocks,
-        block_prepare_concurrency = command_config.loop_config.bulk_catchup.pipeline_limits.block_prepare_concurrency.get(),
-        canonical_batch_max_blocks = command_config.loop_config.bulk_catchup.canonical_batch_max_blocks.get(),
-        canonical_batch_max_artifact_bytes = command_config.loop_config.bulk_catchup.canonical_batch_max_artifact_bytes.get(),
-        canonical_batch_max_estimated_write_bytes = command_config.loop_config.bulk_catchup.canonical_batch_max_estimated_write_bytes.get(),
-        canonical_batch_min_blocks_before_estimated_write_close = command_config.loop_config.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close.get(),
-        source_segment_max_blocks = command_config.loop_config.bulk_catchup.pipeline_limits.source_segment_max_blocks.get(),
-        source_segment_target_response_bytes = command_config.loop_config.bulk_catchup.pipeline_limits.source_segment_target_response_bytes.get(),
-        source_fetch_max_in_flight_requests = command_config.loop_config.bulk_catchup.pipeline_limits.source_fetch_max_in_flight_requests.get(),
-        source_fetch_max_in_flight_bytes = command_config.loop_config.bulk_catchup.pipeline_limits.source_fetch_max_in_flight_bytes.get(),
-        block_prepare_memory_watermark_bytes = command_config.loop_config.bulk_catchup.pipeline_limits.block_prepare_memory_watermark_bytes.get(),
-        commit_reassembly_max_queued_artifact_bytes = command_config.loop_config.bulk_catchup.commit_reassembly_max_queued_artifact_bytes.get(),
-        derive_replay_batch_blocks = command_config.loop_config.derive.replay_batch_blocks.get(),
-        derive_memory_degrade_ratio = command_config.loop_config.derive.memory_degrade_ratio,
-        derive_memory_pause_ratio = command_config.loop_config.derive.memory_pause_ratio,
-        derive_memory_resume_ratio = command_config.loop_config.derive.memory_resume_ratio,
-        derive_min_replay_batch_blocks = command_config.loop_config.derive.min_replay_batch_blocks.get(),
-        commitment_root_backfill_enabled = command_config.loop_config.commitment_root_backfill.enabled,
-        commitment_root_backfill_batch_blocks = command_config.loop_config.commitment_root_backfill.batch_blocks.get(),
-        commitment_root_backfill_fetch_concurrency = command_config.loop_config.commitment_root_backfill.fetch_concurrency.get(),
-        conventional_fee_distribution_backfill_enabled = command_config.conventional_fee_distribution_backfill.enabled,
-        conventional_fee_distribution_backfill_batch_blocks = command_config.conventional_fee_distribution_backfill.batch_blocks.get(),
-        paid_fee_distribution_backfill_enabled = command_config.paid_fee_distribution_backfill.enabled,
-        paid_fee_distribution_backfill_batch_blocks = command_config.paid_fee_distribution_backfill.batch_blocks.get(),
-        paid_fee_distribution_backfill_fetch_concurrency = command_config.paid_fee_distribution_backfill.fetch_concurrency.get(),
-        paid_fee_distribution_backfill_history_days = command_config.paid_fee_distribution_backfill.history_days.get(),
-        paid_fee_distribution_backfill_timestamp_safety_seconds = command_config.paid_fee_distribution_backfill.timestamp_safety_seconds,
-        transaction_component_backfill_enabled = command_config.transaction_component_backfill.enabled,
-        transaction_component_backfill_batch_blocks = command_config.transaction_component_backfill.batch_blocks.get(),
-        transaction_history_verifier_enabled = command_config.transaction_history_verifier.enabled,
-        transaction_history_verifier_batch_blocks = command_config.transaction_history_verifier.batch_blocks.get(),
-        value_pool_flow_backfill_enabled = command_config.value_pool_flow_backfill.enabled,
-        value_pool_flow_backfill_batch_blocks = command_config.value_pool_flow_backfill.batch_blocks.get(),
-        value_pool_flow_backfill_fetch_concurrency = command_config.value_pool_flow_backfill.fetch_concurrency.get(),
-        value_pool_balance_backfill_enabled = command_config.value_pool_balance_backfill.enabled,
-        value_pool_balance_backfill_batch_blocks = command_config.value_pool_balance_backfill.batch_blocks.get(),
-        value_pool_balance_backfill_fetch_concurrency = command_config.value_pool_balance_backfill.fetch_concurrency.get(),
-        poll_interval_ms = u64::try_from(
-            command_config.loop_config.tip_follow.poll_interval.as_millis()
-        )
-        .unwrap_or(u64::MAX),
-        lag_threshold_blocks = command_config.loop_config.tip_follow.lag_threshold_blocks,
-        ingest_control_listen_addr = ?command_config.ingest_control_listen_addr,
-        "unified ingest loop started"
-    );
-
-    let launcher = build_tip_follow_subsystems_launcher(
-        command_config.loop_config.node.clone(),
-        source.clone(),
-        store.clone(),
-        derive_store.clone(),
-        mempool_index,
-        readiness.clone(),
-        command_config.chain_event_retention(),
-        command_config.mempool_event_retention(),
-        cancel.clone(),
-    );
-
-    let loop_outcome = run_ingest_loop(
-        &command_config.loop_config,
-        network_upgrade_activations,
-        Arc::new(source),
-        store.clone(),
-        &readiness,
-        cancel.clone(),
-        Some(launcher),
-    )
-    .await;
-
-    let final_result = handle_loop_outcome(loop_outcome, &readiness, &cancel).await;
-    cancel.cancel();
-    projection_runtime.join().await;
-    if let Err(join_error) = memory_metrics_handle.await {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "runtime_memory_metrics_join_failed",
-            error = %join_error,
-            "runtime memory metrics task failed during shutdown"
-        );
-    }
-    if let Err(join_error) = derive_replay_budget_metrics_handle.await {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "derive_replay_budget_metrics_join_failed",
-            error = %join_error,
-            "derive replay budget metrics task failed during shutdown"
-        );
-    }
-    if let Err(join_error) = transparent_retention_handle.await {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "transparent_retention_join_failed",
-            error = %join_error,
-            "transparent retention task failed during shutdown"
-        );
-    }
-    tracing::info!(
-        target: "zinder::ingest",
-        event = "ingest_loop_stopped",
-        "unified ingest loop stopped"
-    );
-
-    if let Some(handle) = ops_handle {
-        handle.shutdown().await;
-    }
-    if let Some(handle) = ingest_control_handle {
-        handle.shutdown().await;
-    }
-
-    final_result
-}
-
-async fn handle_loop_outcome(
-    outcome: Result<(), IngestError>,
-    readiness: &Readiness,
-    cancel: &CancellationToken,
-) -> Result<(), IngestConfigError> {
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(IngestError::ReorgWindowExceeded {
-            from_height,
-            replacement_depth,
-            configured_window_blocks,
-        }) => {
-            tracing::warn!(
-                target: "zinder::ingest",
-                event = "ingest_loop_reorg_window_exceeded",
-                from_height = from_height.value(),
-                replacement_depth,
-                configured_window_blocks,
-                "ingest reorg replacement crossed the configured reorg window; readiness drained for operator review"
-            );
-            readiness.set(ReadinessState::reorg_window_exceeded(
-                u64::from(replacement_depth),
-                u64::from(configured_window_blocks),
-                Some(from_height.value().saturating_sub(1)),
-            ));
-            cancel.cancelled().await;
-            Ok(())
-        }
-        Err(error) => Err(IngestConfigError::from(error)),
-    }
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "tip-follow subsystems capture the source, store, mempool index, readiness handle, two retention configs, and the cancel token; bundling them into a struct adds indirection without changing the binding count the binary must make."
-)]
-fn build_tip_follow_subsystems_launcher(
-    node_target: NodeTarget,
-    source: ZebraJsonRpcSource,
-    store: PrimaryChainStore,
-    derive_store: zinder_derive::DeriveStore,
-    mempool_index: MempoolIndex,
-    readiness: Readiness,
-    chain_event_retention: zinder_ingest::ChainEventRetentionConfig,
-    mempool_event_retention: zinder_ingest::MempoolEventRetentionWorkerConfig,
-    cancel: CancellationToken,
-) -> TipFollowSubsystemsLauncher {
-    Box::new(move || {
-        let retention_handle = spawn_chain_event_retention_task(
-            store.clone(),
-            readiness.clone(),
-            chain_event_retention,
-            cancel.clone(),
-        );
-        let mempool_retention_handle = spawn_mempool_event_retention_task(
-            store.clone(),
-            readiness.clone(),
-            mempool_event_retention,
-            cancel.clone(),
-        );
-        let mempool_source = build_mempool_source(&node_target, &source);
-        let chain_tip_source = build_chain_tip_notification_source(&node_target);
-        let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
-        let mempool_handle = spawn_mempool_orchestrator(
-            mempool_source,
-            store.clone(),
-            derive_store.clone(),
-            mempool_index,
-            readiness.clone(),
-            mempool_ready_signal,
-            cancel.clone(),
-        );
-
-        TipFollowSubsystems {
-            mempool_ready_gate: Some(mempool_ready_gate),
-            chain_tip_source,
-            spawned_tasks: vec![retention_handle, mempool_retention_handle, mempool_handle],
-        }
-    })
 }
 
 fn resolve_wallet_serving_modifiers(
@@ -1146,108 +710,34 @@ fn zebra_json_rpc_source_for_target(
     }
 }
 
-struct IngestControlEndpointHandle {
-    cancel: CancellationToken,
-    join: JoinHandle<Result<(), IngestConfigError>>,
-}
-
-impl IngestControlEndpointHandle {
-    async fn shutdown(self) {
-        self.cancel.cancel();
-        match self.join.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(
-                target: "zinder::ingest",
-                event = "ingest_control_endpoint_error",
-                error = %error,
-                "ingest-control endpoint exited with error"
-            ),
-            Err(join_error) => tracing::warn!(
-                target: "zinder::ingest",
-                event = "ingest_control_endpoint_panic",
-                error = %join_error,
-                "ingest-control endpoint task failed"
-            ),
-        }
-    }
-}
-
-struct IngestControlEndpointSpec {
-    listen_addr: SocketAddr,
-    network: zinder_core::Network,
-    store: PrimaryChainStore,
-    derive_status_reader: Arc<dyn DeriveStatusReader>,
-    readiness: Readiness,
-    mempool_index: MempoolIndex,
-    node_source: Option<Arc<dyn NodeSource>>,
-    projection_preset: zinder_derive::ProjectionPreset,
-    bearer_token: Option<zinder_runtime::BearerToken>,
-    cancel: CancellationToken,
-}
-
-async fn spawn_ingest_control_endpoint(
-    spec: IngestControlEndpointSpec,
-) -> Result<IngestControlEndpointHandle, IngestConfigError> {
-    let listen_addr = spec.listen_addr;
-    let listener = TcpListener::bind(listen_addr).await.map_err(|source| {
-        IngestConfigError::IngestControlBind {
-            listen_addr,
-            source,
-        }
-    })?;
-    let incoming = TcpListenerStream::new(listener);
-    let endpoint_cancel = CancellationToken::new();
-    let endpoint_cancel_for_task = endpoint_cancel.clone();
-    let shutdown_cancel = spec.cancel.clone();
-    let adapter = {
-        let mut adapter = IngestControlGrpcAdapter::new(spec.network, spec.store, spec.readiness)
-            .with_derive_status_reader(spec.derive_status_reader)
-            .with_projection_preset(spec.projection_preset)
-            .with_mempool(spec.mempool_index);
-        if let Some(node_source) = spec.node_source {
-            adapter = adapter.with_node_source(node_source);
-        }
-        if let Some(bearer_token) = spec.bearer_token {
-            adapter = adapter.with_bearer_token(bearer_token);
-        }
-        adapter
-    };
-    let join = tokio::spawn(async move {
-        tracing::info!(
-            target: "zinder::ingest",
-            event = "ingest_control_endpoint_started",
-            listen_addr = %listen_addr,
-            "ingest-control endpoint started"
-        );
-        let serve_result = tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming_shutdown(incoming, async move {
-                tokio::select! {
-                    () = shutdown_cancel.cancelled() => {}
-                    () = endpoint_cancel_for_task.cancelled() => {}
-                }
-            })
-            .await;
-        tracing::info!(
-            target: "zinder::ingest",
-            event = "ingest_control_endpoint_stopped",
-            "ingest-control endpoint stopped"
-        );
-        serve_result.map_err(|source| IngestConfigError::IngestControlTransport { source })
-    });
-
-    Ok(IngestControlEndpointHandle {
-        cancel: endpoint_cancel,
-        join,
-    })
-}
-
-fn build_chain_tip_notification_source(
+fn build_fact_first_mempool_source(
     node_target: &NodeTarget,
-) -> Option<Arc<dyn ChainTipNotificationSource>> {
-    let indexer_endpoint = node_target.indexer_grpc_addr.as_ref()?;
-    let target = ZebraIndexerSourceTarget::new(indexer_endpoint.clone());
-    Some(Arc::new(ZebraIndexerChainTipSource::new(target)))
+    json_rpc: &ZebraJsonRpcSource,
+) -> Arc<dyn MempoolSource> {
+    node_target.indexer_grpc_addr.as_ref().map_or_else(
+        || {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "mempool_source_selected",
+                backend = "zebra-json-rpc-polling",
+                "selected polling mempool source"
+            );
+            Arc::new(JsonRpcMempoolSource::new(json_rpc.clone())) as Arc<dyn MempoolSource>
+        },
+        |indexer_endpoint| {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "mempool_source_selected",
+                backend = "zebra-indexer-grpc",
+                indexer_endpoint = %indexer_endpoint,
+                "selected streaming mempool source"
+            );
+            Arc::new(ZebraIndexerMempoolSource::new(
+                ZebraIndexerSourceTarget::new(indexer_endpoint.clone()),
+                json_rpc.clone(),
+            )) as Arc<dyn MempoolSource>
+        },
+    )
 }
 
 fn spawn_upstream_health_probe_for(
@@ -1273,151 +763,98 @@ fn spawn_upstream_health_probe_for(
     ))
 }
 
-fn build_mempool_source(
-    node_target: &NodeTarget,
-    json_rpc: &ZebraJsonRpcSource,
-) -> Arc<dyn MempoolSource> {
-    node_target.indexer_grpc_addr.as_ref().map_or_else(
-        || {
-            tracing::info!(
-                target: "zinder::ingest",
-                event = "mempool_source_selected",
-                backend = "zebra-json-rpc-polling",
-                "selected polling mempool source"
-            );
-            Arc::new(JsonRpcMempoolSource::new(json_rpc.clone())) as Arc<dyn MempoolSource>
-        },
-        |indexer_endpoint| {
-            tracing::info!(
-                target: "zinder::ingest",
-                event = "mempool_source_selected",
-                backend = "zebra-indexer-grpc",
-                indexer_endpoint = %indexer_endpoint,
-                "selected streaming mempool source"
-            );
-            let indexer_target = ZebraIndexerSourceTarget::new(indexer_endpoint.clone());
-            Arc::new(ZebraIndexerMempoolSource::new(
-                indexer_target,
-                json_rpc.clone(),
-            )) as Arc<dyn MempoolSource>
-        },
-    )
-}
-
-const MEMPOOL_HYDRATION_LAGGING_THRESHOLD: u64 = 5;
-
 #[allow(
-    clippy::too_many_arguments,
-    reason = "spawn_mempool_orchestrator threads the source, store, live index, readiness, prime signal, and cancel through the orchestrator's spawn loop; bundling them into a struct adds indirection without changing the binding count callers must make."
+    clippy::print_stdout,
+    reason = "--print-config is a structured TOML data dump, not a log event"
 )]
-#[must_use = "drop the handle to detach the orchestrator or await it for symmetric shutdown"]
-fn spawn_mempool_orchestrator(
-    mempool_source: Arc<dyn MempoolSource>,
-    store: PrimaryChainStore,
-    derive_store: zinder_derive::DeriveStore,
-    mempool_index: MempoolIndex,
-    readiness: Readiness,
-    mempool_ready_signal: MempoolReadySignal,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let mut hydration_failures: u64 = 0;
-            let outcome_callback = {
-                let readiness = readiness.clone();
-                let store = store.clone();
-                let signal = mempool_ready_signal.clone();
-                move |outcome: MempoolOrchestratorEventOutcome| {
-                    if matches!(outcome, MempoolOrchestratorEventOutcome::SourceStreamOpened) {
-                        signal.set_primed();
-                        clear_mempool_orchestrator_readiness(&readiness, &store);
-                    } else if matches!(outcome, MempoolOrchestratorEventOutcome::HydrationFailed) {
-                        hydration_failures = hydration_failures.saturating_add(1);
-                        if hydration_failures >= MEMPOOL_HYDRATION_LAGGING_THRESHOLD {
-                            set_mempool_hydration_lagging(&readiness, &store, hydration_failures);
-                        }
-                    }
-                }
-            };
-            let orchestrator = run_mempool_orchestrator(
-                Arc::clone(&mempool_source),
-                store.clone(),
-                derive_store.clone(),
-                mempool_index.clone(),
-                outcome_callback,
-            );
-            tokio::pin!(orchestrator);
-            tokio::select! {
-                outcome = &mut orchestrator => {
-                    match outcome {
-                        Ok(()) => {
-                            tracing::info!(
-                                target: "zinder::ingest",
-                                event = "mempool_orchestrator_stream_closed",
-                                "mempool source stream ended; reconnecting"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                target: "zinder::ingest",
-                                event = "mempool_orchestrator_failed",
-                                error = %error,
-                                "mempool orchestrator returned an error; reconnecting"
-                            );
-                            set_mempool_source_unavailable(&readiness, &store);
-                        }
-                    }
-                }
-                () = cancel.cancelled() => {
-                    tracing::info!(
-                        target: "zinder::ingest",
-                        event = "mempool_orchestrator_cancelled",
-                        "mempool orchestrator cancelled"
-                    );
-                    return;
-                }
-            }
-            tokio::select! {
-                () = tokio::time::sleep(MEMPOOL_ORCHESTRATOR_RECONNECT_BACKOFF) => {}
-                () = cancel.cancelled() => return,
-            }
+fn run_print_config(cli: Cli) -> ExitCode {
+    let overrides = ingest_overrides(&cli);
+    let config_path = cli.config_path.clone();
+    let render_result = match cli.command {
+        None | Some(Command::Probe) => print_ingest_config(config_path, overrides),
+        Some(Command::VerifyCanonicalReplay(args)) => {
+            print_canonical_replay_verification_config(config_path, args)
         }
-    })
-}
+    };
 
-fn clear_mempool_orchestrator_readiness(readiness: &Readiness, store: &PrimaryChainStore) {
-    let cause = readiness.report().cause;
-    if matches!(
-        cause,
-        ReadinessCause::MempoolSourceUnavailable | ReadinessCause::MempoolHydrationLagging { .. }
-    ) {
-        readiness.set(ReadinessState::ready(current_chain_height(store)));
+    match render_result {
+        Ok(rendered_toml) => {
+            println!("{rendered_toml}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => emit_runtime_error(&error),
     }
 }
 
-fn set_mempool_source_unavailable(readiness: &Readiness, store: &PrimaryChainStore) {
-    let cause = readiness.report().cause;
-    if !matches!(cause, ReadinessCause::ReorgWindowExceeded { .. }) {
-        readiness.set(ReadinessState::mempool_source_unavailable(
-            current_chain_height(store),
-        ));
+async fn run_runtime(cli: Cli) -> ExitCode {
+    let ops_listen_addr_override = cli.ops_listen_addr;
+    let overrides = ingest_overrides_with_ops(&cli, ops_listen_addr_override);
+    let config_path = cli.config_path.clone();
+    let runtime_result = match cli.command {
+        Some(Command::Probe) => run_probe(config_path, overrides).await,
+        Some(Command::VerifyCanonicalReplay(args)) => {
+            run_canonical_replay_verification(config_path, args)
+        }
+        None => run_ingest(config_path, overrides).await,
+    };
+
+    match runtime_result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => emit_runtime_error(&error),
     }
 }
 
-fn set_mempool_hydration_lagging(
-    readiness: &Readiness,
-    store: &PrimaryChainStore,
-    recent_hydration_failures: u64,
-) {
-    let cause = readiness.report().cause;
-    if matches!(
-        cause,
-        ReadinessCause::Ready | ReadinessCause::MempoolHydrationLagging { .. }
-    ) {
-        readiness.set(ReadinessState::mempool_hydration_lagging(
-            recent_hydration_failures,
-            current_chain_height(store),
-        ));
+fn emit_runtime_error(error: &IngestConfigError) -> ExitCode {
+    tracing::error!(
+        target: "zinder::ingest",
+        event = "ingest_run_failed",
+        error = %error,
+        "ingest run failed"
+    );
+    ExitCode::FAILURE
+}
+
+fn ingest_overrides(cli: &Cli) -> IngestConfigOverrides {
+    ingest_overrides_with_ops(cli, None)
+}
+
+fn ingest_overrides_with_ops(
+    cli: &Cli,
+    ops_listen_addr_override: Option<SocketAddr>,
+) -> IngestConfigOverrides {
+    IngestConfigOverrides {
+        network: cli.network.clone(),
+        node_source: cli.node_source.clone(),
+        json_rpc_addr: cli.json_rpc_addr.clone(),
+        node_auth_method: cli.node_auth_method.clone(),
+        node_auth_username: cli.node_auth_username.clone(),
+        node_auth_path: cli.node_auth_path.clone(),
+        storage_path: cli.storage_path.clone(),
+        projection_preset: cli.projection_preset.clone(),
+        request_timeout_secs: cli.request_timeout_secs,
+        max_response_bytes: cli.max_response_bytes,
+        reorg_window_blocks: cli.reorg_window_blocks,
+        catchup_threshold_blocks: cli.catchup_threshold_blocks,
+        canonical_batch_max_blocks: cli.canonical_batch_max_blocks,
+        canonical_batch_max_artifact_bytes: cli.canonical_batch_max_artifact_bytes,
+        canonical_batch_max_estimated_write_bytes: cli.canonical_batch_max_estimated_write_bytes,
+        canonical_batch_min_blocks_before_estimated_write_close: cli
+            .canonical_batch_min_blocks_before_estimated_write_close,
+        source_segment_max_blocks: cli.source_segment_max_blocks,
+        source_segment_target_response_bytes: cli.source_segment_target_response_bytes,
+        source_fetch_max_in_flight_requests: cli.source_fetch_max_in_flight_requests,
+        source_fetch_max_in_flight_bytes: cli.source_fetch_max_in_flight_bytes,
+        block_prepare_concurrency: cli.block_prepare_concurrency,
+        poll_interval_ms: cli.poll_interval_ms,
+        lag_threshold_blocks: cli.lag_threshold_blocks,
+        target_height: cli.target_height,
+        checkpoint_height: cli.checkpoint_height,
+        allow_near_tip_finalize: cli.allow_near_tip_finalize.then_some(true),
+        wallet_serving: cli.wallet_serving.then_some(true),
+        ingest_control_listen_addr: cli.ingest_control_listen_addr,
+        ingest_control_bearer_token_path: cli.ingest_control_token_path.clone(),
+        ingest_control_checkpoint_bearer_token_path: None,
+        ops_listen_addr: ops_listen_addr_override,
     }
 }
 
@@ -1448,118 +885,12 @@ fn run_canonical_replay_verification(
     Ok(())
 }
 
-fn run_backup(config_path: Option<PathBuf>, args: BackupArgs) -> Result<(), IngestConfigError> {
-    let backup_config = config::load_backup_config(config_path, args.into())?;
-    let projection_preset = backup::detect_backup_projection_preset(&backup_config.storage_path)
-        .map_err(IngestConfigError::from)?;
-    backup::admit_restore_bundle_if_present(
-        &backup_config.storage_path,
-        backup::RestoreAdmissionOptions {
-            network: backup_config.network,
-            projection_preset,
-            canonical_rocksdb_budget: backup_config.canonical_rocksdb_budget,
-            derive_rocksdb_budget: backup_config.derive_rocksdb_budget,
-            raw_blob_policy: backup_config.raw_blob_policy,
-        },
-    )
-    .map_err(IngestConfigError::from)?;
-    let canonical_store = PrimaryChainStore::open(
-        &backup_config.storage_path,
-        ChainStoreOptions {
-            rocksdb_resource_budget: backup_config.canonical_rocksdb_budget,
-            raw_blob_retention: backup_config.raw_blob_policy.to_retention(),
-            ..ChainStoreOptions::for_network(backup_config.network)
-        },
-    )
-    .map_err(IngestError::from)?;
-    canonical_store
-        .reconcile_canonical_history_bounds(None)
-        .map_err(IngestError::from)?;
-    let started_at = Instant::now();
-    let backup_outcome =
-        backup::create_backup_checkpoints(&backup_config, &canonical_store, projection_preset)
-            .map_err(IngestConfigError::from);
-    record_backup_outcome(backup_config.network, started_at, &backup_outcome);
-    backup_outcome?;
-
-    tracing::info!(
-        target: "zinder::ingest",
-        event = "backup_created",
-        network = encode_zinder_native_chain_name(backup_config.network),
-        storage_path = %backup_config.storage_path.display(),
-        checkpoint_path = %backup_config.to_path.display(),
-        "backup checkpoint created"
-    );
-
-    Ok(())
-}
-
-fn record_backup_outcome(
-    network: zinder_core::Network,
-    started_at: Instant,
-    backup_outcome: &Result<(), IngestConfigError>,
-) {
-    metrics::histogram!(
-        "zinder_ingest_backup_duration_seconds",
-        "network" => encode_zinder_native_chain_name(network),
-        "status" => outcome_status(backup_outcome),
-        "error_class" => ingest_config_error_class(backup_outcome.as_ref().err())
-    )
-    .record(started_at.elapsed());
-    metrics::counter!(
-        "zinder_ingest_backup_total",
-        "network" => encode_zinder_native_chain_name(network),
-        "status" => outcome_status(backup_outcome),
-        "error_class" => ingest_config_error_class(backup_outcome.as_ref().err())
-    )
-    .increment(1);
-    if backup_outcome.is_ok() {
-        metrics::gauge!(
-            "zinder_ingest_backup_last_success_unix_seconds",
-            "network" => encode_zinder_native_chain_name(network)
-        )
-        .set(current_unix_seconds_f64());
-    }
-}
-
-const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str {
-    if outcome.is_ok() { "ok" } else { "error" }
-}
-
-fn ingest_config_error_class(error: Option<&IngestConfigError>) -> &'static str {
-    match error {
-        None => "none",
-        Some(IngestConfigError::Config(_)) => "config",
-        Some(IngestConfigError::Ingest(_)) => "ingest",
-        Some(IngestConfigError::CanonicalRuntime(_)) => "canonical_runtime",
-        Some(IngestConfigError::CanonicalRuntimeRequiresWallet) => "canonical_runtime_workload",
-        Some(IngestConfigError::CanonicalReplayVerification(_)) => "canonical_replay_verification",
-        Some(IngestConfigError::IngestControlBind { .. }) => "ingest_control_bind",
-        Some(IngestConfigError::IngestControlTransport { .. }) => "ingest_control_transport",
-        Some(IngestConfigError::BearerToken(_)) => "bearer_token",
-    }
-}
-
-fn current_unix_seconds_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |duration| duration.as_secs_f64())
-}
-
 fn print_ingest_config(
     config_path: Option<PathBuf>,
     overrides: IngestConfigOverrides,
 ) -> Result<String, IngestConfigError> {
     let command_config = config::load_ingest_config(config_path, overrides)?;
     config::redacted_ingest_config_toml(&command_config)
-}
-
-fn print_backup_config(
-    config_path: Option<PathBuf>,
-    args: BackupArgs,
-) -> Result<String, IngestConfigError> {
-    let backup_config = config::load_backup_config(config_path, args.into())?;
-    config::redacted_backup_config_toml(&backup_config)
 }
 
 fn print_canonical_replay_verification_config(
@@ -1569,17 +900,6 @@ fn print_canonical_replay_verification_config(
     let command_config =
         config::load_canonical_replay_verification_config(config_path, args.into())?;
     config::redacted_canonical_replay_verification_config_toml(&command_config)
-}
-
-impl From<BackupArgs> for BackupConfigOverrides {
-    fn from(args: BackupArgs) -> Self {
-        Self {
-            network: args.network,
-            storage_path: args.storage_path,
-            to_path: args.to_path,
-            raw_blob_policy: args.raw_blob_policy,
-        }
-    }
 }
 
 impl From<CanonicalReplayVerificationArgs> for CanonicalReplayVerificationConfigOverrides {

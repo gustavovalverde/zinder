@@ -1,7 +1,7 @@
 //! Shared `[retention]` config section.
 //!
 //! Owns the chain-event and mempool-event retention windows enforced by
-//! the writer (`zinder-ingest`) and advertised by readers (`zinder-query`)
+//! the writer (`zinder-ingest`)
 //! through `ServerInfo`. Before this section existed, the writer and
 //! readers each carried their own copy of the same windows; operators
 //! were responsible for keeping them in sync. Both planes now read one

@@ -13,7 +13,10 @@
 //! [`crate::ZebraIndexerMempoolSource`] is preferred.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -124,6 +127,7 @@ async fn run_polling_loop(
     known_transaction_ids: Arc<Mutex<HashSet<TransactionId>>>,
     event_sender: mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
 ) {
+    let mut initial_snapshot_complete = false;
     loop {
         let observed_at = UnixTimestampMillis::now();
         match poll_once(
@@ -134,7 +138,19 @@ async fn run_polling_loop(
         )
         .await
         {
-            Ok(()) => {}
+            Ok(PollCompletion::Complete) => {
+                if !initial_snapshot_complete {
+                    if event_sender
+                        .send(Ok(MempoolSourceEvent::InitialSnapshotComplete))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    initial_snapshot_complete = true;
+                }
+            }
+            Ok(PollCompletion::RetryNeeded) => {}
             Err(send_failed) if send_failed.is_send_failure() => return,
             Err(send_failed) => {
                 let send_outcome = event_sender
@@ -147,6 +163,17 @@ async fn run_polling_loop(
         }
         sleep(poll_interval).await;
     }
+}
+
+/// Whether a poll produced a complete, externally usable snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PollCompletion {
+    /// Every observed addition/removal was emitted and the known state now
+    /// matches this poll's source snapshot.
+    Complete,
+    /// A hydration or lookup race needs another poll before the first snapshot
+    /// can be declared complete.
+    RetryNeeded,
 }
 
 /// Outcome of a single poll iteration that escaped the local handlers.
@@ -175,7 +202,7 @@ async fn poll_once(
     known_transaction_ids: &Arc<Mutex<HashSet<TransactionId>>>,
     observed_at: UnixTimestampMillis,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
-) -> Result<(), PollFailure> {
+) -> Result<PollCompletion, PollFailure> {
     let observed_transaction_ids: HashSet<TransactionId> = json_rpc
         .fetch_raw_mempool_transaction_ids()
         .await
@@ -186,37 +213,48 @@ async fn poll_once(
     let (added_transaction_ids, removed_transaction_ids) =
         diff_known_state(known_transaction_ids, &observed_transaction_ids);
 
+    let pending_retry = Arc::new(AtomicBool::new(false));
+    let pending_retry_for_added = Arc::clone(&pending_retry);
     futures_util::stream::iter(added_transaction_ids.into_iter().map(Ok::<_, PollFailure>))
-        .try_for_each_concurrent(
-            MEMPOOL_POLL_HYDRATION_CONCURRENCY,
-            |transaction_id| async move {
+        .try_for_each_concurrent(MEMPOOL_POLL_HYDRATION_CONCURRENCY, move |transaction_id| {
+            let pending_retry = Arc::clone(&pending_retry_for_added);
+            async move {
                 let observation =
                     emit_added_event(json_rpc, transaction_id, observed_at, event_sender).await?;
                 if observation.should_advance_known_state() {
                     remember_added_transaction_id(known_transaction_ids, transaction_id);
+                } else {
+                    pending_retry.store(true, Ordering::Relaxed);
                 }
                 Ok(())
-            },
-        )
+            }
+        })
         .await?;
+    let pending_retry_for_removed = Arc::clone(&pending_retry);
     futures_util::stream::iter(
         removed_transaction_ids
             .into_iter()
             .map(Ok::<_, PollFailure>),
     )
-    .try_for_each_concurrent(
-        MEMPOOL_POLL_HYDRATION_CONCURRENCY,
-        |transaction_id| async move {
+    .try_for_each_concurrent(MEMPOOL_POLL_HYDRATION_CONCURRENCY, move |transaction_id| {
+        let pending_retry = Arc::clone(&pending_retry_for_removed);
+        async move {
             let observation =
                 emit_disappearance_event(json_rpc, transaction_id, event_sender).await?;
             if observation.should_advance_known_state() {
                 forget_removed_transaction_id(known_transaction_ids, transaction_id);
+            } else {
+                pending_retry.store(true, Ordering::Relaxed);
             }
             Ok(())
-        },
-    )
+        }
+    })
     .await?;
-    Ok(())
+    Ok(if pending_retry.load(Ordering::Relaxed) {
+        PollCompletion::RetryNeeded
+    } else {
+        PollCompletion::Complete
+    })
 }
 
 fn diff_known_state(
@@ -444,5 +482,79 @@ mod tests {
 
         assert!(added.is_empty());
         assert!(removed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn polling_marks_an_empty_initial_snapshot_complete_after_a_successful_poll()
+    -> eyre::Result<()> {
+        let server =
+            zinder_testkit::JsonRpcTestServer::start([zinder_testkit::method("getrawmempool")
+                .reply(zinder_testkit::RpcReply::result(serde_json::json!([])))])?;
+        let json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let (event_sender, mut event_receiver) = mpsc::channel(4);
+        let poll_task = tokio::spawn(run_polling_loop(
+            json_rpc,
+            Duration::from_mins(1),
+            known_transaction_ids,
+            event_sender,
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_receiver.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("polling source closed before its completion marker"))??;
+        assert!(matches!(event, MempoolSourceEvent::InitialSnapshotComplete));
+
+        poll_task.abort();
+        let _ = poll_task.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn polling_does_not_complete_initial_snapshot_while_hydration_is_pending()
+    -> eyre::Result<()> {
+        let transaction_id_hex = "A1".repeat(32);
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!([transaction_id_hex]),
+            )),
+            zinder_testkit::method("getrawtransaction").reply(
+                zinder_testkit::RpcReply::error_with_code(
+                    -5,
+                    "No such mempool or blockchain transaction",
+                ),
+            ),
+        ])?;
+        let json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let (event_sender, mut event_receiver) = mpsc::channel(4);
+
+        let Ok(completion) = poll_once(
+            &json_rpc,
+            &known_transaction_ids,
+            UnixTimestampMillis::new(1_750_000_000_000),
+            &event_sender,
+        )
+        .await
+        else {
+            return Err(eyre::eyre!("pending hydration must be retried, not fail"));
+        };
+        assert_eq!(completion, PollCompletion::RetryNeeded);
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "a pending hydration must not emit a source event or completion marker"
+        );
+        assert!(known_transaction_ids.lock().is_empty());
+        Ok(())
     }
 }

@@ -1021,7 +1021,10 @@ async fn mempool_retention_worker_prunes_and_drives_readiness_under_traffic() ->
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use tokio::time::Duration;
     use zinder_ingest::{MempoolIndex, MempoolOrchestratorEventOutcome, run_mempool_orchestrator};
@@ -1041,6 +1044,8 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
         MempoolOrchestratorEventOutcome,
     >::new()));
     let outcomes_for_orchestrator = Arc::clone(&outcomes);
+    let snapshot_complete = Arc::new(AtomicBool::new(false));
+    let snapshot_complete_for_orchestrator = Arc::clone(&snapshot_complete);
 
     let orchestrator_handle = {
         let mempool_index = mempool_index.clone();
@@ -1053,11 +1058,22 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
                 derive_store_for_orchestrator,
                 mempool_index,
                 move |outcome| {
-                    // SourceStreamOpened is a one-shot lifecycle signal,
-                    // not a per-event observation. Filter it out so the
+                    if matches!(
+                        outcome,
+                        MempoolOrchestratorEventOutcome::InitialSnapshotComplete
+                    ) {
+                        snapshot_complete_for_orchestrator.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    // Source lifecycle signals are control-plane-only, not
+                    // per-transition observations. Filter them out so the
                     // count-based wait helpers below stay aligned with
-                    // pushed source events.
-                    if !matches!(outcome, MempoolOrchestratorEventOutcome::SourceStreamOpened) {
+                    // durable source events.
+                    if !matches!(
+                        outcome,
+                        MempoolOrchestratorEventOutcome::SourceStreamOpened
+                            | MempoolOrchestratorEventOutcome::InitialSnapshotComplete
+                    ) {
                         outcomes_for_orchestrator.lock().push(outcome);
                     }
                 },
@@ -1083,6 +1099,12 @@ async fn reorg_returns_mined_tx_to_mempool_through_orchestrator() -> Result<()> 
     // the first event. `MockMempoolSource::push_*` returns `Closed` until
     // the consumer calls `events()`.
     wait_for_source_open(&control).await?;
+
+    // A completed source snapshot is a readiness control event. It must not
+    // create a canonical mempool lifecycle row by itself.
+    control.complete_initial_snapshot()?;
+    wait_for_snapshot_completion(&snapshot_complete).await?;
+    assert_eq!(retained_mempool_event_count(&store)?, 0);
 
     // Phase 1: source observes Added → orchestrator hydrates → index +
     // event log reflect the entry.
@@ -1406,6 +1428,21 @@ async fn wait_for_source_open(control: &zinder_testkit::MockMempoolSourceControl
         if std::time::Instant::now() > deadline {
             return Err(eyre::eyre!(
                 "orchestrator did not open the source stream within 2s"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+async fn wait_for_snapshot_completion(
+    snapshot_complete: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !snapshot_complete.load(std::sync::atomic::Ordering::SeqCst) {
+        if std::time::Instant::now() > deadline {
+            return Err(eyre::eyre!(
+                "orchestrator did not observe the source snapshot-complete marker within 2s"
             ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

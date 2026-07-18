@@ -3,19 +3,21 @@
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, BlockId, NetworkUpgradeActivations, UnixTimestampMillis};
 use zinder_runtime::{IngestPhase, Readiness, ReadinessState};
 use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
-    CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
+    CanonicalStoreBuildPlanError, CanonicalStoreError, CanonicalStoreWorkload,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 
 use crate::{
-    CanonicalConstructionConfig, CanonicalConstructionError, CanonicalFollowConfig,
-    CanonicalFollowError, CanonicalFollower, follow_canonical_tip, load_fresh_canonical,
+    CanonicalConstructionConfig, CanonicalConstructionError, CanonicalControlCommand,
+    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, follow_canonical_tip,
+    follow_canonical_tip_with_control, load_fresh_canonical,
 };
 
 /// Complete concrete configuration for the first `RocksDB` single-host runtime.
@@ -76,6 +78,12 @@ pub enum CanonicalRuntimeError {
     /// A staged READY store changed identity while it was installed and cold-reopened.
     #[error("installed canonical READY fence differs from staged publication")]
     InstalledFenceMismatch,
+    /// The private canonical-control server stopped while the writer was still running.
+    #[error("canonical control server failed: {reason}")]
+    ControlServer {
+        /// Redacted tonic transport failure.
+        reason: String,
+    },
 }
 
 /// Opens or freshly constructs the version-1 store, then follows Zebra.
@@ -85,6 +93,34 @@ pub async fn run_canonical_runtime<Source>(
     config: CanonicalRuntimeConfig,
     readiness: &Readiness,
     cancel: &CancellationToken,
+) -> Result<RocksDbCanonicalStore, CanonicalRuntimeError>
+where
+    Source: NodeSource + Clone,
+{
+    run_canonical_runtime_with_control(
+        source,
+        network_upgrade_activations,
+        config,
+        readiness,
+        cancel,
+        None,
+    )
+    .await
+}
+
+/// Opens or constructs the one canonical primary, then follows while serving
+/// commands from the private canonical-control channel.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the controlled variant preserves the established runtime dependency boundary while adding only the optional owner command receiver"
+)]
+pub async fn run_canonical_runtime_with_control<Source>(
+    source: &Source,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    config: CanonicalRuntimeConfig,
+    readiness: &Readiness,
+    cancel: &CancellationToken,
+    control_commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
 ) -> Result<RocksDbCanonicalStore, CanonicalRuntimeError>
 where
     Source: NodeSource + Clone,
@@ -103,7 +139,12 @@ where
         readiness,
         cancel,
     );
-    let store = follow_canonical_tip(store, follower).await?;
+    let store = match control_commands {
+        Some(control_commands) => {
+            follow_canonical_tip_with_control(store, follower, control_commands).await?
+        }
+        None => follow_canonical_tip(store, follower).await?,
+    };
     Ok(store)
 }
 
@@ -146,6 +187,7 @@ fn open_existing_store(
         &config.storage_path,
         network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     )?;
     tracing::info!(
@@ -176,6 +218,7 @@ fn recover_staged_store(
         staging_path,
         network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     ) {
         Ok(staged_ready) => {
@@ -185,6 +228,7 @@ fn recover_staged_store(
                 &config.storage_path,
                 network_upgrade_activations,
                 CanonicalStoreWorkload::Wallet,
+                CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
                 config.resource_budget,
             )
             .map(Some)
@@ -313,6 +357,7 @@ where
         &config.storage_path,
         network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     )?;
     if store.event_fence() != published_fence {
@@ -356,13 +401,19 @@ where
         let checkpoint = source
             .fetch_chain_checkpoint(checkpoint_height, network_upgrade_activations)
             .await?;
-        CanonicalStoreBuildPlan::checkpointed(network_upgrade_activations, checkpoint, fixed_tip)?
+        CanonicalStoreBuildPlan::checkpointed(
+            network_upgrade_activations,
+            checkpoint,
+            fixed_tip,
+            CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
+        )?
     } else {
         let genesis = source.fetch_block_at(BlockHeight::new(0)).await?;
         CanonicalStoreBuildPlan::complete(
             network_upgrade_activations,
             genesis.block_time_seconds,
             fixed_tip,
+            CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         )?
     };
     let first_retained_height = build_plan.history_bounds().first_available_height();

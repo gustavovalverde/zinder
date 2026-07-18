@@ -17,10 +17,13 @@
 //! each already-present transaction; otherwise a transaction that entered
 //! the mempool before the (re)connect would never be observed. The
 //! resnapshot runs concurrently with, not before, draining the wire
-//! stream, so its `getrawtransaction` round trips never delay delivery of
-//! live deltas (which would risk a self-inflicted `Lagged`). Duplicate
-//! `Added` events the two passes both produce for the same txid are a
-//! safe no-op (`MempoolIndex::apply_added`).
+//! stream. Wire observations are buffered until the resnapshot has been
+//! forwarded, then the source emits
+//! [`MempoolSourceEvent::InitialSnapshotComplete`]. The marker is a control
+//! event, not a mempool lifecycle transition: it is the consumer's proof that
+//! an initially empty index is complete enough to expose. Duplicate `Added`
+//! events the two passes both produce for the same txid are a safe no-op
+//! (`MempoolIndex::apply_added`).
 
 use std::time::Duration;
 
@@ -169,19 +172,15 @@ impl MempoolSource for ZebraIndexerMempoolSource {
         let mut wire_stream = response.into_inner();
 
         let (event_sender, event_receiver) = mpsc::channel(self.options.event_channel_capacity);
+        let (wire_sender, mut wire_receiver) = mpsc::channel(self.options.event_channel_capacity);
         let hydration_json_rpc = self.hydration_json_rpc.clone();
-
-        tokio::spawn(resnapshot_current_mempool(
-            hydration_json_rpc.clone(),
-            event_sender.clone(),
-        ));
 
         tokio::spawn(async move {
             loop {
                 match wire_stream.message().await {
                     Ok(Some(wire_message)) => {
                         if matches!(
-                            forward_wire_message(&hydration_json_rpc, wire_message, &event_sender)
+                            forward_wire_message(&hydration_json_rpc, wire_message, &wire_sender)
                                 .await,
                             ForwardOutcome::ChannelClosed
                         ) {
@@ -190,7 +189,7 @@ impl MempoolSource for ZebraIndexerMempoolSource {
                     }
                     Ok(None) => return,
                     Err(stream_status) => {
-                        let _ = event_sender
+                        let _ = wire_sender
                             .send(Err(SourceError::MempoolStreamUnavailable {
                                 reason: format!(
                                     "indexer mempool_change stream ended: {stream_status}"
@@ -199,6 +198,44 @@ impl MempoolSource for ZebraIndexerMempoolSource {
                             .await;
                         return;
                     }
+                }
+            }
+        });
+
+        let snapshot_hydration_json_rpc = self.hydration_json_rpc.clone();
+        tokio::spawn(async move {
+            if let Err(source_error) =
+                resnapshot_current_mempool(snapshot_hydration_json_rpc, &event_sender).await
+            {
+                let _ = forward_error(source_error, &event_sender).await;
+                return;
+            }
+
+            // `mempool_change` was already open before the snapshot began.
+            // Flush its bounded prefix before publishing the completion
+            // marker so observations that raced the snapshot are applied
+            // while the consumer still keeps the index hidden.
+            while let Ok(wire_event) = wire_receiver.try_recv() {
+                if matches!(
+                    forward_result(wire_event, &event_sender).await,
+                    ForwardOutcome::ChannelClosed
+                ) {
+                    return;
+                }
+            }
+            if matches!(
+                forward_event(MempoolSourceEvent::InitialSnapshotComplete, &event_sender).await,
+                ForwardOutcome::ChannelClosed
+            ) {
+                return;
+            }
+
+            while let Some(wire_event) = wire_receiver.recv().await {
+                if matches!(
+                    forward_result(wire_event, &event_sender).await,
+                    ForwardOutcome::ChannelClosed
+                ) {
+                    return;
                 }
             }
         });
@@ -217,36 +254,32 @@ impl MempoolSource for ZebraIndexerMempoolSource {
 /// `getrawtransaction` round trips never delay live delta delivery.
 async fn resnapshot_current_mempool(
     hydration_json_rpc: ZebraJsonRpcSource,
-    event_sender: mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
-) {
+    event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
+) -> Result<(), SourceError> {
     let observed_at = UnixTimestampMillis::now();
-    let transaction_ids = match hydration_json_rpc.fetch_raw_mempool_transaction_ids().await {
-        Ok(transaction_ids) => transaction_ids,
-        Err(source_error) => {
-            let _ = event_sender.send(Err(source_error)).await;
-            return;
-        }
-    };
+    let transaction_ids = hydration_json_rpc
+        .fetch_raw_mempool_transaction_ids()
+        .await?;
 
-    let _ = futures_util::stream::iter(transaction_ids.into_iter().map(Ok::<_, ()>))
+    futures_util::stream::iter(transaction_ids.into_iter().map(Ok::<_, SourceError>))
         .try_for_each_concurrent(MEMPOOL_RESNAPSHOT_HYDRATION_CONCURRENCY, |transaction_id| {
             let hydration_json_rpc = &hydration_json_rpc;
-            let event_sender = &event_sender;
             async move {
-                let outcome =
-                    match build_added_event(hydration_json_rpc, transaction_id, None, observed_at)
-                        .await
-                    {
-                        Ok(source_event) => forward_event(source_event, event_sender).await,
-                        Err(source_error) => forward_error(source_error, event_sender).await,
-                    };
-                if matches!(outcome, ForwardOutcome::ChannelClosed) {
-                    return Err(());
+                let source_event =
+                    build_added_event(hydration_json_rpc, transaction_id, None, observed_at)
+                        .await?;
+                if matches!(
+                    forward_event(source_event, event_sender).await,
+                    ForwardOutcome::ChannelClosed
+                ) {
+                    return Err(SourceError::MempoolStreamUnavailable {
+                        reason: "mempool snapshot receiver closed".to_owned(),
+                    });
                 }
                 Ok(())
             }
         })
-        .await;
+        .await
 }
 
 /// Whether the consumer is still listening to the source-event channel.
@@ -306,6 +339,16 @@ async fn forward_error(
         ForwardOutcome::ChannelClosed
     } else {
         ForwardOutcome::Continue
+    }
+}
+
+async fn forward_result(
+    source_result: Result<MempoolSourceEvent, SourceError>,
+    event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
+) -> ForwardOutcome {
+    match source_result {
+        Ok(source_event) => forward_event(source_event, event_sender).await,
+        Err(source_error) => forward_error(source_error, event_sender).await,
     }
 }
 
@@ -496,7 +539,8 @@ mod tests {
         )?;
 
         let (event_sender, mut event_receiver) = mpsc::channel(8);
-        resnapshot_current_mempool(hydration_json_rpc, event_sender).await;
+        resnapshot_current_mempool(hydration_json_rpc, &event_sender).await?;
+        drop(event_sender);
 
         let event = event_receiver
             .recv()
