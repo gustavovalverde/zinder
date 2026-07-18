@@ -16,7 +16,7 @@ use zinder_core::{
 
 use super::{
     CanonicalBlockLoadEvidence, CanonicalSequenceCheckpoint, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, construction_manifest::CanonicalColdFamilyEvidence,
+    CanonicalStoreReadyEvidence, construction_manifest::CanonicalConstructionFamilyEvidence,
 };
 
 pub(super) const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
@@ -324,7 +324,7 @@ pub(super) struct PersistedBlockReplayEvidence {
     pub(super) block_digest_version: CanonicalBlockFactsDigestVersion,
     pub(super) sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
     pub(super) sequence_digest: CanonicalBlockFactsSequenceDigest,
-    pub(super) family_evidence: CanonicalColdFamilyEvidence,
+    pub(super) family_evidence: CanonicalConstructionFamilyEvidence,
     pub(super) elapsed: Duration,
 }
 
@@ -353,7 +353,8 @@ pub(super) fn validate_persisted_block_replays_with_checkpoints(
     let mut iterator = db.raw_iterator_cf_opt(&block_replay, read_options);
     iterator.seek_to_first();
     let mut sequence: Option<ReplaySequence> = None;
-    let mut family_evidence = CanonicalColdFamilyEvidence::accumulator(BLOCK_REPLAY_COLUMN_FAMILY);
+    let mut family_evidence =
+        CanonicalConstructionFamilyEvidence::accumulator(BLOCK_REPLAY_COLUMN_FAMILY);
     let mut retained_sequence_checkpoints = VecDeque::new();
     while iterator.valid() {
         let Some((key, encoded_replay)) = iterator.item() else {
@@ -676,8 +677,10 @@ impl ReplaySequence {
             block_digest_version: CanonicalBlockFactsDigestVersion::V1,
             sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
             sequence_digest: self.digest_builder.finish(),
-            family_evidence: CanonicalColdFamilyEvidence::accumulator(BLOCK_REPLAY_COLUMN_FAMILY)
-                .finish(),
+            family_evidence: CanonicalConstructionFamilyEvidence::accumulator(
+                BLOCK_REPLAY_COLUMN_FAMILY,
+            )
+            .finish(),
             elapsed: Duration::ZERO,
         }
     }

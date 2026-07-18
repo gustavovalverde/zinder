@@ -1889,7 +1889,7 @@ mod tests {
             100,
             CommitmentTreeFrontiers::default(),
         ))?;
-        let validated = canonical_builder.validate_for_publication()?;
+        let validated = canonical_builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
             checkpoint_block,
             UnixTimestampMillis::new(1_750_000_100_000),

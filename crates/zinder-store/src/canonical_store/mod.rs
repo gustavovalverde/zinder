@@ -39,7 +39,9 @@ pub use block_replay::{
     CanonicalReplayRangeScan, CanonicalReplayScan, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
 };
 pub use builder::RocksDbCanonicalBuilder;
-pub use construction_manifest::CanonicalConstructionManifestBinding;
+pub use construction_manifest::{
+    CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CanonicalConstructionManifestBinding,
+};
 pub use event_lifecycle::{
     CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
     CanonicalEventRetentionReport, CanonicalRetainedEvent, ProjectionBuildAnchor,

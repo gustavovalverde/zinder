@@ -11,8 +11,9 @@ use super::{
     block_load::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
         CanonicalBlockSstConfig, CanonicalBuildBlock, CanonicalStagedSstEvidence,
-        REVERSE_INDEX_SORT_MEMORY_BYTES, canonical_block_families_are_empty,
-        ingest_canonical_block_ssts, validate_source_tip_checkpoint, write_canonical_block_ssts,
+        CanonicalTrustedFreshBlockEvidence, REVERSE_INDEX_SORT_MEMORY_BYTES,
+        canonical_block_families_are_empty, ingest_canonical_block_ssts,
+        validate_source_tip_checkpoint, write_canonical_block_ssts,
     },
     rocksdb::{
         canonical_column_family_descriptors, canonical_data_options, canonical_store_path,
@@ -37,7 +38,10 @@ pub struct RocksDbCanonicalBuilder {
     pub(super) build_plan: CanonicalStoreBuildPlan,
     pub(super) canonical_block_evidence: Option<CanonicalBlockLoadEvidence>,
     pub(super) canonical_block_staged_ssts: Option<Vec<CanonicalStagedSstEvidence>>,
+    pub(super) trusted_fresh_block_evidence: Option<CanonicalTrustedFreshBlockEvidence>,
     pub(super) subtree_root_evidence: Option<CanonicalSubtreeRootLoadEvidence>,
+    pub(super) trusted_fresh_subtree_family_evidence:
+        Option<super::construction_manifest::CanonicalConstructionFamilyEvidence>,
     pub(super) confirmed_source_tip_checkpoint: Option<zinder_core::CommitmentTreeCheckpoint>,
     pub(super) cursor_auth_key: [u8; 32],
 }
@@ -80,7 +84,9 @@ impl RocksDbCanonicalBuilder {
             build_plan,
             canonical_block_evidence: None,
             canonical_block_staged_ssts: None,
+            trusted_fresh_block_evidence: None,
             subtree_root_evidence: None,
+            trusted_fresh_subtree_family_evidence: None,
             confirmed_source_tip_checkpoint: None,
             cursor_auth_key,
         })
@@ -182,6 +188,7 @@ impl RocksDbCanonicalBuilder {
         staging.remove()?;
         self.canonical_block_evidence = Some(ingested.evidence);
         self.canonical_block_staged_ssts = Some(ingested.staged_ssts);
+        self.trusted_fresh_block_evidence = Some(ingested.trusted_fresh_evidence);
         Ok(ingested.evidence)
     }
 
@@ -211,14 +218,15 @@ impl RocksDbCanonicalBuilder {
             .canonical_block_evidence
             .as_ref()
             .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
-        let evidence = load_subtree_roots(
+        let loaded = load_subtree_roots(
             &self.bounded_open.db,
             &self.build_plan,
             block_evidence,
             subtree_roots,
         )?;
-        self.subtree_root_evidence = Some(evidence);
-        Ok(evidence)
+        self.subtree_root_evidence = Some(loaded.evidence);
+        self.trusted_fresh_subtree_family_evidence = Some(loaded.family_evidence);
+        Ok(loaded.evidence)
     }
 
     /// Confirms that the persisted exact-tip frontier matches a final source observation.
@@ -520,7 +528,7 @@ mod tests {
         let store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
 
         let error = store
-            .validate_for_publication()
+            .prepare_cold_certified_publication()
             .err()
             .ok_or("an empty BUILDING store must not validate")?;
 
@@ -553,7 +561,7 @@ mod tests {
         )?;
 
         let error = store
-            .validate_for_publication()
+            .prepare_cold_certified_publication()
             .err()
             .ok_or("explorer READY must require daily value-pool evidence")?;
 
@@ -568,7 +576,7 @@ mod tests {
         let store_path = temporary.path().join("canonical");
         let store = complete_loaded_builder(&store_path)?;
 
-        let validated = store.validate_for_publication()?;
+        let validated = store.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -576,6 +584,9 @@ mod tests {
         let published = validated.publish_baseline(publication)?;
 
         assert_ready_construction_manifest_binding(&store_path, &published)?;
+        let manifest =
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v2.json"))?;
+        assert!(manifest.contains("\"evidence_provenance\":\"cold-certification\""));
 
         assert_eq!(published.ready_evidence().visible_epoch.value(), 1);
         assert_eq!(published.ready_evidence().visible_block_count, 2);
@@ -638,11 +649,44 @@ mod tests {
     }
 
     #[test]
+    fn trusted_fresh_writer_publishes_without_cold_family_certification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let builder = complete_loaded_builder(&store_path)?;
+
+        let validated = builder.prepare_trusted_fresh_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let published = validated.publish_baseline(publication)?;
+
+        assert_ready_construction_manifest_binding(&store_path, &published)?;
+        let manifest =
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v2.json"))?;
+        assert!(manifest.contains("\"evidence_provenance\":\"trusted-fresh-writer\""));
+        assert_eq!(published.ready_evidence().visible_block_count, 2);
+        assert_eq!(
+            published.ready_evidence().visible_tip.height,
+            BlockHeight::new(2)
+        );
+        let missing_subtree_root = published.subtree_roots(zinder_core::SubtreeRootRange::new(
+            zinder_core::ShieldedProtocol::Sapling,
+            zinder_core::SubtreeRootIndex::new(0),
+            std::num::NonZeroU32::new(1).ok_or("subtree range must be nonzero")?,
+        ));
+        assert!(missing_subtree_root.is_err());
+        Ok(())
+    }
+
+    #[test]
     fn ready_admission_fails_closed_on_missing_or_tampered_construction_manifest()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -651,8 +695,12 @@ mod tests {
         let binding = published.ready_evidence().construction_manifest_sha256;
         drop(published);
 
-        let manifest_path = store_path.join("canonical-construction-manifest.v1.json");
+        let manifest_path = store_path.join("canonical-construction-manifest.v2.json");
         std::fs::remove_file(&manifest_path)?;
+        std::fs::write(
+            store_path.join("canonical-construction-manifest.v1.json"),
+            b"{}",
+        )?;
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let missing = RocksDbCanonicalStore::open_ready(
@@ -667,7 +715,7 @@ mod tests {
         assert!(
             missing
                 .to_string()
-                .contains("canonical-construction-manifest.v1.json")
+                .contains("canonical-construction-manifest.v2.json")
         );
 
         std::fs::write(&manifest_path, b"{}")?;
@@ -969,7 +1017,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -990,7 +1039,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1070,7 +1120,7 @@ mod tests {
         let store_path = temporary.path().join("canonical");
         let validated =
             complete_loaded_builder_with_reorg_window(&store_path, 2, BlockHeight::new(2))?
-                .validate_for_publication()?;
+                .prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1121,7 +1171,7 @@ mod tests {
         let store_path = temporary.path().join("canonical");
         let validated =
             complete_loaded_builder_with_reorg_window(&store_path, 2, BlockHeight::new(2))?
-                .validate_for_publication()?;
+                .prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1166,7 +1216,7 @@ mod tests {
         let store_path = temporary.path().join("canonical");
         let validated =
             complete_loaded_builder_with_reorg_window(&store_path, 1, BlockHeight::new(3))?
-                .validate_for_publication()?;
+                .prepare_cold_certified_publication()?;
 
         let error = validated
             .prepare_baseline(crate::CanonicalBaselinePublication::new(
@@ -1202,7 +1252,7 @@ mod tests {
             100,
             crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(100)),
         ))?;
-        let validated = builder.validate_for_publication()?;
+        let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1227,7 +1277,7 @@ mod tests {
             let store_path = temporary.path().join(format!("canonical-{corruption}"));
             let validated =
                 complete_loaded_builder_with_reorg_window(&store_path, 2, BlockHeight::new(2))?
-                    .validate_for_publication()?;
+                    .prepare_cold_certified_publication()?;
             let publication =
                 validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
                     BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
@@ -1256,7 +1306,8 @@ mod tests {
     fn ready_store_append_anchor_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1288,7 +1339,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1375,7 +1427,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1431,7 +1484,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1494,7 +1548,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1548,7 +1603,8 @@ mod tests {
             return Ok(());
         };
         let store_path = Path::new(&store_path);
-        let validated = complete_loaded_builder(store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1627,7 +1683,7 @@ mod tests {
         drop(replay_family);
 
         let error = store
-            .validate_for_publication()
+            .prepare_cold_certified_publication()
             .err()
             .ok_or("cold publication must reject replay corruption")?;
 
@@ -1653,7 +1709,8 @@ mod tests {
             return Ok(());
         };
         let store_path = Path::new(&store_path);
-        let validated = complete_loaded_builder(store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1705,7 +1762,7 @@ mod tests {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
         let store = complete_loaded_builder(&store_path)?;
-        let validated = store.validate_for_publication()?;
+        let validated = store.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1752,7 +1809,8 @@ mod tests {
     {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let validated = complete_loaded_builder(&store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
@@ -1807,7 +1865,7 @@ mod tests {
         let store_path = temporary.path().join("canonical");
         let store = complete_loaded_builder(&store_path)?;
 
-        let validated = store.validate_for_publication()?;
+        let validated = store.prepare_cold_certified_publication()?;
         let error = validated
             .prepare_baseline(crate::CanonicalBaselinePublication::new(
                 BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([9; 32])),
@@ -2223,7 +2281,10 @@ mod tests {
         store_path: &Path,
         store: &RocksDbCanonicalStore,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(store.ready_evidence().construction_manifest_version, 1);
+        assert_eq!(
+            store.ready_evidence().construction_manifest_version,
+            crate::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
+        );
         assert!(
             store
                 .ready_evidence()
@@ -2233,12 +2294,15 @@ mod tests {
         );
         assert!(
             store_path
-                .join("canonical-construction-manifest.v1.json")
+                .join("canonical-construction-manifest.v2.json")
                 .is_file()
         );
         let manifest_binding =
             RocksDbCanonicalStore::read_construction_manifest_binding(store_path)?;
-        assert_eq!(manifest_binding.version, 1);
+        assert_eq!(
+            manifest_binding.version,
+            crate::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
+        );
         assert_eq!(
             manifest_binding.sha256,
             store.ready_evidence().construction_manifest_sha256
@@ -2673,7 +2737,8 @@ mod tests {
     fn published_store_with_displaced_archive(
         store_path: &Path,
     ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
-        let validated = complete_loaded_builder(store_path)?.validate_for_publication()?;
+        let validated =
+            complete_loaded_builder(store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
             UnixTimestampMillis::new(1_750_000_000_000),

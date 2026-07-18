@@ -319,7 +319,7 @@ fn read_subtree_roots(
                 BlockHash::from_bytes([0; 32]),
             );
             let key = encode_subtree_root_key(&probe);
-            store
+            let encoded = store
                 .serving_open()
                 .db
                 .get_cf(&family, key)
@@ -327,11 +327,16 @@ fn read_subtree_roots(
                     operation: "subtree-root read",
                     source,
                 })?
-                .map(|encoded| decode_subtree_root(&key, &encoded))
-                .transpose()
+                .ok_or_else(|| {
+                    CanonicalStoreError::publication(format!(
+                        "advertised {:?} subtree root {} is absent",
+                        range.protocol,
+                        subtree_index.value()
+                    ))
+                })?;
+            decode_subtree_root(&key, &encoded)
         })
         .collect::<Result<Vec<_>, _>>()
-        .map(|roots| roots.into_iter().flatten().collect())
 }
 
 fn read_optional(

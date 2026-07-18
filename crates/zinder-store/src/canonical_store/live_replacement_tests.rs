@@ -770,7 +770,7 @@ fn published_store(
         build_tip_height.value(),
         super::test_checkpoint_frontiers(&activations, build_tip_height),
     ))?;
-    let validated = builder.validate_for_publication()?;
+    let validated = builder.prepare_cold_certified_publication()?;
     let settled_byte = u8::try_from(settled_height.value())?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         BlockId::new(settled_height, BlockHash::from_bytes([settled_byte; 32])),

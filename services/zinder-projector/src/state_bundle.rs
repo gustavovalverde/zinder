@@ -25,8 +25,8 @@ use zinder_core::{
 };
 use zinder_proto::v1::ingest::{CanonicalWriterFence, CreateCanonicalOwnerCheckpointResponse};
 use zinder_store::{
-    CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreWorkload,
-    RocksDbResourceBudget,
+    CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CANONICAL_STORE_IDENTITY,
+    CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreWorkload, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletCanonicalSourceIdentity,
@@ -703,7 +703,7 @@ fn decode_checkpoint_response(
     })?;
     require_manifest_value(
         schema_version == CANONICAL_STORE_SCHEMA_VERSION,
-        "canonical checkpoint schema must be exactly 5",
+        "canonical checkpoint schema is unsupported",
     )?;
     require_manifest_value(
         response.workload == CanonicalStoreWorkload::Wallet.as_str(),
@@ -752,8 +752,9 @@ fn decode_ready_evidence(
         "canonical replay format version must be exactly 1",
     )?;
     require_manifest_value(
-        ready.construction_manifest_version == 1,
-        "canonical construction-manifest version must be exactly 1",
+        ready.construction_manifest_version
+            == u32::from(CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION),
+        "canonical construction-manifest version is unsupported",
     )?;
     let block_digest_version = u16::try_from(ready.block_digest_version).map_err(|_| {
         StateBundleError::manifest_contract("canonical block digest version does not fit u16")
@@ -1110,15 +1111,15 @@ impl CanonicalCheckpointManifest {
         )?;
         require_manifest_value(
             self.schema_version == CANONICAL_STORE_SCHEMA_VERSION,
-            "canonical checkpoint schema must be exactly 5",
+            "canonical checkpoint schema is unsupported",
         )?;
         validate_lower_hex_32(
             &self.database_identity_sha256,
             "canonical checkpoint database identity SHA-256",
         )?;
         require_manifest_value(
-            self.construction_manifest_version == 1,
-            "canonical construction-manifest version must be exactly 1",
+            self.construction_manifest_version == CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+            "canonical construction-manifest version is unsupported",
         )?;
         validate_lower_hex_32(
             &self.construction_manifest_sha256,
@@ -2090,7 +2091,7 @@ mod tests {
             ),
             (
                 "/canonical_checkpoint/construction_manifest_version",
-                Value::from(2),
+                Value::from(3),
             ),
             (
                 "/canonical_checkpoint/construction_manifest_sha256",
@@ -2301,7 +2302,7 @@ mod tests {
             .ready_evidence
             .as_mut()
             .ok_or("sample response must contain READY evidence")?
-            .construction_manifest_version = 2;
+            .construction_manifest_version = 3;
         assert!(
             CanonicalCheckpointAdmissionEvidence::try_from(wrong_construction_version).is_err()
         );
@@ -2401,7 +2402,7 @@ mod tests {
         let digest = sequence_digest(sequence, 0x44);
         CanonicalAdmission {
             database_identity_sha256: sha256_hex(b"sample-canonical-database-identity"),
-            construction_manifest_version: 1,
+            construction_manifest_version: CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
             construction_manifest_sha256: [0xbb; 32],
             store_identity: CANONICAL_STORE_IDENTITY.to_owned(),
             schema_version: CANONICAL_STORE_SCHEMA_VERSION,

@@ -1,6 +1,9 @@
 mod codec;
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 
 use prost::Message;
 use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode, Options};
@@ -27,9 +30,10 @@ pub(super) use self::codec::{
 };
 
 use super::{
-    CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
-    TREE_STATE_CHECKPOINT_STRIDE,
+    CanonicalSequenceCheckpoint, CanonicalStoreBuildError, CanonicalStoreBuildPlan,
+    CanonicalStoreError, CanonicalStoreWorkload, TREE_STATE_CHECKPOINT_STRIDE,
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+    construction_manifest::CanonicalConstructionFamilyEvidence,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
@@ -143,6 +147,14 @@ pub struct CanonicalBlockLoadEvidence {
 pub(super) struct PreparedCanonicalBlockLoad {
     families: Vec<PreparedColumnFamily>,
     pub(super) evidence: CanonicalBlockLoadEvidence,
+    trusted_fresh_evidence: CanonicalTrustedFreshBlockEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CanonicalTrustedFreshBlockEvidence {
+    pub(super) family_evidence: Vec<CanonicalConstructionFamilyEvidence>,
+    pub(super) retained_sequence_checkpoints: VecDeque<CanonicalSequenceCheckpoint>,
+    pub(super) logical_replay_bytes: u64,
 }
 
 /// Per-file physical evidence emitted by the bounded staging writers.
@@ -166,6 +178,7 @@ struct PreparedColumnFamily {
     name: &'static str,
     paths: Vec<PathBuf>,
     staged_ssts: Vec<CanonicalStagedSstEvidence>,
+    family_evidence: CanonicalConstructionFamilyEvidence,
 }
 
 pub(super) fn write_canonical_block_ssts<SourceError>(
@@ -246,7 +259,15 @@ impl<'options> CanonicalBlockSstStager<'options> {
         let row = BlockSequenceRow::from_block(&block)?;
         match &mut self.sequence {
             Some(sequence) => sequence.append(row)?,
-            None => self.sequence = Some(BlockSequence::new(row)?),
+            None => {
+                let retained_checkpoint_count = usize::try_from(
+                    u64::from(self.config.build_plan.reorg_policy().reorg_window_blocks()) + 1,
+                )
+                .map_err(|_| {
+                    CanonicalStoreError::block_load_sequence("reorg window exceeds usize")
+                })?;
+                self.sequence = Some(BlockSequence::new(row, retained_checkpoint_count)?);
+            }
         }
         write_build_block(
             block,
@@ -370,14 +391,24 @@ fn prepare_canonical_block_load(
             CanonicalStoreError::block_load_sequence("SST file count exceeds u64::MAX")
         })
     })?;
+    let family_evidence = families
+        .iter()
+        .map(|family| family.family_evidence.clone())
+        .collect();
 
+    let finished_sequence = sequence.finish(
+        sst_file_bytes,
+        sst_file_count,
+        predecessor_checkpoint_logical_bytes,
+    )?;
     Ok(PreparedCanonicalBlockLoad {
         families,
-        evidence: sequence.finish(
-            sst_file_bytes,
-            sst_file_count,
-            predecessor_checkpoint_logical_bytes,
-        )?,
+        evidence: finished_sequence.evidence,
+        trusted_fresh_evidence: CanonicalTrustedFreshBlockEvidence {
+            family_evidence,
+            retained_sequence_checkpoints: finished_sequence.retained_sequence_checkpoints,
+            logical_replay_bytes: finished_sequence.logical_replay_bytes,
+        },
     })
 }
 
@@ -476,12 +507,14 @@ pub(super) fn ingest_canonical_block_ssts(
     Ok(IngestedCanonicalBlockLoad {
         evidence: prepared.evidence,
         staged_ssts,
+        trusted_fresh_evidence: prepared.trusted_fresh_evidence,
     })
 }
 
 pub(super) struct IngestedCanonicalBlockLoad {
     pub(super) evidence: CanonicalBlockLoadEvidence,
     pub(super) staged_ssts: Vec<CanonicalStagedSstEvidence>,
+    pub(super) trusted_fresh_evidence: CanonicalTrustedFreshBlockEvidence,
 }
 
 pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, CanonicalStoreError> {
@@ -1055,7 +1088,10 @@ struct BlockSequence {
     tree_state_checkpoint_count: u64,
     block_final_note_commitment_roots_count: u64,
     family_logical_bytes: BlockFamilyLogicalBytes,
+    logical_replay_bytes: u64,
     sequence_digest: CanonicalBlockFactsSequenceDigestBuilder,
+    retained_checkpoint_count: usize,
+    retained_sequence_checkpoints: VecDeque<CanonicalSequenceCheckpoint>,
 }
 
 #[derive(Clone, Copy)]
@@ -1069,6 +1105,7 @@ struct BlockSequenceRow {
     has_tree_state_checkpoint: bool,
     has_block_final_note_commitment_roots: bool,
     family_logical_bytes: BlockFamilyLogicalBytes,
+    replay_value_bytes: u64,
     facts_digest: zinder_core::CanonicalBlockFactsDigest,
 }
 
@@ -1146,6 +1183,9 @@ impl BlockSequenceRow {
                 tree_state_checkpoint: tree_state_checkpoint_logical_bytes,
                 block_final_note_commitment_roots: block_final_note_commitment_roots_logical_bytes,
             },
+            replay_value_bytes: u64::try_from(block.replay_envelope.as_bytes().len()).map_err(
+                |_| CanonicalStoreError::block_load_sequence("replay byte length exceeds u64::MAX"),
+            )?,
             facts_digest: block.facts.digest(CanonicalBlockFactsDigestVersion::V1),
         })
     }
@@ -1199,14 +1239,17 @@ impl BlockFamilyLogicalBytes {
 }
 
 impl BlockSequence {
-    fn new(row: BlockSequenceRow) -> Result<Self, CanonicalStoreError> {
+    fn new(
+        row: BlockSequenceRow,
+        retained_checkpoint_count: usize,
+    ) -> Result<Self, CanonicalStoreError> {
         let mut sequence_digest = CanonicalBlockFactsSequenceDigestBuilder::new(
             CanonicalBlockFactsSequenceDigestVersion::V1,
         );
         sequence_digest.try_append(row.facts_digest).map_err(|_| {
             CanonicalStoreError::block_load_sequence("block sequence count exceeds u64::MAX")
         })?;
-        Ok(Self {
+        let mut sequence = Self {
             first_height: row.height,
             first_parent_hash: row.parent_hash,
             first_hash: row.block_hash,
@@ -1221,8 +1264,13 @@ impl BlockSequence {
                 row.has_block_final_note_commitment_roots,
             ),
             family_logical_bytes: row.family_logical_bytes,
+            logical_replay_bytes: row.replay_value_bytes,
             sequence_digest,
-        })
+            retained_checkpoint_count,
+            retained_sequence_checkpoints: VecDeque::new(),
+        };
+        sequence.retain_checkpoint();
+        Ok(sequence)
     }
 
     fn append(&mut self, row: BlockSequenceRow) -> Result<(), CanonicalStoreError> {
@@ -1285,6 +1333,12 @@ impl BlockSequence {
         self.family_logical_bytes = self
             .family_logical_bytes
             .checked_add(row.family_logical_bytes)?;
+        self.logical_replay_bytes = self
+            .logical_replay_bytes
+            .checked_add(row.replay_value_bytes)
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence("replay bytes exceed u64::MAX")
+            })?;
         self.sequence_digest
             .try_append(row.facts_digest)
             .map_err(|_| {
@@ -1293,7 +1347,22 @@ impl BlockSequence {
         self.tip_height = row.height;
         self.tip_hash = row.block_hash;
         self.tip_metadata = row.tip_metadata;
+        self.retain_checkpoint();
         Ok(())
+    }
+
+    fn retain_checkpoint(&mut self) {
+        self.retained_sequence_checkpoints.push_back(
+            CanonicalSequenceCheckpoint::from_admitted_parts(
+                zinder_core::BlockId::new(self.tip_height, self.tip_hash),
+                self.block_count,
+                self.sequence_digest.clone().finish(),
+                self.logical_replay_bytes,
+            ),
+        );
+        if self.retained_sequence_checkpoints.len() > self.retained_checkpoint_count {
+            self.retained_sequence_checkpoints.pop_front();
+        }
     }
 
     fn finish(
@@ -1301,14 +1370,14 @@ impl BlockSequence {
         sst_file_bytes: u64,
         sst_file_count: u64,
         predecessor_checkpoint_logical_bytes: u64,
-    ) -> Result<CanonicalBlockLoadEvidence, CanonicalStoreError> {
+    ) -> Result<FinishedBlockSequence, CanonicalStoreError> {
         let mut family_logical_bytes = self.family_logical_bytes;
         family_logical_bytes.tree_state_checkpoint = checked_add_logical_bytes(
             family_logical_bytes.tree_state_checkpoint,
             predecessor_checkpoint_logical_bytes,
         )?;
         let logical_bytes = family_logical_bytes.checked_sum()?;
-        Ok(CanonicalBlockLoadEvidence {
+        let evidence = CanonicalBlockLoadEvidence {
             first_height: self.first_height,
             first_parent_hash: self.first_parent_hash,
             first_hash: self.first_hash,
@@ -1350,12 +1419,27 @@ impl BlockSequence {
             block_digest_version: CanonicalBlockFactsDigestVersion::V1,
             sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
             sequence_digest: self.sequence_digest.finish(),
+        };
+        Ok(FinishedBlockSequence {
+            evidence,
+            retained_sequence_checkpoints: self.retained_sequence_checkpoints,
+            logical_replay_bytes: self.logical_replay_bytes,
         })
     }
 }
 
+struct FinishedBlockSequence {
+    evidence: CanonicalBlockLoadEvidence,
+    retained_sequence_checkpoints: VecDeque<CanonicalSequenceCheckpoint>,
+    logical_replay_bytes: u64,
+}
+
 impl PreparedColumnFamily {
     fn new(name: &'static str, files: SstFileSet) -> Self {
+        let family_evidence = CanonicalConstructionFamilyEvidence::from_ordered_writer(
+            name,
+            files.logical_family_evidence,
+        );
         let staged_ssts = files
             .files
             .into_iter()
@@ -1365,6 +1449,7 @@ impl PreparedColumnFamily {
             name,
             paths: files.paths,
             staged_ssts,
+            family_evidence,
         }
     }
 }

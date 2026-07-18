@@ -15,7 +15,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier, ShieldedProtocol};
-use zinder_rocksdb::SstFileEvidence;
+use zinder_rocksdb::{
+    OrderedKeyValueEvidence, OrderedKeyValueEvidenceAccumulator, SstFileEvidence,
+};
 
 use super::{
     CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
@@ -25,17 +27,31 @@ use super::{
 
 /// Fixed sidecar name copied with every owner-created canonical checkpoint.
 pub(super) const CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME: &str =
-    "canonical-construction-manifest.v1.json";
-const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 1;
+    "canonical-construction-manifest.v2.json";
+/// Exact immutable construction-manifest format accepted by this release.
+pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 2;
 const MAX_CONSTRUCTION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const CONSTRUCTION_MANIFEST_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.file.v1\0";
+    b"zinder.canonical.construction-manifest.file.v2\0";
 const CONSTRUCTION_BUILD_PLAN_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.build-plan.v1\0";
+    b"zinder.canonical.construction-manifest.build-plan.v2\0";
 const CONSTRUCTION_CHECKPOINT_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.checkpoint.v1\0";
-const CONSTRUCTION_FAMILY_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.family.v1\0";
+    b"zinder.canonical.construction-manifest.checkpoint.v2\0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CanonicalConstructionProofProvenance {
+    TrustedFreshWriter,
+    ColdCertification,
+}
+
+impl CanonicalConstructionProofProvenance {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrustedFreshWriter => "trusted-fresh-writer",
+            Self::ColdCertification => "cold-certification",
+        }
+    }
+}
 
 /// Exact immutable sidecar identity carried by every READY control record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,9 +62,9 @@ pub struct CanonicalConstructionManifestBinding {
     pub sha256: [u8; 32],
 }
 
-/// One complete cache-bypassing cold-read family observation.
+/// One complete ordered family observation used by construction certification.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct CanonicalColdFamilyEvidence {
+pub(super) struct CanonicalConstructionFamilyEvidence {
     pub(super) family: &'static str,
     pub(super) row_count: u64,
     pub(super) logical_bytes: u64,
@@ -57,33 +73,38 @@ pub(super) struct CanonicalColdFamilyEvidence {
     pub(super) ordered_key_value_digest: [u8; 32],
 }
 
-impl CanonicalColdFamilyEvidence {
-    pub(super) fn accumulator(family: &'static str) -> CanonicalColdFamilyEvidenceAccumulator {
-        CanonicalColdFamilyEvidenceAccumulator::new(family)
+impl CanonicalConstructionFamilyEvidence {
+    pub(super) fn accumulator(
+        family: &'static str,
+    ) -> CanonicalConstructionFamilyEvidenceAccumulator {
+        CanonicalConstructionFamilyEvidenceAccumulator::new(family)
+    }
+
+    pub(super) fn from_ordered_writer(
+        family: &'static str,
+        evidence: OrderedKeyValueEvidence,
+    ) -> Self {
+        Self {
+            family,
+            row_count: evidence.row_count,
+            logical_bytes: evidence.logical_bytes,
+            first_key: evidence.first_key,
+            last_key: evidence.last_key,
+            ordered_key_value_digest: evidence.ordered_key_value_digest,
+        }
     }
 }
 
-pub(super) struct CanonicalColdFamilyEvidenceAccumulator {
+pub(super) struct CanonicalConstructionFamilyEvidenceAccumulator {
     family: &'static str,
-    row_count: u64,
-    logical_bytes: u64,
-    first_key: Option<Vec<u8>>,
-    last_key: Option<Vec<u8>>,
-    digest: Sha256,
+    inner: OrderedKeyValueEvidenceAccumulator,
 }
 
-impl CanonicalColdFamilyEvidenceAccumulator {
+impl CanonicalConstructionFamilyEvidenceAccumulator {
     fn new(family: &'static str) -> Self {
-        let mut digest = Sha256::new();
-        digest.update(CONSTRUCTION_FAMILY_DIGEST_DOMAIN);
-        update_length_prefixed(&mut digest, family.as_bytes());
         Self {
             family,
-            row_count: 0,
-            logical_bytes: 0,
-            first_key: None,
-            last_key: None,
-            digest,
+            inner: OrderedKeyValueEvidenceAccumulator::new(),
         }
     }
 
@@ -92,53 +113,27 @@ impl CanonicalColdFamilyEvidenceAccumulator {
         key: &[u8],
         encoded_value: &[u8],
     ) -> Result<(), CanonicalStoreError> {
-        self.row_count = self.row_count.checked_add(1).ok_or_else(|| {
-            CanonicalStoreError::publication(format!("{} row count exceeds u64::MAX", self.family))
-        })?;
-        let row_bytes = key
-            .len()
-            .checked_add(encoded_value.len())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| {
-                CanonicalStoreError::publication(format!(
-                    "{} row size exceeds u64::MAX",
-                    self.family
-                ))
-            })?;
-        self.logical_bytes = self.logical_bytes.checked_add(row_bytes).ok_or_else(|| {
+        self.inner.record(key, encoded_value).map_err(|source| {
             CanonicalStoreError::publication(format!(
-                "{} logical bytes exceed u64::MAX",
+                "{} ordered family evidence is invalid: {source}",
                 self.family
             ))
-        })?;
-        if self.first_key.is_none() {
-            self.first_key = Some(key.to_vec());
-        }
-        self.last_key = Some(key.to_vec());
-        update_length_prefixed(&mut self.digest, key);
-        update_length_prefixed(&mut self.digest, encoded_value);
-        Ok(())
+        })
     }
 
-    pub(super) fn finish(self) -> CanonicalColdFamilyEvidence {
-        CanonicalColdFamilyEvidence {
-            family: self.family,
-            row_count: self.row_count,
-            logical_bytes: self.logical_bytes,
-            first_key: self.first_key,
-            last_key: self.last_key,
-            ordered_key_value_digest: self.digest.finalize().into(),
-        }
+    pub(super) fn finish(self) -> CanonicalConstructionFamilyEvidence {
+        CanonicalConstructionFamilyEvidence::from_ordered_writer(self.family, self.inner.finish())
     }
 }
 
 pub(super) struct CanonicalConstructionManifestDraft {
+    evidence_provenance: CanonicalConstructionProofProvenance,
     build_plan: CanonicalStoreBuildPlan,
     workload: CanonicalStoreWorkload,
     source_checkpoint: CommitmentTreeCheckpoint,
     block_evidence: CanonicalBlockLoadEvidence,
     subtree_evidence: CanonicalSubtreeRootLoadEvidence,
-    cold_families: Vec<CanonicalColdFamilyEvidence>,
+    family_evidence: Vec<CanonicalConstructionFamilyEvidence>,
     staged_ssts: Vec<CanonicalStagedSstEvidence>,
 }
 
@@ -148,23 +143,43 @@ pub(super) struct CanonicalConstructionManifestInputs {
     pub(super) source_checkpoint: CommitmentTreeCheckpoint,
     pub(super) block_evidence: CanonicalBlockLoadEvidence,
     pub(super) subtree_evidence: CanonicalSubtreeRootLoadEvidence,
-    pub(super) cold_families: Vec<CanonicalColdFamilyEvidence>,
+    pub(super) family_evidence: Vec<CanonicalConstructionFamilyEvidence>,
     pub(super) staged_ssts: Vec<CanonicalStagedSstEvidence>,
 }
 
 impl CanonicalConstructionManifestDraft {
-    pub(super) fn new(
+    pub(super) fn new_trusted_fresh(
         inputs: CanonicalConstructionManifestInputs,
     ) -> Result<Self, CanonicalStoreError> {
-        validate_complete_family_coverage(&inputs.cold_families)?;
-        validate_staged_sst_coverage(&inputs.cold_families, &inputs.staged_ssts)?;
+        Self::new(
+            CanonicalConstructionProofProvenance::TrustedFreshWriter,
+            inputs,
+        )
+    }
+
+    pub(super) fn new_cold_certified(
+        inputs: CanonicalConstructionManifestInputs,
+    ) -> Result<Self, CanonicalStoreError> {
+        Self::new(
+            CanonicalConstructionProofProvenance::ColdCertification,
+            inputs,
+        )
+    }
+
+    fn new(
+        evidence_provenance: CanonicalConstructionProofProvenance,
+        inputs: CanonicalConstructionManifestInputs,
+    ) -> Result<Self, CanonicalStoreError> {
+        validate_complete_family_coverage(&inputs.family_evidence)?;
+        validate_staged_sst_coverage(&inputs.family_evidence, &inputs.staged_ssts)?;
         Ok(Self {
+            evidence_provenance,
             build_plan: inputs.build_plan,
             workload: inputs.workload,
             source_checkpoint: inputs.source_checkpoint,
             block_evidence: inputs.block_evidence,
             subtree_evidence: inputs.subtree_evidence,
-            cold_families: inputs.cold_families,
+            family_evidence: inputs.family_evidence,
             staged_ssts: inputs.staged_ssts,
         })
     }
@@ -374,12 +389,13 @@ fn manifest_digest(bytes: &[u8]) -> [u8; 32] {
 #[serde(deny_unknown_fields)]
 struct PersistedConstructionManifest {
     format_version: u16,
+    evidence_provenance: String,
     workload: String,
     build_plan: PersistedBuildPlan,
     source_tip_checkpoint: PersistedCheckpoint,
     block_evidence: PersistedBlockEvidence,
     subtree_evidence: PersistedSubtreeEvidence,
-    cold_families: Vec<PersistedFamilyEvidence>,
+    family_evidence: Vec<PersistedFamilyEvidence>,
     staged_ssts: Vec<PersistedSstEvidence>,
     initial_ready: PersistedReadyEvidence,
 }
@@ -394,13 +410,14 @@ impl PersistedConstructionManifest {
             PersistedCheckpoint::from_checkpoint(&draft.source_checkpoint).digest_sha256;
         let manifest = Self {
             format_version: CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+            evidence_provenance: draft.evidence_provenance.as_str().to_owned(),
             workload: draft.workload.as_str().to_owned(),
             build_plan: PersistedBuildPlan::from_plan(&draft.build_plan),
             source_tip_checkpoint: PersistedCheckpoint::from_checkpoint(&draft.source_checkpoint),
             block_evidence,
             subtree_evidence: PersistedSubtreeEvidence::from_evidence(draft.subtree_evidence),
-            cold_families: draft
-                .cold_families
+            family_evidence: draft
+                .family_evidence
                 .into_iter()
                 .map(PersistedFamilyEvidence::from_evidence)
                 .collect(),
@@ -421,6 +438,15 @@ impl PersistedConstructionManifest {
                 "construction manifest format {} is not supported",
                 self.format_version
             )));
+        }
+        if self.evidence_provenance
+            != CanonicalConstructionProofProvenance::TrustedFreshWriter.as_str()
+            && self.evidence_provenance
+                != CanonicalConstructionProofProvenance::ColdCertification.as_str()
+        {
+            return Err(CanonicalStoreError::publication(
+                "construction manifest has an unknown proof provenance",
+            ));
         }
         if self.workload != "wallet" && self.workload != "explorer" {
             return Err(CanonicalStoreError::publication(
@@ -447,10 +473,10 @@ impl PersistedConstructionManifest {
                 "construction manifest has unsupported source evidence",
             ));
         }
-        validate_persisted_family_coverage(&self.cold_families)?;
-        validate_persisted_sst_coverage(&self.cold_families, &self.staged_ssts)?;
+        validate_persisted_family_coverage(&self.family_evidence)?;
+        validate_persisted_sst_coverage(&self.family_evidence, &self.staged_ssts)?;
         validate_persisted_source_evidence(
-            &self.cold_families,
+            &self.family_evidence,
             &self.block_evidence,
             &self.subtree_evidence,
         )?;
@@ -707,7 +733,7 @@ struct PersistedFamilyEvidence {
 }
 
 impl PersistedFamilyEvidence {
-    fn from_evidence(evidence: CanonicalColdFamilyEvidence) -> Self {
+    fn from_evidence(evidence: CanonicalConstructionFamilyEvidence) -> Self {
         Self {
             family: evidence.family.to_owned(),
             row_count: evidence.row_count,
@@ -812,7 +838,7 @@ impl PersistedReadyEvidence {
 }
 
 fn validate_complete_family_coverage(
-    families: &[CanonicalColdFamilyEvidence],
+    families: &[CanonicalConstructionFamilyEvidence],
 ) -> Result<(), CanonicalStoreError> {
     let observed = families
         .iter()
@@ -821,19 +847,19 @@ fn validate_complete_family_coverage(
     let expected = canonical_construction_families();
     if families.len() != expected.len() || observed != expected {
         return Err(CanonicalStoreError::publication(
-            "construction manifest cold family evidence is incomplete or duplicated",
+            "construction manifest family evidence is incomplete or duplicated",
         ));
     }
     Ok(())
 }
 
 fn validate_staged_sst_coverage(
-    families: &[CanonicalColdFamilyEvidence],
+    families: &[CanonicalConstructionFamilyEvidence],
     staged_ssts: &[CanonicalStagedSstEvidence],
 ) -> Result<(), CanonicalStoreError> {
     let family_views = families
         .iter()
-        .map(ConstructionFamilyEvidenceView::from_cold)
+        .map(ConstructionFamilyEvidenceView::from_construction)
         .collect::<Vec<_>>();
     let sst_views = staged_ssts
         .iter()
@@ -937,7 +963,7 @@ fn validate_persisted_source_evidence(
         || subtree.logical_bytes != subtree_evidence.subtree_root_logical_bytes
     {
         return Err(CanonicalStoreError::publication(
-            "construction manifest source evidence does not match cold families",
+            "construction manifest source evidence does not match family evidence",
         ));
     }
     Ok(())
@@ -952,7 +978,7 @@ struct ConstructionFamilyEvidenceView<'a> {
 }
 
 impl<'a> ConstructionFamilyEvidenceView<'a> {
-    fn from_cold(evidence: &'a CanonicalColdFamilyEvidence) -> Self {
+    fn from_construction(evidence: &'a CanonicalConstructionFamilyEvidence) -> Self {
         Self {
             family: evidence.family,
             row_count: evidence.row_count,
@@ -1057,7 +1083,7 @@ fn validate_staged_sst_views(
             || files.last().map(|file| file.last_key) != family.last_key
         {
             return Err(CanonicalStoreError::publication(
-                "construction manifest staged SST evidence does not match its cold family",
+                "construction manifest staged SST evidence does not match its family evidence",
             ));
         }
         for (expected_ordinal, file) in files.iter().enumerate() {

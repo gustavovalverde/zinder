@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zinder_core::Network;
-use zinder_store::{CanonicalConstructionManifestBinding, RocksDbCanonicalStore};
+use zinder_store::{
+    CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CanonicalConstructionManifestBinding,
+    RocksDbCanonicalStore,
+};
 
 use crate::state_bundle::{
     CANONICAL_CHECKPOINT_DIRECTORY_NAME, STATE_BUNDLE_MANIFEST_FILE_NAME,
@@ -157,8 +160,9 @@ impl RecoveryArchiveManifest {
             "source state-bundle manifest SHA-256",
         )?;
         require_contract(
-            self.canonical_construction_manifest_version == 1,
-            "canonical construction-manifest version must be exactly 1",
+            self.canonical_construction_manifest_version
+                == CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+            "canonical construction-manifest version is unsupported",
         )?;
         validate_lower_hex_32(
             &self.canonical_construction_manifest_sha256,

@@ -469,7 +469,8 @@ impl<'encoded> Decoder<'encoded> {
             || ready_evidence.replay_format_version != CanonicalBlockReplayFormatVersion::V1
             || ready_evidence.sequence_digest_version
                 != CanonicalBlockFactsSequenceDigestVersion::V1
-            || ready_evidence.construction_manifest_version != 1
+            || ready_evidence.construction_manifest_version
+                != super::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
             || ready_evidence
                 .construction_manifest_sha256
                 .iter()
@@ -477,7 +478,7 @@ impl<'encoded> Decoder<'encoded> {
         {
             return Err(CanonicalStoreError::admission(
                 self.path,
-                "ready store control contracts must all be version 1",
+                "ready store control has an unsupported contract version",
             ));
         }
         Ok(())
@@ -686,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_control_requires_complete_version_one_evidence()
+    fn ready_control_requires_complete_current_contract_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
         let encoded = valid_ready_control();
         let decoded_ready = decode_store_control(Path::new("canonical"), &encoded)?;
@@ -944,7 +945,9 @@ mod tests {
         );
         encoded.extend_from_slice(&[5; 32]);
         encoded.extend_from_slice(&1_u64.to_le_bytes());
-        encoded.extend_from_slice(&1_u16.to_le_bytes());
+        encoded.extend_from_slice(
+            &crate::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION.to_le_bytes(),
+        );
         encoded.extend_from_slice(&[6; 32]);
         assert_eq!(encoded.len(), STORE_CONTROL_MINIMUM_LENGTH);
         encoded
@@ -980,7 +983,8 @@ mod tests {
                     ),
                     1,
                 ),
-                construction_manifest_version: 1,
+                construction_manifest_version:
+                    crate::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
                 construction_manifest_sha256: [6; 32],
             }),
         }

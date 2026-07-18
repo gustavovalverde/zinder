@@ -238,7 +238,7 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
         Arc::clone(&activations),
     );
     let built = load_fresh_canonical(builder, &source, &construction).await?;
-    let validated = built.builder.validate_for_publication()?;
+    let validated = built.builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         first,
         UnixTimestampMillis::new(1_783_933_200_000),
@@ -648,7 +648,7 @@ async fn publish_parseable_store(
         Arc::clone(&activations),
     );
     let built = load_fresh_canonical(builder, source, &construction).await?;
-    let validated = built.builder.validate_for_publication()?;
+    let validated = built.builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         block_id(blocks, settled_height.value())?,
         UnixTimestampMillis::new(1_783_933_200_000),

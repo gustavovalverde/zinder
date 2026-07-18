@@ -1117,7 +1117,7 @@ mod tests {
             1,
             CommitmentTreeFrontiers::default(),
         ))?;
-        let validated = builder.validate_for_publication()?;
+        let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
             tip,
             UnixTimestampMillis::new(1_750_000_000_000),

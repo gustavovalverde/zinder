@@ -1058,7 +1058,7 @@ fn build_ready_canonical_store(
     builder.load_subtree_roots(std::iter::empty())?;
     let tip_checkpoint = CommitmentTreeCheckpoint::new(tip, 3, CommitmentTreeFrontiers::default());
     builder.confirm_source_tip_checkpoint(&tip_checkpoint)?;
-    let validated = builder.validate_for_publication()?;
+    let validated = builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         tip,
         UnixTimestampMillis::new(1_750_000_000_000),

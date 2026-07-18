@@ -1,6 +1,10 @@
 //! Wallet query implementation over admitted version-1 canonical and wallet stores.
 
-use std::{collections::HashSet, num::NonZeroU16, sync::Arc};
+use std::{
+    collections::HashSet,
+    num::{NonZeroU16, NonZeroU32},
+    sync::Arc,
+};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -261,6 +265,10 @@ where
     ) -> Result<TransactionStatus, QueryError> {
         let pair = self.capture_pair();
         let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        // READY admission requires the construction manifest's transaction-location
+        // and transaction-blob row counts to equal the authenticated source count;
+        // live append and replacement update both families in the canonical atomic
+        // batch. Under that admitted coverage contract, absence is a real miss.
         let Some(location) = pair.canonical().transaction_location(transaction_id)? else {
             return Ok(TransactionStatus {
                 chain_epoch,
@@ -544,7 +552,34 @@ where
     ) -> Result<SubtreeRoots, QueryError> {
         let pair = self.capture_pair();
         let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let subtree_roots = pair.canonical().subtree_roots(subtree_root_range)?;
+        let completed_subtree_count = chain_epoch
+            .tip_metadata
+            .completed_subtree_count(subtree_root_range.protocol);
+        if subtree_root_range.start_index.value() >= completed_subtree_count {
+            return Ok(SubtreeRoots {
+                chain_epoch,
+                protocol: subtree_root_range.protocol,
+                start_index: subtree_root_range.start_index,
+                subtree_roots: Vec::new(),
+            });
+        }
+        let available_entries = completed_subtree_count
+            .saturating_sub(subtree_root_range.start_index.value())
+            .min(subtree_root_range.max_entries.get());
+        let available_entries =
+            NonZeroU32::new(available_entries).ok_or_else(|| QueryError::ArtifactUnavailable {
+                family: ArtifactFamily::SubtreeRoot,
+                key: ArtifactKey::SubtreeRootIndex {
+                    protocol: subtree_root_range.protocol,
+                    index: subtree_root_range.start_index,
+                },
+            })?;
+        let available_range = zinder_core::SubtreeRootRange::new(
+            subtree_root_range.protocol,
+            subtree_root_range.start_index,
+            available_entries,
+        );
+        let subtree_roots = pair.canonical().subtree_roots(available_range)?;
         Ok(SubtreeRoots {
             chain_epoch,
             protocol: subtree_root_range.protocol,

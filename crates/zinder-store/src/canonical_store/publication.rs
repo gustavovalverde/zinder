@@ -20,15 +20,16 @@ use super::{
     CanonicalStoreError, CanonicalStoreReadyEvidence, RocksDbCanonicalBuilder,
     RocksDbCanonicalStore,
     block_load::{
-        CanonicalBlockLoadEvidence, read_persisted_tip_metadata,
-        validate_persisted_commitment_tree_families, validate_source_tip_checkpoint,
+        CanonicalBlockLoadEvidence, CanonicalTrustedFreshBlockEvidence,
+        read_persisted_tip_metadata, validate_persisted_commitment_tree_families,
+        validate_source_tip_checkpoint,
     },
     block_replay::{
         PersistedBlockReplayValidation, resume_persisted_sequence_checkpoint,
         validate_persisted_block_replays_with_checkpoints,
     },
     construction_manifest::{
-        CanonicalColdFamilyEvidence, CanonicalConstructionManifestDraft,
+        CanonicalConstructionFamilyEvidence, CanonicalConstructionManifestDraft,
         CanonicalConstructionManifestInputs,
     },
     control::{DecodedStoreControl, decode_store_control, encode_ready_store_control},
@@ -76,9 +77,10 @@ impl CanonicalBaselinePublication {
     }
 }
 
-/// Exclusive owner of a cold-reopened and fully validated canonical v1 build.
+/// Exclusive owner of a reopened canonical v1 build prepared for publication.
 ///
-/// This type can only be produced by [`RocksDbCanonicalBuilder::validate_for_publication`].
+/// Trusted fresh-writer preparation and explicit cold certification are
+/// separate builder APIs that both produce this publication capability.
 pub struct ValidatedRocksDbCanonicalBuild {
     bounded_open: BoundedRocksDbOpen,
     workload: super::CanonicalStoreWorkload,
@@ -113,14 +115,38 @@ struct PublicationContext {
     build_plan: super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
     block_evidence: CanonicalBlockLoadEvidence,
+    trusted_fresh_block_evidence: CanonicalTrustedFreshBlockEvidence,
     staged_ssts: Vec<super::block_load::CanonicalStagedSstEvidence>,
     subtree_root_evidence: super::CanonicalSubtreeRootLoadEvidence,
+    trusted_fresh_subtree_family_evidence: CanonicalConstructionFamilyEvidence,
     source_tip_checkpoint: zinder_core::CommitmentTreeCheckpoint,
 }
 
 impl RocksDbCanonicalBuilder {
-    /// Flushes, closes, cold-reopens, and independently validates a complete v1 build.
-    pub fn validate_for_publication(
+    /// Prepares publication from evidence owned by this one-shot fresh writer.
+    ///
+    /// This path still flushes, closes, reopens, and verifies immutable identity
+    /// and BUILDING control. It validates family boundaries and authenticated tip
+    /// points without rescanning complete historical families.
+    pub fn prepare_trusted_fresh_publication(
+        self,
+    ) -> Result<ValidatedRocksDbCanonicalBuild, CanonicalStoreError> {
+        let context = PublicationContext::from_builder(&self)?;
+        flush_complete_build(&self.bounded_open.db)?;
+        let built_database_identity = self.bounded_open.db.get_db_identity().map_err(|source| {
+            CanonicalStoreError::RocksDbOperation {
+                operation: "publication database identity read",
+                source,
+            }
+        })?;
+        abort_at_publication_failpoint("after_flush");
+        drop(self);
+        abort_at_publication_failpoint("after_builder_drop");
+        context.prepare_trusted_fresh_reopen(&built_database_identity)
+    }
+
+    /// Flushes, closes, cold-reopens, and independently certifies a complete v1 build.
+    pub fn prepare_cold_certified_publication(
         self,
     ) -> Result<ValidatedRocksDbCanonicalBuild, CanonicalStoreError> {
         let context = PublicationContext::from_builder(&self)?;
@@ -153,9 +179,25 @@ impl PublicationContext {
                 "canonical block families have no staged SST construction evidence",
             )
         })?;
+        let trusted_fresh_block_evidence = builder
+            .trusted_fresh_block_evidence
+            .clone()
+            .ok_or_else(|| {
+                CanonicalStoreError::publication(
+                    "canonical block families have no trusted fresh-writer evidence",
+                )
+            })?;
         let subtree_root_evidence = builder.subtree_root_evidence.ok_or_else(|| {
             CanonicalStoreError::publication("canonical subtree-root ranges were not loaded")
         })?;
+        let trusted_fresh_subtree_family_evidence = builder
+            .trusted_fresh_subtree_family_evidence
+            .clone()
+            .ok_or_else(|| {
+                CanonicalStoreError::publication(
+                    "canonical subtree roots have no trusted fresh-writer evidence",
+                )
+            })?;
         let source_tip_checkpoint =
             builder
                 .confirmed_source_tip_checkpoint
@@ -173,9 +215,74 @@ impl PublicationContext {
             build_plan: builder.build_plan.clone(),
             cursor_auth_key: builder.cursor_auth_key,
             block_evidence,
+            trusted_fresh_block_evidence,
             staged_ssts,
             subtree_root_evidence,
+            trusted_fresh_subtree_family_evidence,
             source_tip_checkpoint,
+        })
+    }
+
+    fn prepare_trusted_fresh_reopen(
+        self,
+        built_database_identity: &[u8],
+    ) -> Result<ValidatedRocksDbCanonicalBuild, CanonicalStoreError> {
+        let bounded_open = self.reopen_complete_build(built_database_identity)?;
+        validate_source_tip_checkpoint(
+            &bounded_open.db,
+            &self.build_plan,
+            &self.block_evidence,
+            &self.source_tip_checkpoint,
+        )?;
+        validate_trusted_fresh_tip_points(
+            &bounded_open.db,
+            &self.build_plan,
+            &self.block_evidence,
+        )?;
+
+        let CanonicalTrustedFreshBlockEvidence {
+            mut family_evidence,
+            retained_sequence_checkpoints,
+            logical_replay_bytes,
+        } = self.trusted_fresh_block_evidence;
+        family_evidence.push(self.trusted_fresh_subtree_family_evidence);
+        for name in [
+            DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
+            CHAIN_EPOCH_COLUMN_FAMILY,
+            CHAIN_EVENT_COLUMN_FAMILY,
+            MEMPOOL_EVENT_COLUMN_FAMILY,
+            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
+        ] {
+            family_evidence.push(CanonicalConstructionFamilyEvidence::accumulator(name).finish());
+        }
+        validate_trusted_fresh_family_boundaries(&bounded_open.db, &family_evidence)?;
+
+        let construction_manifest = CanonicalConstructionManifestDraft::new_trusted_fresh(
+            CanonicalConstructionManifestInputs {
+                build_plan: self.build_plan.clone(),
+                workload: self.workload,
+                source_checkpoint: self.source_tip_checkpoint,
+                block_evidence: self.block_evidence,
+                subtree_evidence: self.subtree_root_evidence,
+                family_evidence,
+                staged_ssts: self.staged_ssts,
+            },
+        )?;
+        let ready_evidence = ready_evidence_from_trusted_fresh(
+            &self.block_evidence,
+            logical_replay_bytes,
+            &retained_sequence_checkpoints,
+        )?;
+        abort_at_publication_failpoint("after_cold_validation");
+        Ok(ValidatedRocksDbCanonicalBuild {
+            bounded_open,
+            workload: self.workload,
+            build_plan: self.build_plan,
+            cursor_auth_key: self.cursor_auth_key,
+            ready_evidence,
+            construction_manifest,
+            retained_sequence_checkpoints,
+            tip_metadata: self.block_evidence.tip_metadata,
         })
     }
 
@@ -183,40 +290,16 @@ impl PublicationContext {
         self,
         built_database_identity: &[u8],
     ) -> Result<ValidatedRocksDbCanonicalBuild, CanonicalStoreError> {
-        let expected_control = self.expected_building_control();
-        let expectation =
-            CanonicalStoreAdmissionExpectation::from_build_plan(&self.build_plan, self.workload);
-        let (admitted_database_identity, admitted_control) =
-            admit_existing_store(&self.store_path, expectation)?;
-        if admitted_database_identity.as_slice() != built_database_identity
-            || admitted_control != expected_control
-        {
-            return Err(CanonicalStoreError::publication(
-                "database identity or BUILDING control changed before cold validation",
-            ));
-        }
-        let bounded_open = open_bounded_rocksdb(
-            RocksDbOpenRole::ExistingPrimary {
-                path: &self.store_path,
-            },
-            self.resource_budget,
-            canonical_column_family_descriptors,
-        )
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "cold publication reopen",
-            source,
-        })?;
-        validate_reopened_identity_and_control(
-            &bounded_open.db,
-            &self.store_path,
-            built_database_identity,
-            &expected_control,
-        )?;
+        let bounded_open = self.reopen_complete_build(built_database_identity)?;
         let cold_validation = validate_cold_block_families(
             &bounded_open.db,
             self.workload,
             &self.build_plan,
             &self.block_evidence,
+        )?;
+        validate_cold_evidence_matches_writer(
+            &cold_validation.family_evidence,
+            &self.trusted_fresh_block_evidence.family_evidence,
         )?;
         let persisted_subtree_validation = validate_persisted_subtree_root_family(
             &bounded_open.db,
@@ -229,24 +312,32 @@ impl PublicationContext {
                 "cold subtree-root evidence differs from the authenticated source load",
             ));
         }
+        if persisted_subtree_validation.family_evidence
+            != self.trusted_fresh_subtree_family_evidence
+        {
+            return Err(CanonicalStoreError::publication(
+                "cold subtree-root family evidence differs from the trusted writer evidence",
+            ));
+        }
         validate_source_tip_checkpoint(
             &bounded_open.db,
             &self.build_plan,
             &self.block_evidence,
             &self.source_tip_checkpoint,
         )?;
-        let mut cold_families = cold_validation.family_evidence;
-        cold_families.push(persisted_subtree_validation.family_evidence);
-        let construction_manifest =
-            CanonicalConstructionManifestDraft::new(CanonicalConstructionManifestInputs {
+        let mut family_evidence = cold_validation.family_evidence;
+        family_evidence.push(persisted_subtree_validation.family_evidence);
+        let construction_manifest = CanonicalConstructionManifestDraft::new_cold_certified(
+            CanonicalConstructionManifestInputs {
                 build_plan: self.build_plan.clone(),
                 workload: self.workload,
                 source_checkpoint: self.source_tip_checkpoint,
                 block_evidence: self.block_evidence,
                 subtree_evidence: self.subtree_root_evidence,
-                cold_families,
+                family_evidence,
                 staged_ssts: self.staged_ssts,
-            })?;
+            },
+        )?;
         let ready_evidence = ready_evidence_from_cold_replay(&cold_validation.replay)?;
         abort_at_publication_failpoint("after_cold_validation");
         Ok(ValidatedRocksDbCanonicalBuild {
@@ -269,6 +360,42 @@ impl PublicationContext {
             cursor_auth_key: self.cursor_auth_key,
             build_state: CanonicalStoreBuildState::Building,
         }
+    }
+
+    fn reopen_complete_build(
+        &self,
+        built_database_identity: &[u8],
+    ) -> Result<BoundedRocksDbOpen, CanonicalStoreError> {
+        let expected_control = self.expected_building_control();
+        let expectation =
+            CanonicalStoreAdmissionExpectation::from_build_plan(&self.build_plan, self.workload);
+        let (admitted_database_identity, admitted_control) =
+            admit_existing_store(&self.store_path, expectation)?;
+        if admitted_database_identity.as_slice() != built_database_identity
+            || admitted_control != expected_control
+        {
+            return Err(CanonicalStoreError::publication(
+                "database identity or BUILDING control changed before publication reopen",
+            ));
+        }
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary {
+                path: &self.store_path,
+            },
+            self.resource_budget,
+            canonical_column_family_descriptors,
+        )
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "publication reopen",
+            source,
+        })?;
+        validate_reopened_identity_and_control(
+            &bounded_open.db,
+            &self.store_path,
+            built_database_identity,
+            &expected_control,
+        )?;
+        Ok(bounded_open)
     }
 }
 
@@ -300,6 +427,149 @@ fn ready_evidence_from_cold_replay(
         construction_manifest_version: 0,
         construction_manifest_sha256: [0; 32],
     })
+}
+
+fn ready_evidence_from_trusted_fresh(
+    evidence: &CanonicalBlockLoadEvidence,
+    logical_replay_bytes: u64,
+    retained_sequence_checkpoints: &VecDeque<CanonicalSequenceCheckpoint>,
+) -> Result<CanonicalStoreReadyEvidence, CanonicalStoreError> {
+    let sequence_checkpoint = retained_sequence_checkpoints
+        .back()
+        .copied()
+        .ok_or_else(|| {
+            CanonicalStoreError::publication(
+                "trusted fresh-writer evidence did not retain the visible prefix",
+            )
+        })?;
+    let visible_tip = BlockId::new(evidence.tip_height, evidence.tip_hash);
+    if sequence_checkpoint.through() != visible_tip
+        || sequence_checkpoint.retained_block_count() != evidence.block_count
+        || sequence_checkpoint.sequence_digest() != evidence.sequence_digest
+        || sequence_checkpoint.logical_replay_bytes() != logical_replay_bytes
+    {
+        return Err(CanonicalStoreError::publication(
+            "trusted fresh-writer sequence checkpoint differs from the block load",
+        ));
+    }
+    Ok(CanonicalStoreReadyEvidence {
+        first_retained_block: BlockId::new(evidence.first_height, evidence.first_hash),
+        visible_tip,
+        visible_epoch: BASELINE_EPOCH_ID,
+        visible_event_sequence: BASELINE_EVENT_SEQUENCE,
+        visible_block_count: evidence.block_count,
+        block_digest_version: evidence.block_digest_version,
+        replay_format_version: evidence.replay_format_version,
+        sequence_digest_version: evidence.sequence_digest_version,
+        visible_sequence_digest: evidence.sequence_digest.as_bytes(),
+        visible_logical_fact_bytes: logical_replay_bytes,
+        sequence_checkpoint,
+        construction_manifest_version: 0,
+        construction_manifest_sha256: [0; 32],
+    })
+}
+
+fn validate_trusted_fresh_tip_points(
+    db: &DB,
+    build_plan: &super::CanonicalStoreBuildPlan,
+    evidence: &CanonicalBlockLoadEvidence,
+) -> Result<(), CanonicalStoreError> {
+    let first = BlockId::new(evidence.first_height, evidence.first_hash);
+    let tip = BlockId::new(evidence.tip_height, evidence.tip_hash);
+    if first.height != build_plan.history_bounds().first_available_height()
+        || tip != build_plan.build_tip()
+        || retained_block_hash(db, first.height)? != first.hash
+        || retained_block_hash(db, tip.height)? != tip.hash
+        || read_persisted_tip_metadata(db, tip)? != evidence.tip_metadata
+    {
+        return Err(CanonicalStoreError::publication(
+            "trusted fresh-writer boundary points differ from the source load",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trusted_fresh_family_boundaries(
+    db: &DB,
+    families: &[CanonicalConstructionFamilyEvidence],
+) -> Result<(), CanonicalStoreError> {
+    for evidence in families {
+        let family = db.cf_handle(evidence.family).ok_or_else(|| {
+            CanonicalStoreError::publication(format!(
+                "{} column family is absent during trusted fresh publication",
+                evidence.family
+            ))
+        })?;
+        match (&evidence.first_key, &evidence.last_key, evidence.row_count) {
+            (None, None, 0) => {
+                let mut rows = db.raw_iterator_cf(&family);
+                rows.seek_to_first();
+                if rows.valid() {
+                    return Err(CanonicalStoreError::publication(format!(
+                        "{} must be empty during trusted fresh publication",
+                        evidence.family
+                    )));
+                }
+                rows.status()
+                    .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                        operation: "trusted fresh empty-family boundary validation",
+                        source,
+                    })?;
+            }
+            (Some(first_key), Some(last_key), row_count) if row_count > 0 => {
+                let first_present = db
+                    .get_cf(&family, first_key)
+                    .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                        operation: "trusted fresh first-family boundary validation",
+                        source,
+                    })?
+                    .is_some();
+                let last_present = db
+                    .get_cf(&family, last_key)
+                    .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                        operation: "trusted fresh last-family boundary validation",
+                        source,
+                    })?
+                    .is_some();
+                if !first_present || !last_present {
+                    return Err(CanonicalStoreError::publication(format!(
+                        "{} boundary row is absent during trusted fresh publication",
+                        evidence.family
+                    )));
+                }
+            }
+            _ => {
+                return Err(CanonicalStoreError::publication(
+                    "trusted fresh family evidence has inconsistent boundaries",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cold_evidence_matches_writer(
+    cold: &[CanonicalConstructionFamilyEvidence],
+    writer: &[CanonicalConstructionFamilyEvidence],
+) -> Result<(), CanonicalStoreError> {
+    for writer_family in writer {
+        let cold_family = cold
+            .iter()
+            .find(|cold_family| cold_family.family == writer_family.family)
+            .ok_or_else(|| {
+                CanonicalStoreError::publication(format!(
+                    "trusted writer {} evidence has no cold certification",
+                    writer_family.family
+                ))
+            })?;
+        if cold_family != writer_family {
+            return Err(CanonicalStoreError::publication(format!(
+                "cold {} certification differs from trusted writer evidence",
+                cold_family.family
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl ValidatedRocksDbCanonicalBuild {
@@ -979,7 +1249,7 @@ fn validate_cold_block_families(
 
 struct ColdCanonicalBlockValidation {
     replay: PersistedBlockReplayValidation,
-    family_evidence: Vec<CanonicalColdFamilyEvidence>,
+    family_evidence: Vec<CanonicalConstructionFamilyEvidence>,
 }
 
 pub(super) fn validate_settled_tip(
@@ -1332,7 +1602,7 @@ fn read_array<const N: usize>(
 fn require_empty_family(
     db: &DB,
     name: &'static str,
-) -> Result<CanonicalColdFamilyEvidence, CanonicalStoreError> {
+) -> Result<CanonicalConstructionFamilyEvidence, CanonicalStoreError> {
     let evidence = scan_family(db, name)?;
     if !evidence.matches(0, 0) {
         return Err(CanonicalStoreError::publication(format!(
@@ -1344,7 +1614,7 @@ fn require_empty_family(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ColdFamilyScanEvidence {
-    evidence: CanonicalColdFamilyEvidence,
+    evidence: CanonicalConstructionFamilyEvidence,
     elapsed: Duration,
 }
 
@@ -1374,7 +1644,7 @@ fn scan_family(db: &DB, name: &'static str) -> Result<ColdFamilyScanEvidence, Ca
     read_options.set_readahead_size(2 * 1024 * 1024);
     let mut iterator = db.raw_iterator_cf_opt(&family, read_options);
     iterator.seek_to_first();
-    let mut evidence = CanonicalColdFamilyEvidence::accumulator(name);
+    let mut evidence = CanonicalConstructionFamilyEvidence::accumulator(name);
     while iterator.valid() {
         let Some((key, encoded_row)) = iterator.item() else {
             break;
@@ -1489,7 +1759,8 @@ mod tests {
     #[test]
     fn cold_family_scan_evidence_requires_matching_rows_and_logical_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut accumulator = CanonicalColdFamilyEvidence::accumulator(BLOCK_HEADER_COLUMN_FAMILY);
+        let mut accumulator =
+            CanonicalConstructionFamilyEvidence::accumulator(BLOCK_HEADER_COLUMN_FAMILY);
         for key in [b"a", b"b", b"c"] {
             accumulator.observe(key, b"123456")?;
         }
@@ -1641,7 +1912,7 @@ mod tests {
                 ),
                 1,
             ),
-            construction_manifest_version: 1,
+            construction_manifest_version: crate::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
             construction_manifest_sha256: [6; 32],
         }
     }

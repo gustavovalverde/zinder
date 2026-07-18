@@ -344,7 +344,7 @@ where
         "started version-1 canonical construction"
     );
     let loaded = load_fresh_canonical(builder, source, &config.construction).await?;
-    let validated = loaded.builder.validate_for_publication()?;
+    let validated = loaded.builder.prepare_trusted_fresh_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         settled_tip,
         UnixTimestampMillis::now(),
