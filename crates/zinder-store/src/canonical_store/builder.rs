@@ -346,6 +346,7 @@ mod tests {
         process::{Command, Stdio},
     };
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use prost::Message;
     use rust_rocksdb::DB;
     use tempfile::TempDir;
@@ -654,15 +655,25 @@ mod tests {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
         let builder = complete_loaded_builder(&store_path)?;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let recorder_handle = recorder.handle();
 
-        let validated = builder.prepare_trusted_fresh_publication()?;
-        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
-            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
-        ))?;
-        let published = validated.publish_baseline(publication)?;
+        let published = metrics::with_local_recorder(&recorder, || {
+            let validated = builder.prepare_trusted_fresh_publication()?;
+            let publication =
+                validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+                ))?;
+            validated.publish_baseline(publication)
+        })?;
 
         assert_ready_construction_manifest_binding(&store_path, &published)?;
+        assert!(
+            !recorder_handle
+                .render()
+                .contains("zinder_store_canonical_publication_family_scan")
+        );
         let manifest =
             fs::read_to_string(store_path.join("canonical-construction-manifest.v2.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"trusted-fresh-writer\""));

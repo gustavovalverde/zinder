@@ -6060,6 +6060,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac 0.12.1",
  "metrics",
+ "metrics-exporter-prometheus",
  "parking_lot",
  "prost",
  "rust-rocksdb",

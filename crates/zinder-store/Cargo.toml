@@ -33,6 +33,7 @@ zinder-rocksdb.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
+metrics-exporter-prometheus.workspace = true
 tempfile.workspace = true
 
 [lints]

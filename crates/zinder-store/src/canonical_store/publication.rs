@@ -1603,13 +1603,24 @@ fn require_empty_family(
     db: &DB,
     name: &'static str,
 ) -> Result<CanonicalConstructionFamilyEvidence, CanonicalStoreError> {
-    let evidence = scan_family(db, name)?;
-    if !evidence.matches(0, 0) {
+    let family = column_family(db, name)?;
+    let mut read_options = ReadOptions::default();
+    read_options.fill_cache(false);
+    let mut iterator = db.raw_iterator_cf_opt(&family, read_options);
+    iterator.seek_to_first();
+    let is_empty = !iterator.valid();
+    iterator
+        .status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "empty column-family admission",
+            source,
+        })?;
+    if !is_empty {
         return Err(CanonicalStoreError::publication(format!(
             "{name} must be empty before baseline publication"
         )));
     }
-    Ok(evidence.evidence)
+    Ok(CanonicalConstructionFamilyEvidence::accumulator(name).finish())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
