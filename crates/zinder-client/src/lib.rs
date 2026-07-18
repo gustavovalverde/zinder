@@ -4,6 +4,10 @@
 //! code import. It keeps `RocksDB`, `tonic`, and generated protobuf types behind
 //! typed domain methods so downstream consumers do not need to couple to
 //! Zinder service internals.
+//!
+//! This crate is the external consumer SDK; Zinder's own services do not use
+//! it for service-to-service calls, which go through each service's own
+//! authenticated channel setup instead.
 
 mod chain_index;
 mod error;
