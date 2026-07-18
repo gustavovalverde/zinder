@@ -2,6 +2,7 @@
 
 use std::{num::NonZeroU32, pin::Pin, sync::Arc};
 
+use arc_swap::ArcSwap;
 use prost::Message;
 use serde_json::Value;
 use tokio_stream::StreamExt as _;
@@ -26,7 +27,7 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    FactFirstWalletReadiness, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
+    FactFirstReadPair, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
     WalletQueryApi, address_lookup_to_script_hash, status_from_query_error,
 };
@@ -91,7 +92,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
     wallet_projection_reader: Option<Arc<dyn zinder_query::WalletProjectionReadApi>>,
-    fact_first_wallet_readiness: Option<FactFirstWalletReadiness>,
+    fact_first_read_pairs: Option<Arc<ArcSwap<FactFirstReadPair>>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
@@ -108,8 +109,8 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
                 &self.wallet_projection_reader.is_some(),
             )
             .field(
-                "fact_first_wallet_readiness",
-                &self.fact_first_wallet_readiness,
+                "fact_first_read_pairs",
+                &self.fact_first_read_pairs.is_some(),
             )
             .field(
                 "network_upgrade_activations",
@@ -158,7 +159,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             mempool_surface: None,
             tip_change_watcher: None,
             wallet_projection_reader: None,
-            fact_first_wallet_readiness: None,
+            fact_first_read_pairs: None,
             network_upgrade_activations,
         }
     }
@@ -190,13 +191,17 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
-    /// Supplies the exact position proven by fact-first store admission.
+    /// Supplies the atomically swappable, immutable fact-first read pairs.
+    ///
+    /// `GetLightdInfo` captures this slot at call time rather than retaining a
+    /// startup snapshot, so its transparent-address claim cannot outlive a
+    /// canonical/wallet pair generation.
     #[must_use]
-    pub const fn with_fact_first_wallet_readiness(
+    pub fn with_fact_first_read_pair_slot(
         mut self,
-        readiness: FactFirstWalletReadiness,
+        read_pairs: Arc<ArcSwap<FactFirstReadPair>>,
     ) -> Self {
-        self.fact_first_wallet_readiness = Some(readiness);
+        self.fact_first_read_pairs = Some(read_pairs);
         self
     }
 
@@ -814,9 +819,11 @@ where
 
         let transparent_address_support = if !self.options.transparent_address_support {
             false
-        } else if let Some(readiness) = self.fact_first_wallet_readiness {
-            readiness.chain_epoch_id == latest_block.chain_epoch.id
-                && readiness.height >= latest_block.height
+        } else if let Some(read_pairs) = &self.fact_first_read_pairs {
+            let source_position = read_pairs.load_full().wallet_source().source_position();
+            source_position.chain_epoch_id == latest_block.chain_epoch.id
+                && source_position.tip.height == latest_block.height
+                && source_position.tip.hash == latest_block.block_hash
         } else if let Some(wallet_projection_reader) = &self.wallet_projection_reader {
             let required_cursor = self
                 .query_api

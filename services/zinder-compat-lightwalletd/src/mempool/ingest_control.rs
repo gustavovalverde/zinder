@@ -1,7 +1,7 @@
 //! Production wirings of [`MempoolSurface`] and [`TipChangeWatcher`] over the
 //! private `IngestControl` gRPC.
 //!
-//! The compatibility binary is colocated with `zinder-query` and the writer's
+//! The compatibility binary is colocated with `zinder-projector` and the writer's
 //! `IngestControl` endpoint. The wirings here connect on demand so a transient
 //! writer outage does not require restarting the compat process.
 //!

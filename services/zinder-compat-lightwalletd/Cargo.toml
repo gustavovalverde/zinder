@@ -11,15 +11,17 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
 hex.workspace = true
+metrics.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 toml.workspace = true

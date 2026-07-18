@@ -32,11 +32,14 @@ use zinder_store::{
 };
 
 mod fact_first;
+mod fact_first_pair;
 mod grpc;
-mod readiness_refresh;
 mod wallet_projection_read;
 
-pub use fact_first::{FactFirstWalletQuery, FactFirstWalletReadiness};
+pub use fact_first::FactFirstWalletQuery;
+pub use fact_first_pair::{
+    FactFirstCanonicalRead, FactFirstPairAdmissionError, FactFirstReadPair, FactFirstWalletRead,
+};
 pub use grpc::{
     ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
     address_lookup_to_script_hash, block_header_by_selector_response,
@@ -50,10 +53,6 @@ pub use grpc::{
     transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
     transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
     tree_state_at_response,
-};
-pub use readiness_refresh::{
-    DEFAULT_READINESS_REFRESH_INTERVAL, SecondaryCatchupOptions, WriterStatusConfig,
-    spawn_readiness_refresh, spawn_secondary_catchup,
 };
 pub use wallet_projection_read::{
     ProjectionRead, TransparentAddressHistoryPage, WalletProjectionPosition,
