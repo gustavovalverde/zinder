@@ -1,181 +1,70 @@
-# Deploying Zinder on Railway
+# Railway canonical canary
 
-This runbook gets a fresh Zinder deployment onto Railway (or a structurally similar PaaS like Fly.io or Render) in roughly 30 minutes. Target shape: the `zinder-single-container` target in `deploy/Dockerfile`, running `zinder-ingest` + `zinder-query` together under s6-overlay against a Zebra deployment hosted somewhere reachable from Railway's network.
+Railway is not an admitted fact-first wallet-serving topology. Its services do
+not provide the shared host filesystem required by the current
+`rocksdb-single-host` lifecycle, and the deleted mixed single-container
+runtime combined canonical-v1 ingest with superseded readers. The checked-in
+Railway target therefore supports only an ingest-only diagnostic or
+performance canary.
 
-The same shape applies to any PaaS that:
+Use the [single-VM runbook](deploying-on-a-vm.md) for the three-runtime
+wallet-serving shape.
 
-- runs containers but does not share filesystems across services,
-- injects secrets as environment variables,
-- exposes one TCP port per container.
+## Admitted target
 
-Railway specifics in this document are limited to its env-var UI and volume-binding step. Fly.io and Render operators substitute their equivalents.
+The Railway Dockerfile fails closed unless the service explicitly sets:
 
-## Prerequisites
-
-- A Railway project (free tier is sufficient for testnet experimentation; mainnet sizing requires paid).
-- A reachable Zebra deployment with JSON-RPC. Zebra can run on Railway too, on a peer VM, or on a managed Zcash-node service.
-- The Zebra cookie value (string or file path) or a `username:password` for basic auth.
-
-## Topology
-
-```
-┌───────────────────────────────────────────────────────────┐
-│ Railway service "zinder"                                  │
-│                                                           │
-│   single-container image (zinder-ingest + zinder-query)   │
-│   s6-overlay supervises both processes                    │
-│                                                           │
-│   /var/lib/zinder/store      ← Railway persistent volume  │
-│   /var/lib/zinder/secondary  ← same persistent volume     │
-│                                                           │
-│   exposed ports:                                          │
-│     9101 → WalletQuery gRPC (public)                      │
-│     9106 → ops HTTP (private; for HEALTHCHECK)            │
-└───────────────────────────────────────────────────────────┘
-        │ Railway routing layer terminates TLS
-        ▼
-   Public consumers (wallets, faucets, SDKs)
-                                            │
-                                            ▼
-                                       Zebra
-                                       (peer service)
+```text
+RAILWAY_DOCKER_TARGET_STAGE=zinder-canonical-runtime
 ```
 
-Railway terminates TLS at its routing layer; the container serves plaintext gRPC over the configured port and Railway maps it to the public HTTPS endpoint.
+That target runs `zinder-ingest` only. It does not publish a wallet API,
+projector, compatibility route, coherent checkpoint, or production readiness
+claim.
 
-The container's s6 supervisor restarts an individual Zinder process in place
-after a two-second delay. A failed child process does not terminate the whole
-container, so use service logs and `/healthz` or `/readyz` failures to detect a
-persistent restart loop instead of relying on Railway container-restart events.
-
-## Steps
-
-### 1. Create the service
-
-In the Railway UI, create a new service from a Docker image:
-
-- **Source**: `ghcr.io/gustavovalverde/zinder:latest` (replace with a pinned tag for production: `ghcr.io/gustavovalverde/zinder:v0.1.0`).
-- **Port**: `9101` (TCP). Enable HTTP/2 / gRPC routing in Railway's networking tab.
-
-### 2. Attach a persistent volume
-
-- Mount path: `/var/lib/zinder`
-- Size: 200 GB for testnet; size mainnet according to your retention and proof requirements. The volume holds both the canonical store and the secondary catchup directory.
-
-### 3. Inject configuration via environment variables
-
-Railway provides a UI for environment variables. Set:
-
-| Variable | Value | Notes |
-| --- | --- | --- |
-| `ZINDER_NETWORK__NAME` | `zcash-mainnet` / `zcash-testnet` / `zcash-regtest` | Required |
-| `ZINDER_NODE__JSON_RPC_ADDR` | `http://zebra-host:8232` | Pointing at your Zebra |
-| `ZINDER_NODE__AUTH__METHOD` | `cookie` or `basic` | Pick one |
-| `ZINDER_NODE__AUTH__COOKIE` | `user:cookie-content` | When `__METHOD=cookie` and the secret is inline |
-| `ZINDER_NODE__AUTH__USERNAME` | `zebra` | When `__METHOD=basic` |
-| `ZINDER_NODE__AUTH__PASSWORD` | `your-zebra-password` | When `__METHOD=basic` |
-| `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | `127.0.0.1:9100` | Internal-only |
-| `ZINDER_INGEST_CONTROL__ADDR` | `http://127.0.0.1:9100` | Reader points at colocated writer |
-
-The single-container image accepts the cookie content inline through `ZINDER_NODE__AUTH__COOKIE`; you do not need an entrypoint shim that materializes a cookie file.
-
-Railway's secret-handling UI marks every variable with a leaf name in `{password, secret, cookie, token, private_key}` as sensitive in its console. Treat the variables above accordingly.
-
-> **Set only `ZINDER_*` variables that map to a real config field.** Every binary strict-parses its environment. Any `ZINDER_`-prefixed variable that does not resolve to a known config key is rejected at `load_config`, and the service crash-loops before it opens storage. This covers stray marker or note variables, and typos such as a single `_` where the schema expects `__`. The startup error names the offending variable and the config key it produced. Reserve the `ZINDER_` prefix for real configuration; put any bookkeeping variable under a different prefix so the binaries ignore it. The one exception is the shell-only recovery knob `ZINDER_WIPE_PRIMARY_ON_BOOT` (see [Destructive recovery](#destructive-recovery)), which the s6 run scripts consume and strip before launching any binary.
-
-### 4. Set the health check
-
-Railway's "Healthcheck" tab:
-
-- **Path**: `/readyz` on port `9106`.
-- **Healthy threshold**: 1 success.
-- **Unhealthy threshold**: 3 consecutive failures.
-- **Initial delay**: 120 seconds. Initial sync can take longer than the default; Railway will mark the service unhealthy before it catches up if the delay is too short.
-
-### 5. Deploy
-
-Trigger the deploy. Watch the build log; the image is built upstream so the deploy is a pull + start.
-
-After the container starts, you should see structured tracing in Railway's log viewer:
-
-```
-phase=load_config phase_state=entry
-phase=load_config phase_state=exit outcome=ok elapsed_ms=N
-phase=open_storage phase_state=entry
-phase=open_storage phase_state=exit outcome=ok elapsed_ms=N
-phase=connect_node phase_state=entry
-phase=connect_node phase_state=exit outcome=ok elapsed_ms=N
-phase=ready phase_state=exit outcome=ok elapsed_ms=0
-```
-
-If a phase shows `outcome=failed`, the `reason=` field has the underlying error.
-
-### 6. Expected readiness sequence
-
-For a fresh deployment (empty store, mainnet/testnet sync from scratch):
-
-1. **starting** (seconds): config load, storage open; `phase=awaiting_upstream`.
-2. **bulk catch-up** (minutes to hours): the unified ingest loop uses byte-watermarked source fetches and parallel canonical block prepare; `phase=bulk_catchup`, `cause=syncing`, `lag_blocks` shrinks as progress accumulates.
-3. **tip-follow ready** (steady state): accepting traffic; `phase=following_tip`, `cause=ready`.
-
-`/readyz` returns 503 with `cause = "syncing"` during phase 2 and 200 with `cause = "ready"` in phase 3. If Zebra is itself behind the network tip, the cause becomes `upstream_not_ready` with the structured `upstream_health` substructure; configure `[node.health].addr` to point at Zebra's `/ready` endpoint for the precise signal. See [Initial sync](../runbooks/initial-sync.md) for the full diagnostic.
-
-### 7. Test from outside
+Verify the repository admission boundary before deploying:
 
 ```bash
-# Replace with your Railway public hostname.
-grpcurl -tls zinder-xyz.up.railway.app:443 \
-    list zinder.v1.wallet.WalletQuery
+bash scripts/validate-deployment-admission.sh \
+  --deployment-class canary \
+  --target zinder-canonical-runtime
+bash scripts/validate-deployment-admission.sh --verify-railway-default
 ```
 
-If you set `enable_reflection = true` in `[query.grpc]`, you can list the full method set. Otherwise call a known method directly:
+## Canary configuration
 
-```bash
-grpcurl -tls zinder-xyz.up.railway.app:443 \
-    zinder.v1.wallet.WalletQuery/ServerInfo
-```
+Attach one persistent volume at `/var/lib/zinder` and provide the canonical
+writer configuration through `ZINDER_*` variables. At minimum, set the
+network, Zebra JSON-RPC endpoint, node authentication, wallet projection
+preset, wallet-serving coverage, raw transaction retention, and ingest-control
+settings required by the release's public environment-variable contract.
 
-### 8. Rollback
+The image exposes ingest ops on port 9105. Use `/healthz` for process
+liveness and `/readyz` only as canonical/mempool canary evidence. Neither
+probe proves wallet serving because Railway does not run the projector or
+compatibility reader in this target.
 
-Railway maintains deploy history. To roll back, click "Rollback" on a prior good deploy. The persistent volume is preserved across rollbacks; only the container image changes.
+Record the exact image digest, network, starting fence, final fence, elapsed
+construction/publication time, peak memory, physical bytes by family, and
+restart result. Preserve the volume after a failed performance run until its
+evidence has been captured.
 
-For pinned-tag deploys, change the image tag back to the prior version and redeploy.
+## Rejection cases
 
-## Cost optimization
+Deployment admission must continue rejecting:
 
-- Railway charges by CPU + memory time + egress. Most of the cost for steady-state Zinder is egress; the deployment serves compact blocks at scale to subscribers.
-- The single-container image runs the writer and reader in the same process tree; you pay for one container's resources. Splitting into separate Railway services per process is supported via the per-service targets in `deploy/Dockerfile` but doubles the fixed cost.
+- the removed `zinder-single-container` target;
+- `zinder-canonical-runtime` as a production class;
+- release workflows that publish superseded query or explorer images;
+- release workflows that omit `zinder-projector`.
 
-## Destructive recovery
-
-On PaaS hosts that reschedule the container across machines, a leaked OFD lock can pin the RocksDB primary's `LOCK` inode so every fresh ingest fails with `primary store is already open`. To recover, set `ZINDER_WIPE_PRIMARY_ON_BOOT=1` on the service and redeploy. On the next boot the ingest run script archives the existing `store/`, `secondary/`, and `explorer-secondary/` directories to timestamped siblings on the same volume, then starts a fresh sync from genesis. The run scripts strip this variable from the environment handed to every binary, so it never reaches the strict config loader.
-
-Remove `ZINDER_WIPE_PRIMARY_ON_BOOT` from the service as soon as the container boots cleanly. It is not a one-shot flag at the container level: while it stays set, every restart re-archives the store and resyncs from genesis, discarding all progress since the last boot. The archived directories stay on the volume until you delete them; prune them once the fresh sync is healthy to reclaim space.
-
-## Reader-plane parking during rebuilds
-
-A from-genesis rebuild is ingest-bound: `zinder-query`, `zinder-explorer`, and the nginx multiplexer serve nothing useful while ingest is still bulk-catching-up, but their RocksDB secondaries and idle worker threads still occupy resident memory and CPU inside the container's shared cgroup. Set `ZREBUILD_READERS=off` on the service to park all three: each run script logs one line and execs `sleep infinity` instead of starting its binary. Ingest is unaffected and starts normally.
-
-`ZREBUILD_READERS` is deliberately not `ZINDER_`-prefixed so the strict config loader never sees it. Parking the multiplexer takes down the container's only externally routed port, including the `/readyz` and freshness/operator endpoints normally used to watch rebuild progress; fall back to ingest's private ops port (9105, `/metrics`) over `railway ssh` or an equivalent private-network shell while readers are parked.
-
-Remove `ZREBUILD_READERS` (or set it to anything other than `off`) and redeploy once the rebuild clears the dense band, so the reader plane resumes serving traffic.
-
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-| --- | --- | --- |
-| Service startup repeats before `open_storage`; log names a rejected `ZINDER_*` variable | An env var does not map to a config field (stray marker, typo, single `_` where the schema expects `__`) | Remove or correct the variable; see [step 3](#3-inject-configuration-via-environment-variables) |
-| Container restarts repeatedly | Health check fails during initial sync | Increase initial delay to 300s for fresh mainnet sync |
-| `/readyz` stays `node_unavailable` | Zebra not reachable from Railway | Ensure the Zebra service is in the same Railway project, or that the public endpoint resolves from Railway egress IPs |
-| `/readyz` is `node_capability_missing` | Zebra too old | Upgrade Zebra to the version pinned in this Zinder release |
-| Logs show `outcome=aborted` (no explicit complete/fail) | A startup phase panicked | Inspect the prior log line for the panic reason; file an issue |
-| Volume fills | Retention windows are tuned for high-availability | Reduce `chain_event_retention_hours` in `[retention]` |
-| gRPC traffic returns "HTTP/2 not supported" | Railway routing not configured for gRPC | Enable HTTP/2 on the public endpoint in the networking tab |
+A successful Railway canary can close canonical correctness or performance
+evidence. It cannot close wallet projection, exact-pair serving, coherent
+restore, TLS routing, capacity, or independent-client gates.
 
 ## References
 
-- [Public interfaces §Environment variable mapping](../architecture/public-interfaces.md#environment-variable-mapping)
-- [`deploy/single-container/`](../../deploy/single-container/)
-- [`deploy/single-container/README.md`](../../deploy/single-container/README.md)
-- [Service operations](../architecture/service-operations.md)
-- [Deploying on a VM](deploying-on-a-vm.md)
+- [Fact-first wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
+- [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
+- [Single-VM deployment](deploying-on-a-vm.md)
+- [Public environment-variable contract](../architecture/public-interfaces.md#environment-variable-mapping)

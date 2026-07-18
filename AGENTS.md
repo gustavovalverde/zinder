@@ -16,7 +16,7 @@ This is a Rust 2024 workspace. Domain crates live under `crates/`: `zinder-core`
 - `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps`: validate docs.
 - `cargo deny check` and `cargo machete`: check dependency policy and unused dependencies.
 - `cargo llvm-cov --workspace --all-features --no-report`: run coverage locally before risky storage/parser changes.
-- T3 (live) tests: see [CLAUDE.md §Live Node Tests](CLAUDE.md). Set `ZINDER_TEST_LIVE=1` plus the unified `ZINDER_NETWORK` and `ZINDER_NODE__*` env vars, then `cargo nextest run --profile=ci-live --run-ignored=all`. The real Zallet binary gate is separate: run `cargo nextest run --profile=ci-zallet-live --run-ignored=all` with the `ZINDER_TEST_ZALLET*` env vars documented in [Testing Runbook](docs/runbooks/testing.md).
+- T3 (live) tests: see [CLAUDE.md §Live Node Tests](CLAUDE.md). Set `ZINDER_TEST_LIVE=1` plus the unified `ZINDER_NETWORK` and `ZINDER_NODE__*` env vars, then `cargo nextest run --profile=ci-live --run-ignored=all`.
 
 ## Coding Style & Naming Conventions
 

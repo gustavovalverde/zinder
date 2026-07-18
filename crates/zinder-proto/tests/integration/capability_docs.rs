@@ -35,8 +35,7 @@ const TESTING_RUNBOOK_END: &str = "<!-- capability-list:testing-runbook:end -->"
 /// Each must resolve to an existing `[profile.<name>]` section in
 /// `.config/nextest.toml` so an operator following the runbook hits a
 /// real profile.
-const RUNBOOK_REFERENCED_PROFILES: &[&str] =
-    &["ci", "ci-perf", "ci-live", "ci-zallet-live", "ci-parity"];
+const RUNBOOK_REFERENCED_PROFILES: &[&str] = &["ci", "ci-perf", "ci-live", "ci-parity"];
 
 #[test]
 fn public_interfaces_capability_list_mirrors_zinder_capabilities() -> Result<()> {

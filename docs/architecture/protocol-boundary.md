@@ -6,11 +6,14 @@ This document owns the wire-schema boundary. Source adapters live in [Node sourc
 
 ## Protocol Surfaces
 
-Zinder exposes three protocol families:
+Zinder defines four protocol families. The first fact-first production release
+deploys the private ingest-control and lightwalletd compatibility surfaces; the
+native wallet service remains a library and test contract without a standalone
+runtime.
 
 | Surface | Rust module | Served by | Purpose |
 | ------- | ----------- | --------- | ------- |
-| Native wallet/application API | `zinder_proto::v1::wallet` | `zinder-query` | Primary Zinder query API |
+| Native wallet/application API | `zinder_proto::v1::wallet` | Library-only `WalletQueryGrpcAdapter` | Internal, embedded, and test contract; not a deployed production surface |
 | Private ingest control API | `zinder_proto::v1::ingest` | `zinder-ingest` | Writer status and retained chain-event replay for secondary readers |
 | Internal epoch API | `zinder_proto::v1::epoch` | `zinder-ingest` or read sidecar | Epoch-bound canonical reads and chain-event history |
 | Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Lightwalletd-compatible wallet surface |
@@ -50,8 +53,10 @@ Storage-control protobuf records that never cross a service or API boundary may 
 
 ## Native API
 
-`zinder-query` serves the native `WalletQuery` protobuf service over the Rust
-`WalletQueryApi` boundary.
+The `zinder-query` library implements the native `WalletQuery` protobuf adapter
+over the Rust `WalletQueryApi` boundary. The standalone `zinder-query` binary
+has been deleted; this surface is available only to embedded composition and
+contract tests in the first fact-first production release.
 
 `service WalletQuery` is defined in `zinder/v1/wallet/wallet.proto`. Tonic
 server/client code is generated only for the native Zinder service; the
@@ -105,7 +110,7 @@ lives in `services/zinder-query/src/grpc/native.rs`. The adapter must not open
 storage, call upstream nodes, or build missing artifacts; those responsibilities
 stay behind `WalletQueryApi`, `ChainEpochReadApi`, and ingestion.
 
-The current native network service exposes Zinder concepts:
+The native adapter contract exposes Zinder concepts:
 
 - `LatestBlock`, `CompactBlock`, `CompactBlocksInRange`, `Transaction`
 - `TreeStateCheckpoint`, `LatestTreeStateCheckpoint`, `SubtreeRoots`
@@ -143,7 +148,13 @@ Every chain-dependent response either binds to one `ChainEpoch` or explicitly sa
 
 ## Internal Epoch API
 
-`ChainEpochReadApi` is the internal read surface for epoch-bound canonical reads. It exposes retained chain-event history to `IngestControl.ChainEvents`; wallet-facing replay/live delivery is public through `WalletQuery.ChainEvents`. The `zinder-query` binary proxies public chain-event streams to the private ingest-control endpoint, while direct `WalletQueryGrpcAdapter::new` usage keeps a secondary-store fallback for embedded and integration-test contexts.
+`ChainEpochReadApi` is the internal read surface for epoch-bound canonical
+reads. It exposes retained chain-event history to `IngestControl.ChainEvents`.
+The native `WalletQuery.ChainEvents` adapter remains available for embedded and
+integration-test composition, but the production fact-first runtime does not
+publish a standalone native stream. Production wallet serving is provided by
+`zinder-compat-lightwalletd` over one request-scoped exact canonical and wallet
+secondary pair.
 
 It should provide:
 
@@ -254,7 +265,10 @@ Wallets that need to disable transaction submission can wire `WalletQuery` with
 `()` as the broadcaster, in which case `SendTransaction` returns
 `Code::FailedPrecondition` with a `TransactionBroadcastDisabled` reason.
 
-The adapter can be colocated with `zinder-query` in local development, but it remains a separate deployable boundary.
+The adapter remains embeddable in tests, but the first fact-first production
+topology deploys `zinder-compat-lightwalletd` as the dedicated public wallet
+boundary over immutable canonical and wallet secondary pairs. It owns no
+canonical or wallet writes.
 
 ## QueryError to gRPC Status
 
@@ -264,7 +278,7 @@ The category contract: `Unavailable` is reserved for transient infrastructure fa
 
 ## Capability Descriptor
 
-`WalletQuery.ServerInfo` returns `ServerCapabilities` per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). The descriptor is the canonical client-facing capability protocol; clients gate features on capability strings, not on Zinder version. Server reflection (via `tonic-reflection`) is enabled in development for tooling like `grpcurl`; it exposes the proto schema, not semantic guarantees, so it is not the discovery primitive.
+`WalletQuery.ServerInfo` returns `ServerCapabilities` per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). The descriptor is the canonical client-facing capability protocol; clients gate features on capability strings, not on Zinder version. The compatibility runtime exposes server reflection for tooling such as `grpcurl`, but reflection is gated by the same traffic-readiness interceptor as `CompactTxStreamer`. It exposes the proto schema, not semantic guarantees, so it is not the discovery primitive.
 
 Capability strings follow `domain.subdomain.capability_name_v{N}`. The naming spine in [Public Interfaces §Capability Discovery](public-interfaces.md#capability-discovery) lists the active capabilities.
 

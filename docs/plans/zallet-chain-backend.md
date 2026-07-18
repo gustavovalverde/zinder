@@ -329,7 +329,9 @@ Files:
   epoch-expiry re-pin test; live sync against z3 regtest (initialize,
   recover_history, steady_state, broadcast, reorg through the synthetic-reorg
   event path); then a full testnet sync against the phase 6 store, plus
-  Zinder's `ci-zallet-live` suite.
+  Zinder's fixture-backed native contract parity suite. A real-binary live gate
+  belongs with the adapter implementation; Zinder does not keep an inert
+  standalone runtime or placeholder live profile for it.
 
 Gate: Zallet workspace checks (fmt, clippy, tests) under the `zinder`
 feature; regtest end-to-end green; testnet full sync green with balances
