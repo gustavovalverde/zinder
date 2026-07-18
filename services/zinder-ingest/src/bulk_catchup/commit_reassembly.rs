@@ -1,3 +1,12 @@
+//! Batches prepared blocks into chain epochs and commits them canonically.
+//!
+//! `run_commit_reassembly` drains the block-prepare stream, accumulates
+//! prepared blocks into a batch bounded by the configured block, byte,
+//! and estimated-write-size limits, and closes the batch as one
+//! [`zinder_store::ChainEpochCommitOutcome`]. Closing a batch waits for
+//! any still-in-flight commit from the previous batch first, so at most
+//! one canonical commit is ever outstanding against the store.
+
 use std::time::Instant;
 
 use futures_util::{Stream, StreamExt};

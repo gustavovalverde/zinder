@@ -1,3 +1,12 @@
+//! Concurrent block preparation ahead of canonical commit.
+//!
+//! `build_block_prepare_stream` fetches source blocks and parses them into
+//! [`CanonicalBlockCommitPreparation`] with several prepares in flight at
+//! once, but yields them to the caller in contiguous height order: a block
+//! that finishes preparing out of turn is held until every lower height in
+//! the current window has also completed, so commit reassembly never sees
+//! a gap.
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,

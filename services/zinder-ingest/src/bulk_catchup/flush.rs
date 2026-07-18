@@ -1,3 +1,10 @@
+//! `RocksDB` flush cadence for bulk-catchup commits.
+//!
+//! Flushing after every committed epoch would serialize the write-ahead
+//! log on the hot path; `BulkCatchupFlushState` tracks epochs committed
+//! since the last flush so this only flushes on the configured interval,
+//! and is a no-op when nothing has been committed since then.
+
 use std::time::Instant;
 
 use zinder_store::PrimaryChainStore;

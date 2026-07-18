@@ -1,3 +1,15 @@
+//! Bounded historical catchup: fetches a height range from the upstream
+//! node, prepares canonical block facts, and commits them to the
+//! canonical store in batches.
+//!
+//! `run_bulk_catchup_with_store` drives the pipeline end to end: source
+//! fetch and block preparation ([`block_prepare`]) run concurrently ahead
+//! of commit assembly ([`commit_reassembly`]), which closes each chain
+//! epoch and flushes the store ([`flush`]) on the configured cadence.
+//! Batches must commit in contiguous height order; block preparation may
+//! complete out of order but [`commit_reassembly`] reassembles it before
+//! any commit reaches the store.
+
 use std::{
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
