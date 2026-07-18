@@ -13,10 +13,10 @@ use tonic::Request;
 use zinder_client::{ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
-use zinder_query::{WalletQuery, derive_store_wallet_projection_reader};
+use zinder_query::WalletQuery;
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-use super::{committed_store_fixture, parity_chain_fixture, transparent_address_history_fixture};
+use super::{committed_store_fixture, parity_chain_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_zodl_use_cases() {
@@ -135,118 +135,4 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     );
 
     Ok(())
-}
-
-#[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "The Zodl-shaped transparent flow keeps the wallet-facing RPC expectations together."
-)]
-async fn serves_zodl_transparent_discovery_shape_from_fixture() -> eyre::Result<()> {
-    let fixture = transparent_address_history_fixture()?;
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            fixture.store_fixture.chain_store().clone(),
-            (),
-            activations.clone(),
-        )
-        .with_derive_store(fixture.derive_store.clone()),
-        activations,
-    )
-    .with_transparent_address_support()
-    .with_wallet_projection_reader(derive_store_wallet_projection_reader(
-        fixture.derive_store.clone(),
-    ));
-
-    let lightd_info = adapter
-        .get_lightd_info(Request::new(lightwalletd::Empty {}))
-        .await?
-        .into_inner();
-    let utxos = adapter
-        .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
-            addresses: vec![fixture.address.clone()],
-            start_height: u64::from(fixture.block_height.value()),
-            max_entries: 10,
-        }))
-        .await?
-        .into_inner();
-    let mut txids = adapter
-        .get_taddress_txids(Request::new(address_history_filter(
-            fixture.address.clone(),
-        )))
-        .await?
-        .into_inner();
-    let mut transactions = adapter
-        .get_taddress_transactions(Request::new(address_history_filter(
-            fixture.address.clone(),
-        )))
-        .await?
-        .into_inner();
-    let transaction = adapter
-        .get_transaction(Request::new(lightwalletd::TxFilter {
-            block: None,
-            index: 0,
-            hash: fixture.transaction_id.as_bytes().to_vec(),
-        }))
-        .await?
-        .into_inner();
-
-    assert!(
-        lightd_info.taddr_support,
-        "Zodl-shaped transparent discovery requires the lightwalletd support signal"
-    );
-    assert_eq!(utxos.address_utxos.len(), 1);
-    let utxo = utxos
-        .address_utxos
-        .first()
-        .ok_or_else(|| eyre::eyre!("transparent fixture must expose one UTXO"))?;
-    assert_eq!(utxo.address, fixture.address);
-    assert_eq!(utxo.txid, fixture.transaction_id.as_bytes().to_vec());
-    assert_eq!(utxo.index, 0);
-    assert_eq!(utxo.script, fixture.script_pub_key);
-    assert_eq!(utxo.value_zat, fixture.value_zat);
-    assert_eq!(utxo.height, u64::from(fixture.block_height.value()));
-
-    let txid_response = txids
-        .next()
-        .await
-        .ok_or_else(|| eyre::eyre!("missing transparent txid response"))??;
-    let transaction_response = transactions
-        .next()
-        .await
-        .ok_or_else(|| eyre::eyre!("missing transparent transaction response"))??;
-    assert_eq!(txid_response.data, fixture.raw_transaction_bytes);
-    assert_eq!(
-        txid_response.height,
-        u64::from(fixture.block_height.value())
-    );
-    assert_eq!(transaction_response.data, fixture.raw_transaction_bytes);
-    assert_eq!(
-        transaction_response.height,
-        u64::from(fixture.block_height.value())
-    );
-    assert_eq!(transaction.data, fixture.raw_transaction_bytes);
-    assert_eq!(transaction.height, u64::from(fixture.block_height.value()));
-    assert!(txids.next().await.is_none());
-    assert!(transactions.next().await.is_none());
-
-    Ok(())
-}
-
-fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBlockFilter {
-    lightwalletd::TransparentAddressBlockFilter {
-        address,
-        range: Some(lightwalletd::BlockRange {
-            start: Some(lightwalletd::BlockId {
-                height: 1,
-                hash: Vec::new(),
-            }),
-            end: Some(lightwalletd::BlockId {
-                height: 1,
-                hash: Vec::new(),
-            }),
-            pool_types: Vec::new(),
-        }),
-    }
 }

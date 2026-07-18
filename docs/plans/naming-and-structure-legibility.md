@@ -491,15 +491,23 @@ New deletion scope owned by this plan:
   still exists, and delete the rest with the surface. The migration is part
   of this sub-scope, not a reason to defer it.
 
-Implementation decision recorded per decision 20: after this deletion,
-`zinder-query`'s only remaining `zinder_derive` item is
-`ProjectionPreset` in `grpc/native.rs`; either relocate that enum to a
-domain crate and drop the dependency, or keep the dependency and record that
-the explorer migration owns its future.
+Implementation decision recorded per decision 20: the `zinder_derive`
+dependency stays in `zinder-query`'s `Cargo.toml`. After this deletion it is
+still used by `ProjectionPreset` in `grpc/native.rs` (the native explorer
+query wiring) and by the `QueryError::DeriveStore` variant, which wraps
+`zinder_derive::DeriveStoreError` and must stay to keep the error-reason table
+stable. `ProjectionPreset` is not relocated; the explorer migration owns that
+enum's future.
+
+The `QueryError::WalletProjectionRead` variant stays: the fact-first read pair
+still maps its admission failure onto it, so removing the projection reader
+does not orphan the variant and the error-reason parity guards are unaffected.
 
 Validation for 4b: the default gate plus
-`git grep -n "wallet_projection_read\|WalletProjectionReadApi\|with_derive_store"`
-across `crates/` and `services/` returning no hits.
+`git grep -n "wallet_projection_read\|WalletProjectionReadApi\|derive_store_wallet_projection_reader"`
+across `crates/` and `services/` returning no hits. (`with_derive_store`
+remains on `zinder-explorer`'s query adapter, a distinct production-live
+method outside this scope.)
 
 ### 4c: Empty scaffolding directory
 

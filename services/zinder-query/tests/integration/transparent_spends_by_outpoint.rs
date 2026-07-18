@@ -11,15 +11,13 @@ use zinder_core::{
     BlockHeight, ChainEpochId, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
     TransparentOutputArtifact, TransparentSpendFact,
 };
-use zinder_derive::{DeriveStore, DeriveStoreOptions, ProjectionPreset};
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
     QueryError, ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
 };
 use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
 use zinder_testkit::{
-    StoreFixture, encode_fixture_block_replay, open_test_derive_store_for_canonical,
-    sample_regtest_upgrade_activations, seed_transparent_outpoint_spends,
+    StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
 };
 
 use crate::common::{
@@ -193,91 +191,6 @@ fn commit_to_settled_tip_two(store: &zinder_store::PrimaryChainStore) -> eyre::R
     Ok(())
 }
 
-/// Builds a spend fact that exists only in the derive projection (its outpoint
-/// is never committed to the canonical store).
-fn derive_only_spend(outpoint: TransparentOutPoint, height: BlockHeight) -> TransparentSpendFact {
-    TransparentSpendFact::new(
-        outpoint,
-        3,
-        TransactionId::from_bytes([0x55; 32]),
-        0,
-        height,
-        block_hash_from_seed(height.value()),
-        1_000,
-        TransparentAddressScriptHash::from_bytes([0x66; 32]),
-        BlockHeight::new(1),
-        block_hash_from_seed(1),
-    )
-}
-
-fn open_wallet_derive_store(canonical_path: &std::path::Path) -> eyre::Result<DeriveStore> {
-    Ok(DeriveStore::open_with_projection_preset(
-        DeriveStore::path_for_canonical(canonical_path),
-        ProjectionPreset::Wallet,
-        DeriveStoreOptions {
-            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-            ..DeriveStoreOptions::default()
-        },
-    )?)
-}
-
-#[tokio::test]
-async fn transparent_spends_by_outpoint_resolves_swept_spend_from_derive() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let derive_store = open_wallet_derive_store(store_fixture.tempdir_path())?;
-    commit_to_settled_tip_two(&store)?;
-
-    let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x41; 32]), 0);
-    let spend = derive_only_spend(outpoint, BlockHeight::new(1));
-    seed_transparent_outpoint_spends(&derive_store, std::slice::from_ref(&spend))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_derive_store(derive_store);
-    let response = wallet_query
-        .transparent_spends_by_outpoint(vec![outpoint], None::<ChainEpochId>)
-        .await?;
-
-    assert_eq!(response.spends.len(), 1);
-    let resolved = response
-        .spends
-        .first()
-        .ok_or_else(|| eyre!("expected the derive projection to resolve the spend"))?;
-    assert_eq!(resolved.spent_outpoint, outpoint);
-    assert_eq!(
-        resolved.spending_transaction_id,
-        spend.spending_transaction_id
-    );
-    assert_eq!(resolved.spending_block_height, spend.block_height);
-    assert_eq!(resolved.input_index, spend.input_index);
-    Ok(())
-}
-
-#[tokio::test]
-async fn transparent_spends_by_outpoint_ignores_derive_spend_above_settled_tip() -> eyre::Result<()>
-{
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
-    commit_to_settled_tip_two(&store)?;
-
-    let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x42; 32]), 0);
-    let spend = derive_only_spend(outpoint, BlockHeight::new(5));
-    seed_transparent_outpoint_spends(&derive_store, &[spend])?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_derive_store(derive_store);
-    let response = wallet_query
-        .transparent_spends_by_outpoint(vec![outpoint], None::<ChainEpochId>)
-        .await?;
-
-    assert!(
-        response.spends.is_empty(),
-        "a derive spend above the settled tip keeps the in-window absent semantics",
-    );
-    Ok(())
-}
-
 /// Commits an output, settles its spend, advances the safe tip, and explicitly
 /// runs retention maintenance so the deleted-through marker reaches height 2.
 fn commit_real_sweep_to_deleted_through_two(
@@ -330,29 +243,6 @@ fn commit_real_sweep_to_deleted_through_two(
 }
 
 #[tokio::test]
-async fn transparent_spends_by_outpoint_refuses_when_derive_trails_the_sweep() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
-    commit_real_sweep_to_deleted_through_two(&store)?;
-
-    let missing_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x43; 32]), 0);
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_derive_store(derive_store);
-    let outcome = wallet_query
-        .transparent_spends_by_outpoint(vec![missing_outpoint], None::<ChainEpochId>)
-        .await;
-
-    match outcome {
-        Err(QueryError::DeriveLag { derive_height, .. }) => {
-            assert_eq!(derive_height, None);
-        }
-        other => return Err(eyre!("expected a derive-lag refusal, got {other:?}")),
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn transparent_spends_by_outpoint_refuses_swept_miss_without_derive() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -374,97 +264,23 @@ async fn transparent_spends_by_outpoint_refuses_swept_miss_without_derive() -> e
 }
 
 #[tokio::test]
-async fn transparent_spends_by_outpoint_returns_absent_when_never_swept_and_derive_empty()
--> eyre::Result<()> {
+async fn transparent_spends_by_outpoint_returns_absent_when_never_swept() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
     // No sweep ran, so nothing was deleted and the deleted-through marker is
-    // unset. An empty derive projection must not turn a canonical miss into a
-    // lag refusal; the honest answer is absent.
+    // unset. A canonical miss must read as absent rather than a lag refusal.
     commit_to_settled_tip_two(&store)?;
 
     let missing_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x44; 32]), 0);
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_derive_store(derive_store);
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .transparent_spends_by_outpoint(vec![missing_outpoint], None::<ChainEpochId>)
         .await?;
 
     assert!(
         response.spends.is_empty(),
-        "an empty projection over a store that never swept must read as absent",
+        "a canonical miss over a store that never swept must read as absent",
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn transparent_spends_by_outpoint_skips_reorged_out_derive_row() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
-    commit_to_settled_tip_two(&store)?;
-
-    // A projection row whose spending block hash names a branch the canonical
-    // header at that height no longer carries: a stale in-window row left by a
-    // reorg the tailer has not yet replayed. It must not surface as the spender.
-    let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x45; 32]), 0);
-    let mut stale = derive_only_spend(outpoint, BlockHeight::new(1));
-    stale.block_hash = block_hash_from_seed(999);
-    seed_transparent_outpoint_spends(&derive_store, std::slice::from_ref(&stale))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_derive_store(derive_store);
-    let response = wallet_query
-        .transparent_spends_by_outpoint(vec![outpoint], None::<ChainEpochId>)
-        .await?;
-
-    assert!(
-        response.spends.is_empty(),
-        "a reorged-out projection row must be skipped, not served as the spender",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn transparent_spends_by_outpoint_prefers_the_canonical_spender() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let derive_store = open_test_derive_store_for_canonical(store_fixture.tempdir_path())?;
-    let (spent_outpoint, spend) = commit_spent_outpoint_fixture(&store)?;
-
-    // Seed the derive projection with a different spender for the same outpoint;
-    // the canonical read must win when it hits.
-    let conflicting = TransparentSpendFact::new(
-        spent_outpoint,
-        9,
-        TransactionId::from_bytes([0xEE; 32]),
-        0,
-        spend.block_height,
-        spend.block_hash,
-        spend.spent_value_zat,
-        spend.spent_address_script_hash,
-        spend.spent_block_height,
-        spend.spent_block_hash,
-    );
-    seed_transparent_outpoint_spends(&derive_store, &[conflicting])?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_derive_store(derive_store);
-    let response = wallet_query
-        .transparent_spends_by_outpoint(vec![spent_outpoint], None::<ChainEpochId>)
-        .await?;
-
-    assert_eq!(response.spends.len(), 1);
-    let resolved = response
-        .spends
-        .first()
-        .ok_or_else(|| eyre!("expected the canonical spend"))?;
-    assert_eq!(
-        resolved.spending_transaction_id,
-        spend.spending_transaction_id
-    );
-    assert_eq!(resolved.input_index, spend.input_index);
     Ok(())
 }
 

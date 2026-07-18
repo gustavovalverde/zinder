@@ -32,7 +32,7 @@ use zinder_query::{
     WalletQueryApi, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
-use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition, MempoolEvent};
+use zinder_store::MempoolEvent;
 
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher,
@@ -91,7 +91,6 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     options: LightwalletdCompatibilityOptions,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
-    wallet_projection_reader: Option<Arc<dyn zinder_query::WalletProjectionReadApi>>,
     fact_first_read_pairs: Option<Arc<ArcSwap<FactFirstReadPair>>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
@@ -104,10 +103,6 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("options", &self.options)
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
-            .field(
-                "wallet_projection_reader",
-                &self.wallet_projection_reader.is_some(),
-            )
             .field(
                 "fact_first_read_pairs",
                 &self.fact_first_read_pairs.is_some(),
@@ -158,7 +153,6 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             options,
             mempool_surface: None,
             tip_change_watcher: None,
-            wallet_projection_reader: None,
             fact_first_read_pairs: None,
             network_upgrade_activations,
         }
@@ -177,17 +171,6 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_tip_change_watcher(mut self, watcher: SharedTipChangeWatcher) -> Self {
         self.tip_change_watcher = Some(watcher);
-        self
-    }
-
-    /// Supplies typed wallet-projection readiness for `GetLightdInfo`'s
-    /// transparent-address support claim.
-    #[must_use]
-    pub fn with_wallet_projection_reader(
-        mut self,
-        wallet_projection_reader: Arc<dyn zinder_query::WalletProjectionReadApi>,
-    ) -> Self {
-        self.wallet_projection_reader = Some(wallet_projection_reader);
         self
     }
 
@@ -824,36 +807,6 @@ where
             source_position.chain_epoch_id == latest_block.chain_epoch.id
                 && source_position.tip.height == latest_block.height
                 && source_position.tip.hash == latest_block.block_hash
-        } else if let Some(wallet_projection_reader) = &self.wallet_projection_reader {
-            let required_cursor = self
-                .query_api
-                .resolve_chain_events_start(
-                    EventStreamStartPosition::LiveTail,
-                    ChainEventStreamFamily::Tip,
-                )
-                .await
-                .map_err(|error| status_from_query_error(&error))?
-                .cursor;
-            let wallet_projection_reader = Arc::clone(wallet_projection_reader);
-            let readiness =
-                tokio::task::spawn_blocking(move || wallet_projection_reader.readiness())
-                    .await
-                    .map_err(|error| {
-                        Status::internal(format!(
-                            "wallet projection readiness task failed: {error}"
-                        ))
-                    })?
-                    .map_err(|error| {
-                        Status::internal(format!(
-                            "wallet projection readiness read failed: {error}"
-                        ))
-                    })?;
-            readiness
-                .transparent_address_history
-                .covers(latest_block.height, required_cursor.as_ref())
-                && readiness
-                    .transparent_outpoint_spend
-                    .covers(latest_block.height, required_cursor.as_ref())
         } else {
             false
         };
