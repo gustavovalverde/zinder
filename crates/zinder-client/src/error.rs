@@ -4,7 +4,7 @@ use thiserror::Error;
 use tonic::Code;
 use tonic_types::StatusExt;
 use zinder_core::Network;
-use zinder_derive::DeriveStoreError;
+use zinder_materialized_views::MaterializedViewStoreError;
 use zinder_proto::v1::ops::ErrorReason;
 use zinder_store::StoreError;
 
@@ -186,19 +186,19 @@ impl IndexerError {
     #[allow(
         clippy::needless_pass_by_value,
         clippy::wildcard_enum_match_arm,
-        reason = "DeriveStoreError is consumed through map_err adapters at storage boundaries; unknown future variants stay storage-unavailable for clients."
+        reason = "MaterializedViewStoreError is consumed through map_err adapters at storage boundaries; unknown future variants stay storage-unavailable for clients."
     )]
-    pub(crate) fn from_derive_store_error(error: DeriveStoreError) -> Self {
+    pub(crate) fn from_materialized_view_store_error(error: MaterializedViewStoreError) -> Self {
         match &error {
-            DeriveStoreError::Decode { reason, .. } if reason.contains("cursor") => {
+            MaterializedViewStoreError::Decode { reason, .. } if reason.contains("cursor") => {
                 Self::InvalidRequest {
                     reason: reason.clone(),
                 }
             }
-            DeriveStoreError::Decode { reason, .. } => Self::DataLoss {
+            MaterializedViewStoreError::Decode { reason, .. } => Self::DataLoss {
                 reason: reason.clone(),
             },
-            DeriveStoreError::InvalidOptions { reason } => Self::InvalidRequest {
+            MaterializedViewStoreError::InvalidOptions { reason } => Self::InvalidRequest {
                 reason: (*reason).to_owned(),
             },
             _ => Self::StorageUnavailable {

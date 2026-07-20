@@ -249,7 +249,7 @@ mod tests {
             StoreError::ReorgWindowExceeded {
                 attempted_from_height: BlockHeight::new(1),
                 minimum_reorg_height: BlockHeight::new(2),
-                safe_tip_height: BlockHeight::new(3),
+                settled_tip_height: BlockHeight::new(3),
             },
             StoreError::ChainEventCursorExpired {
                 event_sequence: 1,

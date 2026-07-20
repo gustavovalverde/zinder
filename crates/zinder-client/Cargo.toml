@@ -21,7 +21,7 @@ tonic = { workspace = true, features = ["transport", "tls-ring", "tls-native-roo
 tonic-types.workspace = true
 tracing.workspace = true
 zinder-core.workspace = true
-zinder-derive.workspace = true
+zinder-materialized-views.workspace = true
 zinder-proto.workspace = true
 zinder-store.workspace = true
 

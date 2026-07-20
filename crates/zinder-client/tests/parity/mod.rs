@@ -44,7 +44,7 @@ async fn open_local_chain_index(store_fixture: &StoreFixture) -> eyre::Result<Lo
         secondary_path: store_fixture.tempdir_path().join("parity-secondary"),
         network: Network::ZcashRegtest,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-        derive_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
         initial_catchup_timeout: DEFAULT_INITIAL_CATCHUP_TIMEOUT,

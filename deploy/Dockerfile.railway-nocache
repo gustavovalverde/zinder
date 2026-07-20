@@ -11,8 +11,8 @@
 ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
 # A deployed Railway service must choose an admitted target explicitly. The
-# former default mixed canonical-v1/legacy-reader bundle is not a production
-# candidate. Until Phase 7 supplies a complete version-1 topology, the only
+# former default mixed canonical/legacy-reader bundle is not a production
+# candidate. Until Phase 7 supplies a complete topology, the only
 # admitted explicit target is the ingest-only `zinder-canonical-runtime`
 # diagnostic/canary.
 ARG RAILWAY_DOCKER_TARGET_STAGE=zinder-admission-required

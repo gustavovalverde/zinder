@@ -30,11 +30,11 @@ use zinder_wallet_rocksdb::{
     WalletProjectionBuildLeaseExecution, build_wallet_from_canonical_with_lease_and_heartbeat,
 };
 
-mod canonical_lease_client;
+mod canonical_writer_control;
 mod config;
 mod projector_control;
 
-use canonical_lease_client::{CanonicalRetentionLease, CanonicalRetentionLeaseClient};
+use canonical_writer_control::{CanonicalRetentionLease, CanonicalWriterControlClient};
 use config::{ProjectorConfigOverrides, ProjectorError};
 use projector_control::{
     ProjectorControlCommand, ProjectorControlGrpcAdapter, projector_control_channel,
@@ -233,7 +233,7 @@ async fn run_owned_projector(
         reorg_policy,
         config.canonical_rocksdb_budget,
     )?;
-    let mut canonical_control = CanonicalRetentionLeaseClient::connect(
+    let mut canonical_control = CanonicalWriterControlClient::connect(
         &config.ingest_control_addr,
         config.ingest_control_bearer_token.as_ref(),
         config.projector_control.bearer_token.as_ref(),
@@ -521,7 +521,7 @@ async fn run_continuous_wallet_following(
     readiness: &Readiness,
     cancel: CancellationToken,
     mut canonical: RocksDbCanonicalSecondary,
-    mut canonical_control: CanonicalRetentionLeaseClient,
+    mut canonical_control: CanonicalWriterControlClient,
     mut wallet: RocksDbWalletFollowingStore,
     mut canonical_lease: CanonicalRetentionLease,
 ) -> Result<(), ProjectorError> {
@@ -742,7 +742,7 @@ async fn handle_projector_control_command(
     config: &config::ProjectorConfig,
     readiness: &Readiness,
     expected_fence: CanonicalEventFence,
-    canonical_control: &mut CanonicalRetentionLeaseClient,
+    canonical_control: &mut CanonicalWriterControlClient,
     wallet: &mut RocksDbWalletFollowingStore,
     canonical_lease: &mut CanonicalRetentionLease,
     command: ProjectorControlCommand,
@@ -777,7 +777,7 @@ async fn handle_projector_control_command(
 )]
 async fn capture_state_bundle(
     config: &config::ProjectorConfig,
-    canonical_control: &mut CanonicalRetentionLeaseClient,
+    canonical_control: &mut CanonicalWriterControlClient,
     wallet: &mut RocksDbWalletFollowingStore,
     canonical_lease: &mut CanonicalRetentionLease,
     candidate_id: String,
@@ -878,7 +878,7 @@ async fn bootstrap_resumed_wallet_following(
     readiness: &Readiness,
     cancel: CancellationToken,
     mut canonical: RocksDbCanonicalSecondary,
-    mut canonical_control: CanonicalRetentionLeaseClient,
+    mut canonical_control: CanonicalWriterControlClient,
     mut wallet: RocksDbWalletFollowingStore,
     first_retained_event_sequence: u64,
 ) -> Result<(), ProjectorError> {
@@ -1154,7 +1154,7 @@ async fn wait_for_follow_poll(cancel: &CancellationToken) -> bool {
 }
 
 async fn acquire_following_retention_lease(
-    control: &mut CanonicalRetentionLeaseClient,
+    control: &mut CanonicalWriterControlClient,
     source: WalletCanonicalSourceIdentity,
     lease_duration: Duration,
 ) -> Result<CanonicalRetentionLease, ProjectorError> {
@@ -1223,7 +1223,7 @@ enum ResumedFollowingRetentionPlan {
 /// A lease-acquire race is classified from a fresh writer status so the
 /// immediate-successor bootstrap remains available.
 async fn admit_resumed_following(
-    control: &mut CanonicalRetentionLeaseClient,
+    control: &mut CanonicalWriterControlClient,
     source: WalletCanonicalSourceIdentity,
     lease_duration: Duration,
 ) -> Result<ResumedFollowingAdmission, ProjectorError> {
@@ -1264,7 +1264,7 @@ async fn admit_resumed_following(
 /// If deletion of the old lease fails, the new lease is still retained and the
 /// old bounded lease simply expires naturally.
 async fn advance_retention_lease_anchor(
-    control: &mut CanonicalRetentionLeaseClient,
+    control: &mut CanonicalWriterControlClient,
     previous: CanonicalRetentionLease,
     source: WalletCanonicalSourceIdentity,
     lease_duration: Duration,
@@ -1281,7 +1281,7 @@ async fn advance_retention_lease_anchor(
 }
 
 async fn renew_following_retention_lease_if_due(
-    control: &mut CanonicalRetentionLeaseClient,
+    control: &mut CanonicalWriterControlClient,
     lease: &mut CanonicalRetentionLease,
     source: WalletCanonicalSourceIdentity,
     lease_duration: Duration,
@@ -1327,7 +1327,7 @@ fn following_retention_lease_transition_expiry(
 /// Renews the live cursor immediately before a wallet transition when it does
 /// not already have at least one full configured lease duration remaining.
 async fn renew_following_retention_lease_for_transition(
-    control: &mut CanonicalRetentionLeaseClient,
+    control: &mut CanonicalWriterControlClient,
     lease: &mut CanonicalRetentionLease,
     source: WalletCanonicalSourceIdentity,
     lease_duration: Duration,
@@ -1368,7 +1368,7 @@ async fn best_effort_release_canonical_lease(
     config: &config::ProjectorConfig,
     lease: &CanonicalRetentionLease,
 ) {
-    match CanonicalRetentionLeaseClient::connect(
+    match CanonicalWriterControlClient::connect(
         &config.ingest_control_addr,
         config.ingest_control_bearer_token.as_ref(),
         config.projector_control.bearer_token.as_ref(),
@@ -1437,7 +1437,7 @@ fn require_pre_promotion_follower_admission(
 
 async fn converge_on_writer_fence(
     canonical: &mut RocksDbCanonicalSecondary,
-    control: &mut CanonicalRetentionLeaseClient,
+    control: &mut CanonicalWriterControlClient,
 ) -> Result<CanonicalStoreReadyEvidence, ProjectorError> {
     for _attempt in 0..CANONICAL_FENCE_CONVERGENCE_ATTEMPTS {
         canonical.try_catch_up()?;
@@ -1535,7 +1535,7 @@ enum RetainedEventPageValidation {
 /// durable transition it starts a new page at the newly persisted cursor,
 /// which naturally lets arbitrary retained lag drain through bounded commits.
 async fn fetch_retained_event_page_to_target(
-    control: &mut CanonicalRetentionLeaseClient,
+    control: &mut CanonicalWriterControlClient,
     canonical: &RocksDbCanonicalSecondary,
     wallet_source: WalletCanonicalSourceIdentity,
     target_fence: CanonicalEventFence,

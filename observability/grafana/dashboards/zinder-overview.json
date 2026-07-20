@@ -755,7 +755,7 @@
           },
           "editorMode": "code",
           "expr": "min_over_time(zinder_readiness_state{service=\"zinder-compat-lightwalletd\", cause=\"ready\"}[5m])",
-          "legendFormat": "compat frozen pair ready",
+          "legendFormat": "compat wallet-serving pair ready",
           "range": true,
           "refId": "C"
         }
@@ -866,8 +866,8 @@
             "uid": "zinder-prometheus"
           },
           "editorMode": "code",
-          "expr": "zinder_compat_lightwalletd_frozen_pair_replica_lag_chain_epochs",
-          "legendFormat": "compat frozen pair",
+          "expr": "zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs",
+          "legendFormat": "compat wallet-serving pair",
           "range": true,
           "refId": "B"
         }
@@ -1052,7 +1052,7 @@
             "uid": "zinder-prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (status, le) (rate(zinder_compat_lightwalletd_frozen_pair_catchup_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (status, le) (rate(zinder_compat_lightwalletd_wallet_serving_pair_publisher_catchup_duration_seconds_bucket[5m])))",
           "legendFormat": "{{status}}",
           "range": true,
           "refId": "A"
@@ -1171,8 +1171,8 @@
             "uid": "zinder-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zinder_compat_lightwalletd_frozen_pair_refresh_total{status!=\"ok\"}[$__rate_interval])) or vector(0)",
-          "legendFormat": "frozen pair refresh errors",
+          "expr": "sum(rate(zinder_compat_lightwalletd_wallet_serving_pair_publisher_refresh_total{status!=\"ok\"}[$__rate_interval])) or vector(0)",
+          "legendFormat": "wallet-serving pair refresh errors",
           "range": true,
           "refId": "C"
         }

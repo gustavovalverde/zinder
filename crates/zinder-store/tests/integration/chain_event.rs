@@ -220,7 +220,7 @@ fn chain_event_history_encodes_requested_stream_family() -> eyre::Result<()> {
     ))?;
     let event_envelope = event_history
         .first()
-        .ok_or_else(|| eyre!("expected safe-tip event"))?;
+        .ok_or_else(|| eyre!("expected settled-tip event"))?;
 
     assert_eq!(event_envelope.cursor.as_bytes()[49], 0x1);
 
@@ -379,7 +379,7 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let (_, initial_block_1, initial_compact_block_1) = synthetic_epoch(1, 1);
     let (initial_epoch, initial_block, initial_compact_block) =
-        synthetic_epoch_with_safe_tip(1, 2, 1, block_hash(2));
+        synthetic_epoch_with_settled_tip(1, 2, 1, block_hash(2));
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         initial_epoch,
         vec![initial_block_1, initial_block],
@@ -406,7 +406,7 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
 
     let replacement_hash = block_hash(20);
     let (replacement_epoch, replacement_block, replacement_compact_block) =
-        synthetic_epoch_with_safe_tip(2, 2, 1, replacement_hash);
+        synthetic_epoch_with_settled_tip(2, 2, 1, replacement_hash);
     store.commit_chain_epoch(
         super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
@@ -446,21 +446,21 @@ fn test_derived_consumer_resumes_and_replays_reorgs() -> eyre::Result<()> {
 /// Commits a two-block initial chain as separate epochs and returns the
 /// height-2 cursor.
 ///
-/// Heights 1 and 2 commit under safe tip 1. The returned read-path cursor at
+/// Heights 1 and 2 commit under settled tip 1. The returned read-path cursor at
 /// height 2 carries an enriched locator over heights 2 and 1, so a reorg of
 /// height 2 resolves the fork at height 1.
 fn commit_reorgable_chain_and_cursor(
     store: &PrimaryChainStore,
 ) -> eyre::Result<StreamCursorTokenV1> {
     let (first_epoch, first_block, first_compact_block) =
-        synthetic_epoch_with_safe_tip(1, 1, 1, block_hash(1));
+        synthetic_epoch_with_settled_tip(1, 1, 1, block_hash(1));
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         first_epoch,
         vec![first_block],
         vec![first_compact_block],
     ))?;
     let (second_epoch, second_block, second_compact_block) =
-        synthetic_epoch_with_safe_tip(2, 2, 1, block_hash(2));
+        synthetic_epoch_with_settled_tip(2, 2, 1, block_hash(2));
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         second_epoch,
         vec![second_block],
@@ -485,7 +485,7 @@ fn commit_height_two_reorg(
     created_at: UnixTimestampMillis,
 ) -> eyre::Result<()> {
     let (mut replacement_epoch, replacement_block, replacement_compact_block) =
-        synthetic_epoch_with_safe_tip(3, 2, 1, block_hash(20));
+        synthetic_epoch_with_settled_tip(3, 2, 1, block_hash(20));
     replacement_epoch.created_at = created_at;
     store.commit_chain_epoch(
         super::synthetic_chain_epoch_artifacts(
@@ -613,7 +613,7 @@ fn live_tail_start_skips_prior_events_and_delivers_later_commits() -> eyre::Resu
 }
 
 /// A `LiveTail` head cursor carries the requested family so later pages stay
-/// on the safe-tip stream.
+/// on the settled-tip stream.
 #[test]
 fn live_tail_start_mints_a_cursor_in_the_requested_family() -> eyre::Result<()> {
     let tempdir = tempdir()?;
@@ -721,7 +721,7 @@ fn assert_committed_event(event_envelope: &ChainEventEnvelope, chain_epoch: Chai
     assert_eq!(event_envelope.event_sequence, 1);
     assert_eq!(event_envelope.chain_epoch, chain_epoch);
     assert_eq!(
-        event_envelope.safe_tip_height,
+        event_envelope.settled_tip_height,
         chain_epoch.settled_tip_height
     );
     assert!(matches!(
@@ -800,13 +800,13 @@ fn synthetic_epoch(
     chain_epoch_id: u64,
     height: u32,
 ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
-    synthetic_epoch_with_safe_tip(chain_epoch_id, height, height, block_hash(height))
+    synthetic_epoch_with_settled_tip(chain_epoch_id, height, height, block_hash(height))
 }
 
-fn synthetic_epoch_with_safe_tip(
+fn synthetic_epoch_with_settled_tip(
     chain_epoch_id: u64,
     height: u32,
-    safe_tip_height: u32,
+    settled_tip_height: u32,
     source_hash: BlockHash,
 ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let parent_hash = block_hash(height.saturating_sub(1));
@@ -818,8 +818,8 @@ fn synthetic_epoch_with_safe_tip(
             network: Network::ZcashRegtest,
             visible_tip_height: block_height,
             visible_tip_hash: source_hash,
-            settled_tip_height: BlockHeight::new(safe_tip_height),
-            settled_tip_hash: block_hash(safe_tip_height),
+            settled_tip_height: BlockHeight::new(settled_tip_height),
+            settled_tip_hash: block_hash(settled_tip_height),
             artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),

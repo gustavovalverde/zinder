@@ -1,4 +1,4 @@
-//! Continuous append-only following for the version-1 canonical store.
+//! Continuous append-only following for the canonical store.
 
 use std::{collections::BTreeMap, future::Future, num::NonZeroU32, sync::Arc, time::Duration};
 
@@ -31,7 +31,7 @@ use crate::{
     writer::control::{CanonicalControlCommand, handle_canonical_control_command},
 };
 
-/// Polling and bounded-source settings for version-1 canonical following.
+/// Polling and bounded-source settings for canonical following.
 #[derive(Clone, Debug)]
 pub struct CanonicalFollowConfig {
     /// Maximum wall time for one source request.
@@ -156,7 +156,7 @@ where
             source_tip_height = observed_tip.height.value(),
             historical_prevout_reads = 0_u64,
             cross_block_wallet_reads = 0_u64,
-            "committed one authenticated version-1 canonical append"
+            "committed one authenticated canonical append"
         );
         Ok(store)
     }
@@ -195,7 +195,7 @@ where
             source_tip_height = observed_tip.height.value(),
             historical_prevout_reads = 0_u64,
             cross_block_wallet_reads = 0_u64,
-            "committed one authenticated version-1 canonical suffix replacement"
+            "committed one authenticated canonical suffix replacement"
         );
         Ok(store)
     }
@@ -221,7 +221,7 @@ pub struct CanonicalReorgWindowExceeded {
     pub configured_window_blocks: u32,
 }
 
-/// Failure while following the clean version-1 canonical store.
+/// Failure while following the clean canonical store.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CanonicalFollowError {
@@ -307,7 +307,7 @@ pub enum CanonicalFollowError {
     Store(#[from] CanonicalStoreError),
 }
 
-/// Follows atomic Zebra tip observations through version-1 canonical appends.
+/// Follows atomic Zebra tip observations through canonical appends.
 ///
 /// Source failures happen before the consuming store commit and are retried
 /// with the admitted writer handle. Any store error terminates the writer lane;

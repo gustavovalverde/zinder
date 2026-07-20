@@ -31,8 +31,8 @@ use zinder_store::{
 };
 
 mod grpc;
-mod pair_serving;
-mod read_pair;
+mod wallet_serving_pair;
+mod wallet_serving_query;
 
 pub use grpc::{
     ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
@@ -48,13 +48,15 @@ pub use grpc::{
     transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
     tree_state_at_response,
 };
-pub use pair_serving::ExactPairWalletQuery;
-pub use read_pair::{ExactReadPair, PairCanonicalRead, PairWalletRead, ReadPairAdmissionError};
+pub use wallet_serving_pair::{
+    CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
+};
+pub use wallet_serving_query::WalletServingQuery;
 /// Wallet-facing read API backed by epoch-bound canonical reads.
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves to
 /// the visible chain epoch at call time; `Some(id)` pins the read to that epoch.
-/// Current-projection derive reads expose their chain epoch in the response
+/// Current materialized-view reads expose their chain epoch in the response
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
@@ -68,9 +70,9 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<LatestBlock, QueryError>;
 
-    /// Reads the block at the chain epoch's safe tip (the wallet's scan
+    /// Reads the block at the chain epoch's settled tip (the wallet's scan
     /// ceiling). Mirrors `latest_block` but resolves to
-    /// `chain_epoch.safe_tip_height` rather than `chain_epoch.tip_height`.
+    /// `chain_epoch.settled_tip_height` rather than `chain_epoch.tip_height`.
     async fn latest_safe_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
@@ -766,7 +768,7 @@ where
             }
 
             if !canonical_misses.is_empty() {
-                ensure_spend_lookup_complete_without_derive(&reader)?;
+                ensure_spend_lookup_complete_without_materialized_view(&reader)?;
             }
 
             Ok(TransparentSpendsByOutpointResponse {
@@ -967,7 +969,7 @@ where
                 end_height: request.end_height,
             })
         } else {
-            Err(QueryError::DeriveUnavailable {
+            Err(QueryError::MaterializedViewUnavailable {
                 capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
             })
         };
@@ -1313,9 +1315,9 @@ where
 /// Refuses an ambiguous canonical miss after retention has deleted spend facts.
 ///
 /// Before the first real deletion, a canonical miss proves that no spend fact
-/// exists at the pinned epoch. Afterwards, only the durable derive projection
+/// exists at the pinned epoch. Afterwards, only the durable materialized view
 /// can distinguish an old spent outpoint from an unspent one.
-fn ensure_spend_lookup_complete_without_derive(
+fn ensure_spend_lookup_complete_without_materialized_view(
     reader: &zinder_store::ChainEpochReader<'_>,
 ) -> Result<(), QueryError> {
     if reader
@@ -1323,7 +1325,7 @@ fn ensure_spend_lookup_complete_without_derive(
         .map_err(QueryError::Store)?
         .is_some()
     {
-        return Err(QueryError::DeriveUnavailable {
+        return Err(QueryError::MaterializedViewUnavailable {
             capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
         });
     }
@@ -1637,13 +1639,13 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
         Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
-        Some(QueryError::DeriveUnavailable { .. }) => "derive_unavailable",
-        Some(QueryError::DeriveLag { .. }) => "derive_lag",
+        Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
+        Some(QueryError::MaterializedViewLag { .. }) => "materialized_view_lag",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
         Some(QueryError::Store(_)) => "store",
-        Some(QueryError::DeriveStore(_)) => "derive_store",
+        Some(QueryError::MaterializedViewStore(_)) => "materialized_view_store",
         Some(QueryError::WalletProjectionRead { .. }) => "wallet_projection_read",
         Some(QueryError::CanonicalStore(_)) => "canonical_store",
         Some(QueryError::WalletStore(_)) => "wallet_store",
@@ -1715,15 +1717,15 @@ pub struct LatestBlock {
 }
 
 /// Safe-tip block metadata bound to one chain epoch. The block sits at
-/// `chain_epoch.safe_tip_height` and is the highest height the wallet can
+/// `chain_epoch.settled_tip_height` and is the highest height the wallet can
 /// safely use as its scan ceiling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LatestSafeBlock {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
-    /// Safe tip height (`chain_epoch.safe_tip_height`).
+    /// Settled tip height (`chain_epoch.settled_tip_height`).
     pub height: BlockHeight,
-    /// Block hash at `safe_tip_height`.
+    /// Block hash at `settled_tip_height`.
     pub block_hash: zinder_core::BlockHash,
 }
 
@@ -2098,24 +2100,24 @@ pub enum QueryError {
         maximum: usize,
     },
 
-    /// Derive-owned wallet projection is not configured for this query handle.
-    #[error("derive projection is unavailable for {capability}")]
-    DeriveUnavailable {
-        /// Capability that requires the derive projection.
+    /// Materialized-view-owned wallet projection is not configured for this query handle.
+    #[error("materialized view is unavailable for {capability}")]
+    MaterializedViewUnavailable {
+        /// Capability that requires the materialized view.
         capability: &'static str,
     },
 
-    /// Derive-owned wallet projection has not caught up to the requested epoch.
+    /// Materialized-view-owned wallet projection has not caught up to the requested epoch.
     #[error(
-        "derive projection {capability} is behind chain tip {chain_tip_height:?}: derive height {derive_height:?}"
+        "materialized view {capability} is behind chain tip {chain_tip_height:?}: materialized-view height {materialized_view_height:?}"
     )]
-    DeriveLag {
-        /// Capability that requires the derive projection.
+    MaterializedViewLag {
+        /// Capability that requires the materialized view.
         capability: &'static str,
         /// Canonical chain tip height required by the request.
         chain_tip_height: BlockHeight,
-        /// Latest materialized derive height, when any block has been processed.
-        derive_height: Option<BlockHeight>,
+        /// Latest materialized materialized-view height, when any block has been processed.
+        materialized_view_height: Option<BlockHeight>,
     },
 
     /// A blocking read task failed unexpectedly (panic or runtime shutdown).
@@ -2129,9 +2131,9 @@ pub enum QueryError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
-    /// Derive store returned a storage error.
+    /// Materialized-view store returned a storage error.
     #[error(transparent)]
-    DeriveStore(#[from] zinder_derive::DeriveStoreError),
+    MaterializedViewStore(#[from] zinder_materialized_views::MaterializedViewStoreError),
 
     /// Typed wallet-projection backend returned a storage failure.
     #[error("wallet projection read failed: {source}")]
@@ -2141,11 +2143,11 @@ pub enum QueryError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// Version-1 canonical store returned a storage or admission failure.
+    /// Canonical store returned a storage or admission failure.
     #[error(transparent)]
     CanonicalStore(#[from] zinder_store::CanonicalStoreError),
 
-    /// Version-1 wallet store returned a storage or admission failure.
+    /// Wallet store returned a storage or admission failure.
     #[error(transparent)]
     WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
 
@@ -2177,8 +2179,8 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
             Self::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
             Self::BroadcastTransactionTooLarge { .. } => ErrorReason::BroadcastTransactionTooLarge,
-            Self::DeriveUnavailable { .. } => ErrorReason::DeriveProjectionUnavailable,
-            Self::DeriveLag { .. } => ErrorReason::DeriveProjectionLagging,
+            Self::MaterializedViewUnavailable { .. } => ErrorReason::MaterializedViewUnavailable,
+            Self::MaterializedViewLag { .. } => ErrorReason::MaterializedViewLagging,
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
             Self::ChainEpochPinUnsupported => ErrorReason::ChainEpochPinUnsupported,
             Self::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
@@ -2194,7 +2196,7 @@ impl zinder_proto::BoundaryError for QueryError {
                 ErrorReason::NodeCapabilityMissing
             }
             Self::Node(_) => ErrorReason::NodeUnavailable,
-            Self::DeriveStore(_)
+            Self::MaterializedViewStore(_)
             | Self::Store(_)
             | Self::WalletProjectionRead { .. }
             | Self::CanonicalStore(_)
@@ -2371,21 +2373,23 @@ mod error_reason_tests {
                 actual: MAX_RAW_TRANSACTION_BYTES + 1,
                 maximum: MAX_RAW_TRANSACTION_BYTES,
             },
-            QueryError::DeriveUnavailable {
+            QueryError::MaterializedViewUnavailable {
                 capability: "probe",
             },
-            QueryError::DeriveLag {
+            QueryError::MaterializedViewLag {
                 capability: "probe",
                 chain_tip_height: BlockHeight::new(2),
-                derive_height: Some(BlockHeight::new(1)),
+                materialized_view_height: Some(BlockHeight::new(1)),
             },
             QueryError::BlockingTaskFailed {
                 reason: "probe".to_owned(),
             },
             QueryError::Store(StoreError::NoVisibleChainEpoch),
-            QueryError::DeriveStore(zinder_derive::DeriveStoreError::InvalidOptions {
-                reason: "probe",
-            }),
+            QueryError::MaterializedViewStore(
+                zinder_materialized_views::MaterializedViewStoreError::InvalidOptions {
+                    reason: "probe",
+                },
+            ),
             QueryError::WalletProjectionRead {
                 source: Box::new(std::io::Error::other("probe")),
             },

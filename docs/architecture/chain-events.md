@@ -2,7 +2,8 @@
 
 Chain events are the contract between source observations, canonical commits, query freshness, and derived-index replay. They are not a storage table and not a wallet API by themselves.
 
-This document settles the event vocabulary that the rest of the architecture should reuse. The concrete gRPC schema for `ChainEpochReadApi` should be designed after this model, not before it.
+This document defines the event vocabulary shared by canonical storage,
+`WalletQuery`, and the private `IngestControl` replay surface.
 
 ## Boundaries
 
@@ -45,7 +46,7 @@ pub enum ChainEvent {
 }
 ```
 
-Use `ChainReorged` when one durable transition both invalidates a visible range within the reorg window and commits the replacement range. Use `ChainCommitted` for a pure append or safe-tip advance. A `ChainCommitted` event whose `committed.block_range.start > committed.block_range.end` advances epoch metadata without publishing block artifacts; derive consumers should advance their cursor and apply no block contexts. Zinder does not expose an explicit rollback transition without a replacement range.
+Use `ChainReorged` when one durable transition both invalidates a visible range within the reorg window and commits the replacement range. Use `ChainCommitted` for a pure append or settled-tip advance. A `ChainCommitted` event whose `committed.block_range.start > committed.block_range.end` advances epoch metadata without publishing block artifacts; materialized-view consumers should advance their cursor and apply no block contexts. Zinder does not expose an explicit rollback transition without a replacement range.
 
 Do not publish source observations as `ChainEvent`. Do not publish `ChainEvent` before `commit_chain_epoch` succeeds.
 
@@ -57,10 +58,10 @@ Do not publish source observations as `ChainEvent`. Do not publish `ChainEvent` 
 | ---------------- | ------------------- | --------------- |
 | Append inside the current best chain | `Extend { blocks }` | `ChainCommitted` |
 | Reorg inside the configured window | `Replace { from_height }` | `ChainReorged` |
-| Safe tip advances | `AdvanceSafeTipTo { height }` | `ChainCommitted` |
+| Settled tip advances | `AdvanceSettledTipTo { height }` | `ChainCommitted` |
 | No reorg-window mutation | `Unchanged` | `ChainCommitted` only when artifacts changed |
 
-The replacement range must start at the first height where the old visible branch and the new selected branch differ. It must not replace data at or below the safe tip. If the replacement starts below the supported window or below the safe-tip boundary, `zinder-ingest` returns `ReorgWindowExceeded`, fails readiness with `reorg_window_exceeded`, and requires operator action.
+The replacement range must start at the first height where the old visible branch and the new selected branch differ. It must not replace data at or below the settled tip. If the replacement starts below the supported window or below the settled-tip boundary, `zinder-ingest` returns `ReorgWindowExceeded`, fails readiness with `reorg_window_exceeded`, and requires operator action.
 
 Reject the name `ReorgTooDeep`. It describes a symptom. `ReorgWindowExceeded` names the configured boundary that was violated.
 
@@ -80,7 +81,7 @@ ChainEventEnvelope
   event: ChainCommitted | ChainReorged
 ```
 
-The envelope carries the cross-plane `ChainView` at field tag 3. The Substreams last-irreversible-block pattern maps to `chain_view.chain_epoch.settled_tip.height`: every envelope carries the safe tip height that was true for that event as the settled tip of its epoch, so the envelope needs no separate `safe_tip_height` field. Consumers may discard undo state at or below that height.
+The envelope carries the cross-plane `ChainView` at field tag 3. The Substreams last-irreversible-block pattern maps to `chain_view.chain_epoch.settled_tip.height`: every envelope carries the settled tip height that was true for that event as the settled tip of its epoch, so the envelope needs no separate `settled_tip_height` field. Consumers may discard undo state at or below that height.
 
 `StreamCursorTokenV1` uses the storage-authenticated cursor shape from [ADR-0002](../adrs/0002-boundary-specific-serialization.md). It carries the event sequence and a fork-aware locator (a tip-first, exponentially back-spaced set of `(height, hash)` pairs, capped at `CHAIN_EVENT_LOCATOR_MAX = 32`) for one chain-event stream, per [ADR-0025](../adrs/0025-chain-event-reconnect-reorg-locator.md). Adding a second cursor format for chain events requires updating this contract and the boundary-specific serialization ADR.
 
@@ -102,9 +103,9 @@ The cursor body is not decorative state. `event_sequence` is the resume key, and
 
 Ingest-hosted derived consumers resume through
 `chain_event_history(ChainEventHistoryRequest { from_cursor, max_events })`
-during startup repair. `zinder-ingest` reads the lowest durable derive cursor,
+during startup repair. `zinder-ingest` reads the lowest durable materialized-view cursor,
 replays retained events after that cursor, and dispatches each event through
-`zinder_derive::DeriveStore::write_chain_event`. The derive store persists each
+`zinder_materialized_views::MaterializedViewStore::write_chain_event`. The materialized-view store persists each
 cursor advance atomically with consumer writes. Fresh consumers whose persisted
 cursor sits below the retention floor rebuild from canonical artifacts before
 resuming retained-event replay.
@@ -128,7 +129,7 @@ Rules:
 `StreamCursorTokenV1`'s `flags` byte carries a family code in the lower nibble (per [Chain events §Cursor varieties](chain-events.md#cursor-varieties)). Two `ChainEvents` family codes are active:
 
 - **`0x0` `ChainEventTip`** — receives every `ChainCommitted` and `ChainReorged` envelope. Default for wallet consumers; clients must handle reorgs.
-- **`0x1` `ChainEventSafe`** — receives only envelopes whose `chain_epoch.tip_height <= safe_tip_height`. Never receives `ChainReorged`, including the synthesized reconnect reorg: a `Safe` cursor cannot be reorged out below the settled tip by definition, so a locator miss on a `Safe` cursor is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Safe` and `start = earliest_retained` ([ADR-0027](../adrs/0027-event-stream-start-positions.md)).
+- **`0x1` `ChainEventSafe`** — receives only envelopes whose `chain_epoch.tip_height <= settled_tip_height`. Never receives `ChainReorged`, including the synthesized reconnect reorg: a `Safe` cursor cannot be reorged out below the settled tip by definition, so a locator miss on a `Safe` cursor is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Safe` and `start = earliest_retained` ([ADR-0027](../adrs/0027-event-stream-start-positions.md)).
 
 Future stream families (`Mempool`, `Derive`) are reserved in the family-code table but use parallel cursor body types under their own contracts.
 

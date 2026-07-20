@@ -513,7 +513,7 @@ path = "${storage_path}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.bulk_catchup]
+[ingest.construction]
 canonical_batch_max_blocks = ${CANONICAL_BATCH_MAX_BLOCKS}
 canonical_batch_max_artifact_bytes = ${CANONICAL_BATCH_MAX_ARTIFACT_BYTES}
 canonical_batch_min_blocks_before_estimated_write_close = ${CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE}
@@ -523,11 +523,11 @@ source_fetch_max_in_flight_requests = ${SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS}
 source_fetch_max_in_flight_bytes = ${SOURCE_FETCH_MAX_IN_FLIGHT_BYTES}
 block_prepare_concurrency = ${BLOCK_PREPARE_CONCURRENCY}
 
-[ingest.tip_follow]
+[ingest.follow]
 poll_interval_ms = ${TIP_FOLLOW_POLL_INTERVAL_MS}
 lag_threshold_blocks = 2
 
-[ingest.modifiers]
+[ingest.run_overrides]
 checkpoint_height = ${CHECKPOINT_HEIGHT}
 allow_near_tip_finalize = true
 
@@ -1332,15 +1332,15 @@ snapshot() {
   print_query_summary "bulk reorder bytes" 'zinder_ingest_bulk_pipeline_reorder_buffer_bytes'
   print_query_summary "bulk watermark blocked" 'sum by (stage) (rate(zinder_ingest_bulk_pipeline_watermark_blocked_total[15m]))'
   print_query_summary "memory pressure 15m" 'avg_over_time(zinder_ingest_memory_pressure_ratio[15m])'
-  print_query_summary "derive replay state" 'zinder_ingest_derive_replay_budget_state'
-  print_query_summary "derive replay effective batch" 'zinder_ingest_derive_replay_effective_batch_blocks'
+  print_query_summary "materialized-view replay state" 'zinder_ingest_materialized_view_replay_budget_state'
+  print_query_summary "materialized-view replay effective batch" 'zinder_ingest_materialized_view_replay_effective_batch_blocks'
   print_query_summary "ingest commits" 'sum by (service, status, error_class) (zinder_ingest_commit_duration_seconds_count)'
   print_query_summary "ingest writer progress" 'zinder_ingest_writer_chain_epoch_id'
   print_query_summary "ingest writer status requests" 'sum by (service, status, error_class) (zinder_ingest_writer_status_request_total)'
   print_query_summary "ingest writer status available" 'zinder_ingest_writer_status_available'
-  print_query_summary "compat frozen pair publications" 'zinder_compat_lightwalletd_frozen_pair_publications_total'
-  print_query_summary "compat frozen pair convergence" 'sum by (outcome) (zinder_compat_lightwalletd_frozen_pair_convergence_total)'
-  print_query_summary "compat frozen pair replica lag" 'zinder_compat_lightwalletd_frozen_pair_replica_lag_chain_epochs'
+  print_query_summary "compat wallet-serving pair publications" 'zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total'
+  print_query_summary "compat wallet-serving pair convergence" 'sum by (outcome) (zinder_compat_lightwalletd_wallet_serving_pair_publisher_convergence_total)'
+  print_query_summary "compat wallet-serving pair replica lag" 'zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs'
   print_query_summary "compat writer-status requests" 'sum by (status, error_class) (zinder_compat_lightwalletd_writer_status_total)'
   print_query_summary "compat writer-status available" 'zinder_compat_lightwalletd_writer_status_available'
   print_query_summary "node rpc p95" 'histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[15m])))'
@@ -1452,17 +1452,17 @@ write_readiness_report() {
   local report_canonical_writer_height
   local report_canonical_lag_blocks
   local report_canonical_rate_blocks_per_second
-  local report_derive_replay_height
-  local report_derive_replay_tip_height
-  local report_derive_replay_lag_blocks
-  local report_derive_replay_rate_blocks_per_second
-  local report_derive_replay_phase_gate
-  local report_derive_replay_caught_up
+  local report_materialized_view_replay_height
+  local report_materialized_view_replay_tip_height
+  local report_materialized_view_replay_lag_blocks
+  local report_materialized_view_replay_rate_blocks_per_second
+  local report_materialized_view_replay_phase_gate
+  local report_materialized_view_replay_caught_up
   local report_memory_pressure_ratio
   local report_node_rpc_p95_seconds
   local report_store_read_p95_seconds
-  local report_compat_frozen_pair_publication_count
-  local report_compat_frozen_pair_replica_lag_chain_epochs
+  local report_compat_wallet_serving_pair_publisher_publication_count
+  local report_compat_wallet_serving_pair_publisher_replica_lag_chain_epochs
   local report_rocksdb_pending_compaction_bytes
   local report_rocksdb_running_compactions
   local report_rocksdb_property_samples
@@ -1484,17 +1484,17 @@ write_readiness_report() {
   report_canonical_writer_height="$(prometheus_max_value 'max(zinder_ingest_writer_tip_height)')"
   report_canonical_lag_blocks="$(prometheus_max_value 'max(zinder_ingest_canonical_lag_blocks)')"
   report_canonical_rate_blocks_per_second="$(prometheus_max_value 'sum(rate(zinder_ingest_commit_batch_block_count_sum{status="ok"}[5m]))')"
-  report_derive_replay_height="$(prometheus_max_value 'max(zinder_ingest_derive_replay_height)')"
-  report_derive_replay_tip_height="$(prometheus_max_value 'max(zinder_ingest_derive_replay_tip_height)')"
-  report_derive_replay_lag_blocks="$(prometheus_max_value 'max(zinder_ingest_derive_replay_lag_blocks)')"
-  report_derive_replay_rate_blocks_per_second="$(prometheus_max_value 'sum(rate(zinder_ingest_derive_replay_blocks_total{status="ok"}[5m]))')"
-  report_derive_replay_phase_gate="$(prometheus_max_value 'max(zinder_ingest_derive_replay_phase_gate)')"
-  report_derive_replay_caught_up="$(prometheus_max_value 'max(zinder_ingest_derive_replay_caught_up)')"
+  report_materialized_view_replay_height="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_height)')"
+  report_materialized_view_replay_tip_height="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_tip_height)')"
+  report_materialized_view_replay_lag_blocks="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_lag_blocks)')"
+  report_materialized_view_replay_rate_blocks_per_second="$(prometheus_max_value 'sum(rate(zinder_ingest_materialized_view_replay_blocks_total{status="ok"}[5m]))')"
+  report_materialized_view_replay_phase_gate="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_phase_gate)')"
+  report_materialized_view_replay_caught_up="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_caught_up)')"
   report_memory_pressure_ratio="$(prometheus_max_value 'max(zinder_ingest_memory_pressure_ratio)')"
   report_node_rpc_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[15m]))))')"
   report_store_read_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le, operation, table, caller) (rate(zinder_store_read_duration_seconds_bucket[15m]))))')"
-  report_compat_frozen_pair_publication_count="$(prometheus_max_value 'sum(zinder_compat_lightwalletd_frozen_pair_publications_total)')"
-  report_compat_frozen_pair_replica_lag_chain_epochs="$(prometheus_max_value 'max(zinder_compat_lightwalletd_frozen_pair_replica_lag_chain_epochs)')"
+  report_compat_wallet_serving_pair_publisher_publication_count="$(prometheus_max_value 'sum(zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total)')"
+  report_compat_wallet_serving_pair_publisher_replica_lag_chain_epochs="$(prometheus_max_value 'max(zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs)')"
   report_rocksdb_pending_compaction_bytes="$(prometheus_max_value 'max(zinder_store_rocksdb_property{property="rocksdb.estimate-pending-compaction-bytes"})')"
   report_rocksdb_running_compactions="$(prometheus_max_value 'max(zinder_store_rocksdb_property{property="rocksdb.num-running-compactions"})')"
   report_rocksdb_property_samples="$(prometheus_sample_count 'zinder_store_rocksdb_property')"
@@ -1527,17 +1527,17 @@ write_readiness_report() {
   export REPORT_CANONICAL_WRITER_HEIGHT="$report_canonical_writer_height"
   export REPORT_CANONICAL_LAG_BLOCKS="$report_canonical_lag_blocks"
   export REPORT_CANONICAL_RATE_BLOCKS_PER_SECOND="$report_canonical_rate_blocks_per_second"
-  export REPORT_DERIVE_REPLAY_HEIGHT="$report_derive_replay_height"
-  export REPORT_DERIVE_REPLAY_TIP_HEIGHT="$report_derive_replay_tip_height"
-  export REPORT_DERIVE_REPLAY_LAG_BLOCKS="$report_derive_replay_lag_blocks"
-  export REPORT_DERIVE_REPLAY_RATE_BLOCKS_PER_SECOND="$report_derive_replay_rate_blocks_per_second"
-  export REPORT_DERIVE_REPLAY_PHASE_GATE="$report_derive_replay_phase_gate"
-  export REPORT_DERIVE_REPLAY_CAUGHT_UP="$report_derive_replay_caught_up"
+  export REPORT_MATERIALIZED_VIEW_REPLAY_HEIGHT="$report_materialized_view_replay_height"
+  export REPORT_MATERIALIZED_VIEW_REPLAY_TIP_HEIGHT="$report_materialized_view_replay_tip_height"
+  export REPORT_MATERIALIZED_VIEW_REPLAY_LAG_BLOCKS="$report_materialized_view_replay_lag_blocks"
+  export REPORT_MATERIALIZED_VIEW_REPLAY_RATE_BLOCKS_PER_SECOND="$report_materialized_view_replay_rate_blocks_per_second"
+  export REPORT_MATERIALIZED_VIEW_REPLAY_PHASE_GATE="$report_materialized_view_replay_phase_gate"
+  export REPORT_MATERIALIZED_VIEW_REPLAY_CAUGHT_UP="$report_materialized_view_replay_caught_up"
   export REPORT_MEMORY_PRESSURE_RATIO="$report_memory_pressure_ratio"
   export REPORT_NODE_RPC_P95_SECONDS="$report_node_rpc_p95_seconds"
   export REPORT_STORE_READ_P95_SECONDS="$report_store_read_p95_seconds"
-  export REPORT_COMPAT_FROZEN_PAIR_PUBLICATION_COUNT="$report_compat_frozen_pair_publication_count"
-  export REPORT_COMPAT_FROZEN_PAIR_REPLICA_LAG_CHAIN_EPOCHS="$report_compat_frozen_pair_replica_lag_chain_epochs"
+  export REPORT_COMPAT_WALLET_SERVING_PAIR_PUBLICATION_COUNT="$report_compat_wallet_serving_pair_publisher_publication_count"
+  export REPORT_COMPAT_WALLET_SERVING_PAIR_REPLICA_LAG_CHAIN_EPOCHS="$report_compat_wallet_serving_pair_publisher_replica_lag_chain_epochs"
   export REPORT_ROCKSDB_PENDING_COMPACTION_BYTES="$report_rocksdb_pending_compaction_bytes"
   export REPORT_ROCKSDB_RUNNING_COMPACTIONS="$report_rocksdb_running_compactions"
   export REPORT_ROCKSDB_PROPERTY_SAMPLES="$report_rocksdb_property_samples"
@@ -1587,17 +1587,17 @@ report = {
         "canonical_writer_height": metric("REPORT_CANONICAL_WRITER_HEIGHT"),
         "canonical_lag_blocks": metric("REPORT_CANONICAL_LAG_BLOCKS"),
         "canonical_rate_blocks_per_second": metric("REPORT_CANONICAL_RATE_BLOCKS_PER_SECOND"),
-        "derive_replay_height": metric("REPORT_DERIVE_REPLAY_HEIGHT"),
-        "derive_replay_tip_height": metric("REPORT_DERIVE_REPLAY_TIP_HEIGHT"),
-        "derive_replay_lag_blocks": metric("REPORT_DERIVE_REPLAY_LAG_BLOCKS"),
-        "derive_replay_rate_blocks_per_second": metric("REPORT_DERIVE_REPLAY_RATE_BLOCKS_PER_SECOND"),
-        "derive_replay_phase_gate": metric("REPORT_DERIVE_REPLAY_PHASE_GATE"),
-        "derive_replay_caught_up": metric("REPORT_DERIVE_REPLAY_CAUGHT_UP"),
+        "materialized_view_replay_height": metric("REPORT_MATERIALIZED_VIEW_REPLAY_HEIGHT"),
+        "materialized_view_replay_tip_height": metric("REPORT_MATERIALIZED_VIEW_REPLAY_TIP_HEIGHT"),
+        "materialized_view_replay_lag_blocks": metric("REPORT_MATERIALIZED_VIEW_REPLAY_LAG_BLOCKS"),
+        "materialized_view_replay_rate_blocks_per_second": metric("REPORT_MATERIALIZED_VIEW_REPLAY_RATE_BLOCKS_PER_SECOND"),
+        "materialized_view_replay_phase_gate": metric("REPORT_MATERIALIZED_VIEW_REPLAY_PHASE_GATE"),
+        "materialized_view_replay_caught_up": metric("REPORT_MATERIALIZED_VIEW_REPLAY_CAUGHT_UP"),
         "memory_pressure_ratio": metric("REPORT_MEMORY_PRESSURE_RATIO"),
         "node_rpc_p95_max_seconds": metric("REPORT_NODE_RPC_P95_SECONDS"),
         "store_read_p95_max_seconds": metric("REPORT_STORE_READ_P95_SECONDS"),
-        "compat_frozen_pair_publication_count": metric("REPORT_COMPAT_FROZEN_PAIR_PUBLICATION_COUNT"),
-        "compat_frozen_pair_replica_lag_chain_epochs": metric("REPORT_COMPAT_FROZEN_PAIR_REPLICA_LAG_CHAIN_EPOCHS"),
+        "compat_wallet_serving_pair_publisher_publication_count": metric("REPORT_COMPAT_WALLET_SERVING_PAIR_PUBLICATION_COUNT"),
+        "compat_wallet_serving_pair_publisher_replica_lag_chain_epochs": metric("REPORT_COMPAT_WALLET_SERVING_PAIR_REPLICA_LAG_CHAIN_EPOCHS"),
         "rocksdb_pending_compaction_bytes": metric("REPORT_ROCKSDB_PENDING_COMPACTION_BYTES"),
         "rocksdb_running_compactions": metric("REPORT_ROCKSDB_RUNNING_COMPACTIONS"),
         "rocksdb_property_samples": metric("REPORT_ROCKSDB_PROPERTY_SAMPLES"),
@@ -1637,17 +1637,17 @@ lines = [
     f"- Canonical writer height: `{measurements['canonical_writer_height']}`",
     f"- Canonical lag: `{measurements['canonical_lag_blocks']}` blocks",
     f"- Canonical rate: `{measurements['canonical_rate_blocks_per_second']}` blocks/second",
-    f"- Derive replay height: `{measurements['derive_replay_height']}`",
-    f"- Derive replay tip: `{measurements['derive_replay_tip_height']}`",
-    f"- Derive replay lag: `{measurements['derive_replay_lag_blocks']}` blocks",
-    f"- Derive replay rate: `{measurements['derive_replay_rate_blocks_per_second']}` blocks/second",
-    f"- Derive phase gate: `{measurements['derive_replay_phase_gate']}`",
-    f"- Derive caught up: `{measurements['derive_replay_caught_up']}`",
+    f"- Materialized-view replay height: `{measurements['materialized_view_replay_height']}`",
+    f"- Materialized-view replay tip: `{measurements['materialized_view_replay_tip_height']}`",
+    f"- Materialized-view replay lag: `{measurements['materialized_view_replay_lag_blocks']}` blocks",
+    f"- Materialized-view replay rate: `{measurements['materialized_view_replay_rate_blocks_per_second']}` blocks/second",
+    f"- Materialized-view phase gate: `{measurements['materialized_view_replay_phase_gate']}`",
+    f"- Materialized views caught up: `{measurements['materialized_view_replay_caught_up']}`",
     f"- Memory pressure ratio: `{measurements['memory_pressure_ratio']}`",
     f"- Node RPC p95 max: `{measurements['node_rpc_p95_max_seconds']}` seconds",
     f"- Store read p95 max: `{measurements['store_read_p95_max_seconds']}` seconds",
-    f"- Compat frozen pair publications: `{measurements['compat_frozen_pair_publication_count']}`",
-    f"- Compat frozen pair replica lag: `{measurements['compat_frozen_pair_replica_lag_chain_epochs']}` chain epochs",
+    f"- Compat wallet-serving pair publications: `{measurements['compat_wallet_serving_pair_publisher_publication_count']}`",
+    f"- Compat wallet-serving pair replica lag: `{measurements['compat_wallet_serving_pair_publisher_replica_lag_chain_epochs']}` chain epochs",
     f"- RocksDB pending compaction bytes: `{measurements['rocksdb_pending_compaction_bytes']}`",
     f"- RocksDB running compactions: `{measurements['rocksdb_running_compactions']}`",
     f"- RocksDB property samples: `{measurements['rocksdb_property_samples']}`",
@@ -1714,7 +1714,7 @@ metric_names = [
     "bulk_catchup_seconds",
     "node_rpc_p95_max_seconds",
     "store_read_p95_max_seconds",
-    "compat_frozen_pair_replica_lag_chain_epochs",
+    "compat_wallet_serving_pair_publisher_replica_lag_chain_epochs",
     "readiness_sync_lag_blocks",
     "readiness_replica_lag_chain_epochs",
     "rocksdb_pending_compaction_bytes",
@@ -1746,7 +1746,7 @@ aggregate = {
             "bulk_catchup_to_height": report["checkpoint"]["bulk_catchup_to_height"],
             "bulk_catchup_seconds": report["measurements"]["bulk_catchup_seconds"],
             "store_read_p95_max_seconds": report["measurements"]["store_read_p95_max_seconds"],
-            "compat_frozen_pair_publication_count": report["measurements"]["compat_frozen_pair_publication_count"],
+            "compat_wallet_serving_pair_publisher_publication_count": report["measurements"]["compat_wallet_serving_pair_publisher_publication_count"],
             "restore_status": report["restore"]["status"],
         }
         for path, report in zip(report_paths, reports)
@@ -1841,8 +1841,8 @@ run_stack() {
 
   wait_prometheus_samples "target scrape" "up{stack=\"${PROMETHEUS_STACK_LABEL}\"}" 45 || true
   wait_prometheus_samples "readiness metric" 'zinder_readiness_state' 45 || true
-  wait_prometheus_samples "compat frozen-pair publication metric" 'zinder_compat_lightwalletd_frozen_pair_publications_total' 45 || true
-  wait_prometheus_samples "compat frozen-pair convergence metric" 'zinder_compat_lightwalletd_frozen_pair_convergence_total' 45 || true
+  wait_prometheus_samples "compat wallet-serving-pair publication metric" 'zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total' 45 || true
+  wait_prometheus_samples "compat wallet-serving-pair convergence metric" 'zinder_compat_lightwalletd_wallet_serving_pair_publisher_convergence_total' 45 || true
   wait_prometheus_samples "store read metric" 'zinder_store_read_duration_seconds_count' 45 || true
   wait_prometheus_samples "rocksdb property metric" 'zinder_store_rocksdb_property' 45 || true
   wait_prometheus_samples "ingest commit metric" 'zinder_ingest_commit_duration_seconds_count' 45 || true

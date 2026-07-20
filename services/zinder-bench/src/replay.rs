@@ -12,15 +12,18 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use zinder_core::{ChainEpoch, UnixTimestampMillis, wire::encode_rpc_block_hash_hex};
-use zinder_derive::{DeriveStore, ProjectionPreset, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME};
 use zinder_ingest::{
     BulkCatchupRunConfig, CanonicalPipelineLimits, RawBlobPolicy,
     bench_support::{
         BENCH_MAX_RESPONSE_BYTES, BenchBulkCatchupParams, bench_bulk_catchup_run_config,
-        bench_derive_config,
+        bench_materialized_view_config,
     },
-    bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical,
-    open_primary_derive_store_for_canonical_with_projection_preset, run_bulk_catchup_with_store,
+    bootstrap_transparent_address_ranking, catch_up_materialized_view_store_to_canonical,
+    open_primary_materialized_view_store_for_canonical_with_projection_preset,
+    run_bulk_catchup_with_store,
+};
+use zinder_materialized_views::{
+    MaterializedViewStore, ProjectionPreset, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION, ChainEventStreamFamily,
@@ -32,12 +35,12 @@ use crate::{
     error::BenchError,
     fixture::{FixtureManifest, FixtureNodeSource},
     report::{
-        AcceptanceThresholds, CurrentSchemaFixtureReplayMeasurements,
-        CurrentSchemaFixtureReplayReport, CurrentSchemaReplayWriterSettings, FixtureCachePolicy,
-        FixtureSummary, RocksDbResourceBudgetSummary, STORE_READ_TELEMETRY_FAMILY,
-        StartingCanonicalState, StartingCanonicalStateKind, StorageCandidateIdentity,
-        TELEMETRY_COVERAGE_TOTAL, build_current_schema_fixture_replay_report,
-        is_valid_benchmark_trial_id,
+        AcceptanceThresholds, FixtureCachePolicy, FixtureSummary,
+        ProjectionCoupledFixtureReplayMeasurements, ProjectionCoupledFixtureReplayReport,
+        ProjectionCoupledReplayWriterSettings, RocksDbResourceBudgetSummary,
+        STORE_READ_TELEMETRY_FAMILY, StartingCanonicalState, StartingCanonicalStateKind,
+        StorageCandidateIdentity, TELEMETRY_COVERAGE_TOTAL,
+        build_projection_coupled_fixture_replay_report, is_valid_benchmark_trial_id,
     },
     rss::peak_rss,
 };
@@ -254,7 +257,7 @@ struct StartingCheckpointManifestEvidence {
 pub async fn replay_fixture(
     config: ReplayConfig,
     metrics_handle: Option<PrometheusHandle>,
-) -> Result<CurrentSchemaFixtureReplayReport, BenchError> {
+) -> Result<ProjectionCoupledFixtureReplayReport, BenchError> {
     config.validate(metrics_handle.is_some())?;
     if metrics_handle.is_some() {
         metrics::counter!(
@@ -328,7 +331,7 @@ pub async fn replay_fixture(
     };
     let measurements =
         assemble_replay_measurements(&config, canonical_options, starting_canonical_state, run)?;
-    Ok(build_current_schema_fixture_replay_report(
+    Ok(build_projection_coupled_fixture_replay_report(
         fixture,
         &measurements,
         exposition.as_deref(),
@@ -432,14 +435,14 @@ fn assemble_replay_measurements(
     canonical_options: ChainStoreOptions,
     starting_canonical_state: StartingCanonicalState,
     run: ReplayRunMeasurements,
-) -> Result<CurrentSchemaFixtureReplayMeasurements, BenchError> {
+) -> Result<ProjectionCoupledFixtureReplayMeasurements, BenchError> {
     let ReplayRunMeasurements {
         canonical,
         projection,
         pipeline_limits,
         completed_at_unix_millis,
     } = run;
-    Ok(CurrentSchemaFixtureReplayMeasurements {
+    Ok(ProjectionCoupledFixtureReplayMeasurements {
         block_prepare_concurrency: pipeline_limits.block_prepare_concurrency.get(),
         max_response_bytes: pipeline_limits.max_response_bytes.get(),
         source_segment_max_blocks: pipeline_limits.source_segment_max_blocks.get(),
@@ -512,9 +515,9 @@ fn storage_candidate_identity(
     projection_preset: Option<ProjectionPreset>,
 ) -> Result<StorageCandidateIdentity, BenchError> {
     match projection_preset {
-        None => Ok(StorageCandidateIdentity::rocksdb_current_schema_oracle()),
+        None => Ok(StorageCandidateIdentity::rocksdb_projection_coupled_oracle()),
         Some(ProjectionPreset::Wallet | ProjectionPreset::Explorer) => {
-            Ok(StorageCandidateIdentity::rocksdb_current_schema_with_diagnostic_projections())
+            Ok(StorageCandidateIdentity::rocksdb_projection_coupled_with_diagnostic_projections())
         }
         Some(_) => Err(BenchError::invalid_argument(
             "unsupported projection preset for benchmark candidate identity",
@@ -656,8 +659,8 @@ fn open_canonical_store(
     Ok((store, options))
 }
 
-fn canonical_writer_settings(options: ChainStoreOptions) -> CurrentSchemaReplayWriterSettings {
-    CurrentSchemaReplayWriterSettings {
+fn canonical_writer_settings(options: ChainStoreOptions) -> ProjectionCoupledReplayWriterSettings {
+    ProjectionCoupledReplayWriterSettings {
         store_schema_version: CURRENT_STORE_SCHEMA_VERSION,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         sync_writes: options.sync_writes,
@@ -679,7 +682,7 @@ fn prepare_projection_replay(
     if config.projection_preset.is_none() {
         return Ok(None);
     }
-    let projection_path = DeriveStore::path_for_canonical(&config.store_path);
+    let projection_path = MaterializedViewStore::path_for_canonical(&config.store_path);
     if projection_path.exists() {
         return Err(BenchError::invalid_argument(format!(
             "projection replay requires a fresh projection store, but {} already exists; create the throwaway canonical clone without its projection subdirectory",
@@ -701,15 +704,16 @@ fn prepare_projection_replay(
 fn open_projection_store(
     config: &ReplayConfig,
     fixed_range_start_cursor: Option<&StreamCursorTokenV1>,
-) -> Result<Option<DeriveStore>, BenchError> {
+) -> Result<Option<MaterializedViewStore>, BenchError> {
     let Some(projection_preset) = config.projection_preset else {
         return Ok(None);
     };
-    let projection_store = open_primary_derive_store_for_canonical_with_projection_preset(
-        &config.store_path,
-        RocksDbResourceBudget::derive_writer_defaults(),
-        projection_preset,
-    )?;
+    let projection_store =
+        open_primary_materialized_view_store_for_canonical_with_projection_preset(
+            &config.store_path,
+            RocksDbResourceBudget::materialized_view_writer_defaults(),
+            projection_preset,
+        )?;
     if config.projection_replay_scope == ProjectionReplayScope::FixedRange {
         seed_projection_consumers(&projection_store, fixed_range_start_cursor)?;
     }
@@ -720,7 +724,7 @@ async fn measure_projection_replay(
     store_path: &Path,
     canonical_store: &PrimaryChainStore,
     projection_preset: Option<ProjectionPreset>,
-    projection_store: Option<DeriveStore>,
+    projection_store: Option<MaterializedViewStore>,
 ) -> Result<ProjectionMeasurements, BenchError> {
     let (Some(projection_preset), Some(projection_store)) = (projection_preset, projection_store)
     else {
@@ -728,8 +732,12 @@ async fn measure_projection_replay(
     };
     let projection_build_started_at = Instant::now();
     let logical_write_bytes_before = projection_store.logical_write_bytes();
-    catch_up_derive_store_to_canonical(canonical_store, &projection_store, bench_derive_config())
-        .await?;
+    catch_up_materialized_view_store_to_canonical(
+        canonical_store,
+        &projection_store,
+        bench_materialized_view_config(),
+    )
+    .await?;
     if projection_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME) {
         let _ = bootstrap_transparent_address_ranking(canonical_store, &projection_store).await?;
     }
@@ -739,14 +747,14 @@ async fn measure_projection_replay(
         .saturating_sub(logical_write_bytes_before);
     projection_store.refresh_rocksdb_resource_metrics();
     let row_count = projection_row_count(&projection_store, projection_preset)?;
-    let projection_path = DeriveStore::path_for_canonical(store_path);
+    let projection_path = MaterializedViewStore::path_for_canonical(store_path);
     let store_bytes = directory_bytes(&projection_path)?;
     drop(projection_store);
 
     let reopen_started_at = Instant::now();
-    let reopened = open_primary_derive_store_for_canonical_with_projection_preset(
+    let reopened = open_primary_materialized_view_store_for_canonical_with_projection_preset(
         store_path,
-        RocksDbResourceBudget::derive_writer_defaults(),
+        RocksDbResourceBudget::materialized_view_writer_defaults(),
         projection_preset,
     )?;
     let reopen_seconds = reopen_started_at.elapsed().as_secs_f64();
@@ -765,7 +773,7 @@ async fn measure_projection_replay(
 
 fn validate_projection_reached_canonical_tip(
     canonical_store: &PrimaryChainStore,
-    projection_store: &DeriveStore,
+    projection_store: &MaterializedViewStore,
 ) -> Result<(), BenchError> {
     let expected_cursor = canonical_store
         .resolve_chain_event_stream_start(
@@ -800,7 +808,7 @@ fn validate_projection_reached_canonical_tip(
 /// helper because it intentionally declares earlier history out of scope.
 pub fn seed_projection_replay_at_canonical_tip(
     canonical_store: &PrimaryChainStore,
-    projection_store: &zinder_derive::DeriveStore,
+    projection_store: &zinder_materialized_views::MaterializedViewStore,
 ) -> Result<Option<StreamCursorTokenV1>, BenchError> {
     let cursor = canonical_store
         .resolve_chain_event_stream_start(
@@ -813,7 +821,7 @@ pub fn seed_projection_replay_at_canonical_tip(
 }
 
 fn seed_projection_consumers(
-    projection_store: &zinder_derive::DeriveStore,
+    projection_store: &zinder_materialized_views::MaterializedViewStore,
     cursor: Option<&StreamCursorTokenV1>,
 ) -> Result<(), BenchError> {
     let consumer_names = projection_store
@@ -857,7 +865,7 @@ fn validate_starting_tip(
 }
 
 fn projection_row_count(
-    projection_store: &zinder_derive::DeriveStore,
+    projection_store: &zinder_materialized_views::MaterializedViewStore,
     projection_preset: ProjectionPreset,
 ) -> Result<u64, BenchError> {
     let mut row_count = 0_u64;

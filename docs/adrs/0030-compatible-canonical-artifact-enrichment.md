@@ -20,5 +20,5 @@ Absence remains explicit. A read may bridge an unsettled enrichment gap only fro
 ## Consequences
 
 - Schema numbers have one owner in `zinder-store`; feature tests use named current or historical constants.
-- Writer and readers upgrade as one coordinated service set with a canonical-plus-derive checkpoint.
+- Writer and readers upgrade as one coordinated service set with a canonical-plus-materialized-view checkpoint.
 - Enrichment progress is separate from canonical readiness and is exposed through feature coverage.

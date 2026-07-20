@@ -79,9 +79,9 @@ enum ErrorReason {
   ENTROPY_UNAVAILABLE = 33;
   EXPLORER_INTERNAL = 37;
 
-  // FAILED_PRECONDITION family (derive-projection and node-capability gates).
-  DERIVE_PROJECTION_UNAVAILABLE = 34;
-  DERIVE_PROJECTION_LAGGING = 35;
+  // FAILED_PRECONDITION family (materialized-view and node-capability gates).
+  MATERIALIZED_VIEW_UNAVAILABLE = 34;
+  MATERIALIZED_VIEW_LAGGING = 35;
   NODE_CAPABILITY_MISSING = 36;
   EXPLORER_PRECONDITION_UNSATISFIED = 40;
 
@@ -93,7 +93,7 @@ enum ErrorReason {
 
   // FAILED_PRECONDITION family (operator must reconfigure the deployment).
   // A federated dependency the request needs (the canonical fact store, a
-  // derive view, or a wallet-query endpoint) is not wired on this deployment.
+  // materialized view, or a wallet-query endpoint) is not wired on this deployment.
   // Waiting never clears it; the operator must configure the dependency.
   DEPENDENCY_NOT_CONFIGURED = 41;
 

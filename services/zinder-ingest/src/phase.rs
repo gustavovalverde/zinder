@@ -42,9 +42,9 @@ pub fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
 /// - [`IngestPhase::BulkCatchup`] when the gap from the store tip to
 ///   the upstream tip exceeds `catchup_threshold_blocks`. The bulk
 ///   driver runs the pipelined fetch shape and commits with
-///   `AdvanceSafeTipTo`.
+///   `AdvanceSettledTipTo`.
 /// - [`IngestPhase::FollowingTip`] otherwise. The serial driver
-///   commits one block per poll cycle and advances the safe-tip
+///   commits one block per poll cycle and advances the settled-tip
 ///   boundary through `finalize_tip_if_ready`.
 ///
 /// An empty store (`store_tip = None`) is treated as height `0` so the

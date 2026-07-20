@@ -57,7 +57,8 @@ const CANONICAL_WRITER_BUDGET: RocksDbResourceBudget =
     RocksDbResourceBudget::canonical_writer_defaults();
 const CANONICAL_READER_BUDGET: RocksDbResourceBudget =
     RocksDbResourceBudget::canonical_reader_defaults();
-const WALLET_WRITER_BUDGET: RocksDbResourceBudget = RocksDbResourceBudget::derive_writer_defaults();
+const WALLET_WRITER_BUDGET: RocksDbResourceBudget =
+    RocksDbResourceBudget::materialized_view_writer_defaults();
 
 #[derive(Serialize)]
 struct WalletTransitionReport {

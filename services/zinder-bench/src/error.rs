@@ -50,21 +50,21 @@ pub enum BenchError {
         #[source]
         source: Box<zinder_ingest::CanonicalBlockConstructionError>,
     },
-    /// A blocking fixture-read or fact-preparation task did not complete.
-    #[error("canonical fact preparation task failed: {reason}")]
-    CanonicalFactPreparationTask {
+    /// A blocking fixture-read or replay-preparation task did not complete.
+    #[error("canonical replay preparation task failed: {reason}")]
+    CanonicalReplayPreparationTask {
         /// Human-readable join failure.
         reason: String,
     },
-    /// An ordered canonical fact sequence violated its range or digest contract.
-    #[error("canonical fact sequence mismatch: {reason}")]
-    CanonicalFactSequenceMismatch {
+    /// An ordered canonical replay sequence violated its range or digest contract.
+    #[error("canonical replay sequence mismatch: {reason}")]
+    CanonicalReplaySequenceMismatch {
         /// Human-readable mismatch description.
         reason: String,
     },
-    /// A concrete fact-first storage candidate failed its build or validation.
+    /// A concrete canonical-replay-storage storage candidate failed its build or validation.
     #[error("{candidate} storage candidate error: {reason}")]
-    FactStorageCandidate {
+    CanonicalReplayCandidate {
         /// Stable benchmark candidate identifier.
         candidate: &'static str,
         /// Engine-specific failure description without credentials.
@@ -84,14 +84,14 @@ pub enum BenchError {
         #[source]
         source: zinder_store::StoreError,
     },
-    /// Fresh version-1 canonical construction failed.
+    /// Fresh canonical construction failed.
     #[error("canonical storage lifecycle construction error: {source}")]
     CanonicalConstruction {
         /// Underlying construction failure.
         #[source]
         source: zinder_ingest::CanonicalConstructionError,
     },
-    /// A version-1 canonical store could not be created, published, or admitted.
+    /// A canonical store could not be created, published, or admitted.
     #[error("canonical storage lifecycle error: {source}")]
     CanonicalStorage {
         /// Underlying canonical store failure.
@@ -105,7 +105,7 @@ pub enum BenchError {
         #[source]
         source: zinder_store::CanonicalStoreBuildPlanError,
     },
-    /// Version-1 wallet construction or admission failed.
+    /// Wallet construction or admission failed.
     #[error("wallet storage lifecycle error: {source}")]
     WalletStorage {
         /// Underlying wallet storage failure.
@@ -117,7 +117,7 @@ pub enum BenchError {
     Projection {
         /// Underlying projection-store failure.
         #[source]
-        source: zinder_derive::DeriveStoreError,
+        source: zinder_materialized_views::MaterializedViewStoreError,
     },
     /// Projection construction returned without reaching the canonical event tip.
     #[error("projection build incomplete: {reason}")]
@@ -219,8 +219,8 @@ impl From<zinder_wallet_rocksdb::RocksDbWalletError> for BenchError {
     }
 }
 
-impl From<zinder_derive::DeriveStoreError> for BenchError {
-    fn from(source: zinder_derive::DeriveStoreError) -> Self {
+impl From<zinder_materialized_views::MaterializedViewStoreError> for BenchError {
+    fn from(source: zinder_materialized_views::MaterializedViewStoreError) -> Self {
         Self::Projection { source }
     }
 }
@@ -259,27 +259,30 @@ impl BenchError {
         }
     }
 
-    /// Builds a fact-preparation task error from a join failure.
+    /// Builds a replay-preparation task error from a join failure.
     #[must_use]
-    pub fn canonical_fact_preparation_task(reason: impl Into<String>) -> Self {
-        Self::CanonicalFactPreparationTask {
+    pub fn canonical_replay_storage_preparation_task(reason: impl Into<String>) -> Self {
+        Self::CanonicalReplayPreparationTask {
             reason: reason.into(),
         }
     }
 
-    /// Builds an ordered fact-sequence validation error.
+    /// Builds an ordered replay-sequence validation error.
     #[must_use]
-    pub fn canonical_fact_sequence_mismatch(reason: impl Into<String>) -> Self {
-        Self::CanonicalFactSequenceMismatch {
+    pub fn canonical_replay_storage_sequence_mismatch(reason: impl Into<String>) -> Self {
+        Self::CanonicalReplaySequenceMismatch {
             reason: reason.into(),
         }
     }
 
-    /// Builds an engine-specific fact storage error without exposing its
+    /// Builds an engine-specific replay storage error without exposing its
     /// connection string or other secret-bearing configuration.
     #[must_use]
-    pub fn fact_storage_candidate(candidate: &'static str, reason: impl Into<String>) -> Self {
-        Self::FactStorageCandidate {
+    pub fn canonical_replay_storage_candidate(
+        candidate: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::CanonicalReplayCandidate {
             candidate,
             reason: reason.into(),
         }

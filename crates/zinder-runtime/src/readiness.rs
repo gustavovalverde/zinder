@@ -38,9 +38,9 @@ pub enum IngestPhase {
     /// interval and emits `cause=upstream_not_ready` until enough chain
     /// exists to commit.
     AwaitingUpstream,
-    /// Gap to the upstream tip is above `ingest.phases.catchup_threshold_blocks`.
+    /// Gap to the upstream tip is above `ingest.phase_classification.catchup_threshold_blocks`.
     /// The bulk-catchup driver runs pipelined block fetches and commits
-    /// batches with `AdvanceSafeTipTo`.
+    /// batches with `AdvanceSettledTipTo`.
     BulkCatchup,
     /// Gap is within the catch-up threshold. The serial tip-follow driver
     /// commits one block per poll cycle.
@@ -488,7 +488,7 @@ impl Readiness {
     /// classifier via [`Self::set_phase`]; cause writers (bulk-catchup batch
     /// boundary, upstream-outage backoff, retention warnings) build a fresh
     /// [`ReadinessState`] with no phase, so retaining the last-stamped phase
-    /// keeps `/readyz` and the derive replay phase gate stable between
+    /// keeps `/readyz` and the materialized-view replay phase gate stable between
     /// classifier stamps. Retention and mempool warnings do not observe an
     /// upstream target, so they retain the preceding target through the
     /// warning and its transition back to ready. An explicit
@@ -531,7 +531,7 @@ impl Readiness {
     /// Returns the current [`IngestPhase`] without cloning the readiness cause.
     ///
     /// Cheaper than [`Self::report`] for hot readers that only need the phase,
-    /// such as the derive replay phase gate that samples it per replayed event.
+    /// such as the materialized-view replay phase gate that samples it per replayed event.
     #[must_use]
     pub fn phase(&self) -> Option<IngestPhase> {
         self.inner.lock().phase

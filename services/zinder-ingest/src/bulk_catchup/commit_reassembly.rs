@@ -692,7 +692,7 @@ async fn commit_built_bulk_catchup_batch_inner(
         store,
         chain_epoch,
         batch,
-        ReorgWindowChange::AdvanceSafeTipTo { height: tip_height },
+        ReorgWindowChange::AdvanceSettledTipTo { height: tip_height },
     )
     .await;
     record_bulk_pipeline_stage_duration(

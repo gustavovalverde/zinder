@@ -198,7 +198,7 @@ pub struct FixtureManifest {
     ///
     /// This is provenance for comparisons with the temporary `RocksDB` oracle;
     /// it is not part of the backend-neutral canonical-fact contract.
-    pub current_schema_oracle_artifact_schema_version: u16,
+    pub projection_coupled_oracle_artifact_schema_version: u16,
     /// Backend-neutral block-digest contract and ordered-sequence oracle.
     pub canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence,
     /// Hash of the block at `to_height`, hex-encoded in internal byte order,

@@ -163,7 +163,7 @@ pub struct FixtureTransactionRows {
     /// Optional transaction-intrinsic shielded value balances.
     ///
     /// Constructors populate all-zero balances so schema-19 replay and
-    /// current-schema rows remain exact by default. `None` is reserved for
+    /// canonical schema rows remain exact by default. `None` is reserved for
     /// tests that deliberately construct an invalid or incomplete artifact set.
     pub intrinsic_value_balances: Option<TransactionIntrinsicValueBalances>,
 }
@@ -230,7 +230,7 @@ impl FixtureTransactionRows {
         self
     }
 
-    /// Returns the current-schema intrinsic-balance artifact for these rows.
+    /// Returns the canonical intrinsic-balance artifact for these rows.
     #[must_use]
     pub fn intrinsic_value_balances_artifact(
         &self,

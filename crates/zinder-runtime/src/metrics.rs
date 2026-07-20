@@ -32,7 +32,7 @@ const DURATION_SECONDS_BUCKETS: &[f64] = &[
 /// bucket alerts an SRE that a startup phase exceeded ten minutes, which
 /// is the shape `open_storage` takes during the bulk-catchup OOM trap
 /// described in
-/// [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
+/// [the resource-tuning runbook](../../../docs/runbooks/bulk-catchup-resource-tuning.md).
 const STARTUP_PHASE_DURATION_SECONDS_BUCKETS: &[f64] = &[
     0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0,
 ];

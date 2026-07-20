@@ -64,8 +64,8 @@ pub enum StoreReadCaller {
     CommitFallback,
     /// Safe-tip retention sweep scans.
     RetentionSweep,
-    /// Derive-replay spend-fact and block/transaction hydration.
-    DeriveHydration,
+    /// Materialized-view replay spend-fact and block/transaction hydration.
+    MaterializedViewHydration,
 }
 
 impl StoreReadCaller {
@@ -77,7 +77,7 @@ impl StoreReadCaller {
             Self::BlockPrefetch => "block_prefetch",
             Self::CommitFallback => "commit_fallback",
             Self::RetentionSweep => "retention_sweep",
-            Self::DeriveHydration => "derive_hydration",
+            Self::MaterializedViewHydration => "materialized_view_hydration",
         }
     }
 }
@@ -102,7 +102,7 @@ impl RocksDbOpenPosture {
 
 /// Store domain and open posture used to label `RocksDB` resource gauges.
 ///
-/// The canonical chain store and the derive store share one process, so the
+/// The canonical chain store and the materialized-view store share one process, so the
 /// cache, memtable, WAL, and per-CF gauges carry a `store_role` label to keep
 /// their resident footprints distinguishable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,10 +111,10 @@ pub enum StoreRole {
     CanonicalPrimary,
     /// Canonical chain store opened as a secondary reader.
     CanonicalSecondary,
-    /// Derive store opened as the primary writer.
-    DerivePrimary,
-    /// Derive store opened as a secondary reader.
-    DeriveSecondary,
+    /// Materialized-view store opened as the primary writer.
+    MaterializedViewPrimary,
+    /// Materialized-view store opened as a secondary reader.
+    MaterializedViewSecondary,
 }
 
 impl StoreRole {
@@ -124,15 +124,17 @@ impl StoreRole {
         match self {
             Self::CanonicalPrimary => "canonical_primary",
             Self::CanonicalSecondary => "canonical_secondary",
-            Self::DerivePrimary => "derive_primary",
-            Self::DeriveSecondary => "derive_secondary",
+            Self::MaterializedViewPrimary => "materialized_view_primary",
+            Self::MaterializedViewSecondary => "materialized_view_secondary",
         }
     }
 
     const fn open_posture(self) -> RocksDbOpenPosture {
         match self {
-            Self::CanonicalPrimary | Self::DerivePrimary => RocksDbOpenPosture::Primary,
-            Self::CanonicalSecondary | Self::DeriveSecondary => RocksDbOpenPosture::Secondary,
+            Self::CanonicalPrimary | Self::MaterializedViewPrimary => RocksDbOpenPosture::Primary,
+            Self::CanonicalSecondary | Self::MaterializedViewSecondary => {
+                RocksDbOpenPosture::Secondary
+            }
         }
     }
 }
@@ -951,7 +953,7 @@ fn wal_size_bytes(db: &DB) -> Option<u64> {
 
 /// Publishes the bounded-`RocksDB` resource gauges under a `store_role` label.
 ///
-/// Shared by the canonical chain store and the derive store so both instances
+/// Shared by the canonical chain store and the materialized-view store so both instances
 /// contribute distinguishable cache, memtable, WAL, and per-CF footprints to
 /// the same series. `store_role` keeps the aggregate resident set attributable
 /// to each instance. Primary-only controls are omitted for secondary roles.
@@ -1135,7 +1137,7 @@ fn apply_statistics_level(db_options: &mut Options, level: RocksDbStatisticsLeve
 
 /// Builds `RocksDB` options for any writer-posture instance in the workspace.
 ///
-/// The canonical chain store and the derive store both route through this
+/// The canonical chain store and the materialized-view store both route through this
 /// factory; ADR-0020 describes the bounded resource budget applied here.
 ///
 /// Locked invariants applied here are non-tunable: write-ahead logging on
@@ -1205,7 +1207,7 @@ fn build_write_buffer_manager(memtable_budget_bytes: u64) -> WriteBufferManager 
 ///
 /// Index and filter blocks are accounted to `cache` so the at-rest
 /// metadata budget stays bounded by [`RocksDbResourceBudget::block_cache_bytes`].
-/// Public because the derive store re-uses the same factory; see
+/// Public because the materialized-view store re-uses the same factory; see
 /// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
 #[must_use]
 pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
@@ -2169,13 +2171,19 @@ mod tests {
             None
         );
 
-        for role in [StoreRole::CanonicalPrimary, StoreRole::DerivePrimary] {
+        for role in [
+            StoreRole::CanonicalPrimary,
+            StoreRole::MaterializedViewPrimary,
+        ] {
             assert_eq!(
                 role.open_posture().effective_max_background_jobs(budget),
                 Some(6)
             );
         }
-        for role in [StoreRole::CanonicalSecondary, StoreRole::DeriveSecondary] {
+        for role in [
+            StoreRole::CanonicalSecondary,
+            StoreRole::MaterializedViewSecondary,
+        ] {
             assert_eq!(
                 role.open_posture().effective_max_background_jobs(budget),
                 None

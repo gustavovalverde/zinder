@@ -72,7 +72,7 @@ use crate::common::{
 /// Number of blocks below the tip to bulk catch up.
 ///
 /// Small enough to keep the test under a minute against mainnet; large enough
-/// that the sampled coinbase has crossed the safe tip by the time the federated
+/// that the sampled coinbase has crossed the settled tip by the time the federated
 /// balance reads it back.
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 

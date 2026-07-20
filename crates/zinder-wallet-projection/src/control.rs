@@ -509,7 +509,7 @@ impl WalletStoreControlRecord {
         Ok(bytes)
     }
 
-    /// Decodes and validates one exact version-1 wallet control record.
+    /// Decodes and validates one exact wallet control record.
     pub fn decode(encoded: &[u8]) -> Result<Self, WalletProjectionContractError> {
         let mut decoder = WalletControlDecoder::new(encoded);
         let identity = decoder.read_bytes(WALLET_PROJECTION_STORE_IDENTITY.len())?;

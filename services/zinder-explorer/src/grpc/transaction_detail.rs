@@ -23,7 +23,7 @@ use zinder_core::{
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V3;
 use zinder_proto::wire::encode_privacy_shape;
 
-use zinder_derive::{DeriveStore, TransactionFeesConsumer};
+use zinder_materialized_views::{MaterializedViewStore, TransactionFeesConsumer};
 use zinder_proto::v1::{
     explorer::{
         LockTime as WireLockTime, LockTimeUnlocked, TransactionComponentCounts,
@@ -59,7 +59,7 @@ use super::transparent_input::{
 /// shared dependency does not ripple through every call site.
 pub(crate) struct TransactionDetailContext<'context> {
     pub(crate) chain_store: Option<&'context SecondaryChainStore>,
-    pub(crate) derive_store: Option<&'context DeriveStore>,
+    pub(crate) materialized_view_store: Option<&'context MaterializedViewStore>,
     pub(crate) network: zinder_core::Network,
     pub(crate) upstream_observation_cache: &'context UpstreamObservationCache,
 }
@@ -72,7 +72,7 @@ pub(crate) async fn handle_transaction_detail(
 ) -> Result<Response<TransactionDetailResponse>, Status> {
     let TransactionDetailContext {
         chain_store,
-        derive_store,
+        materialized_view_store,
         network,
         upstream_observation_cache,
     } = context;
@@ -105,7 +105,7 @@ pub(crate) async fn handle_transaction_detail(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            derive_store,
+            materialized_view_store,
             EXPLORER_TRANSACTION_DETAIL_V3,
             Some(chain_epoch.clone()),
             0,
@@ -118,7 +118,7 @@ pub(crate) async fn handle_transaction_detail(
         transaction.canonical_artifact.as_ref(),
     )?;
     let fees = resolve_fee_record(
-        derive_store,
+        materialized_view_store,
         transaction.canonical_artifact.as_ref(),
         &parent_transactions,
     )?;
@@ -286,7 +286,7 @@ fn resolve_facts_and_location(
 }
 
 fn resolve_fee_record(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     transaction: Option<&TransactionFactsArtifact>,
     parent_transactions: &HashMap<TransactionId, Option<TransactionFactsArtifact>>,
 ) -> Result<Option<TransactionFeesRecord>, Status> {
@@ -296,12 +296,12 @@ fn resolve_fee_record(
     if transaction.public_facts.is_coinbase {
         return Ok(None);
     }
-    let Some(derive_store) = derive_store else {
+    let Some(materialized_view_store) = materialized_view_store else {
         return Ok(None);
     };
 
     let projected = TransactionFeesConsumer::read_fees_record(
-        derive_store,
+        materialized_view_store,
         transaction.location.transaction_id,
         transaction.public_facts.privacy_shape,
     )
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_fee_fallback_stays_behind_derive_capability() {
+    fn canonical_fee_fallback_stays_behind_materialized_view_capability() {
         let transaction_id = TransactionId::from_bytes([9; 32]);
         let transaction = TransactionFactsArtifact::new(
             TransactionLocation::new(

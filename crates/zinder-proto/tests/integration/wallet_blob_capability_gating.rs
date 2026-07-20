@@ -82,7 +82,7 @@ fn blob_policies_never_advertise_on_explorer_or_ingest() {
     let readiness = ExplorerReadiness {
         wallet_query_online: true,
         canonical_store_online: true,
-        derive_store_online: true,
+        materialized_view_store_online: true,
         prevout_resolution_online: true,
         payment_disclosure_verifier_online: true,
         ..ExplorerReadiness::default()

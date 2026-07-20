@@ -195,7 +195,7 @@ if [[ -n "$release_images_workflow" ]]; then
     cat >&2 <<'EOF'
 release admission rejected: the image workflow would publish the mixed
 zinder-single-container bundle. Phase 7 must supply and certify a complete
-version-1 topology before a bundled production image can be published.
+topology before a bundled production image can be published.
 EOF
     exit 1
   fi
@@ -204,7 +204,7 @@ EOF
     cat >&2 <<'EOF'
 release admission rejected: the image workflow would publish a superseded
 query or explorer ownership runtime. Those images return only after their
-separate fact-first secondary migrations pass parity and deletion gates.
+separate canonical secondary migrations pass parity and deletion gates.
 EOF
     exit 1
   fi
@@ -213,7 +213,7 @@ EOF
     cat >&2 <<'EOF'
 release admission rejected: the image workflow omits the independent
 zinder-projector runtime required to construct and continuously follow the
-fact-first wallet projection.
+wallet projection.
 EOF
     exit 1
   fi
@@ -244,7 +244,7 @@ case "$deployment_class:$target" in
     ;;
   production:zinder-single-container)
     cat >&2 <<'EOF'
-release admission rejected: zinder-single-container combines canonical-v1
+release admission rejected: zinder-single-container combines canonical
 ingest with legacy reader ownership and omits zinder-compat-lightwalletd.
 It is not a production candidate.
 EOF
@@ -253,7 +253,7 @@ EOF
   production:zinder-canonical-runtime)
     cat >&2 <<'EOF'
 release admission rejected: zinder-canonical-runtime is an ingest-only
-diagnostic canary. It does not provide the complete version-1 topology or a
+diagnostic canary. It does not provide the complete topology or a
 public compatibility route.
 EOF
     exit 1

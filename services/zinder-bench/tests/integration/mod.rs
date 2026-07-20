@@ -1,2 +1,2 @@
-mod postgres_canonical_fact_round_trip;
-mod rocksdb_canonical_fact_round_trip;
+mod postgres_canonical_replay;
+mod rocksdb_canonical_replay;

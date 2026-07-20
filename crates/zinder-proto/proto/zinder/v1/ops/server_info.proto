@@ -41,7 +41,7 @@ message ServerInfo {
   // minimum.
   uint32 contract_revision = 5;
 
-  // Closed projection workload detected from the durable derive manifest.
+  // Closed projection workload detected from the durable materialized-view manifest.
   // Empty only when this process has no projection store attached.
   string projection_preset = 6;
 

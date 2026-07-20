@@ -1,4 +1,4 @@
-//! Atomic fact-first canonical suffix replacement.
+//! Atomic canonical suffix replacement.
 
 use std::collections::HashSet;
 
@@ -308,7 +308,7 @@ impl PreparedLiveReplacement {
             visible_event_sequence: chain_event_sequence,
             visible_block_count: visible_sequence.retained_block_count(),
             visible_sequence_digest: visible_sequence.sequence_digest().as_bytes(),
-            visible_logical_fact_bytes: visible_sequence.logical_replay_bytes(),
+            visible_logical_block_facts_bytes: visible_sequence.logical_replay_bytes(),
             ..store.ready_evidence
         };
         let encoded_control = encode_ready_store_control(

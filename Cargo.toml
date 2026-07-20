@@ -2,9 +2,9 @@
 members = [
     "crates/zinder-core",
     "crates/zinder-client",
-    "crates/zinder-derive",
+    "crates/zinder-materialized-views",
     "crates/zinder-proto",
-    "crates/zinder-bulk-load",
+    "crates/zinder-rocksdb-bulk-load",
     "crates/zinder-runtime",
     "crates/zinder-source",
     "crates/zinder-store",
@@ -80,11 +80,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
 zebra-chain = "11.0.0"
 zinder-core = { path = "crates/zinder-core" }
-zinder-bulk-load = { path = "crates/zinder-bulk-load" }
+zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }
 zinder-client = { path = "crates/zinder-client" }
 zinder-compat-cipherscan = { path = "services/zinder-compat-cipherscan" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
-zinder-derive = { path = "crates/zinder-derive" }
+zinder-materialized-views = { path = "crates/zinder-materialized-views" }
 zinder-explorer = { path = "services/zinder-explorer" }
 zinder-ingest = { path = "services/zinder-ingest" }
 zinder-projector = { path = "services/zinder-projector" }

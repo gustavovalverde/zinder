@@ -27,9 +27,11 @@ use zinder_testkit::StoreFixture;
 #[test]
 fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("derive-print-config-store");
-    let secondary_path = tempdir.path().join("derive-print-config-secondary");
-    let token_path = tempdir.path().join("derive-explorer.token");
+    let storage_path = tempdir.path().join("materialized-view-print-config-store");
+    let secondary_path = tempdir
+        .path()
+        .join("materialized-view-print-config-secondary");
+    let token_path = tempdir.path().join("materialized-view-explorer.token");
     fs::write(&token_path, "expected-token\n")?;
 
     let output = zinder_explorer_command()
@@ -68,9 +70,11 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
 #[test]
 fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("derive-invalid-token-store");
-    let secondary_path = tempdir.path().join("derive-invalid-token-secondary");
-    let token_path = tempdir.path().join("derive-empty.token");
+    let storage_path = tempdir.path().join("materialized-view-invalid-token-store");
+    let secondary_path = tempdir
+        .path()
+        .join("materialized-view-invalid-token-secondary");
+    let token_path = tempdir.path().join("materialized-view-empty.token");
     fs::write(&token_path, "\n")?;
 
     let output = zinder_explorer_command()
@@ -100,7 +104,8 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn runtime_starts_without_derive_store_and_omits_derive_capabilities() -> eyre::Result<()> {
+async fn runtime_starts_without_materialized_view_store_and_omits_materialized_view_capabilities()
+-> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let tempdir = tempdir()?;
     let secondary_path = tempdir.path().join("explorer-secondary");

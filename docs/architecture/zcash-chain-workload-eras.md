@@ -228,7 +228,7 @@ The performance architecture should stay measurement-driven:
 4. RocksDB tuning belongs to bounded resource budgets: memtable size, WAL size,
    write batch size, flush behavior, and compaction pressure. Do not fork
    storage semantics by historical incident.
-5. Derive replay should use the same canonical facts and chain events as normal
+5. Materialized-view replay should use the same canonical facts and chain events as normal
    ingest. A historical band may explain why replay is slower, but it should
    not create a second replay contract.
 

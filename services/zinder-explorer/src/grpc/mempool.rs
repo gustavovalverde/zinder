@@ -1,7 +1,7 @@
 //! `ExplorerQuery` mempool summary, activity, and coherent snapshot views.
 //!
 //! Each handler composes `WalletQuery.MempoolSnapshot` at request time;
-//! no derive consumer is required. `MempoolSnapshot` derives global summary
+//! no materialized-view consumer is required. `MempoolSnapshot` derives global summary
 //! facts and its requested page from one wallet response. The summary
 //! aggregates every entry into one explorer-shaped page; the activity feed
 //! projects the same entries into typed rows ordered by newest-first
@@ -37,7 +37,7 @@ use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
 use super::transaction_detail::encode_component_counts;
-use zinder_derive::DeriveStore;
+use zinder_materialized_views::MaterializedViewStore;
 
 /// Hard cap on the mempool entries the summary aggregates in one call.
 ///
@@ -144,7 +144,7 @@ struct MempoolSnapshotPage {
 
 /// Executes one `ExplorerQuery.MempoolSummary` request.
 pub(crate) async fn handle_mempool_summary(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -171,7 +171,7 @@ pub(crate) async fn handle_mempool_summary(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            derive_store,
+            materialized_view_store,
             EXPLORER_MEMPOOL_SUMMARY_V1,
             Some(chain_epoch),
             snapshot.snapshot_age_millis,
@@ -192,7 +192,7 @@ pub(crate) async fn handle_mempool_summary(
 
 /// Executes one `ExplorerQuery.MempoolSnapshot` request.
 pub(crate) async fn handle_mempool_snapshot(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -224,7 +224,7 @@ pub(crate) async fn handle_mempool_snapshot(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            derive_store,
+            materialized_view_store,
             zinder_proto::capabilities::EXPLORER_MEMPOOL_SNAPSHOT_V1,
             Some(chain_epoch),
             snapshot.snapshot_age_millis,
@@ -297,7 +297,7 @@ fn build_mempool_snapshot_page(
 
 /// Executes one `ExplorerQuery.MempoolActivity` request.
 pub(crate) async fn handle_mempool_activity(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -359,7 +359,7 @@ pub(crate) async fn handle_mempool_activity(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            derive_store,
+            materialized_view_store,
             EXPLORER_MEMPOOL_ACTIVITY_V1,
             Some(chain_epoch),
             snapshot.snapshot_age_millis,

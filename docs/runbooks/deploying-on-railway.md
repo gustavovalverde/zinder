@@ -1,28 +1,21 @@
-# Railway canonical canary
+# Railway canonical-writer validation
 
-Railway is not an admitted wallet-serving topology. Its services do
-not provide the shared host filesystem required by the current
-`rocksdb-single-host` lifecycle, and the deleted mixed single-container
-runtime combined canonical-v1 ingest with superseded readers. The checked-in
-Railway target therefore supports only an ingest-only diagnostic or
-performance canary.
+Railway is not a wallet-serving topology. The supported RocksDB composition
+requires canonical and wallet owners plus readers on one shared host
+filesystem. The checked Railway target runs only `zinder-ingest` for isolated
+canonical correctness, restart, or performance validation.
 
-Use the [single-VM runbook](deploying-on-a-vm.md) for the three-runtime
-wallet-serving shape.
+Use [Deploying on a VM](deploying-on-a-vm.md) for wallet serving.
 
-## Admitted target
+## Target admission
 
-The Railway Dockerfile fails closed unless the service explicitly sets:
+The Railway build requires:
 
 ```text
 RAILWAY_DOCKER_TARGET_STAGE=zinder-canonical-runtime
 ```
 
-That target runs `zinder-ingest` only. It does not publish a wallet API,
-projector, compatibility route, coherent checkpoint, or production readiness
-claim.
-
-Verify the repository admission boundary before deploying:
+Verify the repository guard before deploying:
 
 ```bash
 bash scripts/validate-deployment-admission.sh \
@@ -31,40 +24,34 @@ bash scripts/validate-deployment-admission.sh \
 bash scripts/validate-deployment-admission.sh --verify-railway-default
 ```
 
-## Canary configuration
+The target starts `zinder-ingest` through
+`deploy/canonical-runtime-entrypoint`, drops privileges to the `zinder` user,
+and exposes the operational endpoint. It does not run projector, compatibility,
+native query, explorer, or coherent restore services.
 
-Attach one persistent volume at `/var/lib/zinder` and provide the canonical
-writer configuration through `ZINDER_*` variables. At minimum, set the
-network, Zebra JSON-RPC endpoint, node authentication, wallet projection
-preset, wallet-serving coverage, raw transaction retention, and ingest-control
-settings required by the release's public environment-variable contract.
+## Configuration
 
-The image exposes ingest ops on port 9105. Use `/healthz` for process
-liveness and `/readyz` only as canonical/mempool canary evidence. Neither
-probe proves wallet serving because Railway does not run the projector or
-compatibility reader in this target.
+Attach one persistent volume at `/var/lib/zinder`. Configure the network, Zebra
+endpoint and authentication, canonical path, wallet workload, wallet-serving
+coverage, transaction retention, reorg policy, operations listener, and private
+control listener through `ZINDER_*` variables.
 
-Record the exact image digest, network, starting fence, final fence, elapsed
-construction/publication time, peak memory, physical bytes by family, and
-restart result. Preserve the volume after a failed performance run until its
-evidence has been captured.
+`/healthz` proves process liveness. `/readyz` proves only the canonical writer
+and mempool contract. It does not prove wallet projection, exact-pair serving,
+public TLS, coherent recovery, or client compatibility.
 
-## Rejection cases
+Record the image digest, network, starting and final fences, construction and
+publication duration, peak memory, storage bytes, source settings, and restart
+result outside the repository. Preserve the volume after a failed run until
+the required diagnostic evidence is captured.
 
-Deployment admission must continue rejecting:
+## Boundaries
 
-- the removed `zinder-single-container` target;
-- `zinder-canonical-runtime` as a production class;
-- release workflows that publish superseded query or explorer images;
-- release workflows that omit `zinder-projector`.
+- Do not label this target as a production wallet deployment.
+- Do not add query or compatibility processes to the same container.
+- Do not use Railway service volumes as cross-service RocksDB replication.
+- Do not infer full-topology capacity from the canonical directory alone.
 
-A successful Railway canary can close canonical correctness or performance
-evidence. It cannot close wallet projection, exact-pair serving, coherent
-restore, TLS routing, capacity, or independent-client gates.
-
-## References
-
-- [Wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
-- [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-- [Single-VM deployment](deploying-on-a-vm.md)
-- [Public environment-variable contract](../architecture/public-interfaces.md#environment-variable-mapping)
+See [ADR-0035](../adrs/0035-canonical-storage-topologies.md),
+[Service boundaries](../architecture/service-boundaries.md), and
+[Public interface configuration](../architecture/public-interfaces.md#configuration).

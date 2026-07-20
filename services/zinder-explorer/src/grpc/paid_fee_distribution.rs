@@ -1,15 +1,15 @@
 //! `ExplorerQuery.PaidFeeDistribution` handler.
 //!
-//! Maps exact miner-collected fee frequencies from the derive projection
+//! Maps exact miner-collected fee frequencies from the materialized view
 //! without computing percentiles or product-specific buckets.
 
 use tonic::{Request, Response, Status};
 use zinder_core::{BlockHeight, CanonicalHistoryBounds};
-use zinder_derive::{
-    DeriveStore, PaidFeeDistribution as DerivedPaidFeeDistribution,
+use zinder_materialized_views::{
+    MaterializedViewStore, PaidFeeDistribution as ProjectedPaidFeeDistribution,
     PaidFeeDistributionBackfillCoverage, PaidFeeDistributionConsumer,
-    PaidFeeDistributionDay as DerivedPaidFeeDistributionDay,
-    PaidFeeFrequency as DerivedPaidFeeFrequency,
+    PaidFeeDistributionDay as ProjectedPaidFeeDistributionDay,
+    PaidFeeFrequency as ProjectedPaidFeeFrequency,
 };
 use zinder_proto::capabilities::EXPLORER_PAID_FEE_DISTRIBUTION_V1;
 use zinder_proto::v1::explorer::{
@@ -28,7 +28,7 @@ use super::freshness::{
 
 /// Executes one `ExplorerQuery.PaidFeeDistribution` request.
 pub(crate) async fn handle_paid_fee_distribution(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     canonical_store: &SecondaryChainStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -52,7 +52,7 @@ pub(crate) async fn handle_paid_fee_distribution(
     for _ in 0..MAX_EPOCH_STABILIZATION_ATTEMPTS {
         let (chain_epoch, visible_tip_height) = fetch_current_chain_epoch(wallet_client).await?;
         let (distribution, coverage, freshness) = {
-            let snapshot = derive_store.read_snapshot();
+            let snapshot = materialized_view_store.read_snapshot();
             let distribution = PaidFeeDistributionConsumer::distribution_in_time_range_snapshot(
                 &snapshot,
                 request.start_time_unix_seconds,
@@ -134,11 +134,11 @@ async fn fetch_current_chain_epoch(
     Ok((chain_epoch, visible_tip_height))
 }
 
-fn map_distribution(distribution: DerivedPaidFeeDistribution) -> Vec<PaidFeeDistributionDay> {
+fn map_distribution(distribution: ProjectedPaidFeeDistribution) -> Vec<PaidFeeDistributionDay> {
     distribution.days.into_iter().map(map_day).collect()
 }
 
-fn map_day(day: DerivedPaidFeeDistributionDay) -> PaidFeeDistributionDay {
+fn map_day(day: ProjectedPaidFeeDistributionDay) -> PaidFeeDistributionDay {
     PaidFeeDistributionDay {
         day_start_unix_seconds: day.day_start_unix_seconds,
         frequencies: day.frequencies.into_iter().map(map_frequency).collect(),
@@ -146,7 +146,7 @@ fn map_day(day: DerivedPaidFeeDistributionDay) -> PaidFeeDistributionDay {
     }
 }
 
-fn map_frequency(frequency: DerivedPaidFeeFrequency) -> PaidFeeFrequency {
+fn map_frequency(frequency: ProjectedPaidFeeFrequency) -> PaidFeeFrequency {
     PaidFeeFrequency {
         paid_fee_zat: frequency.paid_fee_zat,
         transaction_count: frequency.transaction_count,
@@ -210,15 +210,15 @@ mod tests {
 
     #[test]
     fn mapping_preserves_exact_frequency_order_and_unavailable_count() {
-        let days = map_distribution(DerivedPaidFeeDistribution {
-            days: vec![DerivedPaidFeeDistributionDay {
+        let days = map_distribution(ProjectedPaidFeeDistribution {
+            days: vec![ProjectedPaidFeeDistributionDay {
                 day_start_unix_seconds: 1_700_006_400,
                 frequencies: vec![
-                    DerivedPaidFeeFrequency {
+                    ProjectedPaidFeeFrequency {
                         paid_fee_zat: 10_000,
                         transaction_count: 4,
                     },
-                    DerivedPaidFeeFrequency {
+                    ProjectedPaidFeeFrequency {
                         paid_fee_zat: 20_000,
                         transaction_count: 2,
                     },

@@ -623,7 +623,7 @@ fn compact_block_range_chunk(
             }),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         compact_block: Some(wallet::CompactBlock {
             height: compact_block.height.value(),

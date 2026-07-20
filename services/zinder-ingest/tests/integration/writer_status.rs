@@ -12,8 +12,10 @@ use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use zinder_core::Network;
-use zinder_derive::{DeriveStore, DeriveStoreOptions, ProjectionPreset};
-use zinder_ingest::{IngestControlGrpcAdapter, RocksDbDeriveStatusReader};
+use zinder_ingest::{IngestControlGrpcAdapter, RocksDbMaterializedViewStatusReader};
+use zinder_materialized_views::{
+    MaterializedViewStore, MaterializedViewStoreOptions, ProjectionPreset,
+};
 use zinder_proto::v1::{
     ingest::{
         WriterPhase, WriterStatusRequest, ingest_control_client::IngestControlClient,
@@ -39,27 +41,32 @@ fn bulk_catchup_readiness(current_height: u32, upstream_height: u32) -> Readines
     )
 }
 
-fn open_derive_store(store_fixture: &StoreFixture) -> Result<DeriveStore> {
-    Ok(DeriveStore::open_with_projection_preset(
-        DeriveStore::path_for_canonical(store_fixture.tempdir_path()),
+fn open_materialized_view_store(store_fixture: &StoreFixture) -> Result<MaterializedViewStore> {
+    Ok(MaterializedViewStore::open_with_projection_preset(
+        MaterializedViewStore::path_for_canonical(store_fixture.tempdir_path()),
         ProjectionPreset::Explorer,
-        DeriveStoreOptions {
+        MaterializedViewStoreOptions {
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-            ..DeriveStoreOptions::default()
+            ..MaterializedViewStoreOptions::default()
         },
     )?)
 }
 
-fn derive_store_with_status(
+fn materialized_view_store_with_status(
     store_fixture: &StoreFixture,
-    derive_status: wallet::DeriveStatus,
-) -> Result<DeriveStore> {
-    let derive_store = open_derive_store(store_fixture)?;
-    derive_store.put_derive_status(&derive_status.encode_to_vec())?;
-    Ok(derive_store)
+    materialized_view_status: wallet::MaterializedViewStatus,
+) -> Result<MaterializedViewStore> {
+    let materialized_view_store = open_materialized_view_store(store_fixture)?;
+    materialized_view_store
+        .put_materialized_view_status(&materialized_view_status.encode_to_vec())?;
+    Ok(materialized_view_store)
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the integration test constructs and verifies one complete writer status response"
+)]
 async fn writer_status_reports_latest_primary_chain_epoch() -> Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let expected_chain_epoch = store_fixture
@@ -70,13 +77,14 @@ async fn writer_status_reports_latest_primary_chain_epoch() -> Result<()> {
         .checked_add(2)
         .ok_or_else(|| eyre::eyre!("fixture height cannot represent a two-block gap"))?;
     let readiness = bulk_catchup_readiness(expected_visible_height, upstream_height);
-    let expected_derive_status = wallet::DeriveStatus {
-        health: wallet::DeriveHealth::Live.into(),
+    let expected_materialized_view_status = wallet::MaterializedViewStatus {
+        health: wallet::MaterializedViewHealth::Live.into(),
         indexed_height: expected_visible_height,
         lag_blocks: 0,
         observed_at_millis: 1_752_588_000_000,
     };
-    let derive_store = derive_store_with_status(&store_fixture, expected_derive_status)?;
+    let materialized_view_store =
+        materialized_view_store_with_status(&store_fixture, expected_materialized_view_status)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
@@ -86,7 +94,9 @@ async fn writer_status_reports_latest_primary_chain_epoch() -> Result<()> {
         store_fixture.chain_store().clone(),
         readiness,
     )
-    .with_derive_status_reader(Arc::new(RocksDbDeriveStatusReader::new(derive_store)));
+    .with_materialized_view_status_reader(Arc::new(RocksDbMaterializedViewStatusReader::new(
+        materialized_view_store,
+    )));
     let server = tokio::spawn(async move {
         Server::builder()
             .add_service(adapter.into_server())
@@ -117,7 +127,10 @@ async fn writer_status_reports_latest_primary_chain_epoch() -> Result<()> {
             estimated_height: None,
         })
     );
-    assert_eq!(chain_view.derive, Some(expected_derive_status));
+    assert_eq!(
+        chain_view.materialized_views,
+        Some(expected_materialized_view_status)
+    );
     let response_chain_epoch = chain_view
         .chain_epoch
         .ok_or_else(|| eyre::eyre!("writer status response missing chain epoch"))?;
@@ -252,16 +265,18 @@ async fn writer_status_reports_upstream_not_ready_snapshot() -> Result<()> {
 }
 
 #[tokio::test]
-async fn malformed_derive_status_does_not_hide_canonical_writer_status() -> Result<()> {
+async fn malformed_materialized_view_status_does_not_hide_canonical_writer_status() -> Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let derive_store = open_derive_store(&store_fixture)?;
-    derive_store.put_derive_status(&[0xff])?;
+    let materialized_view_store = open_materialized_view_store(&store_fixture)?;
+    materialized_view_store.put_materialized_view_status(&[0xff])?;
     let adapter = IngestControlGrpcAdapter::new(
         Network::ZcashRegtest,
         store_fixture.chain_store().clone(),
         Readiness::default(),
     )
-    .with_derive_status_reader(Arc::new(RocksDbDeriveStatusReader::new(derive_store)));
+    .with_materialized_view_status_reader(Arc::new(RocksDbMaterializedViewStatusReader::new(
+        materialized_view_store,
+    )));
 
     let response =
         IngestControlService::writer_status(&adapter, tonic::Request::new(WriterStatusRequest {}))
@@ -272,16 +287,17 @@ async fn malformed_derive_status_does_not_hide_canonical_writer_status() -> Resu
         .chain_view
         .ok_or_else(|| eyre::eyre!("writer status response missing canonical chain view"))?;
     assert!(chain_view.chain_epoch.is_some());
-    assert_eq!(chain_view.derive, None);
+    assert_eq!(chain_view.materialized_views, None);
     Ok(())
 }
 
 #[tokio::test]
-async fn semantically_invalid_derive_status_does_not_hide_canonical_writer_status() -> Result<()> {
+async fn semantically_invalid_materialized_view_status_does_not_hide_canonical_writer_status()
+-> Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let derive_store = derive_store_with_status(
+    let materialized_view_store = materialized_view_store_with_status(
         &store_fixture,
-        wallet::DeriveStatus {
+        wallet::MaterializedViewStatus {
             health: 99,
             indexed_height: 1,
             lag_blocks: 0,
@@ -293,7 +309,9 @@ async fn semantically_invalid_derive_status_does_not_hide_canonical_writer_statu
         store_fixture.chain_store().clone(),
         Readiness::default(),
     )
-    .with_derive_status_reader(Arc::new(RocksDbDeriveStatusReader::new(derive_store)));
+    .with_materialized_view_status_reader(Arc::new(RocksDbMaterializedViewStatusReader::new(
+        materialized_view_store,
+    )));
 
     let response =
         IngestControlService::writer_status(&adapter, tonic::Request::new(WriterStatusRequest {}))
@@ -304,7 +322,7 @@ async fn semantically_invalid_derive_status_does_not_hide_canonical_writer_statu
         .chain_view
         .ok_or_else(|| eyre::eyre!("writer status response missing canonical chain view"))?;
     assert!(chain_view.chain_epoch.is_some());
-    assert_eq!(chain_view.derive, None);
+    assert_eq!(chain_view.materialized_views, None);
     Ok(())
 }
 

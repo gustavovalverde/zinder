@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
-use zinder_derive::DeriveStoreError;
+use zinder_materialized_views::MaterializedViewStoreError;
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlReaderToml,
     IngestControlSection, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
@@ -66,7 +66,7 @@ pub(crate) enum LightwalletdConfigError {
     Store(#[from] StoreError),
 
     #[error(transparent)]
-    DeriveStore(#[from] DeriveStoreError),
+    MaterializedViewStore(#[from] MaterializedViewStoreError),
 
     #[error(transparent)]
     CanonicalStore(#[from] zinder_store::CanonicalStoreError),
@@ -78,7 +78,7 @@ pub(crate) enum LightwalletdConfigError {
     WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
 
     #[error(transparent)]
-    FrozenPair(#[from] crate::frozen_pair::FrozenPairError),
+    WalletServingPair(#[from] crate::wallet_serving_pair_publisher::WalletServingPairError),
 
     #[error(transparent)]
     Query(#[from] zinder_query::QueryError),

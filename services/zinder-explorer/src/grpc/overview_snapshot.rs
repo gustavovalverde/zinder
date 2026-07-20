@@ -7,7 +7,7 @@
 //! lets per-card freshness diverge: the tile claims height N while the
 //! list shows height N+50 because the calls land on different RPC
 //! windows. This handler instead anchors every sub-field to the same
-//! `WalletQuery.LatestBlock` tip and reads every derive-store
+//! `WalletQuery.LatestBlock` tip and reads every materialized-view
 //! column-family in one pass, so the response carries one
 //! `ExplorerFreshness`. The `freshness.chain_epoch.tip_hash` is the
 //! bundle's snapshot identity; two responses with the same `tip_hash`
@@ -19,8 +19,8 @@ use prost::Message as _;
 use tonic::{Code, Request, Response, Status};
 use zinder_core::BlockHeight;
 use zinder_core::wire::encode_height_key_ascending;
-use zinder_derive::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
+use zinder_materialized_views::{
+    BLOCK_SUMMARY_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MaterializedViewStore,
     MempoolEventCountsConsumer, TRANSACTION_HISTORY_COLUMN_FAMILY,
 };
 use zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1;
@@ -75,28 +75,31 @@ const MAX_MEMPOOL_SNAPSHOT_ENTRIES: u32 = 4_096;
 
 /// Executes one `ExplorerQuery.OverviewSnapshot` request.
 pub(crate) async fn handle_overview_snapshot(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<OverviewSnapshotRequest>,
 ) -> Result<Response<OverviewSnapshotResponse>, Status> {
     let limits = RequestLimits::from_request(request.into_inner());
     let anchor = anchor_to_wallet_tip(wallet_client).await?;
-    let block_records = read_block_summary_records(derive_store, anchor.tip_height, &limits)?;
+    let block_records =
+        read_block_summary_records(materialized_view_store, anchor.tip_height, &limits)?;
     let recent_blocks =
         collect_recent_blocks(&block_records, limits.recent_blocks, anchor.tip_height);
     let fee_summary = aggregate_fee_summary(&block_records, limits.fee_summary_blocks);
     let tip_block_time_unix_seconds = recent_blocks
         .first()
         .map_or(0, |summary| summary.block_time_unix_seconds);
-    let recent_transactions = read_recent_transactions(derive_store, limits.recent_transactions)?;
-    let mempool_events = read_mempool_event_counts(derive_store, limits.mempool_window_seconds)?;
+    let recent_transactions =
+        read_recent_transactions(materialized_view_store, limits.recent_transactions)?;
+    let mempool_events =
+        read_mempool_event_counts(materialized_view_store, limits.mempool_window_seconds)?;
     let mempool = aggregate_mempool_summary(wallet_client).await?;
     let value_pools = read_value_pools(wallet_client).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_OVERVIEW_SNAPSHOT_V1,
             Some(anchor.chain_epoch),
             0,
@@ -190,7 +193,7 @@ async fn anchor_to_wallet_tip(
 }
 
 fn read_block_summary_records(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     canonical_tip_height: u32,
     limits: &RequestLimits,
 ) -> Result<Vec<BlockSummaryRecord>, Status> {
@@ -199,7 +202,7 @@ fn read_block_summary_records(
     let start_key = encode_height_key_ascending(BlockHeight::new(start_height));
     let end_key = encode_height_key_ascending(BlockHeight::new(canonical_tip_height));
     let cap = usize::try_from(window).unwrap_or(MAX_FEE_SUMMARY_BLOCK_COUNT as usize);
-    let entries = derive_store
+    let entries = materialized_view_store
         .range_iterate_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &start_key, &end_key, cap)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mut records = Vec::with_capacity(entries.len());
@@ -269,13 +272,13 @@ fn aggregate_fee_summary(records: &[BlockSummaryRecord], limit: u32) -> Overview
 }
 
 fn read_recent_transactions(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     limit: u32,
 ) -> Result<Vec<TransactionHistoryEntry>, Status> {
-    let start_key = [0u8; zinder_derive::TRANSACTION_HISTORY_KEY_LEN];
-    let end_key = [0xFFu8; zinder_derive::TRANSACTION_HISTORY_KEY_LEN];
+    let start_key = [0u8; zinder_materialized_views::TRANSACTION_HISTORY_KEY_LEN];
+    let end_key = [0xFFu8; zinder_materialized_views::TRANSACTION_HISTORY_KEY_LEN];
     let cap = usize::try_from(limit).unwrap_or(MAX_RECENT_TRANSACTIONS_LIMIT as usize);
-    let rows = derive_store
+    let rows = materialized_view_store
         .range_iterate_consumer(TRANSACTION_HISTORY_COLUMN_FAMILY, &start_key, &end_key, cap)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mut entries = Vec::with_capacity(rows.len());
@@ -286,7 +289,7 @@ fn read_recent_transactions(
 }
 
 fn read_mempool_event_counts(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     window_seconds: u32,
 ) -> Result<OverviewMempoolEvents, Status> {
     let now_seconds = current_unix_seconds();
@@ -294,7 +297,7 @@ fn read_mempool_event_counts(
     let start_key = MempoolEventCountsConsumer::key_for_second(window_start);
     let end_key = MempoolEventCountsConsumer::key_for_second(now_seconds);
     let cap = usize::try_from(window_seconds).unwrap_or(MAX_MEMPOOL_WINDOW_SECONDS as usize);
-    let entries = derive_store
+    let entries = materialized_view_store
         .range_iterate_consumer(
             MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
             &start_key,

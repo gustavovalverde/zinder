@@ -1,17 +1,17 @@
 //! `ExplorerQuery.TransactionComponentSummary` handler.
 //!
-//! Reads exact half-open block-time aggregates from the derive projection and
+//! Reads exact half-open block-time aggregates from the materialized view and
 //! reports whether its joined historical and live-tail coverage spans the
 //! current canonical visible tip.
 
 use tonic::{Request, Response, Status};
 use zinder_core::BlockHeight;
-use zinder_derive::{
-    DeriveStore, TransactionComponentBackfillCoverage,
-    TransactionComponentDay as DerivedTransactionComponentDay,
-    TransactionComponentSummary as DerivedTransactionComponentSummary,
+use zinder_materialized_views::{
+    MaterializedViewStore, TransactionComponentBackfillCoverage,
+    TransactionComponentDay as ProjectedTransactionComponentDay,
+    TransactionComponentSummary as ProjectedTransactionComponentSummary,
     TransactionComponentSummaryConsumer,
-    TransactionComponentTotals as DerivedTransactionComponentTotals,
+    TransactionComponentTotals as ProjectedTransactionComponentTotals,
 };
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2;
 use zinder_proto::v1::explorer::{
@@ -28,7 +28,7 @@ use super::freshness::{
 
 /// Executes one `ExplorerQuery.TransactionComponentSummary` request.
 pub(crate) async fn handle_transaction_component_summary(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<TransactionComponentSummaryRequest>,
@@ -40,18 +40,18 @@ pub(crate) async fn handle_transaction_component_summary(
     )?;
 
     let summary = TransactionComponentSummaryConsumer::summary_in_time_range(
-        derive_store,
+        materialized_view_store,
         request.start_time_unix_seconds,
         request.end_time_unix_seconds,
     )
     .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let coverage = TransactionComponentSummaryConsumer::coverage(derive_store)
+    let coverage = TransactionComponentSummaryConsumer::coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let (chain_epoch, visible_tip_height) = fetch_current_chain_epoch(wallet_client).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,
             Some(chain_epoch),
             0,
@@ -99,7 +99,7 @@ async fn fetch_current_chain_epoch(
 }
 
 fn map_summary(
-    summary: DerivedTransactionComponentSummary,
+    summary: ProjectedTransactionComponentSummary,
     totals_only: bool,
 ) -> (TransactionComponentTotals, Vec<TransactionComponentDay>) {
     let days = if totals_only {
@@ -110,7 +110,7 @@ fn map_summary(
     (map_totals(summary.totals), days)
 }
 
-fn map_totals(totals: DerivedTransactionComponentTotals) -> TransactionComponentTotals {
+fn map_totals(totals: ProjectedTransactionComponentTotals) -> TransactionComponentTotals {
     TransactionComponentTotals {
         transaction_count: totals.transaction_count,
         transparent_input_count: totals.transparent_input_count,
@@ -143,7 +143,7 @@ fn map_totals(totals: DerivedTransactionComponentTotals) -> TransactionComponent
     }
 }
 
-fn map_day(day: DerivedTransactionComponentDay) -> TransactionComponentDay {
+fn map_day(day: ProjectedTransactionComponentDay) -> TransactionComponentDay {
     TransactionComponentDay {
         day_start_unix_seconds: day.day_start_unix_seconds,
         totals: Some(map_totals(day.totals)),
@@ -188,8 +188,8 @@ mod tests {
     use super::*;
     use tonic::Code;
 
-    fn derived_totals() -> DerivedTransactionComponentTotals {
-        DerivedTransactionComponentTotals {
+    fn derived_totals() -> ProjectedTransactionComponentTotals {
+        ProjectedTransactionComponentTotals {
             transaction_count: 1,
             transparent_input_count: 2,
             transparent_output_count: 3,
@@ -228,9 +228,9 @@ mod tests {
     #[test]
     fn summary_mapping_preserves_totals_days_and_extrema() {
         let (totals, days) = map_summary(
-            DerivedTransactionComponentSummary {
+            ProjectedTransactionComponentSummary {
                 totals: derived_totals(),
-                days: vec![DerivedTransactionComponentDay {
+                days: vec![ProjectedTransactionComponentDay {
                     day_start_unix_seconds: 1_700_006_400,
                     totals: derived_totals(),
                     first_legacy_shielded_transaction_time_unix_seconds: Some(1_700_006_401),
@@ -275,9 +275,9 @@ mod tests {
     #[test]
     fn summary_mapping_omits_day_buckets_for_totals_only_request() {
         let (totals, days) = map_summary(
-            DerivedTransactionComponentSummary {
+            ProjectedTransactionComponentSummary {
                 totals: derived_totals(),
-                days: vec![DerivedTransactionComponentDay {
+                days: vec![ProjectedTransactionComponentDay {
                     day_start_unix_seconds: 1_700_006_400,
                     totals: derived_totals(),
                     first_legacy_shielded_transaction_time_unix_seconds: None,

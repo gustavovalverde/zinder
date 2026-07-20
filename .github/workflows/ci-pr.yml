@@ -174,7 +174,7 @@ jobs:
           ZINDER_BENCH_POSTGRES_DATABASE_CPUS: "2.0"
         run: |
           set -euo pipefail
-          evidence_path="benchmark-results/postgres-fact-first-database-ci-compose-ci-compose.resources.json"
+          evidence_path="benchmark-results/postgres-canonical-replay-storage-database-ci-compose-ci-compose.resources.json"
           mkdir -p benchmark-results
           cleanup() {
             docker compose \
@@ -211,7 +211,7 @@ jobs:
 
           jq -e '
             .evidence_format_version == 1
-            and .component_id == "postgres-fact-first-database"
+            and .component_id == "postgres-canonical-replay-storage-database"
             and .trial_id == "ci-compose"
             and .child_exit_status == 0
             and .sources.cgroup_namespace.support == "verified-private"

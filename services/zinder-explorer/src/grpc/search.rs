@@ -44,14 +44,14 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
-use zinder_derive::DeriveStore;
+use zinder_materialized_views::MaterializedViewStore;
 
 const CONFIDENCE_HIGH: f32 = 1.0;
 const CONFIDENCE_AMBIGUOUS: f32 = 0.5;
 
 /// Executes one `ExplorerQuery.Search` request.
 pub(crate) async fn handle_search(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: Network,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -65,7 +65,7 @@ pub(crate) async fn handle_search(
     }
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        build_freshness(derive_store, wallet_client).await?,
+        build_freshness(materialized_view_store, wallet_client).await?,
     )
     .await;
     Ok(Response::new(SearchResponse {
@@ -388,7 +388,7 @@ const fn shielded_address_human_reason(network: zinder_core::Network) -> &'stati
 }
 
 async fn build_freshness(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<ExplorerFreshness, Status> {
     let chain_epoch = wallet_client
@@ -400,5 +400,10 @@ async fn build_freshness(
         .ok_or_else(|| {
             ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
         })?;
-    build_explorer_freshness(derive_store, EXPLORER_SEARCH_V1, Some(chain_epoch), 0)
+    build_explorer_freshness(
+        materialized_view_store,
+        EXPLORER_SEARCH_V1,
+        Some(chain_epoch),
+        0,
+    )
 }

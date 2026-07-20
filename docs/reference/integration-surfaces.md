@@ -33,7 +33,7 @@ Method coverage proves that Zinder has an appropriate public primitive. A suppor
 
 `zinder-compat-lightwalletd` serves the vendored lightwalletd
 `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. It
-opens canonical and derive storage only through secondary readers. It does not
+opens canonical and materialized-view storage only through secondary readers. It does not
 call Zebra, write canonical storage, or build artifacts independently.
 
 For a compatible wallet, Zinder is an endpoint-level replacement for
@@ -52,7 +52,7 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 
 The contract is split across two async traits so the compiler expresses which calls a handle can serve:
 
-- `ChainIndex` carries the canonical and derive-store reads. Both adapters implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
+- `ChainIndex` carries the canonical and materialized-view reads. Both adapters implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
 - `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
 
 A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`; passing a `LocalChainIndex` there is a compile error rather than a runtime "endpoint not configured" failure. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
@@ -122,7 +122,7 @@ Explorer-shaped reads use `WalletQuery` for canonical wallet-plane data and
 `ExplorerQuery` for derived views. A consumer should call `WalletQuery` directly
 for canonical blocks, transactions, tree state, broadcast, and wallet events.
 It should call `ExplorerQuery` for summaries, search, history, distributions,
-rankings, and other derived projections. The derive plane consumes canonical
+rankings, and other derived projections. The materialized-view plane consumes canonical
 artifacts and event streams, owns its own storage, and can be rebuilt without
 touching canonical chain state.
 
@@ -130,6 +130,6 @@ touching canonical chain state.
 
 - [Indexer/wallet boundary](../architecture/indexer-wallet-boundary.md)
 - [Wallet data plane](../architecture/wallet-data-plane.md)
-- [Derive plane](../architecture/derive-plane.md)
+- [Materialized-view plane](../architecture/materialized-view-plane.md)
 - [Protocol boundary](../architecture/protocol-boundary.md)
 - [Server-side wallet pattern](server-side-wallet-pattern.md)

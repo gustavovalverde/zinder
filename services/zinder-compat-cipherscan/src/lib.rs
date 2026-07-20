@@ -4236,11 +4236,11 @@ async fn fork_monitor(
         .into_inner()
         .latest_block
         .ok_or(CipherscanRestError::MissingUpstreamField("latest_block"))?;
-    let safe_tip_height = wallet_client
+    let settled_tip_height = wallet_client
         .latest_safe_block(LatestSafeBlockRequest { at_epoch_id: None })
         .await?
         .into_inner()
-        .safe_tip_block
+        .settled_tip_block
         .map_or(0, |block| block.height);
 
     let mut anchors = Vec::new();
@@ -4266,8 +4266,8 @@ async fn fork_monitor(
                 "tip": latest_block.height,
                 "tip_hash": latest_block.block_hash,
                 "peers": 0,
-                "finalized": safe_tip_height,
-                "finality_gap": latest_block.height.saturating_sub(safe_tip_height),
+                "finalized": settled_tip_height,
+                "finality_gap": latest_block.height.saturating_sub(settled_tip_height),
             },
             "ctaz": Value::Null,
             "status": "ctaz_unavailable",

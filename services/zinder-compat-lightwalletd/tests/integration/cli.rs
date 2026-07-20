@@ -47,7 +47,10 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         "{stdout}"
     );
     assert!(stdout.contains("[storage.canonical.rocksdb]"), "{stdout}");
-    assert!(stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
+    assert!(
+        stdout.contains("[storage.materialized_views.rocksdb]"),
+        "{stdout}"
+    );
     assert!(stdout.contains("[wallet]"), "{stdout}");
     assert!(
         stdout.contains(&format!("path = \"{}\"", path_str(&wallet_path)?)),
@@ -287,11 +290,11 @@ fn ingest_only_section_is_rejected() -> eyre::Result<()> {
 }
 
 #[test]
-fn derive_storage_section_is_accepted() -> eyre::Result<()> {
+fn materialized_views_storage_section_is_accepted() -> eyre::Result<()> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-derive-store");
-    let secondary_path = tempdir.path().join("compat-derive-secondary");
-    let wallet_path = tempdir.path().join("compat-derive-wallet");
+    let storage_path = tempdir.path().join("compat-materialized-view");
+    let secondary_path = tempdir.path().join("compat-materialized-view-secondary");
+    let wallet_path = tempdir.path().join("compat-materialized-view-wallet");
     let config_path = tempdir.path().join("zinder-compat.toml");
     fs::write(
         &config_path,
@@ -305,7 +308,10 @@ fn derive_storage_section_is_accepted() -> eyre::Result<()> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
+    assert!(
+        stdout.contains("[storage.materialized_views.rocksdb]"),
+        "{stdout}"
+    );
     assert!(stdout.contains("block_cache_bytes = 134217728"), "{stdout}");
     assert!(!stderr.contains("ERROR"), "{stderr}");
 
@@ -358,7 +364,7 @@ secondary_path = "{}"
 path = "{}"
 secondary_path = "{}"
 
-[storage.derive.rocksdb]
+[storage.materialized_views.rocksdb]
 block_cache_bytes = 134217728
 
 [compat]

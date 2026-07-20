@@ -9,13 +9,13 @@ pub mod bench_support;
 mod bulk_catchup;
 mod chain_ingest;
 mod conventional_fee_distribution_backfill;
-mod derive_consumers;
-mod derive_status_reader;
 mod ingest_control;
-mod loop_config;
+mod materialized_view_consumers;
+mod materialized_view_status_reader;
 mod memory_pressure;
 mod mempool;
 mod phase;
+mod runtime_config;
 mod source_recovery;
 mod tip_follow;
 mod transaction_component_backfill;
@@ -40,20 +40,18 @@ pub use conventional_fee_distribution_backfill::{
     ConventionalFeeDistributionBackfillConfig, ConventionalFeeDistributionBackfillContext,
     spawn_conventional_fee_distribution_backfill_task,
 };
-pub use derive_consumers::{
-    DEFAULT_DERIVE_TAILER_POLL_INTERVAL, catch_up_derive_store_to_canonical,
-    catch_up_derive_store_to_canonical_until_handoff, open_primary_derive_store_for_canonical,
-    open_primary_derive_store_for_canonical_with_projection_preset,
-    seed_backfill_owned_consumer_cursors, seed_commitment_root_search_cursor_for_backfill,
-    spawn_derive_replay_budget_metrics_task, spawn_derive_tailer_task,
-};
-pub use derive_status_reader::{
-    DeriveStatusReadError, DeriveStatusReader, RocksDbDeriveStatusReader,
-};
 pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
-pub use loop_config::{
-    BulkCatchupConfig, DeriveReplayPolicy, HistoricalWorkGate, IngestDeriveConfig,
-    IngestLoopConfig, IngestModifiers, PhasesConfig, TipFollowPhaseConfig,
+pub use materialized_view_consumers::{
+    DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, catch_up_materialized_view_store_to_canonical,
+    catch_up_materialized_view_store_to_canonical_until_handoff,
+    open_primary_materialized_view_store_for_canonical,
+    open_primary_materialized_view_store_for_canonical_with_projection_preset,
+    seed_backfill_owned_consumer_cursors, seed_commitment_root_search_cursor_for_backfill,
+    spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
+};
+pub use materialized_view_status_reader::{
+    MaterializedViewStatusReadError, MaterializedViewStatusReader,
+    RocksDbMaterializedViewStatusReader,
 };
 pub use memory_pressure::{
     DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,
@@ -64,6 +62,11 @@ pub use mempool::{
     run_live_mempool_owner, run_mempool_retention,
 };
 pub use phase::{classify_phase, current_chain_height};
+pub use runtime_config::{
+    CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalRunOverrides,
+    HistoricalWorkGate, IngestRuntimeConfig, MaterializedViewReplayConfig,
+    MaterializedViewReplayPolicy, PhaseClassificationConfig,
+};
 pub use tip_follow::{
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, TipFollowConfig, open_tip_follow_store, tip_follow,
     tip_follow_with_primary_store,

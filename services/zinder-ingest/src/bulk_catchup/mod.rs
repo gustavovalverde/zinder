@@ -89,11 +89,11 @@ pub struct BulkCatchupRunConfig {
     pub canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32,
     /// Shared source-fetch and block-preparation limits.
     pub pipeline_limits: CanonicalPipelineLimits,
-    /// Maximum safe-tip artifact bytes that can accumulate while the previous
+    /// Maximum settled-tip artifact bytes that can accumulate while the previous
     /// batch is attaching metadata, committing, or flushing.
     pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
     /// Force a `RocksDB` flush after committing this many epochs. See
-    /// [`crate::BulkCatchupConfig::flush_interval_epochs`].
+    /// [`crate::CanonicalConstructionSettings::flush_interval_epochs`].
     pub flush_interval_epochs: NonZeroU32,
     /// Optional raw-byte blob write policy.
     pub raw_blob_policy: RawBlobPolicy,

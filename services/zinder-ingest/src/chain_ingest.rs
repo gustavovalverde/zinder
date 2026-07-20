@@ -36,8 +36,8 @@ use zinder_store::{
 use crate::{
     CanonicalBlockConstructionError,
     artifact_builder::{
-        CurrentSchemaBlockArtifacts, PositionedCanonicalBlock, RawBlobPolicy,
-        expand_current_schema_block_artifacts,
+        PositionedCanonicalBlock, ProjectionCoupledBlockArtifacts, RawBlobPolicy,
+        expand_projection_coupled_block_artifacts,
     },
 };
 
@@ -134,18 +134,18 @@ pub enum IngestError {
         protocol: ShieldedProtocol,
     },
 
-    /// Derive-plane dispatch (consumer apply or store write) failed.
-    #[error("derive dispatch failed: {0}")]
-    DeriveDispatch(String),
+    /// Materialized-view plane dispatch (consumer apply or store write) failed.
+    #[error("materialized-view dispatch failed: {0}")]
+    MaterializedViewDispatch(String),
 
-    /// Derive-store open or operation failed.
+    /// Materialized-view store open or operation failed.
     #[error(transparent)]
-    DeriveStore(#[from] zinder_derive::DeriveStoreError),
+    MaterializedViewStore(#[from] zinder_materialized_views::MaterializedViewStoreError),
 
     /// Canonical history exists without the projection store that previously
-    /// consumed it, so a derive-only rebuild cannot be proven safe.
+    /// consumed it, so a materialized-view-only rebuild cannot be proven safe.
     #[error(
-        "canonical history exists but its projection store is missing at {path:?}; configure a new empty canonical storage path and perform a full re-ingest because derive-only rebuilds are unsupported"
+        "canonical history exists but its projection store is missing at {path:?}; configure a new empty canonical storage path and perform a full re-ingest because materialized-view-only rebuilds are unsupported"
     )]
     ProjectionStoreMissingForCanonical {
         /// Expected projection store path.
@@ -203,7 +203,7 @@ pub enum IngestError {
         tip_height: BlockHeight,
         /// Configured store reorg window in blocks.
         reorg_window_blocks: u32,
-        /// Highest height that can be advanced past the safe tip without explicit override.
+        /// Highest height that can be advanced past the settled tip without explicit override.
         maximum_historical_height: BlockHeight,
     },
 
@@ -468,7 +468,7 @@ impl CanonicalBatch {
             compact_block,
             tip_metadata,
         } = block;
-        let CurrentSchemaBlockArtifacts {
+        let ProjectionCoupledBlockArtifacts {
             block_header,
             block_blob,
             block_transaction_index,
@@ -477,7 +477,7 @@ impl CanonicalBatch {
             transaction_intrinsic_value_balances,
             transaction_blobs,
             transparent_outputs_by_outpoint,
-        } = expand_current_schema_block_artifacts(facts, retained_raw_blobs)?;
+        } = expand_projection_coupled_block_artifacts(facts, retained_raw_blobs)?;
         self.block_replay_envelopes.push(replay_envelope);
         self.block_headers.push(block_header);
         if let Some(block_blob) = block_blob {
@@ -1718,8 +1718,8 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::CanonicalBlockConstruction(_)) => "canonical_block_construction",
         Some(IngestError::Store(_)) => "store",
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
-        Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",
-        Some(IngestError::DeriveStore(_)) => "derive_store",
+        Some(IngestError::MaterializedViewDispatch(_)) => "materialized_view_dispatch",
+        Some(IngestError::MaterializedViewStore(_)) => "materialized_view_store",
         Some(IngestError::ProjectionStoreMissingForCanonical { .. }) => {
             "projection_store_missing_for_canonical"
         }
@@ -1764,7 +1764,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 network = encode_zinder_native_chain_name(chain_epoch.network),
                 tip_height = chain_epoch.visible_tip_height.value(),
                 tip_hash = %display_block_hash(chain_epoch.visible_tip_hash),
-                safe_tip_height = chain_epoch.settled_tip_height.value(),
+                settled_tip_height = chain_epoch.settled_tip_height.value(),
                 block_range_start = committed.block_range.start.value(),
                 block_range_end = committed.block_range.end.value(),
                 event_sequence,
@@ -1782,7 +1782,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 network = encode_zinder_native_chain_name(chain_epoch.network),
                 tip_height = chain_epoch.visible_tip_height.value(),
                 tip_hash = %display_block_hash(chain_epoch.visible_tip_hash),
-                safe_tip_height = chain_epoch.settled_tip_height.value(),
+                settled_tip_height = chain_epoch.settled_tip_height.value(),
                 committed_block_range_start = committed.block_range.start.value(),
                 committed_block_range_end = committed.block_range.end.value(),
                 reverted_block_range_start = reverted.block_range.start.value(),
@@ -1815,7 +1815,7 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
     )
     .set(u32_to_f64(chain_epoch.visible_tip_height.value()));
     metrics::gauge!(
-        "zinder_ingest_writer_safe_tip_height",
+        "zinder_ingest_writer_settled_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u32_to_f64(chain_epoch.settled_tip_height.value()));

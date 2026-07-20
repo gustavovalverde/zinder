@@ -11,7 +11,7 @@ use zinder_core::{
     ChainEpoch, ChainValuePools, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
 };
-use zinder_derive::ProjectionPreset;
+use zinder_materialized_views::ProjectionPreset;
 use zinder_proto::capabilities::{CapabilitySurface, capabilities_for_surface};
 use zinder_proto::v1::{
     ingest::{
@@ -36,7 +36,7 @@ use zinder_store::{
     transparent_mempool_spend_message, transparent_output_entry_message,
 };
 
-use crate::{derive_status_reader::DeriveStatusReader, mempool::MempoolIndex};
+use crate::{materialized_view_status_reader::MaterializedViewStatusReader, mempool::MempoolIndex};
 
 type IngestControlStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
 type ChainEventsStream = IngestControlStream<wallet::ChainEventEnvelope>;
@@ -62,16 +62,16 @@ pub struct IngestControlGrpcAdapter {
     bearer_token: Option<BearerToken>,
     projection_preset: ProjectionPreset,
     readiness: Readiness,
-    derive_status_reader: Option<Arc<dyn DeriveStatusReader>>,
+    materialized_view_status_reader: Option<Arc<dyn MaterializedViewStatusReader>>,
 }
 
 impl IngestControlGrpcAdapter {
     /// Creates an ingest-control adapter over the primary store.
     ///
     /// `readiness` supplies the writer's cached phase and upstream observation.
-    /// The returned adapter does not advertise derive or mempool status;
+    /// The returned adapter does not advertise materialized-view or mempool status;
     /// compose those optional surfaces with
-    /// [`IngestControlGrpcAdapter::with_derive_status_reader`] and
+    /// [`IngestControlGrpcAdapter::with_materialized_view_status_reader`] and
     /// [`IngestControlGrpcAdapter::with_mempool`] to expose `MempoolSnapshot`
     /// and `MempoolEvents` once the writer wires the live `MempoolIndex`.
     #[must_use]
@@ -84,17 +84,17 @@ impl IngestControlGrpcAdapter {
             bearer_token: None,
             projection_preset: ProjectionPreset::Explorer,
             readiness,
-            derive_status_reader: None,
+            materialized_view_status_reader: None,
         }
     }
 
-    /// Wires backend-neutral derive-status observations into `WriterStatus`.
+    /// Wires backend-neutral materialized-view status observations into `WriterStatus`.
     #[must_use]
-    pub fn with_derive_status_reader(
+    pub fn with_materialized_view_status_reader(
         mut self,
-        derive_status_reader: Arc<dyn DeriveStatusReader>,
+        materialized_view_status_reader: Arc<dyn MaterializedViewStatusReader>,
     ) -> Self {
-        self.derive_status_reader = Some(derive_status_reader);
+        self.materialized_view_status_reader = Some(materialized_view_status_reader);
         self
     }
 
@@ -164,16 +164,16 @@ impl IngestControlGrpcAdapter {
             .collect()
     }
 
-    fn read_derive_status(&self) -> Option<wallet::DeriveStatus> {
-        let derive_status_reader = self.derive_status_reader.as_ref()?;
-        match derive_status_reader.read_derive_status() {
+    fn read_materialized_view_status(&self) -> Option<wallet::MaterializedViewStatus> {
+        let materialized_view_status_reader = self.materialized_view_status_reader.as_ref()?;
+        match materialized_view_status_reader.read_materialized_view_status() {
             Ok(status) => status,
             Err(error) => {
                 tracing::warn!(
                     target: "zinder::ingest",
-                    event = "writer_status_derive_status_unavailable",
+                    event = "writer_status_materialized_view_status_unavailable",
                     error = %error,
-                    "writer status omitted unavailable derive status",
+                    "writer status omitted unavailable materialized-view status",
                 );
                 None
             }
@@ -222,8 +222,8 @@ impl IngestControl for IngestControlGrpcAdapter {
                 } else {
                     record_empty_writer_progress(self.network);
                 }
-                let derive_status = if chain_epoch.is_some() {
-                    self.read_derive_status()
+                let materialized_view_status = if chain_epoch.is_some() {
+                    self.read_materialized_view_status()
                 } else {
                     None
                 };
@@ -231,7 +231,7 @@ impl IngestControl for IngestControlGrpcAdapter {
                     self.network,
                     chain_epoch,
                     &readiness_report,
-                    derive_status,
+                    materialized_view_status,
                 )))
             }
             Err(error) => Err(status_from_store_error(&error)),
@@ -542,7 +542,7 @@ fn writer_status_response(
     network: Network,
     chain_epoch: Option<ChainEpoch>,
     readiness_report: &ReadinessReport,
-    derive_status: Option<wallet::DeriveStatus>,
+    materialized_view_status: Option<wallet::MaterializedViewStatus>,
 ) -> WriterStatusResponse {
     let upstream_tip = upstream_tip_from_readiness(readiness_report);
     let gap_blocks = chain_epoch.as_ref().and_then(|chain_epoch| {
@@ -556,7 +556,7 @@ fn writer_status_response(
     let chain_view = chain_epoch.map(|chain_epoch| {
         let mut chain_view = chain_view_message(chain_epoch);
         chain_view.upstream_tip = upstream_tip;
-        chain_view.derive = derive_status;
+        chain_view.materialized_views = materialized_view_status;
         chain_view
     });
     let upstream_not_ready =
@@ -813,7 +813,7 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
     )
     .set(u32_to_f64(chain_epoch.visible_tip_height.value()));
     metrics::gauge!(
-        "zinder_ingest_writer_safe_tip_height",
+        "zinder_ingest_writer_settled_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u32_to_f64(chain_epoch.settled_tip_height.value()));
@@ -836,7 +836,7 @@ fn record_empty_writer_progress(network: Network) {
     )
     .set(0.0);
     metrics::gauge!(
-        "zinder_ingest_writer_safe_tip_height",
+        "zinder_ingest_writer_settled_tip_height",
         "network" => encode_zinder_native_chain_name(network)
     )
     .set(0.0);

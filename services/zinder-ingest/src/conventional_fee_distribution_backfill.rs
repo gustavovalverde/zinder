@@ -6,16 +6,16 @@ use std::{num::NonZeroU32, time::Duration};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::BlockHeight;
-use zinder_derive::{
+use zinder_materialized_views::{
     ConventionalFeeDistributionBackfillCoverage, ConventionalFeeDistributionConsumer,
-    ConventionalFeeDistributionTailCoverage, DeriveStore,
+    ConventionalFeeDistributionTailCoverage, MaterializedViewStore,
 };
 use zinder_store::PrimaryChainStore;
 
 use crate::{
     IngestError,
-    derive_consumers::derive_projection_write_guard,
-    loop_config::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
+    materialized_view_consumers::materialized_view_projection_write_guard,
+    runtime_config::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
     transaction_component_backfill::{canonical_history_bounds, read_canonical_context_batch},
 };
 
@@ -24,14 +24,14 @@ const BACKFILL_CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) fn seed_conventional_fee_distribution_visible_tail(
     chain_store: &PrimaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     through_height: BlockHeight,
     batch_blocks: NonZeroU32,
 ) -> Result<(), IngestError> {
     loop {
-        let tail =
-            ConventionalFeeDistributionConsumer::tail_coverage(derive_store)?.ok_or_else(|| {
-                IngestError::DeriveDispatch(
+        let tail = ConventionalFeeDistributionConsumer::tail_coverage(materialized_view_store)?
+            .ok_or_else(|| {
+                IngestError::MaterializedViewDispatch(
                     "conventional-fee distribution tail boundary is missing during startup seeding"
                         .to_owned(),
                 )
@@ -40,7 +40,7 @@ pub(crate) fn seed_conventional_fee_distribution_visible_tail(
             .complete_through_height
             .map_or(Some(tail.boundary_height), BlockHeight::next)
             .ok_or_else(|| {
-                IngestError::DeriveDispatch(
+                IngestError::MaterializedViewDispatch(
                     "conventional-fee distribution startup tail height overflow".to_owned(),
                 )
             })?;
@@ -54,10 +54,10 @@ pub(crate) fn seed_conventional_fee_distribution_visible_tail(
                 .min(through_height.value()),
         );
         let contexts = read_canonical_context_batch(chain_store, next_height, batch_end)?;
-        let _write_guard = derive_projection_write_guard();
+        let _write_guard = materialized_view_projection_write_guard();
         ConventionalFeeDistributionConsumer::new()
-            .write_tail_seed_batch(derive_store, &contexts)
-            .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+            .write_tail_seed_batch(materialized_view_store, &contexts)
+            .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
     }
 }
 
@@ -74,16 +74,19 @@ pub struct ConventionalFeeDistributionBackfillConfig {
 #[derive(Clone)]
 pub struct ConventionalFeeDistributionBackfillContext {
     chain_store: PrimaryChainStore,
-    derive_store: DeriveStore,
+    materialized_view_store: MaterializedViewStore,
 }
 
 impl ConventionalFeeDistributionBackfillContext {
-    /// Groups the canonical and derive stores for task startup.
+    /// Groups the canonical and materialized-view stores for task startup.
     #[must_use]
-    pub fn new(chain_store: PrimaryChainStore, derive_store: DeriveStore) -> Self {
+    pub fn new(
+        chain_store: PrimaryChainStore,
+        materialized_view_store: MaterializedViewStore,
+    ) -> Self {
         Self {
             chain_store,
-            derive_store,
+            materialized_view_store,
         }
     }
 }
@@ -212,7 +215,8 @@ fn backfill_next_batch_blocking(
     config: ConventionalFeeDistributionBackfillConfig,
     context: &ConventionalFeeDistributionBackfillContext,
 ) -> Result<BackfillProgress, IngestError> {
-    let coverage = ConventionalFeeDistributionConsumer::backfill_coverage(&context.derive_store)?;
+    let coverage =
+        ConventionalFeeDistributionConsumer::backfill_coverage(&context.materialized_view_store)?;
     let Some(chain_epoch) = context.chain_store.current_chain_epoch()? else {
         return Ok(BackfillProgress::CaughtUp {
             through_height: coverage.map(|coverage| coverage.complete_through_height),
@@ -223,7 +227,7 @@ fn backfill_next_batch_blocking(
     let next_height = next_backfill_height(coverage, first_available_height)?;
     let Some(target_height) = historical_backfill_target(
         chain_epoch.settled_tip_height,
-        ConventionalFeeDistributionConsumer::tail_coverage(&context.derive_store)?,
+        ConventionalFeeDistributionConsumer::tail_coverage(&context.materialized_view_store)?,
     ) else {
         return Ok(BackfillProgress::CaughtUp {
             through_height: coverage.map(|coverage| coverage.complete_through_height),
@@ -246,7 +250,7 @@ fn backfill_next_batch_blocking(
     let first_block_time = contexts
         .first()
         .ok_or_else(|| {
-            IngestError::DeriveDispatch(
+            IngestError::MaterializedViewDispatch(
                 "conventional-fee distribution backfill hydrated an empty batch".to_owned(),
             )
         })?
@@ -254,7 +258,7 @@ fn backfill_next_batch_blocking(
     let last_block_time = contexts
         .last()
         .ok_or_else(|| {
-            IngestError::DeriveDispatch(
+            IngestError::MaterializedViewDispatch(
                 "conventional-fee distribution backfill hydrated an empty batch".to_owned(),
             )
         })?
@@ -269,10 +273,10 @@ fn backfill_next_batch_blocking(
         }),
         last_block_time,
     );
-    let _write_guard = derive_projection_write_guard();
+    let _write_guard = materialized_view_projection_write_guard();
     ConventionalFeeDistributionConsumer::new()
-        .write_backfill_batch(&context.derive_store, &contexts, next_coverage)
-        .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+        .write_backfill_batch(&context.materialized_view_store, &contexts, next_coverage)
+        .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
 
     Ok(BackfillProgress::Advanced {
         from_height: next_height,
@@ -302,14 +306,14 @@ fn next_backfill_height(
         return Ok(first_available_height);
     };
     if coverage.complete_from_height != first_available_height {
-        return Err(IngestError::DeriveDispatch(format!(
+        return Err(IngestError::MaterializedViewDispatch(format!(
             "conventional-fee distribution backfill coverage starts at {}, expected {}",
             coverage.complete_from_height.value(),
             first_available_height.value()
         )));
     }
     coverage.complete_through_height.next().ok_or_else(|| {
-        IngestError::DeriveDispatch(
+        IngestError::MaterializedViewDispatch(
             "conventional-fee distribution backfill height overflow".to_owned(),
         )
     })
@@ -359,7 +363,10 @@ mod tests {
             )),
             BlockHeight::new(101),
         );
-        assert!(matches!(result, Err(IngestError::DeriveDispatch(_))));
+        assert!(matches!(
+            result,
+            Err(IngestError::MaterializedViewDispatch(_))
+        ));
     }
 
     #[test]

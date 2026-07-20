@@ -1,4 +1,4 @@
-//! Retained canonical-v1 event reads and projection-build lease protection.
+//! Retained canonical event reads and projection-build lease protection.
 //!
 //! The canonical event column family is append-only by sequence. Projection
 //! builders persist the compact versioned cursor below and retain their build

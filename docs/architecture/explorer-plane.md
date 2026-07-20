@@ -1,13 +1,13 @@
 # Explorer Plane
 
-The explorer plane is post-wallet-cutover architecture, not part of the first
-version-1 production release. Its query-runtime federation text is a future
-migration contract; no explorer or standalone query image is built or started
-by the current release topology.
+The explorer plane is implemented by the optional `zinder-explorer` workspace
+service. The service compiles and is tested with the workspace, but the release
+workflow does not build or publish an explorer image. Operators that need the
+native `ExplorerQuery` surface deploy its binary separately.
 
 The explorer plane is the Zinder product surface for block explorers, dashboards, and analytics consumers. It serves UI-ready, API-ready, and agent-ready views over canonical chain artifacts and replayable event streams, with explicit freshness, typed unavailability, and capability-gated panels. It is owned by `zinder-explorer`.
 
-This document defines the boundary, wire vocabulary, capability namespace, freshness contract, and the rule that distinguishes explorer views from wallet views. It is the sibling document to [Wallet data plane](wallet-data-plane.md) and [Derive plane](derive-plane.md). The explorer plane exercises the derive-plane SDK; the derive plane defines that SDK.
+This document defines the boundary, wire vocabulary, capability namespace, freshness contract, and the rule that distinguishes explorer views from wallet views. It is the sibling document to [Wallet data plane](wallet-data-plane.md) and [Materialized-view plane](materialized-view-plane.md). The explorer plane exercises the materialized-view SDK; the materialized-view plane defines that SDK.
 
 ## Purpose
 
@@ -24,10 +24,11 @@ The decisions that govern this plane:
 
 ## Boundary
 
-`zinder-explorer` is a fourth deployable alongside `zinder-ingest`, `zinder-query`, and `zinder-compat-lightwalletd`. It:
+`zinder-explorer` is an optional runtime over the shared query and storage
+libraries. It:
 
-- **Consumes** the writer-owned derive store as a RocksDB secondary under `storage.path` when available, plus `WalletQuery` over gRPC for federated read paths.
-- **Owns** no primary RocksDB. `storage.path` is the canonical store path; the derive store lives at its `derive` subdirectory and is written by `zinder-ingest`.
+- **Consumes** the writer-owned materialized-view store as a RocksDB secondary under `storage.path` when available, plus `WalletQuery` over gRPC for federated read paths.
+- **Owns** no primary RocksDB. `storage.path` is the canonical store path; the materialized-view store lives in its `materialized-views` subdirectory and is written by `zinder-ingest`.
 - **Produces** the `ExplorerQuery` gRPC service.
 - **Does not** open any primary store; does not call upstream Zcash node RPCs; does not custody any wallet secret; does not serve any balance RPC.
 
@@ -67,22 +68,16 @@ transparent prevout resolves and the canonical privacy shape is
 is a transfer between pools, not a provable fee; shielded and unclassified rows
 therefore retain resolved input values but leave `paid_fee_zat` absent.
 
-Schema version 2 adopts version-1 rows without clearing their column families
-or cursor. Every read requires an independently classified privacy shape and
-suppresses a legacy paid-fee value unless that shape is `TransparentOnly`.
-The same retained parent rows reconstruct fee input values when a fee row is
-missing or partial. This fallback restored historical input details
-after the short-lived transparent-spend facts had been swept, without a replay,
-schema clear, canonical write, or upstream-node call. Transaction detail uses
-one epoch-pinned canonical reader and one parent-fact batch for both public
-prevout enrichment and fee recovery, then merges projected and recovered values
-by input index so neither source can erase a value available from the other.
-Recent-transaction pages
-apply the same merge only to transparent-only rows that still lack a proven
-fee, using two bounded batched canonical reads for at most the request's 1,024
-rows. This is a correctness fallback, not projection repair: readers never
-write derive rows, and a future writer-owned repair pass must be justified by
-measured recurring cost rather than added preemptively.
+Schema v2 reads schema-v1 rows in place. Every read requires an independently
+classified privacy shape and suppresses a paid-fee value unless that shape is
+`TransparentOnly`. Retained parent rows reconstruct fee input values when a fee
+row is missing or partial. Transaction detail uses one epoch-pinned canonical
+reader and one parent-fact batch for both public prevout enrichment and fee
+recovery, then merges projected and recovered values by input index so neither
+source can erase an available value. Recent-transaction pages apply the same
+merge only to transparent-only rows that still lack a proven fee, using two
+bounded batched canonical reads for at most the request's 1,024 rows. Readers
+never write materialized-view rows.
 
 Mempool and conflicting transactions retain their location semantics. Mempool rows expose transaction-intrinsic transparent facts from their transient payload, but do not claim canonical parent resolution, canonical spent state, or actual paid fees. Conflicting transactions carry no payload and therefore keep empty transparent rows. This semantic extension adds no storage family, schema migration, replay, backfill, or data wipe.
 
@@ -127,7 +122,7 @@ height index makes reorg removal deterministic. The row value carries no
 product metadata. A background backfill builds historical rows from existing
 block summaries while chain events maintain the live tail.
 
-One derive-store snapshot supplies time rows, block summaries, paid-fee facts,
+One materialized-view snapshot supplies time rows, block summaries, paid-fee facts,
 projection state, and coverage. A canonical epoch reader validates headers and
 coinbase artifacts. The response exposes separate missing-block,
 missing-coinbase, and missing-paid-fee counts. Continuation cursors freeze the
@@ -162,8 +157,8 @@ from an omitted bucket.
 
 The response freshness describes the current `WalletQuery` chain view observed
 while serving the read. It is not a historical `ChainEpoch` snapshot, and the
-explicit coverage fields prevent a partial local derive range from being
-presented as complete activity history. This contract adds no derive consumer,
+explicit coverage fields prevent a partial local materialized-view range from being
+presented as complete activity history. This contract adds no materialized-view consumer,
 column family, schema version, or replay requirement. A product that needs
 unbounded historical activity must add a dedicated durable projection with its
 own reorg, retention, and backfill semantics.
@@ -185,7 +180,7 @@ Autocomplete indexes are separate materialized views and do not gate the `explor
 
 ## Mempool views
 
-The mempool surface is three request-time views over `WalletQuery.MempoolSnapshot`. None requires a derive consumer: upstream snapshot reads are bounded by the hard cap of 4,096 entries, and every parsed entry uses `zinder_source::parse_transaction_public_fact_set` so privacy-shape and version classifiers stay in lockstep with `TransactionDetail`.
+The mempool surface is three request-time views over `WalletQuery.MempoolSnapshot`. None requires a materialized-view consumer: upstream snapshot reads are bounded by the hard cap of 4,096 entries, and every parsed entry uses `zinder_source::parse_transaction_public_fact_set` so privacy-shape and version classifiers stay in lockstep with `TransactionDetail`.
 
 `ExplorerQuery.MempoolSummary` returns one aggregated page:
 
@@ -204,8 +199,6 @@ message MempoolSummaryResponse {
 The age fields are wall-clock deltas computed at response time against the entry's `first_seen_unix_millis`; they are zero when the snapshot is empty.
 
 `ExplorerQuery.MempoolSnapshot` is the coherent page-ready view. It returns a `MempoolSnapshotSummary`, one bounded page of `MempoolActivityEntry` rows, and the usual opaque cursor from one `WalletQuery.MempoolSnapshot` response. Its summary and entries therefore cannot straddle a mine, eviction, or newly observed transaction. Consumers that display global statistics beside current rows must use this capability instead of combining `MempoolSummary` and `MempoolActivity` from separate requests.
-
-`ExplorerQuery.MempoolActivity` paginates the same snapshot into typed entry rows sorted by newest-first observation time. Each row includes the parsed component counts and the sum of its transparent outputs in zatoshis. Both values are derived from the in-memory `MempoolEntry` at request time, so this surface neither requires a durable projection nor changes the chain-store schema. The cursor is opaque: 12 bytes packing `(first_seen_unix_millis, transaction_id_tail_4_bytes)` big-endian. Mempool state is transient, so subsequent pages may interleave with new arrivals; clients that need a consistent paged read should treat any single response as a snapshot and re-pin if needed.
 
 `ExplorerQuery.MempoolActivity` paginates the same snapshot into typed entry rows sorted by newest-first observation time. Each row includes the parsed component counts and the sum of its transparent outputs in zatoshis. Both values are derived from the in-memory `MempoolEntry` at request time, so this surface neither requires a durable projection nor changes the chain-store schema. The cursor is opaque: 12 bytes packing `(first_seen_unix_millis, transaction_id_tail_4_bytes)` big-endian. Mempool state is transient, so subsequent pages may interleave with new arrivals; clients that need a consistent paged read should treat any single response as a snapshot and re-pin if needed.
 
@@ -235,7 +228,7 @@ transaction enrichment. It does not label ranking or canonical facts with an
 independently advancing `WalletQuery` reader epoch. Ranking coverage newer than
 the selected epoch is rejected; active metadata is read again after the summary
 to close generation activation and live-tail races. `ExplorerFreshness` carries
-the shared derive indexed tip, including its hash, so adapters can mark a
+the shared materialized-view indexed tip, including its hash, so adapters can mark a
 same-height canonical mismatch as degraded. This design remains correct during
 ordinary one-block reader skew without requiring retries or returning a mixed
 snapshot.
@@ -268,7 +261,7 @@ totals, so consumers can distinguish standard script templates without scanning
 or decoding every ranked row.
 
 The method is available only while an active materialized generation exists.
-Its `ExplorerFreshness` must describe the same derive cursor and canonical epoch
+Its `ExplorerFreshness` must describe the same materialized-view cursor and canonical epoch
 as that generation; an in-progress replacement generation is never visible.
 This gives dashboards and agents a stable rank snapshot while ingest constructs
 or resumes a replacement after a schema change or interrupted bootstrap.
@@ -277,7 +270,7 @@ or resumes a replacement after a schema change or interrupted bootstrap.
 
 `ExplorerQuery.FeeSummary` aggregates per-transaction [ZIP-317](https://zips.z.cash/zip-0317) conventional fee floors across an inclusive block range. The fee fields are the ZIP-317 floor `MARGINAL_FEE × max(logical_actions, GRACE_ACTIONS)`, not miner-collected fees: computing actual fees requires resolving every transparent input via `WalletQuery.TransparentOutputsByOutpoint`, and that fan-out is intentionally out of scope for `v1`. The conventional-fee floor is the minimum a wallet should attach to a transaction with the given shape; aggregates over many blocks give an explorer page a useful approximation of fee floors without prevout resolution.
 
-`logical_actions = max(transparent_input_count, transparent_output_count, max(sapling_spend_count, sapling_output_count), orchard_action_count) + ironwood_action_count`. The derive plane computes component counts from `TransactionFactsArtifact` once and materializes per-block fee aggregates in `BlockSummaryRecord`. The handler scans those typed records; it does not request raw blocks or parse `zebra-chain` bytes on the read path. The fee helper lives on `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat` so the same formula is reusable from any handler that builds the count shape. The range cap is 256 blocks per request; coinbase transactions are excluded because they have no fee.
+`logical_actions = max(transparent_input_count, transparent_output_count, max(sapling_spend_count, sapling_output_count), orchard_action_count) + ironwood_action_count`. The materialized-view plane computes component counts from `TransactionFactsArtifact` once and materializes per-block fee aggregates in `BlockSummaryRecord`. The handler scans those typed records; it does not request raw blocks or parse `zebra-chain` bytes on the read path. The fee helper lives on `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat` so the same formula is reusable from any handler that builds the count shape. The range cap is 256 blocks per request; coinbase transactions are excluded because they have no fee.
 
 ## Conventional fee distribution
 
@@ -298,11 +291,11 @@ by daily rows while preserving exact rolling-cutoff semantics.
 
 ## Value pool summary
 
-`ExplorerQuery.ValuePoolSummary` wraps `WalletQuery.ChainValuePoolsAtTip` in the standard `ExplorerFreshness` envelope. It does not call upstream nodes directly and it does not project pool ids into fixed response fields. The response carries `source_tip: BlockTip` plus `repeated ChainValuePool pools`, preserving the height/hash identity and pool list from the same upstream observation. Existing UI can render known ids while future consensus pools remain visible without a new explorer wire shape.
+`ExplorerQuery.ValuePoolSummary` wraps `WalletQuery.ChainValuePoolsAtTip` in the standard `ExplorerFreshness` envelope. It does not call upstream nodes directly and it does not project pool ids into fixed response fields. The response carries `source_tip: BlockTip` plus `repeated ChainValuePool pools`, preserving the height/hash identity and pool list from the same upstream observation. Existing UI can render known ids while additional consensus pools remain visible without a new explorer wire shape.
 
 `ValuePoolSummary` reports the upstream node's `getblockchaininfo.valuePools` totals; it is not a Zinder-computed UTXO accounting. The chain-wide transparent UTXO accounting is `UtxoSetSummary`.
 
-`ValuePoolSummary` is only the current source snapshot. Value-pool history and value-pool flow are separate future consumers because cumulative balances and transaction movement have different inputs, coverage, and replay behavior. This prerequisite does not create either consumer or a derive schema.
+`ValuePoolSummary` is only the current source snapshot. Value-pool history and value-pool flow are outside this contract because cumulative balances and transaction movement have different inputs, coverage, and replay behavior.
 
 ## Transaction component summary
 
@@ -369,13 +362,13 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 
 The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
 
-Every `explorer.*` capability is served by the explorer plane itself; clients reach these methods on `ExplorerQuery`, never through `WalletQuery`. A future derive consumer that wants its view surfaced on the wallet client follows the federation rule in [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md): the capability lives in the consumer's product namespace, and the wallet plane advertises it only while the consumer's proxy is ready.
+Every `explorer.*` capability is served by the explorer plane itself; clients reach these methods on `ExplorerQuery`, never through `WalletQuery`. Materialized-view consumers surfaced through the wallet client follow the federation rule in [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md): the capability lives in the consumer's product namespace, and the wallet plane advertises it only while the consumer's proxy is ready.
 
 ## Freshness envelope
 
 Every explorer response embeds `ExplorerFreshness` at field tag 1. The shape and rationale live in [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). The key fields:
 
-- `chain_view`: the cross-plane chain-state envelope (chain epoch, the `{role}_tip` axes, derive status). Identifies the snapshot the response was produced from. The upstream tip rides on `chain_view.upstream_tip`; the derive-replay ceiling on `chain_view.indexed_tip`. Index lag is `chain_view.chain_epoch.visible_tip.height - chain_view.indexed_tip.tip.height`.
+- `chain_view`: the cross-plane chain-state envelope (chain epoch, the `{role}_tip` axes, materialized-view status). Identifies the snapshot the response was produced from. The upstream tip rides on `chain_view.upstream_tip`; the materialized-view replay ceiling on `chain_view.indexed_tip`. Index lag is `chain_view.chain_epoch.visible_tip.height - chain_view.indexed_tip.tip.height`.
 - `snapshot_age_millis`: age of the mempool snapshot, when the response touches mempool state.
 - `capability_version`: exact capability string that produced the response.
 - `unavailable`: repeated `UnavailableField` entries declaring specific field paths absent with structured reasons.
@@ -434,7 +427,7 @@ The explorer plane fails independently from canonical state.
 
 - An explorer service crash does not stop `zinder-ingest`. Ingest continues writing canonical artifacts and ChainEvents.
 - An explorer service crash does not stop `zinder-query`. `WalletQuery` continues serving wallet primitives. `WalletQuery.TransparentAddressBalance` is wallet-plane and unaffected by explorer state: it sums the canonical unspent-output index in-process and overlays the live mempool through the colocated `IngestControl` endpoint.
-- An explorer derive view becoming inconsistent does not corrupt canonical state. Operators drop the derive store and rebuild from retained canonical events. When the derive store is absent, `zinder-explorer` starts with derive-backed capabilities omitted.
+- An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 
 ## Cursor expiry contract
@@ -484,23 +477,23 @@ coverage under `explorer.commitment_root.search_v1`. The search does not
 reinterpret transaction-intermediate anchors, and it does not claim orphaned
 matches without a separately designed non-canonical block archive.
 
-## Derived views
+## Materialized views
 
-Explorer-derived views use the derive-plane SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, `TransparentAddressDeltasConsumer`, `TransparentAddressRankingConsumer`, `TransactionHistoryConsumer`, `CommitmentRootSearchConsumer`, and `ReorgIncidentsConsumer` write product-specific rows in the derive store while the canonical store remains the wallet-correctness boundary. `ReorgIncidentsConsumer` is an event-only chain-event consumer: it reads `ChainEventEnvelope` rows directly and never waits for block-context hydration. It backfills from the earliest retained chain event when first deployed and then preserves future incidents beyond chain-event retention; it cannot reconstruct incidents already pruned before deployment. See [ADR-0017](../adrs/0017-derive-consumer-template-and-key-codec-convention.md) for the derive-consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
+Explorer views use the materialized-view SDK and capability-gated optional fields. `BlockSummaryConsumer`, `TransactionFeesConsumer`, `MempoolEventCountsConsumer`, `TransparentAddressActivityConsumer`, `TransparentAddressDeltasConsumer`, `TransparentAddressRankingConsumer`, `TransactionHistoryConsumer`, `CommitmentRootSearchConsumer`, and `ReorgIncidentsConsumer` write product-specific rows in the materialized-view store while the canonical store remains the wallet-correctness boundary. `ReorgIncidentsConsumer` is an event-only chain-event consumer: it reads `ChainEventEnvelope` rows directly and never waits for block-context hydration. It backfills from the earliest retained chain event when first deployed and preserves incidents beyond chain-event retention; it cannot reconstruct incidents pruned before deployment. See [ADR-0017](../adrs/0017-materialized-view-consumer-and-key-codec.md) for the materialized-view consumer template and [ADR-0018](../adrs/0018-capability-gated-optional-payload-fields.md) for the optional-field convention.
 
-`ExplorerQuery.TransactionHistory` is the reference read-fenced derive query.
+`ExplorerQuery.TransactionHistory` is the reference read-fenced materialized-view query.
 Consumer schema v3 preserves earlier rows and the stable cursor while adding
 atomic projection epoch, tip, revision, and contiguous coverage state. A
 resumable ingest verifier establishes coverage from height 1 against canonical
 transaction facts. The handler reads projection state, rows, fee joins, and an
-optional exact count from one `DeriveStore` snapshot; on a secondary, the
+optional exact count from one `MaterializedViewStore` snapshot; on a secondary, the
 snapshot's catch-up barrier prevents the response from mixing pre-catch-up and
 post-catch-up state. The response returns the exact read fence and coverage.
 Opaque cursors bind both the filter and fence, and a supplied stale fence fails
 with `FAILED_PRECONDITION`.
 
-Capability advertisement follows live projection state. Version 1 is available
-when the projection and its `WalletQuery` dependency are online. Version 2 is
+Capability advertisement follows live projection state. Capability v1 is available
+when the projection and its `WalletQuery` dependency are online. Capability v2 is
 advertised only when contiguous coverage starts at height 1 and reaches the
 current projection tip with the same hash. Exact totals are omitted unless that
 condition holds; when returned, their scope is `FULL_HISTORY`. Adapters that
@@ -510,7 +503,7 @@ and include it in cache identity.
 ## Cross-references
 
 - [Service boundaries](service-boundaries.md) — names `zinder-explorer` in the workspace inventory.
-- [Derive plane](derive-plane.md) — the reusable SDK pattern the explorer plane exercises.
+- [Materialized-view plane](materialized-view-plane.md) — the reusable SDK pattern the explorer plane exercises.
 - [Wallet data plane](wallet-data-plane.md) — sibling boundary; the canonical wallet read surface.
 - [Public interfaces](public-interfaces.md) — naming spine, capability discovery, error vocabulary, configuration conventions.
 - [Service operations](service-operations.md) — readiness, metrics, lifecycle conventions the explorer service inherits.

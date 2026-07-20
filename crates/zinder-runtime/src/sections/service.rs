@@ -18,7 +18,7 @@ pub enum ServiceIdentifier {
     CompatLightwalletd,
     /// `zinder-compat-cipherscan`: Cipherscan REST compat reader.
     CompatCipherscan,
-    /// `zinder-explorer`: explorer-plane derive reader.
+    /// `zinder-explorer`: explorer-plane materialized-view reader.
     Explorer,
 }
 

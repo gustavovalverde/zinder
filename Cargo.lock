@@ -5677,26 +5677,16 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
- "zinder-bulk-load",
  "zinder-core",
- "zinder-derive",
  "zinder-ingest",
+ "zinder-materialized-views",
  "zinder-proto",
+ "zinder-rocksdb-bulk-load",
  "zinder-source",
  "zinder-store",
  "zinder-testkit",
  "zinder-wallet-projection",
  "zinder-wallet-rocksdb",
-]
-
-[[package]]
-name = "zinder-bulk-load"
-version = "0.1.0"
-dependencies = [
- "rust-rocksdb",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5720,7 +5710,7 @@ dependencies = [
  "zebra-chain",
  "zinder-compat-lightwalletd",
  "zinder-core",
- "zinder-derive",
+ "zinder-materialized-views",
  "zinder-proto",
  "zinder-query",
  "zinder-store",
@@ -5783,8 +5773,8 @@ dependencies = [
  "zcash_address",
  "zebra-chain",
  "zinder-core",
- "zinder-derive",
  "zinder-ingest",
+ "zinder-materialized-views",
  "zinder-proto",
  "zinder-query",
  "zinder-runtime",
@@ -5814,23 +5804,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zinder-derive"
-version = "0.1.0"
-dependencies = [
- "eyre",
- "metrics",
- "parking_lot",
- "prost",
- "rust-rocksdb",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "zinder-core",
- "zinder-proto",
- "zinder-store",
-]
-
-[[package]]
 name = "zinder-explorer"
 version = "0.1.0"
 dependencies = [
@@ -5855,8 +5828,8 @@ dependencies = [
  "tracing",
  "zebra-chain",
  "zinder-core",
- "zinder-derive",
  "zinder-ingest",
+ "zinder-materialized-views",
  "zinder-proto",
  "zinder-query",
  "zinder-runtime",
@@ -5894,13 +5867,30 @@ dependencies = [
  "zebra-chain",
  "zinder-compat-lightwalletd",
  "zinder-core",
- "zinder-derive",
+ "zinder-materialized-views",
  "zinder-proto",
  "zinder-query",
  "zinder-runtime",
  "zinder-source",
  "zinder-store",
  "zinder-testkit",
+]
+
+[[package]]
+name = "zinder-materialized-views"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "metrics",
+ "parking_lot",
+ "prost",
+ "rust-rocksdb",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "zinder-core",
+ "zinder-proto",
+ "zinder-store",
 ]
 
 [[package]]
@@ -5970,7 +5960,7 @@ dependencies = [
  "tonic-types",
  "zebra-chain",
  "zinder-core",
- "zinder-derive",
+ "zinder-materialized-views",
  "zinder-proto",
  "zinder-runtime",
  "zinder-source",
@@ -5978,6 +5968,16 @@ dependencies = [
  "zinder-testkit",
  "zinder-wallet-projection",
  "zinder-wallet-rocksdb",
+]
+
+[[package]]
+name = "zinder-rocksdb-bulk-load"
+version = "0.1.0"
+dependencies = [
+ "rust-rocksdb",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6073,9 +6073,9 @@ dependencies = [
  "tonic",
  "tonic-types",
  "tracing",
- "zinder-bulk-load",
  "zinder-core",
  "zinder-proto",
+ "zinder-rocksdb-bulk-load",
 ]
 
 [[package]]
@@ -6104,7 +6104,7 @@ dependencies = [
  "zcash_protocol",
  "zcash_transparent",
  "zinder-core",
- "zinder-derive",
+ "zinder-materialized-views",
  "zinder-proto",
  "zinder-source",
  "zinder-store",
@@ -6129,9 +6129,9 @@ dependencies = [
  "rust-rocksdb",
  "tempfile",
  "thiserror 2.0.18",
- "zinder-bulk-load",
  "zinder-core",
  "zinder-proto",
+ "zinder-rocksdb-bulk-load",
  "zinder-store",
  "zinder-wallet-projection",
 ]

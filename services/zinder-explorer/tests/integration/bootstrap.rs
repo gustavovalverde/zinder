@@ -22,12 +22,13 @@ use zinder_core::{
     TransparentSpendFact,
     wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex},
 };
-use zinder_derive::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer, DeriveStore,
-    DeriveStoreOptions, REORG_INCIDENTS_CONSUMER_NAME, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TransparentAddressDeltasConsumer,
-};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_materialized_views::{
+    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer,
+    MaterializedViewStore, MaterializedViewStoreOptions, REORG_INCIDENTS_CONSUMER_NAME,
+    TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY, TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
+    TransparentAddressDeltasConsumer,
+};
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
     EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_CHAIN_REORG_HISTORY_V1,
@@ -59,9 +60,9 @@ use zinder_testkit::{
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
 
-struct SeededDeriveStore {
+struct SeededMaterializedViewStore {
     _tempdir: tempfile::TempDir,
-    secondary_store: DeriveStore,
+    secondary_store: MaterializedViewStore,
 }
 
 #[tokio::test]
@@ -87,7 +88,7 @@ async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> 
             .as_ref()
             .and_then(|freshness| freshness.chain_view.as_ref())
             .is_none(),
-        "ServerInfo without a derive store or upstream probe carries no chain_view",
+        "ServerInfo without a materialized-view store or upstream probe carries no chain_view",
     );
     let explorer_info = response
         .info
@@ -167,7 +168,7 @@ async fn explorer_query_failed_precondition_without_wallet_query_endpoint() -> R
             .capabilities
             .iter()
             .any(|advertised| { advertised == EXPLORER_OVERVIEW_SNAPSHOT_V1 }),
-        "overview_snapshot capability must not advertise without a derive store",
+        "overview_snapshot capability must not advertise without a materialized-view store",
     );
     let overview_outcome = client
         .overview_snapshot(OverviewSnapshotRequest {
@@ -179,7 +180,7 @@ async fn explorer_query_failed_precondition_without_wallet_query_endpoint() -> R
         .await;
     let overview_status = overview_outcome
         .err()
-        .ok_or_else(|| eyre!("expected FAILED_PRECONDITION without derive store"))?;
+        .ok_or_else(|| eyre!("expected FAILED_PRECONDITION without materialized-view store"))?;
     assert_eq!(overview_status.code(), tonic::Code::FailedPrecondition);
 
     server_handle.abort();
@@ -188,13 +189,16 @@ async fn explorer_query_failed_precondition_without_wallet_query_endpoint() -> R
 }
 
 #[tokio::test]
-async fn explorer_query_serves_block_summary_from_secondary_derive_store() -> Result<()> {
+async fn explorer_query_serves_block_summary_from_secondary_materialized_view_store() -> Result<()>
+{
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (_store_fixture, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
-    let seeded_derive_store = seeded_block_summary_derive_store(&chain_fixture)?;
+    let seeded_materialized_view_store =
+        seeded_block_summary_materialized_view_store(&chain_fixture)?;
     let (mut client, explorer_handle) =
-        spawn_explorer_query_server(seeded_derive_store.secondary_store, wallet_addr).await?;
+        spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
+            .await?;
 
     let server_info = client.server_info(ServerInfoRequest {}).await?.into_inner();
     let explorer_info = server_info
@@ -293,12 +297,13 @@ async fn explorer_query_serves_block_production_series_with_explicit_coverage() 
         ChainStoreOptions::for_local_tests(),
     )?;
     canonical_store.try_catch_up()?;
-    let seeded_derive_store = seeded_block_summary_derive_store_with_transaction_ids(
-        &chain_fixture,
-        &[encode_rpc_transaction_id_hex(coinbase_transaction_id)],
-    )?;
+    let seeded_materialized_view_store =
+        seeded_block_summary_materialized_view_store_with_transaction_ids(
+            &chain_fixture,
+            &[encode_rpc_transaction_id_hex(coinbase_transaction_id)],
+        )?;
     let (mut client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
-        seeded_derive_store.secondary_store,
+        seeded_materialized_view_store.secondary_store,
         canonical_store,
         wallet_addr,
     )
@@ -369,9 +374,11 @@ async fn explorer_query_aggregates_block_activity_with_explicit_coverage() -> Re
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (_store_fixture, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
-    let seeded_derive_store = seeded_block_summary_derive_store(&chain_fixture)?;
+    let seeded_materialized_view_store =
+        seeded_block_summary_materialized_view_store(&chain_fixture)?;
     let (mut client, explorer_handle) =
-        spawn_explorer_query_server(seeded_derive_store.secondary_store, wallet_addr).await?;
+        spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
+            .await?;
 
     let explorer_info = client
         .server_info(ServerInfoRequest {})
@@ -494,10 +501,13 @@ async fn transaction_detail_batches_spent_output_lookup_beyond_wallet_request_li
         ChainStoreOptions::for_local_tests(),
     )?;
     canonical_store.try_catch_up()?;
-    let seeded_derive_store =
-        seeded_block_summary_derive_store_with_transaction_ids(&chain_fixture, &transaction_ids)?;
+    let seeded_materialized_view_store =
+        seeded_block_summary_materialized_view_store_with_transaction_ids(
+            &chain_fixture,
+            &transaction_ids,
+        )?;
     let (mut client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
-        seeded_derive_store.secondary_store,
+        seeded_materialized_view_store.secondary_store,
         canonical_store,
         wallet_addr,
     )
@@ -704,12 +714,13 @@ async fn block_transactions_test_fixture() -> Result<BlockTransactionsTestFixtur
         spawn_wallet_query_server(&chain_fixture).await?;
     let (canonical_store_fixture, canonical_store) =
         canonical_store_without_transaction_facts(&chain_fixture, missing_transaction_id)?;
-    let seeded_derive_store = seeded_block_summary_derive_store_with_transaction_ids(
-        &chain_fixture,
-        &transaction_id_strings,
-    )?;
+    let seeded_materialized_view_store =
+        seeded_block_summary_materialized_view_store_with_transaction_ids(
+            &chain_fixture,
+            &transaction_id_strings,
+        )?;
     let (client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
-        seeded_derive_store.secondary_store,
+        seeded_materialized_view_store.secondary_store,
         canonical_store,
         wallet_addr,
     )
@@ -1005,13 +1016,16 @@ fn assert_block_transactions_response(
 /// block's height and timestamp; the bundle's single
 /// `freshness.capability_version` is the overview capability string.
 #[tokio::test]
-async fn explorer_query_serves_overview_snapshot_with_seeded_derive_store() -> Result<()> {
+async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_store() -> Result<()>
+{
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (_store_fixture, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
-    let seeded_derive_store = seeded_block_summary_derive_store(&chain_fixture)?;
+    let seeded_materialized_view_store =
+        seeded_block_summary_materialized_view_store(&chain_fixture)?;
     let (mut client, explorer_handle) =
-        spawn_explorer_query_server(seeded_derive_store.secondary_store, wallet_addr).await?;
+        spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
+            .await?;
 
     let explorer_info = client
         .server_info(ServerInfoRequest {})
@@ -1097,14 +1111,15 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (_store_fixture, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
-    let seeded_derive_store = seeded_block_summary_derive_store(&chain_fixture)?;
+    let seeded_materialized_view_store =
+        seeded_block_summary_materialized_view_store(&chain_fixture)?;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let explorer_addr = listener.local_addr()?;
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
         network: Network::ZcashRegtest,
     })
-    .with_derive_store(seeded_derive_store.secondary_store)
+    .with_materialized_view_store(seeded_materialized_view_store.secondary_store)
     .with_wallet_query_endpoint(format!("http://{wallet_addr}"))
     .with_prevout_resolution_online(true);
     let probe_cancel = CancellationToken::new();
@@ -1174,9 +1189,12 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
     let store_fixture = StoreFixture::open()?;
     seed_recorded_chain_reorg(&store_fixture)?;
 
-    let seeded_derive_store = seeded_reorg_history_derive_store(&store_fixture).await?;
-    let (mut client, explorer_handle) =
-        spawn_explorer_query_server_with_derive_store(seeded_derive_store.secondary_store).await?;
+    let seeded_materialized_view_store =
+        seeded_reorg_history_materialized_view_store(&store_fixture).await?;
+    let (mut client, explorer_handle) = spawn_explorer_query_server_with_materialized_view_store(
+        seeded_materialized_view_store.secondary_store,
+    )
+    .await?;
 
     assert_reorg_history_capability(&mut client).await?;
     let reorg_cursor = assert_recorded_reorg_history_page(&mut client).await?;
@@ -1239,38 +1257,39 @@ fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
     Ok(())
 }
 
-async fn seeded_reorg_history_derive_store(
+async fn seeded_reorg_history_materialized_view_store(
     store_fixture: &StoreFixture,
-) -> Result<SeededDeriveStore> {
-    let primary_derive_store = zinder_ingest::open_primary_derive_store_for_canonical(
-        store_fixture.tempdir_path(),
-        zinder_store::RocksDbResourceBudget::for_local_tests(),
-    )?;
-    zinder_ingest::catch_up_derive_store_to_canonical(
+) -> Result<SeededMaterializedViewStore> {
+    let primary_materialized_view_store =
+        zinder_ingest::open_primary_materialized_view_store_for_canonical(
+            store_fixture.tempdir_path(),
+            zinder_store::RocksDbResourceBudget::for_local_tests(),
+        )?;
+    zinder_ingest::catch_up_materialized_view_store_to_canonical(
         store_fixture.chain_store(),
-        &primary_derive_store,
-        test_derive_config(),
+        &primary_materialized_view_store,
+        test_materialized_view_config(),
     )
     .await?;
-    let reorg_cursor = primary_derive_store
+    let reorg_cursor = primary_materialized_view_store
         .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
-        .ok_or_else(|| eyre!("reorg incidents cursor missing after derive replay"))?;
+        .ok_or_else(|| eyre!("reorg incidents cursor missing after materialized-view replay"))?;
     assert!(!reorg_cursor.is_empty());
 
-    let derive_secondary_tempdir = tempfile::tempdir()?;
-    let derive_store = DeriveStore::open_secondary(
-        DeriveStore::path_for_canonical(store_fixture.tempdir_path()),
-        derive_secondary_tempdir.path(),
-        DeriveStoreOptions {
+    let materialized_view_secondary_tempdir = tempfile::tempdir()?;
+    let materialized_view_store = MaterializedViewStore::open_secondary(
+        MaterializedViewStore::path_for_canonical(store_fixture.tempdir_path()),
+        materialized_view_secondary_tempdir.path(),
+        MaterializedViewStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
+            consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
-    derive_store.try_catch_up()?;
-    Ok(SeededDeriveStore {
-        _tempdir: derive_secondary_tempdir,
-        secondary_store: derive_store,
+    materialized_view_store.try_catch_up()?;
+    Ok(SeededMaterializedViewStore {
+        _tempdir: materialized_view_secondary_tempdir,
+        secondary_store: materialized_view_store,
     })
 }
 
@@ -1432,47 +1451,49 @@ async fn spawn_wallet_query_server(
     Ok((store_fixture, addr, handle))
 }
 
-fn seeded_block_summary_derive_store(chain_fixture: &ChainFixture) -> Result<SeededDeriveStore> {
-    seeded_block_summary_derive_store_with_transaction_ids(chain_fixture, &[])
+fn seeded_block_summary_materialized_view_store(
+    chain_fixture: &ChainFixture,
+) -> Result<SeededMaterializedViewStore> {
+    seeded_block_summary_materialized_view_store_with_transaction_ids(chain_fixture, &[])
 }
 
-fn seeded_block_summary_derive_store_with_transaction_ids(
+fn seeded_block_summary_materialized_view_store_with_transaction_ids(
     chain_fixture: &ChainFixture,
     transaction_ids: &[String],
-) -> Result<SeededDeriveStore> {
+) -> Result<SeededMaterializedViewStore> {
     let tempdir = tempfile::tempdir()?;
-    let primary_path = tempdir.path().join("derive-primary");
-    let secondary_path = tempdir.path().join("derive-secondary");
-    let primary_store = DeriveStore::open(
+    let primary_path = tempdir.path().join("materialized-view-primary");
+    let secondary_path = tempdir.path().join("materialized-view-secondary");
+    let primary_store = MaterializedViewStore::open(
         &primary_path,
-        DeriveStoreOptions {
+        MaterializedViewStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
+            consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
     seed_block_summary(&primary_store, chain_fixture, transaction_ids)?;
 
-    let secondary_store = DeriveStore::open_secondary(
+    let secondary_store = MaterializedViewStore::open_secondary(
         &primary_path,
         &secondary_path,
-        DeriveStoreOptions {
+        MaterializedViewStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
+            consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
     secondary_store.try_catch_up()?;
-    Ok(SeededDeriveStore {
+    Ok(SeededMaterializedViewStore {
         _tempdir: tempdir,
         secondary_store,
     })
 }
 
-fn test_derive_config() -> zinder_ingest::IngestDeriveConfig {
-    zinder_ingest::IngestDeriveConfig {
+fn test_materialized_view_config() -> zinder_ingest::MaterializedViewReplayConfig {
+    zinder_ingest::MaterializedViewReplayConfig {
         replay_batch_blocks: NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN),
-        replay_policy: zinder_ingest::DeriveReplayPolicy::CanonicalFirst,
+        replay_policy: zinder_ingest::MaterializedViewReplayPolicy::CanonicalFirst,
         memory_budget_bytes: None,
         memory_degrade_ratio: 0.85,
         memory_pause_ratio: 0.95,
@@ -1483,7 +1504,7 @@ fn test_derive_config() -> zinder_ingest::IngestDeriveConfig {
 }
 
 fn seed_block_summary(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     chain_fixture: &ChainFixture,
     transaction_ids: &[String],
 ) -> Result<()> {
@@ -1512,17 +1533,17 @@ fn seed_block_summary(
         min_zip317_conventional_fee_zat: 0,
         max_zip317_conventional_fee_zat: 0,
     };
-    derive_store.put_consumer(
+    materialized_view_store.put_consumer(
         BLOCK_SUMMARY_COLUMN_FAMILY,
         &BlockSummaryConsumer::key_for_height(fixture_block.height),
         &record.encode_to_vec(),
     )?;
-    derive_store.put_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME, &[1])?;
+    materialized_view_store.put_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME, &[1])?;
     Ok(())
 }
 
 async fn spawn_explorer_query_server(
-    derive_store: DeriveStore,
+    materialized_view_store: MaterializedViewStore,
     wallet_addr: SocketAddr,
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1530,7 +1551,7 @@ async fn spawn_explorer_query_server(
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
         network: Network::ZcashRegtest,
     })
-    .with_derive_store(derive_store)
+    .with_materialized_view_store(materialized_view_store)
     .with_wallet_query_endpoint(format!("http://{wallet_addr}"))
     .with_prevout_resolution_online(true);
     let handle = tokio::spawn(async move {
@@ -1544,7 +1565,7 @@ async fn spawn_explorer_query_server(
 }
 
 async fn spawn_explorer_query_server_with_canonical_store(
-    derive_store: DeriveStore,
+    materialized_view_store: MaterializedViewStore,
     canonical_store: SecondaryChainStore,
     wallet_addr: SocketAddr,
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
@@ -1553,7 +1574,7 @@ async fn spawn_explorer_query_server_with_canonical_store(
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
         network: Network::ZcashRegtest,
     })
-    .with_derive_store(derive_store)
+    .with_materialized_view_store(materialized_view_store)
     .with_canonical_store(canonical_store)
     .with_wallet_query_endpoint(format!("http://{wallet_addr}"));
     let handle = tokio::spawn(async move {
@@ -1566,15 +1587,15 @@ async fn spawn_explorer_query_server_with_canonical_store(
     Ok((ExplorerQueryClient::new(channel), handle))
 }
 
-async fn spawn_explorer_query_server_with_derive_store(
-    derive_store: DeriveStore,
+async fn spawn_explorer_query_server_with_materialized_view_store(
+    materialized_view_store: MaterializedViewStore,
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
         network: Network::ZcashRegtest,
     })
-    .with_derive_store(derive_store);
+    .with_materialized_view_store(materialized_view_store);
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())
@@ -1689,7 +1710,7 @@ fn freshness_visible_tip(
         .ok_or_else(|| eyre!("freshness missing chain_view.chain_epoch.visible_tip"))
 }
 
-/// One value event the deltas seeder writes into the derive store.
+/// One value event the deltas seeder writes into the materialized-view store.
 struct SeedDelta {
     height: u32,
     in_block_position: u32,
@@ -1703,7 +1724,7 @@ struct SeedDelta {
 /// the given events, mirroring what `TransparentAddressDeltasConsumer` writes
 /// at commit time.
 fn seed_transparent_address_deltas(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     address: TransparentAddressScriptHash,
     deltas: &[SeedDelta],
 ) -> Result<()> {
@@ -1720,46 +1741,47 @@ fn seed_transparent_address_deltas(
             block_time_unix_seconds: 1_700_000_000 + i64::from(delta.height),
             value_zat: delta.value_zat,
         };
-        derive_store.put_consumer(
+        materialized_view_store.put_consumer(
             TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
             &key,
             &record.encode_to_vec(),
         )?;
     }
-    derive_store.put_chain_event_cursor(TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, &[1])?;
+    materialized_view_store
+        .put_chain_event_cursor(TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, &[1])?;
     Ok(())
 }
 
-/// Opens a primary derive store seeded with the given address deltas, then
+/// Opens a primary materialized-view store seeded with the given address deltas, then
 /// returns a caught-up secondary handle for the explorer to read.
-fn seeded_deltas_derive_store(
+fn seeded_deltas_materialized_view_store(
     address: TransparentAddressScriptHash,
     deltas: &[SeedDelta],
-) -> Result<SeededDeriveStore> {
+) -> Result<SeededMaterializedViewStore> {
     let tempdir = tempfile::tempdir()?;
-    let primary_path = tempdir.path().join("derive-primary");
-    let secondary_path = tempdir.path().join("derive-secondary");
-    let primary_store = DeriveStore::open(
+    let primary_path = tempdir.path().join("materialized-view-primary");
+    let secondary_path = tempdir.path().join("materialized-view-secondary");
+    let primary_store = MaterializedViewStore::open(
         &primary_path,
-        DeriveStoreOptions {
+        MaterializedViewStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
+            consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
     seed_transparent_address_deltas(&primary_store, address, deltas)?;
 
-    let secondary_store = DeriveStore::open_secondary(
+    let secondary_store = MaterializedViewStore::open_secondary(
         &primary_path,
         &secondary_path,
-        DeriveStoreOptions {
+        MaterializedViewStoreOptions {
             sync_writes: false,
-            consumers: DeriveStore::bundled_consumers(),
+            consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?;
     secondary_store.try_catch_up()?;
-    Ok(SeededDeriveStore {
+    Ok(SeededMaterializedViewStore {
         _tempdir: tempdir,
         secondary_store,
     })
@@ -1824,7 +1846,7 @@ async fn spawn_deltas_explorer(
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (_store_fixture, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
-    let seeded = seeded_deltas_derive_store(DELTAS_TEST_ADDRESS, deltas)?;
+    let seeded = seeded_deltas_materialized_view_store(DELTAS_TEST_ADDRESS, deltas)?;
     let (client, explorer_handle) =
         spawn_explorer_query_server(seeded.secondary_store, wallet_addr).await?;
     Ok((client, explorer_handle, wallet_handle))

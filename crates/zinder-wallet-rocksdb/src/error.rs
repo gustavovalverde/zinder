@@ -3,14 +3,14 @@
 use std::{io, path::PathBuf};
 
 use thiserror::Error;
-use zinder_bulk_load::BulkLoadError;
 use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis};
+use zinder_rocksdb_bulk_load::BulkLoadError;
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
     ProjectionBuildOwner, WalletCanonicalSourceIdentity, WalletProjectionContractError,
 };
 
-/// Failure to create, publish, admit, or query a version-1 wallet store.
+/// Failure to create, publish, admit, or query a wallet store.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RocksDbWalletError {
@@ -108,7 +108,7 @@ pub enum RocksDbWalletError {
         #[source]
         source: rust_rocksdb::Error,
     },
-    /// The database does not contain exactly the version-1 wallet families.
+    /// The database does not contain exactly the wallet families.
     #[error(
         "wallet RocksDB column families do not match version 1; expected {expected:?}, observed {observed:?}"
     )]

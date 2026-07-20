@@ -1,8 +1,8 @@
 //! Runtime memory pressure sampling for ingest scheduling.
 //!
-//! Canonical ingest and derive replay share one process in the standard
+//! Canonical ingest and materialized-view replay share one process in the standard
 //! deployment. The scheduler needs cheap, lossy memory signals so rebuildable
-//! derive projections can back off before they compete with canonical writes.
+//! materialized views can back off before they compete with canonical writes.
 
 use std::{
     fs,
@@ -113,9 +113,9 @@ pub(crate) fn container_memory_budget_from_snapshot(
 
 /// Spawns the runtime memory gauge sampler for the ingest process.
 ///
-/// Memory metrics are operational state, not derive replay state. Sampling them
+/// Memory metrics are operational state, not materialized-view replay state. Sampling them
 /// in an independent task keeps `/metrics` fresh even while canonical catchup or
-/// derive replay spends a long time inside a single work pass.
+/// materialized-view replay spends a long time inside a single work pass.
 #[must_use = "drop the handle to detach the runtime memory sampler or await it for symmetric shutdown"]
 pub fn spawn_runtime_memory_metrics_task(
     interval: Duration,
@@ -144,13 +144,13 @@ pub fn spawn_runtime_memory_metrics_task(
 /// The gauge sampler runs every second; logging every sample would flood the
 /// deploy log, so the cgroup limit and pressure ratio surface roughly once a
 /// minute. This is the denominator (`memory.high`/`memory.max`) that makes the
-/// derive replay pressure ratio interpretable from logs alone.
+/// materialized-view replay pressure ratio interpretable from logs alone.
 const RUNTIME_MEMORY_LOG_EVERY_TICKS: u32 = 60;
 
 /// Logs the cgroup memory limit, working set, anon memory, and pressure ratio at INFO.
 ///
 /// Without this the container memory budget is only on the (often unscraped)
-/// metrics endpoint, so a paused or memory-throttled derive plane is hard to
+/// metrics endpoint, so a paused or memory-throttled materialized-view plane is hard to
 /// diagnose from logs. Best-effort and lossy: unset cgroup fields log as
 /// `None`.
 fn log_runtime_memory_observation(snapshot: RuntimeMemorySnapshot) {

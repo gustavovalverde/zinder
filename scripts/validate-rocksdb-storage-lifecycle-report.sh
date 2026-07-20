@@ -262,7 +262,7 @@ jq -e \
         ])
       and .id == "rocksdb-storage-lifecycle"
       and .canonical_engine == "rocksdb"
-      and .canonical_model == "version-1-canonical-facts"
+      and .canonical_model == "canonical-replay-storage"
       and .diagnostic_projection_engine == null
       and .topology == "rocksdb-single-host")
     and (.provenance
@@ -656,6 +656,6 @@ jq -e \
       and ([.samples[].storage_bytes] | max) == .sampled_storage_peak_bytes))
   ' \
   "$report_path" >/dev/null || fail \
-  "report and container-resource evidence do not satisfy the closed version-1 contract"
+  "report and container-resource evidence do not satisfy the closed storage contract"
 
 echo "RocksDB storage lifecycle evidence passed"

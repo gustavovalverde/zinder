@@ -586,8 +586,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `full`. Defaults to `tickers`.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__BLOCK_CACHE_BYTES",
-        toml_path: "storage.derive.rocksdb.block_cache_bytes",
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",
+        toml_path: "storage.materialized_views.rocksdb.block_cache_bytes",
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
@@ -596,12 +596,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB block cache budget in bytes. Defaults to 268435456 for \
+        description: "Materialized-view store RocksDB block cache budget in bytes. Defaults to 268435456 for \
                       writers and 67108864 for readers.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WAL_BYTES",
-        toml_path: "storage.derive.rocksdb.max_wal_bytes",
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES",
+        toml_path: "storage.materialized_views.rocksdb.max_wal_bytes",
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
@@ -610,12 +610,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for \
+        description: "Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for \
                       writers and 16777216 for readers.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_OPEN_FILES",
-        toml_path: "storage.derive.rocksdb.max_open_files",
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES",
+        toml_path: "storage.materialized_views.rocksdb.max_open_files",
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
@@ -624,12 +624,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB open SST file cap. Defaults to 512 for writers and 64 \
+        description: "Materialized-view store RocksDB open SST file cap. Defaults to 512 for writers and 64 \
                       for readers.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__WRITE_BUFFER_BYTES",
-        toml_path: "storage.derive.rocksdb.write_buffer_bytes",
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__WRITE_BUFFER_BYTES",
+        toml_path: "storage.materialized_views.rocksdb.write_buffer_bytes",
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
@@ -638,12 +638,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store per-column-family RocksDB write buffer size. Defaults to \
+        description: "Materialized-view store per-column-family RocksDB write buffer size. Defaults to \
                       16777216 for writers and 4194304 for readers.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
-        toml_path: "storage.derive.rocksdb.max_write_buffer_count",
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
+        toml_path: "storage.materialized_views.rocksdb.max_write_buffer_count",
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
@@ -652,12 +652,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store per-column-family mutable plus immutable RocksDB write buffer \
+        description: "Materialized-view store per-column-family mutable plus immutable RocksDB write buffer \
                       count. Defaults to 4 for writers and 2 for readers.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MAX_BACKGROUND_JOBS",
-        toml_path: "storage.derive.rocksdb.max_background_jobs",
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS",
+        toml_path: "storage.materialized_views.rocksdb.max_background_jobs",
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
@@ -666,12 +666,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store primary-writer RocksDB background job cap shared by flush and \
+        description: "Materialized-view store primary-writer RocksDB background job cap shared by flush and \
                       compaction work. Defaults to 2 and is not applied to secondary opens.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__MEMTABLE_BUDGET_BYTES",
-        toml_path: "storage.derive.rocksdb.memtable_budget_bytes",
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES",
+        toml_path: "storage.materialized_views.rocksdb.memtable_budget_bytes",
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
@@ -680,12 +680,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store total RocksDB memtable budget across column families. Defaults \
+        description: "Materialized-view store total RocksDB memtable budget across column families. Defaults \
                       to 536870912 for writers and 16777216 for readers.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__DERIVE__ROCKSDB__STATISTICS_LEVEL",
-        toml_path: "storage.derive.rocksdb.statistics_level",
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL",
+        toml_path: "storage.materialized_views.rocksdb.statistics_level",
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
@@ -694,7 +694,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive-store RocksDB statistics collection gate: `off`, `tickers`, or `full`. \
+        description: "Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. \
                       Defaults to `tickers`.",
     },
     EnvVarDoc {
@@ -706,7 +706,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the \
                       choice is a writer-private implementation decision: `[node]` describes the \
                       upstream node itself, `[ingest].source` describes which adapter ingest \
-                      uses to talk to it. See [ADR-0016](../adrs/0016-source-streaming-pipeline.md).",
+                      uses to talk to it. See [ADR-0016](../adrs/0016-source-segment-fetching.md).",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__RAW_BLOB_POLICY",
@@ -728,7 +728,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Closed derive workload: `\"wallet\"` or `\"explorer\"`. Defaults to \
+        description: "Closed materialized-view workload: `\"wallet\"` or `\"explorer\"`. Defaults to \
                       `\"explorer\"`. Selection is supported only when creating a fresh \
                       canonical-plus-projection store.",
     },
@@ -845,8 +845,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       following transition. Defaults to 536870912.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__PHASES__CATCHUP_THRESHOLD_BLOCKS",
-        toml_path: "ingest.phases.catchup_threshold_blocks",
+        name: "ZINDER_INGEST__PHASE_CLASSIFICATION__CATCHUP_THRESHOLD_BLOCKS",
+        toml_path: "ingest.phase_classification.catchup_threshold_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -855,16 +855,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md).",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_BLOCKS",
-        toml_path: "ingest.bulk_catchup.canonical_batch_max_blocks",
+        name: "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_BLOCKS",
+        toml_path: "ingest.construction.canonical_batch_max_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Block count per bulk-catchup commit batch. Defaults to 1000.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ARTIFACT_BYTES",
-        toml_path: "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
+        name: "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_ARTIFACT_BYTES",
+        toml_path: "ingest.construction.canonical_batch_max_artifact_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -872,8 +872,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Defaults to 536870912.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES",
-        toml_path: "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
+        name: "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES",
+        toml_path: "ingest.construction.canonical_batch_max_estimated_write_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -881,8 +881,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       bulk-catchup batch. Defaults to 536870912.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE",
-        toml_path: "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
+        name: "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE",
+        toml_path: "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -891,8 +891,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Defaults to 100.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS",
-        toml_path: "ingest.bulk_catchup.source_segment_max_blocks",
+        name: "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS",
+        toml_path: "ingest.construction.source_segment_max_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -900,8 +900,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       from the source in one segment. The resource-resolved default is 64.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES",
-        toml_path: "ingest.bulk_catchup.source_segment_target_response_bytes",
+        name: "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES",
+        toml_path: "ingest.construction.source_segment_target_response_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -909,16 +909,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `min(node.max_response_bytes, 33554432)`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS",
-        toml_path: "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
+        name: "ZINDER_INGEST__CONSTRUCTION__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS",
+        toml_path: "ingest.construction.source_fetch_max_in_flight_requests",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum concurrent source segment requests. Defaults to 12.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES",
-        toml_path: "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
+        name: "ZINDER_INGEST__CONSTRUCTION__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES",
+        toml_path: "ingest.construction.source_fetch_max_in_flight_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -928,8 +928,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       402653184))`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_CONCURRENCY",
-        toml_path: "ingest.bulk_catchup.block_prepare_concurrency",
+        name: "ZINDER_INGEST__CONSTRUCTION__BLOCK_PREPARE_CONCURRENCY",
+        toml_path: "ingest.construction.block_prepare_concurrency",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -937,8 +937,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       default is `min(available_parallelism(), 16)`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES",
-        toml_path: "ingest.bulk_catchup.block_prepare_memory_watermark_bytes",
+        name: "ZINDER_INGEST__CONSTRUCTION__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES",
+        toml_path: "ingest.construction.block_prepare_memory_watermark_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -947,98 +947,98 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `clamp(container_memory / 64, 134217728, 536870912)`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",
-        toml_path: "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
+        name: "ZINDER_INGEST__CONSTRUCTION__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",
+        toml_path: "ingest.construction.commit_reassembly_max_queued_artifact_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum safe-tip artifact bytes that can accumulate while the previous \
+        description: "Maximum settled-tip artifact bytes that can accumulate while the previous \
                       bulk-catchup batch is attaching metadata, committing, or flushing. \
                       Defaults to 536870912.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS",
-        toml_path: "ingest.derive.replay_batch_blocks",
+        name: "ZINDER_INGEST__MATERIALIZED_VIEWS__REPLAY_BATCH_BLOCKS",
+        toml_path: "ingest.materialized_views.replay_batch_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum block contexts hydrated and dispatched in one derive replay write. \
+        description: "Maximum block contexts hydrated and dispatched in one materialized-view replay write. \
                       Must be greater than zero. Defaults to 100.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__REPLAY_POLICY",
-        toml_path: "ingest.derive.replay_policy",
+        name: "ZINDER_INGEST__MATERIALIZED_VIEWS__REPLAY_POLICY",
+        toml_path: "ingest.materialized_views.replay_policy",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Derive replay pressure policy. `canonical-first` pauses rebuildable derive \
+        description: "Materialized-view replay pressure policy. `canonical-first` pauses rebuildable materialized-view work \
                       replay under memory pressure so canonical ingest keeps the process budget. \
                       `continuous` replays retained chain events whenever they are available while \
                       the writer is at tip; during bulk catch-up the canonical-phase gate pauses \
                       replay regardless of policy. Defaults to `canonical-first`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__MEMORY_BUDGET_BYTES",
-        toml_path: "ingest.derive.memory_budget_bytes",
+        name: "ZINDER_INGEST__MATERIALIZED_VIEWS__MEMORY_BUDGET_BYTES",
+        toml_path: "ingest.materialized_views.memory_budget_bytes",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Explicit derive replay memory budget in bytes. When unset, derive replay \
+        description: "Explicit materialized-view replay memory budget in bytes. When unset, materialized-view replay \
                       uses the runtime cgroup `memory.high` or `memory.max` value when present.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__MEMORY_DEGRADE_RATIO",
-        toml_path: "ingest.derive.memory_degrade_ratio",
+        name: "ZINDER_INGEST__MATERIALIZED_VIEWS__MEMORY_DEGRADE_RATIO",
+        toml_path: "ingest.materialized_views.memory_degrade_ratio",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Memory pressure ratio at which derive replay shrinks the effective replay \
+        description: "Memory pressure ratio at which materialized-view replay shrinks the effective replay \
                       batch size. Defaults to 0.90.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__MEMORY_PAUSE_RATIO",
-        toml_path: "ingest.derive.memory_pause_ratio",
+        name: "ZINDER_INGEST__MATERIALIZED_VIEWS__MEMORY_PAUSE_RATIO",
+        toml_path: "ingest.materialized_views.memory_pause_ratio",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Memory pressure ratio at which canonical-first derive replay pauses. \
+        description: "Memory pressure ratio at which canonical-first materialized-view replay pauses. \
                       Defaults to 0.99.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__MEMORY_RESUME_RATIO",
-        toml_path: "ingest.derive.memory_resume_ratio",
+        name: "ZINDER_INGEST__MATERIALIZED_VIEWS__MEMORY_RESUME_RATIO",
+        toml_path: "ingest.materialized_views.memory_resume_ratio",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Memory pressure ratio below which degraded derive replay returns to the \
+        description: "Memory pressure ratio below which degraded materialized-view replay returns to the \
                       normal replay batch size. Paused replay resumes as degraded work once \
                       pressure falls below memory_pause_ratio. Defaults to 0.80.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__MIN_REPLAY_BATCH_BLOCKS",
-        toml_path: "ingest.derive.min_replay_batch_blocks",
+        name: "ZINDER_INGEST__MATERIALIZED_VIEWS__MIN_REPLAY_BATCH_BLOCKS",
+        toml_path: "ingest.materialized_views.min_replay_batch_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Smallest effective derive replay batch size under memory degradation. \
+        description: "Smallest effective materialized-view replay batch size under memory degradation. \
                       Must be greater than zero and no larger than replay_batch_blocks. Defaults \
                       to 10.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__DERIVE__STARTUP_HANDOFF_LAG_BLOCKS",
-        toml_path: "ingest.derive.startup_handoff_lag_blocks",
+        name: "ZINDER_INGEST__MATERIALIZED_VIEWS__STARTUP_HANDOFF_LAG_BLOCKS",
+        toml_path: "ingest.materialized_views.startup_handoff_lag_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Residual derive lag in blocks at which a FollowingTip startup stops \
+        description: "Residual materialized-view lag in blocks at which a FollowingTip startup stops \
                       replaying synchronously and hands the remainder to the always-on tailer. \
                       BulkCatchup, AwaitingUpstream, failed observation, and unclassified startup \
                       states skip synchronous replay. A bounded wall-clock budget caps an \
                       admitted startup catch-up regardless of this value. Defaults to 1000.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__BULK_CATCHUP__FLUSH_INTERVAL_EPOCHS",
-        toml_path: "ingest.bulk_catchup.flush_interval_epochs",
+        name: "ZINDER_INGEST__CONSTRUCTION__FLUSH_INTERVAL_EPOCHS",
+        toml_path: "ingest.construction.flush_interval_epochs",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -1046,8 +1046,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       than zero. Defaults to 5.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__TIP_FOLLOW__POLL_INTERVAL_MS",
-        toml_path: "ingest.tip_follow.poll_interval_ms",
+        name: "ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS",
+        toml_path: "ingest.follow.poll_interval_ms",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -1055,16 +1055,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Defaults to 1000.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__TIP_FOLLOW__LAG_THRESHOLD_BLOCKS",
-        toml_path: "ingest.tip_follow.lag_threshold_blocks",
+        name: "ZINDER_INGEST__FOLLOW__LAG_THRESHOLD_BLOCKS",
+        toml_path: "ingest.follow.lag_threshold_blocks",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Block lag at which tip-follow reports `cause=syncing`. Defaults to 1.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT",
-        toml_path: "ingest.modifiers.target_height",
+        name: "ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT",
+        toml_path: "ingest.run_overrides.target_height",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -1072,8 +1072,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       height. Renamed from `to_height`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__MODIFIERS__CHECKPOINT_HEIGHT",
-        toml_path: "ingest.modifiers.checkpoint_height",
+        name: "ZINDER_INGEST__RUN_OVERRIDES__CHECKPOINT_HEIGHT",
+        toml_path: "ingest.run_overrides.checkpoint_height",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -1081,8 +1081,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       height.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__MODIFIERS__ALLOW_NEAR_TIP_FINALIZE",
-        toml_path: "ingest.modifiers.allow_near_tip_finalize",
+        name: "ZINDER_INGEST__RUN_OVERRIDES__ALLOW_NEAR_TIP_FINALIZE",
+        toml_path: "ingest.run_overrides.allow_near_tip_finalize",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -1090,8 +1090,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       window. Invalid combined with `coverage = \"wallet-serving\"`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__MODIFIERS__COVERAGE",
-        toml_path: "ingest.modifiers.coverage",
+        name: "ZINDER_INGEST__RUN_OVERRIDES__COVERAGE",
+        toml_path: "ingest.run_overrides.coverage",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,

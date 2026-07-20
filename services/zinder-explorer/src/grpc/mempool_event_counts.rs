@@ -1,7 +1,7 @@
 //! `ExplorerQuery.MempoolEventCounts` handler.
 //!
 //! Reads the per-second counter rows written by
-//! [`zinder_derive::MempoolEventCountsConsumer`]
+//! [`zinder_materialized_views::MempoolEventCountsConsumer`]
 //! and aggregates them across the requested window.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +16,9 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
-use zinder_derive::{DeriveStore, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MempoolEventCountsConsumer};
+use zinder_materialized_views::{
+    MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MaterializedViewStore, MempoolEventCountsConsumer,
+};
 
 /// Minimum window size accepted by the handler.
 const MIN_WINDOW_SECONDS: u32 = 60;
@@ -33,7 +35,7 @@ const MAX_ROWS_PER_REQUEST: usize = MAX_WINDOW_SECONDS as usize;
 
 /// Executes one `MempoolEventCounts` request.
 pub(crate) async fn handle_mempool_event_counts(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MempoolEventCountsRequest>,
@@ -44,7 +46,7 @@ pub(crate) async fn handle_mempool_event_counts(
     let window_start = now_seconds.saturating_sub(u64::from(window_seconds));
     let start_key = MempoolEventCountsConsumer::key_for_second(window_start);
     let end_key = MempoolEventCountsConsumer::key_for_second(now_seconds);
-    let entries = derive_store
+    let entries = materialized_view_store
         .range_iterate_consumer(
             MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
             &start_key,
@@ -82,7 +84,7 @@ pub(crate) async fn handle_mempool_event_counts(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
             Some(chain_epoch),
             0,

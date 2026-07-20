@@ -15,7 +15,7 @@ Accepted on 2026-05-16.
 
 Before this decision, the source boundary tagged every failure with `is_retryable: bool` and the loops above used that bool as the discriminator between "drain readiness and retry" and "exit the process." On 2026-05-15 the Railway production deployment `637cf727-3267-46ce-8e9c-008d3b448e7b` exited because Zebra returned a `getblockhash` error whose JSON-RPC code was not on the adapter's small retryable whitelist (`-28` only); the adapter stamped `is_retryable: false` on the resulting `SourceError::BlockUnavailable` for the string `"block height not in best chain"`, the tip-follow loop saw a non-retryable error, and the writer exited.
 
-A pre-existing runbook draft already specified that retryable upstream failures must be readiness transitions and not process exits, but it tied recovery to "errors that the source boundary classifies as retryable." That phrasing made the bool the load-bearing contract field, and the bool was wrong by construction: the adapter could not enumerate every JSON-RPC error code Zebra would ever return, and any code it had not yet whitelisted defaulted to fatal.
+Retryable upstream failures must be readiness transitions rather than process exits. A boolean `retryable` classification is too weak for that contract: an adapter cannot enumerate every JSON-RPC error code Zebra may return, and an unrecognized code must not default to a fatal writer exit.
 
 ## Decision
 
@@ -28,7 +28,7 @@ A pre-existing runbook draft already specified that retryable upstream failures 
 
 ## Consequences
 
-- The production scenario (Zebra returns a non-`-28` JSON-RPC error during tip-follow) is now a `node_unavailable` readiness transition with `failure_class = "upstream_view_changed"` and the writer stays alive across the outage.
+- A non-`-28` Zebra JSON-RPC error during canonical following is a `node_unavailable` readiness transition with `failure_class = "upstream_view_changed"`; the writer stays alive across the outage.
 - The four loops share one recovery primitive instead of three differently shaped retry bodies (and a fourth orchestrator with no retry classification at all). Adding a new long-lived loop follows the same template.
 - Operators reading `/readyz` learn *which kind* of upstream failure is happening, how many iterations the writer has been retrying, and how long the outage has lasted, without consulting logs.
 - New `SourceError` variants only have to pick a `SourceFailureClass`; the bool is gone and cannot be set wrong.

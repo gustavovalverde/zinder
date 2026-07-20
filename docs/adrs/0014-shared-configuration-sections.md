@@ -1,215 +1,63 @@
-# ADR-0014: Shared Configuration Sections
+# ADR-0014: Shared configuration sections
 
-## Status
-
-Superseded in part by
-[ADR-0035](0035-fact-first-storage-selection-and-lifecycle.md).
-
-## Revision history
-
-- 2026-07-17: Recorded the fact-first runtime cutover. The native
-  `zinder-query`, `zinder-explorer`, and legacy backup command are no longer
-  production binaries; their private configuration sections are historical.
-- 2026-06-25: Added the `[security]` shared section and the public-bind
-  refusal it carries (see [§Public-bind refusal](#public-bind-refusal)).
+| Field | Value |
+| --- | --- |
+| Status | Accepted |
+| Related | [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md), [ADR-0035](0035-canonical-storage-topologies.md) |
 
 ## Context
 
-Zinder ships four service binaries (`zinder-ingest`, `zinder-query`,
-`zinder-compat-lightwalletd`, `zinder-explorer`). Each consumes a layered
-TOML + env + CLI configuration through the
-[`zinder-runtime`](../../crates/zinder-runtime/src/config.rs)
-`ConfigLoader`. Before this ADR, the binaries each owned a private copy
-of the schema for the sections they shared: `[network]`, `[node]`,
-`[storage]`, retention windows, and the IngestControl writer/reader
-plumbing. The same field appeared with the same semantics in two to four
-places with drift-prone duplication of struct shapes, default constants,
-and validation logic.
-
-Two production incidents traced back to this duplication:
-
-- The 2026-05-15 operational endpoint footgun, where the four service
-  Dockerfiles each baked an `ENV ZINDER_OPS_LISTEN_ADDR=…` (single
-  underscore) that only one service consumed. The other three accepted
-  the value into the container environment but never wired it through
-  config-rs because they had no schema for it.
-- Operator confusion across runbooks about whether retention windows
-  belonged under `[ingest.retention]` (writer enforcement) or under
-  `[storage]` (reader advertisement). The two paths were textual copies
-  of the same field set, validated independently, with operators
-  expected to keep them in sync.
-
-The asymmetry meant that adding a fifth binary, or adding a new shared
-field to an existing concern, required N copy-paste edits, each one a
-chance for drift. The vocabulary spine at
-[`docs/architecture/public-interfaces.md`](../architecture/public-interfaces.md)
-had no canonical schema to point at because there was no single source
-of truth.
+Zinder binaries share network, node, storage, security, and operational
+concepts. Private copies of those schemas drift in field names, defaults,
+environment mappings, redaction, and validation. At the same time, forcing
+every binary to accept every field makes ownership unclear and allows a reader
+to appear capable of configuring a writer.
 
 ## Decision
 
-Every TOML section that more than one binary consumes lives in a single
-shared module under
-[`crates/zinder-runtime/src/sections/`](../../crates/zinder-runtime/src/sections),
-with a public struct (`<Name>Section`), a resolver
-(`resolve_<name>(...)`), an optional resolved-config projection
-(`Resolved<Name>`), and a TOML mirror for `--print-config` rendering.
-The corresponding [`ConfigLoader`](../../crates/zinder-runtime/src/config.rs)
-helper (`with_<name>_section`) wires per-service defaults so a new
-service cannot drift from the established schema.
+`zinder-runtime` owns reusable configuration section types and the layered
+loader. Each binary composes only the sections it needs and owns its
+service-specific validation.
 
-The eight shared sections at the time of writing are:
+Configuration precedence is:
 
-- `[network]` ([`NetworkSection`](../../crates/zinder-runtime/src/config.rs))
-- `[ops]` ([`OpsSection`](../../crates/zinder-runtime/src/sections/ops.rs)),
-  uniform across all four binaries, on-by-default with empty-string
-  opt-out
-- `[storage]` ([`PrimaryStorageSection`](../../crates/zinder-runtime/src/sections/storage.rs)
-  for the writer,
-  [`SecondaryStorageSection`](../../crates/zinder-runtime/src/sections/storage.rs)
-  for readers)
-- `[retention]`
-  ([`RetentionSection`](../../crates/zinder-runtime/src/sections/retention.rs)),
-  enforced by `zinder-ingest` and advertised by `zinder-query`; single
-  source of truth replaces the writer/reader duplicate
-- `[ingest_control]`
-  ([`IngestControlSection`](../../crates/zinder-runtime/src/sections/ingest_control.rs)),
-  one section that carries writer-side `listen_addr`, reader-side `addr`,
-  and shared `bearer_token_path` (ADR-0006); each binary reads only what
-  it needs
-- `[security]`
-  ([`SecuritySection`](../../crates/zinder-runtime/src/sections/security.rs)),
-  uniform across all four binaries, carrying the serving-surface
-  public-bind posture (see [§Public-bind refusal](#public-bind-refusal))
-- `[node]` and `[node.auth]` ([`NodeSection`](../../crates/zinder-source/src/node_target.rs),
-  pre-existing in `zinder-source`)
+1. compiled defaults;
+2. the optional TOML file;
+3. `ZINDER_*` environment variables; and
+4. explicit CLI overrides.
 
-Per-service sections stay private to their owning binary. The original
-`[backup]`, `[query]`, and `[explorer]` sections described here were removed by
-the fact-first runtime cutover; current production configuration uses
-`[ingest]`, `[projector]`, and `[compat]`.
-[ADR-0015](0015-unified-phase-driven-ingest.md) collapses the earlier
-`[bulk catchup]` and `[tip_follow]` writer-side splits into the
-sub-sectioned `[ingest.phases]`, `[ingest.bulk_catchup]`,
-`[ingest.derive]`, `[ingest.tip_follow]`, and `[ingest.modifiers]`
-schema, and adds a new shared `[node.health]` sub-section on the
-existing `[node]` schema so the upstream-health knobs are
-operator-readable from every binary that wants them.
+Shared names keep the same meaning across services:
 
-### Defaults
+- `[network]` selects the Zinder-native network identity;
+- `[node]` owns upstream endpoints, authentication, transport limits, and
+  health probing;
+- `[storage]` owns canonical paths, secondary paths, catch-up behavior, and
+  role-scoped RocksDB resource budgets;
+- `[security]` owns public-bind refusal and transport policy; and
+- service sections such as `[ingest]`, `[projector]`, and `[compat]` own only
+  behavior for that runtime.
 
-Default ports for the operational endpoint and the gRPC listen addresses
-live in
-[`crates/zinder-runtime/src/sections/defaults.rs`](../../crates/zinder-runtime/src/sections/defaults.rs)
-as `pub const` functions keyed on
-[`ServiceIdentifier`](../../crates/zinder-runtime/src/sections/service.rs).
-Per-section retention/catchup constants live in the section module that
-consumes them; they are intentionally private because external callers
-work through the resolver, which already applies the defaults.
+`zinder-ingest` further groups runtime behavior by domain:
 
-### Public-bind refusal
+- `[ingest.phase_classification]` selects construction versus following;
+- `[ingest.construction]` bounds source and canonical construction work;
+- `[ingest.follow]` controls steady-state polling and lag readiness;
+- `[ingest.materialized_views]` controls materialized-view replay where that
+  subsystem is used; and
+- `[ingest.run_overrides]` contains one-run targeting and checkpoint inputs.
 
-Zinder ships no server TLS (ADR-0006 assigns encryption and public
-exposure to a reverse proxy), so every serving and operational listener
-is plaintext. A listener bound to an unspecified (`0.0.0.0`, `::`) or
-globally-routable address exposes unauthenticated chain data directly to
-the network. The `[security] allow_public_bind` field gates that exposure.
-
-The guard lives in
-[`crates/zinder-runtime/src/bind_guard.rs`](../../crates/zinder-runtime/src/bind_guard.rs)
-and runs at config-validation time, once per resolved listen address
-(native gRPC `*.listen_addr`, `ops.listen_addr`, the IngestControl
-writer's `ingest_control.listen_addr`). Each address is classified with
-stable `std::net` predicates:
-
-- Loopback (`127.0.0.0/8`, `::1`) and private-range
-  (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`,
-  `fe80::/10`) binds are always allowed. The private case keeps the
-  Railway private mesh and LAN development working without an opt-in.
-- Unspecified and globally-routable binds are refused with a
-  [`ConfigError::Invalid`](../../crates/zinder-runtime/src/config.rs)
-  naming the surface, the address, and the opt-in. When
-  `allow_public_bind = true`, the bind proceeds and the guard emits a
-  `tracing::warn!` (target `zinder::runtime`) naming the surface and
-  address. `is_global` is nightly-only, so "public" is defined as the
-  complement of the named ranges.
-
-The opt-in is a **runtime** flag, not a build feature. Zinder ships one
-container image that binds `0.0.0.0`/`[::]` behind a reverse proxy, so a
-build feature would always be compiled in and the guard would never fire.
-A runtime flag (default `false`) lets the single image stay built once
-while only the proxy-fronted deployment consciously opts in. Zinder's own
-`deploy/` Dockerfiles and example configs set
-`ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true` for exactly this reason; a
-deployment that binds a public or unspecified address without it now
-refuses to start.
-
-### Env-var contract
-
-The shared sections inherit the `ZINDER_<SECTION>__<FIELD>` env-var
-convention from
-[Public interfaces §Environment variable mapping](../architecture/public-interfaces.md#environment-variable-mapping).
-The
-[`ENVIRONMENT_VARIABLES`](../../crates/zinder-runtime/src/env_var_docs.rs)
-constant is the single registry; the CI doc-mirror test fails when the
-constant and the spine table diverge.
-
-The
-[`env_diagnostics`](../../crates/zinder-runtime/src/env_diagnostics.rs)
-module intercepts serde "unknown field" errors at deserialization time,
-maps the rejected key back to the originating `ZINDER_…` env var, and
-emits
-[`ConfigError::RejectedEnvVar`](../../crates/zinder-runtime/src/config.rs)
-with a "did you mean" hint that points at the double-underscore form.
-This catches the single-vs-double-underscore footgun that motivated the
-refactor at startup with an actionable error, instead of silently
-producing a meaningless top-level key that the schema rejects with a
-generic message.
+`--print-config` renders the resolved service configuration using the same
+serialization contract as the loader. Secret values and raw authorization
+material are replaced by explicit redaction markers. Unknown fields are
+rejected, invalid cross-field combinations fail before storage opens, and a
+service does not accept configuration for a role it does not own.
 
 ## Consequences
 
-**For service authors.** Adding a new field to a shared section means
-editing one struct + one resolver. Each participating binary picks it up by
-calling the existing `with_<name>_section` helper. Adding a new
-binary means listing its `ServiceIdentifier` variant and chaining the
-existing shared helpers; the schema is uniform by construction.
-
-**For operators.** The canonical TOML at
-[Public interfaces §Configuration Conventions](../architecture/public-interfaces.md#section-layout)
-is the only place that describes the schema. `--print-config` against any
-binary renders the same shared sections in the same shape; operator
-scripts that pivot on section names see the same fields regardless of
-which binary they target.
-
-**For test authors.** Cross-field invariants on shared sections (e.g.,
-"retention warning lead time must be \u{2264} the retention window")
-live in the section's resolver and are exercised by the section's own
-unit tests; service test suites no longer carry parallel copies.
-
-**Breaking changes.** Adopting this ADR renamed several operator-facing
-keys; per the Zinder pre-release breaking-change policy there is no
-compatibility shim:
-
-| Old path                                | New path                            |
-|------------------------------------------|-------------------------------------|
-| `[ingest.control] listen_addr`           | `[ingest_control] listen_addr`      |
-| `[ingest.control] token_path`            | `[ingest_control] bearer_token_path`|
-| `[storage] ingest_control_addr`          | `[ingest_control] addr`             |
-| `[storage] ingest_control_token_path`    | `[ingest_control] bearer_token_path`|
-| `[ingest.retention] *`                   | `[retention] *`                     |
-| `[storage] chain_event_retention_hours`  | `[retention] chain_event_retention_hours` (single source of truth replaces the reader-side mirror) |
-| `[storage] mempool_mined_retention_minutes` | `[retention] mempool_mined_retention_minutes` |
-| `[storage] mempool_invalidated_retention_hours` | `[retention] mempool_invalidated_retention_hours` |
-
-The matching `ZINDER_…` env vars follow the same path; the env-var
-table in
-[Public interfaces](../architecture/public-interfaces.md#operator-facing-variables)
-is the authoritative list.
-
-## References
-
-- [ADR-0003: Canonical Storage Access Boundary](0003-canonical-storage-access-boundary.md)
-- [ADR-0004: Node Source and Protocol Boundaries](0004-node-source-and-protocol-boundaries.md)
-- [ADR-0006: IngestControl Transport Security](0006-ingest-control-transport-security.md)
-- [`crates/zinder-runtime/src/sections/`](../../crates/zinder-runtime/src/sections)
-- [Public interfaces §Configuration Conventions](../architecture/public-interfaces.md#configuration-conventions)
+- Shared fields have one spelling, default, environment mapping, and redaction
+  policy.
+- Service configuration remains narrow enough to communicate ownership.
+- New shared fields belong in `zinder-runtime`; service-only fields remain in
+  that service's config module.
+- Configuration changes must update `--print-config`, environment-variable
+  documentation, examples, tests, and the public vocabulary in the same change.

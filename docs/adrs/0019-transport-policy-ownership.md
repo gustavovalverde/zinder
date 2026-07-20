@@ -146,20 +146,13 @@ the existing `SourceFailureClass` mapping at
 [`crates/zinder-source/src/source_error.rs:367`](../../crates/zinder-source/src/source_error.rs);
 no new error taxonomy.
 
-### Why intra-Zinder gRPC is *not* wrapped in `ResilientClient` yet
+### Intra-Zinder gRPC uses its own channel policy
 
-The intra-Zinder seam already has keep-alive (commit `9537461`) and
-the subscribe-call timeout. There is a separately-tracked failure
-mode (`task #31`: persisted-derive-cursor wedge on explorer restart)
-that *might* be a residual stale-channel symptom but might also be a
-cursor-format or `OnceCell` cancellation issue. Wrapping intra-Zinder
-clients in `ResilientClient` before that investigation concludes
-would be premature optimization that adds an `arc-swap` dependency to
-`zinder-runtime` for an unproven gain.
-
-If task #31's root cause is shown to be transport-class, lifting
-`ResilientClient<C>` into `zinder-runtime::transport` is a small
-follow-up. The wrapper is intentionally agnostic to its owning crate.
+Intra-Zinder channels use the coordinated keep-alive and request-timeout policy
+owned by `zinder-runtime::transport`. They do not use `ResilientClient`: that
+wrapper classifies Zebra source failures and belongs to the upstream-source
+boundary. Keeping the two policies separate avoids importing source-specific
+failure semantics and `arc-swap` into every internal service channel.
 
 ### Observability
 

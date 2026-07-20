@@ -62,7 +62,7 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::UnsupportedShieldedProtocol { .. }
         | QueryError::BroadcastTransactionTooLarge { .. } => bad_request_details(error),
         QueryError::TransactionBroadcastDisabled
-        | QueryError::DeriveUnavailable { .. }
+        | QueryError::MaterializedViewUnavailable { .. }
         | QueryError::ChainEventCursorExpired { .. }
         | QueryError::ChainEpochPinUnsupported
         | QueryError::ChainEpochPinUnavailable { .. } => precondition_failure_details(error),
@@ -145,11 +145,11 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
                 "transaction broadcast is not configured for this deployment",
             )
         }
-        QueryError::DeriveUnavailable { capability } => {
+        QueryError::MaterializedViewUnavailable { capability } => {
             ErrorDetails::with_precondition_failure_violation(
-                "DERIVE_PROJECTION_UNAVAILABLE",
+                "MATERIALIZED_VIEW_UNAVAILABLE",
                 *capability,
-                "derive projection is not configured for this deployment",
+                "materialized view is not configured for this deployment",
             )
         }
         QueryError::ChainEventCursorExpired {

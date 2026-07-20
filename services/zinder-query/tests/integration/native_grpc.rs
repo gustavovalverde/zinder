@@ -480,7 +480,7 @@ async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::R
             chain_epoch: Some(proxied_event_chain_epoch()),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
             wallet::ChainCommitted {
@@ -540,7 +540,7 @@ async fn native_grpc_service_resolves_unpinned_mempool_transactions() -> eyre::R
             chain_epoch: Some(proxied_event_chain_epoch()),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         location: Some(wallet::TransactionLocation {
             location: Some(wallet::transaction_location::Location::InMempool(
@@ -915,7 +915,7 @@ impl IngestControl for StaticIngestControl {
                 }),
                 indexed_tip: None,
                 upstream_tip: None,
-                derive: None,
+                materialized_views: None,
             }),
             network_name: "zcash-regtest".to_owned(),
             phase: WriterPhase::FollowingTip.into(),

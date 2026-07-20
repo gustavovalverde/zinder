@@ -1,6 +1,6 @@
 # Extending the Wallet Data Plane
 
-This document is a cookbook. When you (a contributor or an LLM agent) need to add a new typed read method to Zinder's wallet data plane (a new `WalletQuery` RPC, a new `ChainIndex` trait method, or a new federated derive-plane handler), follow this checklist. The 14 steps are concrete, the examples are real, and the patterns named here are the ones to copy.
+This document is a cookbook. When you (a contributor or an LLM agent) need to add a new typed read method to Zinder's wallet data plane (a new `WalletQuery` RPC, a new `ChainIndex` trait method, or a new federated materialized-view handler), follow this checklist. The 14 steps are concrete, the examples are real, and the patterns named here are the ones to copy.
 
 The goal is unambiguity. After reading this document, an agent should be able to add a new typed read method without inventing new conventions, asking clarifying questions, or making decisions that conflict with the naming spine in [Public Interfaces](public-interfaces.md).
 
@@ -9,10 +9,10 @@ The goal is unambiguity. After reading this document, an agent should be able to
 This document covers three related but distinct extension shapes. Pick the right doc before starting:
 
 | Adding | Doc | When |
-|---|---|---|
+| --- | --- | --- |
 | A new typed read method on existing artifacts | This doc | The data is already in storage; you need a new way to access it |
 | A new artifact family (new storage) | [Extending artifacts](extending-artifacts.md) | The data is chain-derived but not yet persisted |
-| A new derive consumer (federated method) | This doc §Federation extension + [Derive plane](derive-plane.md) | The data is materialized in `zinder-explorer` and surfaced through `WalletQuery` |
+| A new materialized-view consumer | [Materialized-view plane](materialized-view-plane.md) | The data belongs to an independently rebuildable projection and is exposed through `ExplorerQuery` |
 
 Each wire shape pairs with one capability string. Changing the shape of an `_v1` response requires landing a new `_v2` capability; the `_vN` suffix is part of the identity, not a version field decoded by clients (per [Public interfaces §Capability discovery](public-interfaces.md#capability-discovery)).
 
@@ -120,7 +120,7 @@ File: `crates/zinder-proto/src/capabilities.rs`
 Append the capability string to `ZINDER_CAPABILITIES`. Format: `domain.subdomain.capability_name_v{N}`.
 
 | Namespace | Used for |
-|---|---|
+| --- | --- |
 | `wallet.read.*` | Canonical block / transaction / tree-state reads |
 | `wallet.mempool.*` | Live mempool point lookups (writer-owned, no epoch pinning) |
 | `wallet.address.*` | Transparent-address reads |
@@ -129,7 +129,7 @@ Append the capability string to `ZINDER_CAPABILITIES`. Format: `domain.subdomain
 | `wallet.broadcast.*` | Write paths |
 | `<product>.<noun>.*` | Federated explorer/analytics-plane methods (one product namespace per public surface) |
 
-Wallet-plane RPCs own `wallet.*`; derive-backed product methods own their product namespace, for example `explorer.*`. Mixing namespaces fails capability-coverage tests.
+Wallet-plane RPCs own `wallet.*`; materialized-view-backed product methods own their product namespace, for example `explorer.*`. Mixing namespaces fails capability-coverage tests.
 
 ### Step 10 — Capability-coverage row
 
@@ -165,66 +165,6 @@ File: `services/zinder-query/tests/perf/perf_smoke.rs`
 
 Required for range reads where N-block reads could regress. Not required for point lookups. Budget constants are deliberately loose for CI workers; tight numbers live in the architecture docs.
 
-## Federation extension
-
-When the new RPC delegates to `zinder-explorer`'s `ExplorerQuery` or another derive consumer, add everything above plus seven sub-steps. The design rationale and boundary rules live in [Derive plane §Shape 2](derive-plane.md#shape-2--federated-under-walletquery).
-
-### F1. ExplorerQuery proto
-
-File: `crates/zinder-proto/proto/zinder/v1/explorer/explorer.proto`
-
-Add the RPC mirroring the WalletQuery shape.
-
-### F2. Readiness-gated client field on the adapter
-
-File: `services/zinder-query/src/grpc/adapter.rs`
-
-Add an optional readiness-gated client to the derive service onto `WalletQueryGrpcAdapter`, with a `with_<consumer>_proxy(...) -> Self` builder and a getter exposing the consumer's readiness gauge.
-
-### F3. Federated handler
-
-In the WalletQuery server impl arm, forward the request to the consumer's readiness-gated client:
-
-```rust
-async fn rpc_name(
-    &self,
-    request: Request<RequestType>,
-) -> Result<Response<ResponseType>, Status> {
-    let proxy = self
-        .<consumer>_proxy
-        .as_ref()
-        .ok_or_else(|| Status::unavailable("derive consumer not configured"))?;
-    proxy
-        .forward(request, |mut client, request| async move {
-            client.rpc_name(request).await
-        })
-        .await
-}
-```
-
-No translation logic: proto messages flow through unchanged. The forward gates on readiness before opening the channel.
-
-### F4. ServerInfo capability gating
-
-In the `server_info` handler on `WalletQueryGrpcAdapter`: include the federated capability only when the proxy is configured and the readiness gauge reports `is_ready()`. If the proxy is unconfigured or unhealthy, actively remove the string from the advertised list.
-
-### F5. Readiness probe
-
-In the startup path of the serving composition that embeds `WalletQueryGrpcAdapter`: construct the readiness-gated client from its endpoint, bearer token, and target capability, then spawn a background probe that polls the derive service's `ServerInfo` and flips the readiness gauge.
-
-### F6. Two capability strings per consumer
-
-File: `crates/zinder-proto/src/capabilities.rs`
-
-- `derive.<consumer>.server_info_v1`: advertised by the derive service's own `ServerInfo`; the readiness probe polls for this string.
-- `derive.<consumer>.<method>_v1`: advertised by the composition serving `WalletQueryGrpcAdapter` when the readiness gauge is `true`.
-
-### F7. Compat shim derive wiring (if applicable)
-
-File: `services/zinder-compat-lightwalletd/src/grpc.rs`
-
-`LightwalletdGrpcAdapter` has its own `<consumer>_proxy` field, wired via `.with_<consumer>_proxy(proxy)`. The compat shim calls `proxy.forward(request, |mut client, request| ...)` directly; it does not go through `WalletQueryApi`.
-
 ## Response enrichment rule
 
 Some response fields are useful to consumers but are not canonical artifacts. The rule is `chain_epoch` binding: a response builder may synthesize fields only from the same `ChainEpoch` it is already serving. It must not call the upstream node, read an unpinned latest tip, or mix two visible epochs.
@@ -238,7 +178,7 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 (Repeated from Step 9 for visibility.)
 
 | Namespace | Used for | Example |
-|---|---|---|
+| --- | --- | --- |
 | `wallet.read.*` | Canonical block / transaction / tree-state reads | `wallet.read.transaction_by_id_v1` |
 | `wallet.mempool.*` | Live mempool point lookups | `wallet.mempool.transparent_outputs_by_address_v1` |
 | `wallet.address.*` | Transparent-address reads | `wallet.address.transparent_unspent_outputs_v1` |
@@ -247,7 +187,7 @@ Any future enrichment field that depends on tip state takes the response's `Chai
 | `wallet.broadcast.*` | Write paths | `wallet.broadcast.transaction_v1` |
 | `<product>.<noun>.*` | Federated explorer/analytics-plane methods | `explorer.transaction.detail_v3` |
 
-Storage tier and lifecycle drive the namespace; do not mix. Putting a derive-backed method under `wallet.*` fails capability-coverage tests.
+Storage tier and lifecycle drive the namespace; do not mix. Putting a materialized-view-backed method under `wallet.*` fails capability-coverage tests.
 
 ## Two discipline gates
 
@@ -265,7 +205,7 @@ implementation-specific transport habits. A PR proposing any of them must
 explain why the case is different from the documented refusal.
 
 | Anti-pattern | Refusal in code |
-|---|---|
+| --- | --- |
 | Verbosity integer | `transaction_by_id` returns typed `TxStatus`, no `verbose: u64` parameter |
 | Verbose boolean | `block_header_by_selector` returns typed `BlockHeaderInfo`, no `verbose: bool` |
 | String-keyed pool | `ShieldedProtocol` enum at every layer |
@@ -332,4 +272,4 @@ Each entry references the discipline gate that catches it.
 - [Wallet data plane](wallet-data-plane.md): owning venue for most read shapes.
 - [Service boundaries](service-boundaries.md): which runtime owns what.
 - [Extending artifacts](extending-artifacts.md): companion cookbook for new artifact families.
-- [Derive plane](derive-plane.md): federation overview.
+- [Materialized-view plane](materialized-view-plane.md): federation overview.

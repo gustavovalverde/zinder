@@ -1,15 +1,15 @@
 //! `ExplorerQuery.ConventionalFeeDistribution` handler.
 //!
-//! Maps exact ZIP-317 conventional-fee frequencies from the derive projection
+//! Maps exact ZIP-317 conventional-fee frequencies from the materialized view
 //! without computing paid fees, percentiles, or product-specific buckets.
 
 use tonic::{Request, Response, Status};
 use zinder_core::BlockHeight;
-use zinder_derive::{
-    ConventionalFeeDistribution as DerivedConventionalFeeDistribution,
+use zinder_materialized_views::{
+    ConventionalFeeDistribution as ProjectedConventionalFeeDistribution,
     ConventionalFeeDistributionBackfillCoverage, ConventionalFeeDistributionConsumer,
-    ConventionalFeeDistributionDay as DerivedConventionalFeeDistributionDay,
-    ConventionalFeeFrequency as DerivedConventionalFeeFrequency, DeriveStore,
+    ConventionalFeeDistributionDay as ProjectedConventionalFeeDistributionDay,
+    ConventionalFeeFrequency as ProjectedConventionalFeeFrequency, MaterializedViewStore,
 };
 use zinder_proto::capabilities::EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1;
 use zinder_proto::v1::explorer::{
@@ -27,7 +27,7 @@ use super::freshness::{
 
 /// Executes one `ExplorerQuery.ConventionalFeeDistribution` request.
 pub(crate) async fn handle_conventional_fee_distribution(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ConventionalFeeDistributionRequest>,
@@ -39,12 +39,12 @@ pub(crate) async fn handle_conventional_fee_distribution(
     )?;
 
     let distribution = ConventionalFeeDistributionConsumer::distribution_in_time_range(
-        derive_store,
+        materialized_view_store,
         request.start_time_unix_seconds,
         request.end_time_unix_seconds,
     )
     .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let coverage = ConventionalFeeDistributionConsumer::coverage(derive_store)
+    let coverage = ConventionalFeeDistributionConsumer::coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
         .ok_or_else(|| {
             ExplorerError::not_materialized(
@@ -55,7 +55,7 @@ pub(crate) async fn handle_conventional_fee_distribution(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1,
             Some(chain_epoch),
             0,
@@ -106,12 +106,12 @@ async fn fetch_current_chain_epoch(
 }
 
 fn map_distribution(
-    distribution: DerivedConventionalFeeDistribution,
+    distribution: ProjectedConventionalFeeDistribution,
 ) -> Vec<ConventionalFeeDistributionDay> {
     distribution.days.into_iter().map(map_day).collect()
 }
 
-fn map_day(day: DerivedConventionalFeeDistributionDay) -> ConventionalFeeDistributionDay {
+fn map_day(day: ProjectedConventionalFeeDistributionDay) -> ConventionalFeeDistributionDay {
     ConventionalFeeDistributionDay {
         day_start_unix_seconds: day.day_start_unix_seconds,
         frequencies: day.frequencies.into_iter().map(map_frequency).collect(),
@@ -119,7 +119,7 @@ fn map_day(day: DerivedConventionalFeeDistributionDay) -> ConventionalFeeDistrib
     }
 }
 
-fn map_frequency(frequency: DerivedConventionalFeeFrequency) -> ConventionalFeeFrequency {
+fn map_frequency(frequency: ProjectedConventionalFeeFrequency) -> ConventionalFeeFrequency {
     ConventionalFeeFrequency {
         zip317_conventional_fee_zat: frequency.zip317_conventional_fee_zat,
         transaction_count: frequency.transaction_count,
@@ -166,15 +166,15 @@ mod tests {
 
     #[test]
     fn mapping_preserves_exact_frequency_order_and_unavailable_count() {
-        let days = map_distribution(DerivedConventionalFeeDistribution {
-            days: vec![DerivedConventionalFeeDistributionDay {
+        let days = map_distribution(ProjectedConventionalFeeDistribution {
+            days: vec![ProjectedConventionalFeeDistributionDay {
                 day_start_unix_seconds: 1_700_006_400,
                 frequencies: vec![
-                    DerivedConventionalFeeFrequency {
+                    ProjectedConventionalFeeFrequency {
                         zip317_conventional_fee_zat: 10_000,
                         transaction_count: 4,
                     },
-                    DerivedConventionalFeeFrequency {
+                    ProjectedConventionalFeeFrequency {
                         zip317_conventional_fee_zat: 20_000,
                         transaction_count: 2,
                     },

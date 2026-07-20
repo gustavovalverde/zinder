@@ -52,7 +52,7 @@ pub(crate) fn encode_chain_event_envelope(event_envelope: &ChainEventEnvelope) -
     ChainEventEnvelopeRecord {
         event_sequence: event_envelope.event_sequence,
         chain_epoch: Some(chain_epoch_record(&event_envelope.chain_epoch)),
-        safe_tip_height: event_envelope.safe_tip_height.value(),
+        settled_tip_height: event_envelope.settled_tip_height.value(),
         event: Some(chain_event_record(&event_envelope.event)),
     }
     .encode_to_vec()
@@ -116,7 +116,7 @@ pub(crate) fn decode_chain_event_envelope(
         cursor,
         record.event_sequence,
         chain_epoch,
-        BlockHeight::new(record.safe_tip_height),
+        BlockHeight::new(record.settled_tip_height),
         event,
     ))
 }
@@ -2174,8 +2174,8 @@ fn chain_epoch_record(chain_epoch: &ChainEpoch) -> ChainEpochRecord {
         network_id: chain_epoch.network.id(),
         tip_height: chain_epoch.visible_tip_height.value(),
         tip_hash: chain_epoch.visible_tip_hash.as_bytes().to_vec(),
-        safe_tip_height: chain_epoch.settled_tip_height.value(),
-        safe_tip_hash: chain_epoch.settled_tip_hash.as_bytes().to_vec(),
+        settled_tip_height: chain_epoch.settled_tip_height.value(),
+        settled_tip_hash: chain_epoch.settled_tip_hash.as_bytes().to_vec(),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
@@ -2200,8 +2200,8 @@ fn decode_chain_epoch_record(
         network,
         visible_tip_height: BlockHeight::new(record.tip_height),
         visible_tip_hash: decode_block_hash(family, key, &record.tip_hash)?,
-        settled_tip_height: BlockHeight::new(record.safe_tip_height),
-        settled_tip_hash: decode_block_hash(family, key, &record.safe_tip_hash)?,
+        settled_tip_height: BlockHeight::new(record.settled_tip_height),
+        settled_tip_hash: decode_block_hash(family, key, &record.settled_tip_hash)?,
         artifact_schema_version: ArtifactSchemaVersion::new(
             u16::try_from(record.artifact_schema_version).map_err(|_| {
                 StoreError::ArtifactCorrupt {
@@ -2540,9 +2540,9 @@ struct ChainEpochRecord {
     #[prost(bytes, tag = "4")]
     tip_hash: Vec<u8>,
     #[prost(uint32, tag = "5")]
-    safe_tip_height: u32,
+    settled_tip_height: u32,
     #[prost(bytes, tag = "6")]
-    safe_tip_hash: Vec<u8>,
+    settled_tip_hash: Vec<u8>,
     #[prost(uint32, tag = "7")]
     artifact_schema_version: u32,
     #[prost(uint64, tag = "8")]
@@ -2565,7 +2565,7 @@ struct ChainEventEnvelopeRecord {
     #[prost(message, optional, tag = "3")]
     chain_epoch: Option<ChainEpochRecord>,
     #[prost(uint32, tag = "4")]
-    safe_tip_height: u32,
+    settled_tip_height: u32,
     #[prost(message, optional, tag = "5")]
     event: Option<ChainEventRecord>,
 }

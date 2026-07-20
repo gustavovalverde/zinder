@@ -1,6 +1,6 @@
 //! Version-1 `IngestControl` composition over the canonical writer channel.
 //!
-//! This adapter never opens a canonical primary or a derive store. Exact
+//! This adapter never opens a canonical primary or a materialized-view store. Exact
 //! writer status and tip-event replay are serviced by the follower that owns
 //! the admitted `RocksDbCanonicalStore`; resumable mempool history and cursor
 //! retention are also owned by that canonical `RocksDB` event log. Only the

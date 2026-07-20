@@ -302,7 +302,7 @@ impl NodeTarget {
 ///
 /// `[node]` describes the upstream node itself (endpoint, transport, auth).
 /// Ingest's choice of which adapter implementation to instantiate lives on
-/// `[ingest].source` per [ADR-0016](../../../docs/adrs/0016-source-streaming-pipeline.md)
+/// `[ingest].source` per [ADR-0016](../../../docs/adrs/0016-source-segment-fetching.md)
 /// because it is a writer-private implementation decision, not a property
 /// of the node.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

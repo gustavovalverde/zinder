@@ -1,6 +1,6 @@
 //! `ExplorerQuery.CommitmentRootSearch` handler.
 //!
-//! Reads the derive reverse index, then validates every candidate against one
+//! Reads the materialized-view reverse index, then validates every candidate against one
 //! pinned canonical epoch. The second check is intentional: an ingest-owned
 //! historical enrichment can commit just before a reorg, so an obsolete
 //! physical projection row must never become a canonical match.
@@ -13,9 +13,9 @@ use zinder_core::{
     DisplacedRootArchiveCoverage, FinalNoteCommitmentRoot, NetworkUpgradeActivations,
     ShieldedProtocol as CoreProtocol,
 };
-use zinder_derive::{
+use zinder_materialized_views::{
     COMMITMENT_ROOT_SEARCH_INDEX_COLUMN_FAMILY, CommitmentRootBackfillCoverage,
-    CommitmentRootSearchConsumer, DeriveStore,
+    CommitmentRootSearchConsumer, MaterializedViewStore,
 };
 use zinder_proto::capabilities::EXPLORER_COMMITMENT_ROOT_SEARCH_V1;
 use zinder_proto::v1::explorer::{
@@ -37,7 +37,7 @@ const MAX_RECENT_COVERAGE_ROWS: usize = 10_000;
 
 /// Executes one canonical final-root search.
 pub(crate) async fn handle_commitment_root_search(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     canonical_store: &SecondaryChainStore,
     activations: &NetworkUpgradeActivations,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -50,7 +50,7 @@ pub(crate) async fn handle_commitment_root_search(
     let root = FinalNoteCommitmentRoot::from_bytes(root_bytes);
     let max_matches = clamp_max_entries(request.max_matches, DEFAULT_MAX_MATCHES, MAX_MATCHES);
 
-    derive_store
+    materialized_view_store
         .try_catch_up()
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     canonical_store
@@ -66,10 +66,10 @@ pub(crate) async fn handle_commitment_root_search(
         .ok_or_else(|| {
             ExplorerError::internal("network upgrade activations do not include Sapling")
         })?;
-    let matches = canonical_root_matches(derive_store, &reader, root, max_matches)?;
+    let matches = canonical_root_matches(materialized_view_store, &reader, root, max_matches)?;
     let displaced_matches = displaced_root_matches(&reader, root, max_matches)?;
     let coverage = commitment_root_search_coverage(
-        derive_store,
+        materialized_view_store,
         chain_epoch,
         canonical_history_bounds,
         sapling_activation_height,
@@ -82,7 +82,7 @@ pub(crate) async fn handle_commitment_root_search(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_COMMITMENT_ROOT_SEARCH_V1,
             Some(chain_epoch_message(chain_epoch)),
             0,
@@ -99,13 +99,13 @@ pub(crate) async fn handle_commitment_root_search(
 }
 
 fn canonical_root_matches(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     reader: &ChainEpochReader<'_>,
     root: FinalNoteCommitmentRoot,
     max_matches: u32,
 ) -> Result<Vec<CommitmentRootMatch>, Status> {
     let candidates =
-        CommitmentRootSearchConsumer::search(derive_store, root, MAX_CANDIDATES_SCANNED)
+        CommitmentRootSearchConsumer::search(materialized_view_store, root, MAX_CANDIDATES_SCANNED)
             .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mut matches = Vec::with_capacity(max_matches as usize);
     for candidate in candidates {
@@ -243,19 +243,20 @@ fn displaced_root_search_coverage(
 }
 
 fn commitment_root_search_coverage(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     chain_epoch: ChainEpoch,
     canonical_history_bounds: CanonicalHistoryBounds,
     sapling_activation_height: BlockHeight,
 ) -> Result<CommitmentRootSearchCoverage, Status> {
-    let backfill_coverage = CommitmentRootSearchConsumer::backfill_coverage(derive_store)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let latest_indexed_height = derive_store
+    let backfill_coverage =
+        CommitmentRootSearchConsumer::backfill_coverage(materialized_view_store)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let latest_indexed_height = materialized_view_store
         .last_materialized_height_ascending(COMMITMENT_ROOT_SEARCH_INDEX_COLUMN_FAMILY)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let recent_index_complete = match backfill_coverage {
         Some(coverage) => recent_index_is_contiguous(
-            derive_store,
+            materialized_view_store,
             coverage.complete_through_height,
             chain_epoch.visible_tip_height,
         )?,
@@ -311,7 +312,7 @@ impl CommitmentRootCompleteness {
 }
 
 fn recent_index_is_contiguous(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     complete_through_height: zinder_core::BlockHeight,
     visible_tip_height: zinder_core::BlockHeight,
 ) -> Result<bool, Status> {
@@ -331,7 +332,7 @@ fn recent_index_is_contiguous(
     if expected_rows > MAX_RECENT_COVERAGE_ROWS {
         return Ok(false);
     }
-    let entries = derive_store
+    let entries = materialized_view_store
         .range_iterate_consumer(
             COMMITMENT_ROOT_SEARCH_INDEX_COLUMN_FAMILY,
             &zinder_core::wire::encode_height_key_ascending(start_height),

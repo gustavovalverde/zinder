@@ -381,7 +381,7 @@ pub fn chain_epoch_message(chain_epoch: ChainEpoch) -> wallet::ChainEpoch {
 
 /// Wraps chain-epoch metadata in the cross-plane [`wallet::ChainView`] envelope.
 ///
-/// Leaves the derive-plane axes (`indexed_tip`, `upstream_tip`, `derive`)
+/// Leaves the materialized-view axes (`indexed_tip`, `upstream_tip`, `materialized_views`)
 /// absent. The wallet plane owns the epoch; the explorer and ingest planes fill
 /// the remaining axes from their own state.
 #[must_use]
@@ -390,7 +390,7 @@ pub fn chain_view_message(chain_epoch: ChainEpoch) -> wallet::ChainView {
         chain_epoch: Some(chain_epoch_message(chain_epoch)),
         indexed_tip: None,
         upstream_tip: None,
-        derive: None,
+        materialized_views: None,
     }
 }
 

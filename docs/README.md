@@ -1,133 +1,73 @@
-# Zinder Documentation
+# Zinder documentation
 
-This documentation set defines Zinder's product scope, integration contracts, service boundaries, and operational procedures.
+The documentation describes the code that exists in this repository. Proposed
+work, implementation handoffs, validation diaries, and superseded transition
+documents do not live here. Use Git history and GitHub issues for that context.
 
-## Start by goal
+Start with these documents:
 
-| Goal | Start here |
-| --- | --- |
-| Decide whether Zinder fits a wallet or product | [What Zinder is and is not](architecture/indexer-wallet-boundary.md) |
-| Connect a wallet, SDK, application, or explorer | [Integration surfaces](reference/integration-surfaces.md) |
-| Build a headless server-side wallet | [Server-side wallet pattern](reference/server-side-wallet-pattern.md) |
-| See which public chain facts Zinder serves | [Chain data catalog](reference/chain-data-catalog.md) |
-| Deploy and synchronize Zinder | [Initial sync](runbooks/initial-sync.md) and [Deploying on a VM](runbooks/deploying-on-a-vm.md) |
-| Test a consumer or compatibility claim | [Testing](runbooks/testing.md) |
-| Add a chain artifact or wallet RPC | [Extending artifacts](architecture/extending-artifacts.md) and [Extending the wallet data plane](architecture/extending-the-wallet-data-plane.md) |
+- [Indexer and wallet boundary](architecture/indexer-wallet-boundary.md) explains when Zinder is the right integration boundary.
+- [Service boundaries](architecture/service-boundaries.md) assigns runtime and storage ownership.
+- [Public interfaces](architecture/public-interfaces.md) is the vocabulary spine for Rust APIs, protocol fields, configuration, errors, and capabilities.
+- [Canonical and projection architecture](architecture/canonical-projection-architecture.md) explains how canonical storage, wallet state, and explorer materialized views fit together.
+- [Service operations](architecture/service-operations.md) defines health, readiness, metrics, security, and recovery behavior.
+- [Testing](runbooks/testing.md) defines the validation tiers and commands.
 
 ## Architecture
 
-- [Service boundaries](architecture/service-boundaries.md)
-- [Storage backend](architecture/storage-backend.md)
+- [Canonical and projection architecture](architecture/canonical-projection-architecture.md)
 - [Chain ingestion](architecture/chain-ingestion.md)
 - [Chain events](architecture/chain-events.md)
-- [Node source boundary](architecture/node-source-boundary.md): trait shape, capability model, and upstream-platform-binding catalogue (Z3 canonical, bare-Zebra, future in-process).
-- [Zcash chain workload eras](architecture/zcash-chain-workload-eras.md): consensus epochs, historical workload bands, and benchmark anchors for performance-budget work.
-- [Protocol boundary](architecture/protocol-boundary.md)
+- [Storage backend](architecture/storage-backend.md)
 - [Wallet data plane](architecture/wallet-data-plane.md)
-- [Derive plane](architecture/derive-plane.md)
+- [Materialized-view plane](architecture/materialized-view-plane.md)
 - [Explorer plane](architecture/explorer-plane.md)
-- [Fact-first indexer](architecture/fact-first-indexer.md)
-- [Service operations](architecture/service-operations.md)
+- [Node source boundary](architecture/node-source-boundary.md)
+- [Protocol boundary](architecture/protocol-boundary.md)
 - [Public interfaces](architecture/public-interfaces.md)
+- [Service boundaries](architecture/service-boundaries.md)
+- [Service operations](architecture/service-operations.md)
+- [Cipherscan adapter](architecture/cipherscan-adapter.md)
+- [Zcash chain workload eras](architecture/zcash-chain-workload-eras.md)
+
+Extension guides:
+
 - [Extending artifacts](architecture/extending-artifacts.md)
 - [Extending the wallet data plane](architecture/extending-the-wallet-data-plane.md)
 
-## ADRs
-
-- [ADR-0001: Use RocksDB for canonical storage](adrs/0001-rocksdb-canonical-store.md)
-- [ADR-0002: Use boundary-specific serialization](adrs/0002-boundary-specific-serialization.md)
-- [ADR-0003: Use epoch-bound storage access with RocksDB secondaries](adrs/0003-canonical-storage-access-boundary.md)
-- [ADR-0004: Separate node sources from protocol surfaces](adrs/0004-node-source-and-protocol-boundaries.md)
-- [ADR-0005: Consumer-neutral wallet data plane](adrs/0005-consumer-neutral-wallet-data-plane.md)
-- [ADR-0006: IngestControl transport security](adrs/0006-ingest-control-transport-security.md)
-- [ADR-0007: Mempool topology and retention](adrs/0007-mempool-topology-and-retention.md)
-- [ADR-0008: Per-network consensus parameters discovered from the running node](adrs/0008-network-parameter-discovery.md)
-- [ADR-0009: Explorer plane as first-class product surface](adrs/0009-explorer-plane-as-product-surface.md)
-- [ADR-0010: TransactionPublicFacts as the single transaction parser](adrs/0010-transaction-public-facts.md)
-- [ADR-0011: Explorer freshness envelope](adrs/0011-explorer-freshness-envelope.md)
-- [ADR-0012: Typed explorer search and privacy refusal](adrs/0012-typed-explorer-search-and-privacy-refusal.md)
-- [ADR-0013: Source failure recovery topology](adrs/0013-source-failure-recovery-topology.md)
-- [ADR-0014: Shared configuration sections](adrs/0014-shared-configuration-sections.md)
-- [ADR-0015: Unified phase-driven ingest](adrs/0015-unified-phase-driven-ingest.md)
-- [ADR-0016: Source streaming pipeline](adrs/0016-source-streaming-pipeline.md)
-- [ADR-0017: Derive-consumer template and key-codec convention](adrs/0017-derive-consumer-template-and-key-codec-convention.md)
-- [ADR-0018: Capability-gated optional payload fields](adrs/0018-capability-gated-optional-payload-fields.md)
-- [ADR-0019: Transport policy ownership and self-healing](adrs/0019-transport-policy-ownership.md)
-- [ADR-0020: Bounded RocksDB resource budget](adrs/0020-bounded-rocksdb-resource-budget.md)
-- [ADR-0021: Parallel canonical block prepare in bulk catchup](adrs/0021-parallel-block-derivation.md)
-- [ADR-0022: Resource-budgeted bulk catchup and checkpoint tree state](adrs/0022-resource-budgeted-bulk-catchup.md)
-- [ADR-0023: Typed broadcast rejection reasons and a queued outcome](adrs/0023-typed-broadcast-rejection-reasons.md)
-- [ADR-0024: Wire format uses RPC byte order for hashes](adrs/0024-wire-format-rpc-byte-order.md)
-- [ADR-0025: Self-healing reorg on ChainEvents reconnect with a locator cursor](adrs/0025-chain-event-reconnect-reorg-locator.md)
-- [ADR-0026: Transparent UTXO-set commitment](adrs/0026-utxo-set-commitment.md)
-- [ADR-0027: Explicit event-stream start positions](adrs/0027-event-stream-start-positions.md)
-- [ADR-0028: Per-consumer derive schema versioning](adrs/0028-per-consumer-derive-schema-versioning.md)
-- [ADR-0029: Durable transparent-outpoint spend projection and retention release floor](adrs/0029-durable-transparent-outpoint-spend-projection.md)
-- [ADR-0030: Compatible canonical artifact enrichment](adrs/0030-compatible-canonical-artifact-enrichment.md)
-- [ADR-0031: Projection checkpoints and backfill coverage](adrs/0031-projection-checkpoints-and-backfill-coverage.md)
-- [ADR-0032: Writer-owned displaced-block archive](adrs/0032-writer-owned-displaced-block-archive.md)
-- [ADR-0033: Time-indexed block production](adrs/0033-time-indexed-block-production.md)
-- [ADR-0034: Exclusive index-build stages and block-local spend replay](adrs/0034-exclusive-index-build-stages-and-block-local-spend-replay.md)
-- [ADR-0035: Fact-first storage topologies and lifecycle targets](adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-
 ## Reference
 
-Current integration references and API support material:
-
-- [Server-side wallet pattern](reference/server-side-wallet-pattern.md): the canonical recipe for building a server-side Zcash wallet on Zinder + librustzcash.
-- [Integration surfaces](reference/integration-surfaces.md): supported client and operator integration paths.
-- [Chain data catalog](reference/chain-data-catalog.md): the canonical catalog of information Zinder gathers or derives, its availability, and its product value.
-- [Error vocabulary](reference/error-vocabulary.md): every `ErrorReason` value, its gRPC `Status` code, and the retry policy clients should follow.
-
-## Product requirements
-
-- [Block explorer consumer](prd/block-explorer-consumer.md): explorer-facing product requirements, capability ownership, and acceptance boundaries.
-- [ZIP-311 payment disclosure verifier](prd/zip311-payment-disclosure-verifier.md): verifier requirements, trust boundaries, and delivery milestones.
-- [Wallet workload presets](prd/wallet-workload-presets.md): requirements for wallet-sized projection workloads, payload-policy independence, lifecycle safety, and evidence-gated support.
-
-## Investigations
-
-- [Zaino feature comparison](investigations/zaino-feature-comparison.md): public-surface audit against zainod 0.3.1, including native equivalents, raw-RPC differences, and deliberate non-goals.
-
-## Plans
-
-- [Developer documentation strategy](plans/developer-documentation-strategy.md): reader journeys, information architecture, writing standards, design direction, Fumadocs delivery, and quality gates for a public Zinder documentation portal.
-- [Fact-first simplification audit](plans/fact-first-simplification-audit.md): reuse, simplification, efficiency, and altitude findings across the canonical store, wallet storage, and fact-first services, with dead-code deletion sequencing.
-- [Fact-first wallet-serving cutover](plans/fact-first-wallet-serving-cutover.md): evidence-backed implementation order for canonical reorgs, wallet projection following, secondary serving, live mempool behavior, operator composition, and independent-client certification.
-- [Lightwalletd compatibility certification](plans/lightwalletd-compatibility-certification.md): bounded, evidence-backed replacement claims for the compatibility adapter.
-- [Native indexer projections merge](plans/native-indexer-projections-merge.md): native-only scope, schema ladder, coverage matrix, review sequence, and merge constraints for this branch.
-- [Naming and structure legibility](plans/naming-and-structure-legibility.md): deletion-first naming plan covering the derive-plane/wallet-projection vocabulary overlap, the retirement of "fact-first" as a migration label, the production-dead projection-reader surface, the legacy chain-store engine's terminal deletion target, `canonical`/`writer` module grouping, and stale orientation docs on this branch.
-- [Wallet workload presets](plans/wallet-workload-presets.md): investigation findings, invariants, tracer-bullet phases, stop conditions, and requirement traceability for the wallet workload PRD.
+- [Chain data catalog](reference/chain-data-catalog.md)
+- [Error vocabulary](reference/error-vocabulary.md)
+- [Integration surfaces](reference/integration-surfaces.md)
+- [Lightwalletd compatibility](reference/lightwalletd-compatibility.md)
+- [Server-side wallet pattern](reference/server-side-wallet-pattern.md)
 
 ## Runbooks
 
-Operational procedures for running Zinder against the workspace and external systems. Edited in place when the procedure changes; never describes architectural intent (that role belongs to the architecture docs).
+- [Initial sync](runbooks/initial-sync.md)
+- [Bulk-catchup resource tuning](runbooks/bulk-catchup-resource-tuning.md)
+- [Deploying on a VM](runbooks/deploying-on-a-vm.md)
+- [Deploying on Railway](runbooks/deploying-on-railway.md)
+- [Cipherscan adapter verification](runbooks/cipherscan-adapter-verification.md)
+- [Testing](runbooks/testing.md)
 
-- [Testing](runbooks/testing.md): T0-T3 test tiers, the default validation gate, consumer parity checks, live sweeps, native `WalletQuery` smoke tests via `grpcurl`, and a failure-interpretation reference.
-- [Initial sync](runbooks/initial-sync.md): how the unified ingest loop auto-classifies its phase, the operator-visible signals on `/readyz`, the upstream-sync diagnostic, and forked-store recovery.
-- [Bulk-catchup OOM recovery](runbooks/bulk-catchup-oom-recovery.md): the WAL-replay-after-OOM restart loop, how to confirm you're in it, the immediate recovery, and the `primary_db_options` change that prevents recurrence.
-- [Deploying on a VM](runbooks/deploying-on-a-vm.md): Compose + systemd for self-hosted single-VM deployments.
-- [Deploying on Railway](runbooks/deploying-on-railway.md): single-container image on Railway / Fly.io / Render-style PaaS targets.
+## Architecture decision records
 
-## Current Contracts
+The [ADR directory](adrs/) contains accepted decisions that still explain a
+current invariant. Architecture documents describe the current system; ADRs
+explain why an invariant exists. When an ADR no longer applies, replace its
+remaining current truth in architecture or reference documentation and delete
+the ADR instead of leaving a superseded record in the active documentation set.
 
-- **Transparent-address artifact surface**: [Wallet data plane §Transparent Address Outputs](architecture/wallet-data-plane.md#transparent-address-outputs) and [§Transparent Address Tx History](architecture/wallet-data-plane.md#transparent-address-tx-history) carry the wire shapes and capability strings; [Extending artifacts](architecture/extending-artifacts.md) holds the canonical worked example for adding a new artifact family.
-- **Transparent-address balance + derive-plane instantiation**: [Wallet data plane §Transparent Address Balance](architecture/wallet-data-plane.md#transparent-address-balance) defines the wallet and derive capabilities, and [Derive plane](architecture/derive-plane.md) defines the federation primitive.
-- **Prevout resolution**: [Wallet data plane §Transparent Prevout Resolution](architecture/wallet-data-plane.md#transparent-prevout-resolution) defines the compute-at-read-time read path.
-- **Durable spender resolution**: [Wallet data plane §Transparent Reverse-Spend Resolution](architecture/wallet-data-plane.md#transparent-reverse-spend-resolution) owns the public surface; [ADR-0029](adrs/0029-durable-transparent-outpoint-spend-projection.md) records the authority split, the retention release floor, and the startup guard.
-- **Mempool topology**: [ADR-0007](adrs/0007-mempool-topology-and-retention.md) records the durable mempool topology; [Wallet data plane §Mempool Snapshot and Subscription](architecture/wallet-data-plane.md#mempool-snapshot-and-subscription) owns the public surface.
+## Maintenance rules
 
-## Vocabulary and naming rules
-
-See [Public interfaces](architecture/public-interfaces.md) for the canonical naming rules, type conventions, error vocabulary, and config field shapes.
-
-## Document lifecycles
-
-Each tree under `docs/` has its own retire-on-ship rule.
-
-- **Architecture** (`docs/architecture/`): the durable spine. Explains why each contract exists, what its invariants are, and where its boundary lives. Edited in place when contracts change. Architecture docs reference other architecture docs and at most one ADR per topic.
-- **ADRs** (`docs/adrs/`): record of accepted design decisions in present tense. Edited in place when the decision rationale needs clarification; substantive design changes get a new ADR with a contiguous number. ADRs reference the owning architecture docs and only the predecessor decisions they directly build on.
-- **Reference** (`docs/reference/`): current integration patterns and API support material. Reference docs may point into architecture docs, but they should not carry transition history or dated validation notes.
-- **Product requirements** (`docs/prd/`): product contracts, user outcomes, acceptance boundaries, and open product decisions. PRDs stay active until their requirements ship or are explicitly superseded.
-- **Plans** (`docs/plans/`): implementation sequencing, evidence gates, and requirement traceability for approved or proposed work. Plans may incorporate investigation findings, but they do not replace durable architecture decisions.
-- **Runbooks** (`docs/runbooks/`): operational procedures with explicit prereqs, command lines, and expected outcomes. Edited in place as procedures evolve; reference architecture docs and ADRs (up) but do not describe architectural intent.
+- Update documentation in the same change that alters a boundary, public name,
+  protocol field, storage contract, configuration key, readiness rule, or
+  operator workflow.
+- State current behavior directly. Do not preserve migration phases, completed
+  checklists, branch names, commit hashes, or dated evidence logs.
+- Keep future work in tracked issues. Do not add `plans/`, `investigations/`, or
+  `prd/` directories back to this documentation tree.
+- Use names from [Public interfaces](architecture/public-interfaces.md), and
+  prefer links to one authoritative explanation over repeating it.

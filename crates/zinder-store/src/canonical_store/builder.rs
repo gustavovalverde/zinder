@@ -25,7 +25,7 @@ use super::{
     },
 };
 
-/// Exclusive owner of one fresh, unpublished canonical version-1 build.
+/// Exclusive owner of one fresh, unpublished canonical build.
 ///
 /// A builder cannot open an existing path. Any crash residue or partially
 /// populated family requires deletion of the whole build before retrying.
@@ -138,7 +138,7 @@ impl RocksDbCanonicalBuilder {
         &self.build_plan
     }
 
-    /// Bulk-loads every source-derived version-1 canonical block family.
+    /// Bulk-loads every source-derived canonical block family.
     ///
     /// All seven families are completely staged before any column family is
     /// ingested. Reverse indexes use fixed-record bounded sort runs and a

@@ -89,7 +89,7 @@ groups:
           severity: warning
         annotations:
           summary: "Zinder RocksDB WAL approaching ceiling"
-          description: "{{ $labels.service }} {{ $labels.store_role }} live WAL is above 75% of storage.tuning.max_wal_bytes; investigate flush stalls before the bulk-catchup OOM trap fires (docs/runbooks/bulk-catchup-oom-recovery.md)."
+          description: "{{ $labels.service }} {{ $labels.store_role }} live WAL is above 75% of the role-specific RocksDB max_wal_bytes budget; investigate flush stalls and resource pressure (docs/runbooks/bulk-catchup-resource-tuning.md)."
 
       - alert: ZinderStartupOpenStorageSlow
         expr: histogram_quantile(0.95, sum by (service, phase, le) (rate(zinder_startup_phase_duration_seconds_bucket{phase="open_storage"}[10m]))) > 60

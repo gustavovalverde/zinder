@@ -124,7 +124,7 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
         to_height: config.to_height.value(),
         block_count,
         workload_density,
-        current_schema_oracle_artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        projection_coupled_oracle_artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         canonical_block_facts_digest_evidence,
         tip_hash_hex,
         network_upgrade_activations: activation_records,
@@ -269,7 +269,9 @@ async fn measure_fixture_blocks_bounded(
                 measure_fixture_block(&blocks[block_index], &activations)
             })
             .await
-            .map_err(|source| BenchError::canonical_fact_preparation_task(source.to_string()))?
+            .map_err(|source| {
+                BenchError::canonical_replay_storage_preparation_task(source.to_string())
+            })?
         }
     });
     collect_fixture_block_measurements(tasks, prepare_concurrency, block_count).await

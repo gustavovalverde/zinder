@@ -2,8 +2,8 @@
 
 use tonic::{Request, Response, Status};
 use zinder_core::wire::encode_rpc_block_hash_hex;
-use zinder_derive::{
-    DeriveStore, ValuePoolBalanceBackfillCoverage, ValuePoolBalanceDay,
+use zinder_materialized_views::{
+    MaterializedViewStore, ValuePoolBalanceBackfillCoverage, ValuePoolBalanceDay,
     ValuePoolBalanceHistoryConsumer, ValuePoolBalanceTailCoverage,
 };
 use zinder_proto::capabilities::EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1;
@@ -27,7 +27,7 @@ const CURSOR_LEN: usize = CURSOR_PREFIX.len() + size_of::<i64>();
 
 /// Executes one `ExplorerQuery.ValuePoolBalanceHistory` request.
 pub(crate) async fn handle_value_pool_balance_history(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ValuePoolBalanceHistoryRequest>,
@@ -39,9 +39,9 @@ pub(crate) async fn handle_value_pool_balance_history(
     } else {
         Some(decode_cursor(&request.cursor)?)
     };
-    let backfill = ValuePoolBalanceHistoryConsumer::backfill_coverage(derive_store)
+    let backfill = ValuePoolBalanceHistoryConsumer::backfill_coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let tail = ValuePoolBalanceHistoryConsumer::tail_coverage(derive_store)
+    let tail = ValuePoolBalanceHistoryConsumer::tail_coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let chain_epoch = wallet_client
         .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
@@ -60,7 +60,7 @@ pub(crate) async fn handle_value_pool_balance_history(
         .map(|tip| tip.height)
         .ok_or_else(|| Status::from(ExplorerError::internal("ChainEpoch.visible_tip missing")))?;
     let mut days = read_days_blocking(
-        derive_store,
+        materialized_view_store,
         before_day,
         usize::try_from(page_size)
             .unwrap_or(usize::MAX)
@@ -80,7 +80,7 @@ pub(crate) async fn handle_value_pool_balance_history(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
             Some(chain_epoch),
             0,
@@ -97,13 +97,13 @@ pub(crate) async fn handle_value_pool_balance_history(
 }
 
 async fn read_days_blocking(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     before_day: Option<i64>,
     cap: usize,
 ) -> Result<Vec<ValuePoolBalanceDay>, Status> {
-    let derive_store = derive_store.clone();
+    let materialized_view_store = materialized_view_store.clone();
     tokio::task::spawn_blocking(move || {
-        ValuePoolBalanceHistoryConsumer::read_days_before(&derive_store, before_day, cap)
+        ValuePoolBalanceHistoryConsumer::read_days_before(&materialized_view_store, before_day, cap)
             .map_err(|error| Status::from(ExplorerError::internal(error.to_string())))
     })
     .await

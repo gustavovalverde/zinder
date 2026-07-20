@@ -1,4 +1,4 @@
-//! Authenticated checkpointed fixture replay into the production canonical-v1 store.
+//! Authenticated checkpointed fixture replay into the production canonical store.
 
 use std::{
     fs,
@@ -18,7 +18,7 @@ use zinder_bench::{
     recorder::install_recorder,
     report::{
         BenchmarkReport, CANONICAL_FIXTURE_REPLAY_PROFILE_CPU_CORES,
-        CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES, CanonicalFactSequenceDigestSummary,
+        CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES, CanonicalBlockFactsSequenceDigestSummary,
         FixtureSummary, RocksDbCanonicalFixtureEventFenceSummary,
         RocksDbCanonicalFixtureReadySummary, RocksDbCanonicalFixtureReplayMeasurements,
         RocksDbCanonicalFixtureReplayResourceLimits, RocksDbCanonicalFixtureSourceLoadSummary,
@@ -56,13 +56,13 @@ impl CanonicalFixtureBlockSource {
     }
 }
 
-/// CLI contract for authenticated canonical-v1 fixture replay.
+/// CLI contract for authenticated canonical fixture replay.
 #[derive(Args)]
 pub(crate) struct RocksDbCanonicalFixtureReplayArgs {
     /// Directory containing the fixture manifest, segments, and replay plan.
     #[arg(long)]
     fixture: PathBuf,
-    /// Fresh destination for the canonical-v1 store.
+    /// Fresh destination for the canonical store.
     #[arg(long = "canonical-store")]
     canonical_store: PathBuf,
     /// Concrete raw-block source. Transport sources are fixture-authenticated.
@@ -150,7 +150,7 @@ struct MeasuredReplay {
     run_completed_at_unix_millis: u64,
 }
 
-/// Executes the real canonical-v1 fixture replay and builds its closed report.
+/// Executes the real canonical fixture replay and builds its closed report.
 pub(crate) async fn run_rocksdb_canonical_fixture_replay(
     args: RocksDbCanonicalFixtureReplayArgs,
 ) -> Result<RocksDbCanonicalFixtureReplayOutput, BenchError> {
@@ -494,7 +494,7 @@ fn source_load_summary(
         sst_file_bytes: load.sst_file_bytes,
         sst_file_count: load.sst_file_count,
         replay_format_version: load.replay_format_version.value(),
-        sequence_digest: CanonicalFactSequenceDigestSummary::from_digest(
+        sequence_digest: CanonicalBlockFactsSequenceDigestSummary::from_digest(
             load.block_digest_version,
             load.sequence_digest,
         ),
@@ -508,7 +508,7 @@ fn ready_summary(
     let reopened = outcome.reopened_ready_evidence;
     let fence = outcome.event_fence;
     RocksDbCanonicalFixtureReadySummary {
-        scope: "canonical-v1-fixture-ready",
+        scope: "canonical-fixture-ready",
         workload: "wallet",
         first_retained_block: block_id(reopened.first_retained_block),
         visible_tip: block_id(reopened.visible_tip),
@@ -517,13 +517,13 @@ fn ready_summary(
         visible_block_count: reopened.visible_block_count,
         replay_format_version: reopened.replay_format_version.value(),
         sequence_digest: ready_sequence_digest(&reopened),
-        logical_replay_bytes: reopened.visible_logical_fact_bytes,
+        logical_replay_bytes: reopened.visible_logical_block_facts_bytes,
         settled_tip: block_id(outcome.settled_tip),
         event_fence: RocksDbCanonicalFixtureEventFenceSummary {
             chain_epoch_id: fence.chain_epoch_id().value(),
             chain_event_sequence: fence.chain_event_sequence(),
             visible_tip: block_id(fence.visible_tip()),
-            sequence_digest: CanonicalFactSequenceDigestSummary::from_digest(
+            sequence_digest: CanonicalBlockFactsSequenceDigestSummary::from_digest(
                 reopened.block_digest_version,
                 fence.sequence_digest(),
             ),
@@ -540,8 +540,8 @@ fn ready_summary(
 
 fn ready_sequence_digest(
     ready: &CanonicalStoreReadyEvidence,
-) -> CanonicalFactSequenceDigestSummary {
-    CanonicalFactSequenceDigestSummary {
+) -> CanonicalBlockFactsSequenceDigestSummary {
+    CanonicalBlockFactsSequenceDigestSummary {
         block_digest_version: ready.block_digest_version.value(),
         sequence_digest_version: ready.sequence_digest_version.value(),
         block_count: ready.visible_block_count,

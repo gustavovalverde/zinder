@@ -1,4 +1,4 @@
-# Production-shaped fact-first canonical writer configuration for the
+# Production-shaped canonical writer configuration for the
 # single-host Compose topology. Environment variables may override any field.
 
 [network]
@@ -23,7 +23,7 @@ source = "zebra-json-rpc"
 projection_preset = "wallet"
 reorg_window_blocks = 100
 
-[ingest.modifiers]
+[ingest.run_overrides]
 coverage = "wallet-serving"
 
 [ingest_control]

@@ -56,13 +56,13 @@ pub(crate) enum ExplorerConfigError {
     Config(#[from] ConfigError),
 
     #[error(transparent)]
-    Store(#[from] zinder_explorer::DeriveStoreError),
+    Store(#[from] zinder_explorer::MaterializedViewStoreError),
 
     #[error(transparent)]
     CanonicalStore(#[from] zinder_store::StoreError),
 
     #[error("explorer runtime failed: {0}")]
-    Runtime(#[from] zinder_explorer::DeriveError),
+    Runtime(#[from] zinder_explorer::MaterializedViewError),
 
     #[error("gRPC transport failed: {0}")]
     Transport(#[from] tonic::transport::Error),

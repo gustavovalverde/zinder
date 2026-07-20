@@ -3,7 +3,7 @@ name: parity-compat
 # T3 (live) fixed-fence parity diff between Zinder's `zinder-compat-lightwalletd`
 # and the pinned upstream `electriccoinco/lightwalletd` Go reference, both
 # pointed at the same pinned regtest Zebra node. Mempool parity remains outside
-# this workflow until fact-first ingest-control composition is restored.
+# this workflow until dedicated ingest-control composition is restored.
 #
 # Test sources: services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs
 

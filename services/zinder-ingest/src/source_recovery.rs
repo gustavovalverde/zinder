@@ -197,8 +197,8 @@ pub(crate) fn decide_recovery(
         | IngestError::CanonicalBlockConstruction(_)
         | IngestError::BlockingTaskFailed { .. }
         | IngestError::SourceSegmentFetchTaskStopped { .. }
-        | IngestError::DeriveDispatch(_)
-        | IngestError::DeriveStore(_)
+        | IngestError::MaterializedViewDispatch(_)
+        | IngestError::MaterializedViewStore(_)
         | IngestError::ProjectionStoreMissingForCanonical { .. }
         | IngestError::ProjectionStoreWithoutCanonicalHistory { .. }
         | IngestError::ProjectionRetentionCoverageInsufficient { .. } => {

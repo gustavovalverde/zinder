@@ -37,7 +37,7 @@ export TEST_CHILD_STARTED_AT_PATH="$child_started_at_path"
 # The variables in the child program intentionally expand in the child shell.
 # shellcheck disable=SC2016
 ZINDER_BENCH_RESOURCE_EVIDENCE_PATH="$evidence_path" \
-ZINDER_BENCH_RESOURCE_COMPONENT_ID="rocksdb-fact-first-client" \
+ZINDER_BENCH_RESOURCE_COMPONENT_ID="rocksdb-canonical-replay-storage-client" \
 ZINDER_BENCH_RESOURCE_TRIAL_ID="trial-01" \
 ZINDER_BENCH_RESOURCE_STORAGE_PATH="$fake_storage_path" \
 ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS="0.02" \
@@ -84,7 +84,7 @@ set -e
 jq -e '
   .evidence_format_version == 1
   and .measurement_kind == "container-resource-observation"
-  and .component_id == "rocksdb-fact-first-client"
+  and .component_id == "rocksdb-canonical-replay-storage-client"
   and .trial_id == "trial-01"
   and .sample_interval_seconds == 0.02
   and .child_exit_status == 23
@@ -115,7 +115,7 @@ mkdir -p "$unsupported_cgroup_path"
 printf 'io\n' >"$unsupported_cgroup_path/cgroup.controllers"
 
 ZINDER_BENCH_RESOURCE_EVIDENCE_PATH="$unsupported_evidence_path" \
-ZINDER_BENCH_RESOURCE_COMPONENT_ID="postgres-fact-first-client" \
+ZINDER_BENCH_RESOURCE_COMPONENT_ID="postgres-canonical-replay-storage-client" \
 ZINDER_BENCH_RESOURCE_TRIAL_ID="trial-02" \
 ZINDER_BENCH_RESOURCE_STORAGE_PATH="" \
 ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS="0.01" \

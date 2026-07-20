@@ -1,6 +1,6 @@
-//! Version-1 canonical storage contract.
+//! Canonical storage contract.
 //!
-//! This module owns the exact `RocksDB` layout for the clean fact-first
+//! This module owns the exact `RocksDB` layout for the production canonical
 //! canonical data plane. It deliberately exposes no generic database adapter
 //! and no compatibility decoder for earlier Zinder stores.
 
@@ -489,7 +489,7 @@ pub struct CanonicalStoreReadyEvidence {
     /// Ordered digest of the complete visible fact sequence.
     pub visible_sequence_digest: [u8; 32],
     /// Total semantic replay-envelope bytes through `visible_tip`.
-    pub visible_logical_fact_bytes: u64,
+    pub visible_logical_block_facts_bytes: u64,
     /// Resumable authenticated replay prefix through the settled tip.
     pub sequence_checkpoint: CanonicalSequenceCheckpoint,
     /// Exact version of the immutable construction manifest that certified the
@@ -884,33 +884,33 @@ impl CanonicalStoreError {
     }
 }
 
-impl From<zinder_bulk_load::BulkLoadError> for CanonicalStoreError {
-    fn from(source: zinder_bulk_load::BulkLoadError) -> Self {
+impl From<zinder_rocksdb_bulk_load::BulkLoadError> for CanonicalStoreError {
+    fn from(source: zinder_rocksdb_bulk_load::BulkLoadError) -> Self {
         match source {
-            zinder_bulk_load::BulkLoadError::InvalidInput { reason } => {
+            zinder_rocksdb_bulk_load::BulkLoadError::InvalidInput { reason } => {
                 Self::block_load_sequence(reason)
             }
-            zinder_bulk_load::BulkLoadError::AccountedMemoryLimit {
+            zinder_rocksdb_bulk_load::BulkLoadError::AccountedMemoryLimit {
                 limit_bytes,
                 required_bytes,
             } => Self::block_load_sequence(format!(
                 "bulk-load records require {required_bytes} accounted bytes, limit is {limit_bytes}"
             )),
-            zinder_bulk_load::BulkLoadError::TemporaryFileLimit {
+            zinder_rocksdb_bulk_load::BulkLoadError::TemporaryFileLimit {
                 limit_bytes,
                 required_bytes,
             } => Self::block_load_sequence(format!(
                 "bulk-load runs require {required_bytes} temporary bytes, limit is {limit_bytes}"
             )),
-            zinder_bulk_load::BulkLoadError::MemoryAllocation { operation, source } => {
+            zinder_rocksdb_bulk_load::BulkLoadError::MemoryAllocation { operation, source } => {
                 Self::block_load_sequence(format!(
                     "bulk-load {operation} allocation failed: {source}"
                 ))
             }
-            zinder_bulk_load::BulkLoadError::PathUnavailable { path, source } => {
+            zinder_rocksdb_bulk_load::BulkLoadError::PathUnavailable { path, source } => {
                 Self::PathUnavailable { path, source }
             }
-            zinder_bulk_load::BulkLoadError::RocksDbOperation { operation, source } => {
+            zinder_rocksdb_bulk_load::BulkLoadError::RocksDbOperation { operation, source } => {
                 Self::RocksDbOperation { operation, source }
             }
         }

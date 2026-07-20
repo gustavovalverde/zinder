@@ -72,12 +72,14 @@ pub(crate) struct WalletReadTestRange {
     pub(crate) subtree_root_start_indices: SubtreeRootStartIndices,
 }
 
-/// Opens a derive store with no consumer column families for tests that
+/// Opens a materialized-view store with no consumer column families for tests that
 /// only need to satisfy writer API wiring.
-pub(crate) fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
-    Ok(zinder_derive::DeriveStore::open(
-        zinder_derive::DeriveStore::path_for_canonical(storage_path),
-        zinder_derive::DeriveStoreOptions {
+pub(crate) fn test_materialized_view_store(
+    storage_path: &Path,
+) -> Result<zinder_materialized_views::MaterializedViewStore> {
+    Ok(zinder_materialized_views::MaterializedViewStore::open(
+        zinder_materialized_views::MaterializedViewStore::path_for_canonical(storage_path),
+        zinder_materialized_views::MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[],
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
@@ -1130,7 +1132,7 @@ pub(crate) struct WalletServingIngestConfigToml<'fields> {
 
 /// Renders a `BoundedIngestConfigToml` into the TOML shape `zinder-ingest` accepts.
 ///
-/// The `[ingest.modifiers].target_height` field makes the unified loop exit
+/// The `[ingest.run_overrides].target_height` field makes the unified loop exit
 /// with status 0 once the canonical store reaches that height.
 pub(crate) fn bounded_ingest_config_toml(
     config_toml: &BoundedIngestConfigToml<'_>,
@@ -1155,10 +1157,10 @@ path = "{}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.bulk_catchup]
+[ingest.construction]
 canonical_batch_max_blocks = 1000
 
-[ingest.modifiers]
+[ingest.run_overrides]
 target_height = {}
 allow_near_tip_finalize = {}
 
@@ -1203,10 +1205,10 @@ path = "{}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.bulk_catchup]
+[ingest.construction]
 canonical_batch_max_blocks = 100
 
-[ingest.modifiers]
+[ingest.run_overrides]
 coverage = "wallet-serving"
 target_height = {}
 

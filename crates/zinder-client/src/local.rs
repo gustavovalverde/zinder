@@ -12,8 +12,9 @@ use zinder_core::{
     NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TreeStateArtifact, TxStatus,
 };
-use zinder_derive::{
-    DeriveStore, DeriveStoreOptions, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
+use zinder_materialized_views::{
+    MaterializedViewStore, MaterializedViewStoreOptions,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
     TransparentAddressTransactionHistoryConsumer, TransparentAddressTransactionHistoryPageRequest,
 };
 use zinder_store::{
@@ -43,9 +44,9 @@ pub struct LocalOpenOptions {
     /// Bounded `RocksDB` resource budget applied when opening the canonical
     /// secondary store.
     pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
-    /// Bounded `RocksDB` resource budget applied when opening the derive
+    /// Bounded `RocksDB` resource budget applied when opening the materialized-view
     /// secondary store.
-    pub derive_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional service endpoint used for subscriptions and command RPCs.
     pub subscription_endpoint: Option<String>,
     /// Periodic secondary catchup interval.
@@ -67,7 +68,7 @@ pub struct LocalOpenOptions {
 /// Local chain index backed by a `RocksDB` secondary reader.
 pub struct LocalChainIndex {
     store: SecondaryChainStore,
-    derive_store: Option<DeriveStore>,
+    materialized_view_store: Option<MaterializedViewStore>,
     remote_index: Option<RemoteChainIndex>,
     catchup_interval: Duration,
     catchup_cancel: CancellationToken,
@@ -112,10 +113,10 @@ impl LocalChainIndex {
             "canonical",
         )
         .await?;
-        let derive_store = open_derive_secondary_with_timeout(
+        let materialized_view_store = open_materialized_view_secondary_with_timeout(
             options.storage_path.clone(),
             options.secondary_path.clone(),
-            options.derive_rocksdb_budget,
+            options.materialized_view_rocksdb_budget,
             options.initial_catchup_timeout,
         )
         .await?;
@@ -136,7 +137,7 @@ impl LocalChainIndex {
 
         Ok(Self {
             store,
-            derive_store,
+            materialized_view_store,
             remote_index,
             catchup_interval: options.catchup_interval,
             catchup_cancel,
@@ -491,9 +492,9 @@ impl ChainIndex for LocalChainIndex {
         let max_entries = query
             .max_entries
             .unwrap_or(DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES);
-        let Some(derive_store) = self.derive_store.clone() else {
+        let Some(materialized_view_store) = self.materialized_view_store.clone() else {
             return Err(IndexerError::FailedPrecondition {
-                reason: "transparent-address transaction history derive projection is unavailable"
+                reason: "transparent-address transaction history materialized view is unavailable"
                     .to_owned(),
             });
         };
@@ -506,20 +507,20 @@ impl ChainIndex for LocalChainIndex {
                 .current_chain_epoch_reader()
                 .map_err(IndexerError::from_store_error)?
                 .chain_epoch();
-            derive_store
+            materialized_view_store
                 .try_catch_up()
-                .map_err(IndexerError::from_derive_store_error)?;
-            let derive_height = derive_store
+                .map_err(IndexerError::from_materialized_view_store_error)?;
+            let materialized_view_height = materialized_view_store
                 .last_materialized_height_ascending(
                     TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
                 )
-                .map_err(IndexerError::from_derive_store_error)?;
-            if derive_height.is_none_or(|height| height < chain_epoch.visible_tip_height) {
+                .map_err(IndexerError::from_materialized_view_store_error)?;
+            if materialized_view_height.is_none_or(|height| height < chain_epoch.visible_tip_height) {
                 return Err(IndexerError::FailedPrecondition {
                     reason: format!(
-                        "transparent-address transaction history is behind canonical height {}: derive height {:?}",
+                        "transparent-address transaction history is behind canonical height {}: materialized-view height {:?}",
                         chain_epoch.visible_tip_height.value(),
-                        derive_height.map(BlockHeight::value)
+                        materialized_view_height.map(BlockHeight::value)
                     ),
                 });
             }
@@ -527,7 +528,7 @@ impl ChainIndex for LocalChainIndex {
                 zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
             });
             let page = TransparentAddressTransactionHistoryConsumer::read_page(
-                &derive_store,
+                &materialized_view_store,
                 TransparentAddressTransactionHistoryPageRequest {
                     address_script_hash: query.address_script_hash,
                     start_height: query.start_height,
@@ -537,7 +538,7 @@ impl ChainIndex for LocalChainIndex {
                     from_cursor: cursor_token.as_ref(),
                 },
             )
-            .map_err(IndexerError::from_derive_store_error)?;
+            .map_err(IndexerError::from_materialized_view_store_error)?;
             Ok((chain_epoch, page.artifacts, page.next_cursor))
         }))
         .await?;
@@ -784,35 +785,38 @@ async fn join_blocking<Output>(
     }
 }
 
-async fn open_derive_secondary_with_timeout(
+async fn open_materialized_view_secondary_with_timeout(
     storage_path: PathBuf,
     secondary_path: PathBuf,
-    derive_rocksdb_budget: RocksDbResourceBudget,
+    materialized_view_rocksdb_budget: RocksDbResourceBudget,
     timeout: Duration,
-) -> Result<Option<DeriveStore>, IndexerError> {
-    let derive_storage_path = DeriveStore::path_for_canonical(&storage_path);
-    let derive_secondary_path = secondary_path.join("derive");
-    let derive_store =
-        join_blocking(tokio::task::spawn_blocking(
-            move || match DeriveStore::open_secondary(
-                derive_storage_path,
-                derive_secondary_path,
-                DeriveStoreOptions {
-                    sync_writes: false,
-                    consumers: DeriveStore::bundled_consumers(),
-                    rocksdb_resource_budget: derive_rocksdb_budget,
-                },
-            ) {
-                Ok(derive_store) => Ok(Some(derive_store)),
-                Err(zinder_derive::DeriveStoreError::Open { .. }) => Ok(None),
-                Err(error) => Err(IndexerError::from_derive_store_error(error)),
+) -> Result<Option<MaterializedViewStore>, IndexerError> {
+    let materialized_view_storage_path = MaterializedViewStore::path_for_canonical(&storage_path);
+    let materialized_view_secondary_path = secondary_path.join("materialized-views");
+    let materialized_view_store = join_blocking(tokio::task::spawn_blocking(move || {
+        match MaterializedViewStore::open_secondary(
+            materialized_view_storage_path,
+            materialized_view_secondary_path,
+            MaterializedViewStoreOptions {
+                sync_writes: false,
+                consumers: MaterializedViewStore::bundled_consumers(),
+                rocksdb_resource_budget: materialized_view_rocksdb_budget,
             },
-        ))
+        ) {
+            Ok(materialized_view_store) => Ok(Some(materialized_view_store)),
+            Err(zinder_materialized_views::MaterializedViewStoreError::Open { .. }) => Ok(None),
+            Err(error) => Err(IndexerError::from_materialized_view_store_error(error)),
+        }
+    }))
+    .await?;
+    if let Some(materialized_view_store_for_initial_catchup) = materialized_view_store.clone() {
+        try_catch_up_materialized_view_store_with_timeout(
+            materialized_view_store_for_initial_catchup,
+            timeout,
+        )
         .await?;
-    if let Some(derive_store_for_initial_catchup) = derive_store.clone() {
-        try_catch_up_derive_store_with_timeout(derive_store_for_initial_catchup, timeout).await?;
     }
-    Ok(derive_store)
+    Ok(materialized_view_store)
 }
 
 async fn try_catch_up_store_with_timeout(
@@ -844,14 +848,14 @@ async fn try_catch_up_store_with_timeout(
     }
 }
 
-async fn try_catch_up_derive_store_with_timeout(
-    derive_store: DeriveStore,
+async fn try_catch_up_materialized_view_store_with_timeout(
+    materialized_view_store: MaterializedViewStore,
     timeout: Duration,
 ) -> Result<(), IndexerError> {
     let handle = tokio::task::spawn_blocking(move || {
-        derive_store
+        materialized_view_store
             .try_catch_up()
-            .map_err(IndexerError::from_derive_store_error)
+            .map_err(IndexerError::from_materialized_view_store_error)
     });
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(catchup_outcome)) => catchup_outcome,
@@ -862,9 +866,9 @@ async fn try_catch_up_derive_store_with_timeout(
             tracing::warn!(
                 target: "zinder::client",
                 event = "initial_secondary_catchup_timed_out",
-                role = "derive",
+                role = "materialized-views",
                 timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                "initial derive secondary catchup timed out; opening with the current secondary view"
+                "initial materialized-view secondary catchup timed out; opening with the current secondary view"
             );
             Ok(())
         }

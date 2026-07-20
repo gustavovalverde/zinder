@@ -4,14 +4,14 @@ This runbook operates the supported `rocksdb-single-host` wallet-serving
 topology. Three independent processes share one host filesystem:
 `zinder-ingest` owns canonical facts, `zinder-projector` owns the wallet
 projection, and `zinder-compat-lightwalletd` serves immutable canonical and
-wallet secondary pairs. The legacy query, explorer, and mixed
-single-container deployments are not release paths.
+wallet secondary pairs. Query, explorer, and mixed single-container images are
+not release paths.
 
 A successful deployment is a canary until the release's mainnet construction,
 wallet-build, coherent-restore, capacity, replacement, and independent-client
 gates have current evidence. See
-[ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) and the
-[wallet-serving cutover plan](../plans/fact-first-wallet-serving-cutover.md).
+[ADR-0035](../adrs/0035-canonical-storage-topologies.md) and the
+[testing runbook](testing.md).
 
 ## Prerequisites
 
@@ -252,15 +252,13 @@ Before routing mainnet traffic, attach evidence for every item:
   mempool, confirmation, restart, projection lag, and reorg on the pinned
   independent client.
 
-The last measured mainnet canonical lifecycle exceeded its hard gate and the
-500 GB canary did not prove full-topology headroom. Until newer evidence closes
-those results, this topology is suitable for local validation and controlled
-canaries, not a production certification claim.
+A local deployment is suitable for validation and controlled canaries. It is
+not a production certification claim without release-specific evidence for
+every gate above.
 
 ## References
 
 - [Public environment-variable contract](../architecture/public-interfaces.md#environment-variable-mapping)
 - [Initial sync](initial-sync.md)
 - [Testing](testing.md)
-- [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-- [Wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
+- [ADR-0035](../adrs/0035-canonical-storage-topologies.md)

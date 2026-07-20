@@ -54,8 +54,8 @@ fn explorer_freshness_carries_chain_view_with_every_axis() -> eyre::Result<()> {
                 committed_height: Some(2_530_000),
                 estimated_height: Some(2_544_375),
             }),
-            derive: Some(wallet::DeriveStatus {
-                health: wallet::DeriveHealth::CatchingUp as i32,
+            materialized_views: Some(wallet::MaterializedViewStatus {
+                health: wallet::MaterializedViewHealth::CatchingUp as i32,
                 indexed_height: 2_529_999,
                 lag_blocks: 1,
                 observed_at_millis: 1_774_670_400_000,
@@ -88,7 +88,7 @@ fn explorer_freshness_carries_chain_view_with_every_axis() -> eyre::Result<()> {
     Ok(())
 }
 
-/// An absent `indexed_tip` means "derive head unknown", never "at tip"; the
+/// An absent `indexed_tip` means "materialized-view head unknown", never "at tip"; the
 /// proto3 optional message survives the round trip as `None`.
 #[test]
 fn explorer_freshness_absent_indexed_tip_means_unknown() -> eyre::Result<()> {
@@ -97,7 +97,7 @@ fn explorer_freshness_absent_indexed_tip_means_unknown() -> eyre::Result<()> {
             chain_epoch: Some(wallet::ChainEpoch::default()),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         snapshot_age_millis: 0,
         capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
@@ -716,7 +716,7 @@ fn utxo_set_summary_response_round_trips_through_prost() -> eyre::Result<()> {
                 chain_epoch: Some(wallet::ChainEpoch::default()),
                 indexed_tip: None,
                 upstream_tip: None,
-                derive: None,
+                materialized_views: None,
             }),
             snapshot_age_millis: 0,
             capability_version: EXPLORER_UTXO_SET_SUMMARY_V1.to_owned(),

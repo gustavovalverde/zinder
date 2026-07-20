@@ -1,4 +1,4 @@
-//! Durable fact-first mempool event lifecycle.
+//! Durable live mempool event lifecycle.
 //!
 //! The canonical primary retains the resumable event log but never stores the
 //! mutable mempool index. The ingest owner appends an event here before it

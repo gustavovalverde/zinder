@@ -10,7 +10,7 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     ChainEpochId, Network, decode_canonical_block_replay,
 };
-use zinder_derive::{
+use zinder_materialized_views::{
     BLOCK_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
 };
@@ -85,9 +85,9 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("projection_preset = \"wallet\""));
     assert!(stdout.contains("# effective_projection_identities = ["));
     assert!(stdout.contains("reorg_window_blocks = 100"));
-    assert!(stdout.contains("[ingest.phases]"));
+    assert!(stdout.contains("[ingest.phase_classification]"));
     assert!(stdout.contains("catchup_threshold_blocks ="));
-    assert!(stdout.contains("[ingest.derive]"));
+    assert!(stdout.contains("[ingest.materialized_views]"));
     assert!(stdout.contains("replay_batch_blocks = 100"));
     assert!(stdout.contains("replay_policy = \"canonical-first\""));
     assert!(stdout.contains("memory_degrade_ratio = 0.9"));
@@ -96,7 +96,7 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("min_replay_batch_blocks = 10"));
     assert!(stdout.contains("[ingest.conventional_fee_distribution_backfill]"));
     assert!(stdout.contains("[ingest.transaction_component_backfill]"));
-    assert!(stdout.contains("[ingest.bulk_catchup]"));
+    assert!(stdout.contains("[ingest.construction]"));
     assert!(stdout.contains("canonical_batch_max_blocks = 1000"));
     assert!(stdout.contains("canonical_batch_max_artifact_bytes = 536870912"));
     assert!(stdout.contains("canonical_batch_max_estimated_write_bytes = 536870912"));
@@ -108,10 +108,10 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("block_prepare_concurrency ="));
     assert!(stdout.contains("block_prepare_memory_watermark_bytes = 536870912"));
     assert!(stdout.contains("commit_reassembly_max_queued_artifact_bytes = 536870912"));
-    assert!(stdout.contains("[ingest.tip_follow]"));
+    assert!(stdout.contains("[ingest.follow]"));
     assert!(stdout.contains("poll_interval_ms = 1000"));
     assert!(stdout.contains("lag_threshold_blocks ="));
-    assert!(stdout.contains("[ingest.modifiers]"));
+    assert!(stdout.contains("[ingest.run_overrides]"));
     assert!(stdout.contains("allow_near_tip_finalize = false"));
     assert!(stdout.contains("coverage = \"explicit\""));
 
@@ -440,7 +440,7 @@ fn cli_overrides_environment_and_environment_overrides_config_file() -> Result<(
             "--target-height",
             "300",
         ])
-        .env("ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT", "200")
+        .env("ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT", "200")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
@@ -460,7 +460,7 @@ fn target_height_uses_standard_config_precedence() -> Result<(), Box<dyn Error>>
 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT", "777")
+        .env("ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT", "777")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
@@ -515,7 +515,7 @@ fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn 
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.modifiers.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\""
+            "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\""
         ),
         "{stderr}"
     );
@@ -564,7 +564,7 @@ fn wallet_serving_rejects_explicit_checkpoint_height() -> Result<(), Box<dyn Err
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.modifiers.coverage = \"wallet-serving\" derives checkpoint_height from the node"
+            "ingest.run_overrides.coverage = \"wallet-serving\" derives checkpoint_height from the node"
         ),
         "{stderr}"
     );
@@ -594,7 +594,8 @@ fn wallet_serving_rejects_near_tip_finalize_override() -> Result<(), Box<dyn Err
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.modifiers.coverage = \"wallet-serving\" cannot be combined with"),
+        stderr
+            .contains("ingest.run_overrides.coverage = \"wallet-serving\" cannot be combined with"),
         "{stderr}"
     );
 
@@ -700,7 +701,7 @@ fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.bulk_catchup.canonical_batch_max_blocks must be greater than zero"),
+        stderr.contains("ingest.construction.canonical_batch_max_blocks must be greater than zero"),
         "{stderr}"
     );
 
@@ -728,7 +729,7 @@ fn zero_estimated_write_batch_budget_fails_before_storage_creation() -> Result<(
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes must be greater than zero"
+            "ingest.construction.canonical_batch_max_estimated_write_bytes must be greater than zero"
         ),
         "{stderr}"
     );
@@ -762,7 +763,7 @@ fn estimated_write_close_floor_above_block_cap_fails_before_storage_creation()
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.bulk_catchup.canonical_batch_max_blocks"
+            "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.construction.canonical_batch_max_blocks"
         ),
         "{stderr}"
     );
@@ -780,7 +781,7 @@ fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
         .env(
-            "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS",
+            "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS",
             "0",
         )
         .output()?;
@@ -788,7 +789,7 @@ fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.bulk_catchup.source_segment_max_blocks must be greater than zero"),
+        stderr.contains("ingest.construction.source_segment_max_blocks must be greater than zero"),
         "{stderr}"
     );
 
@@ -798,7 +799,7 @@ fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), 
 #[test]
 fn zero_block_prepare_concurrency_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-derive-store");
+    let storage_path = tempdir.path().join("zero-materialized-view");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
@@ -815,7 +816,7 @@ fn zero_block_prepare_concurrency_fails_before_storage_creation() -> Result<(), 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.bulk_catchup.block_prepare_concurrency must be greater than zero"),
+        stderr.contains("ingest.construction.block_prepare_concurrency must be greater than zero"),
         "{stderr}"
     );
 
@@ -823,21 +824,25 @@ fn zero_block_prepare_concurrency_fails_before_storage_creation() -> Result<(), 
 }
 
 #[test]
-fn zero_derive_replay_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
+fn zero_materialized_view_replay_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error>>
+{
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-derive-replay-store");
+    let storage_path = tempdir.path().join("zero-materialized-view replay-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS", "0")
+        .env(
+            "ZINDER_INGEST__MATERIALIZED_VIEWS__REPLAY_BATCH_BLOCKS",
+            "0",
+        )
         .output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.derive.replay_batch_blocks must be greater than zero"),
+        stderr.contains("ingest.materialized_views.replay_batch_blocks must be greater than zero"),
         "{stderr}"
     );
 
@@ -845,21 +850,29 @@ fn zero_derive_replay_batch_fails_before_storage_creation() -> Result<(), Box<dy
 }
 
 #[test]
-fn invalid_derive_replay_policy_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
+fn invalid_materialized_view_replay_policy_fails_before_storage_creation()
+-> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("invalid-derive-replay-policy-store");
+    let storage_path = tempdir
+        .path()
+        .join("invalid-materialized-view replay-policy-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_INGEST__DERIVE__REPLAY_POLICY", "best-effort")
+        .env(
+            "ZINDER_INGEST__MATERIALIZED_VIEWS__REPLAY_POLICY",
+            "best-effort",
+        )
         .output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.derive.replay_policy must be one of: canonical-first, continuous"),
+        stderr.contains(
+            "ingest.materialized_views.replay_policy must be one of: canonical-first, continuous"
+        ),
         "{stderr}"
     );
 
@@ -917,7 +930,7 @@ fn source_fetch_byte_budget_below_max_response_fails_before_storage_creation()
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "invalid ingest.bulk_catchup pipeline limits: source fetch watermark 33554432 is below maximum response 67108864"
+            "invalid ingest.construction pipeline limits: source fetch watermark 33554432 is below maximum response 67108864"
         ),
         "{stderr}"
     );
@@ -945,7 +958,7 @@ fn zero_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Erro
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.tip_follow.poll_interval_ms must be greater than zero"),
+        stderr.contains("ingest.follow.poll_interval_ms must be greater than zero"),
         "{stderr}"
     );
 
@@ -1125,7 +1138,7 @@ path = "{}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.modifiers]
+[ingest.run_overrides]
 coverage = "wallet-serving"
 
 [ingest_control]
@@ -1158,7 +1171,7 @@ path = "{}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.modifiers]
+[ingest.run_overrides]
 coverage = "wallet-serving"
 checkpoint_height = 1
 

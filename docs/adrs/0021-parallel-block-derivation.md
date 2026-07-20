@@ -28,7 +28,7 @@ ordered source segment
   -> canonical commit
 ```
 
-`ingest.bulk_catchup.block_prepare_concurrency` bounds the number of in-flight
+`ingest.construction.block_prepare_concurrency` bounds the number of in-flight
 CPU-bound block builds. The default follows host parallelism and caps the
 worker count so storage commit, source I/O, metrics, and the Tokio reactor
 retain capacity.
@@ -67,7 +67,7 @@ after including the block that reaches 2,048 inputs, or at the
 prepare-concurrency width. This bounds added latency without turning a dense
 two-block RocksDB request back into two single-block requests.
 
-The same concurrency vocabulary applies to derive replay only when replay is
-hydrating typed canonical block contexts. Derive replay has separate
-`ingest.derive.replay_*` limits because it is rebuildable projection work, not
+The same concurrency vocabulary applies to materialized-view replay only when replay is
+hydrating typed canonical block contexts. Materialized-view replay has separate
+`ingest.materialized_views.replay_*` limits because it is rebuildable projection work, not
 canonical ingest work.

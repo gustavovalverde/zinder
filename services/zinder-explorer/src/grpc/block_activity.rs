@@ -9,7 +9,7 @@ use prost::Message as _;
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 use zinder_core::{BlockHeight, wire::encode_height_key_ascending};
-use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
+use zinder_materialized_views::{BLOCK_SUMMARY_COLUMN_FAMILY, MaterializedViewStore};
 use zinder_proto::capabilities::EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1;
 use zinder_proto::v1::explorer::{
     BlockActivityBucket, BlockActivityDistributionRequest, BlockActivityDistributionResponse,
@@ -34,7 +34,7 @@ const ACTIVITY_BUCKET_COUNT: usize = WEEKDAYS_PER_WEEK * HOURS_PER_DAY;
 
 /// Executes one `ExplorerQuery.BlockActivityDistribution` request.
 pub(crate) async fn handle_block_activity_distribution(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockActivityDistributionRequest>,
@@ -44,7 +44,7 @@ pub(crate) async fn handle_block_activity_distribution(
     let (chain_epoch, _) = read_canonical_tip(wallet_client).await?;
     let start_key = encode_height_key_ascending(BlockHeight::new(request.start_height));
     let end_key = encode_height_key_ascending(BlockHeight::new(request.end_height));
-    let entries = derive_store
+    let entries = materialized_view_store
         .range_iterate_consumer(
             BLOCK_SUMMARY_COLUMN_FAMILY,
             &start_key,
@@ -68,7 +68,7 @@ pub(crate) async fn handle_block_activity_distribution(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
             Some(chain_epoch),
             0,

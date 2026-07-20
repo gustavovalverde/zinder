@@ -121,29 +121,15 @@ serve arbitrary per-height tree state.
 
 The canonical ingest vocabulary is `CanonicalBatch`, `CanonicalBatchBudget`,
 `CanonicalBatchCost`, `CanonicalBatchCloseTrigger`, and
-`block_prepare_concurrency`. `derive_replay_*` names are reserved for the async
-derive replay plane.
+`block_prepare_concurrency`. `materialized_view_replay_*` names are reserved for the async
+materialized-view replay plane.
 
 Bulk-catchup observability uses stage labels from this ADR:
 `source_fetch`, `canonical_block_prepare`, `canonical_prevout_resolve`, `canonical_position`,
 `subtree_root_attachment`, `checkpoint_tree_state`, `commit_reassembly`,
 `canonical_commit`, and `canonical_flush`.
 
-## Revision: container-aware default queue caps (2026-05-26)
-
-The four bulk-catchup queue byte-caps (`source_fetch_max_in_flight_bytes`,
-`block_prepare_memory_watermark_bytes`,
-`commit_reassembly_max_queued_artifact_bytes`,
-`canonical_batch_max_estimated_write_bytes`) shipped as fixed constants
-(~512 MiB) sized for hosts with plenty of headroom. Deployed inside a
-24 GiB container (Railway, Fly, mid-tier ECS), the documented worst-case
-in-flight envelope of `commit + prepare + reassembly + next-batch` runs
-~2.4 GiB of watermark, which then amplifies through decoded-artifact
-structures, in-flight commit futures, and RocksDB write buffers into
-container memory exhaustion during dense mainnet ranges (observed on
-2026-05-26 around blocks 297-298k: `estimated_write_bytes=510 MB` batch
-correlated with 22.7 GiB resident memory at a 24 GiB cap, ending in a
-SIGTERM from the container runtime).
+## Container-aware default queue caps
 
 The queue-cap defaults now derive from the container memory budget at
 startup. `services/zinder-ingest/src/memory_pressure.rs` exposes
@@ -156,7 +142,7 @@ canonical-write bounds. Each resource-aware bound uses
 24 GiB container they are 384 MiB; on dev hosts without cgroup the fallback
 constants apply.
 
-The `ZINDER_INGEST__BULK_CATCHUP__*_BYTES` env-var overrides still take
+The `ZINDER_INGEST__CONSTRUCTION__*_BYTES` env-var overrides still take
 precedence over the auto-derived default. They are diagnostic overrides: the
 tracked deployment examples omit them so the deployed runtime and the closed
 storage-lifecycle certification resolve the same resource profile. The closed

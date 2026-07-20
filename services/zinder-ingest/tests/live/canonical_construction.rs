@@ -100,7 +100,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
     .err()
     .ok_or_else(|| eyre!("block-local canonical construction must remain BUILDING"))?;
     assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
-    assert!(!temporary.path().join("derive").exists());
+    assert!(!temporary.path().join("materialized-views").exists());
     assert_and_record_live_evidence(&build_plan, &evidence, &persisted, elapsed, io_mode);
     Ok(())
 }

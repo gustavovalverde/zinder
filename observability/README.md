@@ -212,9 +212,9 @@ The smoke should produce samples for:
 - `zinder_ingest_commit_duration_seconds_count`
 - `zinder_ingest_writer_chain_epoch_id`
 - `zinder_ingest_writer_status_request_total`
-- `zinder_compat_lightwalletd_frozen_pair_publications_total`
-- `zinder_compat_lightwalletd_frozen_pair_convergence_total`
-- `zinder_compat_lightwalletd_frozen_pair_replica_lag_chain_epochs`
+- `zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total`
+- `zinder_compat_lightwalletd_wallet_serving_pair_publisher_convergence_total`
+- `zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs`
 - `zinder_compat_lightwalletd_writer_status_total`
 - `zinder_store_read_duration_seconds_count`
 - `zinder_store_visibility_seek_total`
@@ -253,9 +253,9 @@ should make writer, secondary-reader, and replica-lag failures easy to spot:
 - `Traffic-Blocking Services`: red when any service reports a readiness cause
   that should fail load-balancer readiness.
 - `Storage Access Availability`: red when writer-status serving, writer-status
-  fetching, or frozen-pair readiness is unavailable over the last five minutes.
+  fetching, or wallet-serving-pair readiness is unavailable over the last five minutes.
 - `Replica Lag`: chain-epoch lag from readiness and secondary catchup.
 - `Canonical Writer Chain Epoch`: authenticated canonical-writer progress.
-- `Secondary Catchup P95`: catchup latency for the frozen compat reader pair.
-- `Storage Access Error Rate`: writer-status and frozen-pair catchup error rates.
+- `Secondary Catchup P95`: catchup latency for the compatibility wallet-serving pair.
+- `Storage Access Error Rate`: writer-status and wallet-serving-pair catchup error rates.
   A flat zero line is the healthy state.

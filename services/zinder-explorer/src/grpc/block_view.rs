@@ -1,11 +1,11 @@
 //! `ExplorerQuery` block-view handlers.
 //!
 //! Both reads project the materialized `BlockSummaryRecord` payloads written
-//! by [`zinder_derive::BlockSummaryConsumer`] into the
+//! by [`zinder_materialized_views::BlockSummaryConsumer`] into the
 //! public wire shapes. The handlers wrap reads in the cross-cutting
 //! [`ExplorerFreshness`] envelope per
 //! [ADR-0011](../../../docs/adrs/0011-explorer-freshness-envelope.md) and
-//! compute `derive_cursor_lag_blocks` against the wallet plane's visible
+//! compute `materialized_view_cursor_lag_blocks` against the wallet plane's visible
 //! tip.
 
 use std::collections::{HashMap, HashSet};
@@ -47,10 +47,10 @@ use super::freshness::{
 use super::require_matching_chain_epoch;
 use super::transaction_detail::encode_public_facts;
 use super::transparent_input::{encode_mined_transparent_inputs, parent_transaction_ids};
-use zinder_derive::{
+use zinder_materialized_views::{
     BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_SUMMARY_COLUMN_FAMILY, BlockProductionTimeConsumer,
     BlockProductionTimeCursor, BlockProductionTimePageRequest, ConsumerProjectionState,
-    DeriveStore, DeriveStoreReadSnapshot, PaidFeeDistributionConsumer,
+    MaterializedViewStore, MaterializedViewStoreReadSnapshot, PaidFeeDistributionConsumer,
 };
 use zinder_store::{
     ChainEpochReader, SecondaryChainStore, chain_epoch_from_message, chain_epoch_message,
@@ -97,7 +97,7 @@ struct MaterializedProductionTimePage {
 }
 
 pub(crate) async fn handle_block_summaries_in_range(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockSummariesInRangeRequest>,
@@ -108,7 +108,8 @@ pub(crate) async fn handle_block_summaries_in_range(
     validate_block_view_range(start_height, end_height)?;
 
     let (chain_epoch, canonical_tip) = read_canonical_tip(wallet_client).await?;
-    let mut summaries = read_materialized_block_summaries(derive_store, start_height, end_height)?;
+    let mut summaries =
+        read_materialized_block_summaries(materialized_view_store, start_height, end_height)?;
     for summary in &mut summaries {
         annotate_request_time_fields(summary, canonical_tip);
     }
@@ -116,7 +117,7 @@ pub(crate) async fn handle_block_summaries_in_range(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_BLOCK_SUMMARY_V1,
             Some(chain_epoch),
             0,
@@ -131,7 +132,7 @@ pub(crate) async fn handle_block_summaries_in_range(
 }
 
 pub(crate) async fn handle_block_production_series(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     chain_store: &SecondaryChainStore,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockProductionSeriesRequest>,
@@ -139,8 +140,11 @@ pub(crate) async fn handle_block_production_series(
     let request = request.into_inner();
     let requested_block_count =
         validate_block_view_range(request.start_height, request.end_height)?;
-    let records =
-        read_materialized_block_records(derive_store, request.start_height, request.end_height)?;
+    let records = read_materialized_block_records(
+        materialized_view_store,
+        request.start_height,
+        request.end_height,
+    )?;
     let summaries = records
         .iter()
         .map(|record| {
@@ -184,7 +188,7 @@ pub(crate) async fn handle_block_production_series(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
             Some(chain_epoch_message(chain_epoch)),
             0,
@@ -203,13 +207,16 @@ pub(crate) async fn handle_block_production_series(
 }
 
 pub(crate) async fn handle_block_production_in_time_range(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     chain_store: &SecondaryChainStore,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockProductionInTimeRangeRequest>,
 ) -> Result<Response<BlockProductionInTimeRangeResponse>, Status> {
-    let materialized =
-        read_block_production_time_page(derive_store, chain_store, &request.into_inner())?;
+    let materialized = read_block_production_time_page(
+        materialized_view_store,
+        chain_store,
+        &request.into_inner(),
+    )?;
     let freshness =
         attach_upstream_observation(upstream_observation_cache, materialized.freshness).await;
     Ok(Response::new(BlockProductionInTimeRangeResponse {
@@ -228,7 +235,7 @@ pub(crate) async fn handle_block_production_in_time_range(
 }
 
 fn read_block_production_time_page(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     chain_store: &SecondaryChainStore,
     request: &BlockProductionInTimeRangeRequest,
 ) -> Result<MaterializedProductionTimePage, Status> {
@@ -240,7 +247,7 @@ fn read_block_production_time_page(
         .current_chain_epoch_reader()
         .map_err(|error| status_from_store_error(&error))?;
     let chain_epoch = reader.chain_epoch();
-    let snapshot = derive_store.read_snapshot();
+    let snapshot = materialized_view_store.read_snapshot();
     let current_projection_state = snapshot
         .consumer_projection_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
@@ -312,9 +319,9 @@ fn read_block_production_time_page(
 }
 
 fn read_paid_fee_totals_for_time_rows(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
-    rows: &[zinder_derive::BlockProductionTimeRow],
-) -> Result<Vec<Option<zinder_derive::PaidFeeBlockTotal>>, Status> {
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    rows: &[zinder_materialized_views::BlockProductionTimeRow],
+) -> Result<Vec<Option<zinder_materialized_views::PaidFeeBlockTotal>>, Status> {
     rows.iter()
         .map(|row| {
             PaidFeeDistributionConsumer::block_total_snapshot(
@@ -362,13 +369,13 @@ fn block_production_time_page_size(requested: u32) -> usize {
     } else {
         usize::try_from(requested)
             .unwrap_or(usize::MAX)
-            .min(zinder_derive::BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE)
+            .min(zinder_materialized_views::BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE)
     }
 }
 
 fn read_block_summary_records_for_time_rows(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
-    rows: &[zinder_derive::BlockProductionTimeRow],
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    rows: &[zinder_materialized_views::BlockProductionTimeRow],
 ) -> Result<Vec<Option<BlockSummaryRecord>>, Status> {
     let keys = rows
         .iter()
@@ -395,9 +402,9 @@ fn read_block_summary_records_for_time_rows(
 
 fn materialize_block_production_time_points(
     reader: &ChainEpochReader<'_>,
-    rows: &[zinder_derive::BlockProductionTimeRow],
+    rows: &[zinder_materialized_views::BlockProductionTimeRow],
     records: Vec<Option<BlockSummaryRecord>>,
-    paid_fees: Vec<Option<zinder_derive::PaidFeeBlockTotal>>,
+    paid_fees: Vec<Option<zinder_materialized_views::PaidFeeBlockTotal>>,
 ) -> Result<(Vec<BlockProductionPoint>, u32, u32, u32), Status> {
     let canonical_tip = reader.chain_epoch().visible_tip_height.value();
     let mut points = Vec::with_capacity(rows.len());
@@ -459,7 +466,7 @@ fn materialize_block_production_time_points(
 }
 
 fn validate_time_index_block_summary(
-    row: &zinder_derive::BlockProductionTimeRow,
+    row: &zinder_materialized_views::BlockProductionTimeRow,
     record: &BlockSummaryRecord,
 ) -> Result<BlockSummary, Status> {
     let summary = record
@@ -481,7 +488,7 @@ fn validate_time_index_block_summary(
 }
 
 fn block_production_time_coverage(
-    coverage: Option<zinder_derive::BlockProductionTimeBackfillCoverage>,
+    coverage: Option<zinder_materialized_views::BlockProductionTimeBackfillCoverage>,
     projection_state: ConsumerProjectionState,
     fence_tip_time_unix_seconds: Option<i64>,
 ) -> BlockProductionTimeRangeCoverage {
@@ -548,7 +555,7 @@ fn resolve_block_production_cursor_fence(
     request: &BlockProductionInTimeRangeRequest,
     current_projection_state: ConsumerProjectionState,
     current_chain_epoch_id: ChainEpochId,
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
 ) -> Result<
     (
         Option<BlockProductionTimeCursorEnvelope>,
@@ -680,11 +687,11 @@ fn validate_block_view_range(start_height: u32, end_height: u32) -> Result<u32, 
 }
 
 fn read_materialized_block_summaries(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_height: u32,
     end_height: u32,
 ) -> Result<Vec<BlockSummary>, Status> {
-    read_materialized_block_records(derive_store, start_height, end_height)?
+    read_materialized_block_records(materialized_view_store, start_height, end_height)?
         .into_iter()
         .map(|record| {
             record
@@ -695,13 +702,13 @@ fn read_materialized_block_summaries(
 }
 
 fn read_materialized_block_records(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_height: u32,
     end_height: u32,
 ) -> Result<Vec<BlockSummaryRecord>, Status> {
     let start_key = encode_height_key_ascending(BlockHeight::new(start_height));
     let end_key = encode_height_key_ascending(BlockHeight::new(end_height));
-    derive_store
+    materialized_view_store
         .range_iterate_consumer(
             BLOCK_SUMMARY_COLUMN_FAMILY,
             &start_key,
@@ -854,17 +861,18 @@ fn join_block_production_points(
 }
 
 pub(crate) async fn handle_block_detail(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockDetailRequest>,
 ) -> Result<Response<BlockDetailResponse>, Status> {
     let inner = request.into_inner();
-    let materialized = read_materialized_block_view(derive_store, wallet_client, &inner).await?;
+    let materialized =
+        read_materialized_block_view(materialized_view_store, wallet_client, &inner).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_BLOCK_DETAIL_V1,
             Some(materialized.chain_epoch),
             0,
@@ -880,21 +888,23 @@ pub(crate) async fn handle_block_detail(
 
 pub(crate) async fn handle_block_transactions(
     chain_store: &SecondaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockDetailRequest>,
 ) -> Result<Response<BlockTransactionsResponse>, Status> {
     let inner = request.into_inner();
-    let materialized = read_materialized_block_view(derive_store, wallet_client, &inner).await?;
-    let transactions = read_block_transaction_rows(chain_store, derive_store, &materialized)?;
+    let materialized =
+        read_materialized_block_view(materialized_view_store, wallet_client, &inner).await?;
+    let transactions =
+        read_block_transaction_rows(chain_store, materialized_view_store, &materialized)?;
     let final_note_commitment_roots =
         read_block_final_note_commitment_roots(chain_store, &materialized)?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_BLOCK_TRANSACTIONS_V2,
             Some(materialized.chain_epoch),
             0,
@@ -937,7 +947,7 @@ fn read_block_final_note_commitment_roots(
 
 fn read_block_transaction_rows(
     chain_store: &SecondaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     materialized: &MaterializedBlockView,
 ) -> Result<Vec<BlockTransaction>, Status> {
     chain_store
@@ -973,8 +983,8 @@ fn read_block_transaction_rows(
                 .map(|artifact| (*transaction_id, artifact.public_facts.privacy_shape))
         })
         .collect::<Vec<_>>();
-    let fee_records = zinder_derive::TransactionFeesConsumer::read_fees_records_many(
-        derive_store,
+    let fee_records = zinder_materialized_views::TransactionFeesConsumer::read_fees_records_many(
+        materialized_view_store,
         &fee_lookup_targets,
     )
     .map_err(|error| ExplorerError::internal(error.to_string()))?;
@@ -1038,13 +1048,13 @@ fn encode_block_transaction_rows(
 }
 
 async fn read_materialized_block_view(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     request: &BlockDetailRequest,
 ) -> Result<MaterializedBlockView, Status> {
     let height = resolve_block_height(wallet_client, request).await?;
     let key = encode_height_key_ascending(BlockHeight::new(height));
-    let payload = derive_store
+    let payload = materialized_view_store
         .get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &key)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
         .ok_or_else(|| {
@@ -1150,7 +1160,7 @@ mod tests {
             encode_rpc_transaction_id_hex,
         },
     };
-    use zinder_derive::{
+    use zinder_materialized_views::{
         BlockProductionTimeBackfillCoverage, BlockProductionTimeCursor, ConsumerProjectionState,
     };
     use zinder_proto::v1::explorer::{

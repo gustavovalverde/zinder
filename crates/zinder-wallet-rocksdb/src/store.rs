@@ -1,4 +1,4 @@
-//! Exact version-1 `RocksDB` wallet layout, admission, and reads.
+//! Exact `RocksDB` wallet layout, admission, and reads.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,7 +8,9 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use zinder_bulk_load::{SortedVariableValues, VariableValueSortEvidence, VariableValueSorter};
+use zinder_rocksdb_bulk_load::{
+    SortedVariableValues, VariableValueSortEvidence, VariableValueSorter,
+};
 
 use rust_rocksdb::{
     BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
@@ -188,7 +190,7 @@ pub(crate) struct WalletColdValidationEvidence {
     pub(crate) random_read_count: u64,
 }
 
-/// One admitted READY version-1 wallet `RocksDB` store.
+/// One admitted READY wallet `RocksDB` store.
 ///
 /// The private database handle prevents consumers from bypassing the wallet
 /// row codecs or mutating a store after admission.
@@ -2229,7 +2231,7 @@ fn validate_address_transaction_rows(
 fn validate_expected_address_transaction<I, Key, Value>(
     rows: &mut I,
     digest: &mut WalletProjectionDigestBuilder,
-    expected: &zinder_bulk_load::VariableValueRecord<ADDRESS_TRANSACTION_KEY_BYTES>,
+    expected: &zinder_rocksdb_bulk_load::VariableValueRecord<ADDRESS_TRANSACTION_KEY_BYTES>,
     count: &mut u64,
 ) -> Result<(), RocksDbWalletError>
 where

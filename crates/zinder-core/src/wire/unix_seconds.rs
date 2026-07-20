@@ -1,4 +1,4 @@
-//! Unix-seconds key encoder for time-bucketed derive-store column families.
+//! Unix-seconds key encoder for time-bucketed materialized-view column families.
 //!
 //! Consumers that bucket events by wall-clock second (mempool event-rate
 //! counters today) key their per-bucket rows on the 8-byte big-endian Unix
@@ -6,13 +6,13 @@
 //! forward range scan visits buckets oldest-first and a reverse iterator
 //! reads the latest bucket first.
 //!
-//! Inline `unix_seconds.to_be_bytes()` at derive-store boundaries is a
+//! Inline `unix_seconds.to_be_bytes()` at materialized-view boundaries is a
 //! forbidden pattern enforced by
 //! `crates/zinder-core/tests/integration/wire_invariants.rs`.
 
 use crate::wire::WireDecodeError;
 
-/// Number of bytes a Unix-seconds timestamp occupies in a derive-store key.
+/// Number of bytes a Unix-seconds timestamp occupies in a materialized-view key.
 pub const UNIX_SECONDS_KEY_LEN: usize = 8;
 
 /// Encodes a Unix-seconds timestamp into its big-endian key bytes.

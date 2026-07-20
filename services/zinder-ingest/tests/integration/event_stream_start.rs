@@ -266,7 +266,7 @@ fn commit_synthetic_epoch(
     height: u32,
 ) -> Result<zinder_store::ChainEpochCommitOutcome> {
     let (chain_epoch, block, compact_block) =
-        synthetic_epoch_with_safe_tip(chain_epoch_id, height, height, block_hash(height));
+        synthetic_epoch_with_settled_tip(chain_epoch_id, height, height, block_hash(height));
     let replay_envelope = encode_fixture_block_replay(&block, &[]);
     Ok(store.commit_chain_epoch(ChainEpochArtifacts::new(
         chain_epoch,
@@ -276,13 +276,13 @@ fn commit_synthetic_epoch(
     ))?)
 }
 
-/// Commits a two-block chain under safe tip 1 and returns the height-2
+/// Commits a two-block chain under settled tip 1 and returns the height-2
 /// cursor, whose locator lets a reorg of height 2 resolve the fork at
 /// height 1.
 fn commit_reorgable_chain_and_cursor(store: &PrimaryChainStore) -> Result<StreamCursorTokenV1> {
     commit_synthetic_epoch(store, 1, 1)?;
     let (second_epoch, second_block, second_compact_block) =
-        synthetic_epoch_with_safe_tip(2, 2, 1, block_hash(2));
+        synthetic_epoch_with_settled_tip(2, 2, 1, block_hash(2));
     let second_replay_envelope = encode_fixture_block_replay(&second_block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         second_epoch,
@@ -304,7 +304,7 @@ fn commit_reorgable_chain_and_cursor(store: &PrimaryChainStore) -> Result<Stream
 
 fn commit_height_two_reorg(store: &PrimaryChainStore) -> Result<()> {
     let (mut replacement_epoch, replacement_block, replacement_compact_block) =
-        synthetic_epoch_with_safe_tip(3, 2, 1, block_hash(20));
+        synthetic_epoch_with_settled_tip(3, 2, 1, block_hash(20));
     replacement_epoch.created_at = UnixTimestampMillis::new(1_774_668_300_000);
     let replacement_replay_envelope = encode_fixture_block_replay(&replacement_block, &[]);
     store.commit_chain_epoch(
@@ -321,10 +321,10 @@ fn commit_height_two_reorg(store: &PrimaryChainStore) -> Result<()> {
     Ok(())
 }
 
-fn synthetic_epoch_with_safe_tip(
+fn synthetic_epoch_with_settled_tip(
     chain_epoch_id: u64,
     height: u32,
-    safe_tip_height: u32,
+    settled_tip_height: u32,
     source_hash: BlockHash,
 ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let parent_hash = block_hash(height.saturating_sub(1));
@@ -336,8 +336,8 @@ fn synthetic_epoch_with_safe_tip(
             network: Network::ZcashRegtest,
             visible_tip_height: block_height,
             visible_tip_hash: source_hash,
-            settled_tip_height: BlockHeight::new(safe_tip_height),
-            settled_tip_hash: block_hash(safe_tip_height),
+            settled_tip_height: BlockHeight::new(settled_tip_height),
+            settled_tip_hash: block_hash(settled_tip_height),
             artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),

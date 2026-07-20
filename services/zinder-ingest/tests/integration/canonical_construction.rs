@@ -160,7 +160,7 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
     .err()
     .ok_or("block-local canonical construction must remain BUILDING")?;
     assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
-    assert!(!temporary.path().join("derive").exists());
+    assert!(!temporary.path().join("materialized-views").exists());
     Ok(())
 }
 
@@ -326,7 +326,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
                 .any(|family| family == wallet_state_family)
         );
     }
-    assert!(!temporary.path().join("derive").exists());
+    assert!(!temporary.path().join("materialized-views").exists());
     Ok(())
 }
 

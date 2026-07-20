@@ -40,7 +40,7 @@ use super::{
 ///
 /// The command contains no historical wallet outputs, resolved prevouts, or
 /// projection rows. The canonical store validates its parent against the
-/// authenticated visible fence and writes only version-1 canonical families.
+/// authenticated visible fence and writes only canonical families.
 #[derive(Debug)]
 pub struct CanonicalLiveAppend {
     expected_fence: CanonicalEventFence,
@@ -287,7 +287,7 @@ impl PreparedLiveAppendCommit {
             &append.block,
         )?;
         let (chain_epoch_id, chain_event_sequence) = next_live_fence(&store.ready_evidence)?;
-        let (visible_block_count, visible_sequence_digest, visible_logical_fact_bytes) =
+        let (visible_block_count, visible_sequence_digest, visible_logical_block_facts_bytes) =
             advance_visible_sequence(&store.ready_evidence, &append.block)?;
         let ready_evidence = CanonicalStoreReadyEvidence {
             visible_tip,
@@ -295,7 +295,7 @@ impl PreparedLiveAppendCommit {
             visible_event_sequence: chain_event_sequence,
             visible_block_count,
             visible_sequence_digest,
-            visible_logical_fact_bytes,
+            visible_logical_block_facts_bytes,
             sequence_checkpoint,
             ..store.ready_evidence
         };
@@ -450,14 +450,14 @@ fn advance_visible_sequence(
     let visible_digest = digest_builder.finish();
     let replay_bytes = u64::try_from(block.replay_envelope.as_bytes().len())
         .map_err(|_| CanonicalStoreError::live_commit("live replay bytes exceed u64::MAX"))?;
-    let visible_logical_fact_bytes = ready_evidence
-        .visible_logical_fact_bytes
+    let visible_logical_block_facts_bytes = ready_evidence
+        .visible_logical_block_facts_bytes
         .checked_add(replay_bytes)
         .ok_or_else(|| CanonicalStoreError::live_commit("visible replay bytes exceed u64::MAX"))?;
     Ok((
         visible_digest.block_count(),
         visible_digest.as_bytes(),
-        visible_logical_fact_bytes,
+        visible_logical_block_facts_bytes,
     ))
 }
 

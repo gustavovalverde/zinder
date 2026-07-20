@@ -3,7 +3,7 @@
 Status: Accepted
 Date: 2026-05-19
 Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
-[ADR-0017](0017-derive-consumer-template-and-key-codec-convention.md)
+[ADR-0017](0017-materialized-view-consumer-and-key-codec.md)
 
 ## Context
 
@@ -68,14 +68,13 @@ convention. Specifically:
      (`wallet.read.transparent_outputs_by_outpoint_v1` flips on when the wallet
      advertises it);
    - local opt-in (the `payment_disclosure_verifier_online` flag);
-   - whether the derive store has been wired
-     (`derive_store_online` covers `BlockSummary`, `BlockDetail`,
+   - whether the materialized-view store has been wired
+     (`materialized_view_store_online` covers `BlockSummary`, `BlockDetail`,
      `MempoolEventCounts`, `RecentTransactions`, and
      `TransparentAddressActivity`).
 
    `advertised_capabilities()` is the single source of truth: the gRPC
-   `ServerInfo`, the ops endpoint's `/healthz`, and any future
-   capability-surfacing endpoint all read from it. A flag flipped in
+   `ServerInfo` and the ops endpoint's `/healthz` both read from it. A flag flipped in
    one place therefore reaches every consumer.
 
 ## Examples shipped under this convention
@@ -125,7 +124,7 @@ fails closed; it is never treated as `none`.
 
 ## Projection capabilities require projection evidence
 
-An online derive store is not enough to advertise a backfilled projection as complete. The service evaluates the named consumer's checkpoint and coverage from one read snapshot. A base capability may be advertised when partial rows are useful and the response exposes their bounds. A completeness capability is advertised only when verified contiguous coverage reaches the fenced projection tip and the ending hash matches. Canonical artifact schema, block-summary freshness, and global ingest readiness are inputs, not substitutes for this evidence.
+An online materialized-view store is not enough to advertise a backfilled projection as complete. The service evaluates the named consumer's checkpoint and coverage from one read snapshot. A base capability may be advertised when partial rows are useful and the response exposes their bounds. A completeness capability is advertised only when verified contiguous coverage reaches the fenced projection tip and the ending hash matches. Canonical artifact schema, block-summary freshness, and global ingest readiness are inputs, not substitutes for this evidence.
 
 ## Consequences
 
@@ -145,15 +144,3 @@ An online derive store is not enough to advertise a backfilled projection as com
   flag, the binary adds a new named gate next to the existing ones,
   `advertised_capabilities()` adds one `if flag` arm, and the
   capability string lights up only when the gate is true.
-
-## Revision history
-
-- 2026-07-10: Restricted `paid_fee_zat` to fully resolved
-  `TransparentOnly` transactions. Shielded and unclassified rows keep the
-  field absent because their value balances are not retained canonical facts.
-- 2026-06-25: Added the wallet-surface field capability
-  `wallet.read.transaction_bytes_v1` gating `MinedTransaction
-  .raw_transaction_bytes` (`bytes` to `optional bytes`), the
-  `RequiresBlockBlobs` and `RequiresTransactionBlobs` advertise policies,
-  and the `StorageControl` `raw_blob_policy` singleton the writer persists
-  for reader-side capability discovery.

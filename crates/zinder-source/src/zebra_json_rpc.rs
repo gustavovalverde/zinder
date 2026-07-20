@@ -187,10 +187,10 @@ impl ZebraJsonRpcSource {
 
     /// Fetches the next source-chain update after `cursor`.
     ///
-    /// This keeps the current JSON-RPC catch-up path behind the same
-    /// [`SourceChainUpdate`] boundary the future Zebra indexer feed will use.
+    /// This keeps JSON-RPC catch-up behind the shared
+    /// [`SourceChainUpdate`] boundary used by source adapters.
     /// The JSON-RPC adapter can emit connected blocks and cursor-divergence
-    /// reverts; it does not emit [`SourceChainUpdate::SafeTip`] because
+    /// reverts; it does not emit [`SourceChainUpdate::SettledTip`] because
     /// Zebra JSON-RPC does not expose an ordered finality feed.
     pub async fn fetch_chain_update_after(
         &self,

@@ -72,8 +72,8 @@ pub struct ChainEventEnvelope {
     pub event_sequence: u64,
     /// Chain epoch visible after this event.
     pub chain_epoch: ChainEpoch,
-    /// Safe tip height reported with this event.
-    pub safe_tip_height: BlockHeight,
+    /// Settled tip height reported with this event.
+    pub settled_tip_height: BlockHeight,
     /// Canonical chain transition.
     pub event: ChainEvent,
 }
@@ -83,12 +83,12 @@ pub struct ChainEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChainEvent {
-    /// A non-reorg commit advanced the canonical tip or safe-tip prefix.
+    /// A non-reorg commit advanced the canonical tip or settled-tip prefix.
     ChainCommitted {
         /// Committed epoch payload.
         committed: ChainEpochCommitted,
     },
-    /// A range that had not yet reached the safe tip was replaced.
+    /// A range that had not yet reached the settled tip was replaced.
     ChainReorged {
         /// Previously visible range invalidated by this transition.
         reverted: ChainRangeReverted,
@@ -365,13 +365,13 @@ impl TransparentUtxoSetSummaryView {
     }
 }
 
-/// Canonical and derive-store reads served identically by every chain-index
+/// Canonical and materialized-view reads served identically by every chain-index
 /// handle.
 ///
 /// Both [`crate::LocalChainIndex`] (a colocated `RocksDB`-secondary reader) and
 /// [`crate::RemoteChainIndex`] (a `WalletQuery` gRPC client) implement this
 /// trait with identical semantics. Every method here answers from the
-/// canonical chain store or the derive projection, so a handle that cannot
+/// canonical chain store or the materialized view, so a handle that cannot
 /// reach a live ingest-control endpoint still honors the full contract.
 ///
 /// Methods that require a live ingest-control/broadcast endpoint (broadcast,
@@ -384,7 +384,7 @@ impl TransparentUtxoSetSummaryView {
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves
 /// to the visible chain epoch at call time; `Some(id)` pins the read to that
-/// epoch. Current-projection derive reads expose their chain epoch in stream
+/// epoch. Current materialized-view reads expose their chain epoch in stream
 /// items instead of accepting a pin.
 ///
 /// All trait methods take and return `zinder-core` types; generated
@@ -419,7 +419,7 @@ pub trait ChainIndex: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError>;
 
-    /// Resolves the block at the chain epoch's safe tip (the height a
+    /// Resolves the block at the chain epoch's settled tip (the height a
     /// wallet may safely use as its scan ceiling: both a compact block and
     /// a coherent tree-state checkpoint are guaranteed available within the
     /// wallet's rewind cap of that height).
@@ -833,11 +833,11 @@ pub trait ChainIndex: Send + Sync + 'static {
 /// Live ingest-control reads layered on top of [`ChainIndex`].
 ///
 /// Only [`crate::RemoteChainIndex`] implements this trait: every method needs a
-/// reachable ingest-control/broadcast endpoint that the canonical and derive
+/// reachable ingest-control/broadcast endpoint that the canonical and materialized-view
 /// stores cannot stand in for. Broadcast forwards bytes to the upstream node;
 /// the mempool reads observe the writer's in-process mempool index; the
 /// chain-event stream and chain value-pools are produced by the writer at the
-/// safe tip; the wallet-plane server descriptor is the endpoint's own
+/// settled tip; the wallet-plane server descriptor is the endpoint's own
 /// advertisement.
 ///
 /// A consumer that needs any of these methods bounds its handle as

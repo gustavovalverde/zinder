@@ -111,7 +111,7 @@ pub struct ServerInfoSettings {
     pub transparent_address_history_available: bool,
     /// Whether durable transparent spender resolution is available.
     pub transparent_outpoint_spend_available: bool,
-    /// Closed projection workload detected from the durable derive manifest.
+    /// Closed projection workload detected from the durable materialized-view manifest.
     pub projection_preset: String,
     /// Effective stable projection identities selected by the workload.
     pub projection_identities: Vec<String>,
@@ -153,10 +153,10 @@ impl Default for ServerInfoSettings {
             utxo_set_commitment_enabled: false,
             transparent_address_history_available: true,
             transparent_outpoint_spend_available: true,
-            projection_preset: zinder_derive::ProjectionPreset::Explorer
+            projection_preset: zinder_materialized_views::ProjectionPreset::Explorer
                 .as_str()
                 .to_owned(),
-            projection_identities: zinder_derive::ProjectionPreset::Explorer
+            projection_identities: zinder_materialized_views::ProjectionPreset::Explorer
                 .consumer_schemas()
                 .iter()
                 .map(|schema| schema.name.as_str().to_owned())
@@ -245,7 +245,7 @@ pub async fn latest_block_response<Q: WalletQueryApi + ?Sized>(
         .map(build_latest_block_response)
 }
 
-/// Reads the block at the chain epoch's safe tip and encodes the native
+/// Reads the block at the chain epoch's settled tip and encodes the native
 /// wallet response.
 pub(super) async fn latest_safe_block_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
@@ -643,7 +643,7 @@ fn build_latest_safe_block_response(
 ) -> wallet::LatestSafeBlockResponse {
     wallet::LatestSafeBlockResponse {
         chain_view: Some(build_chain_view_message(safe_block.chain_epoch)),
-        safe_tip_block: Some(build_block_metadata_message(
+        settled_tip_block: Some(build_block_metadata_message(
             safe_block.height,
             safe_block.block_hash,
         )),

@@ -49,8 +49,8 @@ fn chain_view_round_trips_through_prost() -> eyre::Result<()> {
             committed_height: Some(42),
             estimated_height: Some(44),
         }),
-        derive: Some(wallet::DeriveStatus {
-            health: wallet::DeriveHealth::CatchingUp as i32,
+        materialized_views: Some(wallet::MaterializedViewStatus {
+            health: wallet::MaterializedViewHealth::CatchingUp as i32,
             indexed_height: 41,
             lag_blocks: 1,
             observed_at_millis: 1_774_670_400_000,
@@ -76,8 +76,8 @@ fn chain_view_round_trips_through_prost() -> eyre::Result<()> {
     assert_eq!(upstream_tip.estimated_height, Some(44));
     assert_eq!(
         decoded
-            .derive
-            .ok_or_else(|| eyre!("derive missing"))?
+            .materialized_views
+            .ok_or_else(|| eyre!("materialized-view status missing"))?
             .indexed_height,
         41
     );
@@ -369,8 +369,8 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
 
     assert_eq!(decoded_response.cursor, vec![0x99; 82]);
     assert_eq!(decoded_response.event_sequence, 11);
-    // The safe tip height is folded onto chain_view.chain_epoch.settled_tip;
-    // the envelope no longer carries a separate safe_tip_height field.
+    // The settled tip height is folded onto chain_view.chain_epoch.settled_tip;
+    // the envelope no longer carries a separate settled_tip_height field.
     let settled_tip = decoded_response
         .chain_view
         .as_ref()
@@ -660,7 +660,7 @@ fn synthetic_chain_view() -> wallet::ChainView {
         chain_epoch: Some(synthetic_chain_epoch()),
         indexed_tip: None,
         upstream_tip: None,
-        derive: None,
+        materialized_views: None,
     }
 }
 
@@ -911,7 +911,7 @@ fn mempool_snapshot_response_round_trips_events_resume_cursor() -> eyre::Result<
             chain_epoch: Some(synthetic_chain_epoch()),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         events_resume_cursor: vec![0xC4; 82],
         snapshot_age_millis: 250,

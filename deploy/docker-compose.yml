@@ -1,4 +1,4 @@
-# Fact-first single-host wallet-serving topology.
+# Single-host wallet-serving topology.
 #
 # The three release runtimes share one host filesystem. zinder-ingest is the
 # only canonical writer, zinder-projector is the only wallet writer, and

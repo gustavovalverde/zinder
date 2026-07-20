@@ -74,8 +74,9 @@ pub use sections::{
     ServiceIdentifier, StorageRoleSection, StorageRoleToml, defaults as section_defaults,
     resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
     resolve_canonical_secondary_storage, resolve_canonical_writer_rocksdb_budget,
-    resolve_derive_reader_rocksdb_budget, resolve_derive_writer_rocksdb_budget,
-    resolve_ingest_control_reader, resolve_ingest_control_writer, resolve_ops_listen_addr,
+    resolve_ingest_control_reader, resolve_ingest_control_writer,
+    resolve_materialized_view_reader_rocksdb_budget,
+    resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr,
     resolve_primary_storage, resolve_projector_control, resolve_retention,
     resolve_secondary_storage,
 };
@@ -115,7 +116,7 @@ pub const MAX_DECODING_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// kill leaves the WAL un-flushed; the next start has to replay the
 /// stranded writes from disk, which is the entry condition for the
 /// bulk-catchup OOM trap recorded in
-/// [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
+/// [the resource-tuning runbook](../../../docs/runbooks/bulk-catchup-resource-tuning.md).
 #[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
 pub fn cancel_on_terminating_signal(cancel: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {

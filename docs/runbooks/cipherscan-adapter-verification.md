@@ -6,12 +6,14 @@ environment run.
 
 ## Preconditions
 
-- Zinder ingest, wallet query, explorer query, and the Cipherscan adapter are
-  healthy on the same network.
+- Custom-composed `WalletQuery` and `ExplorerQuery` endpoints and the Cipherscan
+  adapter are healthy on the same network. The release Compose file does not
+  provide these native query endpoints.
 - The block-production time projection reports complete coverage through its
   projection tip.
 - Cipherscan uses the adapter as its API base URL without source changes.
-- The preserved Zinder store has been migrated and backfilled in place.
+- Required materialized views report complete coverage for the ranges under
+  test.
 
 ## Pool Distribution
 
@@ -62,5 +64,5 @@ that already have complete coverage:
 For each workflow, require a successful primary request, rendered non-placeholder
 content, and no new application error caused by the change. Degraded panels
 listed as sidecar-owned or unavailable in the
-[coverage matrix](../plans/cipherscan-adapter-architecture.md) remain outside
+[coverage matrix](../architecture/cipherscan-adapter.md) remain outside
 this regression boundary.

@@ -15,8 +15,9 @@ use zinder_runtime::{
     NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml, ProjectorControlSection,
     ProjectorControlToml, SecuritySection, SecurityToml, StorageRoleSection,
     guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_derive_writer_rocksdb_budget,
-    resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_projector_control,
+    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_reader,
+    resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr,
+    resolve_projector_control,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::RocksDbResourceBudget;
@@ -123,7 +124,7 @@ pub(crate) enum ProjectorError {
     WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
 
     #[error(transparent)]
-    CanonicalControl(#[from] crate::canonical_lease_client::CanonicalControlError),
+    CanonicalControl(#[from] crate::canonical_writer_control::CanonicalWriterControlError),
 
     #[error("projector build task failed: {0}")]
     BuildTask(#[from] tokio::task::JoinError),
@@ -319,7 +320,7 @@ struct ProjectorStorageSection {
     canonical_secondary_path: Option<PathBuf>,
     wallet_path: Option<PathBuf>,
     canonical: StorageRoleSection,
-    derive: StorageRoleSection,
+    materialized_views: StorageRoleSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -359,7 +360,8 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
     require_distinct_paths(&canonical_path, &canonical_secondary_path, &wallet_path)?;
     let canonical_rocksdb_budget =
         resolve_canonical_reader_rocksdb_budget(raw.storage.canonical.rocksdb)?;
-    let wallet_rocksdb_budget = resolve_derive_writer_rocksdb_budget(raw.storage.derive.rocksdb)?;
+    let wallet_rocksdb_budget =
+        resolve_materialized_view_writer_rocksdb_budget(raw.storage.materialized_views.rocksdb)?;
     let reorg_window_blocks = require_nonzero_u32(
         raw.projector.reorg_window_blocks,
         "projector.reorg_window_blocks",
@@ -585,7 +587,9 @@ impl ProjectorConfigToml {
                 canonical_secondary_path: config.canonical_secondary_path.clone(),
                 wallet_path: config.wallet_path.clone(),
                 canonical: ProjectorStorageRoleToml::from_budget(config.canonical_rocksdb_budget),
-                derive: ProjectorStorageRoleToml::from_budget(config.wallet_rocksdb_budget),
+                materialized_views: ProjectorStorageRoleToml::from_budget(
+                    config.wallet_rocksdb_budget,
+                ),
             },
             projector: ProjectorToml {
                 reorg_window_blocks: config.reorg_window_blocks,
@@ -616,7 +620,7 @@ struct ProjectorStorageToml {
     canonical_secondary_path: PathBuf,
     wallet_path: PathBuf,
     canonical: ProjectorStorageRoleToml,
-    derive: ProjectorStorageRoleToml,
+    materialized_views: ProjectorStorageRoleToml,
 }
 
 #[derive(Serialize)]

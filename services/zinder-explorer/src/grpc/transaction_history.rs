@@ -34,11 +34,11 @@ use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
 use super::intrinsic_value_balances::resolve_transaction_intrinsic_value_balances;
-use zinder_derive::{
-    ConsumerProjectionState, DeriveStore, DeriveStoreError, DeriveStoreReadSnapshot,
-    TRANSACTION_FEES_COLUMN_FAMILY, TRANSACTION_HISTORY_COLUMN_FAMILY,
-    TRANSACTION_HISTORY_CONSUMER_NAME, TRANSACTION_HISTORY_KEY_LEN, TransactionFeesConsumer,
-    TransactionHistoryConsumer,
+use zinder_materialized_views::{
+    ConsumerProjectionState, MaterializedViewStore, MaterializedViewStoreError,
+    MaterializedViewStoreReadSnapshot, TRANSACTION_FEES_COLUMN_FAMILY,
+    TRANSACTION_HISTORY_COLUMN_FAMILY, TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSACTION_HISTORY_KEY_LEN, TransactionFeesConsumer, TransactionHistoryConsumer,
 };
 
 /// Typed lifecycle state for the optional transaction-history projection.
@@ -90,7 +90,7 @@ pub(crate) enum TransactionHistoryProjectionReadError {
     #[error("transaction-history projection has not materialized a durable position")]
     Materializing,
     #[error("transaction-history projection storage read failed: {0}")]
-    Storage(#[source] DeriveStoreError),
+    Storage(#[source] MaterializedViewStoreError),
     #[error("transaction-history projection request failed: {0}")]
     Request(Status),
 }
@@ -128,17 +128,19 @@ pub(crate) trait TransactionHistoryProjectionReadApi:
 
 /// Current `RocksDB` implementation of the transaction-history read boundary.
 #[derive(Clone, Debug)]
-pub(crate) struct DeriveStoreTransactionHistoryProjectionReader {
-    store: DeriveStore,
+pub(crate) struct MaterializedViewStoreTransactionHistoryProjectionReader {
+    store: MaterializedViewStore,
 }
 
-impl DeriveStoreTransactionHistoryProjectionReader {
-    pub(crate) const fn new(store: DeriveStore) -> Self {
+impl MaterializedViewStoreTransactionHistoryProjectionReader {
+    pub(crate) const fn new(store: MaterializedViewStore) -> Self {
         Self { store }
     }
 }
 
-impl TransactionHistoryProjectionReadApi for DeriveStoreTransactionHistoryProjectionReader {
+impl TransactionHistoryProjectionReadApi
+    for MaterializedViewStoreTransactionHistoryProjectionReader
+{
     fn readiness(
         &self,
     ) -> Result<TransactionHistoryProjectionReadiness, TransactionHistoryProjectionReadError> {
@@ -190,7 +192,7 @@ const CURSOR_LEN: usize =
 /// Dependencies for one typed transaction-history public read.
 pub(crate) struct TransactionHistoryContext<'store> {
     pub(crate) projection_reader: Arc<dyn TransactionHistoryProjectionReadApi>,
-    pub(crate) derive_store: Option<&'store DeriveStore>,
+    pub(crate) materialized_view_store: Option<&'store MaterializedViewStore>,
     pub(crate) chain_store: Option<&'store SecondaryChainStore>,
     pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
 }
@@ -249,7 +251,7 @@ pub(crate) async fn transaction_history(
     let freshness = attach_upstream_observation(
         context.upstream_observation_cache,
         build_explorer_freshness(
-            context.derive_store,
+            context.materialized_view_store,
             EXPLORER_TRANSACTION_HISTORY_V2,
             Some(chain_epoch),
             0,
@@ -334,10 +336,10 @@ pub(crate) struct TransactionHistorySnapshotRead {
 }
 
 fn read_transaction_history_snapshot(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     request: &TransactionHistorySnapshotRequest,
 ) -> Result<TransactionHistorySnapshotRead, Status> {
-    let snapshot = derive_store.read_snapshot();
+    let snapshot = materialized_view_store.read_snapshot();
     let projection_state = snapshot
         .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
@@ -376,7 +378,7 @@ fn read_transaction_history_snapshot(
 }
 
 fn count_matching_transaction_history_rows(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     filter: &HistoryFilter,
 ) -> Result<u64, Status> {
     snapshot
@@ -393,7 +395,7 @@ fn count_matching_transaction_history_rows(
 }
 
 fn transaction_history_total_count(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     filter: &HistoryFilter,
 ) -> Result<u64, Status> {
     if filter.is_unfiltered() {
@@ -406,7 +408,7 @@ fn transaction_history_total_count(
 }
 
 fn resolve_transaction_history_anchor(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     start: Option<transaction_history_request::Start>,
     direction: TransactionHistoryDirection,
     filter: &HistoryFilter,
@@ -572,7 +574,7 @@ fn transaction_history_direction(encoded: i32) -> Result<TransactionHistoryDirec
 }
 
 fn read_transaction_history_page(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     page_size: u32,
     direction: TransactionHistoryDirection,
     anchor: Option<&HistoryAnchor>,
@@ -656,7 +658,7 @@ fn read_transaction_history_page(
 }
 
 fn transaction_history_entries_in_direction(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     height: BlockHeight,
     direction: TransactionHistoryDirection,
 ) -> Result<Vec<TransactionHistoryEntry>, Status> {
@@ -681,7 +683,7 @@ fn adjacent_history_height(
 }
 
 fn transaction_history_height_bounds(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
 ) -> Result<Option<(BlockHeight, BlockHeight)>, Status> {
     let maximum_height = snapshot
         .last_materialized_height_descending(TRANSACTION_HISTORY_COLUMN_FAMILY)
@@ -698,7 +700,7 @@ fn transaction_history_height_bounds(
 }
 
 fn transaction_history_entries_at_height(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     height: BlockHeight,
 ) -> Result<Vec<TransactionHistoryEntry>, Status> {
     let start_key = TransactionHistoryConsumer::key_for_row(height, 0);
@@ -774,7 +776,7 @@ fn entry_is_after_anchor(
 }
 
 fn validate_history_anchor(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     mut anchor: HistoryAnchor,
     require_matching_hash: bool,
 ) -> Result<Option<HistoryAnchor>, Status> {
@@ -1057,7 +1059,7 @@ fn full_history_coverage(projection_state: ConsumerProjectionState) -> bool {
 /// Coinbase rows are skipped (no fee record exists). Missing fee records leave
 /// `paid_fee_zat` unset; that is the explicit "not available" signal.
 fn join_projected_paid_fees(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     entries: &mut [TransactionHistoryEntry],
 ) -> Result<HashMap<TransactionId, TransactionFeesRecord>, Status> {
     let lookup_targets: Vec<(TransactionId, PrivacyShape)> = entries
@@ -1228,15 +1230,17 @@ fn join_transaction_intrinsic_value_balances(
 mod tests {
     use tempfile::tempdir;
     use zinder_core::{BlockHash, ChainEpochId};
-    use zinder_derive::{ConsumerProjectionCoverage, DeriveStoreOptions, ProjectionPreset};
+    use zinder_materialized_views::{
+        ConsumerProjectionCoverage, MaterializedViewStoreOptions, ProjectionPreset,
+    };
     use zinder_store::RocksDbResourceBudget;
 
     use super::*;
 
-    fn test_options() -> DeriveStoreOptions {
-        DeriveStoreOptions {
+    fn test_options() -> MaterializedViewStoreOptions {
+        MaterializedViewStoreOptions {
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-            ..DeriveStoreOptions::default()
+            ..MaterializedViewStoreOptions::default()
         }
     }
 
@@ -1244,25 +1248,26 @@ mod tests {
     fn typed_readiness_distinguishes_omitted_materializing_and_verified_states()
     -> Result<(), Box<dyn std::error::Error>> {
         let wallet_path = tempdir()?;
-        let wallet_store = DeriveStore::open_with_projection_preset(
+        let wallet_store = MaterializedViewStore::open_with_projection_preset(
             wallet_path.path(),
             ProjectionPreset::Wallet,
             test_options(),
         )?;
-        let wallet_reader = DeriveStoreTransactionHistoryProjectionReader::new(wallet_store);
+        let wallet_reader =
+            MaterializedViewStoreTransactionHistoryProjectionReader::new(wallet_store);
         assert_eq!(
             wallet_reader.readiness()?,
             TransactionHistoryProjectionReadiness::Omitted
         );
 
         let explorer_path = tempdir()?;
-        let explorer_store = DeriveStore::open_with_projection_preset(
+        let explorer_store = MaterializedViewStore::open_with_projection_preset(
             explorer_path.path(),
             ProjectionPreset::Explorer,
             test_options(),
         )?;
         let explorer_reader =
-            DeriveStoreTransactionHistoryProjectionReader::new(explorer_store.clone());
+            MaterializedViewStoreTransactionHistoryProjectionReader::new(explorer_store.clone());
         assert_eq!(
             explorer_reader.readiness()?,
             TransactionHistoryProjectionReadiness::Materializing

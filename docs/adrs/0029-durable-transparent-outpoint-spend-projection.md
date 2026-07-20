@@ -4,24 +4,24 @@
 | ----- | ----- |
 | Status | Accepted |
 | Product | Zinder |
-| Domain | Canonical retention, derive plane, wallet spend resolution |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0017](0017-derive-consumer-template-and-key-codec-convention.md), [ADR-0026](0026-utxo-set-commitment.md), [ADR-0028](0028-per-consumer-derive-schema-versioning.md), [Wallet data plane §Transparent Reverse-Spend Resolution](../architecture/wallet-data-plane.md#transparent-reverse-spend-resolution) |
+| Domain | Canonical retention, materialized-view plane, wallet spend resolution |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0017](0017-materialized-view-consumer-and-key-codec.md), [ADR-0026](0026-utxo-set-commitment.md), [ADR-0028](0028-materialized-view-schema-versioning.md), [Wallet data plane §Transparent Reverse-Spend Resolution](../architecture/wallet-data-plane.md#transparent-reverse-spend-resolution) |
 
 ## Context
 
 Canonical transparent-retention maintenance deletes a transparent spend fact and its
-spent-output rows once the spend settles below the safe tip. `WalletQuery.TransparentSpendsByOutpoint`
+spent-output rows once the spend settles below the settled tip. `WalletQuery.TransparentSpendsByOutpoint`
 then cannot resolve the spender of anything spent longer ago than the reorg
 window, which breaks wallet offline-recovery: a wallet backend maps that RPC to
 its spender-resolution path and expects an answer for arbitrarily old spends.
 
 Spender identity must therefore outlive the canonical fact. The canonical store
 cannot retain every spend fact forever without unbounded growth, and it must
-stay ignorant of the derive plane ([ADR-0003](0003-canonical-storage-access-boundary.md)).
+stay ignorant of the materialized-view plane ([ADR-0003](0003-canonical-storage-access-boundary.md)).
 
 ## Decision
 
-A bundled derive consumer records durable spender identity from each child
+A bundled materialized-view consumer records durable spender identity from each child
 transaction's intrinsic input and mined location. The canonical retention sweep
 is clamped so it never deletes a spend fact before the consumer has durably
 materialized the corresponding block.
@@ -38,7 +38,7 @@ projection hit whose spend settled at or below the pinned epoch's settled tip.
 
 ### The `transparent_outpoint_spend` consumer
 
-A `BlockKeyedConsumer` ([ADR-0017](0017-derive-consumer-template-and-key-codec-convention.md))
+A `BlockKeyedConsumer` ([ADR-0017](0017-materialized-view-consumer-and-key-codec.md))
 keys primary rows on the spent outpoint (creating transaction id plus big-endian
 output index) valued with the spending transaction id, spending block hash,
 spending height, and transparent input index. A per-height index column family,
@@ -57,7 +57,7 @@ parent facts must not cause the consumer to skip that row.
 
 Artifact schema 18 stores every observed input and the resolved spend facts in
 the canonical block-local spend index. Transparent-retention maintenance deletes the
-per-outpoint serving row but retains that block record. A derive consumer schema
+per-outpoint serving row but retains that block record. A materialized-view consumer schema
 bump may rebuild only when retained canonical events still begin at the durable
 canonical history boundary; a retained suffix is not proof that every historical
 row will be revisited. Finalized replay
@@ -70,21 +70,21 @@ they do not make the whole replay context unavailable.
 
 The canonical store persists a `transparent_retention_release_height` marker
 alongside the existing swept-through marker. A dedicated ingest maintenance
-worker runs only after canonical and derive are caught up, independently of
-chain commits, and clamps its ceiling to `min(current safe tip, release height)`, so a settled spend
+worker runs only after canonical and materialized views are caught up, independently of
+chain commits, and clamps its ceiling to `min(current settled tip, release height)`, so a settled spend
 above the release height stays retained. `zinder-ingest` publishes the release
-height from the derive tailer's verified contiguous coverage, so canonical
+height from the materialized-view tailer's verified contiguous coverage, so canonical
 retention releases only what the projection proves it has recorded from the
 canonical history boundary. A latest index height without that coverage holds
 retention in place. A release
 height below the swept marker is ignored safely; the sweep never regresses.
 
 The release floor is a durability barrier, not just a progress signal. The
-derive store writes unsynced, so `zinder-ingest` fsyncs the derive
+materialized-view store writes unsynced, so `zinder-ingest` fsyncs the materialized-view
 write-ahead log before publishing a higher floor. Without that a host crash
 could lose projection rows the floor already authorized the canonical sweep to
 delete, stranding spender identities the guard cannot recover. Publication is
-throttled: each floor advance costs one derive fsync plus one synced canonical
+throttled: each floor advance costs one materialized-view fsync plus one synced canonical
 write, and a floor that lags by the throttle interval only defers a sweep.
 
 ### Deleted-through marker and replay source
@@ -97,7 +97,7 @@ cursor, and a migration that deletes nothing, leave the marker unset.
 
 The marker still distinguishes an ambiguous canonical point miss from an
 outpoint that was never observed, which keeps union-routed serving fail-closed
-while derive lags. It also defines the startup recovery obligation: before any
+while materialized views lag. It also defines the startup recovery obligation: before any
 schema reconciliation can clear rows, ingest requires preserved contiguous
 projection coverage from the canonical history boundary through the deleted
 height, or retained chain events that prove a destructive rebuild can replay
@@ -118,8 +118,8 @@ epoch-pinned read first; for canonical misses the union read consults the
 projection and surfaces settled hits whose stored block hash still matches the
 retained canonical header at that height, so a stale row from a reorged-out
 branch (a reorg the tailer has not yet replayed) never surfaces as the spender.
-If the derive head trails the deleted-through marker the read refuses with the
-existing derive-lag vocabulary rather than answering incompletely; a store that
+If the materialized-view head trails the deleted-through marker the read refuses with the
+existing materialized-view lag vocabulary rather than answering incompletely; a store that
 never deleted a fact keeps the canonical-only absent semantics even with an empty
 projection.
 
@@ -128,10 +128,10 @@ projection.
 - Spender identity for a settled transparent outpoint is durable and survives
   the canonical sweep, so wallet offline-recovery resolves arbitrarily old
   spends.
-- Canonical retention no longer advances on the safe tip alone; it waits for the
+- Canonical retention no longer advances on the settled tip alone; it waits for the
   durable projection, so a projection that lags (or is paused under memory
   pressure) holds canonical spend-fact storage until it catches up.
-- A derive projection can be rebuilt after point-row retention only when its
+- A materialized view can be rebuilt after point-row retention only when its
   retained chain-event source still covers the full canonical history boundary;
   otherwise startup fails before destructive reconciliation.
 - Deploying artifact schema 18/store schema 13 onto any older canonical volume

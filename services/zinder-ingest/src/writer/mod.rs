@@ -1,4 +1,4 @@
-//! Version-1 canonical construction, admission, and follower handoff.
+//! Canonical construction, admission, and follower handoff.
 
 pub(crate) mod construction;
 pub(crate) mod control;
@@ -28,7 +28,7 @@ use crate::{
 /// Complete concrete configuration for the first `RocksDB` single-host writer.
 #[derive(Clone, Debug)]
 pub struct CanonicalWriterConfig {
-    /// Final version-1 canonical store path.
+    /// Final canonical store path.
     pub storage_path: PathBuf,
     /// Bounded `RocksDB` resources for construction, following, and reopen.
     pub resource_budget: RocksDbResourceBudget,
@@ -202,7 +202,7 @@ fn open_existing_store(
         visible_tip_height = store.event_fence().visible_tip().height.value(),
         chain_epoch = store.event_fence().chain_epoch_id().value(),
         chain_event_sequence = store.event_fence().chain_event_sequence(),
-        "reopened the authenticated version-1 canonical fence"
+        "reopened the authenticated canonical fence"
     );
     Ok(Some(store))
 }
@@ -346,7 +346,7 @@ where
         event = "canonical_fresh_construction_started",
         staging_path = %staging_path.display(),
         fixed_tip_height = observed_tip.height.value(),
-        "started version-1 canonical construction"
+        "started canonical construction"
     );
     let loaded = load_fresh_canonical(builder, source, &config.construction).await?;
     let validated = loaded.builder.prepare_trusted_fresh_publication()?;
@@ -375,7 +375,7 @@ where
         visible_tip_height = published_fence.visible_tip().height.value(),
         chain_epoch = published_fence.chain_epoch_id().value(),
         chain_event_sequence = published_fence.chain_event_sequence(),
-        "published and cold-reopened the version-1 canonical baseline"
+        "published and cold-reopened the canonical baseline"
     );
     Ok(store)
 }

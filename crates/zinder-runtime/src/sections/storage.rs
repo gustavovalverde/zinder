@@ -6,7 +6,7 @@
 //! - [`PrimaryStorageSection`] for the writer (`zinder-ingest`); a single
 //!   storage path.
 //! - [`SecondaryStorageSection`] for readers that open both canonical and
-//!   derive stores (`zinder-query`, `zinder-explorer`).
+//!   materialized-view stores (`zinder-query`, `zinder-explorer`).
 //! - [`CanonicalSecondaryStorageSection`] for readers that open only the
 //!   canonical store (`zinder-compat-lightwalletd`).
 
@@ -101,7 +101,7 @@ impl RocksDbResourceBudgetSection {
 }
 
 /// Raw storage-role section consumed as `[storage.canonical]` and
-/// `[storage.derive]`.
+/// `[storage.materialized_views]`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageRoleSection {
@@ -117,8 +117,8 @@ pub struct PrimaryStorageSection {
     pub path: Option<PathBuf>,
     /// Canonical store role budget.
     pub canonical: StorageRoleSection,
-    /// Derive store role budget.
-    pub derive: StorageRoleSection,
+    /// Materialized-view store role budget.
+    pub materialized_views: StorageRoleSection,
 }
 
 /// Raw `[storage]` section consumed by reader binaries.
@@ -141,8 +141,8 @@ pub struct SecondaryStorageSection {
     pub secondary_replica_lag_threshold_chain_epochs: Option<u64>,
     /// Canonical store role budget.
     pub canonical: StorageRoleSection,
-    /// Derive store role budget.
-    pub derive: StorageRoleSection,
+    /// Materialized-view store role budget.
+    pub materialized_views: StorageRoleSection,
 }
 
 /// Raw `[storage]` section consumed by reader binaries that only open the
@@ -175,8 +175,8 @@ pub struct ResolvedPrimaryStorage {
     pub path: PathBuf,
     /// Bounded `RocksDB` resource budget for the canonical store.
     pub canonical_rocksdb_budget: RocksDbResourceBudget,
-    /// Bounded `RocksDB` resource budget for the derive store.
-    pub derive_rocksdb_budget: RocksDbResourceBudget,
+    /// Bounded `RocksDB` resource budget for the materialized-view store.
+    pub materialized_view_rocksdb_budget: RocksDbResourceBudget,
 }
 
 /// Resolved secondary storage location with catchup cadence.
@@ -194,8 +194,8 @@ pub struct ResolvedSecondaryStorage {
     pub secondary_replica_lag_threshold_chain_epochs: u64,
     /// Bounded `RocksDB` resource budget for the canonical store.
     pub canonical_rocksdb_budget: RocksDbResourceBudget,
-    /// Bounded `RocksDB` resource budget for the derive store.
-    pub derive_rocksdb_budget: RocksDbResourceBudget,
+    /// Bounded `RocksDB` resource budget for the materialized-view store.
+    pub materialized_view_rocksdb_budget: RocksDbResourceBudget,
 }
 
 /// Resolved canonical-secondary storage location with catchup cadence.
@@ -239,14 +239,14 @@ pub fn resolve_canonical_writer_rocksdb_budget(
     )
 }
 
-/// Merges derive-role overrides onto [`RocksDbResourceBudget::derive_writer_defaults`].
-pub fn resolve_derive_writer_rocksdb_budget(
+/// Merges materialized-view role overrides onto [`RocksDbResourceBudget::materialized_view_writer_defaults`].
+pub fn resolve_materialized_view_writer_rocksdb_budget(
     section: RocksDbResourceBudgetSection,
 ) -> Result<RocksDbResourceBudget, ConfigError> {
     resolve_rocksdb_resource_budget(
         section,
-        RocksDbResourceBudget::derive_writer_defaults(),
-        "storage.derive.rocksdb",
+        RocksDbResourceBudget::materialized_view_writer_defaults(),
+        "storage.materialized_views.rocksdb",
     )
 }
 
@@ -266,14 +266,14 @@ pub fn resolve_canonical_reader_rocksdb_budget(
     resolve_rocksdb_resource_budget(section, defaults, "storage.canonical.rocksdb")
 }
 
-/// Merges derive-role overrides onto [`RocksDbResourceBudget::derive_reader_defaults`].
-pub fn resolve_derive_reader_rocksdb_budget(
+/// Merges materialized-view role overrides onto [`RocksDbResourceBudget::materialized_view_reader_defaults`].
+pub fn resolve_materialized_view_reader_rocksdb_budget(
     section: RocksDbResourceBudgetSection,
 ) -> Result<RocksDbResourceBudget, ConfigError> {
     resolve_rocksdb_resource_budget(
         section,
-        RocksDbResourceBudget::derive_reader_defaults(),
-        "storage.derive.rocksdb",
+        RocksDbResourceBudget::materialized_view_reader_defaults(),
+        "storage.materialized_views.rocksdb",
     )
 }
 
@@ -286,11 +286,12 @@ pub fn resolve_primary_storage(
         .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
     let canonical_rocksdb_budget =
         resolve_canonical_writer_rocksdb_budget(section.canonical.rocksdb)?;
-    let derive_rocksdb_budget = resolve_derive_writer_rocksdb_budget(section.derive.rocksdb)?;
+    let materialized_view_rocksdb_budget =
+        resolve_materialized_view_writer_rocksdb_budget(section.materialized_views.rocksdb)?;
     Ok(ResolvedPrimaryStorage {
         path,
         canonical_rocksdb_budget,
-        derive_rocksdb_budget,
+        materialized_view_rocksdb_budget,
     })
 }
 
@@ -327,7 +328,8 @@ pub fn resolve_secondary_storage(
         .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
     let canonical_rocksdb_budget =
         resolve_canonical_reader_rocksdb_budget(section.canonical.rocksdb)?;
-    let derive_rocksdb_budget = resolve_derive_reader_rocksdb_budget(section.derive.rocksdb)?;
+    let materialized_view_rocksdb_budget =
+        resolve_materialized_view_reader_rocksdb_budget(section.materialized_views.rocksdb)?;
     Ok(ResolvedSecondaryStorage {
         path,
         secondary_path,
@@ -335,7 +337,7 @@ pub fn resolve_secondary_storage(
         initial_catchup_timeout: Duration::from_millis(initial_catchup_timeout_ms),
         secondary_replica_lag_threshold_chain_epochs,
         canonical_rocksdb_budget,
-        derive_rocksdb_budget,
+        materialized_view_rocksdb_budget,
     })
 }
 
@@ -446,8 +448,8 @@ pub struct PrimaryStorageToml {
     pub path: String,
     /// Canonical store role projection.
     pub canonical: StorageRoleToml,
-    /// Derive store role projection.
-    pub derive: StorageRoleToml,
+    /// Materialized-view store role projection.
+    pub materialized_views: StorageRoleToml,
 }
 
 impl PrimaryStorageToml {
@@ -457,7 +459,9 @@ impl PrimaryStorageToml {
         Self {
             path: resolved.path.display().to_string(),
             canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
-            derive: StorageRoleToml::from_resolved(resolved.derive_rocksdb_budget),
+            materialized_views: StorageRoleToml::from_resolved(
+                resolved.materialized_view_rocksdb_budget,
+            ),
         }
     }
 }
@@ -477,8 +481,8 @@ pub struct SecondaryStorageToml {
     pub secondary_replica_lag_threshold_chain_epochs: u64,
     /// Canonical store role projection.
     pub canonical: StorageRoleToml,
-    /// Derive store role projection.
-    pub derive: StorageRoleToml,
+    /// Materialized-view store role projection.
+    pub materialized_views: StorageRoleToml,
 }
 
 impl SecondaryStorageToml {
@@ -496,7 +500,9 @@ impl SecondaryStorageToml {
             secondary_replica_lag_threshold_chain_epochs: resolved
                 .secondary_replica_lag_threshold_chain_epochs,
             canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
-            derive: StorageRoleToml::from_resolved(resolved.derive_rocksdb_budget),
+            materialized_views: StorageRoleToml::from_resolved(
+                resolved.materialized_view_rocksdb_budget,
+            ),
         }
     }
 }
@@ -557,7 +563,7 @@ mod tests {
         let resolved = resolve_primary_storage(PrimaryStorageSection {
             path: Some(PathBuf::from("/tmp/store")),
             canonical: StorageRoleSection::default(),
-            derive: StorageRoleSection::default(),
+            materialized_views: StorageRoleSection::default(),
         })?;
         assert_eq!(resolved.path, PathBuf::from("/tmp/store"));
         Ok(())
@@ -616,8 +622,8 @@ mod tests {
             crate::canonical_reader_max_open_files()
         );
         assert_eq!(
-            resolved.derive_rocksdb_budget,
-            RocksDbResourceBudget::derive_reader_defaults()
+            resolved.materialized_view_rocksdb_budget,
+            RocksDbResourceBudget::materialized_view_reader_defaults()
         );
         Ok(())
     }
@@ -686,11 +692,15 @@ mod tests {
     }
 
     #[test]
-    fn derive_writer_budget_resolution_falls_through_to_writer_defaults() -> Result<(), ConfigError>
-    {
-        let resolved =
-            resolve_derive_writer_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
-        assert_eq!(resolved, RocksDbResourceBudget::derive_writer_defaults());
+    fn materialized_view_writer_budget_resolution_falls_through_to_writer_defaults()
+    -> Result<(), ConfigError> {
+        let resolved = resolve_materialized_view_writer_rocksdb_budget(
+            RocksDbResourceBudgetSection::default(),
+        )?;
+        assert_eq!(
+            resolved,
+            RocksDbResourceBudget::materialized_view_writer_defaults()
+        );
         Ok(())
     }
 
@@ -723,11 +733,15 @@ mod tests {
     }
 
     #[test]
-    fn derive_reader_budget_resolution_falls_through_to_reader_defaults() -> Result<(), ConfigError>
-    {
-        let resolved =
-            resolve_derive_reader_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
-        assert_eq!(resolved, RocksDbResourceBudget::derive_reader_defaults());
+    fn materialized_view_reader_budget_resolution_falls_through_to_reader_defaults()
+    -> Result<(), ConfigError> {
+        let resolved = resolve_materialized_view_reader_rocksdb_budget(
+            RocksDbResourceBudgetSection::default(),
+        )?;
+        assert_eq!(
+            resolved,
+            RocksDbResourceBudget::materialized_view_reader_defaults()
+        );
         Ok(())
     }
 
@@ -801,7 +815,7 @@ mod tests {
                     ..RocksDbResourceBudgetSection::default()
                 },
             },
-            derive: StorageRoleSection {
+            materialized_views: StorageRoleSection {
                 rocksdb: RocksDbResourceBudgetSection {
                     max_wal_bytes: Some(64 * 1024 * 1024),
                     ..RocksDbResourceBudgetSection::default()
@@ -813,7 +827,7 @@ mod tests {
             123 * 1024 * 1024
         );
         assert_eq!(
-            resolved.derive_rocksdb_budget.max_wal_bytes,
+            resolved.materialized_view_rocksdb_budget.max_wal_bytes,
             64 * 1024 * 1024
         );
         Ok(())

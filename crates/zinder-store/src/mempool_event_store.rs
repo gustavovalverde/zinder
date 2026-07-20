@@ -53,7 +53,7 @@ impl<'cursor> MempoolEventHistoryRequest<'cursor> {
 
 /// Per-variant retention windows applied during a pruning pass.
 ///
-/// `Mined` events are diagnostic once the mining block has crossed the safe tip;
+/// `Mined` events are diagnostic once the mining block has crossed the settled tip;
 /// `Invalidated` events feed wallet UX longer because they need to displace
 /// "still pending" displays for transactions the network rejected.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

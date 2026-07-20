@@ -44,7 +44,7 @@ fn unified_ingest_writer_phase_is_always_on() {
 }
 
 /// Compile-time existence check for the [`ChainIndex`] base reads that back
-/// the canonical and derive-store wallet capabilities.
+/// the canonical and materialized-view wallet capabilities.
 ///
 /// The function body references each base trait method a wallet capability
 /// calls; renaming or removing any of them breaks the build. The function

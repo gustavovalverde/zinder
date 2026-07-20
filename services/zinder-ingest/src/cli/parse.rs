@@ -26,7 +26,7 @@ pub(crate) fn parse_canonical_batch_max_blocks(
 ) -> Result<NonZeroU32, ConfigError> {
     NonZeroU32::new(canonical_batch_max_blocks).ok_or_else(|| {
         ConfigError::invalid(
-            "ingest.bulk_catchup.canonical_batch_max_blocks must be greater than zero",
+            "ingest.construction.canonical_batch_max_blocks must be greater than zero",
         )
     })
 }
@@ -48,7 +48,7 @@ pub(crate) fn parse_poll_interval_ms(
 ) -> Result<std::time::Duration, ConfigError> {
     if poll_interval_ms == 0 {
         return Err(ConfigError::invalid(
-            "ingest.tip_follow.poll_interval_ms must be greater than zero",
+            "ingest.follow.poll_interval_ms must be greater than zero",
         ));
     }
 

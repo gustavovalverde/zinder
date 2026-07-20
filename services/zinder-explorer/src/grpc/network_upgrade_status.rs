@@ -7,7 +7,7 @@
 use tonic::{Request, Response, Status};
 use zinder_core::wire::encode_branch_id_hex;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
-use zinder_derive::DeriveStore;
+use zinder_materialized_views::MaterializedViewStore;
 use zinder_proto::capabilities::EXPLORER_NETWORK_UPGRADE_STATUS_V1;
 use zinder_proto::v1::explorer::{
     NetworkUpgradeEntry, NetworkUpgradeStatusRequest, NetworkUpgradeStatusResponse,
@@ -22,7 +22,7 @@ use super::freshness::{
 
 /// Executes one `ExplorerQuery.NetworkUpgradeStatus` request.
 pub(crate) async fn handle_network_upgrade_status(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     activations: &NetworkUpgradeActivations,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -72,7 +72,7 @@ pub(crate) async fn handle_network_upgrade_status(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            derive_store,
+            materialized_view_store,
             EXPLORER_NETWORK_UPGRADE_STATUS_V1,
             Some(chain_epoch),
             0,

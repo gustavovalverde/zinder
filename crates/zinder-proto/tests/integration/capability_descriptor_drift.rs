@@ -28,7 +28,7 @@ use zinder_proto::capabilities::{
 /// Fully qualified methods the descriptor serves but no capability of their
 /// own gates.
 ///
-/// - `LatestSafeBlock` is the safe-tip companion of `LatestBlock`; it shares
+/// - `LatestSafeBlock` is the settled-tip companion of `LatestBlock`; it shares
 ///   the always-on read contract and never carries a capability.
 const UNCAPABILITIED_METHODS: &[&str] = &["zinder.v1.wallet.WalletQuery.LatestSafeBlock"];
 

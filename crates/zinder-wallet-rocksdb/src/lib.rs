@@ -1,4 +1,4 @@
-//! Version-1 wallet projection construction and storage for `RocksDB`.
+//! Wallet projection construction and storage for `RocksDB`.
 
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
 compile_error!("Zinder supports only 32-bit and 64-bit pointer-width targets.");

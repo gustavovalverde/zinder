@@ -138,7 +138,7 @@ pub(crate) async fn fetch_live_network_upgrade_activations(
 /// blocks. Returns the list of newly mined block hashes.
 ///
 /// Mirrors the helper in `services/zinder-ingest/tests/common/mod.rs` so the
-/// derive-plane mempool overlay live test can drive deterministic chain-tip
+/// materialized-view mempool overlay live test can drive deterministic chain-tip
 /// changes without depending on a wallet-side broadcast cycle. Errors on
 /// non-regtest networks because Zebra rejects `generate` outside regtest.
 pub(crate) async fn regtest_generate_blocks(

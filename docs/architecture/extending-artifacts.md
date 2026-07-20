@@ -4,7 +4,7 @@ This document is a cookbook. When you (a contributor or an LLM agent) need to ad
 
 The goal is unambiguity. After reading this document, an agent should be able to add a transparent-address artifact family without inventing new conventions, asking clarifying questions, or making decisions that conflict with the naming spine in [Public Interfaces](public-interfaces.md).
 
-See also [Extending the wallet data plane](extending-the-wallet-data-plane.md) for adding a typed read method on existing artifacts (no new storage), and [Derive plane](derive-plane.md) for adding a new derive consumer.
+See also [Extending the wallet data plane](extending-the-wallet-data-plane.md) for adding a typed read method on existing artifacts (no new storage), and [Materialized-view plane](materialized-view-plane.md) for adding a new materialized-view consumer.
 
 ## When to add an artifact family
 
@@ -13,19 +13,19 @@ You are adding a new artifact family when **all** of the following are true:
 - The data is chain-derived. It comes from canonical chain state (blocks, transactions, mempool source events). It is not upstream-node-supplied configuration, not operator state, not derived analytics.
 - The data has a stable identity that can be looked up by a key. The key fits into one of the variants of `ArtifactKey` (or extends it: `BlockHeight`, `TransactionId`, `SubtreeRootIndex`, `TransparentAddress`, `OutPoint`, future variants).
 - The data is shaped enough to deserve its own schema. If the data fits into an existing artifact's payload as a new field, prefer extending that payload.
-- The data is canonical, not derived in the [zinder-explorer](derive-plane.md) sense. Derived materialized views go through `zinder-explorer`, not through new canonical artifact families.
+- The data is canonical, not derived in the [zinder-explorer](materialized-view-plane.md) sense. Derived materialized views go through `zinder-explorer`, not through new canonical artifact families.
 
 If any of these are false, you may not be adding an artifact family. Common alternatives:
 
 | Situation | Right shape | Wrong shape |
-|-----------|-------------|-------------|
+| --- | --- | --- |
 | Adding a precomputed totals table for explorer dashboards | `zinder-explorer` materialized view consumed via `ChainEvents` | Canonical artifact family |
 | Adding fee-rate ordering to mempool transactions | `zinder-explorer` view over `MempoolEvents` | Canonical mempool artifact |
 | Adding a new field to per-block metadata | Extend `BlockHeaderArtifact` with the new typed field, bump artifact schema version | New artifact family |
-| Adding transparent address transaction history | Derive-owned projection over transaction, transparent output, and transparent spend facts | Canonical ingest index, compat-shim-only feature, ad-hoc index |
+| Adding transparent address transaction history | Materialized-view projection over transaction, transparent output, and transparent spend facts | Canonical ingest index, compat-shim-only feature, ad-hoc index |
 | Adding transparent address output lookup for lightwalletd compatibility | New canonical transparent output artifact family with bounded address reads | On-demand compact-block scans, upstream node proxy calls, unbounded materialize-then-truncate reads |
 
-When in doubt, the [Wallet data plane](wallet-data-plane.md) and [derive plane](derive-plane.md) docs distinguish the two boundaries.
+When in doubt, the [Wallet data plane](wallet-data-plane.md) and [materialized-view plane](materialized-view-plane.md) docs distinguish the two boundaries.
 
 ## Response enrichment is not an artifact family
 
@@ -109,7 +109,7 @@ A new file in `crates/zinder-store/src/` with the matching name. Inside, three t
 
 1. The on-disk byte shape, expressed as `*Key` and `*Payload` types that implement the boundary serialization rules from [ADR-0002](../adrs/0002-boundary-specific-serialization.md). Fixed layout for keys (so RocksDB ordering is correct), protobuf or postcard for payloads.
 
-2. A new column family is registered. Add it to the `ColumnFamilyName` enum (private to `zinder-store`):
+1. A new column family is registered. Add it to the `ColumnFamilyName` enum (private to `zinder-store`):
 
 ```rust
 enum ColumnFamilyName {
@@ -120,7 +120,7 @@ enum ColumnFamilyName {
 
 The enum's `as_str()` method returns the literal column-family name written to RocksDB (`"address_output_index"`). Renaming this string later is a migration; pick carefully.
 
-3. A schema fingerprint is added. The `SchemaFingerprint` table in `crates/zinder-store/src/storage_control.rs` gains a new entry:
+1. A schema fingerprint is added. The `SchemaFingerprint` table in `crates/zinder-store/src/storage_control.rs` gains a new entry:
 
 ```rust
 SchemaFingerprintEntry {
@@ -275,7 +275,7 @@ served natively by `WalletQuery.TransparentAddressUnspentOutputs` under
 `wallet.address.transparent_unspent_outputs_v1`. The lightwalletd
 `GetAddressUtxos[Stream]` adapter reads from the same stored transparent
 output artifacts. The process may set `GetLightdInfo.taddrSupport=true` only
-after it also wires the derive-backed transparent transaction-history
+after it also wires the materialized-view-backed transparent transaction-history
 projection that serves the legacy `GetTaddress*` calls.
 
 ### Step 6 — Adapter wiring
@@ -313,7 +313,7 @@ If the artifact changes the on-disk shape of an existing artifact, [ADR-0002](..
 
 ## A worked example: transparent address transaction history
 
-To make the cookbook concrete, here is the path for transparent-address transaction history, the derive-owned projection that backs paginated `GetTaddressTxids`.
+To make the cookbook concrete, here is the path for transparent-address transaction history, the materialized-view-owned projection that backs paginated `GetTaddressTxids`.
 
 The transparent output artifact follows the same seven-step path,
 but its priority and capability are different: it is served under
@@ -322,13 +322,13 @@ transaction-history example uses `wallet.address.transparent_history_v1`.
 
 1. **Domain type**: `crates/zinder-core/src/transparent_address_tx_index.rs` exporting `TransparentAddressTxIndexArtifact { address_script_hash, block_height, tx_index_in_block, transaction_id, block_hash }`. One row per `(address, transaction)` pair, regardless of how many transparent inputs or outputs the transaction has for that address.
 
-2. **Storage**: derive consumer column families `transparent_address_transaction_history`, `transparent_address_transaction_history_descending`, and `transparent_address_transaction_history_index`. Primary keys are `(address_script_hash, block_height_be, tx_index_be)` in ascending or descending height order. The value is the transaction id and block hash. The per-height index stores both primary keys so reorg rollback deletes exact rows.
+2. **Storage**: materialized-view consumer column families `transparent_address_transaction_history`, `transparent_address_transaction_history_descending`, and `transparent_address_transaction_history_index`. Primary keys are `(address_script_hash, block_height_be, tx_index_be)` in ascending or descending height order. The value is the transaction id and block hash. The per-height index stores both primary keys so reorg rollback deletes exact rows.
 
    Per-row keying lets pagination cursors point at exact `(height, tx_index)` boundaries without re-decoding a vec payload to skip already-returned txids; this is the canonical shape for tx-history-keyed projections.
 
-3. **Derive**: `TransparentAddressTransactionHistoryConsumer` walks canonical transaction facts, transparent outputs, and hydrated transparent spends, deduplicates by `(address_script_hash, tx_index_in_block)`, and emits one row per matching pair. Canonical ingest does not write this projection.
+3. **Materialized view**: `TransparentAddressTransactionHistoryConsumer` walks canonical transaction facts, transparent outputs, and hydrated transparent spends, deduplicates by `(address_script_hash, tx_index_in_block)`, and emits one row per matching pair. Canonical ingest does not write this projection.
 
-4. **Query**: `WalletQueryApi::transparent_address_tx_ids_in_range(request: TransparentAddressTxIdsInRangeRequest) -> impl Stream<Item = Result<TransparentAddressTxIdsChunk, QueryError>>`. The request carries the typed `address_script_hash: TransparentAddressScriptHash`, an inclusive height range, `max_entries` bounded by `WalletQueryOptions::max_transparent_history_entries`, an opaque `from_cursor` for resume, and a `descending: bool` flag for newest-first iteration. The derive projection is current-only; each response chunk carries the `chain_epoch` used to answer the read instead of accepting an `at_epoch` pin.
+4. **Query**: `WalletQueryApi::transparent_address_tx_ids_in_range(request: TransparentAddressTxIdsInRangeRequest) -> impl Stream<Item = Result<TransparentAddressTxIdsChunk, QueryError>>`. The request carries the typed `address_script_hash: TransparentAddressScriptHash`, an inclusive height range, `max_entries` bounded by `WalletQueryOptions::max_transparent_history_entries`, an opaque `from_cursor` for resume, and a `descending: bool` flag for newest-first iteration. The materialized view is current-only; each response chunk carries the `chain_epoch` used to answer the read instead of accepting an `at_epoch` pin.
 
 5. **Wire**:
 
@@ -368,7 +368,7 @@ transaction-history example uses `wallet.address.transparent_history_v1`.
 The DX/AX audit and code review have surfaced a recurring set of errors. Each is preventable by following the cookbook.
 
 | Mistake | Why it happens | Right shape |
-|---------|----------------|-------------|
+| --- | --- | --- |
 | Adding a top-level error variant for the new family (`TransparentAddressUnavailable`) | The old split-error precedent suggests it | Use `ArtifactUnavailable { family, key }` |
 | Forgetting to extend the `ReorgWindow` delete path in `chain_store.rs` | The pattern is implicit, not enforced | Search `chain_store.rs` for `ColumnFamilyName::CompactBlock` and add a parallel branch wherever it appears (per-block families only) |
 | Applying eager-delete `ReorgWindow` semantics to an address-keyed family | Two reorg patterns coexist and the right one is decided by key shape, not family | Pick by key shape per Step 2: per-block keys use eager-delete; address-keyed keys use dynamic-filter. Address-keyed families must include the trailing `chain_epoch_id` byte and call `block_is_visible` at read time |
@@ -386,6 +386,6 @@ The DX/AX audit and code review have surfaced a recurring set of errors. Each is
 - [Storage Backend](storage-backend.md) — column family registration, schema fingerprint conventions, retention.
 - [Chain Events](chain-events.md) — for artifacts that emit events on commit.
 - [Wallet Data Plane](wallet-data-plane.md) — the public protocol surface inventory the new RPC will appear in.
-- [Derive Plane](derive-plane.md) — the alternative boundary if your data is derived rather than canonical.
+- [Materialized-view plane](materialized-view-plane.md) — the alternative boundary if your data is derived rather than canonical.
 - [ADR-0002: Boundary-specific serialization](../adrs/0002-boundary-specific-serialization.md) — the byte rules for new keys and payloads.
 - [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery) — capability-string conventions.

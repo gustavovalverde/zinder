@@ -17,11 +17,11 @@ use zinder_core::{
     CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
     TransactionFactsArtifact, TransactionLocation, TransparentInputFact, UnixTimestampMillis,
 };
-use zinder_derive::project_block_summary_record;
 use zinder_ingest::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
     PositionedCanonicalBlock, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
 };
+use zinder_materialized_views::project_block_summary_record;
 use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_source::{SourceBlock, decode_rpc_block_hash};
 use zinder_store::{

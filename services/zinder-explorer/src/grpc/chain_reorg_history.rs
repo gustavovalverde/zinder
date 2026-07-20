@@ -1,14 +1,15 @@
 //! `ExplorerQuery.ChainReorgHistory` handler.
 //!
-//! Reads the durable reorg-incidents derive projection. The projection
+//! Reads the durable reorg-incidents materialized view. The projection
 //! backfills from the earliest retained chain-event row when the consumer first
 //! appears, then preserves future incidents independently of chain-event
 //! retention.
 
 use prost::Message as _;
 use tonic::{Request, Response, Status};
-use zinder_derive::{
-    DeriveStore, REORG_INCIDENTS_COLUMN_FAMILY, REORG_INCIDENTS_KEY_LEN, ReorgIncidentsConsumer,
+use zinder_materialized_views::{
+    MaterializedViewStore, REORG_INCIDENTS_COLUMN_FAMILY, REORG_INCIDENTS_KEY_LEN,
+    ReorgIncidentsConsumer,
 };
 use zinder_proto::capabilities::EXPLORER_CHAIN_REORG_HISTORY_V1;
 use zinder_proto::v1::explorer::{
@@ -29,7 +30,7 @@ const DEFAULT_CHAIN_REORG_HISTORY_EVENTS: u32 = 64;
 
 /// Executes one `ExplorerQuery.ChainReorgHistory` request.
 pub(crate) async fn handle_chain_reorg_history(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ChainReorgHistoryRequest>,
 ) -> Result<Response<ChainReorgHistoryResponse>, Status> {
@@ -50,15 +51,15 @@ pub(crate) async fn handle_chain_reorg_history(
             .map(ReorgIncidentsConsumer::key_for_event_sequence)
     };
     let Some(start_key) = start_key else {
-        return empty_response(derive_store, upstream_observation_cache).await;
+        return empty_response(materialized_view_store, upstream_observation_cache).await;
     };
     let end_key = [0xFFu8; REORG_INCIDENTS_KEY_LEN];
     let scan_cap = (max_events as usize).saturating_add(1);
 
-    derive_store
+    materialized_view_store
         .try_catch_up()
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let mut rows = derive_store
+    let mut rows = materialized_view_store
         .range_iterate_consumer(
             REORG_INCIDENTS_COLUMN_FAMILY,
             &start_key,
@@ -87,7 +88,12 @@ pub(crate) async fn handle_chain_reorg_history(
     }
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        build_explorer_freshness(Some(derive_store), EXPLORER_CHAIN_REORG_HISTORY_V1, None, 0)?,
+        build_explorer_freshness(
+            Some(materialized_view_store),
+            EXPLORER_CHAIN_REORG_HISTORY_V1,
+            None,
+            0,
+        )?,
     )
     .await;
 
@@ -99,12 +105,17 @@ pub(crate) async fn handle_chain_reorg_history(
 }
 
 async fn empty_response(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     upstream_observation_cache: &UpstreamObservationCache,
 ) -> Result<Response<ChainReorgHistoryResponse>, Status> {
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
-        build_explorer_freshness(Some(derive_store), EXPLORER_CHAIN_REORG_HISTORY_V1, None, 0)?,
+        build_explorer_freshness(
+            Some(materialized_view_store),
+            EXPLORER_CHAIN_REORG_HISTORY_V1,
+            None,
+            0,
+        )?,
     )
     .await;
     Ok(Response::new(ChainReorgHistoryResponse {

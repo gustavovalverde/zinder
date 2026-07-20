@@ -7,9 +7,6 @@ use std::{
 
 use prost::Message;
 use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode, Options};
-use zinder_bulk_load::{
-    FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
-};
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, CanonicalBlockFacts,
     CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
@@ -19,6 +16,9 @@ use zinder_core::{
     TransactionBlobArtifact,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
+use zinder_rocksdb_bulk_load::{
+    FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
+};
 
 use self::codec::{BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN};
 

@@ -101,7 +101,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::ReorgWindowExceeded
         | ErrorReason::ChainEpochConflict
         | ErrorReason::ChainEpochNetworkMismatch
-        | ErrorReason::DeriveProjectionUnavailable
+        | ErrorReason::MaterializedViewUnavailable
         | ErrorReason::DependencyNotConfigured
         | ErrorReason::NodeCapabilityMissing
         | ErrorReason::ExplorerPreconditionUnsatisfied => {
@@ -122,7 +122,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
         | ErrorReason::StorageUnavailable
-        | ErrorReason::DeriveProjectionLagging
+        | ErrorReason::MaterializedViewLagging
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::NoVisibleChainEpoch => {
             ReasonPolicy::new(Code::Unavailable, RetryAfterBackoff)

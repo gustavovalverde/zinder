@@ -1,4 +1,4 @@
-//! Process-local secondary access to an admitted version-1 wallet projection.
+//! Process-local secondary access to an admitted wallet projection.
 
 use std::{
     fs,

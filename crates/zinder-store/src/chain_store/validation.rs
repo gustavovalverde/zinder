@@ -72,7 +72,7 @@ pub(super) fn validate_chain_epoch_artifacts(
         artifacts.chain_epoch.settled_tip_height,
         artifacts.chain_epoch.settled_tip_hash,
         &block_hash_by_height,
-        "safe_tip_hash must match the committed block at safe_tip_height",
+        "settled_tip_hash must match the committed block at settled_tip_height",
     )?;
     validate_block_header_artifacts(&artifacts.block_headers, tip_height)?;
     let validated_block_replay_order =
@@ -150,7 +150,7 @@ pub(super) fn committed_block_range(
         return Ok(changed_block_range);
     }
 
-    if safe_tip_only_commit_without_artifacts(artifacts) {
+    if settled_tip_only_commit_without_artifacts(artifacts) {
         return Ok(BlockHeightRange::empty_at(
             artifacts.chain_epoch.settled_tip_height,
         ));
@@ -165,13 +165,13 @@ pub(super) fn committed_block_range(
 }
 
 fn validate_artifact_presence(artifacts: &ChainEpochArtifacts) -> Result<(), StoreError> {
-    if safe_tip_only_commit_without_artifacts(artifacts) {
+    if settled_tip_only_commit_without_artifacts(artifacts) {
         return Ok(());
     }
 
     if artifacts.block_headers.is_empty() {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "at least one safe-tip block artifact is required",
+            reason: "at least one settled-tip block artifact is required",
         });
     }
 
@@ -184,10 +184,10 @@ fn validate_artifact_presence(artifacts: &ChainEpochArtifacts) -> Result<(), Sto
     Ok(())
 }
 
-fn safe_tip_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> bool {
+fn settled_tip_only_commit_without_artifacts(artifacts: &ChainEpochArtifacts) -> bool {
     matches!(
         artifacts.reorg_window_change,
-        ReorgWindowChange::AdvanceSafeTipTo { .. }
+        ReorgWindowChange::AdvanceSettledTipTo { .. }
     ) && artifacts.block_headers.is_empty()
         && artifacts.block_replay_envelopes.is_empty()
         && artifacts.compact_blocks.is_empty()
@@ -222,7 +222,7 @@ pub(super) fn validate_reorg_window_change(
                 return Err(StoreError::ReorgWindowExceeded {
                     attempted_from_height: from_height,
                     minimum_reorg_height,
-                    safe_tip_height: current_chain_epoch.settled_tip_height,
+                    settled_tip_height: current_chain_epoch.settled_tip_height,
                 });
             }
 
@@ -238,13 +238,13 @@ pub(super) fn validate_reorg_window_change(
                 });
             }
 
-            validate_replacement_preserves_safe_tip_anchor(artifacts, current_chain_epoch)?;
+            validate_replacement_preserves_settled_tip_anchor(artifacts, current_chain_epoch)?;
             validate_replacement_artifact_coverage(artifacts, from_height)
         }
-        ReorgWindowChange::AdvanceSafeTipTo { height } => {
+        ReorgWindowChange::AdvanceSettledTipTo { height } => {
             if height > artifacts.chain_epoch.settled_tip_height {
                 return Err(StoreError::InvalidChainEpochArtifacts {
-                    reason: "AdvanceSafeTipTo height cannot exceed epoch safe_tip_height",
+                    reason: "AdvanceSettledTipTo height cannot exceed epoch settled_tip_height",
                 });
             }
 
@@ -277,7 +277,7 @@ pub(super) fn validate_visible_chain_commit(
         current_chain_epoch,
         changed_block_range,
     )?;
-    validate_safe_tip_hash_against_visible_chain(inner, artifacts, current_chain_epoch)
+    validate_settled_tip_hash_against_visible_chain(inner, artifacts, current_chain_epoch)
 }
 
 pub(super) fn block_height_range(
@@ -308,7 +308,7 @@ fn changed_block_range(
     // Bootstrap commit (empty store seeded by an operator-supplied
     // checkpoint) publishes no block artifacts, so it has no changed range.
     // See `validate_chain_epoch_range_coverage` for the full contract.
-    if current_chain_epoch.is_none() && safe_tip_only_commit_without_artifacts(artifacts) {
+    if current_chain_epoch.is_none() && settled_tip_only_commit_without_artifacts(artifacts) {
         return None;
     }
 
@@ -318,7 +318,7 @@ fn changed_block_range(
             artifacts.chain_epoch.visible_tip_height,
         )),
         ReorgWindowChange::Extend { .. }
-        | ReorgWindowChange::AdvanceSafeTipTo { .. }
+        | ReorgWindowChange::AdvanceSettledTipTo { .. }
         | ReorgWindowChange::Unchanged => match current_chain_epoch {
             Some(current_chain_epoch)
                 if artifacts.chain_epoch.visible_tip_height
@@ -418,28 +418,28 @@ fn validate_committed_block_parent_links(
     Ok(())
 }
 
-fn validate_safe_tip_hash_against_visible_chain(
+fn validate_settled_tip_hash_against_visible_chain(
     inner: &RocksChainStore,
     artifacts: &ChainEpochArtifacts,
     current_chain_epoch: Option<ChainEpoch>,
 ) -> Result<(), StoreError> {
-    let safe_tip_height = artifacts.chain_epoch.settled_tip_height;
-    if safe_tip_height.value() == 0 {
+    let settled_tip_height = artifacts.chain_epoch.settled_tip_height;
+    if settled_tip_height.value() == 0 {
         return Ok(());
     }
 
-    // Bootstrap commit: the operator-supplied safe_tip_hash is the
+    // Bootstrap commit: the operator-supplied settled_tip_hash is the
     // checkpoint's anchor of trust; there is no prior chain to validate
     // against.
-    if current_chain_epoch.is_none() && safe_tip_only_commit_without_artifacts(artifacts) {
+    if current_chain_epoch.is_none() && settled_tip_only_commit_without_artifacts(artifacts) {
         return Ok(());
     }
 
     let committed_hash_by_height = block_hash_by_height(&artifacts.block_headers)?;
-    if let Some(committed_hash) = committed_hash_by_height.get(&safe_tip_height) {
+    if let Some(committed_hash) = committed_hash_by_height.get(&settled_tip_height) {
         if *committed_hash != artifacts.chain_epoch.settled_tip_hash {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "safe_tip_hash must match the committed block at safe_tip_height",
+                reason: "settled_tip_hash must match the committed block at settled_tip_height",
             });
         }
 
@@ -447,17 +447,17 @@ fn validate_safe_tip_hash_against_visible_chain(
     }
 
     if let Some(current_chain_epoch) = current_chain_epoch
-        && safe_tip_height <= current_chain_epoch.visible_tip_height
+        && settled_tip_height <= current_chain_epoch.visible_tip_height
     {
-        let safe_tip_hash =
-            visible_block_hash_at(inner, Some(current_chain_epoch), safe_tip_height)?;
-        if safe_tip_hash == artifacts.chain_epoch.settled_tip_hash {
+        let settled_tip_hash =
+            visible_block_hash_at(inner, Some(current_chain_epoch), settled_tip_height)?;
+        if settled_tip_hash == artifacts.chain_epoch.settled_tip_hash {
             return Ok(());
         }
     }
 
     Err(StoreError::InvalidChainEpochArtifacts {
-        reason: "safe_tip_hash must match the visible block at safe_tip_height",
+        reason: "settled_tip_hash must match the visible block at settled_tip_height",
     })
 }
 
@@ -487,14 +487,14 @@ fn validate_chain_epoch_range_coverage(
     // checkpoint. Validation cannot demand block coverage because the
     // operator deliberately did not replay the chain prefix; reads at
     // heights below the checkpoint return `ArtifactUnavailable`.
-    if current_chain_epoch.is_none() && safe_tip_only_commit_without_artifacts(artifacts) {
+    if current_chain_epoch.is_none() && settled_tip_only_commit_without_artifacts(artifacts) {
         return Ok(());
     }
 
     match artifacts.reorg_window_change {
         ReorgWindowChange::Replace { .. } => Ok(()),
         ReorgWindowChange::Extend { .. }
-        | ReorgWindowChange::AdvanceSafeTipTo { .. }
+        | ReorgWindowChange::AdvanceSettledTipTo { .. }
         | ReorgWindowChange::Unchanged => {
             let required_range = match current_chain_epoch {
                 Some(current_chain_epoch)
@@ -554,7 +554,7 @@ fn validate_non_reorg_chain_epoch_progression(
 
     if chain_epoch.settled_tip_height < current_chain_epoch.settled_tip_height {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "non-replacement commit cannot lower safe_tip_height",
+            reason: "non-replacement commit cannot lower settled_tip_height",
         });
     }
 
@@ -570,7 +570,7 @@ fn validate_non_reorg_chain_epoch_progression(
         && chain_epoch.settled_tip_hash != current_chain_epoch.settled_tip_hash
     {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "non-replacement commit cannot change safe_tip_hash at the current safe_tip_height",
+            reason: "non-replacement commit cannot change settled_tip_hash at the current settled_tip_height",
         });
     }
 
@@ -578,13 +578,13 @@ fn validate_non_reorg_chain_epoch_progression(
 }
 
 fn minimum_reorg_height(chain_epoch: ChainEpoch, reorg_window_blocks: u32) -> BlockHeight {
-    let safe_tip_floor = chain_epoch.settled_tip_height.value().saturating_add(1);
+    let settled_tip_floor = chain_epoch.settled_tip_height.value().saturating_add(1);
     let window_floor = chain_epoch
         .visible_tip_height
         .value()
         .saturating_sub(reorg_window_blocks.saturating_sub(1));
 
-    BlockHeight::new(safe_tip_floor.max(window_floor))
+    BlockHeight::new(settled_tip_floor.max(window_floor))
 }
 
 fn validate_replacement_artifact_coverage(
@@ -598,13 +598,13 @@ fn validate_replacement_artifact_coverage(
     )
 }
 
-fn validate_replacement_preserves_safe_tip_anchor(
+fn validate_replacement_preserves_settled_tip_anchor(
     artifacts: &ChainEpochArtifacts,
     current_chain_epoch: ChainEpoch,
 ) -> Result<(), StoreError> {
     if artifacts.chain_epoch.settled_tip_height < current_chain_epoch.settled_tip_height {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "replacement commit cannot lower safe_tip_height",
+            reason: "replacement commit cannot lower settled_tip_height",
         });
     }
 
@@ -612,7 +612,7 @@ fn validate_replacement_preserves_safe_tip_anchor(
         && artifacts.chain_epoch.settled_tip_hash != current_chain_epoch.settled_tip_hash
     {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "replacement commit cannot change the current safe_tip_hash",
+            reason: "replacement commit cannot change the current settled_tip_hash",
         });
     }
 
@@ -647,7 +647,7 @@ fn validate_required_block_coverage(
 fn validate_settled_tip_height(chain_epoch: ChainEpoch) -> Result<(), StoreError> {
     if chain_epoch.settled_tip_height > chain_epoch.visible_tip_height {
         return Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "safe_tip_height cannot exceed tip height",
+            reason: "settled_tip_height cannot exceed tip height",
         });
     }
 

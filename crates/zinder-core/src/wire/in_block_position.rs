@@ -1,18 +1,18 @@
-//! In-block transaction position encoder for derive-store composite keys.
+//! In-block transaction position encoder for materialized-view composite keys.
 //!
-//! Several derive-store column families key on
+//! Several materialized-view column families key on
 //! `(<discriminator>, height, in_block_position)` so per-block ordering is
 //! preserved inside a height bucket. The position bytes are the
 //! big-endian `u32` representation; lexicographic order matches numeric
 //! order, so a forward range scan visits the coinbase first.
 //!
-//! Inline `in_block_position.to_be_bytes()` at derive-store boundaries is a
+//! Inline `in_block_position.to_be_bytes()` at materialized-view boundaries is a
 //! forbidden pattern enforced by
 //! `crates/zinder-core/tests/integration/wire_invariants.rs`.
 
 use crate::wire::WireDecodeError;
 
-/// Number of bytes an in-block transaction position occupies in a derive-store key.
+/// Number of bytes an in-block transaction position occupies in a materialized-view key.
 pub const IN_BLOCK_POSITION_KEY_LEN: usize = 4;
 
 /// Encodes an in-block transaction position into its big-endian key bytes.

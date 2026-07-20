@@ -1,4 +1,4 @@
-//! One-shot version-1 wallet rebuild from an existing authenticated canonical store.
+//! One-shot wallet rebuild from an existing authenticated canonical store.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -21,7 +21,7 @@ const WALLET_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 64 * 1024 * 1024 * 1024;
 const WALLET_SST_TARGET_LOGICAL_BYTES: u64 = 128 * 1024 * 1024;
 const WALLET_ACCOUNTED_REORG_UNDO_BYTES: u64 = 512 * 1024 * 1024;
 
-/// CLI contract for rebuilding one version-1 wallet store at a READY canonical fence.
+/// CLI contract for rebuilding one wallet store at a READY canonical fence.
 #[derive(Args)]
 pub(crate) struct RocksDbWalletRebuildArgs {
     /// Network name, such as zcash-testnet.
@@ -33,10 +33,10 @@ pub(crate) struct RocksDbWalletRebuildArgs {
     /// Optional node cookie file path.
     #[arg(long = "node-auth-cookie")]
     node_auth_cookie: Option<PathBuf>,
-    /// Existing READY version-1 canonical store.
+    /// Existing READY canonical store.
     #[arg(long = "canonical-store")]
     canonical_store: PathBuf,
-    /// Fresh destination for the version-1 wallet store.
+    /// Fresh destination for the wallet store.
     #[arg(long = "wallet-store")]
     wallet_store: PathBuf,
     /// Per-request source timeout in seconds.
@@ -114,7 +114,7 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
         &canonical_store,
         &args.wallet_store,
         RocksDbWalletBuildOptions {
-            resource_budget: RocksDbResourceBudget::derive_writer_defaults(),
+            resource_budget: RocksDbResourceBudget::materialized_view_writer_defaults(),
             max_outpoint_sort_memory_bytes: WALLET_OUTPOINT_SORT_MEMORY_BYTES,
             max_secondary_sort_memory_bytes_per_sorter:
                 WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,

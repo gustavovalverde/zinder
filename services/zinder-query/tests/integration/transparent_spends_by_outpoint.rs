@@ -191,7 +191,7 @@ fn commit_to_settled_tip_two(store: &zinder_store::PrimaryChainStore) -> eyre::R
     Ok(())
 }
 
-/// Commits an output, settles its spend, advances the safe tip, and explicitly
+/// Commits an output, settles its spend, advances the settled tip, and explicitly
 /// runs retention maintenance so the deleted-through marker reaches height 2.
 fn commit_real_sweep_to_deleted_through_two(
     store: &zinder_store::PrimaryChainStore,
@@ -232,7 +232,7 @@ fn commit_real_sweep_to_deleted_through_two(
     let sweep_epoch = synthetic_multi_block_epoch(2, 3, 2).0;
     store.commit_chain_epoch(
         ChainEpochArtifacts::new(sweep_epoch, Vec::new(), Vec::new(), Vec::new())
-            .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
+            .with_reorg_window_change(ReorgWindowChange::AdvanceSettledTipTo {
                 height: BlockHeight::new(2),
             }),
     )?;
@@ -243,7 +243,8 @@ fn commit_real_sweep_to_deleted_through_two(
 }
 
 #[tokio::test]
-async fn transparent_spends_by_outpoint_refuses_swept_miss_without_derive() -> eyre::Result<()> {
+async fn transparent_spends_by_outpoint_refuses_swept_miss_without_materialized_view()
+-> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     commit_real_sweep_to_deleted_through_two(&store)?;
@@ -256,7 +257,7 @@ async fn transparent_spends_by_outpoint_refuses_swept_miss_without_derive() -> e
 
     assert!(matches!(
         outcome,
-        Err(QueryError::DeriveUnavailable {
+        Err(QueryError::MaterializedViewUnavailable {
             capability: zinder_proto::capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1,
         })
     ));

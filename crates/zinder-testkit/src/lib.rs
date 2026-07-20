@@ -39,10 +39,10 @@
 
 pub mod chain_fixture;
 pub mod commitment_tree_fixtures;
-pub mod derive_fixture;
 pub mod json_rpc_test_server;
 pub mod live;
 pub mod log_capture;
+pub mod materialized_view_fixture;
 pub mod mock_mempool_source;
 pub mod mock_node_source;
 pub mod mock_transaction_broadcaster;
@@ -56,14 +56,14 @@ pub use chain_fixture::{
     synthetic_transaction_public_facts,
 };
 pub use commitment_tree_fixtures::{completed_sapling_subtree_frontier, one_leaf_sapling_frontier};
-pub use derive_fixture::{
-    DeriveFixtureError, open_test_derive_store_for_canonical,
-    seed_transparent_address_transaction_history, seed_transparent_outpoint_spends,
-};
 pub use json_rpc_test_server::{
     JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer, RpcReply, method,
 };
 pub use log_capture::{CapturedEvent, LogCapture};
+pub use materialized_view_fixture::{
+    MaterializedViewFixtureError, open_test_materialized_view_store_for_canonical,
+    seed_transparent_address_transaction_history, seed_transparent_outpoint_spends,
+};
 pub use mock_mempool_source::{
     MockMempoolSource, MockMempoolSourceClosed, MockMempoolSourceControl,
 };

@@ -10,7 +10,7 @@ runner profiles, live-node gates, and consumer-facing certification evidence.
 | ---- | -------- | ------- | ------- | ------- |
 | T0 unit | `#[cfg(test)] mod tests in src/` | `default-filter` of `default`/`ci` | Every commit | Logic regressions in the unit under test |
 | T1 integration | `tests/integration/` | `default-filter` of `default`/`ci` | Every commit | Cross-module wiring, gRPC adapter shape, store/proto round-trips |
-| T1 PostgreSQL integration | `services/zinder-bench/tests/integration/postgres_canonical_fact_round_trip.rs` | `ci-postgres` | Every pull request with disposable PostgreSQL | SCRAM connection, binary COPY, transaction, reconnect, and persisted read-back through the production-intended driver |
+| T1 PostgreSQL integration | `services/zinder-bench/tests/integration/postgres_canonical_replay.rs` | `ci-postgres` | Every pull request with disposable PostgreSQL | SCRAM connection, binary COPY, transaction, reconnect, and persisted read-back through the diagnostic driver |
 | T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
 | Consumer parity | `crates/zinder-client/tests/parity/` | `ci-parity` | Consumer contract changes / release certification | Consumer-shaped request and error-shape regressions for lightwalletd-compatible wallets, Zallet, public lightwalletd operators, and explorers |
 | T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI | Real upstream-node behavior (Zebra JSON-RPC, indexer gRPC) |
@@ -37,7 +37,7 @@ SCRAM-configured PostgreSQL service and runs `ci-postgres` with
 The compatibility adapter is certified in layers: vendored-protocol coverage,
 live parity against the pinned reference, an independent-client flow, then the
 actual public deployment. The required boundaries and reference pins live in
-[the certification plan](../plans/lightwalletd-compatibility-certification.md).
+[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md).
 
 Keep the evidence simple: retain the exact commands, image digests, client
 version, network, wallet-serving floor, and command output with the release.
@@ -84,7 +84,7 @@ below for the full contract.
 
 ## PostgreSQL driver integration gate
 
-Run after changing the canonical-fact PostgreSQL path, its driver dependencies, or
+Run after changing the canonical-replay PostgreSQL path, its driver dependencies, or
 the benchmark database configuration. The URL must identify a fresh disposable
 database because the test deliberately leaves its completed schema in place and
 then proves reuse is rejected.
@@ -294,7 +294,7 @@ The canonical tracer above proves a bounded source-to-SST range but
 deliberately leaves the store `BUILDING`. Use the dedicated
 [RocksDB storage lifecycle harness](../../deploy/rocksdb-storage-lifecycle.md)
 to measure a fresh complete-history canonical store through `READY`, then build
-and cold-admit the version-1 wallet store at the same fixed Zebra tip. The
+and cold-admit the wallet store at the same fixed Zebra tip. The
 harness reports canonical and wallet times separately and captures exact peak
 container memory plus sampled peak disk usage.
 
@@ -315,7 +315,7 @@ scripts/run-rocksdb-storage-lifecycle.sh
 This certifies only canonical and wallet storage readiness. Query serving,
 continuous tip following, and executed reorg recovery remain separate gates.
 
-### Version-1 canonical runtime tracer
+### Canonical runtime tracer
 
 Use the dedicated runtime topology after the storage lifecycle gate. It starts
 the actual `zinder-ingest` binary, gives it one disposable Zinder volume, joins
@@ -502,7 +502,7 @@ the operationally critical "owner crashed, published readers survive"
 semantic one store at a time; the exact-pair tests cover the cross-store
 boundary.
 
-### Automated coverage
+### Primary and secondary coverage
 
 Three integration tests under
 [`crates/zinder-store/tests/integration/primary_secondary.rs`](../../crates/zinder-store/tests/integration/primary_secondary.rs)
@@ -574,7 +574,7 @@ Production deployments fan many clients into each immutable-pair
 streamed reads without serializing them and clean up request-owned generation
 handles when a client disconnects mid-stream.
 
-### Automated coverage
+### Stream cancellation coverage
 
 Two integration tests under
 [`services/zinder-query/tests/integration/stream_cancellation.rs`](../../services/zinder-query/tests/integration/stream_cancellation.rs)
@@ -648,7 +648,7 @@ ZINDER_TEST_LIVE=1 \
 
 Look for the `live_latency_baseline` line in the output:
 
-```
+```text
 live_latency_baseline  network=zcash-regtest  tip=2361
   latest_block          = 160 µs
   compact_block_at      = 168 µs
@@ -673,7 +673,7 @@ cargo mutants --workspace --all-features \
   --file crates/zinder-store/src/chain_store.rs \
   --file crates/zinder-store/src/chain_store/validation.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'chain_event_history|safe_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
+  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
 ```
 
 These are slow (mutants often >30 min). Scheduled CI runs them weekly; locally,
@@ -716,7 +716,7 @@ gate on whether you actually changed trust-sensitive code.
   projection_preset = "wallet"
   reorg_window_blocks = 100
 
-  [ingest.modifiers]
+  [ingest.run_overrides]
   coverage = "wallet-serving"
 
   [ingest_control]
@@ -866,7 +866,7 @@ test asserts the list below equals the wallet and explorer rows of the
 [`CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs) table:
 
 <!-- capability-list:testing-runbook:start -->
-```
+```text
 wallet.read.latest_block_v1
 wallet.read.block_id_by_selector_v1
 wallet.read.block_header_by_selector_v1
@@ -949,8 +949,8 @@ explorer.migration.denominations_v1
 <!-- capability-list:testing-runbook:end -->
 
 The wallet rows above describe the internal native query contract consumed by
-the compatibility adapter. Explorer rows belong to the separate post-wallet
-cutover and are not published by the first version-1 production topology.
+the compatibility adapter. Explorer rows belong to the optional
+`zinder-explorer` runtime and are not published as a release image.
 
 ## Failure interpretation reference
 
@@ -998,7 +998,7 @@ update the referenced architecture or reference page.
 | Lightwalletd compatibility parity | Medium | Run the same lightwalletd-compatible probes or wallet flow against Zinder and a reference lightwalletd endpoint. Include `GetBlockRange`, transaction lookup, transparent history, UTXO, mempool, and send shapes that the support claim names. | Zinder returns compatible response and error shapes where the lightwalletd contract applies. Any intentional difference is documented against the native contract or compatibility adapter. Hot-path timings stay inside the published budgets. | Per-method request/response summaries, error codes, timing samples, endpoint versions. | [T3: Parity against a reference lightwalletd](#t3-parity-against-a-reference-lightwalletd), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |
 | Public deployment shape | Medium for internal CA, high for public cert | Put TLS in front of `zinder-compat-lightwalletd` with Caddy, nginx, or traefik, forwarding h2c to the local compat process. Use a private CA only for internal pilots; use a publicly trusted cert for public claims. | A real lightwalletd-compatible wallet validation succeeds through TLS, `GetLightdInfo` works through the proxy, public traffic cannot reach plaintext gRPC, `IngestControl`, or ops endpoints, proxy rate limiting is present for public exposure, and `--print-config` plus logs redact secrets. | Proxy config, cert source, endpoint validation logs, `grpcurl` result through TLS, bind-address audit, redacted `--print-config` output. | [Integration surfaces §Lightwalletd Compatibility](../reference/integration-surfaces.md#lightwalletd-compatibility), [Service operations §Deployment guidance](../architecture/service-operations.md#deployment-guidance) |
 | Observability and readiness warning semantics | Low | Run `scripts/observability-smoke.sh run` against regtest or a bounded public-network smoke. Inspect `/readyz`, Prometheus, and Grafana readiness panels after traffic generation. | Traffic-blocking readiness causes are zero. `cursor_at_risk` and `mempool_cursor_at_risk` are classified as warnings: `/readyz` still returns HTTP 200 with `"status": "ready"`, and metrics/dashboards expose the warning separately from load-balancer failure. | `.tmp/observability/reports/latest-readiness.json`, latest readiness Markdown, Prometheus query output, Grafana screenshot or panel JSON, service logs. | [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness), [Observability smoke](../../observability/README.md) |
-| Coherent backup, restore, and rolling restart | High until the coherent bundle exists | Produce one authenticated canonical/wallet checkpoint bundle, stop the stack, restore both stores into fresh paths, then start ingest, projector, and compatibility in ownership order. Restart compatibility, projector, and ingest separately while the source advances. | The restored stores carry one exact canonical event fence and wallet digest; all owners fail closed on mismatches; compatibility publishes only an exact pair; the 10,000-block tail reaches ready within 15 minutes; later restarts preserve continuous following. An ad hoc copy of independently timed RocksDB directories is not evidence. | Bundle manifest and digests, restore duration, tail range, source and restored fences, restart logs, `/readyz` after each transition, second-owner failure output. | [ADR-0035 §Coherent checkpoint boundary](../adrs/0035-fact-first-storage-selection-and-lifecycle.md), [Service operations §Recovery](../architecture/service-operations.md#recovery) |
+| Coherent backup, restore, and rolling restart | High until the coherent bundle exists | Produce one authenticated canonical/wallet checkpoint bundle, stop the stack, restore both stores into fresh paths, then start ingest, projector, and compatibility in ownership order. Restart compatibility, projector, and ingest separately while the source advances. | The restored stores carry one exact canonical event fence and wallet digest; all owners fail closed on mismatches; compatibility publishes only an exact pair; the 10,000-block tail reaches ready within 15 minutes; later restarts preserve continuous following. An ad hoc copy of independently timed RocksDB directories is not evidence. | Bundle manifest and digests, restore duration, tail range, source and restored fences, restart logs, `/readyz` after each transition, second-owner failure output. | [ADR-0035 §Recovery boundary](../adrs/0035-canonical-storage-topologies.md#recovery-boundary), [Service operations §Recovery](../architecture/service-operations.md#recovery) |
 | Long soak | High | Run ingest, projector, and compatibility for several hours or longer while scraping every runtime and exercising wallet reads, mempool streams, and transaction submission. | No unexplained readiness flaps; canonical, projection, and exact-pair lag stay bounded; cursor-retention and RocksDB alerts stay quiet; memory growth is explainable; and restart/shutdown is clean. | Metrics scrape, readiness samples, process logs, memory/RSS samples, final restart result. | [Service operations §Validation Tiers](../architecture/service-operations.md#validation-tiers), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |
 | Certification evidence manifest | Low | Before declaring a production-ready support claim, collect the commands, versions, network, node tip, consumer versions, and artifact paths from the rows above into one file under `.tmp/production-readiness/<run-id>/manifest.md` or `.json`. | A reviewer can replay the certification story without chat history: every claimed consumer, network, command, binary version, and evidence artifact has a path and pass/fail result. | Manifest file, command transcript, commit SHA, binary versions, Zebra version and tip height, consumer versions. | This runbook |
 

@@ -4,10 +4,10 @@
 //! attaches the canonical wallet-plane epoch used for freshness reporting.
 
 use tonic::{Request, Response, Status};
-use zinder_derive::{
-    DeriveStore, TransparentAddressRankingConsumer,
-    TransparentAddressRankingCoverage as DerivedTransparentAddressRankingCoverage,
-    TransparentAddressRankingEntry as DerivedTransparentAddressRankingEntry,
+use zinder_materialized_views::{
+    MaterializedViewStore, TransparentAddressRankingConsumer,
+    TransparentAddressRankingCoverage as ProjectedTransparentAddressRankingCoverage,
+    TransparentAddressRankingEntry as ProjectedTransparentAddressRankingEntry,
     TransparentAddressRankingPage,
 };
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1;
@@ -30,7 +30,7 @@ const MAX_RANKING_LIMIT: u32 = 500;
 
 /// Executes one bounded transparent-address ranking read.
 pub(crate) async fn handle_transparent_address_ranking(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<TransparentAddressRankingRequest>,
@@ -38,7 +38,7 @@ pub(crate) async fn handle_transparent_address_ranking(
     let request = request.into_inner();
     let limit = clamp_max_entries(request.limit, DEFAULT_RANKING_LIMIT, MAX_RANKING_LIMIT);
     let page = TransparentAddressRankingConsumer::page(
-        derive_store,
+        materialized_view_store,
         request.offset,
         usize::try_from(limit).unwrap_or(usize::MAX),
     )
@@ -60,7 +60,7 @@ pub(crate) async fn handle_transparent_address_ranking(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
             Some(chain_epoch),
             0,
@@ -104,7 +104,7 @@ fn map_page(
 }
 
 fn map_entry(
-    entry: DerivedTransparentAddressRankingEntry,
+    entry: ProjectedTransparentAddressRankingEntry,
 ) -> Result<TransparentAddressRankingEntry, Status> {
     let summary = entry.summary;
     let script_pub_key = summary.script_pub_key.ok_or_else(|| {
@@ -145,7 +145,7 @@ fn maximum_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 }
 
 fn map_coverage(
-    coverage: DerivedTransparentAddressRankingCoverage,
+    coverage: ProjectedTransparentAddressRankingCoverage,
 ) -> TransparentAddressRankingCoverage {
     TransparentAddressRankingCoverage {
         balance_complete_through_height: coverage.balance_complete_through_height.value(),
@@ -167,13 +167,13 @@ mod tests {
     )]
 
     use zinder_core::{BlockHeight, TransparentAddressScriptHash};
-    use zinder_derive::{TransparentAddressRankingMetadata, TransparentAddressSummary};
+    use zinder_materialized_views::{TransparentAddressRankingMetadata, TransparentAddressSummary};
 
     use super::*;
 
     fn ranking_page_fixture() -> TransparentAddressRankingPage {
         TransparentAddressRankingPage {
-            entries: vec![DerivedTransparentAddressRankingEntry {
+            entries: vec![ProjectedTransparentAddressRankingEntry {
                 rank: 3,
                 address_script_hash: TransparentAddressScriptHash::from_bytes([7; 32]),
                 summary: TransparentAddressSummary {
@@ -194,15 +194,15 @@ mod tests {
                 total_positive_balance_zat: 1_000,
                 top_10_balance_zat: 600,
                 top_100_balance_zat: 950,
-                p2pkh: zinder_derive::TransparentAddressScriptTypeTotals {
+                p2pkh: zinder_materialized_views::TransparentAddressScriptTypeTotals {
                     positive_address_count: 80,
                     total_positive_balance_zat: 700,
                 },
-                p2sh: zinder_derive::TransparentAddressScriptTypeTotals {
+                p2sh: zinder_materialized_views::TransparentAddressScriptTypeTotals {
                     positive_address_count: 40,
                     total_positive_balance_zat: 300,
                 },
-                coverage: DerivedTransparentAddressRankingCoverage {
+                coverage: ProjectedTransparentAddressRankingCoverage {
                     balance_complete_through_height: BlockHeight::new(200),
                     history_complete_from_height: Some(BlockHeight::new(10)),
                     history_complete_through_height: Some(BlockHeight::new(200)),
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn ranked_entry_without_a_script_fails_closed() -> Result<(), Status> {
-        let result = map_entry(DerivedTransparentAddressRankingEntry {
+        let result = map_entry(ProjectedTransparentAddressRankingEntry {
             rank: 1,
             address_script_hash: TransparentAddressScriptHash::from_bytes([8; 32]),
             summary: TransparentAddressSummary {

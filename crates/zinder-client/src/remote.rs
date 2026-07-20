@@ -233,13 +233,16 @@ impl ChainIndex for RemoteChainIndex {
             .await
             .map_err(|status| self.handle_status(status))?
             .into_inner();
-        let safe_tip_block = response
-            .safe_tip_block
-            .ok_or_else(|| IndexerError::malformed("safe_tip_block", "field is missing"))?;
+        let settled_tip_block = response
+            .settled_tip_block
+            .ok_or_else(|| IndexerError::malformed("settled_tip_block", "field is missing"))?;
 
         Ok(BlockId {
-            height: BlockHeight::new(safe_tip_block.height),
-            hash: block_hash_from_rpc_hex("safe_tip_block.block_hash", &safe_tip_block.block_hash)?,
+            height: BlockHeight::new(settled_tip_block.height),
+            hash: block_hash_from_rpc_hex(
+                "settled_tip_block.block_hash",
+                &settled_tip_block.block_hash,
+            )?,
         })
     }
 
@@ -1411,7 +1414,7 @@ fn chain_event_envelope_from_message(
     Ok(ChainEventEnvelope {
         cursor: ChainEventCursor::from_bytes(message.cursor),
         event_sequence: message.event_sequence,
-        safe_tip_height: chain_epoch.settled_tip_height,
+        settled_tip_height: chain_epoch.settled_tip_height,
         chain_epoch,
         event,
     })
@@ -1813,7 +1816,7 @@ mod tests {
             chain_epoch: Some(synthetic_chain_epoch(network)),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }
     }
 

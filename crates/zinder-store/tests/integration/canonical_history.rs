@@ -135,7 +135,7 @@ fn ordinary_commit_cannot_publish_an_artifactless_checkpoint_as_complete_history
     assert!(matches!(
         store.commit_chain_epoch(
             super::synthetic_chain_epoch_artifacts(checkpoint_epoch, Vec::new(), Vec::new())
-                .with_reorg_window_change(zinder_store::ReorgWindowChange::AdvanceSafeTipTo {
+                .with_reorg_window_change(zinder_store::ReorgWindowChange::AdvanceSettledTipTo {
                     height: BlockHeight::new(20),
                 })
         ),

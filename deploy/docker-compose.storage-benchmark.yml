@@ -1,4 +1,4 @@
-# Resource-bounded storage environment for current-schema and fact-first measurements.
+# Resource-bounded storage environment for projection-coupled and canonical-replay-storage measurements.
 #
 # This file stays separate from deploy/docker-compose.yml. The application
 # deployment owns long-running Zinder services; this topology owns disposable
@@ -6,7 +6,7 @@
 name: ${ZINDER_BENCH_PROJECT_NAME:-zinder-storage-benchmark}
 
 services:
-  rocksdb-current-schema-oracle:
+  rocksdb-projection-coupled-oracle:
     image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
     profiles: [oracle, comparison]
     restart: "no"
@@ -38,12 +38,12 @@ services:
         bind:
           create_host_path: false
       - type: volume
-        source: rocksdb-current-schema-store
+        source: rocksdb-projection-coupled-store
         target: /var/lib/zinder/benchmark-store
         volume:
           nocopy: true
     command:
-      - current-schema-replay
+      - projection-coupled-replay
       - --fixture
       - /benchmark/fixture
       - --store
@@ -67,9 +67,9 @@ services:
       - --image-reference
       - ${ZINDER_BENCH_IMAGE}
       - --report
-      - /benchmark/results/rocksdb-current-schema-oracle-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
+      - /benchmark/results/rocksdb-projection-coupled-oracle-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
 
-  rocksdb-fact-first:
+  rocksdb-canonical-replay-storage:
     image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
     profiles: [rocksdb, comparison]
     restart: "no"
@@ -79,8 +79,8 @@ services:
     mem_limit: ${ZINDER_BENCH_ROCKSDB_FACT_MEMORY_LIMIT_BYTES:-17179869184}
     networks: [storage-benchmark]
     environment:
-      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/rocksdb-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
-      ZINDER_BENCH_RESOURCE_COMPONENT_ID: rocksdb-fact-first-client
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: rocksdb-canonical-replay-storage-client
       ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
       # Includes the sibling benchmark-store.external-sst staging directory.
       ZINDER_BENCH_RESOURCE_STORAGE_PATH: /var/lib/zinder
@@ -107,12 +107,12 @@ services:
       - type: volume
         # A fresh named-volume root is initialized for UID 1000 by the
         # runbook before the measured command starts.
-        source: rocksdb-fact-first-store
+        source: rocksdb-canonical-replay-storage-store
         target: /var/lib/zinder
         volume:
           nocopy: true
     command:
-      - canonical-facts-round-trip
+      - canonical-replay-storage
       - rocksdb
       - --fixture
       - /benchmark/fixture
@@ -137,9 +137,9 @@ services:
       - --image-reference
       - ${ZINDER_BENCH_IMAGE}
       - --report
-      - /benchmark/results/rocksdb-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
+      - /benchmark/results/rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
 
-  postgres-fact-first:
+  postgres-canonical-replay-storage:
     image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
     profiles: [postgres, comparison]
     restart: "no"
@@ -153,8 +153,8 @@ services:
         condition: service_healthy
     environment:
       ZINDER_BENCH_POSTGRES_DATABASE_URL: "postgresql://${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}:${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}@postgres-database:5432/${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}"
-      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/postgres-fact-first-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
-      ZINDER_BENCH_RESOURCE_COMPONENT_ID: postgres-fact-first-client
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/postgres-canonical-replay-storage-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: postgres-canonical-replay-storage-client
       ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
       ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS: ${ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS:-1}
       ZINDER_BENCH_RESOURCE_REQUIRE_EXACT_MEMORY: "true"
@@ -172,7 +172,7 @@ services:
         bind:
           create_host_path: false
     command:
-      - canonical-facts-round-trip
+      - canonical-replay-storage
       - postgres
       - --fixture
       - /benchmark/fixture
@@ -207,7 +207,7 @@ services:
       - --image-reference
       - ${ZINDER_BENCH_IMAGE}
       - --report
-      - /benchmark/results/postgres-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
+      - /benchmark/results/postgres-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
 
   postgres-database:
     image: ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296}
@@ -232,8 +232,8 @@ services:
       POSTGRES_PASSWORD: ${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}
       POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8 --locale=C --auth-host=scram-sha-256
       PGDATA: /var/lib/postgresql/18/docker
-      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/postgres-fact-first-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
-      ZINDER_BENCH_RESOURCE_COMPONENT_ID: postgres-fact-first-database
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/postgres-canonical-replay-storage-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: postgres-canonical-replay-storage-database
       ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
       ZINDER_BENCH_RESOURCE_STORAGE_PATH: /var/lib/postgresql
       ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS: ${ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS:-1}
@@ -321,6 +321,6 @@ networks:
   postgres-host-access:
 
 volumes:
-  rocksdb-current-schema-store:
-  rocksdb-fact-first-store:
+  rocksdb-projection-coupled-store:
+  rocksdb-canonical-replay-storage-store:
   postgres-data:

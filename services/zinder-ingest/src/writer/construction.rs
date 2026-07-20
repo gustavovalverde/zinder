@@ -1,4 +1,4 @@
-//! Fresh version-1 canonical construction from one ordered node-source pass.
+//! Fresh canonical construction from one ordered node-source pass.
 
 pub(crate) mod abort_on_drop;
 pub(crate) mod source_fetch;
@@ -215,7 +215,7 @@ impl CanonicalConstructionConfig {
     }
 }
 
-/// Failure while constructing a fresh version-1 canonical store.
+/// Failure while constructing a fresh canonical store.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CanonicalConstructionError {

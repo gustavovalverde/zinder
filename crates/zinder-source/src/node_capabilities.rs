@@ -18,8 +18,8 @@ pub enum NodeCapability {
     TreeState,
     /// Source can provide shielded subtree roots.
     SubtreeRoots,
-    /// Source can report or infer safe tip height.
-    SafeTipHeight,
+    /// Source can report or infer settled tip height.
+    SettledTipHeight,
     /// Source has an explicit readiness probe.
     ReadinessProbe,
     /// Source can broadcast transactions.
@@ -51,7 +51,7 @@ impl NodeCapability {
             Self::TipId => "tip_id",
             Self::TreeState => "tree_state",
             Self::SubtreeRoots => "subtree_roots",
-            Self::SafeTipHeight => "safe_tip_height",
+            Self::SettledTipHeight => "settled_tip_height",
             Self::ReadinessProbe => "readiness_probe",
             Self::TransactionBroadcast => "transaction_broadcast",
             Self::JsonRpc => "json_rpc",
@@ -68,7 +68,7 @@ const ORDERED_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::TipId,
     NodeCapability::TreeState,
     NodeCapability::SubtreeRoots,
-    NodeCapability::SafeTipHeight,
+    NodeCapability::SettledTipHeight,
     NodeCapability::ReadinessProbe,
     NodeCapability::TransactionBroadcast,
     NodeCapability::JsonRpc,
@@ -84,7 +84,7 @@ const fn capability_bit(capability: NodeCapability) -> u16 {
         NodeCapability::TipId => 1 << 2,
         NodeCapability::TreeState => 1 << 3,
         NodeCapability::SubtreeRoots => 1 << 4,
-        NodeCapability::SafeTipHeight => 1 << 5,
+        NodeCapability::SettledTipHeight => 1 << 5,
         NodeCapability::ReadinessProbe => 1 << 6,
         NodeCapability::TransactionBroadcast => 1 << 7,
         NodeCapability::JsonRpc => 1 << 8,

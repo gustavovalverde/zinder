@@ -79,8 +79,8 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured reorg window; operator must reconcile | — |
 | `CHAIN_EPOCH_CONFLICT` | Detected chain-epoch contention between writer and reader | — |
 | `CHAIN_EPOCH_NETWORK_MISMATCH` | Store opened against the wrong `network` | — |
-| `DERIVE_PROJECTION_UNAVAILABLE` | A derive-backed wallet/explorer projection is not configured for this deployment | `type=DERIVE_PROJECTION_UNAVAILABLE, subject=<capability>` |
-| `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical fact store, a derive view, or a wallet-query endpoint) is not wired on this deployment | — |
+| `MATERIALIZED_VIEW_UNAVAILABLE` | A materialized-view-backed wallet/explorer projection is not configured for this deployment | `type=MATERIALIZED_VIEW_UNAVAILABLE, subject=<capability>` |
+| `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical fact store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
 | `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires; the operator must reconfigure the node | — |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state (for example a conflicting-chain transaction) | — |
 
@@ -90,7 +90,7 @@ The requested resource does not exist. Retry disposition: **RetryAfterBackoff** 
 
 | Reason | What it means | Example metadata |
 | --- | --- | --- |
-| `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized derive row) | `resource_type=<family>, resource_name=<key>` |
+| `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized materialized-view row) | `resource_type=<family>, resource_name=<key>` |
 | `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned) | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
 | `BLOCK_NOT_IN_BEST_CHAIN` | The requested block exists but is not on the visible best chain | — |
 
@@ -115,7 +115,7 @@ Service is reachable but a dependency is not, or the operation is not yet suppor
 | `UNSUPPORTED_CHAIN_EVENT` | A future event type is not yet supported by this binary |
 | `UNSUPPORTED_BLOCK_SELECTOR` | A future selector shape is not yet supported |
 | `UNSUPPORTED_TRANSACTION_STATUS` | A future tx-status variant is not yet decodable |
-| `DERIVE_PROJECTION_LAGGING` | The derive projection has not caught up to the canonical tip the request needs; a later retry succeeds once it materializes |
+| `MATERIALIZED_VIEW_LAGGING` | The materialized view has not caught up to the canonical tip the request needs; a later retry succeeds once it materializes |
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint) is temporarily unreachable |
 | `NO_VISIBLE_CHAIN_EPOCH` | No visible chain epoch has been committed yet (the store is empty or still bootstrapping) |
 
@@ -134,7 +134,7 @@ A self-inflicted failure that needs investigation. Retry disposition: **NonRetry
 | Reason | What it means |
 | --- | --- |
 | `ENTROPY_UNAVAILABLE` | The deployment cannot read OS-level entropy (very rare) |
-| `EXPLORER_INTERNAL` | An explorer read hit an unexpected condition: a stored derive record failed to decode, a federated wallet response omitted a required field, or an index key had the wrong shape |
+| `EXPLORER_INTERNAL` | An explorer read hit an unexpected condition: a stored materialized-view record failed to decode, a federated wallet response omitted a required field, or an index key had the wrong shape |
 
 ### Sentinel
 

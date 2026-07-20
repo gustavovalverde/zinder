@@ -1,4 +1,4 @@
-//! Serialized fact-first canonical writer control plane.
+//! Serialized canonical writer control plane.
 //!
 //! The gRPC adapter owns no `RocksDbCanonicalStore`. It sends bounded commands
 //! to the one follower task that owns the primary handle, so projectors cannot
@@ -257,7 +257,7 @@ pub(crate) struct CanonicalIngestEvent {
     pub(crate) committed_range: BlockHeightRange,
 }
 
-/// Bounded fact-first event page used by the public ingest-control adapter.
+/// Bounded canonical event page used by the public ingest-control adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalIngestEventPage {
     pub(crate) events: Vec<CanonicalIngestEvent>,
@@ -1196,7 +1196,7 @@ fn checkpoint_ready_evidence_message(
         block_digest_version: u32::from(evidence.block_digest_version.value()),
         replay_format_version: evidence.replay_format_version.value(),
         sequence_digest_version: u32::from(evidence.sequence_digest_version.value()),
-        visible_logical_fact_bytes: evidence.visible_logical_fact_bytes,
+        visible_logical_block_facts_bytes: evidence.visible_logical_block_facts_bytes,
         sequence_checkpoint: Some(CanonicalCheckpointSequenceEvidence {
             through: Some(checkpoint_block_id_message(sequence_checkpoint.through())),
             retained_block_count: sequence_checkpoint.retained_block_count(),
@@ -1426,7 +1426,7 @@ fn map_store_error(error: &CanonicalStoreError) -> Status {
 
 #[cfg(test)]
 /// Fixture-backed canonical control helpers and loopback coverage shared by
-/// fact-first control-plane tests.
+/// canonical writer control-plane tests.
 pub(crate) mod test_support {
     use std::{fs, num::NonZeroU32, str::FromStr as _, time::Duration};
 

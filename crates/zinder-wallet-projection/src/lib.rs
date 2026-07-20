@@ -1,7 +1,7 @@
 //! Wallet projection contracts independent of storage engines.
 //!
 //! This crate owns the exact durable keys and values needed by wallet-facing
-//! reads. It does not depend on canonical-store readers or the legacy derive
+//! reads. It does not depend on canonical-store readers or the legacy materialized-view
 //! plane.
 
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]

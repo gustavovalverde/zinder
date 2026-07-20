@@ -1,7 +1,7 @@
 //! `ExplorerQuery.TransparentAddressActivity` handler.
 //!
 //! Reads the confirmed-activity feed materialized by
-//! [`zinder_derive::TransparentAddressActivityConsumer`]
+//! [`zinder_materialized_views::TransparentAddressActivityConsumer`]
 //! out of the consumer-owned `transparent_address_activity` column family.
 //! The storage layout sorts newest-first per address, so the handler
 //! serves pages in that order; clients that want oldest-first reverse
@@ -41,10 +41,10 @@ use super::freshness::{
 use super::transaction_detail::encode_component_counts;
 use super::transparent_input::parent_transaction_ids;
 use super::{clamp_max_entries, require_matching_chain_epoch};
-use zinder_derive::{
-    DeriveStore, TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN,
-    TransparentAddressRankingConsumer,
-    TransparentAddressSummary as DerivedTransparentAddressSummary,
+use zinder_materialized_views::{
+    MaterializedViewStore, TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN, TransparentAddressRankingConsumer,
+    TransparentAddressSummary as ProjectedTransparentAddressSummary,
 };
 
 /// Hard cap on the activity rows one page returns.
@@ -62,7 +62,7 @@ const HEIGHT_KEY_END: usize = HEIGHT_KEY_OFFSET + 4;
 
 /// Executes one `ExplorerQuery.TransparentAddressActivity` request.
 pub(crate) struct TransparentAddressActivityContext<'store> {
-    pub(crate) derive_store: &'store DeriveStore,
+    pub(crate) materialized_view_store: &'store MaterializedViewStore,
     pub(crate) canonical_store: Option<&'store SecondaryChainStore>,
     pub(crate) network: Network,
     pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
@@ -74,7 +74,7 @@ pub(crate) async fn handle_transparent_address_activity(
     request: Request<TransparentAddressActivityRequest>,
 ) -> Result<Response<TransparentAddressActivityResponse>, Status> {
     let TransparentAddressActivityContext {
-        derive_store,
+        materialized_view_store,
         canonical_store,
         network,
         upstream_observation_cache,
@@ -85,20 +85,21 @@ pub(crate) async fn handle_transparent_address_activity(
         .address
         .ok_or_else(|| ExplorerError::invalid_request("address selector is required"))?;
     let resolved_address = resolve_address_lookup(&address, network)?;
-    let active_metadata = TransparentAddressRankingConsumer::active_metadata(derive_store)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?
-        .ok_or_else(|| {
-            ExplorerError::not_materialized(
-                "transparent-address ranking has no active materialized generation",
-            )
-        })?;
+    let active_metadata =
+        TransparentAddressRankingConsumer::active_metadata(materialized_view_store)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?
+            .ok_or_else(|| {
+                ExplorerError::not_materialized(
+                    "transparent-address ranking has no active materialized generation",
+                )
+            })?;
     let max_entries = clamp_max_entries(
         inner.max_entries,
         DEFAULT_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES,
         MAX_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES_PER_REQUEST,
     );
     let (mut entries, next_cursor) = scan_address_activity(
-        derive_store,
+        materialized_view_store,
         &ActivityScanParameters {
             script_hash: resolved_address.script_hash,
             offset: inner.offset,
@@ -111,8 +112,11 @@ pub(crate) async fn handle_transparent_address_activity(
     let chain_epoch =
         resolve_activity_chain_epoch(canonical_store, wallet_client, inner.at_epoch_id).await?;
     validate_ranking_metadata_at_chain_epoch(active_metadata, &chain_epoch)?;
-    let summary =
-        read_address_summary_at_metadata(derive_store, active_metadata, &resolved_address)?;
+    let summary = read_address_summary_at_metadata(
+        materialized_view_store,
+        active_metadata,
+        &resolved_address,
+    )?;
     let coverage = encode_ranking_coverage(active_metadata.coverage);
     enrich_activity_entries(
         canonical_store,
@@ -123,7 +127,7 @@ pub(crate) async fn handle_transparent_address_activity(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
             Some(chain_epoch),
             0,
@@ -171,15 +175,18 @@ async fn resolve_activity_chain_epoch(
 }
 
 fn read_address_summary_at_metadata(
-    derive_store: &DeriveStore,
-    expected_metadata: zinder_derive::TransparentAddressRankingMetadata,
+    materialized_view_store: &MaterializedViewStore,
+    expected_metadata: zinder_materialized_views::TransparentAddressRankingMetadata,
     resolved_address: &ResolvedAddressLookup,
 ) -> Result<WireTransparentAddressSummary, Status> {
-    let derived_summary =
-        TransparentAddressRankingConsumer::summary(derive_store, resolved_address.script_hash)
+    let derived_summary = TransparentAddressRankingConsumer::summary(
+        materialized_view_store,
+        resolved_address.script_hash,
+    )
+    .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let confirmed_metadata =
+        TransparentAddressRankingConsumer::active_metadata(materialized_view_store)
             .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let confirmed_metadata = TransparentAddressRankingConsumer::active_metadata(derive_store)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     if confirmed_metadata != Some(expected_metadata) {
         return Err(ExplorerError::unsatisfied_precondition(
             "active transparent-address ranking changed while reading address summary",
@@ -193,7 +200,7 @@ fn read_address_summary_at_metadata(
 }
 
 fn validate_ranking_metadata_at_chain_epoch(
-    metadata: zinder_derive::TransparentAddressRankingMetadata,
+    metadata: zinder_materialized_views::TransparentAddressRankingMetadata,
     chain_epoch: &wallet::ChainEpoch,
 ) -> Result<(), Status> {
     let visible_tip = chain_epoch.visible_tip.as_ref().ok_or_else(|| {
@@ -241,7 +248,7 @@ struct ActivityScanParameters<'a> {
 }
 
 fn scan_address_activity(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     parameters: &ActivityScanParameters<'_>,
 ) -> Result<(Vec<TransparentAddressActivityEntry>, Vec<u8>), Status> {
     let prefix = encode_address_script_hash(parameters.script_hash);
@@ -258,7 +265,7 @@ fn scan_address_activity(
         Vec::with_capacity(usize::try_from(parameters.max_entries).unwrap_or(usize::MAX));
     let mut last_key: Option<RowKey> = None;
     'scan: loop {
-        let rows = derive_store
+        let rows = materialized_view_store
             .range_iterate_consumer(
                 TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
                 &start_key,
@@ -508,7 +515,7 @@ fn validate_transaction_identity(
 }
 
 fn encode_address_summary(
-    summary: Option<DerivedTransparentAddressSummary>,
+    summary: Option<ProjectedTransparentAddressSummary>,
     requested_script_pub_key: Option<&[u8]>,
 ) -> WireTransparentAddressSummary {
     let Some(summary) = summary else {
@@ -542,7 +549,7 @@ fn encode_address_summary(
 }
 
 fn encode_ranking_coverage(
-    coverage: zinder_derive::TransparentAddressRankingCoverage,
+    coverage: zinder_materialized_views::TransparentAddressRankingCoverage,
 ) -> TransparentAddressRankingCoverage {
     TransparentAddressRankingCoverage {
         balance_complete_through_height: coverage.balance_complete_through_height.value(),
@@ -706,10 +713,10 @@ mod tests {
         TransactionId, TransactionLocation, TransactionPublicFacts, TransactionVersion,
         TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
     };
-    use zinder_derive::{
-        DeriveStoreOptions, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
+    use zinder_materialized_views::{
+        MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
         TransparentAddressActivityConsumer,
-        TransparentAddressRankingCoverage as DerivedRankingCoverage,
+        TransparentAddressRankingCoverage as ProjectedRankingCoverage,
         TransparentAddressRankingMetadata, TransparentAddressScriptTypeTotals,
     };
     use zinder_store::RocksDbResourceBudget;
@@ -760,9 +767,9 @@ mod tests {
     #[test]
     fn offset_skips_matching_rows_without_changing_cursor_order() -> TestResult {
         let tempdir = tempdir()?;
-        let store = DeriveStore::open(
+        let store = MaterializedViewStore::open(
             tempdir.path(),
-            DeriveStoreOptions {
+            MaterializedViewStoreOptions {
                 consumers: &[TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
@@ -825,7 +832,7 @@ mod tests {
     #[test]
     fn summary_uses_snapshot_and_tail_timestamp_extrema() {
         let summary = encode_address_summary(
-            Some(DerivedTransparentAddressSummary {
+            Some(ProjectedTransparentAddressSummary {
                 script_pub_key: None,
                 balance_zat: 900,
                 total_received_zat: 1_200,
@@ -977,7 +984,7 @@ mod tests {
             top_100_balance_zat: 100,
             p2pkh: TransparentAddressScriptTypeTotals::default(),
             p2sh: TransparentAddressScriptTypeTotals::default(),
-            coverage: DerivedRankingCoverage {
+            coverage: ProjectedRankingCoverage {
                 balance_complete_through_height: BlockHeight::new(height),
                 history_complete_from_height: Some(BlockHeight::new(1)),
                 history_complete_through_height: Some(BlockHeight::new(height)),

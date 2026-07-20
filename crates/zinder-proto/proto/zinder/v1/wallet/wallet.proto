@@ -38,7 +38,7 @@ message ChainEpoch {
   // Highest block in this chain epoch for which both compact-block and
   // commitment-tree artifacts are coherent past the reorg window. The wallet
   // uses this as its scan ceiling; see ADR-0005 in the zally repo. Carries the
-  // exact reorg-window semantics the prior `safe_tip_*` fields did.
+  // exact reorg-window semantics the prior `settled_tip_*` fields did.
   BlockTip settled_tip = 6;
 
   // Sapling note commitment tree size at the visible tip. Wallets use this to
@@ -52,11 +52,11 @@ message ChainEpoch {
   uint32 ironwood_commitment_tree_size = 9;
 }
 
-// Highest block the derive projections have fully materialized.
+// Highest block the materialized views have fully materialized.
 //
-// Distinct from the canonical chain tip on `ChainEpoch`: the derive plane
+// Distinct from the canonical chain tip on `ChainEpoch`: the materialized-view plane
 // replays canonical chain events asynchronously and trails the canonical tip
-// while catching up. This is the height every derive-backed read response can
+// while catching up. This is the height every materialized-view-backed read response can
 // actually answer for.
 message IndexedTip {
   // Materialized block tip.
@@ -88,14 +88,14 @@ message UpstreamTip {
 // `WalletQuery`, `ExplorerQuery`, and `IngestControl` read response.
 //
 // Folds the epoch identity, the reorg-vs-replay tips, the upstream view, and
-// the derive-plane status into one shape so a consumer reads chain state the
+// the materialized-view status into one shape so a consumer reads chain state the
 // same way on every surface. See ADR-0011.
 message ChainView {
   // Chain epoch this response was produced from.
   ChainEpoch chain_epoch = 1;
 
-  // Derive-replay ceiling. Optional because responses that do not read the
-  // derive store, and cold starts before the first materialized block, leave
+  // Materialized-view replay ceiling. Optional because responses that do not read the
+  // materialized-view store, and cold starts before the first materialized block, leave
   // it unset. Absent means "unknown", never "at tip".
   optional IndexedTip indexed_tip = 2;
 
@@ -104,30 +104,30 @@ message ChainView {
   // the first probe completes.
   optional UpstreamTip upstream_tip = 3;
 
-  // Derive-plane status. Absent on responses that are not derive-backed.
-  optional DeriveStatus derive = 4;
+  // Materialized-view status. Absent on responses without materialized views.
+  optional MaterializedViewStatus materialized_views = 4;
 }
 
-// Derive-plane lifecycle. Separates a derive plane that is healthily catching
-// up from one that has stalled, which a block-count lag alone cannot express.
-enum DeriveHealth {
-  DERIVE_HEALTH_UNSPECIFIED = 0;
+// Materialized-view lifecycle. Separates healthy replay from stalled replay,
+// which a block-count lag alone cannot express.
+enum MaterializedViewHealth {
+  MATERIALIZED_VIEW_HEALTH_UNSPECIFIED = 0;
   // Indexed tip is at the canonical tip; reads reflect the latest block.
-  DERIVE_HEALTH_LIVE = 1;
+  MATERIALIZED_VIEW_HEALTH_LIVE = 1;
   // Replay is advancing but the indexed tip is behind the canonical tip.
-  DERIVE_HEALTH_CATCHING_UP = 2;
+  MATERIALIZED_VIEW_HEALTH_CATCHING_UP = 2;
   // Replay is paused (e.g. memory pressure); the indexed tip is frozen and
   // will not advance until the pause clears. Reads serve historical data.
-  DERIVE_HEALTH_PAUSED = 3;
+  MATERIALIZED_VIEW_HEALTH_PAUSED = 3;
 }
 
-// Operator-facing derive-plane summary.
+// Operator-facing materialized-view summary.
 //
-// Written by the ingest plane and surfaced on `ChainView.derive` and
+// Written by the view owner and surfaced on `ChainView.materialized_views` and
 // `ExplorerServerInfo`. The `observed_at_millis` stamp lets a consumer detect a
-// status record that has itself gone stale (ingest stopped writing it).
-message DeriveStatus {
-  DeriveHealth health = 1;
+// status record that has itself gone stale.
+message MaterializedViewStatus {
+  MaterializedViewHealth health = 1;
   uint32 indexed_height = 2;
   uint64 lag_blocks = 3;
   uint64 observed_at_millis = 4;
@@ -167,7 +167,7 @@ message LatestSafeBlockResponse {
   ChainView chain_view = 1;
 
   // Block at chain_view.chain_epoch.settled_tip.height.
-  BlockMetadata safe_tip_block = 2;
+  BlockMetadata settled_tip_block = 2;
 }
 
 // Safe-tip block metadata request.
@@ -801,13 +801,13 @@ message ChainRangeReverted {
 //
 // Carries a non-reorg commit that advanced the canonical tip or the safe
 // prefix. The architectural-spine name; preferred over "tip-advance"
-// because Zinder commits to either the visible tip or the safe tip under
+// because Zinder commits to either the visible tip or the settled tip under
 // the same event variant.
 message ChainCommitted {
   ChainEpochCommitted committed = 1;
 }
 
-// Reorg chain event: a range that had not yet reached the safe tip was
+// Reorg chain event: a range that had not yet reached the settled tip was
 // replaced.
 message ChainReorged {
   ChainRangeReverted reverted = 1;
@@ -825,7 +825,7 @@ message ChainEventEnvelope {
   // Cross-plane chain-state envelope visible after this event (ADR-0011,
   // field tag 3 on this message). `chain_view.chain_epoch` is the epoch
   // visible after the event; `chain_view.chain_epoch.settled_tip.height`
-  // carries the safe tip height that was true for this event.
+  // carries the settled tip height that was true for this event.
   ChainView chain_view = 3;
 
   oneof event {
@@ -853,7 +853,7 @@ message WalletServerInfo {
   uint32 schema_version = 3;
 
   // Configured reorg window depth, in blocks. A block becomes part of the
-  // safe prefix (safe_tip_height) once it is buried at least this deep.
+  // safe prefix (settled_tip_height) once it is buried at least this deep.
   uint32 reorg_window_blocks = 4;
 
   // Chain-event retention window in seconds. 0 indicates unbounded retention
@@ -1591,7 +1591,7 @@ service WalletQuery {
   // Return latest visible block metadata.
   rpc LatestBlock(LatestBlockRequest) returns (LatestBlockResponse);
 
-  // Return the block at the safe tip height: the highest height at which
+  // Return the block at the settled tip height: the highest height at which
   // both compact blocks and a coherent tree-state checkpoint are
   // guaranteed available. The wallet uses this as its scan ceiling.
   rpc LatestSafeBlock(LatestSafeBlockRequest) returns (LatestSafeBlockResponse);

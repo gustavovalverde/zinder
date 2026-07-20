@@ -103,7 +103,7 @@ pub struct ChainStoreOptions {
     pub rocksdb_resource_budget: RocksDbResourceBudget,
     /// Raw-blob retention the primary writer persists on open.
     pub raw_blob_retention: RawBlobRetention,
-    /// Maximum heights one maintenance pass sweeps when the safe-tip retention floor
+    /// Maximum heights one maintenance pass sweeps when the settled-tip retention floor
     /// jumps far ahead of the swept marker. Bounds the scan through sparse
     /// eras where few outpoints ever meet the outpoint budget.
     pub retention_sweep_max_heights_per_pass: u32,
@@ -160,7 +160,7 @@ impl ChainStoreOptions {
 pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 14;
 /// Durable artifact schema version written by this binary.
 ///
-/// Version 10 carried the fact-first layout with every hash-shaped proto
+/// Version 10 carried the canonical-block-facts layout with every hash-shaped proto
 /// field in stored artifacts encoded as `string` in RPC byte order. Its
 /// `address_output_index` rows were append-only history with an epoch
 /// suffix on the key, filtered at read time.
@@ -169,7 +169,7 @@ pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 14;
 /// Version 11 keeps every artifact payload from version 10 and converts
 /// `address_output_index` into a reorg-safe current projection: the key
 /// drops the epoch suffix, rows derive from `transparent_outputs_by_outpoint`
-/// at commit, and finalized-spent rows are deleted by the safe-tip
+/// at commit, and finalized-spent rows are deleted by the settled-tip
 /// retention sweep. A version-10 store is migrated in place at primary
 /// open by a one-shot streaming rebuild of the projection from
 /// `transparent_output` and `transparent_spend_fact`; no resync is needed.
@@ -190,7 +190,7 @@ pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 14;
 /// Store schema version 12 removes the canonical
 /// `transparent_address_tx_index` column family. The typed
 /// `TransparentAddressTxIndexArtifact` remains the wallet/query response row,
-/// but materialization belongs to the derive plane.
+/// but materialization belongs to the materialized-view plane.
 ///
 /// Store schema version 13 replaces the outpoint-only transparent spend block
 /// index with complete retained spend facts. Older stores may have swept the
@@ -218,7 +218,7 @@ pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 14;
 ///
 /// Version 18 stores every observed transparent input and its resolved spend
 /// facts in each block-local spend replay index. Point rows may still be
-/// deleted after safe-tip retention, while derive rebuilds remain possible
+/// deleted after settled-tip retention, while materialized-view rebuilds remain possible
 /// from the durable block records. Store schema 13 introduces this
 /// non-migratable payload.
 ///
@@ -575,7 +575,7 @@ impl PrimaryChainStore {
     /// Called by `zinder-ingest` between `BulkCatchup` batches to bound
     /// the live WAL by writer cadence rather than `RocksDB`'s own
     /// WAL-size trigger. See [the OOM-recovery
-    /// runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md) for
+    /// runbook](../../../docs/runbooks/bulk-catchup-resource-tuning.md) for
     /// the rationale.
     pub fn flush(&self) -> Result<(), StoreError> {
         self.store.inner.flush()
@@ -624,7 +624,7 @@ impl PrimaryChainStore {
         read_transparent_retention_swept_height(self.store.inner.as_ref())
     }
 
-    /// Reads the height through which the safe-tip sweep has actually deleted
+    /// Reads the height through which the settled-tip sweep has actually deleted
     /// transparent spend facts, or `None` before any real deletion.
     ///
     /// Unlike the swept-through cursor, this marker advances only in a batch
@@ -640,8 +640,8 @@ impl PrimaryChainStore {
 
     /// Publishes the durable-consumer retention release height.
     ///
-    /// `zinder-ingest` calls this from the derive tailer as the durable
-    /// transparent-outpoint-spend projection advances. The safe-tip sweep never
+    /// `zinder-ingest` calls this from the materialized-view tailer as the durable
+    /// transparent-outpoint-spend projection advances. The settled-tip sweep never
     /// deletes a spend fact above this height, so canonical retention releases
     /// only what the durable projection has already recorded.
     pub fn set_transparent_retention_release_height(
@@ -656,10 +656,10 @@ impl PrimaryChainStore {
     /// Runs one bounded transparent-projection retention maintenance pass.
     ///
     /// The pass deletes only finalized spends already released by the durable
-    /// derive projection. It is deliberately separate from
+    /// materialized view. It is deliberately separate from
     /// [`Self::commit_chain_epoch`] so a large historical retention backlog
     /// cannot delay canonical chain advancement. The ingest scheduler calls
-    /// this only after canonical ingest and derive replay have both caught up.
+    /// this only after canonical ingest and materialized-view replay have both caught up.
     pub fn sweep_transparent_retention_once(
         &self,
     ) -> Result<TransparentRetentionSweepOutcome, StoreError> {
@@ -1308,7 +1308,7 @@ impl ChainStoreInner {
         })?;
         let checkpoint_height = chain_epoch.visible_tip_height;
         let artifacts = ChainEpochArtifacts::new(chain_epoch, Vec::new(), Vec::new(), Vec::new())
-            .with_reorg_window_change(ReorgWindowChange::AdvanceSafeTipTo {
+            .with_reorg_window_change(ReorgWindowChange::AdvanceSettledTipTo {
                 height: checkpoint_height,
             });
         self.commit_chain_epoch_with_initial_bounds(artifacts, Some(bounds))
@@ -1348,7 +1348,7 @@ impl ChainStoreInner {
             && artifacts.block_headers.is_empty()
             && matches!(
                 &reorg_window_change,
-                ReorgWindowChange::AdvanceSafeTipTo { .. }
+                ReorgWindowChange::AdvanceSettledTipTo { .. }
             );
         let (current_projection_protected_outpoints, current_spend_projection_protected_outpoints) =
             protected_transparent_outpoints(&artifacts);
@@ -3329,7 +3329,7 @@ fn build_chain_event(
         }
         ReorgWindowChange::Unchanged
         | ReorgWindowChange::Extend { .. }
-        | ReorgWindowChange::AdvanceSafeTipTo { .. } => ChainEvent::ChainCommitted { committed },
+        | ReorgWindowChange::AdvanceSettledTipTo { .. } => ChainEvent::ChainCommitted { committed },
     };
 
     Ok(event)
@@ -3385,7 +3385,7 @@ fn chain_event_matches_family(
     match family {
         ChainEventStreamFamily::Tip => true,
         ChainEventStreamFamily::Safe => {
-            event_envelope.chain_epoch.visible_tip_height <= event_envelope.safe_tip_height
+            event_envelope.chain_epoch.visible_tip_height <= event_envelope.settled_tip_height
                 && matches!(&event_envelope.event, ChainEvent::ChainCommitted { .. })
         }
     }
@@ -3638,13 +3638,13 @@ struct RetentionSweepAdvance {
 ///
 /// A projection row may be physically deleted only when no commit the store
 /// will ever accept can make it live again. `validate_reorg_window_change`
-/// floors every `Replace` at `safe_tip + 1`, so a spend at or below
-/// `safe_tip_height` is irreversible: the spent output's rows are deleted
+/// floors every `Replace` at `settled_tip + 1`, so a spend at or below
+/// `settled_tip_height` is irreversible: the spent output's rows are deleted
 /// from `address_output_index`, `transparent_output`, and
 /// `transparent_spend_fact` in one maintenance batch.
 ///
 /// The sweep covers heights from the persisted swept-through marker up to
-/// `min(current safe tip, retention release height)`. The retention
+/// `min(current settled tip, retention release height)`. The retention
 /// release height is the durable-consumer floor: `zinder-ingest` publishes it
 /// through [`PrimaryChainStore::set_transparent_retention_release_height`] as the
 /// durable transparent-outpoint-spend projection advances, so a spend fact is
@@ -3658,7 +3658,7 @@ struct RetentionSweepAdvance {
 /// A single pass sweeps at most `max_heights_per_pass` heights and stops
 /// after the first fully-swept height that reaches
 /// `max_outpoints_per_pass`, whichever budget hits first. When the release
-/// floor jumps far ahead of the swept marker (a store rebuilt with derive
+/// floor jumps far ahead of the swept marker (a store rebuilt with materialized views
 /// paused, then un-paused at tip), the marker advances only to the last
 /// fully-swept height and the remaining backlog drains across later passes;
 /// the outpoint budget bounds the delete batch through transaction-dense
@@ -3667,8 +3667,8 @@ struct RetentionSweepAdvance {
 /// The scan runs outside the control lock so readiness and event-history
 /// reads stay responsive through a bounded chunk. This is sound because
 /// every row it reads is finalized: the range ends at or below the current
-/// safe tip, `validate_reorg_window_change` floors every `Replace` at
-/// `safe_tip + 1`, and the swept marker is written only by this sweep inside
+/// settled tip, `validate_reorg_window_change` floors every `Replace` at
+/// `settled_tip + 1`, and the swept marker is written only by this sweep inside
 /// the serialized writer. The locked write still re-checks the marker via
 /// [`TransparentRetentionSweep::swept_marker_unchanged`] and discards the sweep on
 /// skew rather than writing markers derived from stale state.
@@ -5607,10 +5607,10 @@ mod tests {
     }
 
     #[test]
-    fn opening_current_schema_with_missing_block_replay_envelopes_refuses_without_mutating_manifest()
+    fn opening_schema_nineteen_with_missing_block_replay_envelopes_refuses_without_mutating_manifest()
     -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
-        let storage_path = tempdir.path().join("incomplete-current-schema-store");
+        let storage_path = tempdir.path().join("incomplete-schema-19-store");
         {
             let _store =
                 PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())?;
@@ -5625,7 +5625,7 @@ mod tests {
         let Err(error) =
             PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())
         else {
-            return Err("expected incomplete-current-schema rejection on reopen".into());
+            return Err("expected incomplete schema-19 rejection on reopen".into());
         };
         assert!(
             matches!(

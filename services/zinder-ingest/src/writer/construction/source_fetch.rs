@@ -506,7 +506,7 @@ where
                     reason: "source chain segment reverted during canonical construction",
                 }));
             }
-            SourceChainUpdate::SafeTip { .. } => {}
+            SourceChainUpdate::SettledTip { .. } => {}
         }
     }
 

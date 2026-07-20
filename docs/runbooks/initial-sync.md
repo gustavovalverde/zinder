@@ -1,177 +1,154 @@
-# Initial Sync
+# Initial sync
 
-Zinder's production-shaped wallet path has three state owners:
+This runbook covers the supported single-host wallet-serving topology. The
+canonical writer constructs and publishes canonical RocksDB, the projector
+builds wallet RocksDB from an authenticated canonical fence, and the
+lightwalletd adapter begins serving only after both secondary readers form an
+exact pair.
 
-1. `zinder-ingest` constructs and follows the schema-v4 canonical store.
-2. `zinder-projector` constructs and follows the schema-v1 wallet store from an
-   authenticated canonical event fence.
-3. `zinder-compat-lightwalletd` serves immutable canonical/wallet RocksDB
-   secondary pairs at one exact fence.
+There is no in-place migration from an incompatible store identity or schema.
+Use empty target paths or a certified coherent restore bundle.
 
-There is no production query fallback, derive-store writer, dual-write mode, or
-legacy store migration. A store that does not satisfy the current physical
-schema and network contract is rejected without mutation and must be rebuilt in
-a fresh path.
+## Prerequisites
 
-## Before starting
+- A Zebra node on the selected network with required JSON-RPC capabilities.
+- Enough local storage for canonical data, wallet state, staging, compaction,
+  checkpoints, and growth reserve.
+- Stable canonical and wallet primary paths on one host filesystem.
+- Unique secondary metadata roots for projector and compatibility.
+- Stable projector build-owner identity and private control bearer tokens.
+- Resource limits that leave headroom outside RocksDB caches and memtables.
 
-- Sync Zebra to the target network tip and enable the JSON-RPC capabilities in
-  the checked-in service configurations.
-- Put canonical, projector-secondary, wallet, compatibility canonical-secondary,
-  and compatibility wallet-secondary data in distinct paths. Nested or aliased
-  paths are rejected.
-- Give the projector one stable 32-character hexadecimal build-owner identity.
-- Size the host for the canonical store, wallet store, one coherent checkpoint,
-  worst-case compaction/restore workspace, and chain-growth reserve. The prior
-  500 GB mainnet canary did not establish that capacity envelope.
-- Keep `CanonicalControl` and `IngestControl` on loopback in the single-host
-  topology. If either control plane is non-loopback, configure the same bearer
-  token for every client before starting.
+For Z3-managed nodes, start and synchronize the selected Z3 network before
+starting Zinder.
 
-The supported configurations are:
-
-- [`deploy/config/ingest.toml`](../../deploy/config/ingest.toml)
-- [`deploy/config/projector.toml`](../../deploy/config/projector.toml)
-- [`deploy/config/compat-lightwalletd.toml`](../../deploy/config/compat-lightwalletd.toml)
-
-Use [`deploy/docker-compose.yml`](../../deploy/docker-compose.yml) or the systemd
-unit for the complete single-host topology. Railway is an ingest-only diagnostic
-canary and cannot certify wallet production because it does not provide the
-required shared-host filesystem contract.
-
-## Start order
-
-Start the canonical writer first:
-
-```bash
-zinder-ingest --config /etc/zinder/ingest.toml
-```
-
-The writer probes Zebra, enters bulk construction when needed, publishes READY,
-and then follows the tip. It owns the canonical event log, reorg replacement,
-retention leases, durable mempool history, and both control services.
-
-Start the projector after ingest is healthy:
-
-```bash
-ZINDER_PROJECTOR__BUILD_OWNER_HEX=00112233445566778899aabbccddeeff \
-  zinder-projector --config /etc/zinder/projector.toml
-```
-
-The projector takes a durable build lease, constructs the wallet store at a
-fixed canonical fence, publishes READY only after cold validation, and then
-follows canonical append and replacement events. Settlement advances the
-wallet undo floor atomically. A restart resumes from the persisted canonical
-source position instead of rebuilding a second truth.
-
-Start compatibility only after the projector is healthy:
-
-```bash
-zinder-compat-lightwalletd --config /etc/zinder/compat-lightwalletd.toml
-```
-
-Compatibility catches inactive canonical and wallet secondary generations up
-to one authenticated fence, validates the pair, then atomically publishes it.
-Requests retain the generation they started with; replacement generations are
-removed only after their last request releases them. Compatibility must stay
-not-ready when no exact pair exists.
-
-Compose encodes this order and keeps projector and compatibility in ingest's
-network namespace so the control listener remains loopback-only:
+## Start the stack
 
 ```bash
 docker compose \
-  --env-file deploy/.env.mainnet \
+  --env-file deploy/.env.testnet \
   -f deploy/docker-compose.yml \
-  up -d
+  up -d --build
 ```
 
-Substitute the checked-in testnet or regtest environment when targeting those
-networks.
-
-## Readiness sequence
-
-Probe every runtime independently:
+The dependency order is ingest, projector, then compatibility, but container
+start does not imply traffic readiness. Follow all three operational endpoints:
 
 ```bash
-curl -fsS http://127.0.0.1:9105/readyz
-curl -fsS http://127.0.0.1:9110/readyz
-curl -fsS http://127.0.0.1:9107/readyz
+curl -sS http://127.0.0.1:19105/readyz  # ingest
+curl -sS http://127.0.0.1:19110/readyz  # projector
+curl -sS http://127.0.0.1:19107/readyz  # compatibility
 ```
 
-Admission requires all of the following:
+## Canonical construction
 
-- ingest reports canonical READY at the current authenticated event sequence;
-- the mempool source has emitted a complete initial snapshot for the current
-  connection generation;
-- projector reports the same canonical source fence and a READY wallet digest;
-- compatibility reports a validated exact pair at that fence;
-- canonical and projection lag are each within their published bounds.
+On an empty canonical path, ingest creates a sibling construction staging
+directory, fixes a source range, loads and validates it, publishes a baseline
+fence, installs it at the configured path, and starts continuous following.
+The configured path does not become a ready store until publication succeeds.
 
-An HTTP health response proves only that a process is alive. Do not route
-wallet traffic until every readiness condition above is true. A projection-
-behind, replica-behind, hydration-incomplete, lease-loss, or fence-mismatch
-cause is a failed admission, not an empty-data condition.
+The checked ingest configuration uses `coverage = "wallet-serving"`. The
+writer derives the earliest supported wallet height from node-advertised
+network activations and uses its predecessor as the construction checkpoint.
+This avoids storing history that the supported lightwalletd wallet workload
+cannot consume. An explicit checkpoint must carry the required predecessor
+tree state and source identity.
 
-## Reorgs and reconnects
+Useful canonical metrics:
 
-The canonical writer may replace only an unsettled suffix within its persisted
-nonzero reorg window. It authenticates the connected replacement and commits
-the replacement blocks, displaced archive, event, and visible fence in one
-batch. Attempts to cross settlement or exceed the window fail without mutation.
+- `zinder_ingest_source_fetch_queue_requests`
+- `zinder_ingest_source_fetch_queue_bytes`
+- `zinder_ingest_canonical_tip_height`
+- `zinder_ingest_canonical_lag_blocks`
+- `zinder_ingest_canonical_historical_prevout_reads_total`
+- `zinder_ingest_canonical_cross_block_wallet_reads_total`
 
-The projector consumes that exact replacement event and either applies its
-persisted undo suffix or fails closed. Compatibility keeps serving its previous
-immutable exact pair until a newer exact pair passes validation. It never
-combines a newer canonical secondary with an older wallet secondary.
+The last two counters must remain zero.
 
-When the mempool source reconnects, ingest immediately withdraws mempool-backed
-readiness and pending-transaction visibility. It restores them only after the
-new connection emits a complete snapshot marker; partial hydration is never
-published as an empty mempool.
+If the process stops during construction, restart it with the same
+configuration. A published staging store is installed and reopened. An
+unpublished staging store is removed and reconstructed. Do not manually move
+or edit the staging directory while the owner is running.
 
-## Restart and recovery
+## Wallet construction
 
-For an ordinary restart, preserve the same owner identities and paths and start
-services in the normal ownership order. Each owner validates its persisted
-network, schema, lease, event position, and digest before serving.
+Projector opens canonical storage through its own secondary, converges on the
+writer fence, and binds a wallet build plan to that source identity. It acquires
+a wallet projection build lease and a writer-owned canonical retention lease,
+then builds the wallet store in its owned path.
 
-A production restore requires one coherent canonical/wallet checkpoint bundle
-with an authenticated cross-store fence. Independently timed directory copies
-are not a supported restore procedure. Until the coherent bundle implementation
-and the 10,000-block-tail restore gate pass, restore remains a production
-blocker; do not substitute the old derive backup manifest or a fixed-fence
-primary-store handoff.
+Wallet publication requires the complete build digest and source position to
+match the admitted canonical fence. The projector then catches up and takes
+continuous following ownership before releasing construction leases.
 
-If an old or mismatched store is found, keep it outside the active paths for
-forensics and start canonical schema-v4 and wallet schema-v1 construction in
-fresh directories. Do not add a migration reader, compatibility alias, or
-second writer to make it open.
+Restarting projector is safe. Lease generation, build state, source identity,
+and ready evidence are persisted. A second projector using the same wallet path
+must fail lease or writer admission rather than run concurrently.
+
+## Exact-pair serving
+
+Compatibility maintains generation-specific canonical and wallet secondaries.
+It catches both up, validates source identity and event position, and publishes
+one immutable `WalletServingReadPair`. Only then does `/readyz` report ready and
+the gRPC readiness interceptor admit traffic.
+
+Probe a data-bearing method after readiness:
+
+```bash
+grpcurl -plaintext -d '{}' 127.0.0.1:19067 \
+  cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
+```
+
+An open canonical secondary plus an open wallet secondary is not sufficient.
+The pair must agree on network, reorg policy, canonical source identity, event
+fence, and wallet digest.
+
+## Expected readiness states
+
+| Runtime | Normal initial state | Ready boundary |
+| --- | --- | --- |
+| ingest | `starting` or `syncing` | Canonical lag is within threshold and mempool snapshot is complete |
+| projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
+| compatibility | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
+
+`node_unavailable` and `upstream_not_ready` are recoverable source conditions.
+`schema_mismatch`, `reorg_window_exceeded`, corrupt store errors, and source
+identity mismatches require operator action.
+
+## Memory and storage pressure
+
+Watch cgroup memory, RocksDB block cache, memtables, WAL bytes, pending
+compaction, write-stop state, construction queue reservations, and disk free
+space. Store size must not determine process RSS.
+
+If construction approaches its memory boundary, stop the owner cleanly and
+reduce the source-request, reserved-response, preparation, or RocksDB budgets
+before restarting. Do not delete an admitted ready store merely to change a
+runtime resource limit. See
+[Bulk-catchup resource tuning](bulk-catchup-resource-tuning.md).
+
+## Recovery and restart order
+
+For ordinary process restarts, start owners before readers:
+
+1. `zinder-ingest`
+2. `zinder-projector`
+3. `zinder-compat-lightwalletd`
+
+Readers remain unready until their owner and secondary contracts recover. Do
+not replace this with manual directory copies or primary-read shortcuts.
+
+For disaster recovery, restore a coherent canonical and wallet state bundle
+into fresh paths and require cold owner admission plus normal exact-pair
+admission. Independently timed RocksDB copies are not a wallet-serving backup.
 
 ## Production acceptance
 
-Initial sync is production-admissible only when the release evidence shows:
+A successful initial sync proves only the observed construction and admission
+run. Production acceptance also needs current evidence for sustained following,
+bounded reorg replacement, coherent restore, capacity headroom, restart
+behavior, mempool recovery, TLS routing, and the exact independent client and
+network being advertised.
 
-- fresh mainnet canonical construction in at most 3 hours;
-- wallet projection in at most 2 hours and the complete wallet-ready lifecycle
-  in at most 4 hours;
-- coherent checkpoint restore plus a 10,000-block tail in at most 15 minutes;
-- canonical lag no greater than 2 blocks and wallet lag no greater than 2
-  canonical epochs under sustained following;
-- sufficient measured disk and memory headroom for the complete topology;
-- live replacement, restart, exact-pair drain, mempool reconnect, and real
-  Android create/restore/transparent/send flows.
-
-The measured mainnet canary took about 7 hours 47 minutes for canonical
-construction and validation, so the current code and deployment shape must not
-be described as production-certified until that performance gate and the
-restore/capacity/client gates are closed. See
-[the wallet-serving cutover plan](../plans/fact-first-wallet-serving-cutover.md)
-for the current evidence and execution order.
-
-## References
-
-- [ADR-0035: Fact-first storage selection and lifecycle](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-- [Wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
-- [Deploying on a VM](deploying-on-a-vm.md)
-- [Testing](testing.md)
+See [Testing](testing.md), [Service operations](../architecture/service-operations.md),
+and [ADR-0035](../adrs/0035-canonical-storage-topologies.md).

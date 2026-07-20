@@ -1,330 +1,112 @@
 # Protocol Boundary
 
-Zinder has one protocol owner: `zinder-proto`. All service `.proto` files, vendored lightwalletd-compatible protos, generated Rust modules, and method-level wire documentation live behind that crate.
+`zinder-proto` owns Zinder's service protobufs, vendored compatibility
+protobufs, generated Rust modules, and wire-level byte conventions. Domain and
+storage crates use their own types and convert at service adapters.
 
-This document owns the wire-schema boundary. Source adapters live in [Node source boundary](node-source-boundary.md). Storage bytes live in [ADR-0002](../adrs/0002-boundary-specific-serialization.md).
+Upstream node protocols belong to [Node source boundary](node-source-boundary.md).
+Storage encodings belong to [Storage backend](storage-backend.md).
 
-## Protocol Surfaces
+## Protocol surfaces
 
-Zinder defines four protocol families. The first version-1 production release
-deploys the private ingest-control and lightwalletd compatibility surfaces; the
-native wallet service remains a library and test contract without a standalone
-runtime.
+| Surface | Rust module | Service owner | Release status |
+| --- | --- | --- | --- |
+| Native wallet API | `zinder_proto::v1::wallet` | `WalletQueryGrpcAdapter` in `zinder-query` | Library contract; no standalone query runtime |
+| Native explorer API | `zinder_proto::v1::explorer` | `zinder-explorer` | Optional workspace runtime; no published release image |
+| Private control APIs | `zinder_proto::v1::ingest` | `zinder-ingest` and `zinder-projector` | Internal deployed services |
+| Shared operations messages | `zinder_proto::v1::ops` | Runtime and service adapters | Embedded in native/control surfaces |
+| Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Published compatibility service |
+| Zebra indexer client contract | `zinder_proto::external::zebra` | `zinder-source` | Client-only upstream protocol |
 
-| Surface | Rust module | Served by | Purpose |
-| ------- | ----------- | --------- | ------- |
-| Native wallet/application API | `zinder_proto::v1::wallet` | Library-only `WalletQueryGrpcAdapter` | Internal, embedded, and test contract; not a deployed production surface |
-| Private ingest control API | `zinder_proto::v1::ingest` | `zinder-ingest` | Writer status and retained chain-event replay for secondary readers |
-| Internal epoch API | `zinder_proto::v1::epoch` | `zinder-ingest` or read sidecar | Epoch-bound canonical reads and chain-event history |
-| Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Lightwalletd-compatible wallet surface |
+`ChainEpochReadApi` is a Rust storage trait, not a gRPC service. It provides the
+epoch-bound read boundary used by `zinder-query` and store implementations.
 
-Native protocol naming must not copy lightwalletd names unless the concept is truly identical. Compat protocol naming must not be rewritten into Zinder terminology because it is a compatibility contract.
-
-## `zinder-proto` Ownership
+## Ownership rules
 
 `zinder-proto` owns:
 
-- Vendored `compact_formats.proto` and `service.proto` files for lightwalletd compatibility.
-- Native Zinder `.proto` files.
-- Generated `prost` Rust modules and generated `tonic` client/server modules.
-- Golden wire fixtures for compatibility.
-- Method-level Markdown docs when generated proto docs are not enough.
-
-No service crate should hand-write `prost::Message` structs for protocol payloads. No service crate should generate its own copy of a shared proto. No domain crate should expose generated proto types in its public API.
-
-Vendored compatibility protos are a pinned external contract. Before implementing
-or extending `CompactTxStreamer`, compare the vendored files with the upstream
-`zcash/lightwallet-protocol` source, then either update them and record the
-source commit or document the pinned version and scope compatibility claims to
-that version. Do not call a surface "current lightwalletd-compatible" when the
-vendored proto is intentionally older.
-
-The current compatibility pin is `zcash/lightwallet-protocol` commit
-`ac7cee052a1bf5d430985a478d39e8b513fc4bd4` (tag `v0.5.0`), verified on
-2026-07-05. The machine-readable source provenance lives in
-`crates/zinder-proto/proto/compat/lightwalletd/UPSTREAM.md`, and
-`crates/zinder-proto/tests/integration/lightwalletd_protocol.rs` is the local
-golden decode guard for the current compatibility message shapes. The
-`vendored proto drift` CI job compares the normalized vendored files with that
-pinned upstream commit so
-drift is a deliberate compatibility update, not an accidental edit.
-
-Storage-control protobuf records that never cross a service or API boundary may live in `zinder-store`, not `zinder-proto`. The rule is ownership, not file extension: service protocols belong to `zinder-proto`; storage-private control records belong to storage.
-
-## Native API
-
-The `zinder-query` library implements the native `WalletQuery` protobuf adapter
-over the Rust `WalletQueryApi` boundary. The standalone `zinder-query` binary
-has been deleted; this surface is available only to embedded composition and
-contract tests in the first version-1 production release.
-
-`service WalletQuery` is defined in `zinder/v1/wallet/wallet.proto`. Tonic
-server/client code is generated only for the native Zinder service; the
-vendored lightwalletd protos remain message-only and are wired through
-`zinder-compat-lightwalletd`.
-
-The current native wallet read-sync surface is:
-
-- `zinder_proto::v1::wallet::ChainEpoch`
-- `zinder_proto::v1::wallet::BlockId`
-- `zinder_proto::v1::wallet::LatestBlockRequest`
-- `zinder_proto::v1::wallet::LatestBlockResponse`
-- `zinder_proto::v1::wallet::CompactBlock`
-- `zinder_proto::v1::wallet::CompactBlocksInRangeRequest`
-- `zinder_proto::v1::wallet::CompactBlockRequest`
-- `zinder_proto::v1::wallet::CompactBlockResponse`
-- `zinder_proto::v1::wallet::CompactBlocksInRangeChunk`
-- `zinder_proto::v1::wallet::TransactionRequest`
-- `zinder_proto::v1::wallet::Transaction`
-- `zinder_proto::v1::wallet::TransactionResponse`
-- `zinder_proto::v1::wallet::TreeStateCheckpointRequest`
-- `zinder_proto::v1::wallet::LatestTreeStateCheckpointRequest`
-- `zinder_proto::v1::wallet::TreeStateResponse`
-- `zinder_proto::v1::wallet::ShieldedProtocol`
-- `zinder_proto::v1::wallet::SubtreeRootsRequest`
-- `zinder_proto::v1::wallet::SubtreeRoot`
-- `zinder_proto::v1::wallet::SubtreeRootsResponse`
-- `zinder_proto::v1::wallet::ServerInfoRequest`
-- `zinder_proto::v1::wallet::ServerInfoResponse`
-- `zinder_proto::v1::wallet::ServerCapabilities`
-- `zinder_proto::v1::wallet::NodeCapabilitiesDescriptor`
-- `zinder_proto::v1::wallet::wallet_query_server::WalletQuery`
-- `zinder_proto::v1::wallet::wallet_query_client::WalletQueryClient`
-
-The native wallet protocol carries the following messages and RPCs in addition to the read-sync surface:
-
-- `zinder_proto::v1::wallet::BroadcastTransactionRequest`
-- `zinder_proto::v1::wallet::BroadcastTransactionResponse`
-- `zinder_proto::v1::wallet::ChainEventsRequest`
-- `zinder_proto::v1::wallet::ChainEventEnvelope`
-- `zinder_proto::v1::wallet::ChainCommitted`
-- `zinder_proto::v1::wallet::ChainReorged`
-- `zinder_proto::v1::wallet::MempoolEventsRequest`
-- `zinder_proto::v1::wallet::MempoolEventEnvelope`
-- `zinder_proto::v1::wallet::MempoolSnapshotRequest`
-- `zinder_proto::v1::wallet::MempoolSnapshotResponse`
-
-`services/zinder-query/src/grpc/adapter.rs` owns `WalletQueryGrpcAdapter`, a
-thin tonic adapter over `WalletQueryApi`. Generated native response shaping
-lives in `services/zinder-query/src/grpc/native.rs`. The adapter must not open
-storage, call upstream nodes, or build missing artifacts; those responsibilities
-stay behind `WalletQueryApi`, `ChainEpochReadApi`, and ingestion.
-
-The native adapter contract exposes Zinder concepts:
-
-- `LatestBlock`, `CompactBlock`, `CompactBlocksInRange`, `Transaction`
-- `TreeStateCheckpoint`, `LatestTreeStateCheckpoint`, `SubtreeRoots`
-- `ServerInfo`
-
-The native protocol exposes `BroadcastTransaction` and `ChainEvents` with Tip and Safe cursor families per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription), plus `MempoolEvents` and `MempoolSnapshot` per [ADR-0007](../adrs/0007-mempool-topology-and-retention.md).
-
-Native read requests that depend on canonical chain state carry an optional
-`at_epoch` field. When it is absent, the server answers from the visible epoch
-at request time. When it is present, the server must answer from that exact
-`ChainEpoch` or return `Code::FailedPrecondition` with a structured
-`CHAIN_EPOCH_PIN_*` detail.
-
-## Private Ingest Control API
-
-`zinder-ingest` serves the private `IngestControl` protobuf service for
-colocated readers. This is not a wallet-facing API.
-
-`service IngestControl` is defined in `zinder/v1/ingest/ingest.proto`. The current
-surface is:
-
-- `zinder_proto::v1::ingest::WriterStatusRequest`
-- `zinder_proto::v1::ingest::WriterStatusResponse`
-- `zinder_proto::v1::wallet::ChainEventsRequest`
-- `zinder_proto::v1::wallet::ChainEventEnvelope`
-- `zinder_proto::v1::ingest::ingest_control_server::IngestControl`
-- `zinder_proto::v1::ingest::ingest_control_client::IngestControlClient`
-
-Future native slices may add:
-
-- Transparent address artifacts (paginated `TransparentAddressTxIdsInRange`, streamed `TransparentAddressUnspentOutputs`, wallet-plane `TransparentAddressBalance`)
-- Internal `ChainEpochReadApi` over gRPC for multi-process query mode
-
-Every chain-dependent response either binds to one `ChainEpoch` or explicitly says why a field is independent of the epoch. Range and list APIs must have cursors or explicit maximum sizes.
-
-## Internal Epoch API
-
-`ChainEpochReadApi` is the internal read surface for epoch-bound canonical
-reads. It exposes retained chain-event history to `IngestControl.ChainEvents`.
-The native `WalletQuery.ChainEvents` adapter remains available for embedded and
-integration-test composition, but the production version-1 runtime does not
-publish a standalone native stream. Production wallet serving is provided by
-`zinder-compat-lightwalletd` over one request-scoped exact canonical and wallet
-secondary pair.
-
-It should provide:
-
-- `resolve_chain_epoch`
-- `read_compact_block_range`
-- `read_tree_state_checkpoint_at_or_before`
-- `read_latest_tree_state_checkpoint`
-- `read_subtree_roots`
-- `read_transaction`
-- `chain_event_history` (library/internal helper for the subscription plane, not a second public stream)
-
-The exact RPC method names can differ if the proto review finds clearer names, but they must preserve the same concepts. Do not use vague names such as `get_data`, `query_store`, or `epoch_history` when the operation is replaying chain events.
-
-## Lightwalletd Compatibility
-
-`zinder-compat-lightwalletd` adapts `WalletQueryApi` to the vendored `CompactTxStreamer` schema.
-
-Adapter-level claims stop at `protocol-compatible` or
-`reference-parity-compatible`. `client-compatible` and
-`public-operator-compatible` claims also require wallet-serving storage,
-real-client evidence, and deployment evidence from
-[Wallet data plane §External Wallet Compatibility Claims](wallet-data-plane.md#external-wallet-compatibility-claims)
-and [Testing runbook §External certification procedures](../runbooks/testing.md#external-certification-procedures).
-
-It may:
-
-- Translate request and response shapes.
-- Map Zinder typed errors to lightwalletd-compatible status codes.
-- Preserve lightwalletd streaming behavior for block ranges.
-- Run compatibility tests against lightwalletd fixtures.
-
-It must not:
-
-- Open live canonical storage.
-- Call upstream nodes.
-- Build compact blocks.
-- Run migrations.
-- Define a second wallet query model.
-- Modify vendored proto files except through an explicit compatibility update.
-
-The compatibility adapter must not advertise working lightwalletd wallet sync
-until stored compact-block artifacts contain the block identity fields, compact
-transaction data, and commitment-tree sizes required by the pinned lightwalletd
-contract. If the pinned protocol says a field such as `CompactBlock.header`
-should be empty, the builder and tests must follow that contract instead of
-using a non-empty value as a proof of completeness. Decoding an empty protobuf
-shell is fixture coverage, not a compatibility claim.
-
-The compatibility adapter consumes `WalletQueryApi`; it does not own storage,
-source I/O, or artifact construction. Its production claim is limited to the
-read-sync methods below and to the range shapes validated by live
-regtest/testnet tests.
-For non-genesis public-history ranges, ingestion must already have a contiguous
-stored tip metadata base or a future source backend for chain-global tree
-sizes.
-
-The minimum lightwalletd-compatible read-sync surface is:
-
-- `GetLightdInfo`
-- `GetLatestBlock`
-- `GetBlock`
-- `GetBlockRange`
-- `GetTreeState`
-- `GetLatestTreeState`
-- `GetSubtreeRoots`
-- `GetAddressUtxos`
-- `GetAddressUtxosStream`
-
-Android/Zodl compatibility claims are governed by
-[Wallet data plane §External Wallet Compatibility Claims](wallet-data-plane.md#external-wallet-compatibility-claims).
-`GetLightdInfo.taddrSupport` may be true only when the adapter is explicitly
-configured to advertise transparent-address support after the serving process
-has wired both the stored transparent output artifacts and the derive-backed
-transparent transaction-history projection. The compatibility service must not
-claim broader Zodl compatibility until the full external-wallet contract is
-satisfied.
-
-`SendTransaction` forwards `request.data` to
-`WalletQueryApi::broadcast_transaction` and maps each
-`TransactionBroadcastResult` variant into a `lightwalletd::SendResponse` shape:
-
-| Outcome | `errorCode` | `errorMessage` |
-| ------- | ----------- | -------------- |
-| `Accepted` | `0` | display-hex transaction id |
-| `InvalidEncoding` | upstream node code or `-22` | upstream node message |
-| `Rejected` | upstream node code or `-26` | upstream node message |
-| `Duplicate` | upstream node code or `-27` | upstream node message |
-| `Unknown` | upstream node code or `-1` | upstream node message |
-
-## Native Single-Artifact RPCs
-
-`WalletQuery` exposes single-artifact lookups alongside the streaming and batch RPCs:
-
-- `CompactBlock(CompactBlockRequest) returns (CompactBlockResponse)` — fetch one indexed compact block by height.
-- `Transaction(TransactionRequest) returns (TransactionResponse)` — fetch one indexed transaction by transaction id.
-- `NetworkUpgradeActivations(NetworkUpgradeActivationsRequest) returns (NetworkUpgradeActivationsResponse)` — fetch the node-discovered consensus schedule used by the query process.
-
-The compact-block and transaction responses are bound to one `ChainEpoch` so wallets cannot mix epochs across follow-up requests. The lightwalletd compat adapter routes `GetBlock` to `compact_block_at` and `GetTransaction` to `transaction`. The compat layer translates between the lightwalletd surface's byte conventions and Zinder's storage types: display-form hex strings such as `TreeState.hash` and `SendResponse.error_message` go through `encode_rpc_*_hex` / `decode_rpc_*_hex`; compact-block `bytes txid` fields stay as internal-order bytes per the lightwalletd `// MUST be in protocol order and MUST NOT be reversed` convention in `compat/lightwalletd/compact_formats.proto`.
-
-The defaults reuse Bitcoin/Zcash JSON-RPC error-code conventions so wallet
-clients that already track those codes do not need a Zinder-specific table.
-When the upstream node reports its own `error_code`, that code is forwarded
-unchanged so operators can correlate Zinder responses with upstream node logs.
-
-`SendTransaction` does not mutate canonical storage; the request is forwarded to
-the configured source broadcaster and the typed outcome is reported back.
-Wallets that need to disable transaction submission can wire `WalletQuery` with
-`()` as the broadcaster, in which case `SendTransaction` returns
-`Code::FailedPrecondition` with a `TransactionBroadcastDisabled` reason.
-
-The adapter remains embeddable in tests, but the first version-1 production
-topology deploys `zinder-compat-lightwalletd` as the dedicated public wallet
-boundary over immutable canonical and wallet secondary pairs. It owns no
-canonical or wallet writes.
-
-## QueryError to gRPC Status
-
-The mapping is centralized in `services/zinder-query/src/grpc/mod.rs::status_from_query_error` and shared by both `WalletQueryGrpcAdapter` (native) and `LightwalletdGrpcAdapter` (compat), so wallet clients see one stable contract regardless of which surface served the request. The variant-by-variant table and structured-detail conventions are owned by [Public Interfaces §Error Conventions](public-interfaces.md#error-conventions).
-
-The category contract: `Unavailable` is reserved for transient infrastructure failures the client may retry, `NotFound` for absent resources inside a successful read path, and `FailedPrecondition` for state mismatches the client must resolve (typically by reseeding a cursor or adjusting a range). Mixing categories is forbidden.
-
-## Capability Descriptor
-
-`WalletQuery.ServerInfo` returns `ServerCapabilities` per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). The descriptor is the canonical client-facing capability protocol; clients gate features on capability strings, not on Zinder version. The compatibility runtime exposes server reflection for tooling such as `grpcurl`, but reflection is gated by the same traffic-readiness interceptor as `CompactTxStreamer`. It exposes the proto schema, not semantic guarantees, so it is not the discovery primitive.
-
-Capability strings follow `domain.subdomain.capability_name_v{N}`. The naming spine in [Public Interfaces §Capability Discovery](public-interfaces.md#capability-discovery) lists the active capabilities.
-
-## Proto Evolution
-
-`buf breaking` runs as a CI gate on every PR touching the owned Zinder proto tree and rejects package-level non-additive changes. `buf lint` also checks the owned Zinder proto package layout. The vendored lightwalletd protos under `proto/compat/lightwalletd/` are excluded from Buf because they are governed by the upstream commit pin and the existing `vendored proto drift` job.
-
-Each wire shape pairs with one capability identifier. A shape change lands as a new `_vN` identifier. Removing an older capability requires the owning architecture document to name the consumer constraint and removal rule.
-
-A second CI gate, `capability_descriptor_drift`, decodes the compiled `FileDescriptorSet` and asserts that every served `WalletQuery`, `ExplorerQuery`, and `IngestControl` RPC maps to exactly one row in the `CAPABILITIES` table at `crates/zinder-proto/src/capabilities.rs`, and that every table row binds a method the descriptor serves. Adding an RPC without a capability row (or naming a non-existent method) fails the job; a method that is intentionally uncapability'd is listed in the guard's explicit allowlist.
-
-## OpenRPC
-
-OpenRPC is not part of v1.
-
-Zebra may expose OpenRPC for JSON-RPC capability discovery, and source adapters may consume that as upstream node input. That does not make OpenRPC a Zinder public API format.
-
-If Zinder later ships a JSON-RPC server, OpenRPC must be generated from the primary proto and method docs. It must not become a parallel hand-maintained spec.
-
-## Compatibility Tests
-
-Protocol changes require tests at the right boundary:
-
-- Native API golden tests use `zinder_proto::v1::wallet`.
-- Internal API tests prove `ChainEpochReadApi` preserves epoch consistency.
-- Lightwalletd compatibility tests decode stored compact-block payload bytes through the vendored `CompactBlock` schema.
-- In-workspace lightwalletd compatibility tests should connect with the
-  generated client from Zinder's vendored protos. Wallet-SDK compatibility tests
-  may use `zcash_client_backend` only when that SDK graph passes the dependency
-  policy gate; SDK scanning must run locally without sending wallet secrets to
-  Zinder.
-- Android SDK/Zodl compatibility tests must satisfy the canonical external
-  wallet contract in [Wallet data plane](wallet-data-plane.md#external-wallet-compatibility-claims).
-- Error mapping tests prove typed Zinder errors reach clients as stable wire responses.
-- Cursor tests prove cross-network, expired, and tampered cursors fail closed.
-
-## Review Checklist
-
-A protocol change is not ready unless:
-
-- The `.proto` file lives in `zinder-proto`.
-- The generated Rust type does not leak into `zinder-core` or `zinder-store` public APIs.
-- The method has a clear owner: native, internal, or compat.
-- The change is additive, or `buf breaking` CI passes because maintainers have approved the breaking semver bump.
-- The new method has a corresponding `CapabilitySpec` row in the `CAPABILITIES` table (`capability_descriptor_drift` CI passes).
-- Tests cover wire compatibility and domain error mapping.
-- The docs name the service that serves the method.
-- Compatibility methods are backed by native artifacts, document their
-  capability or `taddrSupport` behavior, and do not proxy upstream node reads.
+- native `.proto` files and generated `prost`/`tonic` modules;
+- vendored lightwalletd protobuf files and their provenance record;
+- the external Zebra indexer client schema used by `zinder-source`;
+- protocol golden fixtures and wire-compatibility tests; and
+- shared enums and messages whose semantics cross a service boundary.
+
+Service crates do not hand-write `prost::Message` types or generate private
+copies of shared protocols. Domain crates do not expose generated protocol types
+in public APIs. Storage-private control records may live in `zinder-store` when
+they never cross a service boundary.
+
+Native protocol names use Zinder's domain vocabulary. Compatibility protocol
+names remain identical to the external contract even when their wording differs
+from native APIs.
+
+## Native wallet API
+
+`WalletQuery` is the native wallet and application read contract. The
+`zinder-query` crate implements it over `WalletQueryApi` and exact-fence
+canonical/wallet-projection readers. The release topology embeds that library in
+the lightwalletd adapter rather than running a standalone query listener.
+
+Wallet responses carry the chain identity needed to prevent mixed-epoch reads.
+Streaming and pagination requests use bounded ranges and authenticated cursors.
+Capabilities are advertised by exact strings through `ServerInfo`; clients gate
+features on those strings rather than parsing a Zinder version.
+
+## Native explorer API
+
+`ExplorerQuery` serves explorer, dashboard, and analytics shapes. It composes
+materialized views, a canonical secondary, and selected `WalletQuery` calls.
+Every response carries `ExplorerFreshness`, and optional fields use typed
+unavailability reasons. See [Explorer plane](explorer-plane.md).
+
+## Private control APIs
+
+The `zinder.v1.ingest` package contains:
+
+- `CanonicalControl` for canonical writer position and authenticated checkpoint
+  evidence;
+- `ProjectorControl` for wallet-projection coordination; and
+- `IngestControl` for writer status, retained chain events, mempool events, and
+  source-backed control operations.
+
+These endpoints are private operational contracts. They use the shared
+transport policy and fail closed when authentication or transport requirements
+are not met. See [ADR-0006](../adrs/0006-ingest-control-transport-security.md).
+
+## Lightwalletd compatibility
+
+The vendored `CompactTxStreamer` schema is an external contract. Its source pin
+and provenance live in
+`crates/zinder-proto/proto/compat/lightwalletd/UPSTREAM.md`. The compatibility
+adapter translates native query results, byte order, errors, and capability
+claims into that contract. It does not mutate canonical storage or fetch missing
+artifacts from an upstream node.
+
+Compatibility claims are bounded by executable certification. The stable method
+matrix lives in [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md).
+
+## Byte conventions
+
+Wire fields follow explicit conventions:
+
+- hash strings use lowercase RPC display order;
+- raw hash bytes use the order documented by the owning protobuf field;
+- opaque cursors are not parsed or synthesized by clients;
+- integer fields include units in their names when the type alone is
+  insufficient; and
+- unknown enum values fail or degrade according to the method contract rather
+  than silently mapping to a valid domain value.
+
+Conversion helpers live at protocol adapters. Storage encodings and protobuf
+encodings must not share serializers merely because both contain the same
+domain value.
+
+## Evolution and verification
+
+- Additive fields receive new tags; removed tags stay reserved.
+- Breaking native shapes use a new capability version or package version.
+- Compatibility schemas change only with an explicit upstream-pin update.
+- Proto tests cover golden decoding, byte order, enum mappings, pagination, and
+  epoch identity.
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps`
+  keeps generated and adapter documentation references valid.

@@ -26,17 +26,17 @@ use zinder_bench::{
 use zinder_core::{
     BlockHeight, Network, UnixTimestampMillis, wire::decode_zinder_native_chain_name,
 };
-use zinder_derive::ProjectionPreset;
+use zinder_materialized_views::ProjectionPreset;
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
-#[path = "canonical_fact_round_trip/command.rs"]
-mod fact_round_trip_command;
+#[path = "canonical_replay_storage/command.rs"]
+mod canonical_replay_storage_command;
 mod rocksdb_canonical_fixture_replay;
 mod rocksdb_compact_block_range;
 mod rocksdb_storage_lifecycle;
 mod rocksdb_wallet_rebuild;
 
-use fact_round_trip_command::{CanonicalFactsRoundTripArgs, run_canonical_facts_round_trip};
+use canonical_replay_storage_command::{CanonicalReplayStorageArgs, run_canonical_replay_storage};
 use rocksdb_canonical_fixture_replay::{
     RocksDbCanonicalFixtureReplayArgs, run_rocksdb_canonical_fixture_replay,
 };
@@ -69,16 +69,17 @@ enum Command {
     #[command(name = "capture-canonical-fixture-checkpoints")]
     CaptureCanonicalFixtureCheckpoints(CaptureCanonicalFixtureCheckpointsArgs),
     /// Replay the current projection-coupled schema over a captured fixture.
-    CurrentSchemaReplay(CurrentSchemaReplayArgs),
-    /// Persist and read back backend-neutral canonical block facts.
-    CanonicalFactsRoundTrip(CanonicalFactsRoundTripArgs),
-    /// Replay an authenticated fixture into a fresh canonical-v1 `RocksDB` store.
+    ProjectionCoupledReplay(ProjectionCoupledReplayArgs),
+    /// Persist and read back backend-neutral canonical replay records.
+    #[command(name = "canonical-replay-storage")]
+    CanonicalReplayStorage(CanonicalReplayStorageArgs),
+    /// Replay an authenticated fixture into a fresh canonical `RocksDB` store.
     #[command(name = "rocksdb-canonical-fixture-replay")]
     RocksDbCanonicalFixtureReplay(RocksDbCanonicalFixtureReplayArgs),
     /// Serve an immutable canonical fixture through JSON-RPC and indexer gRPC.
     #[command(name = "serve-canonical-fixture-transports")]
     ServeCanonicalFixtureTransports(ServeCanonicalFixtureTransportsArgs),
-    /// Build and cold-admit complete version-1 canonical and wallet stores.
+    /// Build and cold-admit complete canonical and wallet stores.
     #[command(name = "rocksdb-storage-lifecycle")]
     RocksDbStorageLifecycle(RocksDbStorageLifecycleArgs),
     /// Rebuild and cold-admit a wallet store from an existing READY canonical store.
@@ -174,7 +175,7 @@ struct CaptureCanonicalFixtureCheckpointsArgs {
 }
 
 #[derive(Args)]
-struct CurrentSchemaReplayArgs {
+struct ProjectionCoupledReplayArgs {
     /// Captured fixture directory.
     #[arg(long)]
     fixture: PathBuf,
@@ -314,9 +315,9 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::CaptureCanonicalFixtureCheckpoints(args) => {
             run_capture_canonical_fixture_checkpoints(args).await
         }
-        Command::CurrentSchemaReplay(args) => run_current_schema_replay(args).await,
-        Command::CanonicalFactsRoundTrip(args) => {
-            let output = run_canonical_facts_round_trip(args).await?;
+        Command::ProjectionCoupledReplay(args) => run_projection_coupled_replay(args).await,
+        Command::CanonicalReplayStorage(args) => {
+            let output = run_canonical_replay_storage(args).await?;
             emit_report(&output.report, output.report_path.as_deref())?;
             output.report.validate()
         }
@@ -437,7 +438,9 @@ async fn run_capture(args: CaptureArgs) -> Result<(), BenchError> {
     Ok(())
 }
 
-async fn run_current_schema_replay(args: CurrentSchemaReplayArgs) -> Result<(), BenchError> {
+async fn run_projection_coupled_replay(
+    args: ProjectionCoupledReplayArgs,
+) -> Result<(), BenchError> {
     let run_started_at_unix_millis = UnixTimestampMillis::now().value();
     let canonical_fixture_replay_thresholds = canonical_fixture_replay_thresholds(&args)?;
     let metrics_handle = install_recorder()?;
@@ -494,7 +497,7 @@ async fn run_current_schema_replay(args: CurrentSchemaReplayArgs) -> Result<(), 
 }
 
 fn canonical_fixture_replay_thresholds(
-    args: &CurrentSchemaReplayArgs,
+    args: &ProjectionCoupledReplayArgs,
 ) -> Result<Option<AcceptanceThresholds>, BenchError> {
     let thresholds = match (
         args.canonical_fixture_replay_target_secs,
@@ -571,10 +574,10 @@ mod tests {
 
     use super::{Cli, Command, canonical_fixture_replay_thresholds, create_report_file};
 
-    fn current_schema_replay_args(extra: &[&str]) -> Vec<String> {
+    fn projection_coupled_replay_args(extra: &[&str]) -> Vec<String> {
         [
             "zinder-bench",
-            "current-schema-replay",
+            "projection-coupled-replay",
             "--fixture",
             "fixture",
             "--store",
@@ -597,7 +600,7 @@ mod tests {
             "--wallet-build-lifecycle-hard-limit-secs",
         ] {
             assert!(
-                Cli::try_parse_from(current_schema_replay_args(&[removed_flag, "10"])).is_err()
+                Cli::try_parse_from(projection_coupled_replay_args(&[removed_flag, "10"])).is_err()
             );
         }
     }
@@ -719,12 +722,12 @@ mod tests {
 
     #[test]
     fn acceptance_threshold_flags_must_be_supplied_as_a_pair() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(current_schema_replay_args(&[
+        let cli = Cli::try_parse_from(projection_coupled_replay_args(&[
             "--canonical-fixture-replay-target-secs",
             "10",
         ]))?;
-        let Command::CurrentSchemaReplay(args) = cli.command else {
-            return Err("expected current-schema-replay command".into());
+        let Command::ProjectionCoupledReplay(args) = cli.command else {
+            return Err("expected projection-coupled-replay command".into());
         };
 
         let Some(error) = canonical_fixture_replay_thresholds(&args).err() else {
@@ -738,14 +741,14 @@ mod tests {
 
     #[test]
     fn acceptance_threshold_pair_parses() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(current_schema_replay_args(&[
+        let cli = Cli::try_parse_from(projection_coupled_replay_args(&[
             "--canonical-fixture-replay-target-secs",
             "10",
             "--canonical-fixture-replay-hard-limit-secs",
             "20",
         ]))?;
-        let Command::CurrentSchemaReplay(args) = cli.command else {
-            return Err("expected current-schema-replay command".into());
+        let Command::ProjectionCoupledReplay(args) = cli.command else {
+            return Err("expected projection-coupled-replay command".into());
         };
 
         assert!(canonical_fixture_replay_thresholds(&args)?.is_some());
@@ -754,9 +757,9 @@ mod tests {
 
     #[test]
     fn unthresholded_replay_allows_omitted_provenance() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(current_schema_replay_args(&[]))?;
-        let Command::CurrentSchemaReplay(args) = cli.command else {
-            return Err("expected current-schema-replay command".into());
+        let cli = Cli::try_parse_from(projection_coupled_replay_args(&[]))?;
+        let Command::ProjectionCoupledReplay(args) = cli.command else {
+            return Err("expected projection-coupled-replay command".into());
         };
 
         assert!(canonical_fixture_replay_thresholds(&args)?.is_none());
@@ -765,7 +768,7 @@ mod tests {
 
     #[test]
     fn source_admission_experiment_flags_parse() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(current_schema_replay_args(&[
+        let cli = Cli::try_parse_from(projection_coupled_replay_args(&[
             "--max-response-bytes",
             "67108864",
             "--source-segment-max-blocks",
@@ -781,8 +784,8 @@ mod tests {
             "--source-segment-delay-millis",
             "250",
         ]))?;
-        let Command::CurrentSchemaReplay(args) = cli.command else {
-            return Err("expected current-schema-replay command".into());
+        let Command::ProjectionCoupledReplay(args) = cli.command else {
+            return Err("expected projection-coupled-replay command".into());
         };
 
         assert_eq!(args.max_response_bytes, Some(67_108_864));

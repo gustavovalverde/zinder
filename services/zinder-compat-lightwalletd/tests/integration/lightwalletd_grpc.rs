@@ -1633,9 +1633,9 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
     let transaction_id = TransactionId::from_bytes([0x33; 32]);
     let reorged_height = BlockHeight::new(2);
     let mut chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let safe_tip_block = chain_fixture
+    let settled_tip_block = chain_fixture
         .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("reorg fixture must include safe-tip block"))?
+        .ok_or_else(|| eyre!("reorg fixture must include settled-tip block"))?
         .clone();
     let reorged_block = chain_fixture
         .block_at(reorged_height)
@@ -1652,18 +1652,17 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
     let mut initial_artifacts = chain_fixture
         .chain_epoch_artifacts(ChainEpochId::new(1))
         .ok_or_else(|| eyre!("reorg fixture must build an initial chain epoch"))?;
-    initial_artifacts.chain_epoch.settled_tip_height = safe_tip_block.height;
-    initial_artifacts.chain_epoch.settled_tip_hash = safe_tip_block.hash;
+    initial_artifacts.chain_epoch.settled_tip_height = settled_tip_block.height;
+    initial_artifacts.chain_epoch.settled_tip_hash = settled_tip_block.hash;
     store_fixture
         .chain_store()
         .commit_chain_epoch(initial_artifacts)?;
 
     store_fixture.chain_store().commit_chain_epoch(
-        reorg_replacement_artifacts(safe_tip_block.hash, reorged_height).with_reorg_window_change(
-            ReorgWindowChange::Replace {
+        reorg_replacement_artifacts(settled_tip_block.hash, reorged_height)
+            .with_reorg_window_change(ReorgWindowChange::Replace {
                 from_height: reorged_height,
-            },
-        ),
+            }),
     )?;
 
     let adapter = LightwalletdGrpcAdapter::new(

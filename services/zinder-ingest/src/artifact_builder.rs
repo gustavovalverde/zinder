@@ -482,9 +482,9 @@ pub fn position_canonical_block(
 
 /// Physical rows required by the current `RocksDB` writer.
 ///
-/// These redundant index shapes are deliberately private to the current-schema
+/// These redundant index shapes are deliberately private to the canonical
 /// writer boundary and are not part of the backend-neutral fact contract.
-pub(crate) struct CurrentSchemaBlockArtifacts {
+pub(crate) struct ProjectionCoupledBlockArtifacts {
     pub(crate) block_header: BlockHeaderArtifact,
     pub(crate) block_blob: Option<BlockBlobArtifact>,
     pub(crate) block_transaction_index: Vec<BlockTransactionIndexArtifact>,
@@ -497,11 +497,11 @@ pub(crate) struct CurrentSchemaBlockArtifacts {
 
 /// Expands the minimal fact envelope into the redundant rows the current
 /// `RocksDB` schema still commits.
-pub(crate) fn expand_current_schema_block_artifacts(
+pub(crate) fn expand_projection_coupled_block_artifacts(
     facts: CanonicalBlockFacts,
     retained_raw_blobs: RetainedRawBlobs,
-) -> Result<CurrentSchemaBlockArtifacts, CanonicalBlockConstructionError> {
-    let transparent_outputs_by_outpoint = current_schema_transparent_outputs(&facts);
+) -> Result<ProjectionCoupledBlockArtifacts, CanonicalBlockConstructionError> {
+    let transparent_outputs_by_outpoint = projection_coupled_transparent_outputs(&facts);
     let CanonicalBlockFacts {
         block_header,
         transactions,
@@ -548,7 +548,7 @@ pub(crate) fn expand_current_schema_block_artifacts(
         ));
     }
 
-    Ok(CurrentSchemaBlockArtifacts {
+    Ok(ProjectionCoupledBlockArtifacts {
         block_header,
         block_blob,
         block_transaction_index,
@@ -565,8 +565,8 @@ struct PreparedCanonicalTransactions {
     transaction_blobs: Vec<TransactionBlobArtifact>,
 }
 
-/// Expands block-local transparent outputs into current-schema outpoint rows.
-pub(crate) fn current_schema_transparent_outputs(
+/// Expands block-local transparent outputs into canonical outpoint rows.
+pub(crate) fn projection_coupled_transparent_outputs(
     facts: &CanonicalBlockFacts,
 ) -> Vec<TransparentOutputArtifact> {
     let block_height = facts.block_header.height;
@@ -1035,7 +1035,8 @@ mod tests {
         COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CanonicalBlockConstructionError, CommitmentTreeSizes,
         CompactOrchardAction, CompactTx, RawBlobPolicy, ShieldedProtocol,
         compact_note_ciphertext_prefix, compact_transaction_has_payload,
-        expand_current_schema_block_artifacts, position_canonical_block, prepare_canonical_block,
+        expand_projection_coupled_block_artifacts, position_canonical_block,
+        prepare_canonical_block,
     };
 
     #[test]
@@ -1055,8 +1056,10 @@ mod tests {
         let compact_block = positioned.compact_block;
         let replay_envelope = positioned.replay_envelope;
         let tip_metadata = positioned.tip_metadata;
-        let current_schema =
-            expand_current_schema_block_artifacts(positioned.facts, positioned.retained_raw_blobs)?;
+        let current_schema = expand_projection_coupled_block_artifacts(
+            positioned.facts,
+            positioned.retained_raw_blobs,
+        )?;
         let location = *current_schema
             .transaction_locations
             .first()

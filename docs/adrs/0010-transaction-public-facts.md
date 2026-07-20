@@ -13,7 +13,7 @@ Zinder needs one transaction parser output that produces the public facts
 required by wallet status, explorer transaction detail, fee projection,
 privacy-shape classification, and transparent-address activity.
 
-The fact-first store materializes parsed transaction facts during ingest and
+The canonical store materializes parsed transaction facts during ingest and
 stores them in the canonical `transaction_facts` table.
 
 ## Current Decision

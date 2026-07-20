@@ -21,7 +21,7 @@ The decisions to record here are:
 2. Shielded addresses, unified viewing keys, and unified-address shielded receivers route to a typed `NotPubliclyIndexable` arm with structured reason and canonical human-readable string.
 3. ZIP-316 unified addresses surface the present receiver typecodes so the UI can route the transparent receivers while refusing the shielded ones.
 4. ZIP-320 TEX addresses classify as transparent-source-only and map to the underlying P2PKH address for indexable history.
-5. The classifier runs locally; no derive consumer is required to ship the search RPC.
+5. The classifier runs locally; no materialized-view consumer is required to ship the search RPC.
 
 ## Decision
 
@@ -124,7 +124,7 @@ message TexAddressMatch {
 
 The classifier decodes the Bech32m `tex`/`textest` HRP, extracts the 20-byte P2PKH key hash, and re-encodes both as `tex1...` (canonical) and `t1.../tm...` (equivalent). The `transparent` arm carries the routable `TransparentAddressMatch`, so the UI can link directly to the transparent-address page. `transparent_source_only` and `spend_side_note` explain the semantic difference (per ZIP-320, the address restricts the *sender* to transparent inputs, but on-chain the output is indistinguishable from the underlying P2PKH).
 
-### The classifier is local; no derive consumer required
+### The classifier is local; no materialized-view consumer required
 
 `ExplorerQuery.Search` runs in the explorer service handler directly. It decodes the input string with:
 
@@ -139,7 +139,7 @@ The classifier decodes the Bech32m `tex`/`textest` HRP, extracts the 20-byte P2P
 
 The classifier never opens canonical storage for shielded inputs; the refusal is computed from the input string alone. For non-shielded inputs (transparent addresses, transaction IDs), the classifier may issue lookups against `WalletQuery.Transaction` and `WalletQuery.TransparentAddressBalance` to confirm the entity exists. Lookups against shielded receivers are forbidden by structural invariant: the classifier short-circuits before any storage call.
 
-A `SearchIndexConsumer` derive view (deferred to a later slice) may pre-build sublinear address-prefix lookups for autocomplete; the consumer is optional and does not gate the `explorer.search.v1` capability.
+A `SearchIndexConsumer` materialized view (deferred to a later slice) may pre-build sublinear address-prefix lookups for autocomplete; the consumer is optional and does not gate the `explorer.search.v1` capability.
 
 ## Consequences
 
@@ -186,7 +186,10 @@ Rejected. Even though the explorer never persists the key, echoing it on the res
 
 ## Out of Scope
 
-- Payment disclosure payload verification. The PRD defers it as a future stateless tool; the search arm `PaymentDisclosureMatch` is reserved for that future work but is not implemented in this slice.
+- Payment disclosure payload verification. Search does not classify or verify
+  disclosure payloads. The reserved `PaymentDisclosureMatch` wire arm is not
+  emitted, and the default explorer runtime does not advertise the separate
+  verification capability.
 - Autocomplete suggestions. The classifier returns explicit candidates per input; the UI implements autocomplete locally.
 - Cross-chain search (other Zcash forks). The classifier is Zcash-specific.
-- ZIP-321 payment URI parsing. A URI like `zcash:address?amount=...` is a different concept (a payment request, not a search target); a future RPC may parse URIs but not through the search endpoint.
+- ZIP-321 payment URI parsing. A URI like `zcash:address?amount=...` is a payment request, not a search target.

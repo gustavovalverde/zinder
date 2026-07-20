@@ -12,11 +12,11 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockId, ChainValuePool, ChainValuePools, Network, ShieldedProtocol,
     SubtreeRootIndex,
 };
-use zinder_derive::{
+use zinder_ingest::IngestControlGrpcAdapter;
+use zinder_materialized_views::{
     ProjectionPreset, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
 };
-use zinder_ingest::IngestControlGrpcAdapter;
 use zinder_proto::capabilities::INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_proto::v1::{
     ingest::{ServerInfoRequest, ingest_control_server::IngestControl as IngestControlService},

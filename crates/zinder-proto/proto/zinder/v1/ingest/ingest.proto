@@ -35,7 +35,7 @@ enum WriterPhase {
   // interval and emits `cause=upstream_not_ready` until enough chain
   // exists to commit.
   WRITER_PHASE_AWAITING_UPSTREAM = 1;
-  // Gap to the upstream tip is above `ingest.phases.catchup_threshold_blocks`.
+  // Gap to the upstream tip is above `ingest.phase_classification.catchup_threshold_blocks`.
   // The bulk-catchup driver runs pipelined block fetches and commits
   // batches with `FinalizeThrough`.
   WRITER_PHASE_BULK_CATCHUP = 2;
@@ -62,7 +62,7 @@ message WriterStatusResponse {
   string network_name = 2;
 
   reserved 3, 4;
-  reserved "latest_writer_tip_height", "latest_writer_safe_tip_height";
+  reserved "latest_writer_tip_height", "latest_writer_settled_tip_height";
 
   // Current phase of the unified ingest loop. ADR-0015.
   WriterPhase phase = 5;
@@ -101,7 +101,7 @@ message CanonicalWriterFence {
   uint64 visible_block_count = 6;
 }
 
-// Status request for the fact-first canonical writer.
+// Status request for the canonical writer.
 message CanonicalWriterStatusRequest {}
 
 // Status used by projectors and secondary readers to authenticate their view.
@@ -231,7 +231,7 @@ message CanonicalOwnerCheckpointReadyEvidence {
   uint32 block_digest_version = 3;
   uint32 replay_format_version = 4;
   uint32 sequence_digest_version = 5;
-  uint64 visible_logical_fact_bytes = 6;
+  uint64 visible_logical_block_facts_bytes = 6;
   CanonicalCheckpointSequenceEvidence sequence_checkpoint = 7;
   // Immutable fresh-build construction-manifest format bound into READY.
   uint32 construction_manifest_version = 8;
@@ -287,7 +287,7 @@ message ReadmitCanonicalOwnerCheckpointRequest {
   bytes expected_database_identity = 4;
 }
 
-// Fact-first writer operations needed by projectors and secondary readers.
+// Canonical-writer operations needed by projectors and secondary readers.
 // Every mutation is serialized by the canonical writer; clients never open a
 // second primary handle to acquire leases or change event retention.
 service CanonicalControl {

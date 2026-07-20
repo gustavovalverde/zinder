@@ -220,7 +220,7 @@ pub fn synthetic_chain_epoch(
 /// settled tip.
 ///
 /// Unlike [`synthetic_chain_epoch`], the settled tip is decoupled from the
-/// visible tip, so a caller can commit spends below the safe tip and then
+/// visible tip, so a caller can commit spends below the settled tip and then
 /// advance it to exercise the retention sweep.
 #[must_use]
 pub fn synthetic_multi_block_epoch(

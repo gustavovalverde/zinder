@@ -159,7 +159,7 @@ fn write_regtest_fixture() -> Result<RegtestFixtureCase> {
         to_height: 603,
         block_count: 1,
         workload_density: measurements.workload_density,
-        current_schema_oracle_artifact_schema_version:
+        projection_coupled_oracle_artifact_schema_version:
             zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         canonical_block_facts_digest_evidence: measurements
             .canonical_block_facts_digest_evidence()?,
@@ -417,7 +417,7 @@ fn assert_canonical_fixture_ready_evidence(
 fn assert_no_legacy_canonical_families(canonical_store_path: &std::path::Path) -> Result<()> {
     let column_families =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), canonical_store_path)?;
-    for legacy_or_derive_family in [
+    for legacy_or_materialized_view_family in [
         "storage_control",
         "block_transaction_index",
         "transaction_facts",
@@ -439,13 +439,14 @@ fn assert_no_legacy_canonical_families(canonical_store_path: &std::path::Path) -
         assert!(
             !column_families
                 .iter()
-                .any(|family| family == legacy_or_derive_family),
-            "canonical v1 store must not create legacy or derive family {legacy_or_derive_family}"
+                .any(|family| family == legacy_or_materialized_view_family),
+            "canonical v1 store must not create legacy or materialized-view family {legacy_or_materialized_view_family}"
         );
     }
     assert!(
-        !zinder_derive::DeriveStore::path_for_canonical(canonical_store_path).exists(),
-        "canonical-v1 fixture replay must not create a derive store"
+        !zinder_materialized_views::MaterializedViewStore::path_for_canonical(canonical_store_path)
+            .exists(),
+        "canonical fixture replay must not create a materialized-view store"
     );
     Ok(())
 }
@@ -950,7 +951,7 @@ async fn canonical_fixture_checkpoint_capture_rejects_disconnected_segment_bound
             block_count: 2,
             ..WorkloadDensity::default()
         },
-        current_schema_oracle_artifact_schema_version:
+        projection_coupled_oracle_artifact_schema_version:
             zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence {
             block_digest_version: zinder_core::CanonicalBlockFactsDigestVersion::CURRENT.value(),

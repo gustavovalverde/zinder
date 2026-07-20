@@ -162,7 +162,7 @@ fn seek_transaction_facts_keys(
 /// Equivalent to [`read_transaction_facts_artifacts_batch`], but the block
 /// dedup phase looks a needed height up in `known_block_headers` first and
 /// only falls back to a fresh store read for heights not present there.
-/// Callers that stage every needed height's header up front (as derive
+/// Callers that stage every needed height's header up front (as materialized-view replay
 /// replay does) pay zero extra block reads in the common case.
 pub(crate) fn read_transaction_facts_artifacts_batch_with_known_headers(
     inner: &impl RocksChainStoreRead,
