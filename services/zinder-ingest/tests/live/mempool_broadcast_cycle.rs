@@ -30,7 +30,7 @@ use eyre::{Result, eyre};
 use serde::Deserialize;
 use tokio_stream::StreamExt as _;
 use zinder_core::{
-    BroadcastAccepted, BroadcastRejected, Network, RawTransactionBytes,
+    BlockHeight, BroadcastAccepted, BroadcastRejected, Network, RawTransactionBytes,
     TransactionBroadcastOutcome, TransactionId, UnixTimestampMillis,
 };
 use zinder_source::{
@@ -415,6 +415,28 @@ async fn wait_for_mined(
     ))
 }
 
+async fn wait_for_canonical_tip(
+    json_rpc: &ZebraJsonRpcSource,
+    expected_tip: BlockHeight,
+    deadline: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let observed_tip = json_rpc.tip_id().await?.height;
+        if observed_tip == expected_tip {
+            return Ok(());
+        }
+        if started.elapsed() >= deadline {
+            return Err(eyre!(
+                "canonical tip did not become {} within {deadline:?}; last observed tip was {}",
+                expected_tip.value(),
+                observed_tip.value()
+            ));
+        }
+        tokio::time::sleep(MEMPOOL_POLL_INTERVAL).await;
+    }
+}
+
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "TransactionBroadcastOutcome is #[non_exhaustive]; collapse every non-Accepted variant into a single failure"
@@ -517,65 +539,64 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
     // invalidation instead of expecting a synthesized `Added` event.
     rpc_invalidate_block(&env, &mined_block_hash).await?;
 
-    // Confirm the tip rolled back. The chain at this point should be at
-    // mined_height - 1 because the only invalidated block is the one we
-    // mined to confirm the broadcast.
-    let post_invalidate_tip = json_rpc.tip_id().await?.height;
-    assert_eq!(
-        post_invalidate_tip.value(),
-        mined_height.value().saturating_sub(1),
-        "after invalidateblock, the canonical tip should drop to mined_height - 1"
-    );
+    let post_invalidation_result = async {
+        // Zebra acknowledges `invalidateblock` before every subsequent RPC
+        // necessarily observes the new canonical tip, so wait for the
+        // rollback instead of treating the first read as authoritative.
+        let expected_tip = BlockHeight::new(mined_height.value().saturating_sub(1));
+        wait_for_canonical_tip(&json_rpc, expected_tip, MEMPOOL_OBSERVE_TIMEOUT).await?;
 
-    // Re-broadcast the same signed tx. Zebra's mempool accepts it (its
-    // inputs are still spendable now that the mining block is gone), and
-    // the polling source emits Added again on the next poll cycle. This
-    // proves the post-reorg cycle works end-to-end.
-    let rebroadcast_raw_tx = test_key
-        .build_p2pkh_spend(&P2pkhSpendArgs {
-            coinbase_txid_be: coinbase.txid_be,
-            coinbase_vout: coinbase.vout,
-            coinbase_value_zats: coinbase.value_zats,
-            recipient: &recipient_address,
-            target_height: coinbase.target_height,
-        })
-        .map_err(|error| eyre!("transparent signer rejected the rebroadcast: {error}"))?;
-    let rebroadcast_outcome = json_rpc
-        .broadcast_transaction(RawTransactionBytes::new(rebroadcast_raw_tx))
-        .await?;
-    let rebroadcast_txid = match &rebroadcast_outcome {
-        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id }) => {
-            *transaction_id
-        }
-        _ => {
-            return Err(eyre!(
-                "Zebra rejected the rebroadcast after invalidateblock: {rebroadcast_outcome:?}"
-            ));
-        }
-    };
-    assert_eq!(
-        rebroadcast_txid, broadcast_txid,
-        "rebroadcast must produce the same txid as the original broadcast"
-    );
+        // Re-broadcast the same signed tx. Zebra's mempool accepts it (its
+        // inputs are still spendable now that the mining block is gone), and
+        // the polling source emits Added again on the next poll cycle. This
+        // proves the post-reorg cycle works end-to-end.
+        let rebroadcast_raw_tx = test_key
+            .build_p2pkh_spend(&P2pkhSpendArgs {
+                coinbase_txid_be: coinbase.txid_be,
+                coinbase_vout: coinbase.vout,
+                coinbase_value_zats: coinbase.value_zats,
+                recipient: &recipient_address,
+                target_height: coinbase.target_height,
+            })
+            .map_err(|error| eyre!("transparent signer rejected the rebroadcast: {error}"))?;
+        let rebroadcast_outcome = json_rpc
+            .broadcast_transaction(RawTransactionBytes::new(rebroadcast_raw_tx))
+            .await?;
+        let rebroadcast_txid = match &rebroadcast_outcome {
+            TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id }) => {
+                *transaction_id
+            }
+            _ => {
+                return Err(eyre!(
+                    "Zebra rejected the rebroadcast after invalidateblock: {rebroadcast_outcome:?}"
+                ));
+            }
+        };
+        assert_eq!(
+            rebroadcast_txid, broadcast_txid,
+            "rebroadcast must produce the same txid as the original broadcast"
+        );
 
-    let readded_entry = wait_for_added(&mut event_stream, broadcast_txid, MEMPOOL_OBSERVE_TIMEOUT)
-        .await
-        .map_err(|error| {
-            eyre!(
-                "polling source did not surface rebroadcast Added for txid {}: {error}",
-                hex::encode(broadcast_txid.as_bytes())
-            )
-        })?;
-    assert_eq!(
-        readded_entry.transaction_id, broadcast_txid,
-        "post-reorg rebroadcast Added carries a different txid than the original"
-    );
+        let readded_entry =
+            wait_for_added(&mut event_stream, broadcast_txid, MEMPOOL_OBSERVE_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    eyre!(
+                        "polling source did not surface rebroadcast Added for txid {}: {error}",
+                        hex::encode(broadcast_txid.as_bytes())
+                    )
+                })?;
+        assert_eq!(
+            readded_entry.transaction_id, broadcast_txid,
+            "post-reorg rebroadcast Added carries a different txid than the original"
+        );
+        Ok(())
+    }
+    .await;
 
-    // Restore the chain so subsequent runs in the same regtest sidecar
-    // session see a clean linear history. Best-effort; even if the call
-    // fails, the test result already passed/failed on the substantive
-    // assertion.
+    // Restore the chain even when a post-invalidation assertion fails, so a
+    // retry or a later live test never inherits this scenario's invalid tip.
     let _ = rpc_reconsider_block(&env, &mined_block_hash).await;
     let _ = regtest_generate_blocks(&env, 1).await;
-    Ok(())
+    post_invalidation_result
 }

@@ -118,7 +118,13 @@ pub struct BulkCatchupRunConfig {
 }
 
 impl BulkCatchupRunConfig {
-    fn canonical_store_options(&self) -> ChainStoreOptions {
+    /// Returns the durable store options required by this ingest configuration.
+    ///
+    /// Callers that open the primary store themselves must use these options so
+    /// the immutable reorg-window and raw-blob-retention contracts match the
+    /// writer configuration.
+    #[must_use]
+    pub fn canonical_store_options(&self) -> ChainStoreOptions {
         canonical_writer_store_options(
             self.node.network,
             self.reorg_window_blocks,
@@ -240,9 +246,8 @@ where
 /// Returns `Some(commit_outcome)` when at least one chain epoch was
 /// committed and `None` when the requested range was already present in
 /// the store. The supplied store must have been opened with the same
-/// [`ChainStoreOptions`] bulk catchup expects, including
-/// `config.reorg_window_blocks` and `config.raw_blob_policy.to_retention()`;
-/// `RocksDB`
+/// [`ChainStoreOptions`] returned by
+/// [`BulkCatchupRunConfig::canonical_store_options`]; `RocksDB`
 /// enforces a single primary handle per database, so a caller that
 /// needs to expose readable surfaces (the `IngestControl` gRPC service)
 /// during bulk catchup must open the store once and pass it to this entry

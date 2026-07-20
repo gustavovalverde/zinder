@@ -39,7 +39,7 @@ use zinder_core::{
 use zinder_ingest::run_bulk_catchup;
 use zinder_query::{WalletQuery, WalletQueryApi};
 use zinder_source::{NodeSource, SourceBlock};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 
 use crate::common::{
@@ -140,7 +140,7 @@ async fn bulk_catchup_and_sample_tip_coinbase(
     let block_at_tip = source.fetch_block_at(tip_height).await?;
     let sample = sample_first_coinbase_output(&block_at_tip)?;
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     Ok((tempdir, store, sample, activations))
 }
 

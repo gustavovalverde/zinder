@@ -34,7 +34,7 @@ use tempfile::tempdir;
 use zinder_core::{BlockHeight, MinedTransaction, Network, TxStatus};
 use zinder_ingest::run_bulk_catchup;
 use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
@@ -106,7 +106,7 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
         .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let wallet_query = WalletQuery::new(store, (), activations.clone());
 
     let coinbase_transaction = wallet_query

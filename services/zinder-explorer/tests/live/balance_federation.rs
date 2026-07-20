@@ -29,7 +29,7 @@ use zinder_query::{
     WalletQueryGrpcAdapter,
 };
 use zinder_source::{NodeSource as _, SourceBlock};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::{
     live::{LiveTestEnv, init, require_live_for},
     sample_regtest_upgrade_activations,
@@ -140,8 +140,7 @@ async fn catch_up_and_sample(
         .ok_or_else(|| eyre!("bulk catchup did not commit"))?;
     let block = source.fetch_block_at(tip).await?;
     let script_hash = sample_coinbase_script_hash(&block)?;
-    let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+    let store = PrimaryChainStore::open(&storage_path, config.canonical_store_options())?;
     Ok((tempdir, store, script_hash, from_height))
 }
 

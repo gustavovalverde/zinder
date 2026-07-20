@@ -36,8 +36,7 @@ use zinder_source::{
     decode_rpc_block_hash,
 };
 use zinder_store::{
-    ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, ChainStoreOptions,
-    PrimaryChainStore, RawBlobRetention,
+    ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEventHistoryRequest, PrimaryChainStore,
 };
 use zinder_testkit::{one_leaf_sapling_frontier, sample_regtest_upgrade_activations};
 
@@ -67,13 +66,6 @@ fn bundled_materialized_view_store(
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?)
-}
-
-fn test_all_blob_store_options() -> ChainStoreOptions {
-    ChainStoreOptions {
-        raw_blob_retention: RawBlobRetention::All,
-        ..ChainStoreOptions::for_network(Network::ZcashTestnet)
-    }
 }
 
 fn empty_checkpoint(block_id: BlockId) -> CommitmentTreeCheckpoint {
@@ -150,7 +142,8 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     );
     assert_eq!(fetched_heights.lock().as_slice(), [source_block.height]);
 
-    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
+    let store =
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     assert_eq!(
         store
             .chain_event_history(ChainEventHistoryRequest::with_default_limit(None))?
@@ -249,7 +242,8 @@ async fn materialized_view_replay_catches_up_checkpoint_bootstrap_and_block_comm
         allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
-    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
+    let store =
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let readiness = Readiness::default();
 
     run_bulk_catchup_until_complete(&bulk_catchup_config, &source, &store, &readiness)
@@ -504,7 +498,8 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
         allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
-    let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
+    let store =
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let readiness = Readiness::default();
 
     let outcome =

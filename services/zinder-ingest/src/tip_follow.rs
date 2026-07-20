@@ -20,7 +20,7 @@ use zinder_source::{
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
-    ChainEpochReader, PrimaryChainStore, ReorgWindowChange,
+    ChainEpochReader, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
 };
 
 use crate::artifact_builder::{
@@ -86,6 +86,23 @@ pub struct TipFollowConfig {
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
+impl TipFollowConfig {
+    /// Returns the durable store options required by this ingest configuration.
+    ///
+    /// Callers that open the primary store themselves must use these options so
+    /// the immutable reorg-window and raw-blob-retention contracts match the
+    /// writer configuration.
+    #[must_use]
+    pub fn canonical_store_options(&self) -> ChainStoreOptions {
+        canonical_writer_store_options(
+            self.node.network,
+            self.reorg_window_blocks,
+            self.canonical_rocksdb_budget,
+            self.raw_blob_policy,
+        )
+    }
+}
+
 /// Follows the upstream node tip until `cancel` is triggered, updating
 /// `readiness` after every iteration.
 pub async fn tip_follow<Source>(
@@ -106,12 +123,7 @@ where
 /// Binaries use this when they need to share the primary store handle with a
 /// process-local adapter, such as the private ingest-control endpoint.
 pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainStore, IngestError> {
-    let store_options = canonical_writer_store_options(
-        config.node.network,
-        config.reorg_window_blocks,
-        config.canonical_rocksdb_budget,
-        config.raw_blob_policy,
-    );
+    let store_options = config.canonical_store_options();
     PrimaryChainStore::open(&config.storage_path, store_options).map_err(IngestError::from)
 }
 

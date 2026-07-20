@@ -13,7 +13,7 @@ use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, BlockHeightRange};
 use zinder_ingest::run_bulk_catchup;
 use zinder_query::{WalletQuery, WalletQueryApi};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
@@ -63,7 +63,7 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     let _outcome = run_bulk_catchup(&bulk_catchup_config, &source).await?;
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let wallet_query = WalletQuery::new(store, (), Arc::clone(&activations));
 
     let measurement_start = std::time::Instant::now();
@@ -187,7 +187,7 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
     assert_eq!(commit_outcome.chain_epoch.visible_tip_height, tip_height);
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let wallet_query = WalletQuery::new(store, (), Arc::clone(&activations));
 
     let measurement_start = std::time::Instant::now();
