@@ -533,6 +533,13 @@ impl ChainFixture {
         self
     }
 
+    pub(crate) fn with_canonical_genesis_parent(mut self) -> Self {
+        if let Some(first_block) = self.blocks.first_mut() {
+            first_block.parent_hash = self.network.genesis_hash();
+        }
+        self
+    }
+
     /// Returns a new fixture that shares blocks `< divergence_height` with
     /// `self` and is empty from `divergence_height` onwards.
     ///
@@ -799,7 +806,13 @@ impl ChainFixture {
             .collect()
     }
 
-    fn canonical_transaction_rows(&self) -> Vec<FixtureTransactionRows> {
+    /// Returns the complete ordered transaction rows used by canonical replay.
+    ///
+    /// Explicit transaction rows are merged with transparent output and spend
+    /// facts so production-store fixtures consume the same semantic source as
+    /// [`Self::chain_epoch_artifacts`].
+    #[must_use]
+    pub(crate) fn canonical_transaction_rows(&self) -> Vec<FixtureTransactionRows> {
         build_fixture_transaction_rows(
             &self.transaction_rows,
             &self.transparent_outputs_by_outpoint,

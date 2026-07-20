@@ -30,7 +30,6 @@ tonic-reflection.workspace = true
 tracing.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
-zinder-materialized-views.workspace = true
 zinder-proto.workspace = true
 zinder-query.workspace = true
 zinder-runtime.workspace = true

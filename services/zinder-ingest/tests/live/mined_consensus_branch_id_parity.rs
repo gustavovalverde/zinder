@@ -2,11 +2,15 @@
     missing_docs,
     reason = "Live test names describe the behavior under test."
 )]
+#![allow(
+    clippy::too_long_first_doc_paragraph,
+    reason = "The module documentation records the complete end-to-end parity path before the test declaration."
+)]
 
-//! Live regression: `MinedDetails.consensus_branch_id` returned by the typed
+//! Live regression: `MinedTransactionChainContext.consensus_branch_id` returned by the typed
 //! `WalletQueryApi::transaction` lookup matches what the running node's
 //! upgrade activations say is active at the mined height.
-//!
+
 //! Closes the wire-level gap left open by `lightwalletd_grpc` integration
 //! tests, which only exercise the in-process adapter against a synthetic
 //! table. This test follows the end-to-end production path:
@@ -18,7 +22,7 @@
 //! 4. Pick the tip block's coinbase via
 //!    `WalletQueryApi::transaction_at_block_index(tip, 0)`.
 //! 5. Look up that txid via `WalletQueryApi::transaction(...)`.
-//! 6. Assert `MinedDetails.consensus_branch_id == activations.consensus_branch_id_at(mined_height)`.
+//! 6. Assert `MinedTransactionChainContext.consensus_branch_id == activations.consensus_branch_id_at(mined_height)`.
 //!
 //! Pins the regtest active-upgrade behavior in CI and proves parity on
 //! testnet and mainnet by opting in via `require_live_for`.
@@ -115,9 +119,12 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
         .transaction(coinbase_transaction_id, None)
         .await?;
     let TransactionStatus {
-        status: TxStatus::Mined(MinedTransaction {
-            location, details, ..
-        }),
+        status:
+            TxStatus::Mined(MinedTransaction {
+                location,
+                chain_context,
+                ..
+            }),
         ..
     } = status
     else {
@@ -133,13 +140,14 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
     );
     let expected_branch_id = activations.consensus_branch_id_at(coinbase_block_height);
     assert_eq!(
-        details.consensus_branch_id,
+        chain_context.consensus_branch_id,
         expected_branch_id,
-        "MinedDetails.consensus_branch_id must match the activations' branch id at the mined \
-         height (mined_height={}, activations_say={:#010x}, MinedDetails_says={:#010x})",
+        "MinedTransactionChainContext.consensus_branch_id must match the activations' branch \
+         id at the mined height (mined_height={}, activations_say={:#010x}, \
+         MinedTransactionChainContext_says={:#010x})",
         coinbase_block_height.value(),
         expected_branch_id,
-        details.consensus_branch_id,
+        chain_context.consensus_branch_id,
     );
     Ok(())
 }

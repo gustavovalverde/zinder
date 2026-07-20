@@ -37,7 +37,7 @@ use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::{encode_rpc_transaction_id_hex, encode_zinder_native_chain_name};
 use zinder_core::{BlockHeight, Network, TransactionId};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
+use zinder_ingest::run_bulk_catchup;
 use zinder_proto::v1::explorer::{
     PrivacyShape as WirePrivacyShape, TransactionDetailRequest, TransactionVersionKind,
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
@@ -131,11 +131,7 @@ fn assert_response_invariants(
             .location
             .as_ref()
             .ok_or_else(|| eyre!("mined transaction missing block location"))?,
-        Some(
-            transaction_location::Location::InMempool(_)
-            | transaction_location::Location::Conflicting(_),
-        )
-        | None => {
+        Some(transaction_location::Location::InMempool(_)) | None => {
             return Err(eyre!("expected mined location for tip-block coinbase"));
         }
     };
@@ -175,7 +171,6 @@ struct TransactionDetailFixture {
     sample_block_height: BlockHeight,
     explorer_adapter: ExplorerQueryGrpcAdapter,
     wallet_server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
-    ingest_control_handle: JoinHandle<Result<(), tonic::transport::Error>>,
     _tempdir: TempDir,
 }
 
@@ -189,10 +184,8 @@ impl TransactionDetailFixture {
             Arc::new(sample_regtest_upgrade_activations()),
         );
 
-        let (ingest_control_addr, ingest_control_handle) =
-            serve_ingest_control_grpc(network, store, MempoolIndex::new()).await?;
         let (wallet_grpc_addr, wallet_server_handle) =
-            serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
+            serve_wallet_query_grpc(wallet_query).await?;
         let canonical_secondary = SecondaryChainStore::open(
             tempdir.path().join("zinder-store"),
             tempdir.path().join("zinder-store-secondary-explorer"),
@@ -210,7 +203,6 @@ impl TransactionDetailFixture {
             sample_block_height: sample.block_height,
             explorer_adapter,
             wallet_server_handle,
-            ingest_control_handle,
             _tempdir: tempdir,
         })
     }
@@ -231,41 +223,14 @@ impl TransactionDetailFixture {
 
     async fn shutdown(&mut self) {
         self.wallet_server_handle.abort();
-        self.ingest_control_handle.abort();
         let _ = (&mut self.wallet_server_handle).await;
-        let _ = (&mut self.ingest_control_handle).await;
     }
 }
 
 async fn serve_wallet_query_grpc(
     wallet_query: WalletQuery<PrimaryChainStore>,
-    ingest_control_endpoint: String,
 ) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
-        wallet_query,
-        ServerInfoSettings::default(),
-        ingest_control_endpoint,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
-async fn serve_ingest_control_grpc(
-    network: Network,
-    store: PrimaryChainStore,
-    mempool_index: MempoolIndex,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter =
-        IngestControlGrpcAdapter::new(network, store, zinder_runtime::Readiness::default())
-            .with_mempool(mempool_index);
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(async move {

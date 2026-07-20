@@ -1,8 +1,8 @@
 //! `ExplorerQuery.TransactionHistory` handler.
 //!
-//! Reads the preserved transaction-history projection through bounded,
-//! filter-aware, bidirectional pages. The physical column-family name remains
-//! stable for the no-wipe migration; that identifier is not public vocabulary.
+//! Reads the preserved transaction-history materialized view through bounded,
+//! filter-aware, bidirectional pages. The physical column-family name is an
+//! internal storage detail, not public vocabulary.
 
 use std::{cmp::Reverse, collections::HashMap, fmt, sync::Arc};
 
@@ -23,7 +23,7 @@ use zinder_proto::v1::explorer::{
     TransactionHistoryFilter, TransactionHistoryReadFence, TransactionHistoryRequest,
     TransactionHistoryResponse, transaction_history_request,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
 use zinder_store::{SecondaryChainStore, chain_epoch_from_message, status_from_store_error};
@@ -35,24 +35,24 @@ use super::freshness::{
 };
 use super::intrinsic_value_balances::resolve_transaction_intrinsic_value_balances;
 use zinder_materialized_views::{
-    ConsumerProjectionState, MaterializedViewStore, MaterializedViewStoreError,
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreError,
     MaterializedViewStoreReadSnapshot, TRANSACTION_FEES_COLUMN_FAMILY,
     TRANSACTION_HISTORY_COLUMN_FAMILY, TRANSACTION_HISTORY_CONSUMER_NAME,
     TRANSACTION_HISTORY_KEY_LEN, TransactionFeesConsumer, TransactionHistoryConsumer,
 };
 
-/// Typed lifecycle state for the optional transaction-history projection.
+/// Typed lifecycle state for the optional transaction-history materialized view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TransactionHistoryProjectionReadiness {
+pub(crate) enum TransactionHistoryMaterializedViewReadiness {
     /// The selected workload deliberately omits transaction history.
     Omitted,
-    /// The projection is selected and schema-compatible but has no durable position yet.
+    /// The materialized view is selected and schema-compatible but has no durable position yet.
     Materializing,
-    /// The projection has a durable epoch, tip, revision, and optional verified coverage.
-    Available(ConsumerProjectionState),
+    /// The materialized view has a durable epoch, tip, revision, and optional verified coverage.
+    Available(MaterializedViewState),
 }
 
-impl TransactionHistoryProjectionReadiness {
+impl TransactionHistoryMaterializedViewReadiness {
     pub(crate) const fn is_available(self) -> bool {
         matches!(self, Self::Available(_))
     }
@@ -66,44 +66,46 @@ impl TransactionHistoryProjectionReadiness {
             Self::Available(state)
                 if full_history_coverage(state)
                     && canonical_position == Some((
-                        state.projection_epoch_id,
-                        state.projection_tip_height,
-                        state.projection_tip_hash,
+                        state.chain_epoch_id,
+                        state.tip_height,
+                        state.tip_hash,
                     ))
         )
     }
 
-    pub(crate) fn require_available(self) -> Result<(), TransactionHistoryProjectionReadError> {
+    pub(crate) fn require_available(
+        self,
+    ) -> Result<(), TransactionHistoryMaterializedViewReadError> {
         match self {
             Self::Available(_) => Ok(()),
-            Self::Omitted => Err(TransactionHistoryProjectionReadError::Omitted),
-            Self::Materializing => Err(TransactionHistoryProjectionReadError::Materializing),
+            Self::Omitted => Err(TransactionHistoryMaterializedViewReadError::Omitted),
+            Self::Materializing => Err(TransactionHistoryMaterializedViewReadError::Materializing),
         }
     }
 }
 
-/// Failures returned by the typed transaction-history projection seam.
+/// Failures returned by the typed transaction-history materialized-view seam.
 #[derive(Debug, Error)]
-pub(crate) enum TransactionHistoryProjectionReadError {
-    #[error("transaction-history projection is omitted by the selected workload")]
+pub(crate) enum TransactionHistoryMaterializedViewReadError {
+    #[error("transaction-history materialized view is omitted by the selected workload")]
     Omitted,
-    #[error("transaction-history projection has not materialized a durable position")]
+    #[error("transaction-history materialized view has not recorded a durable position")]
     Materializing,
-    #[error("transaction-history projection storage read failed: {0}")]
+    #[error("transaction-history materialized-view storage read failed: {0}")]
     Storage(#[source] MaterializedViewStoreError),
-    #[error("transaction-history projection request failed: {0}")]
+    #[error("transaction-history materialized-view request failed: {0}")]
     Request(Status),
 }
 
-impl TransactionHistoryProjectionReadError {
+impl TransactionHistoryMaterializedViewReadError {
     pub(crate) fn into_status(self) -> Status {
         match self {
             Self::Omitted => ExplorerError::unsupported(
-                "TransactionHistory is omitted by the selected projection workload",
+                "TransactionHistory is omitted by the selected materialized-view workload",
             )
             .into(),
             Self::Materializing => ExplorerError::unsatisfied_precondition(
-                "transaction-history projection state is not available",
+                "transaction-history materialized-view state is not available",
             )
             .into(),
             Self::Storage(error) => ExplorerError::internal(error.to_string()).into(),
@@ -112,61 +114,65 @@ impl TransactionHistoryProjectionReadError {
     }
 }
 
-/// Typed read boundary for the optional transaction-history projection.
-pub(crate) trait TransactionHistoryProjectionReadApi:
+/// Typed read boundary for the optional transaction-history materialized view.
+pub(crate) trait TransactionHistoryMaterializedViewReadApi:
     fmt::Debug + Send + Sync + 'static
 {
     fn readiness(
         &self,
-    ) -> Result<TransactionHistoryProjectionReadiness, TransactionHistoryProjectionReadError>;
+    ) -> Result<
+        TransactionHistoryMaterializedViewReadiness,
+        TransactionHistoryMaterializedViewReadError,
+    >;
 
     fn read_snapshot(
         &self,
         request: &TransactionHistorySnapshotRequest,
-    ) -> Result<TransactionHistorySnapshotRead, TransactionHistoryProjectionReadError>;
+    ) -> Result<TransactionHistorySnapshotRead, TransactionHistoryMaterializedViewReadError>;
 }
 
 /// Current `RocksDB` implementation of the transaction-history read boundary.
 #[derive(Clone, Debug)]
-pub(crate) struct MaterializedViewStoreTransactionHistoryProjectionReader {
+pub(crate) struct TransactionHistoryMaterializedViewReader {
     store: MaterializedViewStore,
 }
 
-impl MaterializedViewStoreTransactionHistoryProjectionReader {
+impl TransactionHistoryMaterializedViewReader {
     pub(crate) const fn new(store: MaterializedViewStore) -> Self {
         Self { store }
     }
 }
 
-impl TransactionHistoryProjectionReadApi
-    for MaterializedViewStoreTransactionHistoryProjectionReader
-{
+impl TransactionHistoryMaterializedViewReadApi for TransactionHistoryMaterializedViewReader {
     fn readiness(
         &self,
-    ) -> Result<TransactionHistoryProjectionReadiness, TransactionHistoryProjectionReadError> {
+    ) -> Result<
+        TransactionHistoryMaterializedViewReadiness,
+        TransactionHistoryMaterializedViewReadError,
+    > {
         if !self.store.has_consumer(TRANSACTION_HISTORY_CONSUMER_NAME) {
-            return Ok(TransactionHistoryProjectionReadiness::Omitted);
+            return Ok(TransactionHistoryMaterializedViewReadiness::Omitted);
         }
         self.store
             .try_catch_up()
-            .map_err(TransactionHistoryProjectionReadError::Storage)?;
+            .map_err(TransactionHistoryMaterializedViewReadError::Storage)?;
         let state = self
             .store
-            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)
-            .map_err(TransactionHistoryProjectionReadError::Storage)?;
+            .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)
+            .map_err(TransactionHistoryMaterializedViewReadError::Storage)?;
         Ok(state.map_or(
-            TransactionHistoryProjectionReadiness::Materializing,
-            TransactionHistoryProjectionReadiness::Available,
+            TransactionHistoryMaterializedViewReadiness::Materializing,
+            TransactionHistoryMaterializedViewReadiness::Available,
         ))
     }
 
     fn read_snapshot(
         &self,
         request: &TransactionHistorySnapshotRequest,
-    ) -> Result<TransactionHistorySnapshotRead, TransactionHistoryProjectionReadError> {
+    ) -> Result<TransactionHistorySnapshotRead, TransactionHistoryMaterializedViewReadError> {
         self.readiness()?.require_available()?;
         read_transaction_history_snapshot(&self.store, request)
-            .map_err(TransactionHistoryProjectionReadError::Request)
+            .map_err(TransactionHistoryMaterializedViewReadError::Request)
     }
 }
 
@@ -191,7 +197,7 @@ const CURSOR_LEN: usize =
 
 /// Dependencies for one typed transaction-history public read.
 pub(crate) struct TransactionHistoryContext<'store> {
-    pub(crate) projection_reader: Arc<dyn TransactionHistoryProjectionReadApi>,
+    pub(crate) materialized_view_reader: Arc<dyn TransactionHistoryMaterializedViewReadApi>,
     pub(crate) materialized_view_store: Option<&'store MaterializedViewStore>,
     pub(crate) chain_store: Option<&'store SecondaryChainStore>,
     pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
@@ -200,7 +206,7 @@ pub(crate) struct TransactionHistoryContext<'store> {
 /// Executes one `ExplorerQuery.TransactionHistory` request.
 #[allow(
     clippy::too_many_lines,
-    reason = "The handler keeps one projection snapshot, canonical joins, and response fence together."
+    reason = "The handler keeps one materialized-view snapshot, canonical joins, and response fence together."
 )]
 pub(crate) async fn transaction_history(
     context: TransactionHistoryContext<'_>,
@@ -223,7 +229,7 @@ pub(crate) async fn transaction_history(
         start: inner.start,
         include_total_count: inner.include_total_count,
     };
-    let snapshot_reader = Arc::clone(&context.projection_reader);
+    let snapshot_reader = Arc::clone(&context.materialized_view_reader);
     let snapshot_result =
         tokio::task::spawn_blocking(move || snapshot_reader.read_snapshot(&snapshot_request))
             .await
@@ -231,11 +237,13 @@ pub(crate) async fn transaction_history(
                 ExplorerError::internal(format!("transaction-history snapshot failed: {error}"))
             })?;
     let snapshot_read =
-        snapshot_result.map_err(TransactionHistoryProjectionReadError::into_status)?;
+        snapshot_result.map_err(TransactionHistoryMaterializedViewReadError::into_status)?;
 
-    let chain_epoch =
-        resolve_transaction_history_chain_epoch(wallet_client, snapshot_read.projection_state)
-            .await?;
+    let chain_epoch = resolve_transaction_history_chain_epoch(
+        wallet_client,
+        snapshot_read.materialized_view_state,
+    )
+    .await?;
     let mut page = snapshot_read.page;
     resolve_missing_transparent_fees(
         context.chain_store,
@@ -258,8 +266,8 @@ pub(crate) async fn transaction_history(
         )?,
     )
     .await;
-    let read_fence = projection_read_fence(snapshot_read.projection_state);
-    let coverage = projection_coverage(snapshot_read.projection_state);
+    let read_fence = materialized_view_read_fence(snapshot_read.materialized_view_state);
+    let coverage = materialized_view_coverage(snapshot_read.materialized_view_state);
     let response = TransactionHistoryResponse {
         freshness: Some(freshness),
         older_cursor: history_page_cursor(
@@ -286,7 +294,7 @@ pub(crate) async fn transaction_history(
         coverage,
         count_scope: transaction_history_count_scope(
             snapshot_read.total_matching_transactions,
-            snapshot_read.projection_state,
+            snapshot_read.materialized_view_state,
         ) as i32,
     };
     Ok(Response::new(response))
@@ -294,11 +302,11 @@ pub(crate) async fn transaction_history(
 
 async fn resolve_transaction_history_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
 ) -> Result<zinder_proto::v1::wallet::ChainEpoch, Status> {
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest {
-            at_epoch_id: Some(projection_state.projection_epoch_id.value()),
+        .visible_tip_block(Request::new(VisibleTipBlockRequest {
+            at_epoch_id: Some(materialized_view_state.chain_epoch_id.value()),
         }))
         .await?
         .into_inner();
@@ -306,13 +314,13 @@ async fn resolve_transaction_history_chain_epoch(
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let wallet_epoch = chain_epoch_from_message(chain_epoch.clone())
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    if wallet_epoch.id != projection_state.projection_epoch_id {
+    if wallet_epoch.id != materialized_view_state.chain_epoch_id {
         return Err(ExplorerError::unsatisfied_precondition(
-            "transaction-history projection epoch is unavailable from WalletQuery",
+            "transaction-history materialized-view epoch is unavailable from WalletQuery",
         )
         .into());
     }
@@ -331,7 +339,7 @@ pub(crate) struct TransactionHistorySnapshotRequest {
 pub(crate) struct TransactionHistorySnapshotRead {
     page: HistoryPage,
     projected_fee_records: HashMap<TransactionId, TransactionFeesRecord>,
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
     total_matching_transactions: Option<u64>,
 }
 
@@ -340,21 +348,21 @@ fn read_transaction_history_snapshot(
     request: &TransactionHistorySnapshotRequest,
 ) -> Result<TransactionHistorySnapshotRead, Status> {
     let snapshot = materialized_view_store.read_snapshot();
-    let projection_state = snapshot
-        .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)
+    let materialized_view_state = snapshot
+        .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
         .ok_or_else(|| {
             ExplorerError::unsatisfied_precondition(
-                "transaction-history projection state is not available",
+                "transaction-history materialized-view state is not available",
             )
         })?;
-    validate_request_read_fence(request.request_fence.as_ref(), projection_state)?;
+    validate_request_read_fence(request.request_fence.as_ref(), materialized_view_state)?;
     let anchor = resolve_transaction_history_anchor(
         &snapshot,
         request.start.clone(),
         request.direction,
         &request.filter,
-        projection_state,
+        materialized_view_state,
     )?;
     let mut page = read_transaction_history_page(
         &snapshot,
@@ -365,14 +373,14 @@ fn read_transaction_history_snapshot(
     )?;
     let projected_fee_records = join_projected_paid_fees(&snapshot, &mut page.entries)?;
     let total_matching_transactions = (request.include_total_count
-        && full_history_coverage(projection_state))
+        && full_history_coverage(materialized_view_state))
     .then(|| transaction_history_total_count(&snapshot, &request.filter))
     .transpose()?;
     drop(snapshot);
     Ok(TransactionHistorySnapshotRead {
         page,
         projected_fee_records,
-        projection_state,
+        materialized_view_state,
         total_matching_transactions,
     })
 }
@@ -412,7 +420,7 @@ fn resolve_transaction_history_anchor(
     start: Option<transaction_history_request::Start>,
     direction: TransactionHistoryDirection,
     filter: &HistoryFilter,
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
 ) -> Result<Option<HistoryAnchor>, Status> {
     match start {
         Some(transaction_history_request::Start::Cursor(cursor)) => {
@@ -423,9 +431,9 @@ fn resolve_transaction_history_anchor(
                 )
                 .into());
             }
-            if cursor_fence != projection_read_fence(projection_state) {
+            if cursor_fence != materialized_view_read_fence(materialized_view_state) {
                 return Err(ExplorerError::unsatisfied_precondition(
-                    "transaction-history cursor was invalidated by a projection change",
+                    "transaction-history cursor was invalidated by a materialized-view change",
                 )
                 .into());
             }
@@ -889,9 +897,9 @@ fn encode_history_cursor(
     cursor.extend_from_slice(entry.block_hash.as_bytes());
     cursor.extend_from_slice(&filter.cursor_bytes());
     cursor.extend_from_slice(&read_fence.chain_epoch_id.to_be_bytes());
-    cursor.extend_from_slice(&read_fence.projection_revision.to_be_bytes());
-    cursor.extend_from_slice(&read_fence.projection_tip_height.to_be_bytes());
-    cursor.extend_from_slice(read_fence.projection_tip_hash.as_bytes());
+    cursor.extend_from_slice(&read_fence.materialized_view_revision.to_be_bytes());
+    cursor.extend_from_slice(&read_fence.materialized_view_tip_height.to_be_bytes());
+    cursor.extend_from_slice(read_fence.materialized_view_tip_hash.as_bytes());
     cursor
 }
 
@@ -917,9 +925,9 @@ fn decode_history_cursor(
     let filter = HistoryFilter::from_cursor_bytes(&cursor[hash_end..filter_end])?;
     let fence = TransactionHistoryReadFence {
         chain_epoch_id: read_cursor_u64(cursor, filter_end)?,
-        projection_revision: read_cursor_u64(cursor, filter_end + 8)?,
-        projection_tip_height: read_cursor_u32(cursor, filter_end + 16)?,
-        projection_tip_hash: decode_cursor_hash(cursor, filter_end + 20)?,
+        materialized_view_revision: read_cursor_u64(cursor, filter_end + 8)?,
+        materialized_view_tip_height: read_cursor_u32(cursor, filter_end + 16)?,
+        materialized_view_tip_hash: decode_cursor_hash(cursor, filter_end + 20)?,
     };
     Ok((
         HistoryAnchor {
@@ -1001,32 +1009,36 @@ fn decode_cursor_hash(cursor: &[u8], offset: usize) -> Result<String, Status> {
     Ok(hash)
 }
 
-fn projection_read_fence(projection_state: ConsumerProjectionState) -> TransactionHistoryReadFence {
+fn materialized_view_read_fence(
+    materialized_view_state: MaterializedViewState,
+) -> TransactionHistoryReadFence {
     TransactionHistoryReadFence {
-        chain_epoch_id: projection_state.projection_epoch_id.value(),
-        projection_revision: projection_state.revision,
-        projection_tip_height: projection_state.projection_tip_height.value(),
-        projection_tip_hash: encode_rpc_block_hash_hex(projection_state.projection_tip_hash),
+        chain_epoch_id: materialized_view_state.chain_epoch_id.value(),
+        materialized_view_revision: materialized_view_state.revision,
+        materialized_view_tip_height: materialized_view_state.tip_height.value(),
+        materialized_view_tip_hash: encode_rpc_block_hash_hex(materialized_view_state.tip_hash),
     }
 }
 
 fn validate_request_read_fence(
     request_fence: Option<&TransactionHistoryReadFence>,
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
 ) -> Result<(), Status> {
-    if request_fence.is_some_and(|fence| fence != &projection_read_fence(projection_state)) {
+    if request_fence
+        .is_some_and(|fence| fence != &materialized_view_read_fence(materialized_view_state))
+    {
         return Err(ExplorerError::unsatisfied_precondition(
-            "transaction-history read fence does not match the current projection",
+            "transaction-history read fence does not match the current materialized view",
         )
         .into());
     }
     Ok(())
 }
 
-fn projection_coverage(
-    projection_state: ConsumerProjectionState,
+fn materialized_view_coverage(
+    materialized_view_state: MaterializedViewState,
 ) -> Option<TransactionHistoryCoverage> {
-    projection_state
+    materialized_view_state
         .coverage
         .map(|coverage| TransactionHistoryCoverage {
             complete_from_height: coverage.complete_from_height.value(),
@@ -1037,24 +1049,24 @@ fn projection_coverage(
 
 fn transaction_history_count_scope(
     total_matching_transactions: Option<u64>,
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
 ) -> TransactionHistoryCountScope {
-    if total_matching_transactions.is_some() && full_history_coverage(projection_state) {
+    if total_matching_transactions.is_some() && full_history_coverage(materialized_view_state) {
         TransactionHistoryCountScope::FullHistory
     } else {
         TransactionHistoryCountScope::Unspecified
     }
 }
 
-fn full_history_coverage(projection_state: ConsumerProjectionState) -> bool {
-    projection_state.coverage.is_some_and(|coverage| {
+fn full_history_coverage(materialized_view_state: MaterializedViewState) -> bool {
+    materialized_view_state.coverage.is_some_and(|coverage| {
         coverage.complete_from_height == BlockHeight::new(1)
-            && coverage.complete_through_height == projection_state.projection_tip_height
-            && coverage.complete_through_hash == projection_state.projection_tip_hash
+            && coverage.complete_through_height == materialized_view_state.tip_height
+            && coverage.complete_through_hash == materialized_view_state.tip_hash
     })
 }
 
-/// Hydrates `entries[*].paid_fee_zat` from the read snapshot's fee projection.
+/// Hydrates `entries[*].paid_fee_zat` from the read snapshot's fee materialized view.
 ///
 /// Coinbase rows are skipped (no fee record exists). Missing fee records leave
 /// `paid_fee_zat` unset; that is the explicit "not available" signal.
@@ -1231,7 +1243,7 @@ mod tests {
     use tempfile::tempdir;
     use zinder_core::{BlockHash, ChainEpochId};
     use zinder_materialized_views::{
-        ConsumerProjectionCoverage, MaterializedViewStoreOptions, ProjectionPreset,
+        MaterializedViewCoverage, MaterializedViewPreset, MaterializedViewStoreOptions,
     };
     use zinder_store::RocksDbResourceBudget;
 
@@ -1248,84 +1260,79 @@ mod tests {
     fn typed_readiness_distinguishes_omitted_materializing_and_verified_states()
     -> Result<(), Box<dyn std::error::Error>> {
         let wallet_path = tempdir()?;
-        let wallet_store = MaterializedViewStore::open_with_projection_preset(
+        let wallet_store = MaterializedViewStore::open_with_materialized_view_preset(
             wallet_path.path(),
-            ProjectionPreset::Wallet,
+            MaterializedViewPreset::Wallet,
             test_options(),
         )?;
-        let wallet_reader =
-            MaterializedViewStoreTransactionHistoryProjectionReader::new(wallet_store);
+        let wallet_reader = TransactionHistoryMaterializedViewReader::new(wallet_store);
         assert_eq!(
             wallet_reader.readiness()?,
-            TransactionHistoryProjectionReadiness::Omitted
+            TransactionHistoryMaterializedViewReadiness::Omitted
         );
 
         let explorer_path = tempdir()?;
-        let explorer_store = MaterializedViewStore::open_with_projection_preset(
+        let explorer_store = MaterializedViewStore::open_with_materialized_view_preset(
             explorer_path.path(),
-            ProjectionPreset::Explorer,
+            MaterializedViewPreset::Explorer,
             test_options(),
         )?;
-        let explorer_reader =
-            MaterializedViewStoreTransactionHistoryProjectionReader::new(explorer_store.clone());
+        let explorer_reader = TransactionHistoryMaterializedViewReader::new(explorer_store.clone());
         assert_eq!(
             explorer_reader.readiness()?,
-            TransactionHistoryProjectionReadiness::Materializing
+            TransactionHistoryMaterializedViewReadiness::Materializing
         );
 
-        let partial_state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(7),
-            projection_tip_height: BlockHeight::new(20),
-            projection_tip_hash: BlockHash::from_bytes([0x20; 32]),
+        let partial_state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(7),
+            tip_height: BlockHeight::new(20),
+            tip_hash: BlockHash::from_bytes([0x20; 32]),
             revision: 1,
             coverage: None,
         };
-        explorer_store
-            .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, partial_state)?;
+        explorer_store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, partial_state)?;
         let readiness = explorer_reader.readiness()?;
         assert!(readiness.is_available());
         assert!(!readiness.is_complete_at(Some((
-            partial_state.projection_epoch_id,
-            partial_state.projection_tip_height,
-            partial_state.projection_tip_hash,
+            partial_state.chain_epoch_id,
+            partial_state.tip_height,
+            partial_state.tip_hash,
         ))));
 
-        let checkpoint_state = ConsumerProjectionState {
+        let checkpoint_state = MaterializedViewState {
             revision: 2,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(8),
-                complete_through_height: partial_state.projection_tip_height,
-                complete_through_hash: partial_state.projection_tip_hash,
+                complete_through_height: partial_state.tip_height,
+                complete_through_hash: partial_state.tip_hash,
             }),
             ..partial_state
         };
-        explorer_store
-            .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, checkpoint_state)?;
+        explorer_store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, checkpoint_state)?;
         let readiness = explorer_reader.readiness()?;
         assert!(readiness.is_available());
         assert!(!readiness.is_complete_at(Some((
-            checkpoint_state.projection_epoch_id,
-            checkpoint_state.projection_tip_height,
-            checkpoint_state.projection_tip_hash,
+            checkpoint_state.chain_epoch_id,
+            checkpoint_state.tip_height,
+            checkpoint_state.tip_hash,
         ))));
 
-        let complete_state = ConsumerProjectionState {
+        let complete_state = MaterializedViewState {
             revision: 3,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(1),
-                complete_through_height: partial_state.projection_tip_height,
-                complete_through_hash: partial_state.projection_tip_hash,
+                complete_through_height: partial_state.tip_height,
+                complete_through_hash: partial_state.tip_hash,
             }),
             ..partial_state
         };
-        explorer_store
-            .put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, complete_state)?;
+        explorer_store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, complete_state)?;
         let readiness = explorer_reader.readiness()?;
         assert!(readiness.is_available());
         assert!(readiness.is_complete_at(Some((
-            complete_state.projection_epoch_id,
-            complete_state.projection_tip_height,
-            complete_state.projection_tip_hash,
+            complete_state.chain_epoch_id,
+            complete_state.tip_height,
+            complete_state.tip_hash,
         ))));
         Ok(())
     }
@@ -1357,9 +1364,9 @@ mod tests {
         };
         let read_fence = TransactionHistoryReadFence {
             chain_epoch_id: 1,
-            projection_revision: 2,
-            projection_tip_height: 42,
-            projection_tip_hash: "00".repeat(32),
+            materialized_view_revision: 2,
+            materialized_view_tip_height: 42,
+            materialized_view_tip_hash: "00".repeat(32),
         };
 
         let cursor = history_page_cursor(

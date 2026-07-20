@@ -40,7 +40,7 @@ pub use utxo_set_commitment::{
 pub use block_artifact::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockTransactionIndexArtifact, CompactBlockArtifact,
 };
-pub use block_header::BlockHeaderInfo;
+pub use block_header::BlockHeader;
 pub use block_id::{BlockId, BlockSelector};
 pub use canonical_block_facts::{
     CanonicalBlockFacts, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
@@ -84,8 +84,8 @@ pub use subtree_root::{
 pub use transaction::{
     AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
     BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, MAX_RAW_TRANSACTION_BYTES,
-    MinedDetails, MinedTransaction, RawTransactionBytes, TransactionBlobArtifact,
-    TransactionBroadcastResult, TransactionFactsArtifact, TransactionId,
+    MinedTransaction, MinedTransactionChainContext, RawTransactionBytes, TransactionBlobArtifact,
+    TransactionBroadcastOutcome, TransactionFactsArtifact, TransactionId,
     TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
     TransactionLocation, TxStatus,
 };

@@ -103,7 +103,7 @@ pub(crate) enum WalletServingPairError {
         /// Bounded generation slot that was expected to hold a candidate.
         generation: usize,
     },
-    /// Convergence exhausted its time or attempt bound without an exact pair.
+    /// Convergence exhausted its time or attempt bound without a wallet-serving pair.
     #[error(
         "canonical and wallet secondaries did not converge within the configured bounds; last outcome={last_outcome:?}"
     )]
@@ -112,7 +112,7 @@ pub(crate) enum WalletServingPairError {
         last_outcome: WalletServingConvergence,
     },
     /// Pair construction changed after pre-publication validation.
-    #[error("exact read pair changed during publication: {0}")]
+    #[error("wallet-serving read pair changed during publication: {0}")]
     PairPublication(zinder_query::QueryError),
 }
 

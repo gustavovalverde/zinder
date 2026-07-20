@@ -28,7 +28,7 @@ use crate::{
     writer::construction::{
         canonical_build_block, compact_block_commitments, register_prohibited_read_metrics,
     },
-    writer::control::{CanonicalControlCommand, handle_canonical_control_command},
+    writer::control::{CanonicalControlCommand, apply_canonical_control_command},
 };
 
 /// Polling and bounded-source settings for canonical following.
@@ -213,7 +213,7 @@ pub struct CanonicalReorgWindowExceeded {
     pub local_tip: BlockId,
     /// Latest atomic source observation.
     pub source_tip: BlockId,
-    /// Authenticated finality boundary that source discovery may not cross.
+    /// Authenticated settlement boundary that source discovery may not cross.
     pub settled_tip: BlockId,
     /// Minimum replacement depth required to continue discovery.
     pub required_depth: u32,
@@ -360,7 +360,7 @@ where
     loop {
         if let Some(control_commands) = control_commands.as_mut() {
             while let Ok(command) = control_commands.try_recv() {
-                handle_canonical_control_command(&mut store, command);
+                apply_canonical_control_command(&mut store, command);
             }
         }
         if follower.cancel.is_cancelled() {
@@ -467,7 +467,7 @@ where
                         }
                         command = control_receiver.recv() => {
                             command.is_none_or(|command| {
-                                handle_canonical_control_command(&mut store, command);
+                                apply_canonical_control_command(&mut store, command);
                                 false
                             })
                         }

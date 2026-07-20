@@ -74,7 +74,7 @@ pub struct TipFollowConfig {
     /// service is ready as soon as the store is at most one block behind the
     /// observed node tip.
     pub lag_threshold_blocks: u64,
-    /// Optional lag boundary that returns control to the unified phase
+    /// Optional lag boundary that returns control to the phase-driven
     /// classifier so bulk catchup can replace serial tip-follow immediately.
     /// Standalone tip-follow callers leave this unset.
     pub phase_exit_lag_blocks: Option<u32>,
@@ -124,7 +124,7 @@ pub fn open_tip_follow_store(config: &TipFollowConfig) -> Result<PrimaryChainSto
 /// otherwise flip readiness to `Ready`. While the gate is unhydrated, the
 /// readiness state stays in `Syncing` so consumers do not observe a
 /// "ready" writer that has not yet rebuilt its in-process mempool index.
-/// Pass `None` for callers that do not run the mempool orchestrator
+/// Pass `None` for callers that do not run the live mempool owner
 /// (tests, bulk catchup).
 ///
 /// The caller-owned store must use the same immutable raw-blob retention as
@@ -170,7 +170,7 @@ where
 )]
 #[allow(
     clippy::too_many_lines,
-    reason = "the tip-follow loop is one auditable sequence of select+recover+commit+finalize+readiness; splitting it would scatter the contract across helpers without simplifying any single decision."
+    reason = "the tip-follow loop is one auditable sequence of select+recover+commit+settle+readiness; splitting it would scatter the contract across helpers without simplifying any single decision."
 )]
 async fn run_tip_follow_loop<Source, Prepare>(
     config: &TipFollowConfig,
@@ -246,7 +246,7 @@ where
         };
 
         if let Some(commit_outcome) = iteration.commit_outcome.as_ref() {
-            match finalize_tip_if_ready(config, &store, commit_outcome.chain_epoch) {
+            match advance_settled_tip_if_ready(config, &store, commit_outcome.chain_epoch) {
                 Ok(Some(settled_tip_advance_outcome)) => {
                     iteration.commit_outcome = Some(settled_tip_advance_outcome);
                 }
@@ -387,7 +387,7 @@ fn set_tip_follow_readiness(
 
     // Don't override retention-driven warning states with the lag-derived
     // Ready: the retention task owns the cursor-at-risk lifecycle and the
-    // orchestrator owns mempool source/hydration causes. Leaving those in
+    // live mempool owner owns mempool source/hydration causes. Leaving those in
     // place keeps each subsystem the source of truth for its own causes. The
     // tip-follow observation still owns current and target heights, so advance
     // those fields while the orthogonal warning remains active.
@@ -1016,7 +1016,7 @@ fn chain_epoch_for_tip_commit(
     })
 }
 
-fn finalize_tip_if_ready(
+fn advance_settled_tip_if_ready(
     config: &TipFollowConfig,
     store: &PrimaryChainStore,
     chain_epoch: ChainEpoch,

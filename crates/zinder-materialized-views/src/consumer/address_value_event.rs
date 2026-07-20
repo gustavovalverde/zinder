@@ -159,7 +159,7 @@ mod tests {
 
     use super::{AddressValueEvent, AddressValueEventKind, address_value_events};
     use crate::consumer::block_commit_context::{
-        BlockCommitContext, BlockCommitPayload, TransparentSpendFacts,
+        BlockCommitContext, BlockCommitInput, TransparentSpendFacts,
     };
 
     const ADDRESS_A: TransparentAddressScriptHash =
@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn block_with(transactions: Vec<TransactionFactsArtifact>) -> BlockCommitContext {
-        let payload = BlockCommitPayload {
+        let payload = BlockCommitInput {
             height: BlockHeight::new(100),
             block_hash: BlockHash::from_bytes([1; 32]),
             previous_block_hash: BlockHash::from_bytes([0; 32]),

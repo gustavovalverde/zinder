@@ -7,7 +7,7 @@ The release runtime serves wallets that speak [lightwalletd](https://github.com/
 ## Wallet integration paths
 
 - **Existing lightwalletd clients** keep their `CompactTxStreamer` integration and point it at `zinder-compat-lightwalletd`. ZODL and Vizor use this protocol shape, although each current wallet release still needs end-to-end validation before Zinder claims support.
-- **Native wallet adapters** can implement the `WalletQuery` Rust contract when they need epoch-pinned full blocks, transaction status, chain events, mempool state, or typed broadcast results. Deploying such an adapter is a custom composition.
+- **Native wallet adapters** can implement the `WalletQuery` Rust contract when they need epoch-pinned full blocks, transaction status, chain events, mempool state, or typed broadcast outcomes. Deploying such an adapter is a custom composition.
 - **Rust wallet libraries and applications** can use `zinder-client`. `RemoteChainIndex` targets a separately composed native endpoint, while `LocalChainIndex` is limited to colocated stored reads.
 - **Explorers and application backends** use epoch-consistent wallet reads plus the optional `ExplorerQuery` plane for block summaries, transaction details, mempool views, typed search, and rebuildable materialized views.
 
@@ -18,7 +18,7 @@ The deployment target is single-operator self-hosting backed by one Zebra node. 
 ## Quickstart
 
 The supported wallet-serving topology uses three independent release runtimes
-on one host filesystem: `zinder-ingest` owns canonical facts,
+on one host filesystem: `zinder-ingest` owns canonical storage,
 `zinder-projector` owns the wallet projection, and
 `zinder-compat-lightwalletd` serves one immutable exact-fence pair. Query,
 explorer, and mixed single-container images are not built or published by the
@@ -42,8 +42,8 @@ identities for one lane per network. Override
 value before starting a side-by-side rebuild lane.
 
 The writer becomes ready only after canonical catch-up and a complete mempool
-snapshot. The projector remains unready until it has built or resumed a
-schema-v1 wallet store and reached the writer's authenticated event fence. The
+snapshot. The projector remains unready until it has built or resumed the
+current wallet-store format and reached the writer's authenticated event fence. The
 compatibility service becomes ready only after its canonical and wallet
 secondaries converge to one exact fence.
 
@@ -80,7 +80,7 @@ lifecycle, see
 ## Architecture at a glance
 
 Zinder indexes the chain once and serves one shared chain view to wallets,
-applications, and explorers. Canonical facts remain the source of truth, while
+applications, and explorers. Canonical data remains the source of truth, while
 selected projections provide rebuildable views for specific query workloads.
 
 ```mermaid
@@ -93,17 +93,17 @@ flowchart LR
     APIs --> Consumers["Wallets · applications · explorers"]
 ```
 
-The [indexer architecture](docs/architecture/canonical-projection-architecture.md) explains
+The [indexer architecture](docs/architecture/canonical-materialized-view-architecture.md) explains
 how canonical indexing, projection selection, and API serving fit together.
 
 ### Planes
 
-- **Node source boundary** (`zinder-source`). All Zebra node coupling is isolated here. Adapters normalize upstream node observations into `NodeSource` values; no other crate imports Zebra or source-specific types, so a new source backend is a new module here rather than a workspace-wide refactor. See [node source boundary](docs/architecture/node-source-boundary.md).
-- **Chain ingestion plane** (`zinder-ingest`). The only writer to canonical storage. Owns fresh construction, continuous following, reorg handling, the authenticated canonical event stream, and live mempool state. See [chain ingestion](docs/architecture/chain-ingestion.md), [chain events](docs/architecture/chain-events.md), and [ADR-0015](docs/adrs/0015-unified-phase-driven-ingest.md).
+- **Node source boundary** (`zinder-source`). Adapters normalize upstream node observations into `NodeSource` values. Authoritative chain facts enter only through this boundary; optional upstream-health checks and source-format parsing elsewhere cannot become fallback chain readers or parallel followers. See [node source boundary](docs/architecture/node-source-boundary.md).
+- **Chain ingestion plane** (`zinder-ingest`). The only writer to canonical storage. Owns fresh construction, continuous following, reorg handling, the authenticated canonical event stream, and live mempool state. See [chain ingestion](docs/architecture/chain-ingestion.md), [chain events](docs/architecture/chain-events.md), and [ADR-0015](docs/adrs/0015-phase-driven-ingest.md).
 - **Canonical storage** (`zinder-store`). RocksDB-backed `RocksDbCanonicalStore` and `RocksDbCanonicalSecondary` roles expose domain-shaped canonical operations. RocksDB types remain private, and readers bind to one `ChainEpoch` or `CanonicalEventFence` before reading. See [storage backend](docs/architecture/storage-backend.md) and [ADR-0003](docs/adrs/0003-canonical-storage-access-boundary.md).
-- **Wallet projection plane** (`zinder-projector`, `zinder-wallet-*`). The projector is the sole wallet-store writer. It constructs and continuously follows schema-v1 wallet state at authenticated canonical event fences; the query crate remains a Rust library contract consumed by compatibility, not a standalone production runtime. See [wallet data plane](docs/architecture/wallet-data-plane.md).
-- **Compatibility plane** (`zinder-compat-lightwalletd`, optional `zinder-compat-cipherscan`). Protocol-edge adapters preserve consumer contracts without shaping Zinder's native APIs around a product. The lightwalletd adapter translates `CompactTxStreamer` onto `WalletQueryApi`; the Cipherscan adapter translates REST and WebSocket contracts onto `ExplorerQuery` and `WalletQuery`. Neither owns canonical writes or parallel artifact construction. See [protocol boundary](docs/architecture/protocol-boundary.md) and the [Cipherscan adapter README](services/zinder-compat-cipherscan/README.md).
-- **Explorer plane** (`zinder-explorer`, optional). Serves block summaries, transaction details, typed search, mempool dashboards, and other explorer-shaped reads through `ExplorerQuery`. Owns materialized views (consuming canonical artifacts and the `ChainEvents` stream) that cannot affect canonical state; any derived view can be discarded and rebuilt from canonical artifacts. See [explorer plane](docs/architecture/explorer-plane.md) and [materialized-view plane](docs/architecture/materialized-view-plane.md) (the reusable SDK pattern this service exercises).
+- **Wallet projection plane** (`zinder-projector`, `zinder-wallet-*`). The projector is the sole wallet-store writer. It constructs and continuously follows the current wallet-store format at authenticated canonical event fences; the query crate remains a Rust library contract consumed by compatibility, not a standalone production runtime. See [wallet data plane](docs/architecture/wallet-data-plane.md).
+- **Compatibility plane** (`zinder-compat-lightwalletd`, optional `zinder-compat-cipherscan`). Protocol-edge adapters preserve consumer contracts without shaping Zinder's native APIs around a product. The lightwalletd adapter translates `CompactTxStreamer` onto `LightwalletdQueryApi` through `LightwalletdServingQuery`; the Cipherscan adapter translates REST and WebSocket contracts onto `ExplorerQuery` and `WalletQuery`. Neither owns canonical writes or parallel artifact construction. See [protocol boundary](docs/architecture/protocol-boundary.md) and the [Cipherscan adapter README](services/zinder-compat-cipherscan/README.md).
+- **Explorer plane** (`zinder-explorer`, optional). Serves block summaries, transaction details, typed search, mempool dashboards, and other explorer-shaped reads through `ExplorerQuery`. It opens, reads, and serves materialized views as a secondary. `zinder-materialized-views` owns the reusable store and consumers; no release runtime writes them unless a replay host is composed separately. See [explorer plane](docs/architecture/explorer-plane.md) and [materialized-view plane](docs/architecture/materialized-view-plane.md).
 
 Two foundation crates are shared across every plane: `zinder-core` (chain vocabulary: `ChainEpoch`, `BlockArtifact`, `Network`) and `zinder-proto` (`.proto` files and generated wire modules, including the pinned vendored lightwalletd schemas). Every binary also exposes an operational HTTP surface (`/healthz`, `/readyz`, `/metrics`) with typed readiness causes; that contract is owned by `zinder-runtime`. See [service operations](docs/architecture/service-operations.md).
 
@@ -125,10 +125,11 @@ The release workflow builds these deployable services:
 
 - `zinder-ingest`: the only writer to canonical RocksDB. Owns construction, following, retained canonical events, the private control endpoint, live mempool state, and upstream-source configuration.
 - `zinder-projector`: the only writer to wallet RocksDB. Owns fixed-fence construction, continuous canonical-event following, settlement, and bounded reorg reconciliation.
-- `zinder-compat-lightwalletd`: translates the vendored lightwalletd `CompactTxStreamer` gRPC service to `WalletQueryApi`.
+- `zinder-compat-lightwalletd`: translates the vendored lightwalletd `CompactTxStreamer` gRPC service through `LightwalletdQueryApi` and an exact canonical/wallet-projection serving pair.
 
-`zinder-query` is the internal Rust library for `WalletQueryApi`, request types,
-exact-fence serving pairs, and adapters. `zinder-explorer` and
+`zinder-query` is the internal Rust library for `WalletQueryApi`,
+`LightwalletdQueryApi`, request types, exact-fence serving pairs, and adapters.
+`zinder-explorer` and
 `zinder-compat-cipherscan` compile as optional services but are not release
 images.
 
@@ -159,7 +160,7 @@ cargo mutants --workspace --all-features \
   --file crates/zinder-store/src/chain_store.rs \
   --file crates/zinder-store/src/chain_store/validation.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'chain_event_history|finalized_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
+  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
 ```
 
 T3 live tests use the same env-var schema as production binaries and are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` plus a runtime `require_live()` check. Mainnet is rejected unless tests opt in by name. To run T3 against a local Zebra:

@@ -1,13 +1,13 @@
 # zinder-bench
 
 Fixed-range capture and storage benchmark harness for measuring Zinder against
-identical source bytes. It drives the current projection-coupled replay oracle
+identical source bytes. It drives canonical-store range replay
 and two backend-neutral canonical-replay round trips: one sorted external SST
 ingestion for `RocksDB` and binary `COPY` with deferred index construction for
 PostgreSQL.
 
-The captured fixture is the common input for all three arms. Current-schema
-replay also requires a matching starting canonical store supplied by the
+The captured fixture is the common input for all three arms. Canonical-store
+range replay also requires a matching starting canonical store supplied by the
 operator. Canonical storage arms create fresh candidate storage and compare every
 persisted semantic replay envelope against the fixture's ordered digest oracle.
 
@@ -40,9 +40,9 @@ Optional flags: `--node-auth-cookie <path>` for cookie auth, `--segment-blocks`
 
 The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
 `manifest.json` recording the network, range, consensus activations,
-projection-coupled oracle artifact version, replay tip hash, per-segment SHA-256,
+canonical artifact schema version, replay tip hash, per-segment SHA-256,
 and any shielded subtree roots that complete inside the range. Fixture format
-version 1 records the versioned `CanonicalBlockFacts` block-digest and
+version 2 records the versioned `CanonicalBlockFacts` block-digest and
 ordered sequence-digest evidence used by both canonical-replay-storage arms. Workload totals
 and per-block maxima let reviewers detect burst-dominated ranges.
 
@@ -103,7 +103,7 @@ captured range against the cold store. The operator supplies this clone; the
 harness does not snapshot a live store for you.
 
 For an unthresholded exploratory run, copy a stopped store directory while
-excluding its projection subdirectory:
+excluding its materialized view subdirectory:
 
 ```bash
 rsync -a --exclude '/materialized-views/' /var/lib/zinder/ ./fixtures/store-149999/
@@ -120,10 +120,10 @@ systemctl start zinder
 
 This stopped-store copy is a benchmark fixture, not a production recovery
 artifact. Production recovery remains blocked until the canonical writer and
-wallet projector can publish and verify one coherent canonical schema-v4 and
-wallet schema-v1 checkpoint bundle. Projection benchmarks require a fresh
-projection store for both fixed-range and retained-history construction. The
-harness rejects a pre-existing projection path instead of silently timing an
+wallet projector can publish and verify one coherent, schema-admitted checkpoint
+bundle. Materialized-view benchmarks require a fresh materialized-view store for both
+fixed-range and retained-history construction. The
+harness rejects a pre-existing materialized view path instead of silently timing an
 incremental catch-up. The clone's canonical tip must equal `from_height - 1`.
 Replay writes into the clone, so use one throwaway copy per run (or per
 configuration in a sweep).
@@ -146,13 +146,13 @@ When the harness runs inside Docker Desktop, place RocksDB stores on named
 Linux volumes rather than host bind mounts. The macOS virtiofs path can report
 direct-I/O support while producing padded SST file sizes that fail RocksDB
 manifest validation on reopen. Bind mounts remain appropriate for immutable
-fixture inputs and JSON reports; the writable canonical and projection stores
+fixture inputs and JSON reports; the writable canonical and materialized-view stores
 must use the container VM's ext4-backed named volumes.
 
-## 3. Run the projection-coupled replay oracle
+## 3. Run canonical-store range replay
 
 ```bash
-zinder-bench projection-coupled-replay \
+zinder-bench canonical-store-range-replay \
   --fixture ./fixtures/mainnet-150k-200k \
   --store ./fixtures/store-149999 \
   --block-prepare-concurrency 16 \
@@ -187,23 +187,23 @@ identical runs (each against a fresh store clone):
   segment response, which makes transport-latency A/B runs repeatable without
   changing the captured bytes.
 - `--block-cache-bytes <N>` for the canonical block-cache-size sweep.
-- `--projection-preset wallet|explorer` to drive one explicit projection
+- `--materialized-view-preset wallet|explorer` to drive one explicit materialized view
   diagnostic over the committed range. Neither preset builds ADR-0035's wallet
   plane: they do not own its live set, balances, address index, undo state, or
-  readiness contract. `explorer` also does not drive projection-startup
+  readiness contract. `explorer` also does not drive materialized view-startup
   historical backfills or the coverage verifier. Neither preset can produce a
   wallet construction or wallet-ready acceptance result.
-- `--projection-replay-scope fixed-range|retained-history` to compare only the
+- `--materialized view-replay-scope fixed-range|retained-history` to compare only the
   captured range (the default) or a full rebuild from retained canonical event
-  history. Fixed-range replay requires a fresh projection store in the clone.
+  history. Fixed-range replay requires a fresh materialized-view store in the clone.
 
-The source-planner controls exercise the source lane shared by
-projection-coupled bulk catchup and canonical construction. This command
+The source-planner controls exercise the source lane shared by production bulk
+catchup and canonical construction. This command
 still commits into `PrimaryChainStore`, so its results isolate source planning,
-admission, and downstream supply; they do not certify version-1 construction
-or the complete service composition. End-to-end version-1 evidence
+admission, and downstream supply; they do not certify canonical construction
+or the complete service composition. End-to-end canonical-construction evidence
 requires a separate checkpointed fixture replay with the authenticated
-predecessor tree checkpoint needed by the version-1 builder.
+predecessor tree checkpoint needed by the canonical builder.
 
 The command validates the effective limits as one set before replay. It rejects
 a segment response target above the hard response limit and a source byte
@@ -214,7 +214,7 @@ flags. This example is the zero-delay baseline; set the final flag to the
 measured delay for the latency arm:
 
 ```bash
-zinder-bench projection-coupled-replay \
+zinder-bench canonical-store-range-replay \
   --fixture ./fixtures/mainnet-dense-range \
   --store ./fixtures/store-before-dense-range \
   --block-prepare-concurrency 10 \
@@ -238,7 +238,7 @@ recorder. Exploratory unthresholded runs may omit it.
 
 The only acceptance boundary this command currently drives is canonical
 fixture replay: the timed call replays exactly the captured range into the
-supplied projection-coupled store. It does not open, build, validate, or promote a
+supplied canonical store. It does not open, build, validate, or promote a
 fresh database, so it is not a fresh canonical construction lifecycle. Opt in
 with the paired flags:
 
@@ -246,11 +246,11 @@ with the paired flags:
 - `--canonical-fixture-replay-hard-limit-secs`.
 
 The target must be positive and no greater than the hard limit. Thresholded
-canonical fixture replay is canonical-only and rejects `--projection-preset`,
-which keeps projection caches and work outside the accepted measurement. The
+canonical fixture replay is canonical-only and rejects `--materialized-view-preset`,
+which keeps materialized view caches and work outside the accepted measurement. The
 report validates final height, fixture-order tip hash, committed block count,
 and required telemetry before evaluating time. Production snapshot restore,
-canonical-replay-storage canonical construction, projection construction, following, and
+canonical-replay-storage canonical construction, materialized view construction, following, and
 wallet readiness gain report fields only when their real drivers own those
 full boundaries.
 
@@ -264,7 +264,7 @@ Omit `--report` to print the JSON to stdout (progress logs go to stderr).
 
 ## 4. Measure a complete RocksDB storage lifecycle
 
-`rocksdb-storage-lifecycle` builds two fresh version-1 stores from an existing
+`rocksdb-storage-lifecycle` builds fresh canonical and wallet stores from an existing
 Zebra. It freezes one source tip, retains every non-genesis canonical block,
 publishes and cold-admits canonical READY, derives the wallet store from the
 authenticated canonical replay, then cold-admits both stores and compares
@@ -299,7 +299,7 @@ The report exposes two independent acceptance measurements:
 
 - `canonical_storage_ready` covers source discovery, complete-history
   canonical construction, READY publication, and an independent cold reopen;
-- `wallet_storage_ready` covers wallet projection construction after canonical readiness
+- `wallet_storage_ready` covers wallet materialized view construction after canonical readiness
   and the final cold admission of both stores.
 
 Optional target and hard-limit pairs are
@@ -366,7 +366,7 @@ zinder-bench canonical-replay-storage postgres \
   --report ./postgres-canonical-replay-storage-trial-01.json
 ```
 
-The CPU and memory values on a fact report describe the complete benchmark
+The CPU and memory values in a storage report describe the complete benchmark
 arm. PostgreSQL requires the client and database limits together, and their
 exact sum must equal the aggregate arm limits. Its report also identifies the
 database image independently from the benchmark-client image.
@@ -392,7 +392,7 @@ server stops.
 
 These commands prove a persisted canonical replay encoding round trip only. They
 do not persist compact blocks, tree state, subtree roots, `ChainEpoch`, or
-`ChainEvent`; exercise reorgs; build wallet or explorer projections; serve
+`ChainEvent`; exercise reorgs; build wallet projection or explorer materialized views; serve
 queries; measure fresh canonical construction; or certify either deployment
 topology.
 
@@ -414,16 +414,16 @@ component diagnostics in the external resource artifacts.
 - `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
 - `report_format_version`: machine-readable report contract version. The
-  closed measurement contract described here is version 2.
-- `measurement_kind`: `projection-coupled-fixture-replay`,
+  closed measurement contract described here is version 3.
+- `measurement_kind`: `canonical-store-range-replay`,
   `rocksdb-canonical-fixture-replay`, `canonical-replay-storage`, or a
   storage-lifecycle report. The tagged shape prevents block-local replay evidence from
-  acquiring placeholder lifecycle or projection-coupled telemetry fields.
+  acquiring placeholder lifecycle or canonical-store range-replay telemetry fields.
 - `provenance`: benchmark version, software revision, immutable image identity,
   build target OS/architecture, structured runner identity and resources, plus
   `run.trial_id`, `run.fixture_cache_policy`, and binary-generated start and
   completion Unix-millisecond timestamps.
-- `storage_candidate`: identifies `rocksdb-projection-coupled-oracle`,
+- `storage_candidate`: identifies `rocksdb-canonical-store-range-replay`,
   `rocksdb-canonical-replay-storage`, or `postgres-canonical-replay-storage`, including the logical model
   and the `rocksdb-single-host` or `postgres-scale-out` topology represented by
   that arm. This is candidate identity, not topology certification.
@@ -431,12 +431,12 @@ component diagnostics in the external resource artifacts.
   target/hard-limit evaluation. It is the only current acceptance boundary.
   There are no placeholder production lifecycle fields.
 - `fixture.contract_identity`, `fixture.fixture_format_version`,
-  `fixture.projection_coupled_oracle_artifact_schema_version`,
+  `fixture.canonical_artifact_schema_version`,
   `fixture.canonical_block_facts_digest_evidence`, `fixture.tip_hash_hex`, and
   `fixture.digest_sha256`: fixture provenance required to compare candidates
   against identical source bytes and digest contracts. Each driver verifies
   every segment SHA-256 before writing its rows. Version 1 requires the exact
-  fixture identity `canonical-fixture`; numeric version 1 alone is not enough.
+  fixture identity `canonical-fixture`; numeric version 2 alone is not enough.
 - `fixture.workload_density`: the immutable workload totals and per-block
   maxima copied from the captured fixture manifest.
 - `replay.wall_clock_seconds`, `replay.blocks_committed`,
@@ -476,21 +476,21 @@ component diagnostics in the external resource artifacts.
 - `replay.canonical_writer`: actual canonical store/artifact schema versions,
   sync-write and WAL/fsync durability mode, and the complete effective RocksDB
   resource budget, including the default cache size when no override is given.
-- `replay.projection_preset`: the projection workload replayed after canonical
+- `replay.materialized_view_preset`: the materialized-view workload replayed after canonical
   ingest, or `null` for a canonical-only run.
-- `replay.projection_replay_scope`: whether the projection arm measured only
+- `replay.materialized_view_replay_scope`: whether the materialized view arm measured only
   the fixed range or rebuilt all retained history.
-- `replay.projection_row_count`, `replay.projection_store_bytes`: selected
-  projection rows and final projection-store disk use.
-- `replay.projection_logical_write_bytes`,
-  `replay.projection_compaction_bytes`: serialized projection WriteBatch bytes
+- `replay.materialized_view_row_count`, `replay.materialized_view_store_bytes`: selected
+  materialized view rows and final materialized-view store disk use.
+- `replay.materialized_view_logical_write_bytes`,
+  `replay.materialized_view_compaction_bytes`: serialized materialized-view WriteBatch bytes
   and compaction I/O for the run. Logical write bytes are not WAL bytes;
   compaction bytes are `null` when both required RocksDB ticker families were
   not covered.
-- `replay.projection_event_cursor_at_tip`: `true` only after every selected
-  cursor in the reopened projection store equals canonical `LiveTail`.
-- `replay.projection_build_wall_clock_seconds`,
-  `replay.projection_store_reopen_seconds`: projection construction and
+- `replay.materialized_view_event_cursor_at_tip`: `true` only after every selected
+  cursor in the reopened materialized-view store equals canonical `LiveTail`.
+- `replay.materialized_view_build_wall_clock_seconds`,
+  `replay.materialized_view_store_reopen_seconds`: materialized view construction and
   populated-store reopen time.
 - `replay.epochs_committed`: committed chain epochs, or `null` when its metric
   family was not covered.
@@ -544,8 +544,8 @@ roots, and complete report-window coverage for every component.
   Zebra response generation, network jitter, or JSON and hexadecimal decoding.
   Fixture replay parses only the block header before handing the payload to
   canonical preparation, matching the production batch-source boundary.
-  Everything downstream runs the projection-coupled bulk-catchup pipeline against
-  `PrimaryChainStore`; version-1 construction shares the source planner but not
+  Everything downstream runs the production bulk-catchup pipeline against
+  `PrimaryChainStore`; canonical construction shares the source planner but not
   this command's canonical storage boundary.
 - Shielded subtree roots that complete inside the range are captured verbatim
   and served during replay, so post-Sapling ranges commit correctly.

@@ -17,7 +17,8 @@
 //!
 //! Construct one with writer defaults for primary stores and reader defaults
 //! for `RocksDB` secondaries. Operators may override individual fields through
-//! `[storage.canonical.rocksdb]` and `[storage.materialized_views.rocksdb]` in their TOML.
+//! `[storage.canonical.rocksdb]`, `[storage.materialized_views.rocksdb]`, and
+//! `[wallet.rocksdb]` in their TOML.
 
 /// Bounded `RocksDB` resource budget applied to one DB instance at open.
 ///
@@ -147,6 +148,16 @@ impl RocksDbResourceBudget {
         }
     }
 
+    /// Wallet-projection writer defaults.
+    ///
+    /// The wallet projection currently has the same multi-column-family write
+    /// posture as a materialized-view consumer, but it is a distinct durable
+    /// ownership domain and therefore has its own named profile.
+    #[must_use]
+    pub const fn wallet_projection_writer_defaults() -> Self {
+        Self::materialized_view_writer_defaults()
+    }
+
     /// Canonical-store reader defaults for secondary processes.
     ///
     /// `128 MiB` block cache, `32 MiB` WAL ceiling, `128` open file handles,
@@ -188,6 +199,16 @@ impl RocksDbResourceBudget {
             memtable_budget_bytes: 16 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
+    }
+
+    /// Wallet-projection reader defaults for immutable serving secondaries.
+    ///
+    /// The serving secondary currently uses the same resource profile as a
+    /// materialized-view reader, while retaining a distinct domain name at the
+    /// configuration boundary.
+    #[must_use]
+    pub const fn wallet_projection_reader_defaults() -> Self {
+        Self::materialized_view_reader_defaults()
     }
 
     /// Defaults for throwaway local test stores.
@@ -254,12 +275,11 @@ pub enum RocksDbStatisticsLevel {
     /// `zinder_store_rocksdb_ticker` exports nothing at this level.
     Off,
     /// Ticker counters only (`StatsLevel::ExceptHistogramOrTimers`), the
-    /// production default since the 2026-07-12 telemetry audit.
+    /// production default.
     #[default]
     Tickers,
     /// `RocksDB`'s own default level: tickers plus per-operation timer
-    /// histograms. Reserved for a live bloom/block-cache experiment that
-    /// needs histogram detail.
+    /// histograms. Use when histogram detail is required.
     Full,
 }
 
@@ -344,6 +364,18 @@ mod tests {
     }
 
     #[test]
+    fn wallet_projection_profiles_match_the_current_multi_family_profiles() {
+        assert_eq!(
+            RocksDbResourceBudget::wallet_projection_writer_defaults(),
+            RocksDbResourceBudget::materialized_view_writer_defaults()
+        );
+        assert_eq!(
+            RocksDbResourceBudget::wallet_projection_reader_defaults(),
+            RocksDbResourceBudget::materialized_view_reader_defaults()
+        );
+    }
+
+    #[test]
     fn local_test_defaults_fit_in_megabytes() {
         let budget = RocksDbResourceBudget::for_local_tests();
         assert!(budget.block_cache_bytes <= 64 * MIB);
@@ -398,8 +430,10 @@ mod tests {
         for budget in [
             RocksDbResourceBudget::canonical_writer_defaults(),
             RocksDbResourceBudget::materialized_view_writer_defaults(),
+            RocksDbResourceBudget::wallet_projection_writer_defaults(),
             RocksDbResourceBudget::canonical_reader_defaults(),
             RocksDbResourceBudget::materialized_view_reader_defaults(),
+            RocksDbResourceBudget::wallet_projection_reader_defaults(),
             RocksDbResourceBudget::for_local_tests(),
         ] {
             assert_eq!(budget.max_background_jobs, 2);
@@ -420,8 +454,10 @@ mod tests {
         for budget in [
             RocksDbResourceBudget::canonical_writer_defaults(),
             RocksDbResourceBudget::materialized_view_writer_defaults(),
+            RocksDbResourceBudget::wallet_projection_writer_defaults(),
             RocksDbResourceBudget::canonical_reader_defaults(),
             RocksDbResourceBudget::materialized_view_reader_defaults(),
+            RocksDbResourceBudget::wallet_projection_reader_defaults(),
             RocksDbResourceBudget::for_local_tests(),
         ] {
             assert_eq!(budget.statistics_level, RocksDbStatisticsLevel::Tickers);

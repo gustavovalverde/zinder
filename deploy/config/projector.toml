@@ -16,7 +16,9 @@ path = "/var/run/auth/.cookie"
 [storage]
 canonical_path = "/var/lib/zinder/canonical"
 canonical_secondary_path = "/var/lib/zinder/projector/canonical-secondary"
-wallet_path = "/var/lib/zinder/wallet"
+
+[wallet]
+path = "/var/lib/zinder/wallet"
 
 [projector]
 reorg_window_blocks = 100

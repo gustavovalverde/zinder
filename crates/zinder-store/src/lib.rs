@@ -83,15 +83,13 @@ pub use event_stream::{
 };
 pub use final_note_commitment_roots::FinalNoteCommitmentRootsStore;
 pub use format::{
-    AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
-    MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
-    SnapshotPageCursorAnchor, SnapshotPageCursorPayload, SnapshotPageStreamFamily,
-    StreamCursorError, StreamCursorTokenV1, TransparentHistoryCursorAnchor,
-    TransparentHistoryCursorPayload, TransparentHistoryStreamFamily,
+    AddressOutputCursorPayload, ChainEventStreamFamily, MempoolEventCursorPayload,
+    STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorAnchor, SnapshotPageCursorPayload,
+    StreamCursorError, StreamCursorTokenV1,
 };
 pub use grpc_status::{
     chain_event_stream_family_from_request, event_stream_start_from_request,
-    mempool_event_stream_family_from_request, status_from_store_error,
+    status_from_store_error,
 };
 pub use kv::{
     BoundedRocksDbOpen, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole,
@@ -108,11 +106,11 @@ pub use proto_codec::{
     chain_epoch_message, chain_event_envelope_message, chain_event_stream_family_from_message,
     chain_view_message, event_stream_start_from_message, event_stream_start_message,
     mempool_entry_from_message, mempool_entry_message, mempool_event_envelope_from_message,
-    mempool_event_envelope_message, mempool_event_stream_family_from_message,
-    outpoint_from_message, outpoint_message, stream_cursor_from_message_bytes,
-    transparent_mempool_output_from_message, transparent_mempool_output_message,
-    transparent_mempool_spend_from_message, transparent_mempool_spend_message,
-    transparent_output_entry_message, transparent_output_message, transparent_spend_message,
+    mempool_event_envelope_message, outpoint_from_message, outpoint_message,
+    stream_cursor_from_message_bytes, transparent_mempool_output_from_message,
+    transparent_mempool_output_message, transparent_mempool_spend_from_message,
+    transparent_mempool_spend_message, transparent_output_entry_message,
+    transparent_output_message, transparent_spend_message,
 };
 pub use raw_blob_retention::RawBlobRetention;
 pub use rocksdb_resource_budget::{RocksDbResourceBudget, RocksDbStatisticsLevel};

@@ -1,4 +1,4 @@
-//! Live regression: `MinedDetails.consensus_branch_id` transitions correctly
+//! Live regression: `MinedTransactionChainContext.consensus_branch_id` transitions correctly
 //! across a network-upgrade activation height.
 //!
 //! The companion test [`mined_consensus_branch_id_parity`] checks a single
@@ -215,7 +215,7 @@ async fn read_coinbase_consensus_branch_id<QueryApi: WalletQueryApi>(
         .transaction(coinbase_transaction_id, None)
         .await?;
     let TransactionStatus {
-        status: TxStatus::Mined(MinedTransaction { details, .. }),
+        status: TxStatus::Mined(MinedTransaction { chain_context, .. }),
         ..
     } = status
     else {
@@ -225,5 +225,5 @@ async fn read_coinbase_consensus_branch_id<QueryApi: WalletQueryApi>(
             status.status
         ));
     };
-    Ok(details.consensus_branch_id)
+    Ok(chain_context.consensus_branch_id)
 }

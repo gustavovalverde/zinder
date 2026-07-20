@@ -41,7 +41,7 @@ cargo mutants --workspace --all-features \
   --file crates/zinder-store/src/chain_store.rs \
   --file crates/zinder-store/src/chain_store/validation.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'chain_event_history|finalized_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
+  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
 ```
 
 Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<test_name>)'`. Tier filter: `-E 'test(/^integration::cli::/)'`. Integration tests live in each crate's `tests/{integration,live,perf}/` submodules; the per-crate binary is `tests/acceptance.rs`.

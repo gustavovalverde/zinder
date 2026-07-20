@@ -9,7 +9,7 @@ use zinder_bench::{
         CanonicalReplaySequencePosition,
         postgres::{
             POSTGRES_CANONICAL_REPLAY_SCHEMA_VERSION, POSTGRES_REPLAY_ENVELOPE_COMPRESSION,
-            PostgresCanonicalReplayConfig, PostgresCanonicalReplayResult,
+            PostgresCanonicalReplayConfig, PostgresCanonicalReplayReport,
             run_postgres_canonical_replay_storage,
         },
         rocksdb::{
@@ -283,7 +283,7 @@ async fn run_postgres(
 fn build_postgres_round_trip_output(
     manifest: &FixtureManifest,
     block_prepare_concurrency: NonZeroU32,
-    round_trip: PostgresCanonicalReplayResult,
+    round_trip: PostgresCanonicalReplayReport,
     benchmark_runtime: PostgresBenchmarkRuntimeEvidence,
     report_context: CanonicalReplayStorageReportContext,
 ) -> Result<CanonicalReplayStorageOutput, BenchError> {

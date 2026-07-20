@@ -519,7 +519,7 @@ mod tests {
         );
         assert_eq!(
             oracle.last_projected_block(),
-            Some(block_two.block_header.into_header_info().block_id)
+            Some(block_two.block_header.into_header().block_id)
         );
         assert_eq!(
             oracle

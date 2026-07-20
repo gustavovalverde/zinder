@@ -68,7 +68,7 @@ Every consumer declares one `MaterializedViewConsumerSchema` containing:
 - a stable `MaterializedViewConsumerName`;
 - a monotonically increasing schema version;
 - the complete set of owned column families; and
-- any older row versions the current reader explicitly accepts.
+- the single row version admitted by the current reader.
 
 Column-family ownership must be disjoint. Consumer names are persisted keys,
 not display labels, so renaming one is a storage migration rather than a source
@@ -81,12 +81,12 @@ cleanup.
 configured canonical path. Writer and reader processes resolve that path
 through `MaterializedViewStore::path_for_canonical`.
 
-The primary stages consumer rows, projection state, and cursor advances in one
+The primary stages consumer rows, materialized-view state, and cursor advances in one
 write batch. A crash cannot publish a cursor beyond the rows it describes. A
 secondary validates the container and every declared consumer after open and
-after each catch-up; it never reconciles schemas or writes primary state.
+after each catch-up; it never alters schemas or writes primary state.
 
-`MaterializedViewStore::read_snapshot` binds projection metadata and reads to
+`MaterializedViewStore::read_snapshot` binds materialized-view metadata and reads to
 one store sequence. Primary stores use a RocksDB snapshot. Secondary stores
 hold the shared side of the catch-up barrier for the snapshot lifetime, so a
 catch-up cannot advance the underlying sequence halfway through a multi-read
@@ -100,38 +100,30 @@ blocks named by each event, and calls
 point covered by the consumer's declared recovery source, not automatically
 from the oldest retained event.
 
-Consumers that make completeness claims persist `ConsumerProjectionState`
-beside their rows. It records the canonical epoch, projection tip, revision,
-and optional contiguous `ConsumerProjectionCoverage`. Cursor position alone is
+Consumers that make completeness claims persist `MaterializedViewState`
+beside their rows. It records the canonical epoch, materialized-view tip, revision,
+and optional contiguous `MaterializedViewCoverage`. Cursor position alone is
 progress evidence and must not be presented as historical completeness.
 
 A deterministic recovery source can be retained events, canonical artifacts,
-or an explicit checkpoint. Before clearing incompatible rows, the schema gate
-must prove that the declared source covers the history being replaced. If it
-does not, the operation fails instead of publishing partial history behind a
-fresh cursor.
+or an explicit checkpoint. Before activating a replacement store, operators
+must prove that the declared source covers the history being rebuilt. This
+prevents a replacement from publishing partial history behind a fresh cursor.
 
 ## Schema lifecycle
 
 `MATERIALIZED_VIEW_STORE_FORMAT_VERSION` versions shared container state:
-manifest layout, cursor encoding, and metadata families. An older container may
-be rebuilt as a whole by the primary; a newer container is left untouched and
-rejected. Secondaries reject every container mismatch.
+manifest layout, cursor encoding, and metadata families. Every opener rejects a
+container mismatch without mutation. Operators create a fresh materialized-view
+path and rebuild from a certified recovery source; no service deletes an
+existing materialized-view directory during open.
 
-Individual row layouts use per-consumer versions. On primary open:
-
-- an exact match preserves rows and cursors;
-- an explicitly compatible older row version preserves rows and records the
-  cumulative accepted provenance;
-- an incompatible older consumer version resets only that consumer's cursors
-  and rows, then records the new manifest after the reset;
-- a newer persisted consumer version fails without mutation; and
-- an undeclared persisted consumer fails without mutation.
-
-Reconciliation clears rows with range tombstones and point deletes. It does not
-drop and recreate a column family in a live database because RocksDB secondary
-catch-up can encounter those manifest edits. The full decision is recorded in
-[ADR-0028](../adrs/0028-materialized-view-schema-versioning.md).
+Individual row layouts use per-consumer versions. A fresh store records the
+complete manifest atomically. Every later primary or secondary open requires
+the exact consumer names, versions, owned column families, and physical
+column-family set. Any divergence fails without mutation and requires a fresh
+store rebuilt from a certified recovery source. The full decision is recorded
+in [ADR-0028](../adrs/0028-materialized-view-schema-versioning.md).
 
 ## Key codecs and reorgs
 
@@ -143,16 +135,15 @@ Each block-keyed consumer must be able to delete exactly the rows produced by a
 reverted block. Height-prefixed layouts use bounded range deletes. Layouts
 whose primary key does not begin with height maintain a per-height index of the
 keys written by that block. Reorg deletion and replacement rows share the same
-batch as the cursor and projection-state transition.
+batch as the cursor and materialized-view-state transition.
 
 ## Query exposure
 
 `zinder-explorer` exposes materialized views through `ExplorerQuery` and
 advertises a capability only when its dependencies and coverage support the
-method. An unavailable materialized-view store or insufficient coverage maps
-to the stable `MATERIALIZED_VIEW_UNAVAILABLE` or
-`MATERIALIZED_VIEW_LAGGING` vocabulary. Missing data is never translated into
-zero, an empty complete result, or canonical absence.
+method. An unavailable materialized-view store maps to the stable
+`MATERIALIZED_VIEW_UNAVAILABLE` vocabulary. Missing data is never translated
+into zero, an empty complete result, or canonical absence.
 
 The Cipherscan adapter may translate those explorer methods into product
 routes, but Cipherscan names and response shapes stop at the adapter boundary.
@@ -167,8 +158,8 @@ When adding a consumer:
 2. choose a stable consumer name and owned column families;
 3. add reusable key codecs to `zinder-core::wire`;
 4. implement apply and revert behavior in one atomic batch;
-5. persist truthful projection coverage when the public method needs it;
-6. define incompatible and row-compatible schema behavior;
+5. persist truthful materialized-view coverage when the public method needs it;
+6. define the fresh-store recovery behavior for a schema change;
 7. expose the method under an explorer capability; and
 8. test replay, reorg, crash recovery, secondary catch-up, and incomplete
    coverage refusal.

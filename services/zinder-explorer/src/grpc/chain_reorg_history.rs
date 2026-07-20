@@ -1,6 +1,6 @@
 //! `ExplorerQuery.ChainReorgHistory` handler.
 //!
-//! Reads the durable reorg-incidents materialized view. The projection
+//! Reads the durable reorg-incidents materialized view. The view
 //! backfills from the earliest retained chain-event row when the consumer first
 //! appears, then preserves future incidents independently of chain-event
 //! retention.
@@ -29,7 +29,7 @@ const MAX_CHAIN_REORG_HISTORY_EVENTS_PER_REQUEST: u32 = 1024;
 const DEFAULT_CHAIN_REORG_HISTORY_EVENTS: u32 = 64;
 
 /// Executes one `ExplorerQuery.ChainReorgHistory` request.
-pub(crate) async fn handle_chain_reorg_history(
+pub(crate) async fn query_chain_reorg_history(
     materialized_view_store: &MaterializedViewStore,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ChainReorgHistoryRequest>,

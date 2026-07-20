@@ -2,7 +2,7 @@
 
 Zinder can replace the server role of lightwalletd only for clients that speak
 the vendored `CompactTxStreamer` protocol. It remains an adapter over
-`WalletQueryApi`; it must not introduce a second chain-data model, wallet
+`LightwalletdQueryApi`; it must not introduce a second chain-data model, wallet
 state, or key-management surface.
 
 ## Claim boundary
@@ -26,16 +26,16 @@ the claimed RPC set, and the highest evidence-backed level.
 ## Architecture
 
 - `zinder-proto` owns the vendored protocol and its provenance.
-- `zinder-query` owns the native wallet contract.
-- `zinder-compat-lightwalletd` only translates protocol messages, native
-  values, and errors.
-- `zinder-ingest` and `zinder-store` own the compact blocks, tree states,
-  subtree roots, transaction bytes, and transparent artifacts that wallet
-  methods read.
+- `zinder-query` owns the native wallet contract and `LightwalletdQueryApi`.
+- `zinder-compat-lightwalletd` translates protocol messages, query values, and
+  errors over an admitted exact-fence canonical/wallet-projection reader pair.
+- `zinder-ingest` and `zinder-store` own compact blocks, tree states, subtree
+  roots, and transaction bytes; `zinder-projector` owns the wallet projection
+  that provides transparent UTXOs and transaction history.
 
 In particular, `GetLightdInfo.taddrSupport` is an explicit serving-process
-claim. Enable it only for a wallet-serving store after both transparent-output
-and transparent-history reads are wired.
+claim. Enable it only after the wallet projection has admitted both
+transparent-output and transparent-history reads at the serving fence.
 
 ## Certification work
 

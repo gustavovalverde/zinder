@@ -1,4 +1,4 @@
-# ADR-0015: Unified Phase-Driven Ingest
+# ADR-0015: Phase-Driven Ingest
 
 ## Status
 
@@ -35,7 +35,7 @@ operator action.
 
 Bulk catch-up fetches bounded source segments, prepares blocks concurrently,
 and publishes authenticated canonical batches without crossing the configured
-reorg window unless `ingest.run_overrides.allow_near_tip_finalize` explicitly
+reorg window unless `ingest.run_overrides.allow_reorg_window_settlement` explicitly
 permits it. Following-tip mode observes one coherent source update at a time and
 publishes either an append or a replacement. Both paths use the same canonical
 store, error classification, readiness state, and recovery policy.
@@ -50,14 +50,13 @@ The configuration is grouped by responsibility:
 - `[ingest.phase_classification]` owns the gap boundary.
 - `[ingest.construction]` owns historical construction limits.
 - `[ingest.follow]` owns near-tip polling and lag limits.
-- `[ingest.materialized_views]` owns materialized-view replay limits.
 - `[ingest.run_overrides]` owns bounded one-run overrides.
 - `[node.health]` owns the upstream readiness probe because health is a source
   property, not an ingest-phase property.
 
 The writer opens the primary canonical store once. The mempool owner, retention
-worker, control service, and materialized-view tailer share the same process
-lifetime and do not restart when the ingest phase changes.
+worker, and control service share the same process lifetime and do not restart
+when the ingest phase changes.
 
 ### Upstream sync detection
 

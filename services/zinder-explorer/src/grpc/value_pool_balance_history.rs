@@ -11,7 +11,7 @@ use zinder_proto::v1::explorer::{
     ValuePoolBalance, ValuePoolBalanceHistoryCoverage, ValuePoolBalanceHistoryPoint,
     ValuePoolBalanceHistoryRequest, ValuePoolBalanceHistoryResponse,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::clamp_max_entries;
@@ -26,7 +26,7 @@ const CURSOR_PREFIX: &[u8; 4] = b"zvb1";
 const CURSOR_LEN: usize = CURSOR_PREFIX.len() + size_of::<i64>();
 
 /// Executes one `ExplorerQuery.ValuePoolBalanceHistory` request.
-pub(crate) async fn handle_value_pool_balance_history(
+pub(crate) async fn query_value_pool_balance_history(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -44,14 +44,14 @@ pub(crate) async fn handle_value_pool_balance_history(
     let tail = ValuePoolBalanceHistoryConsumer::tail_coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let chain_epoch = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
             Status::from(ExplorerError::internal(
-                "LatestBlockResponse.chain_view.chain_epoch missing",
+                "VisibleTipBlockResponse.chain_view.chain_epoch missing",
             ))
         })?;
     let visible_tip_height = chain_epoch

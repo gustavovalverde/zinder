@@ -26,7 +26,7 @@ use zinder_proto::v1::explorer::{
     TransparentAddressRankingCoverage, TransparentAddressSummary as WireTransparentAddressSummary,
 };
 use zinder_proto::v1::wallet::{
-    self, AddressLookup, LatestBlockRequest, address_lookup::Selector as AddressSelector,
+    self, AddressLookup, VisibleTipBlockRequest, address_lookup::Selector as AddressSelector,
     wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
@@ -68,7 +68,7 @@ pub(crate) struct TransparentAddressActivityContext<'store> {
     pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
 }
 
-pub(crate) async fn handle_transparent_address_activity(
+pub(crate) async fn query_transparent_address_activity(
     context: TransparentAddressActivityContext<'_>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     request: Request<TransparentAddressActivityRequest>,
@@ -164,13 +164,13 @@ async fn resolve_activity_chain_epoch(
     }
 
     wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing").into()
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing").into()
         })
 }
 
@@ -204,7 +204,7 @@ fn validate_ranking_metadata_at_chain_epoch(
     chain_epoch: &wallet::ChainEpoch,
 ) -> Result<(), Status> {
     let visible_tip = chain_epoch.visible_tip.as_ref().ok_or_else(|| {
-        ExplorerError::internal("LatestBlockResponse chain epoch visible_tip missing")
+        ExplorerError::internal("VisibleTipBlockResponse chain epoch visible_tip missing")
     })?;
     let coverage = metadata.coverage;
     let balance_height = coverage.balance_complete_through_height.value();

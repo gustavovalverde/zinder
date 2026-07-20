@@ -69,7 +69,7 @@ scripts/observability-smoke.sh run
 
 The opt-in path pauses the projector while Zebra advances beyond the configured
 compatibility lag threshold, requires the typed `replica_lagging` readiness
-cause, resumes the projector, and waits for exact-pair recovery. It then
+cause, resumes the projector, and waits for wallet-serving admission recovery. It then
 restarts compatibility, projector, and ingest one at a time, requiring the
 complete readiness chain after each restart, before invalidating 1 regtest
 block and mining a 2-block replacement branch. The pass condition requires both
@@ -167,8 +167,8 @@ process logs under `.tmp/observability/logs`.
 
 The live smoke proves process and network lifecycle behavior. The deterministic
 `atomic_publication_keeps_a_retired_generation_until_every_request_arc_drains`
-test remains the gate for an old request retaining its original storage handles
-while a new pair is published; the shell smoke does not manufacture a delayed
+test remains the gate for an in-flight request retaining its original storage handles
+while a replacement pair is published; the shell smoke does not manufacture a delayed
 wallet request to duplicate that proof.
 
 ## Tunables

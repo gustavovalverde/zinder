@@ -11,13 +11,18 @@ use zinder_core::{
     BlockHeight, ChainEpochId, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
     TransparentOutputArtifact, TransparentSpendFact,
 };
+use zinder_materialized_views::{
+    MaterializedViewCoverage, MaterializedViewState, MaterializedViewStore,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+};
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
     QueryError, ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
 };
 use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
 use zinder_testkit::{
-    StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+    StoreFixture, encode_fixture_block_replay, open_test_materialized_view_store_for_canonical,
+    sample_regtest_upgrade_activations, seed_transparent_outpoint_spends,
 };
 
 use crate::common::{
@@ -191,11 +196,62 @@ fn commit_to_settled_tip_two(store: &zinder_store::PrimaryChainStore) -> eyre::R
     Ok(())
 }
 
-/// Commits an output, settles its spend, advances the settled tip, and explicitly
-/// runs retention maintenance so the deleted-through marker reaches height 2.
-fn commit_real_sweep_to_deleted_through_two(
-    store: &zinder_store::PrimaryChainStore,
+/// One canonical spend removed by transparent-retention maintenance.
+struct SweptTransparentSpendFixture {
+    outpoint: TransparentOutPoint,
+    spend: TransparentSpendFact,
+}
+
+/// Builds a spend row that exists only in the materialized view.
+fn projected_spend(
+    outpoint: TransparentOutPoint,
+    spending_block_height: BlockHeight,
+) -> TransparentSpendFact {
+    TransparentSpendFact::new(
+        outpoint,
+        3,
+        TransactionId::from_bytes([0x55; 32]),
+        0,
+        spending_block_height,
+        block_hash_from_seed(spending_block_height.value()),
+        1_000,
+        TransparentAddressScriptHash::from_bytes([0x66; 32]),
+        BlockHeight::new(1),
+        block_hash_from_seed(1),
+    )
+}
+
+/// Records verified transparent-spend coverage through the canonical visible tip.
+fn seed_complete_transparent_spend_materialized_view(
+    materialized_view_store: &MaterializedViewStore,
+    canonical_store: &zinder_store::PrimaryChainStore,
 ) -> eyre::Result<()> {
+    let reader = canonical_store.current_chain_epoch_reader()?;
+    let chain_epoch = reader.chain_epoch();
+    let materialized_view_tip = reader
+        .block_header_at(chain_epoch.visible_tip_height)?
+        .ok_or_else(|| eyre!("visible-tip header must exist"))?;
+    materialized_view_store.put_consumer_state(
+        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+        MaterializedViewState {
+            chain_epoch_id: chain_epoch.id,
+            tip_height: chain_epoch.visible_tip_height,
+            tip_hash: materialized_view_tip.block_hash,
+            revision: 1,
+            coverage: Some(MaterializedViewCoverage {
+                complete_from_height: reader.canonical_history_bounds().first_available_height(),
+                complete_through_height: chain_epoch.visible_tip_height,
+                complete_through_hash: materialized_view_tip.block_hash,
+            }),
+        },
+    )?;
+    Ok(())
+}
+
+/// Commits an output and spend, settles the spend, then removes its canonical facts.
+fn commit_swept_transparent_spend(
+    store: &zinder_store::PrimaryChainStore,
+) -> eyre::Result<SweptTransparentSpendFixture> {
     let (epoch_one, blocks, compact_blocks) = synthetic_multi_block_epoch(1, 3, 1);
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x31; 32]), 0);
     let script_pub_key = vec![0x76, 0xa9, 0x14, 0x88, 0xac];
@@ -225,7 +281,7 @@ fn commit_real_sweep_to_deleted_through_two(
         blocks,
         compact_blocks,
         &[output],
-        vec![spend],
+        vec![spend.clone()],
     ))?;
 
     store.set_transparent_retention_release_height(BlockHeight::new(3))?;
@@ -239,6 +295,189 @@ fn commit_real_sweep_to_deleted_through_two(
     let sweep = store.sweep_transparent_retention_once()?;
     assert_eq!(sweep.swept_heights(), 2);
     assert_eq!(sweep.swept_outpoints(), 1);
+    let reader = store.current_chain_epoch_reader()?;
+    assert_eq!(
+        reader.transparent_retention_deleted_through_height()?,
+        Some(BlockHeight::new(2))
+    );
+    assert!(
+        reader
+            .transparent_spend_facts_by_outpoints(&[outpoint])?
+            .is_empty(),
+        "retention maintenance must remove the canonical spend before the projection query",
+    );
+    Ok(SweptTransparentSpendFixture { outpoint, spend })
+}
+
+#[tokio::test]
+async fn transparent_spends_by_outpoint_resolves_swept_spend_from_materialized_view()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let materialized_view_store =
+        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let swept = commit_swept_transparent_spend(&store)?;
+    seed_transparent_outpoint_spends(&materialized_view_store, std::slice::from_ref(&swept.spend))?;
+    seed_complete_transparent_spend_materialized_view(&materialized_view_store, &store)?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_materialized_view_store(materialized_view_store);
+    let response = wallet_query
+        .transparent_spends_by_outpoint(vec![swept.outpoint], None::<ChainEpochId>)
+        .await?;
+
+    assert_eq!(response.spends.len(), 1);
+    let resolved = response
+        .spends
+        .first()
+        .ok_or_else(|| eyre!("expected the materialized view to resolve the swept spend"))?;
+    assert_eq!(resolved.spent_outpoint, swept.outpoint);
+    assert_eq!(
+        resolved.spending_transaction_id,
+        swept.spend.spending_transaction_id
+    );
+    assert_eq!(resolved.spending_block_height, swept.spend.block_height);
+    assert_eq!(resolved.input_index, swept.spend.input_index);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_spends_by_outpoint_ignores_materialized_spend_above_settled_tip()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let materialized_view_store =
+        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let swept = commit_swept_transparent_spend(&store)?;
+    let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x42; 32]), 0);
+    let spend = projected_spend(outpoint, BlockHeight::new(3));
+    seed_transparent_outpoint_spends(&materialized_view_store, &[swept.spend, spend])?;
+    seed_complete_transparent_spend_materialized_view(&materialized_view_store, &store)?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_materialized_view_store(materialized_view_store);
+    let response = wallet_query
+        .transparent_spends_by_outpoint(vec![outpoint], None::<ChainEpochId>)
+        .await?;
+
+    assert!(
+        response.spends.is_empty(),
+        "a materialized spend above the settled tip must remain unavailable",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_spends_by_outpoint_refuses_when_materialized_view_trails_the_sweep()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let materialized_view_store =
+        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    commit_swept_transparent_spend(&store)?;
+    let reader = store.current_chain_epoch_reader()?;
+    let block_one = reader
+        .block_header_at(BlockHeight::new(1))?
+        .ok_or_else(|| eyre!("block-one header must exist"))?;
+    let chain_epoch = reader.chain_epoch();
+    let materialized_view_tip = reader
+        .block_header_at(chain_epoch.visible_tip_height)?
+        .ok_or_else(|| eyre!("visible-tip header must exist"))?;
+    materialized_view_store.put_consumer_state(
+        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+        MaterializedViewState {
+            chain_epoch_id: chain_epoch.id,
+            tip_height: chain_epoch.visible_tip_height,
+            tip_hash: materialized_view_tip.block_hash,
+            revision: 1,
+            coverage: Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(1),
+                complete_through_height: BlockHeight::new(1),
+                complete_through_hash: block_one.block_hash,
+            }),
+        },
+    )?;
+    drop(reader);
+
+    let missing_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x43; 32]), 0);
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_materialized_view_store(materialized_view_store);
+    let outcome = wallet_query
+        .transparent_spends_by_outpoint(vec![missing_outpoint], None::<ChainEpochId>)
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(QueryError::MaterializedViewUnavailable {
+            capability: zinder_proto::capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1,
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_spends_by_outpoint_skips_reorged_out_materialized_spend() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let materialized_view_store =
+        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let swept = commit_swept_transparent_spend(&store)?;
+    let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x45; 32]), 0);
+    let mut stale_spend = projected_spend(outpoint, BlockHeight::new(1));
+    stale_spend.block_hash = block_hash_from_seed(999);
+    seed_transparent_outpoint_spends(&materialized_view_store, &[swept.spend, stale_spend])?;
+    seed_complete_transparent_spend_materialized_view(&materialized_view_store, &store)?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_materialized_view_store(materialized_view_store);
+    let response = wallet_query
+        .transparent_spends_by_outpoint(vec![outpoint], None::<ChainEpochId>)
+        .await?;
+
+    assert!(
+        response.spends.is_empty(),
+        "a materialized row from a replaced branch must not surface as the spender",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_spends_by_outpoint_prefers_the_canonical_spender() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let materialized_view_store =
+        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let (spent_outpoint, spend) = commit_spent_outpoint_fixture(&store)?;
+    let conflicting_spend = TransparentSpendFact::new(
+        spent_outpoint,
+        9,
+        TransactionId::from_bytes([0xEE; 32]),
+        0,
+        spend.block_height,
+        spend.block_hash,
+        spend.spent_value_zat,
+        spend.spent_address_script_hash,
+        spend.spent_block_height,
+        spend.spent_block_hash,
+    );
+    seed_transparent_outpoint_spends(&materialized_view_store, &[conflicting_spend])?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_materialized_view_store(materialized_view_store);
+    let response = wallet_query
+        .transparent_spends_by_outpoint(vec![spent_outpoint], None::<ChainEpochId>)
+        .await?;
+
+    assert_eq!(response.spends.len(), 1);
+    let resolved = response
+        .spends
+        .first()
+        .ok_or_else(|| eyre!("expected the canonical spend"))?;
+    assert_eq!(
+        resolved.spending_transaction_id,
+        spend.spending_transaction_id
+    );
+    assert_eq!(resolved.input_index, spend.input_index);
     Ok(())
 }
 
@@ -247,7 +486,7 @@ async fn transparent_spends_by_outpoint_refuses_swept_miss_without_materialized_
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    commit_real_sweep_to_deleted_through_two(&store)?;
+    commit_swept_transparent_spend(&store)?;
 
     let missing_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x45; 32]), 0);
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));

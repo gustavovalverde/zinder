@@ -24,7 +24,7 @@ use zinder_core::wire::{
 };
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
+use zinder_ingest::run_bulk_catchup;
 use zinder_proto::capabilities::EXPLORER_SEARCH_V1;
 use zinder_proto::v1::explorer::{
     NotPubliclyIndexableReason, SearchRequest, SearchResponse,
@@ -293,7 +293,6 @@ struct SearchFixture {
     sample_coinbase_id: TransactionId,
     explorer_adapter: ExplorerQueryGrpcAdapter,
     wallet_server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
-    ingest_control_handle: JoinHandle<Result<(), tonic::transport::Error>>,
     _store_tempdir: TempDir,
 }
 
@@ -306,10 +305,8 @@ impl SearchFixture {
             (),
             Arc::new(sample_regtest_upgrade_activations()),
         );
-        let (ingest_control_addr, ingest_control_handle) =
-            serve_ingest_control_grpc(network, store, MempoolIndex::new()).await?;
         let (wallet_grpc_addr, wallet_server_handle) =
-            serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
+            serve_wallet_query_grpc(wallet_query).await?;
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
 
         let explorer_adapter =
@@ -323,7 +320,6 @@ impl SearchFixture {
             sample_coinbase_id: sample.coinbase_transaction_id,
             explorer_adapter,
             wallet_server_handle,
-            ingest_control_handle,
             _store_tempdir: store_tempdir,
         })
     }
@@ -342,9 +338,7 @@ impl SearchFixture {
 
     async fn shutdown(&mut self) {
         self.wallet_server_handle.abort();
-        self.ingest_control_handle.abort();
         let _ = (&mut self.wallet_server_handle).await;
-        let _ = (&mut self.ingest_control_handle).await;
     }
 }
 
@@ -429,33 +423,8 @@ fn sample_tip(block: &SourceBlock) -> Result<SampleBlock> {
 
 async fn serve_wallet_query_grpc(
     wallet_query: WalletQuery<PrimaryChainStore>,
-    ingest_control_endpoint: String,
 ) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
-        wallet_query,
-        ServerInfoSettings::default(),
-        ingest_control_endpoint,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
-async fn serve_ingest_control_grpc(
-    network: Network,
-    store: PrimaryChainStore,
-    mempool_index: MempoolIndex,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter =
-        IngestControlGrpcAdapter::new(network, store, zinder_runtime::Readiness::default())
-            .with_mempool(mempool_index);
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(async move {

@@ -35,7 +35,8 @@ use zinder_proto::v1::explorer::{
     CoinbaseTransactionSummary, block_detail_request,
 };
 use zinder_proto::v1::wallet::{
-    self, BlockSelector, LatestBlockRequest, block_selector, wallet_query_client::WalletQueryClient,
+    self, BlockSelector, VisibleTipBlockRequest, block_selector,
+    wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
 
@@ -49,7 +50,7 @@ use super::transaction_detail::encode_public_facts;
 use super::transparent_input::{encode_mined_transparent_inputs, parent_transaction_ids};
 use zinder_materialized_views::{
     BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_SUMMARY_COLUMN_FAMILY, BlockProductionTimeConsumer,
-    BlockProductionTimeCursor, BlockProductionTimePageRequest, ConsumerProjectionState,
+    BlockProductionTimeCursor, BlockProductionTimePageRequest, MaterializedViewState,
     MaterializedViewStore, MaterializedViewStoreReadSnapshot, PaidFeeDistributionConsumer,
 };
 use zinder_store::{
@@ -78,9 +79,9 @@ struct BlockProductionTimeCursorEnvelope {
     start_time_unix_seconds: i64,
     end_time_unix_seconds: i64,
     chain_epoch_id: u64,
-    projection_revision: u64,
-    projection_tip_height: BlockHeight,
-    projection_tip_hash: BlockHash,
+    materialized_view_revision: u64,
+    tip_height: BlockHeight,
+    tip_hash: BlockHash,
     after: BlockProductionTimeCursor,
 }
 
@@ -96,7 +97,7 @@ struct MaterializedProductionTimePage {
     read_fence: BlockProductionTimeRangeReadFence,
 }
 
-pub(crate) async fn handle_block_summaries_in_range(
+pub(crate) async fn query_block_summaries_in_range(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -131,7 +132,7 @@ pub(crate) async fn handle_block_summaries_in_range(
     }))
 }
 
-pub(crate) async fn handle_block_production_series(
+pub(crate) async fn query_block_production_series(
     materialized_view_store: &MaterializedViewStore,
     chain_store: &SecondaryChainStore,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -206,7 +207,7 @@ pub(crate) async fn handle_block_production_series(
     }))
 }
 
-pub(crate) async fn handle_block_production_in_time_range(
+pub(crate) async fn query_block_production_in_time_range(
     materialized_view_store: &MaterializedViewStore,
     chain_store: &SecondaryChainStore,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -248,28 +249,28 @@ fn read_block_production_time_page(
         .map_err(|error| status_from_store_error(&error))?;
     let chain_epoch = reader.chain_epoch();
     let snapshot = materialized_view_store.read_snapshot();
-    let current_projection_state = snapshot
-        .consumer_projection_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
+    let current_materialized_view_state = snapshot
+        .consumer_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
         .ok_or_else(|| {
             ExplorerError::not_materialized(
-                "block-production time projection state is not available",
+                "block-production time materialized-view state is not available",
             )
         })?;
-    let (cursor, projection_state) = resolve_block_production_cursor_fence(
+    let (cursor, materialized_view_state) = resolve_block_production_cursor_fence(
         request,
-        current_projection_state,
+        current_materialized_view_state,
         chain_epoch.id,
         &snapshot,
     )?;
-    validate_frozen_projection_tip(&reader, projection_state)?;
+    validate_frozen_materialized_view_tip(&reader, materialized_view_state)?;
     let page = BlockProductionTimeConsumer::read_page_snapshot(
         &snapshot,
         BlockProductionTimePageRequest {
             start_time_unix_seconds: request.start_time_unix_seconds,
             end_time_unix_seconds: request.end_time_unix_seconds,
             after: cursor.map(|cursor| cursor.after),
-            maximum_height: Some(projection_state.projection_tip_height),
+            maximum_height: Some(materialized_view_state.tip_height),
             limit: block_production_time_page_size(request.max_entries),
         },
     )
@@ -278,10 +279,10 @@ fn read_block_production_time_page(
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let fence_tip_time = BlockProductionTimeConsumer::row_at_height_snapshot(
         &snapshot,
-        projection_state.projection_tip_height,
+        materialized_view_state.tip_height,
     )
     .map_err(|error| ExplorerError::internal(error.to_string()))?
-    .filter(|row| row.block_hash == projection_state.projection_tip_hash)
+    .filter(|row| row.block_hash == materialized_view_state.tip_hash)
     .map(|row| row.block_time_unix_seconds);
     let records = read_block_summary_records_for_time_rows(&snapshot, &page.rows)?;
     let paid_fees = read_paid_fee_totals_for_time_rows(&snapshot, &page.rows)?;
@@ -299,12 +300,13 @@ fn read_block_production_time_page(
         encode_block_production_cursor(
             request.start_time_unix_seconds,
             request.end_time_unix_seconds,
-            projection_state,
+            materialized_view_state,
             after,
         )
     });
-    let read_fence = block_production_time_read_fence(projection_state);
-    let coverage = block_production_time_coverage(coverage, projection_state, fence_tip_time);
+    let read_fence = block_production_time_read_fence(materialized_view_state);
+    let coverage =
+        block_production_time_coverage(coverage, materialized_view_state, fence_tip_time);
     Ok(MaterializedProductionTimePage {
         freshness,
         points,
@@ -335,16 +337,16 @@ fn read_paid_fee_totals_for_time_rows(
         .collect()
 }
 
-fn validate_frozen_projection_tip(
+fn validate_frozen_materialized_view_tip(
     reader: &ChainEpochReader<'_>,
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
 ) -> Result<(), Status> {
     let header = reader
-        .block_header_at(projection_state.projection_tip_height)
+        .block_header_at(materialized_view_state.tip_height)
         .map_err(|error| status_from_store_error(&error))?;
-    if header.is_none_or(|header| header.block_hash != projection_state.projection_tip_hash) {
+    if header.is_none_or(|header| header.block_hash != materialized_view_state.tip_hash) {
         return Err(ExplorerError::unsatisfied_precondition(
-            "block-production projection tip is not canonical in the current chain view",
+            "block-production materialized-view tip is not canonical in the current chain view",
         )
         .into());
     }
@@ -489,14 +491,14 @@ fn validate_time_index_block_summary(
 
 fn block_production_time_coverage(
     coverage: Option<zinder_materialized_views::BlockProductionTimeBackfillCoverage>,
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
     fence_tip_time_unix_seconds: Option<i64>,
 ) -> BlockProductionTimeRangeCoverage {
     let coverage = coverage.map(|mut coverage| {
-        if coverage.complete_through_height > projection_state.projection_tip_height
+        if coverage.complete_through_height > materialized_view_state.tip_height
             && let Some(fence_tip_time_unix_seconds) = fence_tip_time_unix_seconds
         {
-            coverage.complete_through_height = projection_state.projection_tip_height;
+            coverage.complete_through_height = materialized_view_state.tip_height;
             coverage.complete_through_time_unix_seconds = fence_tip_time_unix_seconds;
         }
         coverage
@@ -510,20 +512,20 @@ fn block_production_time_coverage(
             .map(|coverage| coverage.complete_through_time_unix_seconds),
         requested_range_complete: coverage.is_some_and(|coverage| {
             coverage.complete_from_height.value() <= 1
-                && coverage.complete_through_height >= projection_state.projection_tip_height
+                && coverage.complete_through_height >= materialized_view_state.tip_height
         }),
     }
 }
 
 fn block_production_time_read_fence(
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
 ) -> BlockProductionTimeRangeReadFence {
     BlockProductionTimeRangeReadFence {
-        chain_epoch_id: projection_state.projection_epoch_id.value(),
-        projection_revision: projection_state.revision,
-        projection_tip: Some(wallet::BlockTip {
-            height: projection_state.projection_tip_height.value(),
-            hash: encode_rpc_block_hash_hex(projection_state.projection_tip_hash),
+        chain_epoch_id: materialized_view_state.chain_epoch_id.value(),
+        materialized_view_revision: materialized_view_state.revision,
+        materialized_view_tip: Some(wallet::BlockTip {
+            height: materialized_view_state.tip_height.value(),
+            hash: encode_rpc_block_hash_hex(materialized_view_state.tip_hash),
         }),
     }
 }
@@ -531,7 +533,7 @@ fn block_production_time_read_fence(
 fn encode_block_production_cursor(
     start_time_unix_seconds: i64,
     end_time_unix_seconds: i64,
-    projection_state: ConsumerProjectionState,
+    materialized_view_state: MaterializedViewState,
     after: BlockProductionTimeCursor,
 ) -> Vec<u8> {
     let after_bytes = after.as_bytes();
@@ -540,11 +542,11 @@ fn encode_block_production_cursor(
     cursor.push(BLOCK_PRODUCTION_CURSOR_VERSION);
     cursor.extend_from_slice(&start_time_unix_seconds.to_be_bytes());
     cursor.extend_from_slice(&end_time_unix_seconds.to_be_bytes());
-    cursor.extend_from_slice(&projection_state.projection_epoch_id.value().to_be_bytes());
-    cursor.extend_from_slice(&projection_state.revision.to_be_bytes());
-    cursor.extend_from_slice(&projection_state.projection_tip_height.value().to_be_bytes());
+    cursor.extend_from_slice(&materialized_view_state.chain_epoch_id.value().to_be_bytes());
+    cursor.extend_from_slice(&materialized_view_state.revision.to_be_bytes());
+    cursor.extend_from_slice(&materialized_view_state.tip_height.value().to_be_bytes());
     cursor.extend_from_slice(&encode_internal_block_hash(
-        projection_state.projection_tip_hash,
+        materialized_view_state.tip_hash,
     ));
     cursor.extend_from_slice(&after_len.to_be_bytes());
     cursor.extend_from_slice(after_bytes);
@@ -553,13 +555,13 @@ fn encode_block_production_cursor(
 
 fn resolve_block_production_cursor_fence(
     request: &BlockProductionInTimeRangeRequest,
-    current_projection_state: ConsumerProjectionState,
+    current_materialized_view_state: MaterializedViewState,
     current_chain_epoch_id: ChainEpochId,
     snapshot: &MaterializedViewStoreReadSnapshot<'_>,
 ) -> Result<
     (
         Option<BlockProductionTimeCursorEnvelope>,
-        ConsumerProjectionState,
+        MaterializedViewState,
     ),
     Status,
 > {
@@ -575,35 +577,32 @@ fn resolve_block_production_cursor_fence(
         }
         return Ok((
             None,
-            ConsumerProjectionState {
-                projection_epoch_id: current_chain_epoch_id,
-                ..current_projection_state
+            MaterializedViewState {
+                chain_epoch_id: current_chain_epoch_id,
+                ..current_materialized_view_state
             },
         ));
     }
     let cursor = decode_and_validate_block_production_cursor_request(request)?;
-    let frozen_tip_is_still_canonical = current_projection_state.projection_tip_height
-        >= cursor.projection_tip_height
-        && BlockProductionTimeConsumer::row_at_height_snapshot(
-            snapshot,
-            cursor.projection_tip_height,
-        )
-        .map_err(|error| ExplorerError::internal(error.to_string()))?
-        .is_some_and(|row| row.block_hash == cursor.projection_tip_hash);
+    let frozen_tip_is_still_canonical = current_materialized_view_state.tip_height
+        >= cursor.tip_height
+        && BlockProductionTimeConsumer::row_at_height_snapshot(snapshot, cursor.tip_height)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?
+            .is_some_and(|row| row.block_hash == cursor.tip_hash);
     if !frozen_tip_is_still_canonical {
         return Err(ExplorerError::unsatisfied_precondition(
-            "block-production cursor projection fence is no longer current",
+            "block-production cursor materialized-view fence is no longer current",
         )
         .into());
     }
-    let frozen_projection_state = ConsumerProjectionState {
-        projection_epoch_id: ChainEpochId::new(cursor.chain_epoch_id),
-        projection_tip_height: cursor.projection_tip_height,
-        projection_tip_hash: cursor.projection_tip_hash,
-        revision: cursor.projection_revision,
+    let frozen_materialized_view_state = MaterializedViewState {
+        chain_epoch_id: ChainEpochId::new(cursor.chain_epoch_id),
+        tip_height: cursor.tip_height,
+        tip_hash: cursor.tip_hash,
+        revision: cursor.materialized_view_revision,
         coverage: None,
     };
-    Ok((Some(cursor), frozen_projection_state))
+    Ok((Some(cursor), frozen_materialized_view_state))
 }
 
 fn decode_and_validate_block_production_cursor_request(
@@ -637,10 +636,9 @@ fn decode_block_production_cursor(
     let start_time_unix_seconds = i64::from_be_bytes(cursor_field(bytes, &mut offset)?);
     let end_time_unix_seconds = i64::from_be_bytes(cursor_field(bytes, &mut offset)?);
     let chain_epoch_id = u64::from_be_bytes(cursor_field(bytes, &mut offset)?);
-    let projection_revision = u64::from_be_bytes(cursor_field(bytes, &mut offset)?);
-    let projection_tip_height =
-        BlockHeight::new(u32::from_be_bytes(cursor_field(bytes, &mut offset)?));
-    let projection_tip_hash = decode_internal_block_hash(&bytes[offset..offset + 32])
+    let materialized_view_revision = u64::from_be_bytes(cursor_field(bytes, &mut offset)?);
+    let tip_height = BlockHeight::new(u32::from_be_bytes(cursor_field(bytes, &mut offset)?));
+    let tip_hash = decode_internal_block_hash(&bytes[offset..offset + 32])
         .map_err(|_| ExplorerError::invalid_request("block-production cursor hash is malformed"))?;
     offset += 32;
     let after_len = usize::from(u16::from_be_bytes(cursor_field(bytes, &mut offset)?));
@@ -653,9 +651,9 @@ fn decode_block_production_cursor(
         start_time_unix_seconds,
         end_time_unix_seconds,
         chain_epoch_id,
-        projection_revision,
-        projection_tip_height,
-        projection_tip_hash,
+        materialized_view_revision,
+        tip_height,
+        tip_hash,
         after,
     })
 }
@@ -860,7 +858,7 @@ fn join_block_production_points(
         .collect()
 }
 
-pub(crate) async fn handle_block_detail(
+pub(crate) async fn query_block_detail(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -886,7 +884,7 @@ pub(crate) async fn handle_block_detail(
     }))
 }
 
-pub(crate) async fn handle_block_transactions(
+pub(crate) async fn query_block_transactions(
     chain_store: &SecondaryChainStore,
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
@@ -1121,18 +1119,20 @@ async fn read_canonical_tip(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<(wallet::ChainEpoch, u32), Status> {
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let canonical_tip = latest
-        .latest_block
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.latest_block missing"))?
+        .visible_tip_block
+        .ok_or_else(|| {
+            ExplorerError::internal("VisibleTipBlockResponse.visible_tip_block missing")
+        })?
         .height;
     Ok((chain_epoch, canonical_tip))
 }
@@ -1161,7 +1161,7 @@ mod tests {
         },
     };
     use zinder_materialized_views::{
-        BlockProductionTimeBackfillCoverage, BlockProductionTimeCursor, ConsumerProjectionState,
+        BlockProductionTimeBackfillCoverage, BlockProductionTimeCursor, MaterializedViewState,
     };
     use zinder_proto::v1::explorer::{
         BlockProductionInTimeRangeRequest, BlockProductionPoint, BlockSummary, BlockSummaryRecord,
@@ -1266,26 +1266,23 @@ mod tests {
     }
 
     #[test]
-    fn block_production_time_cursor_binds_request_and_projection_fence() -> eyre::Result<()> {
-        let state = projection_state(9);
-        let after = cursor_after(
-            1_774_670_100,
-            BlockHeight::new(100),
-            state.projection_tip_hash,
-        )?;
+    fn block_production_time_cursor_binds_request_and_materialized_view_fence() -> eyre::Result<()>
+    {
+        let state = materialized_view_state(9);
+        let after = cursor_after(1_774_670_100, BlockHeight::new(100), state.tip_hash)?;
         let request = BlockProductionInTimeRangeRequest {
             start_time_unix_seconds: 1_774_670_000,
             end_time_unix_seconds: 1_774_671_000,
             max_entries: 2,
             from_cursor: encode_block_production_cursor(1_774_670_000, 1_774_671_000, state, after),
-            at_epoch_id: Some(state.projection_epoch_id.value()),
+            at_epoch_id: Some(state.chain_epoch_id.value()),
         };
 
         let decoded = decode_and_validate_block_production_cursor_request(&request)?;
-        assert_eq!(decoded.chain_epoch_id, state.projection_epoch_id.value());
-        assert_eq!(decoded.projection_revision, state.revision);
-        assert_eq!(decoded.projection_tip_height, state.projection_tip_height);
-        assert_eq!(decoded.projection_tip_hash, state.projection_tip_hash);
+        assert_eq!(decoded.chain_epoch_id, state.chain_epoch_id.value());
+        assert_eq!(decoded.materialized_view_revision, state.revision);
+        assert_eq!(decoded.tip_height, state.tip_height);
+        assert_eq!(decoded.tip_hash, state.tip_hash);
         assert_eq!(decoded.after, after);
 
         let mismatched_bounds = BlockProductionInTimeRangeRequest {
@@ -1298,7 +1295,7 @@ mod tests {
         assert_eq!(bounds_error.code(), tonic::Code::InvalidArgument);
 
         let mismatched_epoch = BlockProductionInTimeRangeRequest {
-            at_epoch_id: Some(state.projection_epoch_id.value() + 1),
+            at_epoch_id: Some(state.chain_epoch_id.value() + 1),
             ..request
         };
         let epoch_error = decode_and_validate_block_production_cursor_request(&mismatched_epoch)
@@ -1309,11 +1306,12 @@ mod tests {
     }
 
     #[test]
-    fn block_production_time_coverage_and_fence_map_one_projection_state() -> eyre::Result<()> {
-        let state = projection_state(9);
+    fn block_production_time_coverage_and_fence_map_one_materialized_view_state() -> eyre::Result<()>
+    {
+        let state = materialized_view_state(9);
         let coverage = BlockProductionTimeBackfillCoverage::new(
             BlockHeight::new(1),
-            state.projection_tip_height,
+            state.tip_height,
             1_234,
             1_774_670_100,
         );
@@ -1323,7 +1321,7 @@ mod tests {
         assert_eq!(mapped_coverage.complete_from_height, Some(1));
         assert_eq!(
             mapped_coverage.complete_through_height,
-            Some(state.projection_tip_height.value())
+            Some(state.tip_height.value())
         );
         assert_eq!(mapped_coverage.complete_from_time_unix_seconds, Some(1_234));
         assert_eq!(
@@ -1346,23 +1344,23 @@ mod tests {
         assert!(!block_production_time_coverage(None, state, None).requested_range_complete);
 
         let read_fence = block_production_time_read_fence(state);
-        assert_eq!(read_fence.chain_epoch_id, state.projection_epoch_id.value());
-        assert_eq!(read_fence.projection_revision, state.revision);
+        assert_eq!(read_fence.chain_epoch_id, state.chain_epoch_id.value());
+        assert_eq!(read_fence.materialized_view_revision, state.revision);
         assert_eq!(
             read_fence
-                .projection_tip
-                .ok_or_else(|| eyre::eyre!("read fence projection tip missing"))?
+                .materialized_view_tip
+                .ok_or_else(|| eyre::eyre!("read fence materialized-view tip missing"))?
                 .height,
-            state.projection_tip_height.value()
+            state.tip_height.value()
         );
         Ok(())
     }
 
-    fn projection_state(revision: u64) -> ConsumerProjectionState {
-        ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(47),
-            projection_tip_height: BlockHeight::new(100),
-            projection_tip_hash: BlockHash::from_bytes([0xa5; 32]),
+    fn materialized_view_state(revision: u64) -> MaterializedViewState {
+        MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(47),
+            tip_height: BlockHeight::new(100),
+            tip_hash: BlockHash::from_bytes([0xa5; 32]),
             revision,
             coverage: None,
         }

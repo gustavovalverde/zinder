@@ -31,7 +31,7 @@ The store owns start-position resolution: `EventStreamStartPosition` is the type
 
 ### Family resolution
 
-The cursor's encoded family is authoritative. With `after_cursor`, the request's `family` field must be unset/default or equal to the family encoded in the cursor; a non-default family that disagrees is `INVALID_ARGUMENT` (`CHAIN_EVENT_CURSOR_INVALID`). Because proto3 cannot distinguish an unset enum from its zero value, a request carrying the default family (`Tip` for chain events) always defers to the cursor. `earliest_retained` and `live_tail` have no cursor to defer to, so they resolve within the request's `family` field.
+The cursor's encoded family is authoritative. With `after_cursor`, the request's `family` field must be unset/default or equal to the family encoded in the cursor; a non-default family that disagrees is `INVALID_ARGUMENT` (`CHAIN_EVENT_CURSOR_INVALID`). Because proto3 cannot distinguish an unset enum from its zero value, a request carrying the default family (`Visible` for chain events) always defers to the cursor. `earliest_retained` and `live_tail` have no cursor to defer to, so they resolve within the request's `family` field.
 
 ### `live_tail` resolves once, at subscribe time
 

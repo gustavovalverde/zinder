@@ -596,7 +596,7 @@ fn canonical_ready_summary(
             ready.block_digest_version,
             sequence_digest,
         ),
-        logical_replay_bytes: ready.visible_logical_block_facts_bytes,
+        logical_replay_bytes: ready.visible_logical_replay_bytes,
         logical_storage_bytes: block_load.logical_bytes,
         sst_file_bytes: block_load.sst_file_bytes,
         sst_file_count: block_load.sst_file_count,
@@ -624,7 +624,7 @@ fn wallet_ready_summary(
             zinder_core::CanonicalBlockFactsDigestVersion::V1,
             report.source_sequence_digest,
         ),
-        projection_digest_hex: hex::encode(report.projection_digest.as_bytes()),
+        wallet_projection_digest_hex: hex::encode(report.projection_digest.as_bytes()),
         row_counts: WalletStorageRowCounts {
             transparent_unspent_output_count: row_counts.transparent_unspent_output_count,
             transparent_unspent_output_by_address_count: row_counts

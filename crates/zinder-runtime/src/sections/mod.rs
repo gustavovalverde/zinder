@@ -11,8 +11,8 @@ mod ingest_control;
 mod ops;
 mod projector_control;
 mod retention;
+mod runtime_service;
 mod security;
-mod service;
 mod storage;
 
 pub use ingest_control::{
@@ -26,17 +26,16 @@ pub use projector_control::{
     resolve_projector_control,
 };
 pub use retention::{ResolvedRetention, RetentionSection, RetentionToml, resolve_retention};
+pub use runtime_service::RuntimeService;
 pub use security::{
     DEFAULT_ALLOW_PUBLIC_BIND, SecuritySection, SecurityToml, resolve_allow_public_bind,
 };
-pub use service::ServiceIdentifier;
 pub use storage::{
-    CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, PrimaryStorageSection,
-    PrimaryStorageToml, ResolvedCanonicalSecondaryStorage, ResolvedPrimaryStorage,
-    ResolvedSecondaryStorage, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    SecondaryStorageSection, SecondaryStorageToml, StorageRoleSection, StorageRoleToml,
-    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
+    CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
+    ResolvedCanonicalSecondaryStorage, ResolvedSecondaryStorage, RocksDbResourceBudgetSection,
+    RocksDbResourceBudgetToml, SecondaryStorageSection, SecondaryStorageToml, StorageRoleSection,
+    StorageRoleToml, resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
     resolve_canonical_writer_rocksdb_budget, resolve_materialized_view_reader_rocksdb_budget,
-    resolve_materialized_view_writer_rocksdb_budget, resolve_primary_storage,
-    resolve_secondary_storage,
+    resolve_secondary_storage, resolve_wallet_projection_reader_rocksdb_budget,
+    resolve_wallet_projection_writer_rocksdb_budget,
 };

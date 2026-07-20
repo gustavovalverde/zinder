@@ -3,5 +3,6 @@ mod error_reason_roundtrip;
 mod local_chain_index;
 mod remote_chain_index;
 mod rustdoc_coverage;
+mod transparent_address_tx_history_parity;
 mod transparent_address_unspent_outputs_parity;
 mod transparent_outputs_by_outpoint_parity;

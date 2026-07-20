@@ -124,7 +124,7 @@ impl BlockKeyedConsumer for TransparentAddressActivityConsumer {
         block: &BlockCommitContext,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let transparent_spends = block.transparent_spends()?;
+        let transparent_spends = block.transparent_spends();
         let rows = aggregate_address_rows(block, transparent_spends.as_deref());
         let primary_cf = ctx
             .store

@@ -1,6 +1,6 @@
 //! Exact positive miner-collected fee frequencies by block time and UTC day.
 //!
-//! This projection combines canonical transparent values with signed
+//! This materialized view combines canonical transparent values with signed
 //! transaction-intrinsic shielded value balances. Missing inputs remain
 //! explicit unavailable counts; conventional fees are never substituted.
 
@@ -18,7 +18,7 @@ use zinder_core::{
 use zinder_proto::capabilities::EXPLORER_PAID_FEE_DISTRIBUTION_V1;
 
 use crate::consumer::{
-    BlockCommitContext, BlockCommitContextError, BlockKeyedConsumer, MaterializedViewConsumerCtx,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
     MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
 };
 use crate::{MaterializedViewStore, MaterializedViewStoreError, MaterializedViewStoreReadSnapshot};
@@ -52,7 +52,7 @@ pub const PAID_FEE_DISTRIBUTION_SCHEMA: MaterializedViewConsumerSchema =
         PAID_FEE_DISTRIBUTION_COLUMN_FAMILIES,
     );
 
-/// Capability advertised when this projection is ready.
+/// Capability advertised when this materialized view is ready.
 pub const PAID_FEE_DISTRIBUTION_CAPABILITIES: &[&str] = &[EXPLORER_PAID_FEE_DISTRIBUTION_V1];
 
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -589,7 +589,7 @@ impl PaidFeeDistributionConsumer {
             store.consumer_column_family(PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY)?;
         ctx.batch
             .put_cf(&coverage_cf, COVERAGE_KEY, encode_coverage(next_coverage));
-        store.write_projection_batch(PAID_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(PAID_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -610,7 +610,7 @@ impl PaidFeeDistributionConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_projection_batch(PAID_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(PAID_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -839,8 +839,8 @@ impl BlockKeyedConsumer for PaidFeeDistributionConsumer {
 fn contribution_for_block(
     block: &BlockCommitContext,
 ) -> Result<BlockContribution, PaidFeeDistributionConsumerError> {
-    let transparent_spends = block.transparent_spends()?;
-    let intrinsic_value_balances = block.transaction_intrinsic_value_balances()?;
+    let transparent_spends = block.transparent_spends();
+    let intrinsic_value_balances = block.transaction_intrinsic_value_balances();
     let mut frequencies = BTreeMap::<u64, u64>::new();
     let mut unavailable = 0_u64;
     for transaction in &block.transactions {
@@ -1506,9 +1506,6 @@ fn store_decode_error(error: &PaidFeeDistributionConsumerError) -> MaterializedV
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PaidFeeDistributionConsumerError {
-    /// A block context failed to expose one of its hydrated fact maps.
-    #[error(transparent)]
-    BlockContext(#[from] BlockCommitContextError),
     /// Checked fee arithmetic exceeded the internal accumulator.
     #[error("paid-fee arithmetic overflowed for transaction {transaction_id:?}")]
     FeeArithmeticOverflow {
@@ -1657,7 +1654,7 @@ mod tests {
     use super::*;
     use crate::MaterializedViewStoreOptions;
     use crate::consumer::{
-        BlockCommitPayload, TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
+        BlockCommitInput, TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -1725,7 +1722,7 @@ mod tests {
             })
             .collect();
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height,
                 block_hash: hash,
                 previous_block_hash: block_hash(hash_seed.wrapping_sub(1)),
@@ -2079,7 +2076,7 @@ mod tests {
     fn missing_intrinsic_for_transparent_only_increments_unavailable_count() -> TestResult {
         let (transaction, transparent_spends) = transparent_transaction(50_000, 40_000);
         let block = BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: BlockHeight::new(100),
                 block_hash: block_hash(7),
                 previous_block_hash: block_hash(6),
@@ -2126,7 +2123,7 @@ mod tests {
         let mut coinbase = transaction(BlockHeight::new(100), block_hash(1), 0);
         coinbase.public_facts.is_coinbase = true;
         let block = BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: BlockHeight::new(100),
                 block_hash: block_hash(1),
                 previous_block_hash: block_hash(0),

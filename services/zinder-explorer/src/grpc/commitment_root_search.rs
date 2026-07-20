@@ -3,7 +3,7 @@
 //! Reads the materialized-view reverse index, then validates every candidate against one
 //! pinned canonical epoch. The second check is intentional: an ingest-owned
 //! historical enrichment can commit just before a reorg, so an obsolete
-//! physical projection row must never become a canonical match.
+//! physical materialized-view row must never become a canonical match.
 
 use std::num::NonZeroU32;
 
@@ -36,7 +36,7 @@ const MAX_CANDIDATES_SCANNED: usize = 1_024;
 const MAX_RECENT_COVERAGE_ROWS: usize = 10_000;
 
 /// Executes one canonical final-root search.
-pub(crate) async fn handle_commitment_root_search(
+pub(crate) async fn query_commitment_root_search(
     materialized_view_store: &MaterializedViewStore,
     canonical_store: &SecondaryChainStore,
     activations: &NetworkUpgradeActivations,
@@ -376,7 +376,7 @@ fn wire_protocol(protocol: CoreProtocol) -> Result<ShieldedProtocol, Status> {
         CoreProtocol::Ironwood => ShieldedProtocol::Ironwood,
         _ => {
             return Err(ExplorerError::internal(
-                "commitment-root projection contains an unsupported shielded protocol",
+                "commitment-root materialized view contains an unsupported shielded protocol",
             )
             .into());
         }

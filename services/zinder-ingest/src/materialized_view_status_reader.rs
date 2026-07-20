@@ -1,4 +1,4 @@
-//! Backend-neutral access to the ingest plane's latest materialized-view status.
+//! Backend-neutral access to the materialized-view plane's latest status.
 
 use prost::Message as _;
 use thiserror::Error;

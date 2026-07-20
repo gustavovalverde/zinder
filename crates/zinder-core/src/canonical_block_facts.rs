@@ -348,7 +348,7 @@ impl CanonicalBlockFactsSequenceDigestBuilder {
 /// Immutable facts for one transaction at its position in a source block.
 ///
 /// The containing block identity and this value's vector position supply its
-/// mined location. Current-schema index rows are expanded only at the writer
+/// mined location. Canonical-store index rows are expanded only at the writer
 /// boundary and are not part of this backend-neutral contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalTransactionFacts {

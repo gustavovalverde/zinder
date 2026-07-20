@@ -103,7 +103,9 @@ domain value.
 
 ## Evolution and verification
 
-- Additive fields receive new tags; removed tags stay reserved.
+- Additive fields receive new tags. This pre-compat native protocol may reuse a
+  deleted native tag as part of an explicitly breaking contract change.
+- Vendored compatibility schemas retain upstream field and reservation rules.
 - Breaking native shapes use a new capability version or package version.
 - Compatibility schemas change only with an explicit upstream-pin update.
 - Proto tests cover golden decoding, byte order, enum mappings, pagination, and

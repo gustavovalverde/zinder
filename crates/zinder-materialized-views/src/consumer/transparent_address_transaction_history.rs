@@ -2,7 +2,7 @@
 //!
 //! Materializes transparent-address transaction history from typed canonical
 //! facts. Canonical ingest writes transparent outputs and spend facts once; this
-//! consumer owns the address-to-transaction projection that serves wallet
+//! consumer owns the address-to-transaction materialized view that serves wallet
 //! `GetTaddressTxids`-style reads.
 
 use std::{collections::HashMap, num::NonZeroU32};
@@ -62,10 +62,11 @@ const POSITION_LEN: usize = 4;
 const HISTORY_KEY_LEN: usize = ADDRESS_HASH_LEN + HEIGHT_LEN + POSITION_LEN;
 const HISTORY_VALUE_LEN: usize = 64;
 const INDEX_ENTRY_LEN: usize = HISTORY_KEY_LEN * 2;
-const CURSOR_PREFIX: &[u8; 4] = b"zth1";
+const CURSOR_PREFIX: &[u8; 4] = b"zth2";
 const CURSOR_DIRECTION_OFFSET: usize = CURSOR_PREFIX.len();
-const CURSOR_KEY_OFFSET: usize = CURSOR_DIRECTION_OFFSET + 1;
-const CURSOR_LEN: usize = CURSOR_KEY_OFFSET + HISTORY_KEY_LEN;
+const CURSOR_FENCE_LENGTH_OFFSET: usize = CURSOR_DIRECTION_OFFSET + 1;
+const CURSOR_FENCE_OFFSET: usize = CURSOR_FENCE_LENGTH_OFFSET + 2;
+const CURSOR_MIN_LEN: usize = CURSOR_FENCE_OFFSET + HISTORY_KEY_LEN;
 const TRANSACTION_ID_RANGE: std::ops::Range<usize> = 0..32;
 const BLOCK_HASH_RANGE: std::ops::Range<usize> = 32..64;
 
@@ -82,6 +83,11 @@ pub struct TransparentAddressTransactionHistoryPageRequest<'cursor> {
     pub max_entries: NonZeroU32,
     /// Optional cursor returned by a previous page.
     pub from_cursor: Option<&'cursor StreamCursorTokenV1>,
+    /// Exact visible-chain event fence the rows and pagination cursor must
+    /// represent. The caller obtains this from the canonical store and must
+    /// compare it with this consumer's persisted cursor in the same
+    /// materialized-view snapshot before reading rows.
+    pub chain_event_fence: Option<&'cursor StreamCursorTokenV1>,
     /// Iterate newest-first when true.
     pub descending: bool,
 }
@@ -196,8 +202,19 @@ impl TransparentAddressTransactionHistoryConsumer {
             .from_cursor
             .map(history_cursor_from_token)
             .transpose()?;
+        let expected_fence = request.chain_event_fence.map(StreamCursorTokenV1::as_bytes);
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.chain_event_fence.as_deref() != expected_fence)
+        {
+            return Err(cursor_error(
+                "cursor is bound to a different visible chain fence",
+            ));
+        }
         let request = TransparentAddressTransactionHistoryPageRequest {
-            descending: cursor.map_or(request.descending, |cursor| cursor.descending),
+            descending: cursor
+                .as_ref()
+                .map_or(request.descending, |cursor| cursor.descending),
             ..request
         };
         let column_family = if request.descending {
@@ -232,8 +249,13 @@ impl TransparentAddressTransactionHistoryConsumer {
             last_key = Some(key);
             artifacts.push(artifact);
         }
-        let next_cursor =
-            last_key.map(|key| history_cursor_token(request.descending, key.as_slice()));
+        let next_cursor = last_key.map(|key| {
+            history_cursor_token(
+                request.descending,
+                request.chain_event_fence.map(StreamCursorTokenV1::as_bytes),
+                key.as_slice(),
+            )
+        });
         Ok(TransparentAddressTransactionHistoryPage {
             artifacts,
             next_cursor,
@@ -251,7 +273,7 @@ impl BlockKeyedConsumer for TransparentAddressTransactionHistoryConsumer {
         block: &BlockCommitContext,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let transparent_spends = block.transparent_spends()?;
+        let transparent_spends = block.transparent_spends();
         let rows = collect_address_transaction_rows(block, transparent_spends.as_deref());
         let ascending_cf = ctx
             .store
@@ -512,16 +534,25 @@ fn history_key_from_bytes(
         .map_err(|_| decode_error("history cursor length is invalid"))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct HistoryCursor {
     descending: bool,
+    chain_event_fence: Option<Vec<u8>>,
     key: [u8; HISTORY_KEY_LEN],
 }
 
-fn history_cursor_token(descending: bool, key: &[u8]) -> StreamCursorTokenV1 {
-    let mut bytes = Vec::with_capacity(CURSOR_LEN);
+fn history_cursor_token(
+    descending: bool,
+    chain_event_fence: Option<&[u8]>,
+    key: &[u8],
+) -> StreamCursorTokenV1 {
+    let chain_event_fence = chain_event_fence.unwrap_or_default();
+    let fence_len = u16::try_from(chain_event_fence.len()).unwrap_or(u16::MAX);
+    let mut bytes = Vec::with_capacity(CURSOR_MIN_LEN.saturating_add(chain_event_fence.len()));
     bytes.extend_from_slice(CURSOR_PREFIX);
     bytes.push(u8::from(descending));
+    bytes.extend_from_slice(&fence_len.to_be_bytes());
+    bytes.extend_from_slice(chain_event_fence);
     bytes.extend_from_slice(key);
     StreamCursorTokenV1::from_bytes(bytes)
 }
@@ -530,7 +561,7 @@ fn history_cursor_from_token(
     cursor: &StreamCursorTokenV1,
 ) -> Result<HistoryCursor, MaterializedViewStoreError> {
     let bytes = cursor.as_bytes();
-    if bytes.len() != CURSOR_LEN {
+    if bytes.len() < CURSOR_MIN_LEN {
         return Err(cursor_error("history cursor length is invalid"));
     }
     if bytes.get(..CURSOR_PREFIX.len()) != Some(CURSOR_PREFIX) {
@@ -541,9 +572,25 @@ fn history_cursor_from_token(
         1 => true,
         _ => return Err(cursor_error("history cursor direction is invalid")),
     };
+    let fence_len = usize::from(u16::from_be_bytes(
+        bytes[CURSOR_FENCE_LENGTH_OFFSET..CURSOR_FENCE_OFFSET]
+            .try_into()
+            .map_err(|_| cursor_error("history cursor fence length is invalid"))?,
+    ));
+    let fence_end = CURSOR_FENCE_OFFSET
+        .checked_add(fence_len)
+        .ok_or_else(|| cursor_error("history cursor fence length overflows"))?;
+    let key_end = fence_end
+        .checked_add(HISTORY_KEY_LEN)
+        .ok_or_else(|| cursor_error("history cursor key length overflows"))?;
+    if bytes.len() != key_end {
+        return Err(cursor_error("history cursor length is invalid"));
+    }
     Ok(HistoryCursor {
         descending,
-        key: bytes[CURSOR_KEY_OFFSET..]
+        chain_event_fence: (!bytes[CURSOR_FENCE_OFFSET..fence_end].is_empty())
+            .then(|| bytes[CURSOR_FENCE_OFFSET..fence_end].to_vec()),
+        key: bytes[fence_end..]
             .try_into()
             .map_err(|_| cursor_error("history cursor length is invalid"))?,
     })
@@ -592,8 +639,8 @@ fn decode_error(reason: impl Into<String>) -> MaterializedViewStoreError {
 }
 
 fn cursor_error(reason: &'static str) -> MaterializedViewStoreError {
-    MaterializedViewStoreError::ProjectionCursorInvalid {
-        projection: TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME.as_str(),
+    MaterializedViewStoreError::ConsumerCursorInvalid {
+        consumer: TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME.as_str(),
         reason,
     }
 }
@@ -621,7 +668,7 @@ mod tests {
         TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
         TransparentOutPoint, TransparentOutputFact, TransparentSpendFact,
     };
-    use zinder_store::RocksDbResourceBudget;
+    use zinder_store::{RocksDbResourceBudget, StreamCursorTokenV1};
 
     use super::{
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
@@ -629,10 +676,13 @@ mod tests {
         TransparentAddressTransactionHistoryPageRequest,
     };
     use crate::consumer::block_commit_context::{
-        BlockCommitContext, BlockCommitPayload, TransparentSpendFacts,
+        BlockCommitContext, BlockCommitInput, TransparentSpendFacts,
     };
     use crate::consumer::{BlockKeyedConsumer, MaterializedViewConsumerCtx};
-    use crate::store::{MaterializedViewStore, MaterializedViewStoreOptions};
+    use crate::{
+        MaterializedViewStoreError,
+        store::{MaterializedViewStore, MaterializedViewStoreOptions},
+    };
 
     const WATCHED_ADDRESS: TransparentAddressScriptHash =
         TransparentAddressScriptHash::from_bytes([7; 32]);
@@ -716,7 +766,7 @@ mod tests {
                 )],
             );
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: RECEIVE_HEIGHT,
                 block_hash: block_hash(1),
                 previous_block_hash: block_hash(0),
@@ -753,7 +803,7 @@ mod tests {
             ),
         );
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: SPEND_HEIGHT,
                 block_hash: block_hash(5),
                 previous_block_hash: block_hash(4),
@@ -783,6 +833,7 @@ mod tests {
                 end_height: BlockHeight::new(200),
                 max_entries: NonZeroU32::new(10).expect("ten is non-zero"),
                 from_cursor: None,
+                chain_event_fence: None,
                 descending: false,
             },
         )?;
@@ -818,6 +869,7 @@ mod tests {
                     end_height: SPEND_HEIGHT,
                     max_entries: NonZeroU32::new(10).expect("ten is non-zero"),
                     from_cursor: None,
+                    chain_event_fence: None,
                     descending,
                 },
             )
@@ -870,7 +922,7 @@ mod tests {
             )],
         );
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: MULTI_RECEIVE_HEIGHT,
                 block_hash: block_hash(7),
                 previous_block_hash: block_hash(6),
@@ -899,6 +951,7 @@ mod tests {
                 end_height: MULTI_RECEIVE_HEIGHT,
                 max_entries: NonZeroU32::new(10).expect("ten is non-zero"),
                 from_cursor: None,
+                chain_event_fence: None,
                 descending: true,
             },
         )?;
@@ -906,6 +959,52 @@ mod tests {
         assert_eq!(page.artifacts.len(), 2);
         assert_eq!(page.artifacts[0].tx_index_in_block, 1);
         assert_eq!(page.artifacts[1].tx_index_in_block, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn page_cursor_rejects_a_different_visible_chain_fence()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = TransparentAddressTransactionHistoryConsumer::new();
+        apply_block(&store, &mut consumer, &multi_receive_block())?;
+        let first_fence = StreamCursorTokenV1::from_bytes(vec![0xA1]);
+        let first_page = TransparentAddressTransactionHistoryConsumer::read_page(
+            &store,
+            TransparentAddressTransactionHistoryPageRequest {
+                address_script_hash: WATCHED_ADDRESS,
+                start_height: MULTI_RECEIVE_HEIGHT,
+                end_height: MULTI_RECEIVE_HEIGHT,
+                max_entries: NonZeroU32::new(1).expect("one is non-zero"),
+                from_cursor: None,
+                chain_event_fence: Some(&first_fence),
+                descending: false,
+            },
+        )?;
+        let cursor = first_page
+            .next_cursor
+            .ok_or("first page must carry a cursor")?;
+        let replacement_fence = StreamCursorTokenV1::from_bytes(vec![0xB2]);
+        let error = TransparentAddressTransactionHistoryConsumer::read_page(
+            &store,
+            TransparentAddressTransactionHistoryPageRequest {
+                address_script_hash: WATCHED_ADDRESS,
+                start_height: MULTI_RECEIVE_HEIGHT,
+                end_height: MULTI_RECEIVE_HEIGHT,
+                max_entries: NonZeroU32::new(1).expect("one is non-zero"),
+                from_cursor: Some(&cursor),
+                chain_event_fence: Some(&replacement_fence),
+                descending: false,
+            },
+        )
+        .expect_err("a cursor from a replaced visible chain must fail closed");
+        assert!(matches!(
+            error,
+            MaterializedViewStoreError::ConsumerCursorInvalid {
+                reason: "cursor is bound to a different visible chain fence",
+                ..
+            }
+        ));
         Ok(())
     }
 

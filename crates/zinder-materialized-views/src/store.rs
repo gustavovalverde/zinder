@@ -76,17 +76,16 @@ use crate::{
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
     },
     consumer::transparent_outpoint_spend::{
-        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
-        TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
+        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
     },
     consumer::value_pool_balance_history::VALUE_POOL_BALANCE_HISTORY_SCHEMA,
     consumer::value_pool_flow_history::{
         VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, VALUE_POOL_FLOW_HISTORY_SCHEMA,
     },
     consumer::{
-        BlockCommitContext, BlockKeyedConsumer, BlockProjectionCheckpoint, ChainCommittedEvent,
-        ChainReorgedEvent, CommittedRange, MaterializedViewConsumer, MaterializedViewConsumerCtx,
-        MaterializedViewConsumerName, MaterializedViewConsumerSchema,
+        BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
+        CommittedRange, MaterializedViewBlockCheckpoint, MaterializedViewConsumer,
+        MaterializedViewConsumerCtx, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
         MaterializedViewMempoolConsumer, RevertedRange, apply_chain_committed_in_memory,
         apply_chain_reorged_in_memory,
     },
@@ -96,10 +95,10 @@ use crate::{
 /// Conventional subdirectory of the canonical store path where the
 /// materialized-view `RocksDB` instance lives.
 ///
-/// Both the writer (`zinder-ingest`) and any reader process opening the
-/// store in secondary mode resolve the materialized-view store with
-/// [`MaterializedViewStore::path_for_canonical`], so operators only configure one
-/// `storage.path` per service.
+/// A separately composed replay host and any reader process opening the store
+/// in secondary mode resolve the materialized-view store with
+/// [`MaterializedViewStore::path_for_canonical`], so operators only configure
+/// one `storage.path` per service.
 pub const MATERIALIZED_VIEW_STORE_SUBDIR: &str = "materialized-views";
 
 /// Container-format version of the materialized-view store.
@@ -108,14 +107,15 @@ pub const MATERIALIZED_VIEW_STORE_SUBDIR: &str = "materialized-views";
 /// manifest layout, the cursor encoding, and the metadata column family.
 /// Per-consumer column-family layouts version themselves through
 /// [`MaterializedViewConsumerSchema::schema_version`]; a consumer changing its own
-/// persisted row contract bumps its own version. Incompatible changes rebuild
-/// only that consumer, while explicitly row-compatible changes preserve its
-/// rows and cursor. This
-/// constant bumps only when the shared container changes, which forces a
-/// whole-store wipe because no consumer's data survives a container change.
-/// The version is persisted in the `consumer_metadata` column family on
-/// first open and validated on subsequent opens.
-pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 7;
+/// persisted row contract bumps its own version. The running binary admits
+/// only an exact manifest, so any consumer schema change requires a fresh
+/// materialized-view store. This constant bumps only when the shared container
+/// changes. No persisted consumer data survives any schema change, so an
+/// incompatible store is rejected until an operator supplies a fresh store and
+/// rebuilds it from a certified recovery source. The version is persisted in
+/// the `consumer_metadata` column family on first open and validated on
+/// subsequent opens.
+pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 9;
 
 /// Total attempts used to cross a primary-compaction race while a secondary
 /// catches up and validates its newly replayed manifest.
@@ -124,10 +124,10 @@ const SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS: u32 = 3;
 const STORE_FORMAT_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const MATERIALIZED_VIEW_STATUS_KEY: &[u8] = b"\x00\x02materialized_view_status";
 const CONSUMER_SCHEMA_KEY_PREFIX: &[u8] = b"\x00\x03consumer_schema:";
-const CONSUMER_PROJECTION_STATE_KEY_PREFIX: &[u8] = b"\x00\x04consumer_projection_state:";
-const CONSUMER_PROJECTION_STATE_VERSION: u8 = 1;
-const CONSUMER_PROJECTION_STATE_LEN: usize = 94;
-const PROJECTION_ROCKSDB_PROPERTIES: [&str; 7] = [
+const MATERIALIZED_VIEW_STATE_KEY_PREFIX: &[u8] = b"\x00\x04consumer_state:";
+const MATERIALIZED_VIEW_STATE_VERSION: u8 = 1;
+const MATERIALIZED_VIEW_STATE_LEN: usize = 94;
+const MATERIALIZED_VIEW_ROCKSDB_PROPERTIES: [&str; 7] = [
     "rocksdb.estimate-live-data-size",
     "rocksdb.total-sst-files-size",
     "rocksdb.size-all-mem-tables",
@@ -137,33 +137,33 @@ const PROJECTION_ROCKSDB_PROPERTIES: [&str; 7] = [
     "rocksdb.num-running-compactions",
 ];
 
-/// Per-projection work staged into one successful atomic materialized-view commit.
+/// Per-consumer work staged into one successful atomic materialized-view commit.
 ///
-/// Measurements use the stable projection identity rather than its owned
-/// column-family names. The ingest scheduler turns these values into replay
+/// Measurements use the stable consumer identity rather than its owned
+/// column-family names. The replay scheduler turns these values into replay
 /// and write metrics only after the shared batch commits successfully.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProjectionWriteMeasurement {
-    /// Stable projection identity that staged the writes.
-    pub projection: MaterializedViewConsumerName,
-    /// Number of puts, deletes, and merges staged by this projection.
+pub struct MaterializedViewWriteMeasurement {
+    /// Stable consumer identity that staged the writes.
+    pub consumer: MaterializedViewConsumerName,
+    /// Number of puts, deletes, and merges staged by this consumer.
     pub operations: u64,
-    /// Serialized write-batch bytes attributable to this projection.
+    /// Serialized write-batch bytes attributable to this consumer.
     pub logical_bytes: u64,
-    /// Time spent applying the event and staging projection-owned rows.
+    /// Time spent applying the event and staging consumer-owned rows.
     pub dispatch_duration: Duration,
 }
 
-impl ProjectionWriteMeasurement {
+impl MaterializedViewWriteMeasurement {
     fn from_batch_delta(
-        projection: MaterializedViewConsumerName,
+        consumer: MaterializedViewConsumerName,
         before: WriteBatchSize,
         batch: &WriteBatch,
         dispatch_duration: Duration,
     ) -> Self {
         let after = WriteBatchSize::capture(batch);
         Self {
-            projection,
+            consumer,
             operations: usize_to_u64_saturating(after.operations.saturating_sub(before.operations)),
             logical_bytes: usize_to_u64_saturating(
                 after.logical_bytes.saturating_sub(before.logical_bytes),
@@ -198,16 +198,6 @@ impl WriteBatchSize {
     }
 }
 const ROCKSDB_DEFAULT_COLUMN_FAMILY: &str = "default";
-
-/// Inclusive lower bound for a full column-family clear: the empty key sorts
-/// before every stored key.
-const CLEAR_RANGE_LOWER_BOUND: &[u8] = &[];
-/// Exclusive upper bound for a full column-family clear.
-///
-/// It sits above every consumer key, so one range tombstone covers the whole
-/// family; any key at or above it is removed by the residue sweep in
-/// [`MaterializedViewStore::clear_consumer_column_family`].
-const CLEAR_RANGE_UPPER_BOUND: &[u8] = &[0xff; 512];
 
 const BUNDLED_CONSUMERS: &[MaterializedViewConsumerSchema] = &[
     BLOCK_PRODUCTION_TIME_SCHEMA,
@@ -259,59 +249,20 @@ const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES: &[MaterializedViewConsumerN
 ///
 /// Presets choose which read models the materialized-view store materializes. They do not
 /// change canonical facts, historical coverage, raw payload retention, or the
-/// process that executes a projection.
+/// process that executes a materialized view.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum ProjectionPreset {
-    /// Wallet-serving projections required for transparent history and durable
+pub enum MaterializedViewPreset {
+    /// Wallet-serving materialized views required for transparent history and durable
     /// spender resolution.
     Wallet,
-    /// Wallet-serving projections plus every explorer projection bundled with
+    /// Wallet-serving materialized views plus every explorer materialized view bundled with
     /// this Zinder release.
     #[default]
     Explorer,
 }
 
-/// Read-only facts discovered from an existing projection store before a
-/// writer opens it for schema reconciliation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProjectionStoreInspection {
-    has_projection_data: bool,
-    transparent_outpoint_spend_height: Option<BlockHeight>,
-    transparent_outpoint_spend_coverage: Option<ConsumerProjectionCoverage>,
-    transparent_outpoint_spend_requires_rebuild: bool,
-}
-
-impl ProjectionStoreInspection {
-    /// Returns whether any selected projection row or event cursor exists.
-    #[must_use]
-    pub const fn has_projection_data(self) -> bool {
-        self.has_projection_data
-    }
-
-    /// Returns the durable height of the retention-authoritative spender
-    /// projection, if that projection has materialized any block.
-    #[must_use]
-    pub const fn transparent_outpoint_spend_height(self) -> Option<BlockHeight> {
-        self.transparent_outpoint_spend_height
-    }
-
-    /// Returns the verified contiguous range held by the
-    /// retention-authoritative spender projection.
-    #[must_use]
-    pub const fn transparent_outpoint_spend_coverage(self) -> Option<ConsumerProjectionCoverage> {
-        self.transparent_outpoint_spend_coverage
-    }
-
-    /// Returns whether opening this store with the running schema would clear
-    /// the retention-authoritative spender projection before replay.
-    #[must_use]
-    pub const fn transparent_outpoint_spend_requires_rebuild(self) -> bool {
-        self.transparent_outpoint_spend_requires_rebuild
-    }
-}
-
-impl ProjectionPreset {
+impl MaterializedViewPreset {
     /// Returns the stable configuration and storage name for this preset.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -349,11 +300,10 @@ fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResource
 
 /// Builds the open-time column-family descriptors.
 ///
-/// Every store family and every declared consumer family is opened, plus any
-/// column family already on disk that neither list covers. `RocksDB` refuses
-/// to open a store while leaving an existing column family unlisted, so unknown
-/// families must be opened before manifest validation can reject an undeclared
-/// consumer without mutating it.
+/// Every store family and every declared consumer family is opened. On an
+/// existing store, the supplied on-disk names were already checked against
+/// that exact identity before this function runs; retaining them here lets
+/// `RocksDB` verify the checked set at open time.
 fn column_family_descriptors(
     cache: &Cache,
     rocksdb_resource_budget: RocksDbResourceBudget,
@@ -391,104 +341,39 @@ fn existing_column_family_names(path: &Path) -> Vec<String> {
     DB::list_cf(&Options::default(), path).unwrap_or_default()
 }
 
-fn column_family_has_any_row(
-    db: &DB,
-    column_family: &'static str,
-) -> Result<bool, MaterializedViewStoreError> {
-    let Some(handle) = db.cf_handle(column_family) else {
-        return Ok(false);
-    };
-    let Some(entry) = db.iterator_cf(&handle, IteratorMode::Start).next() else {
-        return Ok(false);
-    };
-    entry
-        .map(|_| true)
-        .map_err(|source| MaterializedViewStoreError::ConsumerOperation {
-            operation: "inspect_first_row",
-            name: column_family,
-            source,
-        })
-}
-
-fn last_height_in_column_family(
-    db: &DB,
-    column_family: &'static str,
-) -> Result<Option<BlockHeight>, MaterializedViewStoreError> {
-    let Some(handle) = db.cf_handle(column_family) else {
-        return Ok(None);
-    };
-    let Some(entry) = db.iterator_cf(&handle, IteratorMode::End).next() else {
-        return Ok(None);
-    };
-    let (key, _) = entry.map_err(|source| MaterializedViewStoreError::ConsumerOperation {
-        operation: "inspect_last_row",
-        name: column_family,
-        source,
-    })?;
-    zinder_core::wire::decode_height_key_ascending(&key)
-        .map(Some)
-        .map_err(|error| MaterializedViewStoreError::ConsumerPayloadDecode {
-            name: column_family,
-            reason: error.to_string(),
-        })
-}
-
-fn transparent_outpoint_spend_state_for_inspection(
-    db: &DB,
-) -> Result<Option<ConsumerProjectionState>, MaterializedViewStoreError> {
-    let Some(column_family) =
-        db.cf_handle(MaterializedViewStoreTable::ConsumerMetadata.column_family_name())
-    else {
-        return Ok(None);
-    };
-    db.get_cf(
-        &column_family,
-        consumer_projection_state_key(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str()),
-    )
-    .map_err(|source| MaterializedViewStoreError::Operation {
-        operation: "get",
-        column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
-        source,
-    })?
-    .map(|payload| {
-        decode_consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, &payload)
+fn validate_column_family_identity(
+    persisted: &[String],
+    consumers: &[MaterializedViewConsumerSchema],
+) -> Result<(), MaterializedViewStoreError> {
+    let expected = std::iter::once(ROCKSDB_DEFAULT_COLUMN_FAMILY.to_owned())
+        .chain(
+            MaterializedViewStoreTable::all()
+                .into_iter()
+                .map(|table| table.column_family_name().to_owned()),
+        )
+        .chain(consumers.iter().flat_map(|consumer| {
+            consumer
+                .column_families
+                .iter()
+                .map(|name| (*name).to_owned())
+        }))
+        .collect::<BTreeSet<_>>();
+    let persisted = persisted.iter().cloned().collect::<BTreeSet<_>>();
+    if persisted == expected {
+        return Ok(());
+    }
+    Err(MaterializedViewStoreError::ColumnFamilyIdentityMismatch {
+        persisted: persisted.into_iter().collect(),
+        expected: expected.into_iter().collect(),
     })
-    .transpose()
-}
-
-fn store_format_requires_rebuild_for_inspection(
-    db: &DB,
-) -> Result<bool, MaterializedViewStoreError> {
-    let Some(column_family) =
-        db.cf_handle(MaterializedViewStoreTable::ConsumerMetadata.column_family_name())
-    else {
-        return Ok(false);
-    };
-    db.get_cf(&column_family, STORE_FORMAT_VERSION_KEY)
-        .map_err(|source| MaterializedViewStoreError::Operation {
-            operation: "get",
-            column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
-            source,
-        })?
-        .map(|bytes| decode_store_format_version(&bytes))
-        .transpose()
-        .map_err(|reason| MaterializedViewStoreError::Decode {
-            column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
-            reason,
-        })
-        .map(|persisted| {
-            persisted.is_some_and(|version| version < MATERIALIZED_VIEW_STORE_FORMAT_VERSION)
-        })
 }
 
 /// Rejects consumer declarations whose column families collide.
 ///
 /// Every declared column family must be unique across consumers and must not
-/// reuse a store-table name or the `RocksDB` default family. Reconciliation
-/// drops a column family only when no declared consumer owns it, so a name
-/// shared by two declarations would let one consumer's rebuild or removal wipe
-/// another's rows behind a cursor that never rewinds. Rejecting at open time
-/// keeps that impossible.
+/// reuse a store-table name or the `RocksDB` default family. A name shared by
+/// two declarations would make the persisted schema identity ambiguous, so
+/// rejecting it at open time keeps the manifest unambiguous.
 fn validate_consumer_declarations(
     consumers: &[MaterializedViewConsumerSchema],
 ) -> Result<(), MaterializedViewStoreError> {
@@ -564,9 +449,9 @@ pub struct MaterializedViewStoreOptions {
     pub sync_writes: bool,
     /// Consumers to register at open time. Each declares its stable name, its
     /// schema version, and the column families it reads and writes through
-    /// [`MaterializedViewStore::consumer_column_family`]. On open the store reconciles
-    /// each consumer's declared version against the persisted manifest,
-    /// rebuilding only the consumers whose versions moved.
+    /// [`MaterializedViewStore::consumer_column_family`]. On reopen every
+    /// declaration must match the persisted manifest exactly; a changed
+    /// consumer requires a fresh materialized-view store.
     pub consumers: &'static [MaterializedViewConsumerSchema],
     /// Bounded `RocksDB` resource budget applied at open time.
     pub rocksdb_resource_budget: RocksDbResourceBudget,
@@ -615,9 +500,9 @@ pub struct ChainEventDispatchInputs<'event> {
     pub settled_tip_height: BlockHeight,
 }
 
-/// One verified contiguous range within a consumer projection.
+/// One verified contiguous range within a materialized-view consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConsumerProjectionCoverage {
+pub struct MaterializedViewCoverage {
     /// First verified canonical height.
     pub complete_from_height: BlockHeight,
     /// Last verified canonical height.
@@ -628,17 +513,17 @@ pub struct ConsumerProjectionCoverage {
 
 /// Atomic read fence and optional verified coverage for one materialized-view consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConsumerProjectionState {
-    /// Canonical epoch whose projection writes are visible.
-    pub projection_epoch_id: ChainEpochId,
-    /// Highest canonical height reflected by the projection.
-    pub projection_tip_height: BlockHeight,
-    /// Canonical hash at [`Self::projection_tip_height`].
-    pub projection_tip_hash: BlockHash,
-    /// Monotonic projection mutation and coverage revision.
+pub struct MaterializedViewState {
+    /// Canonical epoch whose materialized-view writes are visible.
+    pub chain_epoch_id: ChainEpochId,
+    /// Highest canonical height reflected by the materialized view.
+    pub tip_height: BlockHeight,
+    /// Canonical hash at [`Self::tip_height`].
+    pub tip_hash: BlockHash,
+    /// Monotonic materialized-view mutation and coverage revision.
     pub revision: u64,
     /// Verified contiguous coverage, when verification has started.
-    pub coverage: Option<ConsumerProjectionCoverage>,
+    pub coverage: Option<MaterializedViewCoverage>,
 }
 
 /// Consumers that participate in one chain-event materialized-view write.
@@ -679,7 +564,7 @@ pub struct MaterializedViewStore {
 
 /// Consistent read view over one `MaterializedViewStore` sequence.
 ///
-/// Every method reads through the same storage snapshot, so projection
+/// Every method reads through the same storage snapshot, so materialized-view
 /// metadata, consumer rows, bounds, and exact counts cannot observe different
 /// commits during one request. The underlying storage handles remain private.
 pub struct MaterializedViewStoreReadSnapshot<'store> {
@@ -703,15 +588,15 @@ impl MaterializedViewStoreReadSnapshot<'_> {
         options
     }
 
-    /// Reads one consumer's projection fence and verified coverage.
-    pub fn consumer_projection_state(
+    /// Reads one consumer's atomic state and verified coverage.
+    pub fn consumer_state(
         &self,
         consumer: MaterializedViewConsumerName,
-    ) -> Result<Option<ConsumerProjectionState>, MaterializedViewStoreError> {
+    ) -> Result<Option<MaterializedViewState>, MaterializedViewStoreError> {
         let column_family = self
             .store
             .column_family(MaterializedViewStoreTable::ConsumerMetadata)?;
-        let key = consumer_projection_state_key(consumer.as_str());
+        let key = consumer_state_key(consumer.as_str());
         self.store
             .db
             .get_cf_opt(&column_family, key, &self.read_options())
@@ -720,7 +605,7 @@ impl MaterializedViewStoreReadSnapshot<'_> {
                 column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
                 source,
             })?
-            .map(|payload| decode_consumer_projection_state(consumer, &payload))
+            .map(|payload| decode_materialized_view_state(consumer, &payload))
             .transpose()
     }
 
@@ -1124,18 +1009,18 @@ impl MaterializedViewStore {
     /// Returns the closed product workload represented by this store's
     /// selected consumer identities.
     ///
-    /// Generic test stores and stores with explorer projections classify as
+    /// Generic test stores and stores with explorer materialized views classify as
     /// explorer. Only the exact wallet identity set classifies as wallet.
     #[must_use]
-    pub fn effective_projection_preset(&self) -> ProjectionPreset {
+    pub fn effective_materialized_view_preset(&self) -> MaterializedViewPreset {
         let is_wallet = self.consumers.len() == WALLET_PROJECTION_CONSUMERS.len()
             && WALLET_PROJECTION_CONSUMERS
                 .iter()
                 .all(|schema| self.has_consumer(schema.name));
         if is_wallet {
-            ProjectionPreset::Wallet
+            MaterializedViewPreset::Wallet
         } else {
-            ProjectionPreset::Explorer
+            MaterializedViewPreset::Explorer
         }
     }
 
@@ -1163,16 +1048,11 @@ impl MaterializedViewStore {
     ///
     /// Rejects with [`MaterializedViewStoreError::ConsumerColumnFamilyConflict`] when the
     /// declared consumers do not own disjoint column families. On a fresh path
-    /// the store-format version is written immediately and the manifest is
-    /// seeded with every declared consumer's version. A persisted store-format
-    /// version older than [`MATERIALIZED_VIEW_STORE_FORMAT_VERSION`] deletes the whole
-    /// materialized-view directory and reopens it fresh, so the rebuild leaves no
-    /// column-family drop edits in the `RocksDB` manifest for a secondary
-    /// reader to replay; a newer persisted version is rejected with
-    /// [`MaterializedViewStoreError::SchemaMismatch`] so an older binary never wipes a
-    /// store it cannot read. Each consumer is then reconciled: a consumer whose
-    /// declared version moved has its cursor reset and its column families
-    /// rebuilt while every other consumer is left untouched.
+    /// the store-format version and complete manifest are written atomically.
+    /// On every subsequent open, the persisted container version and every
+    /// declared consumer identity must match exactly. Any divergence is
+    /// rejected without mutation; the operator must choose a fresh path and
+    /// rebuild from a certified recovery source.
     pub fn open(
         path: impl AsRef<Path>,
         options: MaterializedViewStoreOptions,
@@ -1180,117 +1060,35 @@ impl MaterializedViewStore {
         Self::open_primary(path.as_ref(), options, None)
     }
 
-    /// Opens or creates a materialized-view store for one closed projection preset.
+    /// Opens or creates a materialized-view store for one closed materialized-view preset.
     ///
-    /// The durable per-consumer manifest is preflighted before consumer schemas
-    /// are reconciled. Reopening a wallet store as explorer, or an explorer
+    /// The durable per-consumer manifest is preflighted before the primary
+    /// opens the database. Reopening a wallet store as explorer, or an explorer
     /// store as wallet, fails before that manifest can be expanded or reduced.
-    pub fn open_with_projection_preset(
+    pub fn open_with_materialized_view_preset(
         path: impl AsRef<Path>,
-        projection_preset: ProjectionPreset,
+        materialized_view_preset: MaterializedViewPreset,
         mut options: MaterializedViewStoreOptions,
     ) -> Result<Self, MaterializedViewStoreError> {
-        options.consumers = projection_preset.consumer_schemas();
-        Self::open_primary(path.as_ref(), options, Some(projection_preset))
+        options.consumers = materialized_view_preset.consumer_schemas();
+        Self::open_primary(path.as_ref(), options, Some(materialized_view_preset))
     }
 
-    /// Inspects an existing projection store without opening it for writes.
-    ///
-    /// The requested preset is validated against the recorded consumer
-    /// identities before any primary open can create column families,
-    /// reconcile schemas, or rewrite the manifest. `None` means `path` is not
-    /// currently a `RocksDB` materialized-view store.
-    pub fn inspect_projection_store_at_path(
-        path: impl AsRef<Path>,
-        requested: ProjectionPreset,
-    ) -> Result<Option<ProjectionStoreInspection>, MaterializedViewStoreError> {
-        let path = path.as_ref();
-        let existing_column_families = existing_column_family_names(path);
-        if existing_column_families.is_empty() {
-            return Ok(None);
-        }
-        let db =
-            DB::open_cf_for_read_only(&Options::default(), path, &existing_column_families, false)
-                .map_err(|source| MaterializedViewStoreError::Open {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-        let recorded_consumers = if let Some(column_family) =
-            db.cf_handle(MaterializedViewStoreTable::ConsumerMetadata.column_family_name())
-        {
-            decode_consumer_manifest_entries(db.iterator_cf(
-                &column_family,
-                IteratorMode::From(CONSUMER_SCHEMA_KEY_PREFIX, rust_rocksdb::Direction::Forward),
-            ))?
-        } else {
-            BTreeMap::new()
-        };
-        Self::validate_recorded_projection_identities(requested, &recorded_consumers, false)?;
-
-        let has_projection_data = requested
-            .consumer_schemas()
-            .iter()
-            .flat_map(|schema| schema.column_families.iter().copied())
-            .chain([
-                MaterializedViewStoreTable::ChainEventCursor.column_family_name(),
-                MaterializedViewStoreTable::MempoolEventCursor.column_family_name(),
-            ])
-            .try_fold(false, |found, column_family| {
-                if found {
-                    return Ok(true);
-                }
-                column_family_has_any_row(&db, column_family)
-            })?;
-        let transparent_outpoint_spend_height =
-            last_height_in_column_family(&db, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?;
-        let transparent_outpoint_spend_state =
-            transparent_outpoint_spend_state_for_inspection(&db)?;
-        let store_format_requires_rebuild = store_format_requires_rebuild_for_inspection(&db)?;
-        let transparent_outpoint_spend_schema = requested
-            .consumer_schemas()
-            .iter()
-            .find(|schema| schema.name == TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
-            .ok_or_else(|| MaterializedViewStoreError::ConsumerNotDeclared {
-                consumer: TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str().to_owned(),
-                persisted_schema_version: 0,
-            })?;
-        let schema_requires_rebuild = recorded_consumers
-            .get(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str())
-            .is_none_or(|recorded| {
-                recorded.schema_version <= transparent_outpoint_spend_schema.schema_version
-                    && !Self::consumer_manifest_is_exact(
-                        transparent_outpoint_spend_schema,
-                        recorded,
-                    )
-                    && !Self::consumer_manifest_is_row_compatible(
-                        transparent_outpoint_spend_schema,
-                        recorded,
-                    )
-            });
-        Ok(Some(ProjectionStoreInspection {
-            has_projection_data,
-            transparent_outpoint_spend_height,
-            transparent_outpoint_spend_coverage: transparent_outpoint_spend_state
-                .and_then(|state| state.coverage),
-            transparent_outpoint_spend_requires_rebuild: store_format_requires_rebuild
-                || schema_requires_rebuild,
-        }))
-    }
-
-    /// Detects the closed projection preset recorded by an existing materialized-view
-    /// store without opening it for writes or reconciling schemas.
+    /// Detects the closed materialized-view preset recorded by an existing materialized-view
+    /// store without opening it for writes.
     ///
     /// Returns `None` when the path is not a materialized-view `RocksDB` store. Manifests
-    /// containing explorer projections are classified as
-    /// [`ProjectionPreset::Explorer`]; only the exact two-identity wallet
+    /// containing explorer materialized views are classified as
+    /// [`MaterializedViewPreset::Explorer`]; only the exact two-identity wallet
     /// manifest is classified as wallet.
-    pub fn detect_projection_preset_at_path(
+    pub fn detect_materialized_view_preset_at_path(
         path: impl AsRef<Path>,
-    ) -> Result<Option<ProjectionPreset>, MaterializedViewStoreError> {
+    ) -> Result<Option<MaterializedViewPreset>, MaterializedViewStoreError> {
+        Self::require_matching_store_format_at_path(path.as_ref())?;
         let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path.as_ref())? else {
             return Ok(None);
         };
-        Self::reject_unknown_projection_identities(&recorded_consumers)?;
+        Self::reject_unknown_consumer_identities(&recorded_consumers)?;
         Ok(Some(Self::preset_for_recorded_consumers(
             &recorded_consumers,
         )))
@@ -1299,18 +1097,23 @@ impl MaterializedViewStore {
     fn open_primary(
         path: &Path,
         options: MaterializedViewStoreOptions,
-        projection_preset: Option<ProjectionPreset>,
+        materialized_view_preset: Option<MaterializedViewPreset>,
     ) -> Result<Self, MaterializedViewStoreError> {
         options
             .rocksdb_resource_budget
             .validate()
             .map_err(|reason| MaterializedViewStoreError::InvalidOptions { reason })?;
         validate_consumer_declarations(options.consumers)?;
-        if let Some(projection_preset) = projection_preset {
-            Self::preflight_projection_preset_at_path(path, projection_preset)?;
-        }
-        Self::wipe_materialized_view_directory_if_store_format_superseded(path)?;
+        Self::require_matching_store_format_at_path(path)?;
         let existing_column_families = existing_column_family_names(path);
+        let is_fresh_store = existing_column_families.is_empty();
+        if let Some(materialized_view_preset) = materialized_view_preset {
+            Self::preflight_materialized_view_preset_at_path(path, materialized_view_preset)?;
+        }
+        if !is_fresh_store {
+            Self::preflight_consumer_schemas_at_path(path, options.consumers)?;
+            validate_column_family_identity(&existing_column_families, options.consumers)?;
+        }
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary { path },
             options.rocksdb_resource_budget,
@@ -1342,11 +1145,12 @@ impl MaterializedViewStore {
             resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
             logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
-        store.validate_or_initialize_store_format_version()?;
-        if let Some(projection_preset) = projection_preset {
-            store.preflight_projection_preset(projection_preset, true)?;
+        if is_fresh_store {
+            store.initialize_schema_manifest()?;
+        } else {
+            store.require_matching_store_format_version()?;
+            store.validate_consumer_schemas()?;
         }
-        store.reconcile_consumer_schemas()?;
         store.record_rocksdb_properties();
         Ok(store)
     }
@@ -1364,13 +1168,14 @@ impl MaterializedViewStore {
     /// [`Self::try_catch_up`] is called; reads observe the snapshot from
     /// the last successful catchup.
     ///
-    /// A secondary reader cannot reconcile schemas, so it validates instead:
+    /// A secondary reader cannot initialize schemas, so it validates instead:
     /// the persisted container version must equal
     /// [`MATERIALIZED_VIEW_STORE_FORMAT_VERSION`], and every declared consumer's version
     /// must match the persisted manifest. A divergence returns
     /// [`MaterializedViewStoreError::SchemaMismatch`] or
-    /// [`MaterializedViewStoreError::ConsumerSchemaMismatch`]; the caller retries the
-    /// open once the primary has reconciled and rewritten the manifest.
+    /// [`MaterializedViewStoreError::ConsumerSchemaMismatch`]; the caller
+    /// retries against a fresh store after rebuilding from a certified recovery
+    /// source.
     pub fn open_secondary(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
@@ -1384,21 +1189,21 @@ impl MaterializedViewStore {
         )
     }
 
-    /// Opens a secondary reader for one closed projection preset.
+    /// Opens a secondary reader for one closed materialized-view preset.
     ///
     /// The primary must already have initialized the same durable preset.
-    pub fn open_secondary_with_projection_preset(
+    pub fn open_secondary_with_materialized_view_preset(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
-        projection_preset: ProjectionPreset,
+        materialized_view_preset: MaterializedViewPreset,
         mut options: MaterializedViewStoreOptions,
     ) -> Result<Self, MaterializedViewStoreError> {
-        options.consumers = projection_preset.consumer_schemas();
+        options.consumers = materialized_view_preset.consumer_schemas();
         Self::open_secondary_store(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             options,
-            Some(projection_preset),
+            Some(materialized_view_preset),
         )
     }
 
@@ -1406,14 +1211,25 @@ impl MaterializedViewStore {
         primary_path: &Path,
         secondary_path: &Path,
         options: MaterializedViewStoreOptions,
-        projection_preset: Option<ProjectionPreset>,
+        materialized_view_preset: Option<MaterializedViewPreset>,
     ) -> Result<Self, MaterializedViewStoreError> {
         options
             .rocksdb_resource_budget
             .validate()
             .map_err(|reason| MaterializedViewStoreError::InvalidOptions { reason })?;
         validate_consumer_declarations(options.consumers)?;
+        Self::require_matching_store_format_at_path(primary_path)?;
+        if let Some(materialized_view_preset) = materialized_view_preset {
+            Self::preflight_materialized_view_preset_at_path(
+                primary_path,
+                materialized_view_preset,
+            )?;
+        }
         let existing_column_families = existing_column_family_names(primary_path);
+        if !existing_column_families.is_empty() {
+            Self::preflight_consumer_schemas_at_path(primary_path, options.consumers)?;
+            validate_column_family_identity(&existing_column_families, options.consumers)?;
+        }
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Secondary {
                 primary_path,
@@ -1449,9 +1265,6 @@ impl MaterializedViewStore {
             logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
         store.require_matching_store_format_version()?;
-        if let Some(projection_preset) = projection_preset {
-            store.preflight_projection_preset(projection_preset, false)?;
-        }
         store.validate_secondary_consumer_schemas()?;
         store.record_rocksdb_properties();
         Ok(store)
@@ -1508,9 +1321,9 @@ impl MaterializedViewStore {
     ///
     /// The materialized-view store opens with `sync_writes: false`, so writes land in the
     /// unsynced WAL. Before the canonical retention release floor vouches that
-    /// projection rows up to a height are durable, the writer fsyncs the WAL so
+    /// materialized-view rows up to a height are durable, the writer fsyncs the WAL so
     /// a host crash cannot leave the floor (and the canonical deletes it
-    /// authorizes) ahead of the projection rows they depend on. No-op on a
+    /// authorizes) ahead of the materialized-view rows they depend on. No-op on a
     /// secondary, which owns no WAL of its own.
     pub fn flush_wal_to_disk(&self) -> Result<(), MaterializedViewStoreError> {
         if self.is_secondary {
@@ -1610,7 +1423,7 @@ impl MaterializedViewStore {
         consumers: &mut [&mut dyn BlockKeyedConsumer],
         inputs: ChainEventDispatchInputs<'_>,
         blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
-    ) -> Result<Vec<ProjectionWriteMeasurement>, MaterializedViewError>
+    ) -> Result<Vec<MaterializedViewWriteMeasurement>, MaterializedViewError>
     where
         S: BuildHasher,
     {
@@ -1641,7 +1454,7 @@ impl MaterializedViewStore {
         inputs: ChainEventDispatchInputs<'_>,
         blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
         advance_cursor: bool,
-    ) -> Result<Vec<ProjectionWriteMeasurement>, MaterializedViewError>
+    ) -> Result<Vec<MaterializedViewWriteMeasurement>, MaterializedViewError>
     where
         S: BuildHasher,
     {
@@ -1670,7 +1483,7 @@ impl MaterializedViewStore {
         inputs: ChainEventDispatchInputs<'_>,
         blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
         advance_cursor: bool,
-    ) -> Result<Vec<ProjectionWriteMeasurement>, MaterializedViewError>
+    ) -> Result<Vec<MaterializedViewWriteMeasurement>, MaterializedViewError>
     where
         S: BuildHasher,
     {
@@ -1683,12 +1496,12 @@ impl MaterializedViewStore {
             store: self,
             batch: &mut batch,
         };
-        let projection_checkpoint = block_projection_checkpoint(inputs, blocks);
+        let block_checkpoint = block_checkpoint(inputs, blocks);
         let mut measurements =
             Vec::with_capacity(block_consumers.len().saturating_add(event_consumers.len()));
 
         for consumer in block_consumers.iter_mut() {
-            let projection = consumer.name();
+            let consumer_name = consumer.name();
             let before = WriteBatchSize::capture(ctx.batch);
             let started_at = Instant::now();
             consumer
@@ -1699,22 +1512,22 @@ impl MaterializedViewStore {
                 .finish_batch(&mut ctx)
                 .map_err(MaterializedViewError::Consumer)?;
             consumer
-                .stage_chain_event_checkpoint(projection_checkpoint, &mut ctx)
+                .stage_chain_event_checkpoint(block_checkpoint, &mut ctx)
                 .map_err(MaterializedViewError::Consumer)?;
-            measurements.push(ProjectionWriteMeasurement::from_batch_delta(
-                projection,
+            measurements.push(MaterializedViewWriteMeasurement::from_batch_delta(
+                consumer_name,
                 before,
                 ctx.batch,
                 started_at.elapsed(),
             ));
         }
         for consumer in event_consumers.iter_mut() {
-            let projection = consumer.name();
+            let consumer_name = consumer.name();
             let before = WriteBatchSize::capture(ctx.batch);
             let started_at = Instant::now();
             dispatch_chain_event_to_consumer(&mut **consumer, inputs, &mut ctx)?;
-            measurements.push(ProjectionWriteMeasurement::from_batch_delta(
-                projection,
+            measurements.push(MaterializedViewWriteMeasurement::from_batch_delta(
+                consumer_name,
                 before,
                 ctx.batch,
                 started_at.elapsed(),
@@ -1725,7 +1538,7 @@ impl MaterializedViewStore {
             let cursor_column_family =
                 self.column_family(MaterializedViewStoreTable::ChainEventCursor)?;
             for consumer in block_consumers.iter() {
-                stage_projection_cursor_and_measure(
+                stage_consumer_cursor_and_measure(
                     &mut batch,
                     &cursor_column_family,
                     consumer.name(),
@@ -1734,7 +1547,7 @@ impl MaterializedViewStore {
                 );
             }
             for consumer in event_consumers.iter() {
-                stage_projection_cursor_and_measure(
+                stage_consumer_cursor_and_measure(
                     &mut batch,
                     &cursor_column_family,
                     consumer.name(),
@@ -1744,7 +1557,7 @@ impl MaterializedViewStore {
             }
         }
         self.write_batch(&batch)?;
-        record_projection_write_measurements(&measurements);
+        record_materialized_view_write_measurements(&measurements);
         Ok(measurements)
     }
 
@@ -1755,29 +1568,29 @@ impl MaterializedViewStore {
         consumer: &mut dyn MaterializedViewMempoolConsumer,
         event: &crate::consumer::MempoolConsumerEvent<'_>,
         cursor_bytes: &[u8],
-    ) -> Result<ProjectionWriteMeasurement, MaterializedViewError> {
+    ) -> Result<MaterializedViewWriteMeasurement, MaterializedViewError> {
         let mut batch = WriteBatch::default();
         let mut ctx = MaterializedViewConsumerCtx {
             store: self,
             batch: &mut batch,
         };
-        let projection = consumer.name();
+        let consumer_name = consumer.name();
         let before = WriteBatchSize::capture(ctx.batch);
         let started_at = Instant::now();
         consumer
             .apply_mempool_event(event, &mut ctx)
             .map_err(MaterializedViewError::Consumer)?;
-        let mut measurement = ProjectionWriteMeasurement::from_batch_delta(
-            projection,
+        let mut measurement = MaterializedViewWriteMeasurement::from_batch_delta(
+            consumer_name,
             before,
             ctx.batch,
             started_at.elapsed(),
         );
         let cursor_before = WriteBatchSize::capture(&batch);
-        self.stage_mempool_event_cursor_advance(&mut batch, projection, cursor_bytes)?;
+        self.stage_mempool_event_cursor_advance(&mut batch, consumer_name, cursor_bytes)?;
         measurement.add_batch_delta(cursor_before, &batch);
         self.write_batch(&batch)?;
-        record_projection_write_measurements(std::slice::from_ref(&measurement));
+        record_materialized_view_write_measurements(std::slice::from_ref(&measurement));
         Ok(measurement)
     }
 
@@ -1810,7 +1623,7 @@ impl MaterializedViewStore {
                 column_family: MaterializedViewStoreColumnFamily::ChainEventCursor,
                 source,
             })?;
-        self.record_projection_batch_if_selected(consumer, &batch);
+        self.record_consumer_batch_if_selected(consumer, &batch);
         Ok(())
     }
 
@@ -1895,41 +1708,43 @@ impl MaterializedViewStore {
             })
     }
 
-    /// Commits a batch owned by one stable projection identity and attributes
-    /// its successful writes to that projection's operational counters.
+    /// Commits a batch owned by one stable consumer identity and attributes
+    /// its successful writes to that consumer's operational counters.
     ///
     /// Callers use this for backfill, seed, and repair batches that do not pass
     /// through chain-event dispatch. The batch must contain only rows and
-    /// metadata owned by `projection`.
-    pub fn write_projection_batch(
+    /// metadata owned by `consumer`.
+    pub fn write_consumer_batch(
         &self,
-        projection: MaterializedViewConsumerName,
+        consumer: MaterializedViewConsumerName,
         batch: &WriteBatch,
     ) -> Result<(), MaterializedViewStoreError> {
-        if !self.has_consumer(projection) {
-            return Err(MaterializedViewStoreError::ProjectionNotSelected {
-                projection: projection.as_str(),
+        if !self.has_consumer(consumer) {
+            return Err(MaterializedViewStoreError::ConsumerNotSelected {
+                consumer: consumer.as_str(),
             });
         }
         self.write_batch(batch)?;
-        self.record_projection_batch_if_selected(projection, batch);
+        self.record_consumer_batch_if_selected(consumer, batch);
         Ok(())
     }
 
-    fn record_projection_batch_if_selected(
+    fn record_consumer_batch_if_selected(
         &self,
-        projection: MaterializedViewConsumerName,
+        consumer: MaterializedViewConsumerName,
         batch: &WriteBatch,
     ) {
-        if !self.has_consumer(projection) {
+        if !self.has_consumer(consumer) {
             return;
         }
-        record_projection_write_measurements(std::slice::from_ref(&ProjectionWriteMeasurement {
-            projection,
-            operations: usize_to_u64_saturating(batch.len()),
-            logical_bytes: usize_to_u64_saturating(batch.size_in_bytes()),
-            dispatch_duration: Duration::ZERO,
-        }));
+        record_materialized_view_write_measurements(std::slice::from_ref(
+            &MaterializedViewWriteMeasurement {
+                consumer,
+                operations: usize_to_u64_saturating(batch.len()),
+                logical_bytes: usize_to_u64_saturating(batch.size_in_bytes()),
+                dispatch_duration: Duration::ZERO,
+            },
+        ));
     }
 
     /// Returns a column-family handle the caller can use when staging puts
@@ -1999,13 +1814,13 @@ impl MaterializedViewStore {
                 name: column_family,
                 source,
             })?;
-        if let Some(projection) = self
+        if let Some(consumer_name) = self
             .consumers
             .iter()
             .find(|schema| schema.column_families.contains(&column_family))
             .map(|schema| schema.name)
         {
-            self.record_projection_batch_if_selected(projection, &batch);
+            self.record_consumer_batch_if_selected(consumer_name, &batch);
         }
         Ok(())
     }
@@ -2036,44 +1851,44 @@ impl MaterializedViewStore {
         )
     }
 
-    /// Reads one consumer's atomic projection fence and verified coverage.
-    pub fn consumer_projection_state(
+    /// Reads one consumer's atomic state and verified coverage.
+    pub fn consumer_state(
         &self,
         consumer: MaterializedViewConsumerName,
-    ) -> Result<Option<ConsumerProjectionState>, MaterializedViewStoreError> {
-        let key = consumer_projection_state_key(consumer.as_str());
+    ) -> Result<Option<MaterializedViewState>, MaterializedViewStoreError> {
+        let key = consumer_state_key(consumer.as_str());
         self.get(MaterializedViewStoreTable::ConsumerMetadata, &key)?
-            .map(|payload| decode_consumer_projection_state(consumer, &payload))
+            .map(|payload| decode_materialized_view_state(consumer, &payload))
             .transpose()
     }
 
-    /// Stages one consumer's projection state in a caller-owned atomic batch.
-    pub fn stage_consumer_projection_state(
+    /// Stages one consumer's state in a caller-owned atomic batch.
+    pub fn stage_consumer_state(
         &self,
         batch: &mut WriteBatch,
         consumer: MaterializedViewConsumerName,
-        state: ConsumerProjectionState,
+        state: MaterializedViewState,
     ) -> Result<(), MaterializedViewStoreError> {
-        validate_projection_coverage_bounds(consumer, &state)?;
+        validate_materialized_view_coverage_bounds(consumer, &state)?;
         let column_family = self.column_family(MaterializedViewStoreTable::ConsumerMetadata)?;
         batch.put_cf(
             &column_family,
-            consumer_projection_state_key(consumer.as_str()),
-            encode_consumer_projection_state(state),
+            consumer_state_key(consumer.as_str()),
+            encode_materialized_view_state(state),
         );
         Ok(())
     }
 
-    /// Atomically persists one consumer's projection state.
-    pub fn put_consumer_projection_state(
+    /// Atomically persists one consumer's state.
+    pub fn put_consumer_state(
         &self,
         consumer: MaterializedViewConsumerName,
-        state: ConsumerProjectionState,
+        state: MaterializedViewState,
     ) -> Result<(), MaterializedViewStoreError> {
         let mut batch = WriteBatch::default();
-        self.stage_consumer_projection_state(&mut batch, consumer, state)?;
+        self.stage_consumer_state(&mut batch, consumer, state)?;
         self.write_batch(&batch)?;
-        self.record_projection_batch_if_selected(consumer, &batch);
+        self.record_consumer_batch_if_selected(consumer, &batch);
         Ok(())
     }
 
@@ -2152,7 +1967,7 @@ impl MaterializedViewStore {
 
     /// Reads a bounded page from an inclusive consumer-key range.
     ///
-    /// Rows before `offset` are scanned but never retained, so legacy offset
+    /// Rows before `offset` are scanned but never retained, so offset
     /// pagination cannot allocate in proportion to an untrusted offset.
     pub fn page_consumer_range(
         &self,
@@ -2368,7 +2183,7 @@ impl MaterializedViewStore {
     /// Decodes the lexicographically last key as a four-byte big-endian
     /// height via [`zinder_core::wire::decode_height_key_ascending`]. Use
     /// this on column families whose primary key is exactly four bytes of
-    /// ascending height (the `BlockSummary` projection). Returns
+    /// ascending height (the `BlockSummary` materialized view). Returns
     /// [`MaterializedViewStoreError::Decode`] when the last key is not four bytes,
     /// which signals a column-family schema mismatch and should fail loudly.
     pub fn last_materialized_height_ascending(
@@ -2461,71 +2276,32 @@ impl MaterializedViewStore {
 
     /// Rejects a secondary open whose consumer declaration cannot safely read
     /// the persisted manifest.
-    ///
-    /// A secondary reader cannot rebuild a consumer's column families. It may
-    /// read an exact schema match or an explicitly row-compatible older
-    /// version with the same column-family set; every other mismatch waits for
-    /// the primary to reconcile first.
     fn validate_secondary_consumer_schemas(&self) -> Result<(), MaterializedViewStoreError> {
-        let recorded = self.read_consumer_manifest()?;
-        self.reject_undeclared_recorded_consumers(&recorded)?;
-        for consumer in self.consumers {
-            let entry = recorded.get(consumer.name.as_str());
-            let compatible = entry.is_some_and(|entry| {
-                Self::consumer_manifest_is_exact(consumer, entry)
-                    || Self::consumer_manifest_is_row_compatible(consumer, entry)
-            });
-            if !compatible {
-                return Err(MaterializedViewStoreError::ConsumerSchemaMismatch {
-                    consumer: consumer.name.as_str(),
-                    persisted: entry.map(|entry| entry.schema_version),
-                    running: consumer.schema_version,
-                });
-            }
-        }
-        Ok(())
+        self.validate_consumer_schemas()
     }
 
-    /// Deletes the materialized-view directory when its persisted container version is
-    /// older than the running binary, so the reopened store starts fresh.
-    ///
-    /// A container-format change invalidates every consumer's rows at once. The
-    /// whole store is wiped by deleting the directory rather than dropping
-    /// column families in place: an in-place drop records column-family drop
-    /// edits in the `RocksDB` manifest, and a secondary reader replaying those
-    /// edits during catch-up crashes. A persisted version newer than the
-    /// running one is left untouched and surfaces later as
-    /// [`MaterializedViewStoreError::SchemaMismatch`], so rolling a binary back never
-    /// destroys a store it cannot read.
-    fn wipe_materialized_view_directory_if_store_format_superseded(
+    /// Rejects a persisted container version different from the running
+    /// format without opening the store for mutation.
+    fn require_matching_store_format_at_path(
         path: &Path,
     ) -> Result<(), MaterializedViewStoreError> {
         let Some(persisted) = Self::peek_store_format_version(path)? else {
             return Ok(());
         };
-        if persisted >= MATERIALIZED_VIEW_STORE_FORMAT_VERSION {
+        if persisted == MATERIALIZED_VIEW_STORE_FORMAT_VERSION {
             return Ok(());
         }
-        tracing::warn!(
-            target: "zinder::materialized_views",
-            event = "store_format_rebuild",
-            from_store_format_version = persisted,
-            to_store_format_version = MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
-            "materialized-view store container format changed; deleting the materialized-view directory and rebuilding the whole store"
-        );
-        std::fs::remove_dir_all(path).map_err(|source| {
-            MaterializedViewStoreError::SchemaReconcile {
-                operation: "store_format_wipe",
-                reason: format!("{}: {source}", path.display()),
-            }
+        Err(MaterializedViewStoreError::SchemaMismatch {
+            persisted,
+            running: MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
         })
     }
 
     /// Reads the persisted container version without keeping the store open.
     ///
     /// Returns `None` when `path` holds no materialized-view store yet. The store is
-    /// opened as a primary, read, and closed before the caller decides whether
-    /// to wipe or open it for real.
+    /// opened read-only and closed before the caller decides whether it may open
+    /// the current format.
     fn peek_store_format_version(path: &Path) -> Result<Option<u16>, MaterializedViewStoreError> {
         let existing_column_families = existing_column_family_names(path);
         if existing_column_families.is_empty() {
@@ -2559,15 +2335,16 @@ impl MaterializedViewStore {
     }
 
     /// Reads the existing per-consumer manifest without opening the store for
-    /// writes, creating column families, or reconciling schemas.
-    fn preflight_projection_preset_at_path(
+    /// writes or creating column families.
+    fn preflight_materialized_view_preset_at_path(
         path: &Path,
-        requested: ProjectionPreset,
+        requested: MaterializedViewPreset,
     ) -> Result<(), MaterializedViewStoreError> {
+        Self::require_matching_store_format_at_path(path)?;
         let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path)? else {
             return Ok(());
         };
-        Self::validate_recorded_projection_identities(requested, &recorded_consumers, false)
+        Self::validate_preset_consumer_identities(requested, &recorded_consumers)
     }
 
     fn read_consumer_manifest_at_path(
@@ -2596,77 +2373,69 @@ impl MaterializedViewStore {
         Ok(Some(recorded_consumers))
     }
 
-    fn validate_or_initialize_store_format_version(
-        &self,
-    ) -> Result<(), MaterializedViewStoreError> {
-        let Some(bytes) = self.get(
-            MaterializedViewStoreTable::ConsumerMetadata,
+    /// Writes the current container version and the full consumer manifest to
+    /// a fresh store. A crash before this batch commits leaves no initialized
+    /// schema to reopen; a crash after it commits leaves a complete identity.
+    fn initialize_schema_manifest(&self) -> Result<(), MaterializedViewStoreError> {
+        let metadata = self.column_family(MaterializedViewStoreTable::ConsumerMetadata)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            &metadata,
             STORE_FORMAT_VERSION_KEY,
-        )?
-        else {
-            return self.put(
-                MaterializedViewStoreTable::ConsumerMetadata,
-                STORE_FORMAT_VERSION_KEY,
-                &MATERIALIZED_VIEW_STORE_FORMAT_VERSION.to_be_bytes(),
+            MATERIALIZED_VIEW_STORE_FORMAT_VERSION.to_be_bytes(),
+        );
+        for consumer in self.consumers {
+            let payload = encode_manifest_entry(consumer.schema_version, consumer.column_families)
+                .map_err(|reason| MaterializedViewStoreError::ConsumerManifest {
+                    operation: "encode_manifest_entry",
+                    reason,
+                })?;
+            batch.put_cf(
+                &metadata,
+                consumer_schema_manifest_key(consumer.name.as_str()),
+                payload,
             );
+        }
+        self.write_batch(&batch)
+    }
+
+    fn preflight_consumer_schemas_at_path(
+        path: &Path,
+        consumers: &[MaterializedViewConsumerSchema],
+    ) -> Result<(), MaterializedViewStoreError> {
+        let Some(recorded) = Self::read_consumer_manifest_at_path(path)? else {
+            return Ok(());
         };
-        let persisted = decode_store_format_version(&bytes).map_err(|reason| {
-            MaterializedViewStoreError::Decode {
-                column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
-                reason,
-            }
-        })?;
-        if persisted == MATERIALIZED_VIEW_STORE_FORMAT_VERSION {
+        Self::validate_declared_consumer_schemas(consumers, &recorded)
+    }
+
+    fn validate_consumer_schemas(&self) -> Result<(), MaterializedViewStoreError> {
+        let recorded = self.read_consumer_manifest()?;
+        Self::validate_declared_consumer_schemas(self.consumers, &recorded)
+    }
+
+    fn validate_preset_consumer_identities(
+        requested: MaterializedViewPreset,
+        recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
+    ) -> Result<(), MaterializedViewStoreError> {
+        Self::reject_unknown_consumer_identities(recorded_consumers)?;
+        let requested_consumers = requested.consumer_schemas();
+        let exact_identity_set = recorded_consumers.len() == requested_consumers.len()
+            && requested_consumers
+                .iter()
+                .all(|consumer| recorded_consumers.contains_key(consumer.name.as_str()));
+        if exact_identity_set {
             Ok(())
         } else {
-            Err(MaterializedViewStoreError::SchemaMismatch {
-                persisted,
-                running: MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
-            })
+            Err(
+                MaterializedViewStoreError::MaterializedViewPresetRequiresFreshStore {
+                    requested: requested.as_str(),
+                },
+            )
         }
     }
 
-    fn preflight_projection_preset(
-        &self,
-        requested: ProjectionPreset,
-        allow_fresh_store: bool,
-    ) -> Result<(), MaterializedViewStoreError> {
-        let recorded_consumers = self.read_consumer_manifest()?;
-        Self::validate_recorded_projection_identities(
-            requested,
-            &recorded_consumers,
-            allow_fresh_store,
-        )
-    }
-
-    fn validate_recorded_projection_identities(
-        requested: ProjectionPreset,
-        recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
-        allow_fresh_store: bool,
-    ) -> Result<(), MaterializedViewStoreError> {
-        if recorded_consumers.is_empty() && allow_fresh_store {
-            return Ok(());
-        }
-        Self::reject_unknown_projection_identities(recorded_consumers)?;
-        let recorded_preset = Self::preset_for_recorded_consumers(recorded_consumers);
-        let compatible = match requested {
-            ProjectionPreset::Wallet => recorded_preset == ProjectionPreset::Wallet,
-            // Explorer manifests may include a subset of the current explorer
-            // catalog when a projection was added after the store was created.
-            // An exact wallet identity set is the one forbidden expansion.
-            ProjectionPreset::Explorer => recorded_preset == ProjectionPreset::Explorer,
-        };
-        if compatible {
-            return Ok(());
-        }
-        Err(
-            MaterializedViewStoreError::ProjectionPresetRequiresFreshStore {
-                requested: requested.as_str(),
-            },
-        )
-    }
-
-    fn reject_unknown_projection_identities(
+    fn reject_unknown_consumer_identities(
         recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
     ) -> Result<(), MaterializedViewStoreError> {
         for (name, entry) in recorded_consumers {
@@ -2685,71 +2454,24 @@ impl MaterializedViewStore {
 
     fn preset_for_recorded_consumers(
         recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
-    ) -> ProjectionPreset {
+    ) -> MaterializedViewPreset {
         let recorded_is_wallet = recorded_consumers.len() == WALLET_PROJECTION_CONSUMERS.len()
             && WALLET_PROJECTION_CONSUMERS
                 .iter()
                 .all(|schema| recorded_consumers.contains_key(schema.name.as_str()));
         if recorded_is_wallet {
-            ProjectionPreset::Wallet
+            MaterializedViewPreset::Wallet
         } else {
-            ProjectionPreset::Explorer
+            MaterializedViewPreset::Explorer
         }
     }
 
-    /// Reconciles each declared consumer's schema version against the
-    /// persisted manifest.
-    ///
-    /// An exact match keeps its column families and cursor. An explicitly
-    /// row-compatible older version with the same column-family set is adopted
-    /// by advancing the manifest while retaining every row version still
-    /// present. Every other older version has its rows cleared and cursor
-    /// reset. A newer persisted version or undeclared recorded consumer fails
-    /// closed so an older binary cannot destroy rows it does not understand. A
-    /// newly declared consumer has its column
-    /// families cleared and is then recorded at its declared version, so a
-    /// family that previously belonged to another consumer starts empty rather
-    /// than serving the prior owner's rows behind a fresh cursor.
-    /// Reconciliation never drops a column family in place: a
-    /// range-tombstone clear replays safely on an attached secondary, while a
-    /// `drop_cf`/`create_cf` edit crashes a secondary mid-catchup. An emptied
-    /// orphan family is reclaimed physically only when a container-format
-    /// change wipes the whole materialized-view directory.
-    fn reconcile_consumer_schemas(&self) -> Result<(), MaterializedViewStoreError> {
-        let recorded = self.read_consumer_manifest()?;
-        self.reject_undeclared_recorded_consumers(&recorded)?;
-        self.reject_newer_consumer_schemas(&recorded)?;
-        for consumer in self.consumers {
-            match recorded.get(consumer.name.as_str()) {
-                Some(entry) if Self::consumer_manifest_is_exact(consumer, entry) => {}
-                Some(entry) if Self::consumer_manifest_is_row_compatible(consumer, entry) => {
-                    self.adopt_row_compatible_consumer(consumer, entry)?;
-                }
-                Some(entry)
-                    if entry.schema_version < consumer.schema_version
-                        && Self::consumer_column_families_match(consumer, entry)
-                        && !consumer.row_compatible_versions.is_empty() =>
-                {
-                    return Err(MaterializedViewStoreError::ConsumerSchemaMismatch {
-                        consumer: consumer.name.as_str(),
-                        persisted: Some(entry.schema_version),
-                        running: consumer.schema_version,
-                    });
-                }
-                Some(entry) => self.rebuild_consumer(consumer, entry)?,
-                None => self.initialize_new_consumer(consumer)?,
-            }
-        }
-        Ok(())
-    }
-
-    fn reject_undeclared_recorded_consumers(
-        &self,
+    fn validate_declared_consumer_schemas(
+        declared: &[MaterializedViewConsumerSchema],
         recorded: &BTreeMap<String, ConsumerManifestEntry>,
     ) -> Result<(), MaterializedViewStoreError> {
         for (name, entry) in recorded {
-            if self
-                .consumers
+            if declared
                 .iter()
                 .all(|consumer| consumer.name.as_str() != name)
             {
@@ -2759,21 +2481,12 @@ impl MaterializedViewStore {
                 });
             }
         }
-        Ok(())
-    }
-
-    fn reject_newer_consumer_schemas(
-        &self,
-        recorded: &BTreeMap<String, ConsumerManifestEntry>,
-    ) -> Result<(), MaterializedViewStoreError> {
-        for consumer in self.consumers {
-            let Some(entry) = recorded.get(consumer.name.as_str()) else {
-                continue;
-            };
-            if entry.schema_version > consumer.schema_version {
+        for consumer in declared {
+            let entry = recorded.get(consumer.name.as_str());
+            if !entry.is_some_and(|entry| Self::consumer_manifest_is_exact(consumer, entry)) {
                 return Err(MaterializedViewStoreError::ConsumerSchemaMismatch {
                     consumer: consumer.name.as_str(),
-                    persisted: Some(entry.schema_version),
+                    persisted: entry.map(|entry| entry.schema_version),
                     running: consumer.schema_version,
                 });
             }
@@ -2787,16 +2500,6 @@ impl MaterializedViewStore {
     ) -> bool {
         recorded.schema_version == consumer.schema_version
             && Self::consumer_column_families_match(consumer, recorded)
-            && Self::consumer_supports_recorded_row_versions(consumer, recorded)
-    }
-
-    fn consumer_manifest_is_row_compatible(
-        consumer: &MaterializedViewConsumerSchema,
-        recorded: &ConsumerManifestEntry,
-    ) -> bool {
-        recorded.schema_version < consumer.schema_version
-            && Self::consumer_column_families_match(consumer, recorded)
-            && Self::consumer_supports_recorded_row_versions(consumer, recorded)
     }
 
     fn consumer_column_families_match(
@@ -2812,73 +2515,6 @@ impl MaterializedViewStore {
         consumer.column_families.len() == recorded.column_families.len() && declared == persisted
     }
 
-    fn consumer_supports_recorded_row_versions(
-        consumer: &MaterializedViewConsumerSchema,
-        recorded: &ConsumerManifestEntry,
-    ) -> bool {
-        recorded.row_schema_versions.iter().all(|version| {
-            *version == consumer.schema_version
-                || consumer.row_compatible_versions.contains(version)
-        })
-    }
-
-    fn adopt_row_compatible_consumer(
-        &self,
-        consumer: &MaterializedViewConsumerSchema,
-        recorded: &ConsumerManifestEntry,
-    ) -> Result<(), MaterializedViewStoreError> {
-        let mut row_schema_versions = recorded.row_schema_versions.clone();
-        row_schema_versions.insert(consumer.schema_version);
-        tracing::info!(
-            target: "zinder::materialized_views",
-            event = "consumer_schema_rows_preserved",
-            consumer = consumer.name.as_str(),
-            from_schema_version = recorded.schema_version,
-            to_schema_version = consumer.schema_version,
-            "materialized-view consumer schema version moved compatibly; preserving its rows and cursor"
-        );
-        self.write_consumer_manifest_entry_with_row_versions(consumer, &row_schema_versions)
-    }
-
-    fn rebuild_consumer(
-        &self,
-        consumer: &MaterializedViewConsumerSchema,
-        recorded: &ConsumerManifestEntry,
-    ) -> Result<(), MaterializedViewStoreError> {
-        tracing::warn!(
-            target: "zinder::materialized_views",
-            event = "consumer_schema_rebuild",
-            consumer = consumer.name.as_str(),
-            from_schema_version = recorded.schema_version,
-            to_schema_version = consumer.schema_version,
-            "materialized-view consumer schema version moved; resetting its cursor and clearing its column families"
-        );
-        self.reset_consumer_cursors(consumer.name.as_str())?;
-        for column_family in &recorded.column_families {
-            if consumer.column_families.contains(&column_family.as_str()) {
-                continue;
-            }
-            self.clear_consumer_column_family(column_family)?;
-        }
-        for column_family in consumer.column_families {
-            self.clear_consumer_column_family(column_family)?;
-        }
-        self.write_consumer_manifest_entry(consumer)
-    }
-
-    /// Clears a newly declared consumer's column families before recording it,
-    /// so a family that previously belonged to another consumer starts empty
-    /// and replays from the earliest retained event.
-    fn initialize_new_consumer(
-        &self,
-        consumer: &MaterializedViewConsumerSchema,
-    ) -> Result<(), MaterializedViewStoreError> {
-        for column_family in consumer.column_families {
-            self.clear_consumer_column_family(column_family)?;
-        }
-        self.write_consumer_manifest_entry(consumer)
-    }
-
     fn read_consumer_manifest(
         &self,
     ) -> Result<BTreeMap<String, ConsumerManifestEntry>, MaterializedViewStoreError> {
@@ -2888,76 +2524,6 @@ impl MaterializedViewStore {
             IteratorMode::From(CONSUMER_SCHEMA_KEY_PREFIX, rust_rocksdb::Direction::Forward),
         );
         decode_consumer_manifest_entries(iterator)
-    }
-
-    /// Clears every row in a consumer-owned column family without dropping the
-    /// family itself.
-    ///
-    /// A range tombstone over the full key span, plus a point-delete sweep of
-    /// any residue at or above the range's exclusive upper bound, leaves the
-    /// family indistinguishable from a freshly created one. The family is never
-    /// dropped: a `drop_cf`/`create_cf` edit records a column-family change in
-    /// the `RocksDB` manifest, and a secondary reader replaying that edit during
-    /// catch-up crashes; range tombstones and point deletes replay as ordinary
-    /// data writes.
-    fn clear_consumer_column_family(&self, name: &str) -> Result<(), MaterializedViewStoreError> {
-        let Some(handle) = self.db.cf_handle(name) else {
-            return Ok(());
-        };
-        let mut batch = WriteBatch::default();
-        batch.delete_range_cf(&handle, CLEAR_RANGE_LOWER_BOUND, CLEAR_RANGE_UPPER_BOUND);
-        let residue = self.db.iterator_cf(
-            &handle,
-            IteratorMode::From(CLEAR_RANGE_UPPER_BOUND, rust_rocksdb::Direction::Forward),
-        );
-        for entry in residue {
-            let (key, _payload) =
-                entry.map_err(|source| MaterializedViewStoreError::SchemaReconcile {
-                    operation: "clear_consumer_column_family",
-                    reason: format!("{name}: {source}"),
-                })?;
-            batch.delete_cf(&handle, &key);
-        }
-        self.write_batch(&batch)
-    }
-
-    fn reset_consumer_cursors(&self, name: &str) -> Result<(), MaterializedViewStoreError> {
-        let chain_cf = self.column_family(MaterializedViewStoreTable::ChainEventCursor)?;
-        let mempool_cf = self.column_family(MaterializedViewStoreTable::MempoolEventCursor)?;
-        let metadata_cf = self.column_family(MaterializedViewStoreTable::ConsumerMetadata)?;
-        let mut batch = WriteBatch::default();
-        batch.delete_cf(&chain_cf, name.as_bytes());
-        batch.delete_cf(&mempool_cf, name.as_bytes());
-        batch.delete_cf(&metadata_cf, consumer_projection_state_key(name));
-        self.write_batch(&batch)
-    }
-
-    fn write_consumer_manifest_entry(
-        &self,
-        consumer: &MaterializedViewConsumerSchema,
-    ) -> Result<(), MaterializedViewStoreError> {
-        self.write_consumer_manifest_entry_with_row_versions(
-            consumer,
-            &BTreeSet::from([consumer.schema_version]),
-        )
-    }
-
-    fn write_consumer_manifest_entry_with_row_versions(
-        &self,
-        consumer: &MaterializedViewConsumerSchema,
-        row_schema_versions: &BTreeSet<u16>,
-    ) -> Result<(), MaterializedViewStoreError> {
-        let key = consumer_schema_manifest_key(consumer.name.as_str());
-        let payload = encode_manifest_entry(
-            consumer.schema_version,
-            consumer.column_families,
-            row_schema_versions,
-        )
-        .map_err(|reason| MaterializedViewStoreError::SchemaReconcile {
-            operation: "encode_manifest_entry",
-            reason,
-        })?;
-        self.put(MaterializedViewStoreTable::ConsumerMetadata, &key, &payload)
     }
 
     fn get(
@@ -3028,12 +2594,12 @@ impl MaterializedViewStore {
             io_mode: self.io_mode,
             resource_budget: self.rocksdb_resource_budget,
         });
-        self.record_projection_rocksdb_properties(store_role);
+        self.record_materialized_view_rocksdb_properties(store_role);
     }
 
-    fn record_projection_rocksdb_properties(&self, store_role: StoreRole) {
+    fn record_materialized_view_rocksdb_properties(&self, store_role: StoreRole) {
         for consumer in self.consumers {
-            for property in PROJECTION_ROCKSDB_PROPERTIES {
+            for property in MATERIALIZED_VIEW_ROCKSDB_PROPERTIES {
                 let mut aggregate = 0_u64;
                 let mut sampled = false;
                 for column_family_name in consumer.column_families {
@@ -3050,8 +2616,8 @@ impl MaterializedViewStore {
                 }
                 if sampled {
                     metrics::gauge!(
-                        "zinder_projection_rocksdb_property",
-                        "projection" => consumer.name.as_str(),
+                        "zinder_materialized_view_rocksdb_property",
+                        "consumer" => consumer.name.as_str(),
                         "property" => property,
                         "store_role" => store_role.as_str()
                     )
@@ -3062,38 +2628,38 @@ impl MaterializedViewStore {
     }
 }
 
-fn stage_projection_cursor_and_measure(
+fn stage_consumer_cursor_and_measure(
     batch: &mut WriteBatch,
     cursor_column_family: &Arc<rust_rocksdb::BoundColumnFamily<'_>>,
-    projection: MaterializedViewConsumerName,
+    consumer: MaterializedViewConsumerName,
     cursor_bytes: &[u8],
-    measurements: &mut [ProjectionWriteMeasurement],
+    measurements: &mut [MaterializedViewWriteMeasurement],
 ) {
     let before = WriteBatchSize::capture(batch);
     batch.put_cf(
         cursor_column_family,
-        projection.as_str().as_bytes(),
+        consumer.as_str().as_bytes(),
         cursor_bytes,
     );
     if let Some(measurement) = measurements
         .iter_mut()
-        .find(|measurement| measurement.projection == projection)
+        .find(|measurement| measurement.consumer == consumer)
     {
         measurement.add_batch_delta(before, batch);
     }
 }
 
-fn record_projection_write_measurements(measurements: &[ProjectionWriteMeasurement]) {
+fn record_materialized_view_write_measurements(measurements: &[MaterializedViewWriteMeasurement]) {
     for measurement in measurements {
-        let projection = measurement.projection.as_str();
+        let consumer = measurement.consumer.as_str();
         metrics::counter!(
-            "zinder_projection_write_operations_total",
-            "projection" => projection
+            "zinder_materialized_view_write_operations_total",
+            "consumer" => consumer
         )
         .increment(measurement.operations);
         metrics::counter!(
-            "zinder_projection_write_bytes_total",
-            "projection" => projection
+            "zinder_materialized_view_write_bytes_total",
+            "consumer" => consumer
         )
         .increment(measurement.logical_bytes);
     }
@@ -3159,10 +2725,10 @@ where
     }
 }
 
-fn block_projection_checkpoint<'event, S>(
+fn block_checkpoint<'event, S>(
     inputs: ChainEventDispatchInputs<'event>,
     blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
-) -> BlockProjectionCheckpoint<'event>
+) -> MaterializedViewBlockCheckpoint<'event>
 where
     S: BuildHasher,
 {
@@ -3186,11 +2752,11 @@ where
             .get(&range.end)
             .map(|block| (block.height, block.block_hash))
     });
-    BlockProjectionCheckpoint {
+    MaterializedViewBlockCheckpoint {
         chain_epoch: inputs.chain_epoch,
         chain_event: inputs.chain_event,
-        projection_tip_height: projected_tip.map(|(height, _hash)| height),
-        projection_tip_hash: projected_tip.map(|(_height, hash)| hash),
+        tip_height: projected_tip.map(|(height, _hash)| height),
+        tip_hash: projected_tip.map(|(_height, hash)| hash),
     }
 }
 
@@ -3255,7 +2821,7 @@ fn decode_consumer_manifest_entries(
     let mut manifest = BTreeMap::new();
     for entry in iterator {
         let (key, payload) =
-            entry.map_err(|source| MaterializedViewStoreError::SchemaReconcile {
+            entry.map_err(|source| MaterializedViewStoreError::ConsumerManifest {
                 operation: "read_manifest",
                 reason: source.to_string(),
             })?;
@@ -3263,13 +2829,13 @@ fn decode_consumer_manifest_entries(
             break;
         };
         let name = String::from_utf8(name_bytes.to_vec()).map_err(|error| {
-            MaterializedViewStoreError::SchemaReconcile {
+            MaterializedViewStoreError::ConsumerManifest {
                 operation: "decode_manifest_name",
                 reason: error.to_string(),
             }
         })?;
         let decoded = decode_manifest_entry(&payload).map_err(|reason| {
-            MaterializedViewStoreError::SchemaReconcile {
+            MaterializedViewStoreError::ConsumerManifest {
                 operation: "decode_manifest_entry",
                 reason,
             }
@@ -3285,7 +2851,6 @@ fn decode_consumer_manifest_entries(
 struct ConsumerManifestEntry {
     schema_version: u16,
     column_families: Vec<String>,
-    row_schema_versions: BTreeSet<u16>,
 }
 
 fn consumer_schema_manifest_key(name: &str) -> Vec<u8> {
@@ -3295,52 +2860,54 @@ fn consumer_schema_manifest_key(name: &str) -> Vec<u8> {
     key
 }
 
-fn consumer_projection_state_key(name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(CONSUMER_PROJECTION_STATE_KEY_PREFIX.len() + name.len());
-    key.extend_from_slice(CONSUMER_PROJECTION_STATE_KEY_PREFIX);
+fn consumer_state_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(MATERIALIZED_VIEW_STATE_KEY_PREFIX.len() + name.len());
+    key.extend_from_slice(MATERIALIZED_VIEW_STATE_KEY_PREFIX);
     key.extend_from_slice(name.as_bytes());
     key
 }
 
-fn projection_coverage_bounds_valid(
-    coverage: ConsumerProjectionCoverage,
-    projection_tip_height: BlockHeight,
+fn materialized_view_coverage_bounds_valid(
+    coverage: MaterializedViewCoverage,
+    tip_height: BlockHeight,
 ) -> bool {
     let ordered = coverage.complete_from_height <= coverage.complete_through_height;
-    let within_tip = coverage.complete_through_height <= projection_tip_height;
+    let within_tip = coverage.complete_through_height <= tip_height;
     ordered && within_tip
 }
 
-fn validate_projection_coverage_bounds(
+fn validate_materialized_view_coverage_bounds(
     consumer: MaterializedViewConsumerName,
-    state: &ConsumerProjectionState,
+    state: &MaterializedViewState,
 ) -> Result<(), MaterializedViewStoreError> {
     let Some(coverage) = state.coverage else {
         return Ok(());
     };
-    if projection_coverage_bounds_valid(coverage, state.projection_tip_height) {
+    if materialized_view_coverage_bounds_valid(coverage, state.tip_height) {
         return Ok(());
     }
-    Err(MaterializedViewStoreError::InvalidProjectionCoverage {
-        consumer: consumer.as_str(),
-        complete_from_height: coverage.complete_from_height.value(),
-        complete_through_height: coverage.complete_through_height.value(),
-        projection_tip_height: state.projection_tip_height.value(),
-    })
+    Err(
+        MaterializedViewStoreError::InvalidMaterializedViewCoverage {
+            consumer: consumer.as_str(),
+            complete_from_height: coverage.complete_from_height.value(),
+            complete_through_height: coverage.complete_through_height.value(),
+            tip_height: state.tip_height.value(),
+        },
+    )
 }
 
-fn encode_consumer_projection_state(
-    state: ConsumerProjectionState,
-) -> [u8; CONSUMER_PROJECTION_STATE_LEN] {
-    let mut payload = [0_u8; CONSUMER_PROJECTION_STATE_LEN];
+fn encode_materialized_view_state(
+    state: MaterializedViewState,
+) -> [u8; MATERIALIZED_VIEW_STATE_LEN] {
+    let mut payload = [0_u8; MATERIALIZED_VIEW_STATE_LEN];
     let mut offset = 0;
-    payload[offset] = CONSUMER_PROJECTION_STATE_VERSION;
+    payload[offset] = MATERIALIZED_VIEW_STATE_VERSION;
     offset += 1;
-    payload[offset..offset + 8].copy_from_slice(&state.projection_epoch_id.value().to_be_bytes());
+    payload[offset..offset + 8].copy_from_slice(&state.chain_epoch_id.value().to_be_bytes());
     offset += 8;
-    payload[offset..offset + 4].copy_from_slice(&state.projection_tip_height.value().to_be_bytes());
+    payload[offset..offset + 4].copy_from_slice(&state.tip_height.value().to_be_bytes());
     offset += 4;
-    payload[offset..offset + 32].copy_from_slice(&state.projection_tip_hash.as_bytes());
+    payload[offset..offset + 32].copy_from_slice(&state.tip_hash.as_bytes());
     offset += 32;
     payload[offset..offset + 8].copy_from_slice(&state.revision.to_be_bytes());
     offset += 8;
@@ -3358,94 +2925,87 @@ fn encode_consumer_projection_state(
     payload
 }
 
-fn decode_consumer_projection_state(
+fn decode_materialized_view_state(
     consumer: MaterializedViewConsumerName,
     payload: &[u8],
-) -> Result<ConsumerProjectionState, MaterializedViewStoreError> {
-    let bytes: [u8; CONSUMER_PROJECTION_STATE_LEN] = payload.try_into().map_err(|_| {
-        projection_state_decode_error("consumer projection state length is invalid")
+) -> Result<MaterializedViewState, MaterializedViewStoreError> {
+    let bytes: [u8; MATERIALIZED_VIEW_STATE_LEN] = payload.try_into().map_err(|_| {
+        materialized_view_state_decode_error("materialized-view state length is invalid")
     })?;
-    if bytes[0] != CONSUMER_PROJECTION_STATE_VERSION {
-        return Err(projection_state_decode_error(
-            "consumer projection state version is unsupported",
+    if bytes[0] != MATERIALIZED_VIEW_STATE_VERSION {
+        return Err(materialized_view_state_decode_error(
+            "materialized-view state version is unsupported",
         ));
     }
-    let projection_epoch_id =
+    let chain_epoch_id =
         ChainEpochId::new(u64::from_be_bytes(bytes[1..9].try_into().map_err(
-            |_| projection_state_decode_error("projection epoch is malformed"),
+            |_| materialized_view_state_decode_error("chain epoch is malformed"),
         )?));
-    let projection_tip_height =
+    let tip_height =
         BlockHeight::new(u32::from_be_bytes(bytes[9..13].try_into().map_err(
-            |_| projection_state_decode_error("projection tip height is malformed"),
+            |_| materialized_view_state_decode_error("tip height is malformed"),
         )?));
-    let projection_tip_hash = BlockHash::from_bytes(
+    let tip_hash = BlockHash::from_bytes(
         bytes[13..45]
             .try_into()
-            .map_err(|_| projection_state_decode_error("projection tip hash is malformed"))?,
+            .map_err(|_| materialized_view_state_decode_error("tip hash is malformed"))?,
     );
-    let revision = u64::from_be_bytes(
-        bytes[45..53]
-            .try_into()
-            .map_err(|_| projection_state_decode_error("projection revision is malformed"))?,
-    );
-    let coverage =
-        match bytes[53] {
-            0 => None,
-            1 => Some(ConsumerProjectionCoverage {
-                complete_from_height: BlockHeight::new(u32::from_be_bytes(
-                    bytes[54..58].try_into().map_err(|_| {
-                        projection_state_decode_error("coverage start height is malformed")
-                    })?,
-                )),
-                complete_through_height: BlockHeight::new(u32::from_be_bytes(
-                    bytes[58..62].try_into().map_err(|_| {
-                        projection_state_decode_error("coverage end height is malformed")
-                    })?,
-                )),
-                complete_through_hash: BlockHash::from_bytes(bytes[62..94].try_into().map_err(
-                    |_| projection_state_decode_error("coverage end hash is malformed"),
-                )?),
-            }),
-            _ => {
-                return Err(projection_state_decode_error(
-                    "consumer projection coverage presence is invalid",
-                ));
-            }
-        };
+    let revision = u64::from_be_bytes(bytes[45..53].try_into().map_err(|_| {
+        materialized_view_state_decode_error("materialized-view revision is malformed")
+    })?);
+    let coverage = match bytes[53] {
+        0 => None,
+        1 => Some(MaterializedViewCoverage {
+            complete_from_height: BlockHeight::new(u32::from_be_bytes(
+                bytes[54..58].try_into().map_err(|_| {
+                    materialized_view_state_decode_error("coverage start height is malformed")
+                })?,
+            )),
+            complete_through_height: BlockHeight::new(u32::from_be_bytes(
+                bytes[58..62].try_into().map_err(|_| {
+                    materialized_view_state_decode_error("coverage end height is malformed")
+                })?,
+            )),
+            complete_through_hash: BlockHash::from_bytes(bytes[62..94].try_into().map_err(
+                |_| materialized_view_state_decode_error("coverage end hash is malformed"),
+            )?),
+        }),
+        _ => {
+            return Err(materialized_view_state_decode_error(
+                "materialized-view coverage presence is invalid",
+            ));
+        }
+    };
     let coverage = match coverage {
-        Some(coverage) if !projection_coverage_bounds_valid(coverage, projection_tip_height) => {
+        Some(coverage) if !materialized_view_coverage_bounds_valid(coverage, tip_height) => {
             tracing::warn!(
                 consumer = consumer.as_str(),
                 complete_from_height = coverage.complete_from_height.value(),
                 complete_through_height = coverage.complete_through_height.value(),
-                projection_tip_height = projection_tip_height.value(),
-                "dropping consumer projection coverage with invalid bounds; the consumer re-derives its coverage"
+                tip_height = tip_height.value(),
+                "dropping materialized-view coverage with invalid bounds; the consumer re-derives its coverage"
             );
             None
         }
         other => other,
     };
-    Ok(ConsumerProjectionState {
-        projection_epoch_id,
-        projection_tip_height,
-        projection_tip_hash,
+    Ok(MaterializedViewState {
+        chain_epoch_id,
+        tip_height,
+        tip_hash,
         revision,
         coverage,
     })
 }
 
-fn projection_state_decode_error(reason: &'static str) -> MaterializedViewStoreError {
+fn materialized_view_state_decode_error(reason: &'static str) -> MaterializedViewStoreError {
     MaterializedViewStoreError::Decode {
         column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
         reason: reason.to_owned(),
     }
 }
 
-fn encode_manifest_entry(
-    schema_version: u16,
-    column_families: &[&str],
-    row_schema_versions: &BTreeSet<u16>,
-) -> Result<Vec<u8>, String> {
+fn encode_manifest_entry(schema_version: u16, column_families: &[&str]) -> Result<Vec<u8>, String> {
     let count = u16::try_from(column_families.len()).map_err(|_| {
         format!(
             "consumer declares {} column families; the manifest holds at most {}",
@@ -3468,17 +3028,6 @@ fn encode_manifest_entry(
         bytes.extend_from_slice(&name_len.to_be_bytes());
         bytes.extend_from_slice(name_bytes);
     }
-    let row_version_count = u16::try_from(row_schema_versions.len()).map_err(|_| {
-        format!(
-            "consumer has {} row schema versions; the manifest holds at most {}",
-            row_schema_versions.len(),
-            u16::MAX
-        )
-    })?;
-    bytes.extend_from_slice(&row_version_count.to_be_bytes());
-    for version in row_schema_versions {
-        bytes.extend_from_slice(&version.to_be_bytes());
-    }
     Ok(bytes)
 }
 
@@ -3500,31 +3049,12 @@ fn decode_manifest_entry(bytes: &[u8]) -> Result<ConsumerManifestEntry, String> 
             .push(String::from_utf8(name_bytes.to_vec()).map_err(|error| error.to_string())?);
         offset = end;
     }
-    let row_schema_versions = if offset == bytes.len() {
-        BTreeSet::from([schema_version])
-    } else {
-        let row_version_count = read_manifest_u16(bytes, offset)?;
-        offset += 2;
-        let mut versions = BTreeSet::new();
-        for _ in 0..row_version_count {
-            let version = read_manifest_u16(bytes, offset)?;
-            if !versions.insert(version) {
-                return Err("consumer manifest has duplicate row schema versions".to_owned());
-            }
-            offset += 2;
-        }
-        if offset != bytes.len() {
-            return Err("consumer manifest entry has trailing bytes".to_owned());
-        }
-        if versions.is_empty() || versions.iter().any(|version| *version > schema_version) {
-            return Err("consumer manifest row schema versions are invalid".to_owned());
-        }
-        versions
-    };
+    if offset != bytes.len() {
+        return Err("consumer manifest entry has trailing bytes".to_owned());
+    }
     Ok(ConsumerManifestEntry {
         schema_version,
         column_families,
-        row_schema_versions,
     })
 }
 
@@ -3646,7 +3176,8 @@ mod tests {
     }
 
     #[test]
-    fn projection_write_measurement_attributes_rows_and_cursor_to_stable_identity() -> Result<()> {
+    fn materialized_view_write_measurement_attributes_rows_and_cursor_to_stable_identity()
+    -> Result<()> {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
@@ -3655,35 +3186,35 @@ mod tests {
                 ..MaterializedViewStoreOptions::default()
             },
         )?;
-        let projection = TEST_CONSUMER_SCHEMA.name;
+        let consumer_name = TEST_CONSUMER_SCHEMA.name;
         let consumer_column_family = store.consumer_column_family(TEST_CONSUMER_CF)?;
         let mut batch = WriteBatch::default();
         let before = WriteBatchSize::capture(&batch);
         batch.put_cf(&consumer_column_family, b"row-key", b"row-payload");
-        let mut measurements = vec![ProjectionWriteMeasurement::from_batch_delta(
-            projection,
+        let mut measurements = vec![MaterializedViewWriteMeasurement::from_batch_delta(
+            consumer_name,
             before,
             &batch,
             Duration::ZERO,
         )];
         let cursor_column_family =
             store.column_family(MaterializedViewStoreTable::ChainEventCursor)?;
-        stage_projection_cursor_and_measure(
+        stage_consumer_cursor_and_measure(
             &mut batch,
             &cursor_column_family,
-            projection,
+            consumer_name,
             b"cursor",
             &mut measurements,
         );
 
-        assert_eq!(measurements[0].projection, projection);
+        assert_eq!(measurements[0].consumer, consumer_name);
         assert_eq!(measurements[0].operations, 2);
         assert!(measurements[0].logical_bytes > 0);
         Ok(())
     }
 
     #[test]
-    fn projection_owned_batch_rejects_an_unselected_identity_before_write() -> Result<()> {
+    fn materialized_view_owned_batch_rejects_an_unselected_identity_before_write() -> Result<()> {
         let tempdir = tempdir()?;
         let store =
             MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
@@ -3691,12 +3222,12 @@ mod tests {
         let mut batch = WriteBatch::default();
         batch.put_cf(&metadata, b"must-not-commit", b"row");
 
-        let outcome = store.write_projection_batch(TEST_CONSUMER, &batch);
+        let outcome = store.write_consumer_batch(TEST_CONSUMER, &batch);
 
         assert!(matches!(
             outcome,
-            Err(MaterializedViewStoreError::ProjectionNotSelected { projection })
-                if projection == TEST_CONSUMER.as_str()
+            Err(MaterializedViewStoreError::ConsumerNotSelected { consumer: consumer_name })
+                if consumer_name == TEST_CONSUMER.as_str()
         ));
         assert_eq!(
             store.get(
@@ -3765,15 +3296,12 @@ mod tests {
 
     fn assert_snapshot_point_reads(
         snapshot: &MaterializedViewStoreReadSnapshot<'_>,
-        initial_state: ConsumerProjectionState,
+        initial_state: MaterializedViewState,
         height_10_key: [u8; 4],
         height_20_key: [u8; 4],
         height_30_key: [u8; 4],
     ) -> Result<()> {
-        assert_eq!(
-            snapshot.consumer_projection_state(TEST_CONSUMER)?,
-            Some(initial_state)
-        );
+        assert_eq!(snapshot.consumer_state(TEST_CONSUMER)?, Some(initial_state));
         assert_eq!(
             snapshot.get_consumer(TEST_CONSUMER_CF, &height_20_key)?,
             Some(b"match-before".to_vec())
@@ -3852,28 +3380,28 @@ mod tests {
         store.put_consumer(TEST_CONSUMER_CF, &height_10_key, b"skip")?;
         store.put_consumer(TEST_CONSUMER_CF, &height_20_key, b"match-before")?;
         store.put_materialized_view_status(b"status-before")?;
-        let initial_state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(1),
-            projection_tip_height: BlockHeight::new(20),
-            projection_tip_hash: BlockHash::from_bytes([0x20; 32]),
+        let initial_state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(1),
+            tip_height: BlockHeight::new(20),
+            tip_hash: BlockHash::from_bytes([0x20; 32]),
             revision: 1,
             coverage: None,
         };
-        store.put_consumer_projection_state(TEST_CONSUMER, initial_state)?;
+        store.put_consumer_state(TEST_CONSUMER, initial_state)?;
 
         let snapshot = store.read_snapshot();
 
-        let advanced_state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(1),
-            projection_tip_height: BlockHeight::new(30),
-            projection_tip_hash: BlockHash::from_bytes([0x30; 32]),
+        let advanced_state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(1),
+            tip_height: BlockHeight::new(30),
+            tip_hash: BlockHash::from_bytes([0x30; 32]),
             revision: 2,
             coverage: None,
         };
         store.put_consumer(TEST_CONSUMER_CF, &height_5_key, b"match-after")?;
         store.put_consumer(TEST_CONSUMER_CF, &height_20_key, b"match-after")?;
         store.put_consumer(TEST_CONSUMER_CF, &height_30_key, b"match-after")?;
-        store.put_consumer_projection_state(TEST_CONSUMER, advanced_state)?;
+        store.put_consumer_state(TEST_CONSUMER, advanced_state)?;
         store.put_materialized_view_status(b"status-after")?;
 
         assert_eq!(
@@ -3881,10 +3409,7 @@ mod tests {
             Some(b"match-after".to_vec())
         );
         assert_eq!(store.consumer_row_count(TEST_CONSUMER_CF)?, 4);
-        assert_eq!(
-            store.consumer_projection_state(TEST_CONSUMER)?,
-            Some(advanced_state)
-        );
+        assert_eq!(store.consumer_state(TEST_CONSUMER)?, Some(advanced_state));
         assert_eq!(
             store.get_materialized_view_status()?,
             Some(b"status-after".to_vec())
@@ -4017,34 +3542,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn reopening_a_store_with_an_advanced_store_format_version_returns_mismatch() -> Result<()> {
-        let tempdir = tempdir()?;
-        {
-            let store = MaterializedViewStore::open(
-                tempdir.path(),
-                MaterializedViewStoreOptions::default(),
-            )?;
-            store.put(
-                MaterializedViewStoreTable::ConsumerMetadata,
-                STORE_FORMAT_VERSION_KEY,
-                &(MATERIALIZED_VIEW_STORE_FORMAT_VERSION + 1).to_be_bytes(),
-            )?;
-        }
-        let outcome =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default());
-        assert!(matches!(
-            outcome,
-            Err(MaterializedViewStoreError::SchemaMismatch {
-                persisted,
-                running,
-            }) if persisted == MATERIALIZED_VIEW_STORE_FORMAT_VERSION + 1 && running == MATERIALIZED_VIEW_STORE_FORMAT_VERSION
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn reopening_a_store_with_an_older_store_format_version_rebuilds() -> Result<()> {
+    fn incompatible_store_format_rejection_preserves_rows(persisted_version: u16) -> Result<()> {
         let tempdir = tempdir()?;
         {
             let store = MaterializedViewStore::open(
@@ -4054,42 +3552,130 @@ mod tests {
                     ..MaterializedViewStoreOptions::default()
                 },
             )?;
-            let handle = store.consumer_column_family("test_cf")?;
-            let mut batch = WriteBatch::default();
-            batch.put_cf(&handle, 1_u32.to_be_bytes(), b"row");
-            drop(handle);
-            store.write_batch(&batch)?;
-            store.put_chain_event_cursor(TEST_CONSUMER, &[9])?;
+            store.put_consumer(TEST_CONSUMER_CF, b"row", b"value")?;
+            store.put_chain_event_cursor(TEST_CONSUMER, b"cursor")?;
+            store.put(
+                MaterializedViewStoreTable::ConsumerMetadata,
+                STORE_FORMAT_VERSION_KEY,
+                &persisted_version.to_be_bytes(),
+            )?;
+        }
+        let column_families_before = existing_column_family_names(tempdir.path());
+        let outcome = MaterializedViewStore::open(
+            tempdir.path(),
+            MaterializedViewStoreOptions {
+                consumers: &[TEST_CONSUMER_SCHEMA],
+                ..MaterializedViewStoreOptions::default()
+            },
+        );
+        assert!(matches!(
+            outcome,
+            Err(MaterializedViewStoreError::SchemaMismatch {
+                persisted,
+                running,
+            }) if persisted == persisted_version && running == MATERIALIZED_VIEW_STORE_FORMAT_VERSION
+        ));
+        assert_eq!(
+            existing_column_family_names(tempdir.path()),
+            column_families_before
+        );
+
+        let db = DB::open_cf_for_read_only(
+            &Options::default(),
+            tempdir.path(),
+            existing_column_family_names(tempdir.path()),
+            false,
+        )?;
+        let consumer = db
+            .cf_handle(TEST_CONSUMER_CF)
+            .ok_or_else(|| eyre::eyre!("test consumer column family is missing"))?;
+        assert_eq!(
+            db.get_cf(&consumer, b"row")?.as_deref(),
+            Some(b"value".as_slice())
+        );
+        let cursor = db
+            .cf_handle(MaterializedViewStoreTable::ChainEventCursor.column_family_name())
+            .ok_or_else(|| eyre::eyre!("chain-event cursor column family is missing"))?;
+        assert_eq!(
+            db.get_cf(&cursor, TEST_CONSUMER.as_str().as_bytes())?
+                .as_deref(),
+            Some(b"cursor".as_slice())
+        );
+        let metadata = db
+            .cf_handle(MaterializedViewStoreTable::ConsumerMetadata.column_family_name())
+            .ok_or_else(|| eyre::eyre!("consumer metadata column family is missing"))?;
+        assert_eq!(
+            db.get_cf(&metadata, STORE_FORMAT_VERSION_KEY)?.as_deref(),
+            Some(persisted_version.to_be_bytes().as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lower_store_format_version_returns_mismatch_without_mutation() -> Result<()> {
+        incompatible_store_format_rejection_preserves_rows(
+            MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1,
+        )
+    }
+
+    #[test]
+    fn reopening_a_store_with_an_advanced_store_format_version_returns_mismatch_without_mutation()
+    -> Result<()> {
+        incompatible_store_format_rejection_preserves_rows(
+            MATERIALIZED_VIEW_STORE_FORMAT_VERSION + 1,
+        )
+    }
+
+    #[test]
+    fn incompatible_store_format_is_rejected_before_manifest_decoding() -> Result<()> {
+        let tempdir = tempdir()?;
+        {
+            let store = MaterializedViewStore::open(
+                tempdir.path(),
+                MaterializedViewStoreOptions {
+                    consumers: &[TEST_CONSUMER_SCHEMA],
+                    ..MaterializedViewStoreOptions::default()
+                },
+            )?;
+            store.put(
+                MaterializedViewStoreTable::ConsumerMetadata,
+                &consumer_schema_manifest_key(TEST_CONSUMER.as_str()),
+                &[0, 1, 0, 0, 0, 1],
+            )?;
             store.put(
                 MaterializedViewStoreTable::ConsumerMetadata,
                 STORE_FORMAT_VERSION_KEY,
                 &(MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1).to_be_bytes(),
             )?;
         }
-        let store = MaterializedViewStore::open(
-            tempdir.path(),
-            MaterializedViewStoreOptions {
-                consumers: &[TEST_CONSUMER_SCHEMA],
-                ..MaterializedViewStoreOptions::default()
-            },
-        )?;
-        assert_eq!(
-            store.store_format_version()?,
-            MATERIALIZED_VIEW_STORE_FORMAT_VERSION
-        );
-        assert_eq!(store.last_consumer_key("test_cf")?, None);
-        assert!(store.get_chain_event_cursor(TEST_CONSUMER)?.is_none());
+
+        for outcome in [
+            MaterializedViewStore::detect_materialized_view_preset_at_path(tempdir.path())
+                .map(|_| ()),
+            MaterializedViewStore::open_with_materialized_view_preset(
+                tempdir.path(),
+                MaterializedViewPreset::Explorer,
+                MaterializedViewStoreOptions::default(),
+            )
+            .map(|_| ()),
+        ] {
+            assert!(matches!(
+                outcome,
+                Err(MaterializedViewStoreError::SchemaMismatch {
+                    persisted,
+                    running,
+                }) if persisted == MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1 && running == MATERIALIZED_VIEW_STORE_FORMAT_VERSION
+            ));
+        }
         Ok(())
     }
 
     #[test]
-    fn manifest_entry_round_trips_writer_row_versions_and_column_families() -> Result<()> {
-        let row_schema_versions = BTreeSet::from([1, 2, 3]);
-        let encoded = encode_manifest_entry(3, &["alpha", "beta_index"], &row_schema_versions)
+    fn manifest_entry_round_trips_schema_version_and_column_families() -> Result<()> {
+        let encoded = encode_manifest_entry(3, &["alpha", "beta_index"])
             .map_err(|reason| eyre::eyre!(reason))?;
         let decoded = decode_manifest_entry(&encoded).map_err(|reason| eyre::eyre!(reason))?;
         assert_eq!(decoded.schema_version, 3);
-        assert_eq!(decoded.row_schema_versions, row_schema_versions);
         assert_eq!(
             decoded.column_families,
             vec!["alpha".to_owned(), "beta_index".to_owned()]
@@ -4098,49 +3684,45 @@ mod tests {
     }
 
     #[test]
-    fn consumer_projection_state_round_trips_verified_coverage() -> Result<()> {
-        let state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(42),
-            projection_tip_height: BlockHeight::new(100),
-            projection_tip_hash: BlockHash::from_bytes([0xA1; 32]),
+    fn consumer_state_round_trips_verified_coverage() -> Result<()> {
+        let state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(42),
+            tip_height: BlockHeight::new(100),
+            tip_hash: BlockHash::from_bytes([0xA1; 32]),
             revision: 7,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(1),
                 complete_through_height: BlockHeight::new(90),
                 complete_through_hash: BlockHash::from_bytes([0xB2; 32]),
             }),
         };
 
-        let decoded = decode_consumer_projection_state(
-            TEST_CONSUMER,
-            &encode_consumer_projection_state(state),
-        )?;
+        let decoded =
+            decode_materialized_view_state(TEST_CONSUMER, &encode_materialized_view_state(state))?;
 
         assert_eq!(decoded, state);
         Ok(())
     }
 
     #[test]
-    fn decoding_coverage_past_projection_tip_drops_coverage() -> Result<()> {
-        let state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(42),
-            projection_tip_height: BlockHeight::new(10),
-            projection_tip_hash: BlockHash::from_bytes([0xA1; 32]),
+    fn decoding_coverage_past_materialized_view_tip_drops_coverage() -> Result<()> {
+        let state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(42),
+            tip_height: BlockHeight::new(10),
+            tip_hash: BlockHash::from_bytes([0xA1; 32]),
             revision: 7,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(1),
                 complete_through_height: BlockHeight::new(11),
                 complete_through_hash: BlockHash::from_bytes([0xB2; 32]),
             }),
         };
 
-        let decoded = decode_consumer_projection_state(
-            TEST_CONSUMER,
-            &encode_consumer_projection_state(state),
-        )?;
+        let decoded =
+            decode_materialized_view_state(TEST_CONSUMER, &encode_materialized_view_state(state))?;
 
         assert_eq!(decoded.coverage, None);
-        assert_eq!(decoded.projection_tip_height, BlockHeight::new(10));
+        assert_eq!(decoded.tip_height, BlockHeight::new(10));
         assert_eq!(decoded.revision, 7);
         Ok(())
     }
@@ -4148,43 +3730,26 @@ mod tests {
     #[test]
     fn encoding_a_manifest_entry_rejects_more_column_families_than_the_count_field_holds() {
         let column_families = vec!["x"; usize::from(u16::MAX) + 1];
-        let outcome = encode_manifest_entry(1, &column_families, &BTreeSet::from([1]));
+        let outcome = encode_manifest_entry(1, &column_families);
         assert!(matches!(outcome, Err(reason) if reason.contains("column families")));
     }
 
     #[test]
     fn encoding_a_manifest_entry_rejects_a_column_family_name_longer_than_the_length_field_holds() {
         let overlong = "a".repeat(usize::from(u16::MAX) + 1);
-        let outcome = encode_manifest_entry(1, &[overlong.as_str()], &BTreeSet::from([1]));
+        let outcome = encode_manifest_entry(1, &[overlong.as_str()]);
         assert!(matches!(outcome, Err(reason) if reason.contains("column family name")));
     }
 
     #[test]
-    fn legacy_manifest_without_row_versions_uses_writer_version_as_provenance() -> Result<()> {
-        let mut encoded = encode_manifest_entry(3, &["alpha"], &BTreeSet::from([3]))
-            .map_err(|reason| eyre::eyre!(reason))?;
-        encoded.truncate(encoded.len().saturating_sub(4));
-
-        let decoded = decode_manifest_entry(&encoded).map_err(|reason| eyre::eyre!(reason))?;
-
-        assert_eq!(decoded.schema_version, 3);
-        assert_eq!(decoded.row_schema_versions, BTreeSet::from([3]));
-        Ok(())
-    }
-
-    #[test]
-    fn decoding_a_manifest_entry_rejects_duplicate_row_versions() -> Result<()> {
-        let mut encoded = encode_manifest_entry(2, &["alpha"], &BTreeSet::from([1, 2]))
-            .map_err(|reason| eyre::eyre!(reason))?;
-        let duplicate_version_offset = encoded.len().saturating_sub(2);
-        encoded.extend_from_within(duplicate_version_offset..);
-        let row_version_count_offset = 2 + 2 + 2 + "alpha".len();
-        encoded[row_version_count_offset..row_version_count_offset + 2]
-            .copy_from_slice(&3_u16.to_be_bytes());
+    fn decoding_a_manifest_entry_rejects_trailing_bytes() -> Result<()> {
+        let mut encoded =
+            encode_manifest_entry(2, &["alpha"]).map_err(|reason| eyre::eyre!(reason))?;
+        encoded.extend_from_slice(&[0, 1]);
 
         let outcome = decode_manifest_entry(&encoded);
 
-        assert!(matches!(outcome, Err(reason) if reason.contains("duplicate row schema")));
+        assert!(matches!(outcome, Err(reason) if reason.contains("trailing bytes")));
         Ok(())
     }
 
@@ -4220,17 +3785,17 @@ mod tests {
         Ok(())
     }
 
-    fn projection_state_with_coverage(
-        projection_tip_height: u32,
+    fn materialized_view_state_with_coverage(
+        tip_height: u32,
         complete_from_height: u32,
         complete_through_height: u32,
-    ) -> ConsumerProjectionState {
-        ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(1),
-            projection_tip_height: BlockHeight::new(projection_tip_height),
-            projection_tip_hash: BlockHash::from_bytes([0x11; 32]),
+    ) -> MaterializedViewState {
+        MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(1),
+            tip_height: BlockHeight::new(tip_height),
+            tip_hash: BlockHash::from_bytes([0x11; 32]),
             revision: 7,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(complete_from_height),
                 complete_through_height: BlockHeight::new(complete_through_height),
                 complete_through_hash: BlockHash::from_bytes([0x22; 32]),
@@ -4239,59 +3804,59 @@ mod tests {
     }
 
     #[test]
-    fn staging_projection_coverage_with_inverted_bounds_is_rejected() -> Result<()> {
+    fn staging_materialized_view_coverage_with_inverted_bounds_is_rejected() -> Result<()> {
         let tempdir = tempdir()?;
         let store =
             MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
 
-        let inverted = projection_state_with_coverage(200, 150, 100);
-        match store.put_consumer_projection_state(TEST_CONSUMER, inverted) {
-            Err(MaterializedViewStoreError::InvalidProjectionCoverage {
+        let inverted = materialized_view_state_with_coverage(200, 150, 100);
+        match store.put_consumer_state(TEST_CONSUMER, inverted) {
+            Err(MaterializedViewStoreError::InvalidMaterializedViewCoverage {
                 consumer,
                 complete_from_height,
                 complete_through_height,
-                projection_tip_height,
+                tip_height,
             }) => {
                 assert_eq!(consumer, TEST_CONSUMER.as_str());
                 assert_eq!(complete_from_height, 150);
                 assert_eq!(complete_through_height, 100);
-                assert_eq!(projection_tip_height, 200);
+                assert_eq!(tip_height, 200);
             }
             other => {
                 return Err(eyre::eyre!(
-                    "expected InvalidProjectionCoverage, got {other:?}"
+                    "expected InvalidMaterializedViewCoverage, got {other:?}"
                 ));
             }
         }
 
-        assert!(store.consumer_projection_state(TEST_CONSUMER)?.is_none());
+        assert!(store.consumer_state(TEST_CONSUMER)?.is_none());
         Ok(())
     }
 
     #[test]
-    fn staging_projection_coverage_beyond_tip_is_rejected() -> Result<()> {
+    fn staging_materialized_view_coverage_beyond_tip_is_rejected() -> Result<()> {
         let tempdir = tempdir()?;
         let store =
             MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
 
-        let beyond_tip = projection_state_with_coverage(180_256, 1, 180_512);
-        match store.put_consumer_projection_state(TEST_CONSUMER, beyond_tip) {
-            Err(MaterializedViewStoreError::InvalidProjectionCoverage {
+        let beyond_tip = materialized_view_state_with_coverage(180_256, 1, 180_512);
+        match store.put_consumer_state(TEST_CONSUMER, beyond_tip) {
+            Err(MaterializedViewStoreError::InvalidMaterializedViewCoverage {
                 complete_through_height,
-                projection_tip_height,
+                tip_height,
                 ..
             }) => {
                 assert_eq!(complete_through_height, 180_512);
-                assert_eq!(projection_tip_height, 180_256);
+                assert_eq!(tip_height, 180_256);
             }
             other => {
                 return Err(eyre::eyre!(
-                    "expected InvalidProjectionCoverage, got {other:?}"
+                    "expected InvalidMaterializedViewCoverage, got {other:?}"
                 ));
             }
         }
 
-        assert!(store.consumer_projection_state(TEST_CONSUMER)?.is_none());
+        assert!(store.consumer_state(TEST_CONSUMER)?.is_none());
         Ok(())
     }
 }

@@ -250,7 +250,7 @@ jq -e \
       "wallet_storage_ready"
     ])
     and .contract_identity == "benchmark-report"
-    and .report_format_version == 2
+    and .report_format_version == 3
     and .measurement_kind == "rocksdb-storage-lifecycle"
     and (.storage_candidate
       | exact_keys([
@@ -448,7 +448,7 @@ jq -e \
           "historical_prevout_read_count",
           "phase_durations",
           "physical_store_bytes",
-          "projection_digest_hex",
+          "wallet_projection_digest_hex",
           "row_counts",
           "scanned_block_count",
           "scanned_transaction_count",
@@ -464,7 +464,7 @@ jq -e \
       and .source_event_sequence == $report.canonical_storage_ready.visible_event_sequence
       and .source_tip == $report.canonical_storage_ready.visible_tip
       and .source_sequence_digest == $report.canonical_storage_ready.sequence_digest
-      and (.projection_digest_hex | hex_bytes(32))
+      and (.wallet_projection_digest_hex | hex_bytes(32))
       and (.row_counts | row_counts)
       and .row_counts.transparent_unspent_output_by_address_count
         == .row_counts.transparent_unspent_output_count

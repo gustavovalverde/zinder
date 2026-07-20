@@ -4,7 +4,7 @@ use rust_rocksdb::WriteBatch;
 use tempfile::tempdir;
 use zinder_core::{BlockHash, BlockHeight, ValuePoolBalance};
 use zinder_materialized_views::{
-    BlockCommitContext, BlockCommitPayload, BlockKeyedConsumer, BlockValuePoolBalanceFacts,
+    BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, BlockValuePoolBalanceFacts,
     MaterializedViewConsumerCtx, MaterializedViewStore, MaterializedViewStoreOptions,
     TransparentSpendFacts, VALUE_POOL_BALANCE_HISTORY_COLUMN_FAMILY,
     VALUE_POOL_BALANCE_HISTORY_SCHEMA, ValuePoolBalanceBackfillCoverage,
@@ -26,7 +26,7 @@ fn pools(amount_zat: u64) -> Vec<ValuePoolBalance> {
 
 fn block(height: u32, hash_byte: u8, time: i64, amount_zat: u64) -> BlockCommitContext {
     BlockCommitContext::new(
-        BlockCommitPayload {
+        BlockCommitInput {
             height: BlockHeight::new(height),
             block_hash: BlockHash::from_bytes([hash_byte; 32]),
             previous_block_hash: BlockHash::from_bytes([0; 32]),

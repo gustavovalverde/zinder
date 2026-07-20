@@ -15,12 +15,25 @@
 use std::{
     num::{NonZeroU32, NonZeroU64},
     path::Path,
+    pin::Pin,
     sync::Arc,
 };
 
 use eyre::Result;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio_stream::{Stream, wrappers::TcpListenerStream};
+use tonic::{Request, Response, Status};
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{BulkCatchupRunConfig, CanonicalPipelineLimits, NodeSourceKind};
+use zinder_proto::v1::{
+    ingest::{
+        MempoolTransactionRequest, ServerInfoRequest, ServerInfoResponse, WriterStatusRequest,
+        WriterStatusResponse,
+        ingest_control_server::{IngestControl, IngestControlServer},
+    },
+    wallet,
+};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_testkit::live::LiveTestEnv;
 
@@ -36,7 +49,7 @@ pub(crate) fn live_bulk_catchup_run_config(
     from_height: BlockHeight,
     to_height: BlockHeight,
     canonical_batch_max_blocks: NonZeroU32,
-    allow_near_tip_finalize: bool,
+    allow_reorg_window_settlement: bool,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 ) -> BulkCatchupRunConfig {
     const SOURCE_SEGMENT_MAX_BLOCKS: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
@@ -77,7 +90,7 @@ pub(crate) fn live_bulk_catchup_run_config(
             .unwrap_or(NonZeroU64::MIN),
         flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),
         upstream_tip_hint: None,
-        allow_near_tip_finalize,
+        allow_reorg_window_settlement,
         checkpoint: None,
     }
 }
@@ -184,4 +197,171 @@ pub(crate) async fn regtest_generate_blocks(
             )
         })?;
     Ok(block_hashes)
+}
+
+type TestChainEventStream =
+    Pin<Box<dyn Stream<Item = Result<wallet::ChainEventEnvelope, Status>> + Send>>;
+type TestMempoolEventStream =
+    Pin<Box<dyn Stream<Item = Result<wallet::MempoolEventEnvelope, Status>> + Send>>;
+
+/// Serves a deliberately small current `IngestControl` implementation for
+/// Explorer federation tests.
+///
+/// The writer owns canonical-control composition; this fixture only supplies
+/// the current private responses that Explorer reaches through `WalletQuery`.
+pub(crate) async fn serve_test_ingest_control(
+    value_pools_response: Option<wallet::ChainValuePoolsAtTipResponse>,
+) -> Result<(
+    std::net::SocketAddr,
+    JoinHandle<Result<(), tonic::transport::Error>>,
+)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(IngestControlServer::new(TestIngestControl {
+                value_pools_response,
+            }))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    Ok((address, handle))
+}
+
+#[derive(Clone)]
+struct TestIngestControl {
+    value_pools_response: Option<wallet::ChainValuePoolsAtTipResponse>,
+}
+
+#[tonic::async_trait]
+impl IngestControl for TestIngestControl {
+    type VisibleChainEventsStream = TestChainEventStream;
+    type MempoolEventsStream = TestMempoolEventStream;
+
+    async fn server_info(
+        &self,
+        _: Request<ServerInfoRequest>,
+    ) -> Result<Response<ServerInfoResponse>, Status> {
+        Ok(Response::new(ServerInfoResponse { server_info: None }))
+    }
+
+    async fn writer_status(
+        &self,
+        _: Request<WriterStatusRequest>,
+    ) -> Result<Response<WriterStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "Explorer test fixture does not expose writer status",
+        ))
+    }
+
+    async fn visible_chain_events(
+        &self,
+        _: Request<wallet::EventStreamStart>,
+    ) -> Result<Response<Self::VisibleChainEventsStream>, Status> {
+        Err(Status::unimplemented(
+            "Explorer test fixture does not expose visible-chain events",
+        ))
+    }
+
+    async fn mempool_snapshot(
+        &self,
+        _: Request<wallet::MempoolSnapshotRequest>,
+    ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        Ok(Response::new(wallet::MempoolSnapshotResponse {
+            chain_view: Some(test_chain_view()),
+            events_resume_cursor: Vec::new(),
+            snapshot_age_millis: 0,
+            entries: Vec::new(),
+            next_cursor: Vec::new(),
+        }))
+    }
+
+    async fn mempool_transaction(
+        &self,
+        _: Request<MempoolTransactionRequest>,
+    ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
+        Err(Status::not_found("transaction is not in the test mempool"))
+    }
+
+    async fn mempool_events(
+        &self,
+        _: Request<wallet::MempoolEventsRequest>,
+    ) -> Result<Response<Self::MempoolEventsStream>, Status> {
+        Err(Status::unimplemented(
+            "Explorer test fixture does not expose mempool events",
+        ))
+    }
+
+    async fn transparent_mempool_outputs_by_address(
+        &self,
+        _: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
+        Ok(Response::new(
+            wallet::TransparentMempoolOutputsByAddressResponse {
+                chain_view: Some(test_chain_view()),
+                outputs: Vec::new(),
+            },
+        ))
+    }
+
+    async fn transparent_mempool_spends_by_outpoint(
+        &self,
+        _: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
+        Ok(Response::new(
+            wallet::TransparentMempoolSpendsByOutpointResponse {
+                chain_view: Some(test_chain_view()),
+                spends: Vec::new(),
+            },
+        ))
+    }
+
+    async fn transparent_mempool_outputs_by_outpoint(
+        &self,
+        _: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
+    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
+        Ok(Response::new(
+            wallet::TransparentOutputsByOutpointResponse {
+                chain_view: Some(test_chain_view()),
+                entries: Vec::new(),
+            },
+        ))
+    }
+
+    async fn chain_value_pools_at_tip(
+        &self,
+        _: Request<wallet::ChainValuePoolsAtTipRequest>,
+    ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
+        self.value_pools_response
+            .clone()
+            .map(Response::new)
+            .ok_or_else(|| {
+                Status::unimplemented("Explorer test fixture does not expose source value pools")
+            })
+    }
+}
+
+fn test_chain_view() -> wallet::ChainView {
+    wallet::ChainView {
+        chain_epoch: Some(wallet::ChainEpoch {
+            chain_epoch_id: 1,
+            network_name: "zcash-regtest".to_owned(),
+            artifact_schema_version: 1,
+            created_at_millis: 0,
+            visible_tip: Some(wallet::BlockTip {
+                height: 1,
+                hash: "01".repeat(32),
+            }),
+            settled_tip: Some(wallet::BlockTip {
+                height: 0,
+                hash: "00".repeat(32),
+            }),
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        }),
+        indexed_tip: None,
+        upstream_tip: None,
+        materialized_views: None,
+    }
 }

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     MetricsHandle, MetricsInstallError, Readiness, install_metrics_recorder,
-    sections::ServiceIdentifier,
+    sections::RuntimeService,
 };
 
 /// Service identity surfaced by `/metrics` for build-time labeling.
@@ -95,21 +95,21 @@ impl OpsEndpointHandle {
     }
 }
 
-/// Spawns the operational HTTP server for a known service identity when
+/// Spawns the operational HTTP server for a known runtime service when
 /// `listen_addr` is populated.
 ///
 /// Returns `None` when the operator opted out (empty string in
 /// `ops.listen_addr` resolves to `None` before this function is called).
 /// Otherwise returns the spawned handle, identical to
 /// [`spawn_ops_endpoint`] but with `service_name` filled in from the
-/// [`ServiceIdentifier`] table so each binary cannot drift its own label.
+/// [`RuntimeService`] table so each binary cannot drift its own label.
 #[must_use = "drop the returned handle only on graceful shutdown"]
 #[allow(
     clippy::too_many_arguments,
-    reason = "service identity, listen address, version, network, readiness, and capability snapshot are all binding-time inputs; bundling them into a struct would only push the field count one layer out"
+    reason = "runtime service, listen address, version, network, readiness, and capability snapshot are all binding-time inputs; bundling them into a struct would only push the field count one layer out"
 )]
 pub fn spawn_ops_endpoint_for(
-    service: ServiceIdentifier,
+    service: RuntimeService,
     listen_addr: Option<SocketAddr>,
     service_version: &'static str,
     network_name: &'static str,
@@ -279,9 +279,9 @@ struct ReadinessResponseBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    projection_preset: Option<String>,
+    materialized_view_preset: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    projection_identities: Vec<String>,
+    materialized_view_identities: Vec<String>,
 }
 
 fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseBody>) {
@@ -301,8 +301,8 @@ fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseB
         cause: report.cause,
         current_height: report.current_height,
         target_height: report.target_height,
-        projection_preset: report.projection_preset,
-        projection_identities: report.projection_identities,
+        materialized_view_preset: report.materialized_view_preset,
+        materialized_view_identities: report.materialized_view_identities,
     };
 
     (status_code, Json(body))
@@ -322,21 +322,21 @@ fn metrics_handler(state: &MetricsState) -> (StatusCode, String) {
 
 fn record_readiness_metrics(state: &MetricsState) {
     let report = state.readiness.report();
-    if let Some(projection_preset) = &report.projection_preset {
+    if let Some(materialized_view_preset) = &report.materialized_view_preset {
         metrics::gauge!(
-            "zinder_projection_workload_info",
+            "zinder_materialized_view_workload_info",
             "service" => state.service_name,
             "network" => state.network_name,
-            "preset" => projection_preset.clone(),
+            "preset" => materialized_view_preset.clone(),
         )
         .set(1.0);
-        for projection_identity in &report.projection_identities {
+        for materialized_view_identity in &report.materialized_view_identities {
             metrics::gauge!(
-                "zinder_projection_identity_info",
+                "zinder_materialized_view_identity_info",
                 "service" => state.service_name,
                 "network" => state.network_name,
-                "preset" => projection_preset.clone(),
-                "identity" => projection_identity.clone(),
+                "preset" => materialized_view_preset.clone(),
+                "identity" => materialized_view_identity.clone(),
             )
             .set(1.0);
         }

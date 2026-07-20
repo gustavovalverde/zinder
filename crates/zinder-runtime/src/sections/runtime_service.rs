@@ -1,17 +1,15 @@
-//! Service identity used by shared section helpers to pick per-service
-//! defaults without each binary repeating the table.
+//! Deployable runtime service used by shared configuration defaults.
 
 use std::fmt;
 
-/// Identity of a deployable Zinder runtime.
+/// A deployable Zinder service process.
 ///
-/// Variants enumerate every binary the workspace ships; adding a new
-/// variant forces a compile error in every section's default table so
-/// nothing silently defaults to a placeholder. The string returned by
-/// [`Self::binary_name`] is stable across releases and used as the
-/// `service` label in Prometheus metrics.
+/// Adding a service requires a variant, which in turn forces its default
+/// addresses and metrics label to be chosen explicitly. The string
+/// returned by [`Self::binary_name`] is stable across releases and is used as
+/// the `service` Prometheus label.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ServiceIdentifier {
+pub enum RuntimeService {
     /// `zinder-ingest`: writer plane.
     Ingest,
     /// `zinder-compat-lightwalletd`: lightwalletd-protocol compat reader.
@@ -22,7 +20,7 @@ pub enum ServiceIdentifier {
     Explorer,
 }
 
-impl ServiceIdentifier {
+impl RuntimeService {
     /// Canonical binary name used in metrics labels, log targets, and
     /// docs. Stable across releases.
     #[must_use]
@@ -36,7 +34,7 @@ impl ServiceIdentifier {
     }
 }
 
-impl fmt::Display for ServiceIdentifier {
+impl fmt::Display for RuntimeService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.binary_name())
     }
@@ -49,10 +47,10 @@ mod tests {
     #[test]
     fn binary_name_matches_display() {
         for service in [
-            ServiceIdentifier::Ingest,
-            ServiceIdentifier::CompatLightwalletd,
-            ServiceIdentifier::CompatCipherscan,
-            ServiceIdentifier::Explorer,
+            RuntimeService::Ingest,
+            RuntimeService::CompatLightwalletd,
+            RuntimeService::CompatCipherscan,
+            RuntimeService::Explorer,
         ] {
             assert_eq!(service.binary_name(), service.to_string());
         }

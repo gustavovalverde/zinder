@@ -1,6 +1,6 @@
 //! Canonical transaction-component totals by block time and UTC day.
 //!
-//! The projection keeps one fixed-width contribution per block, a height
+//! The materialized view keeps one fixed-width contribution per block, a height
 //! index for deterministic rewind, one aggregate per UTC day, and a separate
 //! contiguous historical-coverage row. Time-range reads use day aggregates
 //! only for whole UTC days and scan block contributions for clipped boundary
@@ -47,8 +47,8 @@ pub const TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME: MaterializedViewConsumerN
 
 /// Version 2 appends transaction predicate totals to the fixed-width rows.
 ///
-/// Version-1 rows are not readable as version 2, so opening an existing
-/// materialized-view store clears and rebuilds this consumer only.
+/// Version-1 rows are not readable as version 2, so this change requires a
+/// fresh materialized-view store rebuilt from a certified recovery source.
 pub const TRANSACTION_COMPONENT_SUMMARY_SCHEMA: MaterializedViewConsumerSchema =
     MaterializedViewConsumerSchema::new(
         TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
@@ -99,16 +99,16 @@ pub struct TransactionComponentTotals {
     /// Transactions with any Sprout component.
     pub sprout_transaction_count: u64,
     /// Transactions with a Sapling or Orchard component.
-    pub legacy_shielded_transaction_count: u64,
-    /// Legacy-shielded transactions with Sapling but no Orchard component.
-    pub legacy_sapling_only_transaction_count: u64,
-    /// Legacy-shielded transactions with Orchard but no Sapling component.
-    pub legacy_orchard_only_transaction_count: u64,
-    /// Legacy-shielded transactions with both Sapling and Orchard components.
-    pub legacy_sapling_and_orchard_transaction_count: u64,
-    /// Legacy-shielded transactions with shielded inputs and outputs and no
-    /// transparent inputs or outputs.
-    pub legacy_fully_shielded_transaction_count: u64,
+    pub sapling_or_orchard_transaction_count: u64,
+    /// Transactions with Sapling but no Orchard component.
+    pub sapling_without_orchard_transaction_count: u64,
+    /// Transactions with Orchard but no Sapling component.
+    pub orchard_without_sapling_transaction_count: u64,
+    /// Transactions with both Sapling and Orchard components.
+    pub sapling_and_orchard_transaction_count: u64,
+    /// Transactions with Sapling-or-Orchard inputs and outputs and no transparent
+    /// inputs or outputs.
+    pub sapling_or_orchard_fully_shielded_transaction_count: u64,
     /// Transactions, including coinbase, with any Sapling, Orchard, or
     /// Ironwood component. Sprout-only transactions do not count.
     pub sapling_orchard_or_ironwood_transaction_count: u64,
@@ -169,22 +169,22 @@ impl TransactionComponentTotals {
             sprout_transaction_count: self
                 .sprout_transaction_count
                 .checked_add(other.sprout_transaction_count)?,
-            legacy_shielded_transaction_count: self
-                .legacy_shielded_transaction_count
-                .checked_add(other.legacy_shielded_transaction_count)?,
-            legacy_sapling_only_transaction_count: self
-                .legacy_sapling_only_transaction_count
-                .checked_add(other.legacy_sapling_only_transaction_count)?,
-            legacy_orchard_only_transaction_count: self
-                .legacy_orchard_only_transaction_count
-                .checked_add(other.legacy_orchard_only_transaction_count)?,
-            legacy_sapling_and_orchard_transaction_count: self
-                .legacy_sapling_and_orchard_transaction_count
-                .checked_add(other.legacy_sapling_and_orchard_transaction_count)?,
-            legacy_fully_shielded_transaction_count: self
-                .legacy_fully_shielded_transaction_count
+            sapling_or_orchard_transaction_count: self
+                .sapling_or_orchard_transaction_count
+                .checked_add(other.sapling_or_orchard_transaction_count)?,
+            sapling_without_orchard_transaction_count: self
+                .sapling_without_orchard_transaction_count
+                .checked_add(other.sapling_without_orchard_transaction_count)?,
+            orchard_without_sapling_transaction_count: self
+                .orchard_without_sapling_transaction_count
+                .checked_add(other.orchard_without_sapling_transaction_count)?,
+            sapling_and_orchard_transaction_count: self
+                .sapling_and_orchard_transaction_count
+                .checked_add(other.sapling_and_orchard_transaction_count)?,
+            sapling_or_orchard_fully_shielded_transaction_count: self
+                .sapling_or_orchard_fully_shielded_transaction_count
                 .checked_add(
-                other.legacy_fully_shielded_transaction_count,
+                other.sapling_or_orchard_fully_shielded_transaction_count,
             )?,
             sapling_orchard_or_ironwood_transaction_count: self
                 .sapling_orchard_or_ironwood_transaction_count
@@ -225,11 +225,11 @@ impl TransactionComponentTotals {
             self.orchard_transaction_count,
             self.ironwood_transaction_count,
             self.sprout_transaction_count,
-            self.legacy_shielded_transaction_count,
-            self.legacy_sapling_only_transaction_count,
-            self.legacy_orchard_only_transaction_count,
-            self.legacy_sapling_and_orchard_transaction_count,
-            self.legacy_fully_shielded_transaction_count,
+            self.sapling_or_orchard_transaction_count,
+            self.sapling_without_orchard_transaction_count,
+            self.orchard_without_sapling_transaction_count,
+            self.sapling_and_orchard_transaction_count,
+            self.sapling_or_orchard_fully_shielded_transaction_count,
             self.sapling_orchard_or_ironwood_transaction_count,
             self.non_coinbase_without_sapling_orchard_or_ironwood_transaction_count,
             self.non_coinbase_sapling_orchard_or_ironwood_with_transparent_inputs_and_outputs_transaction_count,
@@ -253,11 +253,11 @@ impl TransactionComponentTotals {
             orchard_transaction_count: fields[9],
             ironwood_transaction_count: fields[10],
             sprout_transaction_count: fields[11],
-            legacy_shielded_transaction_count: fields[12],
-            legacy_sapling_only_transaction_count: fields[13],
-            legacy_orchard_only_transaction_count: fields[14],
-            legacy_sapling_and_orchard_transaction_count: fields[15],
-            legacy_fully_shielded_transaction_count: fields[16],
+            sapling_or_orchard_transaction_count: fields[12],
+            sapling_without_orchard_transaction_count: fields[13],
+            orchard_without_sapling_transaction_count: fields[14],
+            sapling_and_orchard_transaction_count: fields[15],
+            sapling_or_orchard_fully_shielded_transaction_count: fields[16],
             sapling_orchard_or_ironwood_transaction_count: fields[17],
             non_coinbase_without_sapling_orchard_or_ironwood_transaction_count: fields[18],
             non_coinbase_sapling_orchard_or_ironwood_with_transparent_inputs_and_outputs_transaction_count: fields[19],
@@ -275,10 +275,10 @@ pub struct TransactionComponentDay {
     pub day_start_unix_seconds: i64,
     /// Additive totals inside this bucket.
     pub totals: TransactionComponentTotals,
-    /// Earliest block time carrying a legacy-shielded transaction.
-    pub first_legacy_shielded_transaction_time_unix_seconds: Option<i64>,
-    /// Latest block time carrying a legacy-shielded transaction.
-    pub last_legacy_shielded_transaction_time_unix_seconds: Option<i64>,
+    /// Earliest block time carrying a Sapling-or-Orchard transaction.
+    pub first_sapling_or_orchard_transaction_time_unix_seconds: Option<i64>,
+    /// Latest block time carrying a Sapling-or-Orchard transaction.
+    pub last_sapling_or_orchard_transaction_time_unix_seconds: Option<i64>,
 }
 
 impl TransactionComponentDay {
@@ -296,13 +296,13 @@ impl TransactionComponentDay {
         Some(Self {
             day_start_unix_seconds: self.day_start_unix_seconds,
             totals: self.totals.checked_add(other.totals)?,
-            first_legacy_shielded_transaction_time_unix_seconds: min_optional(
-                self.first_legacy_shielded_transaction_time_unix_seconds,
-                other.first_legacy_shielded_transaction_time_unix_seconds,
+            first_sapling_or_orchard_transaction_time_unix_seconds: min_optional(
+                self.first_sapling_or_orchard_transaction_time_unix_seconds,
+                other.first_sapling_or_orchard_transaction_time_unix_seconds,
             ),
-            last_legacy_shielded_transaction_time_unix_seconds: max_optional(
-                self.last_legacy_shielded_transaction_time_unix_seconds,
-                other.last_legacy_shielded_transaction_time_unix_seconds,
+            last_sapling_or_orchard_transaction_time_unix_seconds: max_optional(
+                self.last_sapling_or_orchard_transaction_time_unix_seconds,
+                other.last_sapling_or_orchard_transaction_time_unix_seconds,
             ),
         })
     }
@@ -652,7 +652,7 @@ impl TransactionComponentSummaryConsumer {
             store.consumer_column_family(TRANSACTION_COMPONENT_SUMMARY_COVERAGE_COLUMN_FAMILY)?;
         ctx.batch
             .put_cf(&coverage_cf, COVERAGE_KEY, encode_coverage(next_coverage));
-        store.write_projection_batch(TRANSACTION_COMPONENT_SUMMARY_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(TRANSACTION_COMPONENT_SUMMARY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -678,7 +678,7 @@ impl TransactionComponentSummaryConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_projection_batch(TRANSACTION_COMPONENT_SUMMARY_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(TRANSACTION_COMPONENT_SUMMARY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -948,17 +948,17 @@ fn contribution_for_block(
             .totals
             .checked_add(transaction_totals)
             .ok_or(TransactionComponentSummaryConsumerError::CounterOverflow)?;
-        if transaction_totals.legacy_shielded_transaction_count > 0 {
-            contribution.first_legacy_shielded_transaction_time_unix_seconds = Some(
+        if transaction_totals.sapling_or_orchard_transaction_count > 0 {
+            contribution.first_sapling_or_orchard_transaction_time_unix_seconds = Some(
                 contribution
-                    .first_legacy_shielded_transaction_time_unix_seconds
+                    .first_sapling_or_orchard_transaction_time_unix_seconds
                     .map_or(block.block_time_unix_seconds, |existing| {
                         existing.min(block.block_time_unix_seconds)
                     }),
             );
-            contribution.last_legacy_shielded_transaction_time_unix_seconds = Some(
+            contribution.last_sapling_or_orchard_transaction_time_unix_seconds = Some(
                 contribution
-                    .last_legacy_shielded_transaction_time_unix_seconds
+                    .last_sapling_or_orchard_transaction_time_unix_seconds
                     .map_or(block.block_time_unix_seconds, |existing| {
                         existing.max(block.block_time_unix_seconds)
                     }),
@@ -979,11 +979,11 @@ fn totals_for_transaction(transaction: &TransactionFactsArtifact) -> Transaction
     let has_sprout = counts.sprout_joinsplit_count > 0;
     let has_shielded_protocol = has_sapling || has_orchard || has_ironwood;
     let predicates_are_unavailable = !transaction.public_facts.unsupported_sections.is_empty();
-    let is_legacy_shielded = has_sapling || has_orchard;
-    let has_legacy_shielded_input = counts.sapling_spend_count > 0 || has_orchard;
-    let has_legacy_shielded_output = counts.sapling_output_count > 0 || has_orchard;
-    let is_legacy_fully_shielded = has_legacy_shielded_input
-        && has_legacy_shielded_output
+    let is_sapling_or_orchard = has_sapling || has_orchard;
+    let has_sapling_or_orchard_input = counts.sapling_spend_count > 0 || has_orchard;
+    let has_sapling_or_orchard_output = counts.sapling_output_count > 0 || has_orchard;
+    let is_sapling_or_orchard_fully_shielded = has_sapling_or_orchard_input
+        && has_sapling_or_orchard_output
         && counts.transparent_input_count == 0
         && counts.transparent_output_count == 0;
     let is_transparent = !predicates_are_unavailable
@@ -1012,11 +1012,11 @@ fn totals_for_transaction(transaction: &TransactionFactsArtifact) -> Transaction
         orchard_transaction_count: u64::from(has_orchard),
         ironwood_transaction_count: u64::from(has_ironwood),
         sprout_transaction_count: u64::from(has_sprout),
-        legacy_shielded_transaction_count: u64::from(is_legacy_shielded),
-        legacy_sapling_only_transaction_count: u64::from(has_sapling && !has_orchard),
-        legacy_orchard_only_transaction_count: u64::from(has_orchard && !has_sapling),
-        legacy_sapling_and_orchard_transaction_count: u64::from(has_sapling && has_orchard),
-        legacy_fully_shielded_transaction_count: u64::from(is_legacy_fully_shielded),
+        sapling_or_orchard_transaction_count: u64::from(is_sapling_or_orchard),
+        sapling_without_orchard_transaction_count: u64::from(has_sapling && !has_orchard),
+        orchard_without_sapling_transaction_count: u64::from(has_orchard && !has_sapling),
+        sapling_and_orchard_transaction_count: u64::from(has_sapling && has_orchard),
+        sapling_or_orchard_fully_shielded_transaction_count: u64::from(is_sapling_or_orchard_fully_shielded),
         sapling_orchard_or_ironwood_transaction_count:
             u64::from(!predicates_are_unavailable && has_shielded_protocol),
         non_coinbase_without_sapling_orchard_or_ironwood_transaction_count:
@@ -1470,8 +1470,8 @@ fn encode_summary_value(summary: TransactionComponentDay) -> [u8; SUMMARY_VALUE_
     }
     let extrema_offset = TIME_KEY_LEN + TOTALS_LEN;
     if let (Some(first), Some(last)) = (
-        summary.first_legacy_shielded_transaction_time_unix_seconds,
-        summary.last_legacy_shielded_transaction_time_unix_seconds,
+        summary.first_sapling_or_orchard_transaction_time_unix_seconds,
+        summary.last_sapling_or_orchard_transaction_time_unix_seconds,
     ) {
         payload[extrema_offset] = 1;
         payload[extrema_offset + 1..extrema_offset + 1 + TIME_KEY_LEN]
@@ -1511,7 +1511,7 @@ fn decode_summary_value(
     }
     let totals = TransactionComponentTotals::from_fields(fields);
     let (first, last) = decode_summary_extrema(payload)?;
-    if (totals.legacy_shielded_transaction_count == 0) != first.is_none()
+    if (totals.sapling_or_orchard_transaction_count == 0) != first.is_none()
         || first.zip(last).is_some_and(|(first, last)| first > last)
     {
         return Err(
@@ -1532,8 +1532,8 @@ fn decode_summary_value(
     Ok(TransactionComponentDay {
         day_start_unix_seconds,
         totals,
-        first_legacy_shielded_transaction_time_unix_seconds: first,
-        last_legacy_shielded_transaction_time_unix_seconds: last,
+        first_sapling_or_orchard_transaction_time_unix_seconds: first,
+        last_sapling_or_orchard_transaction_time_unix_seconds: last,
     })
 }
 
@@ -1860,7 +1860,7 @@ mod tests {
         totals_for_transaction,
     };
     use crate::consumer::{
-        BlockCommitContext, BlockCommitPayload, BlockKeyedConsumer, MaterializedViewConsumerCtx,
+        BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, MaterializedViewConsumerCtx,
         TransparentSpendFacts,
     };
     use crate::{MaterializedViewStore, MaterializedViewStoreOptions};
@@ -1912,7 +1912,7 @@ mod tests {
         let height = BlockHeight::new(height);
         let hash = block_hash(hash_seed);
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height,
                 block_hash: hash,
                 previous_block_hash: block_hash(hash_seed.wrapping_sub(1)),
@@ -1993,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_predicates_exclude_ironwood_and_sprout() {
+    fn sapling_or_orchard_predicates_exclude_ironwood_and_sprout() {
         let sapling = TransactionComponentCounts {
             sapling_spend_count: 1,
             sapling_output_count: 2,
@@ -2018,24 +2018,30 @@ mod tests {
         let hash = block_hash(1);
 
         let sapling = totals_for_transaction(&transaction(height, hash, 0, sapling));
-        assert_eq!(sapling.legacy_sapling_only_transaction_count, 1);
-        assert_eq!(sapling.legacy_fully_shielded_transaction_count, 1);
+        assert_eq!(sapling.sapling_without_orchard_transaction_count, 1);
+        assert_eq!(
+            sapling.sapling_or_orchard_fully_shielded_transaction_count,
+            1
+        );
 
         let orchard =
             totals_for_transaction(&transaction(height, hash, 1, orchard_with_transparent));
-        assert_eq!(orchard.legacy_orchard_only_transaction_count, 1);
-        assert_eq!(orchard.legacy_fully_shielded_transaction_count, 0);
+        assert_eq!(orchard.orchard_without_sapling_transaction_count, 1);
+        assert_eq!(
+            orchard.sapling_or_orchard_fully_shielded_transaction_count,
+            0
+        );
 
         let both = totals_for_transaction(&transaction(height, hash, 2, both));
-        assert_eq!(both.legacy_sapling_and_orchard_transaction_count, 1);
-        assert_eq!(both.legacy_fully_shielded_transaction_count, 1);
+        assert_eq!(both.sapling_and_orchard_transaction_count, 1);
+        assert_eq!(both.sapling_or_orchard_fully_shielded_transaction_count, 1);
 
         let native = totals_for_transaction(&transaction(height, hash, 3, native_only));
         assert_eq!(native.ironwood_action_count, 4);
         assert_eq!(native.sprout_joinsplit_count, 2);
         assert_eq!(native.ironwood_transaction_count, 1);
         assert_eq!(native.sprout_transaction_count, 1);
-        assert_eq!(native.legacy_shielded_transaction_count, 0);
+        assert_eq!(native.sapling_or_orchard_transaction_count, 0);
     }
 
     #[test]
@@ -2237,7 +2243,7 @@ mod tests {
         assert_eq!(clipped.totals.ironwood_action_count, 0);
         assert_eq!(clipped.days.len(), 1);
         assert_eq!(
-            clipped.days[0].first_legacy_shielded_transaction_time_unix_seconds,
+            clipped.days[0].first_sapling_or_orchard_transaction_time_unix_seconds,
             Some(20)
         );
 
@@ -2252,7 +2258,7 @@ mod tests {
     }
 
     #[test]
-    fn revert_recomputes_first_and_last_legacy_times() -> TestResult {
+    fn revert_recomputes_first_and_last_sapling_or_orchard_times() -> TestResult {
         let (_tempdir, store) = open_store()?;
         let mut consumer = TransactionComponentSummaryConsumer::new();
         let sapling = TransactionComponentCounts {
@@ -2274,11 +2280,11 @@ mod tests {
         let summary =
             TransactionComponentSummaryConsumer::summary_in_time_range(&store, 0, SECONDS_PER_DAY)?;
         assert_eq!(
-            summary.days[0].first_legacy_shielded_transaction_time_unix_seconds,
+            summary.days[0].first_sapling_or_orchard_transaction_time_unix_seconds,
             Some(20)
         );
         assert_eq!(
-            summary.days[0].last_legacy_shielded_transaction_time_unix_seconds,
+            summary.days[0].last_sapling_or_orchard_transaction_time_unix_seconds,
             Some(30)
         );
         assert_eq!(
@@ -2296,7 +2302,7 @@ mod tests {
         let summary =
             TransactionComponentSummaryConsumer::summary_in_time_range(&store, 0, SECONDS_PER_DAY)?;
         assert_eq!(
-            summary.days[0].last_legacy_shielded_transaction_time_unix_seconds,
+            summary.days[0].last_sapling_or_orchard_transaction_time_unix_seconds,
             Some(20)
         );
         assert_eq!(

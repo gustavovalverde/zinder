@@ -122,9 +122,9 @@ impl ValuePoolFlowEvent {
     /// Returns whether this event belongs to the block's coinbase transaction.
     ///
     /// Consensus blocks place the coinbase transaction at index zero. Older
-    /// projection rows can contain shielded coinbase payouts, so readers use
+    /// materialized-view rows can contain shielded coinbase payouts, so readers use
     /// this structural fact to exclude issuance from transparent-boundary flow
-    /// analytics without requiring a projection replay.
+    /// analytics without requiring a materialized-view replay.
     #[must_use]
     pub const fn is_coinbase(self) -> bool {
         self.transaction_index_in_block == 0
@@ -261,7 +261,7 @@ impl ValuePoolFlowHistoryConsumer {
             .transpose()
     }
 
-    /// Initializes or widens the startup tail without deleting projection rows.
+    /// Initializes or widens the startup tail without deleting materialized-view rows.
     pub fn widen_tail_boundary_for_startup(
         store: &crate::MaterializedViewStore,
         boundary_height: BlockHeight,
@@ -298,7 +298,7 @@ impl ValuePoolFlowHistoryConsumer {
         let cf = store.consumer_column_family(VALUE_POOL_FLOW_HISTORY_COVERAGE_COLUMN_FAMILY)?;
         ctx.batch
             .put_cf(&cf, COVERAGE_KEY, encode_coverage(next_coverage));
-        store.write_projection_batch(VALUE_POOL_FLOW_HISTORY_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(VALUE_POOL_FLOW_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -319,7 +319,7 @@ impl ValuePoolFlowHistoryConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_projection_batch(VALUE_POOL_FLOW_HISTORY_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(VALUE_POOL_FLOW_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -465,7 +465,7 @@ impl BlockKeyedConsumer for ValuePoolFlowHistoryConsumer {
         block: &BlockCommitContext,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let intrinsic_balances = block.transaction_intrinsic_value_balances()?;
+        let intrinsic_balances = block.transaction_intrinsic_value_balances();
         let mut event_rows = Vec::new();
         for transaction in &block.transactions {
             if transaction.public_facts.is_coinbase {
@@ -943,9 +943,6 @@ pub enum ValuePoolFlowHistoryConsumerError {
     /// Materialized-view store operation failed.
     #[error(transparent)]
     Store(#[from] MaterializedViewStoreError),
-    /// Shared block-context hydration failed.
-    #[error(transparent)]
-    BlockContext(#[from] crate::consumer::BlockCommitContextError),
     /// A transparent-participating transaction lacks its intrinsic balances.
     #[error(
         "transaction {transaction_id:?} at height {height} is missing intrinsic value balances"

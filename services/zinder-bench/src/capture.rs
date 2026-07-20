@@ -124,7 +124,7 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
         to_height: config.to_height.value(),
         block_count,
         workload_density,
-        projection_coupled_oracle_artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        canonical_artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         canonical_block_facts_digest_evidence,
         tip_hash_hex,
         network_upgrade_activations: activation_records,

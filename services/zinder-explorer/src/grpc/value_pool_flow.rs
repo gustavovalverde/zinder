@@ -29,7 +29,7 @@ use zinder_proto::v1::explorer::{
     ValuePoolFlowRoundedAmountSummaryRow, ValuePoolFlowSummaryBucket, ValuePoolFlowSummaryRequest,
     ValuePoolFlowSummaryResolution, ValuePoolFlowSummaryResponse,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::clamp_max_entries;
@@ -55,7 +55,7 @@ const CURSOR_LEN: usize = CURSOR_PREFIX.len()
     + zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_KEY_LEN;
 
 /// Executes one `ExplorerQuery.ValuePoolFlowHistory` request.
-pub(crate) async fn handle_value_pool_flow_history(
+pub(crate) async fn query_value_pool_flow_history(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -125,7 +125,7 @@ pub(crate) async fn handle_value_pool_flow_history(
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowEventsInRange` request.
-pub(crate) async fn handle_value_pool_flow_events_in_range(
+pub(crate) async fn query_value_pool_flow_events_in_range(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -207,7 +207,7 @@ pub(crate) async fn handle_value_pool_flow_events_in_range(
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowSummary` request.
-pub(crate) async fn handle_value_pool_flow_summary(
+pub(crate) async fn query_value_pool_flow_summary(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -261,7 +261,7 @@ pub(crate) async fn handle_value_pool_flow_summary(
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowAmountThresholdSummary` request.
-pub(crate) async fn handle_value_pool_flow_amount_threshold_summary(
+pub(crate) async fn query_value_pool_flow_amount_threshold_summary(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -316,7 +316,7 @@ pub(crate) async fn handle_value_pool_flow_amount_threshold_summary(
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowRoundedAmountSummary` request.
-pub(crate) async fn handle_value_pool_flow_rounded_amount_summary(
+pub(crate) async fn query_value_pool_flow_rounded_amount_summary(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -377,13 +377,13 @@ async fn fetch_current_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<zinder_proto::v1::wallet::ChainEpoch, Status> {
     wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing").into()
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing").into()
         })
 }
 
@@ -1341,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn history_filters_exclude_legacy_coinbase_rows() {
+    fn history_filters_exclude_coinbase_flow_rows() {
         let filter = FlowFilter {
             direction_mask: 0,
             pool_mask: 0,

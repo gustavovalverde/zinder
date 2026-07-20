@@ -1,9 +1,9 @@
-//! Coordination point between the mempool orchestrator and the tip-follow
+//! Coordination point between the live mempool owner and the tip-follow
 //! readiness state machine.
 //!
 //! The writer must finish rebuilding the live `MempoolIndex` before
 //! signalling `ready`. After a writer restart the index is empty until the
-//! orchestrator receives the source's
+//! owner receives the source's
 //! [`MempoolSourceEvent::InitialSnapshotComplete`] control marker. The
 //! streaming backend emits it after its upstream snapshot; the polling
 //! backend emits it after a complete first poll. Opening a stream alone is
@@ -43,7 +43,7 @@ impl MempoolReadyGate {
     }
 }
 
-/// Write-side handle owned by the orchestrator's spawn loop. Cloning is
+/// Write-side handle owned by the live mempool owner's source loop. Cloning is
 /// cheap; every clone shares the same hydration state.
 #[derive(Clone, Debug)]
 pub struct MempoolReadySignal {

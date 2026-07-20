@@ -110,8 +110,8 @@ pub struct BenchBulkCatchupParams {
 
 /// Assembles a [`BulkCatchupRunConfig`] for a fixed-range benchmark replay.
 ///
-/// The returned configuration finalizes the entire captured range in one call
-/// (`upstream_tip_hint` pinned to `to_height`, `allow_near_tip_finalize`
+/// The returned configuration advances the settled tip across the entire captured range in one call
+/// (`upstream_tip_hint` pinned to `to_height`, `allow_reorg_window_settlement`
 /// enabled) because the fixture is immutable history with no live reorg window.
 #[must_use]
 pub fn bench_bulk_catchup_run_config(params: BenchBulkCatchupParams) -> BulkCatchupRunConfig {
@@ -154,7 +154,7 @@ pub fn bench_bulk_catchup_run_config(params: BenchBulkCatchupParams) -> BulkCatc
         ),
         flush_interval_epochs: nz32(BENCH_FLUSH_INTERVAL_EPOCHS),
         upstream_tip_hint: Some(params.to_height),
-        allow_near_tip_finalize: true,
+        allow_reorg_window_settlement: true,
         checkpoint: None,
     }
 }

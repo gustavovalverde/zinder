@@ -10,7 +10,7 @@
 //!
 //! [`ZebraJsonRpcSource::poll_upstream_health`]: crate::ZebraJsonRpcSource
 //! [ADR-0015 §Upstream sync detection]:
-//!     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+//!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
 
 use std::{borrow::Cow, time::Duration};
 

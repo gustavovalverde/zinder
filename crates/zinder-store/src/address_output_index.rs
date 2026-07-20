@@ -295,9 +295,10 @@ pub(crate) struct TransparentUtxoSetAggregate {
 /// count and value sum over the outputs created at or below the chain epoch's
 /// settled tip.
 ///
-/// Rows at heights at or below `settled_tip_height` are the irreversible
-/// unspent set: reorgs cannot reach them, and transparent-retention maintenance has
-/// already deleted finalized spends and reverted creations. The scan therefore
+/// Rows at heights at or below `settled_tip_height` are the settled-tip unspent
+/// set under the configured reorg policy. Transparent-retention maintenance has
+/// already deleted settled spends and reverted creations; a deeper reorg fails
+/// closed. The scan therefore
 /// needs neither a producing-block visibility check nor a spend re-check. Rows
 /// above the settled tip live inside the reorg window and are excluded so the
 /// aggregate cannot count an output a later reorg or spend could remove. The

@@ -16,7 +16,7 @@ use zinder_proto::v1::explorer::{
     TransparentAddressRankingRequest, TransparentAddressRankingResponse,
     TransparentAddressScriptTypeSummary, TransparentScriptType,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::clamp_max_entries;
@@ -29,7 +29,7 @@ const DEFAULT_RANKING_LIMIT: u32 = 100;
 const MAX_RANKING_LIMIT: u32 = 500;
 
 /// Executes one bounded transparent-address ranking read.
-pub(crate) async fn handle_transparent_address_ranking(
+pub(crate) async fn query_transparent_address_ranking(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -49,13 +49,13 @@ pub(crate) async fn handle_transparent_address_ranking(
         )
     })?;
     let chain_epoch = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,

@@ -99,7 +99,7 @@ write_report() {
     ($candidate == "rocksdb-canonical-replay-storage") as $is_rocksdb
     | {
         contract_identity: "benchmark-report",
-        report_format_version: 2,
+        report_format_version: 3,
         measurement_kind: "canonical-replay-storage",
         provenance: {
           benchmark_version: "0.1.0",
@@ -122,8 +122,8 @@ write_report() {
         },
         fixture: {
           contract_identity: "canonical-fixture",
-          fixture_format_version: 1,
-          projection_coupled_oracle_artifact_schema_version: 18,
+          fixture_format_version: 2,
+          canonical_artifact_schema_version: 18,
           canonical_block_facts_digest_evidence: {
             block_digest_version: 1,
             sequence_digest_version: 1,
@@ -142,7 +142,7 @@ write_report() {
         storage_candidate: {
           id: $candidate,
           canonical_engine: (if $is_rocksdb then "rocksdb" else "postgres" end),
-          canonical_model: "block-granular-canonical-replay",
+          canonical_model: "block-granular-canonical-replays",
           diagnostic_projection_engine: null,
           topology: (if $is_rocksdb then "rocksdb-single-host" else "postgres-scale-out" end)
         },
@@ -151,8 +151,8 @@ write_report() {
           block_prepare_concurrency: 16,
           wall_clock_seconds: (if $is_rocksdb then 10 else 8 end),
           storage_initialization_wall_clock_seconds: 0.5,
-          fact_preparation_wall_clock_seconds: 1,
-          fact_persistence_wall_clock_seconds: 2,
+          replay_preparation_wall_clock_seconds: 1,
+          replay_persistence_wall_clock_seconds: 2,
           index_construction_wall_clock_seconds: 1,
           storage_optimization_wall_clock_seconds: 0.5,
           validation_wall_clock_seconds: 1,
@@ -505,12 +505,12 @@ mutate_report \
   'del(.contract_identity)'
 expect_failure "missing report contract identity" "$missing_report_identity_campaign"
 
-old_report_identity_campaign="$scratch_directory/old-report-identity"
-cp -R "$valid_campaign" "$old_report_identity_campaign"
+unrecognized_report_identity_campaign="$scratch_directory/unrecognized-report-identity"
+cp -R "$valid_campaign" "$unrecognized_report_identity_campaign"
 mutate_report \
-  "$old_report_identity_campaign/postgres-canonical-replay-storage-trial-02.json" \
+  "$unrecognized_report_identity_campaign/postgres-canonical-replay-storage-trial-02.json" \
   '.contract_identity = "zinder-benchmark-report"'
-expect_failure "old report contract identity" "$old_report_identity_campaign"
+expect_failure "unrecognized report contract identity" "$unrecognized_report_identity_campaign"
 
 missing_fixture_identity_campaign="$scratch_directory/missing-fixture-identity"
 cp -R "$valid_campaign" "$missing_fixture_identity_campaign"
@@ -519,12 +519,12 @@ mutate_report \
   'del(.fixture.contract_identity)'
 expect_failure "missing fixture contract identity" "$missing_fixture_identity_campaign"
 
-old_fixture_identity_campaign="$scratch_directory/old-fixture-identity"
-cp -R "$valid_campaign" "$old_fixture_identity_campaign"
+unrecognized_fixture_identity_campaign="$scratch_directory/unrecognized-fixture-identity"
+cp -R "$valid_campaign" "$unrecognized_fixture_identity_campaign"
 mutate_report \
-  "$old_fixture_identity_campaign/postgres-canonical-replay-storage-trial-03.json" \
+  "$unrecognized_fixture_identity_campaign/postgres-canonical-replay-storage-trial-03.json" \
   '.fixture.contract_identity = "zinder-bench-fixture-manifest"'
-expect_failure "old fixture contract identity" "$old_fixture_identity_campaign"
+expect_failure "unrecognized fixture contract identity" "$unrecognized_fixture_identity_campaign"
 
 wrong_rocksdb_schema_campaign="$scratch_directory/wrong-rocksdb-schema"
 cp -R "$valid_campaign" "$wrong_rocksdb_schema_campaign"
@@ -695,10 +695,10 @@ mutate_report \
   '.round_trip.blocks_per_second = 99'
 expect_failure "inconsistent throughput" "$wrong_throughput_campaign"
 
-legacy_ledger_campaign="$scratch_directory/legacy-ledger"
-cp -R "$valid_campaign" "$legacy_ledger_campaign"
-printf 'rocksdb_report\tpostgres_report\n' >"$legacy_ledger_campaign/campaign.tsv"
-expect_failure "ledger without resource evidence columns" "$legacy_ledger_campaign"
+missing_resource_evidence_campaign="$scratch_directory/missing-resource-evidence"
+cp -R "$valid_campaign" "$missing_resource_evidence_campaign"
+printf 'rocksdb_report\tpostgres_report\n' >"$missing_resource_evidence_campaign/campaign.tsv"
+expect_failure "ledger without resource evidence columns" "$missing_resource_evidence_campaign"
 
 missing_resource_campaign="$scratch_directory/missing-resource"
 cp -R "$valid_campaign" "$missing_resource_campaign"

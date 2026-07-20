@@ -1,9 +1,10 @@
 # Server-side wallet pattern on Zinder
 
 This page describes the direct librustzcash pattern for a server-side wallet
-that reads chain data from Zinder. It is an implementation reference, not a
-guide for choosing an indexer. See [Integration surfaces](integration-surfaces.md)
-for that choice.
+that reads chain data from a deployment that embeds Zinder's native
+`WalletQuery` adapter. It is an implementation reference, not a guide for
+choosing an indexer. The native adapter is not one of the release runtimes. See
+[Integration surfaces](integration-surfaces.md) for that choice.
 
 There are 2 implementation levels:
 
@@ -18,7 +19,7 @@ There are 2 implementation levels:
 ## Higher-level wallet library seam
 
 Zally's existing interfaces show how a server-side wallet can divide the work.
-`ChainSource` needs safe and visible tips, compact blocks, tree state, subtree
+`ChainSource` needs settled and visible tips, compact blocks, tree state, subtree
 roots, transaction status, transparent UTXOs, and chain events. `Submitter`
 needs transaction broadcast. These methods map to `RemoteChainIndex` and
 `EndpointBackedIndex`, while Zally remains responsible for its SQLite wallet
@@ -60,9 +61,10 @@ flowchart LR
         Proofs[zcash_proofs<br/>proving]:::consumer
     end
 
-    subgraph ZinderSide["Zinder deployment"]
-        Zinder[zinder-query<br/>WalletQuery gRPC]:::indexer
-        Store[(canonical store<br/>RocksDB)]:::indexer
+    subgraph ZinderSide["Custom native Zinder deployment"]
+        Zinder[WalletQuery adapter<br/>using zinder-query]:::indexer
+        Canonical[(canonical store<br/>RocksDB)]:::indexer
+        Wallet[(wallet projection<br/>RocksDB)]:::indexer
     end
 
     Backend -->|compact blocks<br/>tree state<br/>subtree roots| Zinder
@@ -72,7 +74,8 @@ flowchart LR
     Backend --> Sqlite
     Builder --> Proofs
 
-    Zinder --> Store
+    Canonical --> Zinder
+    Wallet --> Zinder
 ```
 
 **Keys never cross the wire to Zinder.** Trial decryption, note management, transaction signing, and proof generation all happen inside the consumer process. Zinder receives only the raw transaction bytes at broadcast time; raw bytes are already in canonical encoded form and reveal no key material.
@@ -92,7 +95,7 @@ The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Cha
 
 `zinder-client` splits the chain-index contract in two so the compiler tells you which calls a handle can serve:
 
-- `ChainIndex` carries the canonical and materialized-view reads. Both `RemoteChainIndex` (a `WalletQuery` gRPC client) and `LocalChainIndex` (a colocated RocksDB-secondary reader) implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
+- `ChainIndex` carries canonical and wallet-projection reads. Both `RemoteChainIndex` (a `WalletQuery` gRPC client) and `LocalChainIndex` (a colocated RocksDB-secondary reader) implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
 - `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
 
 A function that broadcasts or subscribes to chain events bounds its handle `T: ChainIndex + EndpointBackedIndex`; a function that only reads canonical state bounds it `T: ChainIndex`. A `LocalChainIndex` passed where `EndpointBackedIndex` is required fails to compile, so the missing-endpoint case is a build error rather than a runtime error.
@@ -106,7 +109,7 @@ use tokio_stream::StreamExt as _;
 use zinder_client::{
     ChainEventCursor, ChainEventEnvelope, ChainEventStreamFamily, ChainIndex, EndpointBackedIndex,
     EventStreamStart, IndexerError, Network, RawTransactionBytes, RemoteChainIndex,
-    RemoteOpenOptions, TransactionBroadcastResult, TransparentAddressScriptHash,
+    RemoteOpenOptions, TransactionBroadcastOutcome, TransparentAddressScriptHash,
     TransparentAddressUnspentOutputsQuery,
 };
 
@@ -165,7 +168,7 @@ async fn run_server_wallet(endpoint: String) -> Result<(), IndexerError> {
         .load_last_chain_event_cursor()
         .map_or(EventStreamStart::EarliestRetained, EventStreamStart::AfterCursor);
     let mut stream = zinder
-        .chain_events_for_family(start, ChainEventStreamFamily::Tip)
+        .chain_events_for_family(start, ChainEventStreamFamily::Visible)
         .await?;
     while let Some(envelope) = stream.next().await {
         let envelope = envelope?;
@@ -182,7 +185,7 @@ async fn run_server_wallet(endpoint: String) -> Result<(), IndexerError> {
 async fn send_transparent<T: ChainIndex + EndpointBackedIndex>(
     zinder: &T,
     raw_transaction: RawTransactionBytes,
-) -> Result<TransactionBroadcastResult, IndexerError> {
+) -> Result<TransactionBroadcastOutcome, IndexerError> {
     zinder.broadcast_transaction(raw_transaction).await
 }
 ```

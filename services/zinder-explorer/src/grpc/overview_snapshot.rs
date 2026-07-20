@@ -7,7 +7,7 @@
 //! lets per-card freshness diverge: the tile claims height N while the
 //! list shows height N+50 because the calls land on different RPC
 //! windows. This handler instead anchors every sub-field to the same
-//! `WalletQuery.LatestBlock` tip and reads every materialized-view
+//! `WalletQuery.VisibleTipBlock` tip and reads every materialized-view
 //! column-family in one pass, so the response carries one
 //! `ExplorerFreshness`. The `freshness.chain_epoch.tip_hash` is the
 //! bundle's snapshot identity; two responses with the same `tip_hash`
@@ -29,7 +29,7 @@ use zinder_proto::v1::explorer::{
     OverviewSnapshotRequest, OverviewSnapshotResponse, TransactionHistoryEntry,
 };
 use zinder_proto::v1::wallet::{
-    self, ChainValuePoolsAtTipRequest, LatestBlockRequest, MempoolSnapshotRequest,
+    self, ChainValuePoolsAtTipRequest, MempoolSnapshotRequest, VisibleTipBlockRequest,
     wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
@@ -74,7 +74,7 @@ const DEFAULT_FEE_SUMMARY_BLOCK_COUNT: u32 = 50;
 const MAX_MEMPOOL_SNAPSHOT_ENTRIES: u32 = 4_096;
 
 /// Executes one `ExplorerQuery.OverviewSnapshot` request.
-pub(crate) async fn handle_overview_snapshot(
+pub(crate) async fn query_overview_snapshot(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -172,7 +172,7 @@ async fn anchor_to_wallet_tip(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<WalletAnchor, Status> {
     let response = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = response
@@ -180,11 +180,13 @@ async fn anchor_to_wallet_tip(
         .clone()
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let tip_height = response
-        .latest_block
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.latest_block missing"))?
+        .visible_tip_block
+        .ok_or_else(|| {
+            ExplorerError::internal("VisibleTipBlockResponse.visible_tip_block missing")
+        })?
         .height;
     Ok(WalletAnchor {
         chain_epoch,
@@ -308,15 +310,12 @@ fn read_mempool_event_counts(
     let mut added_count: u32 = 0;
     let mut mined_count: u32 = 0;
     let mut invalidated_count: u32 = 0;
-    let mut suppressed_count: u32 = 0;
     for (_, payload) in entries {
-        if let Some((added, mined, invalidated, suppressed)) =
-            MempoolEventCountsConsumer::decode_row(&payload)
+        if let Some((added, mined, invalidated)) = MempoolEventCountsConsumer::decode_row(&payload)
         {
             added_count = added_count.saturating_add(added);
             mined_count = mined_count.saturating_add(mined);
             invalidated_count = invalidated_count.saturating_add(invalidated);
-            suppressed_count = suppressed_count.saturating_add(suppressed);
         }
     }
     Ok(OverviewMempoolEvents {
@@ -324,7 +323,6 @@ fn read_mempool_event_counts(
         added_count,
         mined_count,
         invalidated_count,
-        suppressed_count,
     })
 }
 
@@ -334,8 +332,8 @@ async fn aggregate_mempool_summary(
     // Best-effort: if the wallet's MempoolSnapshot is wired off (e.g.
     // the ingest-control proxy is not configured) the bundle still
     // returns with zero mempool counts rather than failing the entire
-    // overview. Surfacing "tried but could not observe" via
-    // `freshness.unavailable` is a v2 follow-up.
+    // overview. The response model has no unavailable marker, so this path
+    // returns the default mempool summary.
     let snapshot = match wallet_client
         .mempool_snapshot(Request::new(MempoolSnapshotRequest {
             max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES,

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use zinder_core::{
     BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
     BroadcastRejected, BroadcastRejectionReason, MAX_RAW_TRANSACTION_BYTES, Network,
-    RawTransactionBytes, TransactionBroadcastResult, TransactionId,
+    RawTransactionBytes, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
 use zinder_source::SourceError;
@@ -27,13 +27,13 @@ async fn broadcast_transaction_returns_accepted_result() -> eyre::Result<()> {
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let broadcast_result = wallet_query
+    let broadcast_outcome = wallet_query
         .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
         .await?;
 
     assert_eq!(
-        broadcast_result,
-        TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id })
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id })
     );
     assert_eq!(
         mock_broadcaster.captured_calls(),
@@ -46,42 +46,42 @@ async fn broadcast_transaction_returns_accepted_result() -> eyre::Result<()> {
 #[tokio::test]
 async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()> {
     let cases = [
-        TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {
+        TransactionBroadcastOutcome::InvalidEncoding(BroadcastInvalidEncoding {
             error_code: Some(-22),
             message: "TX decode failed".to_owned(),
         }),
-        TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
+        TransactionBroadcastOutcome::Duplicate(BroadcastDuplicate {
             error_code: Some(-27),
             message: "transaction already in mempool".to_owned(),
         }),
-        TransactionBroadcastResult::Queued(BroadcastQueued {
+        TransactionBroadcastOutcome::Queued(BroadcastQueued {
             message: "already queued for download".to_owned(),
         }),
-        TransactionBroadcastResult::Rejected(BroadcastRejected {
+        TransactionBroadcastOutcome::Rejected(BroadcastRejected {
             kind: BroadcastRejectionReason::InvalidSignature,
             error_code: Some(-25),
             message: "transaction signature is invalid".to_owned(),
         }),
-        TransactionBroadcastResult::Rejected(BroadcastRejected {
+        TransactionBroadcastOutcome::Rejected(BroadcastRejected {
             kind: BroadcastRejectionReason::Unknown,
             error_code: Some(-25),
             message: "bad-txns-invalid".to_owned(),
         }),
     ];
 
-    for expected_broadcast_result in cases {
+    for expected_broadcast_outcome in cases {
         let store_fixture = StoreFixture::open()?;
         let wallet_query = WalletQuery::new(
             store_fixture.chain_store().clone(),
-            MockTransactionBroadcaster::returning(expected_broadcast_result.clone()),
+            MockTransactionBroadcaster::returning(expected_broadcast_outcome.clone()),
             Arc::new(sample_regtest_upgrade_activations()),
         );
 
-        let broadcast_result = wallet_query
+        let broadcast_outcome = wallet_query
             .broadcast_transaction(RawTransactionBytes::new([0x02]))
             .await?;
 
-        assert_eq!(broadcast_result, expected_broadcast_result);
+        assert_eq!(broadcast_outcome, expected_broadcast_outcome);
     }
 
     Ok(())
@@ -100,8 +100,8 @@ async fn broadcast_transaction_rejects_oversized_payload_before_upstream_call() 
     let oversized = RawTransactionBytes::new(vec![0u8; MAX_RAW_TRANSACTION_BYTES + 1]);
 
     let error = match wallet_query.broadcast_transaction(oversized).await {
-        Ok(broadcast_result) => {
-            return Err(eyre!("expected size error, got {broadcast_result:?}"));
+        Ok(broadcast_outcome) => {
+            return Err(eyre!("expected size error, got {broadcast_outcome:?}"));
         }
         Err(error) => error,
     };
@@ -131,11 +131,11 @@ async fn broadcast_transaction_admits_payload_at_size_bound() -> eyre::Result<()
     );
     let at_bound = RawTransactionBytes::new(vec![0u8; MAX_RAW_TRANSACTION_BYTES]);
 
-    let broadcast_result = wallet_query.broadcast_transaction(at_bound.clone()).await?;
+    let broadcast_outcome = wallet_query.broadcast_transaction(at_bound.clone()).await?;
 
     assert_eq!(
-        broadcast_result,
-        TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id })
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id })
     );
     assert_eq!(mock_broadcaster.captured_calls(), vec![at_bound]);
 
@@ -155,8 +155,8 @@ async fn broadcast_transaction_maps_node_unavailability_to_query_error() -> eyre
         .broadcast_transaction(RawTransactionBytes::new([0x03]))
         .await
     {
-        Ok(broadcast_result) => {
-            return Err(eyre!("expected node error, got {broadcast_result:?}"));
+        Ok(broadcast_outcome) => {
+            return Err(eyre!("expected node error, got {broadcast_outcome:?}"));
         }
         Err(error) => error,
     };
@@ -185,14 +185,14 @@ async fn broadcast_transaction_does_not_mutate_chain_epoch() -> eyre::Result<()>
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let broadcast_result = wallet_query
+    let broadcast_outcome = wallet_query
         .broadcast_transaction(RawTransactionBytes::new([0x04]))
         .await?;
     let reader = store.current_chain_epoch_reader()?;
 
     assert_eq!(
-        broadcast_result,
-        TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id })
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id })
     );
     assert_eq!(store.current_chain_epoch()?, Some(chain_epoch));
     assert!(reader.transaction_facts_by_id(transaction_id)?.is_none());
@@ -213,8 +213,8 @@ async fn read_only_wallet_query_reports_broadcast_disabled() -> eyre::Result<()>
         .broadcast_transaction(RawTransactionBytes::new([0x05]))
         .await
     {
-        Ok(broadcast_result) => {
-            return Err(eyre!("expected disabled error, got {broadcast_result:?}"));
+        Ok(broadcast_outcome) => {
+            return Err(eyre!("expected disabled error, got {broadcast_outcome:?}"));
         }
         Err(error) => error,
     };

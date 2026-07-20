@@ -3,8 +3,8 @@
 This runbook covers the supported single-host wallet-serving topology. The
 canonical writer constructs and publishes canonical RocksDB, the projector
 builds wallet RocksDB from an authenticated canonical fence, and the
-lightwalletd adapter begins serving only after both secondary readers form an
-exact pair.
+lightwalletd adapter begins serving only after both secondary readers form a
+wallet-serving pair.
 
 There is no in-place migration from an incompatible store identity or schema.
 Use empty target paths or a certified coherent restore bundle.
@@ -85,7 +85,7 @@ Restarting projector is safe. Lease generation, build state, source identity,
 and ready evidence are persisted. A second projector using the same wallet path
 must fail lease or writer admission rather than run concurrently.
 
-## Exact-pair serving
+## Wallet-serving admission
 
 Compatibility maintains generation-specific canonical and wallet secondaries.
 It catches both up, validates source identity and event position, and publishes
@@ -139,7 +139,7 @@ Readers remain unready until their owner and secondary contracts recover. Do
 not replace this with manual directory copies or primary-read shortcuts.
 
 For disaster recovery, restore a coherent canonical and wallet state bundle
-into fresh paths and require cold owner admission plus normal exact-pair
+into fresh paths and require cold owner admission plus normal wallet-serving
 admission. Independently timed RocksDB copies are not a wallet-serving backup.
 
 ## Production acceptance

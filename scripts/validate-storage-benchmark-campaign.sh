@@ -82,8 +82,8 @@ validate_report() {
       <= ([($actual | absolute), ($expected | absolute), 1] | max) * 0.000000001;
     def attributed_seconds:
       .round_trip.storage_initialization_wall_clock_seconds
-      + .round_trip.fact_preparation_wall_clock_seconds
-      + .round_trip.fact_persistence_wall_clock_seconds
+      + .round_trip.replay_preparation_wall_clock_seconds
+      + .round_trip.replay_persistence_wall_clock_seconds
       + .round_trip.index_construction_wall_clock_seconds
       + .round_trip.storage_optimization_wall_clock_seconds
       + .round_trip.validation_wall_clock_seconds
@@ -95,11 +95,11 @@ validate_report() {
       and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
       and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
     .contract_identity == "benchmark-report"
-    and .report_format_version == 2
+    and .report_format_version == 3
     and .measurement_kind == "canonical-replay-storage"
     and .storage_candidate.id == $candidate
     and .storage_candidate.canonical_engine == $engine
-    and .storage_candidate.canonical_model == "block-granular-canonical-replay"
+    and .storage_candidate.canonical_model == "block-granular-canonical-replays"
     and .storage_candidate.diagnostic_projection_engine == null
     and .storage_candidate.topology == $topology
     and .round_trip.scope == "block-local-canonical-replay"
@@ -107,8 +107,8 @@ validate_report() {
     and .round_trip.replay_format_version == 1
     and .round_trip.semantic_replay_validated == true
     and .fixture.contract_identity == "canonical-fixture"
-    and .fixture.fixture_format_version == 1
-    and (.fixture.projection_coupled_oracle_artifact_schema_version > 0)
+    and .fixture.fixture_format_version == 2
+    and (.fixture.canonical_artifact_schema_version > 0)
     and (.fixture.digest_sha256 | lowercase_sha256)
     and .fixture.canonical_block_facts_digest_evidence.block_digest_version == 1
     and .fixture.canonical_block_facts_digest_evidence.sequence_digest_version == 1
@@ -142,8 +142,8 @@ validate_report() {
       (.round_trip.block_count / .round_trip.wall_clock_seconds)
     )
     and (.round_trip.storage_initialization_wall_clock_seconds | nonnegative_number)
-    and (.round_trip.fact_preparation_wall_clock_seconds | nonnegative_number)
-    and (.round_trip.fact_persistence_wall_clock_seconds | nonnegative_number)
+    and (.round_trip.replay_preparation_wall_clock_seconds | nonnegative_number)
+    and (.round_trip.replay_persistence_wall_clock_seconds | nonnegative_number)
     and (.round_trip.index_construction_wall_clock_seconds | nonnegative_number)
     and (.round_trip.storage_optimization_wall_clock_seconds | nonnegative_number)
     and (.round_trip.validation_wall_clock_seconds | nonnegative_number)

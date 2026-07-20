@@ -284,7 +284,7 @@ pub enum CanonicalStoreBuildPlanError {
     /// A complete build must start before every shielded-pool frontier.
     #[error("complete history predecessor commitment-tree frontiers must all be absent")]
     CompleteHistoryHasFrontiers,
-    /// One predecessor frontier exceeds the exact version-1 store-control bound.
+    /// One predecessor frontier exceeds the exact canonical store-control bound.
     #[error(
         "canonical build {protocol:?} predecessor frontier is {encoded_bytes} bytes; maximum is 1090"
     )]
@@ -489,7 +489,7 @@ pub struct CanonicalStoreReadyEvidence {
     /// Ordered digest of the complete visible fact sequence.
     pub visible_sequence_digest: [u8; 32],
     /// Total semantic replay-envelope bytes through `visible_tip`.
-    pub visible_logical_block_facts_bytes: u64,
+    pub visible_logical_replay_bytes: u64,
     /// Resumable authenticated replay prefix through the settled tip.
     pub sequence_checkpoint: CanonicalSequenceCheckpoint,
     /// Exact version of the immutable construction manifest that certified the

@@ -21,7 +21,7 @@ use zinder_store::{
     RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
-    ProjectionBuildLeaseRequest, ProjectionBuildOwner, WalletCanonicalSourceIdentity,
+    WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
     WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
@@ -170,7 +170,6 @@ async fn run_projector(cli: Cli) -> Result<(), ProjectorError> {
     let config_path = cli.config_path.clone();
     let config = config::load_projector_config(config_path, cli.into())?;
     let readiness = Readiness::default();
-    readiness.set_projection_workload("wallet", vec!["wallet".to_owned()]);
     let ops_handle = config.ops_listen_addr.map(|listen_addr| {
         spawn_ops_endpoint(
             listen_addr,
@@ -329,8 +328,8 @@ async fn run_owned_projector(
     );
     let canonical_lease = canonical_control.acquire(canonical_lease).await?;
     let canonical_lease_for_recovery = canonical_lease.clone();
-    let wallet_lease_request = ProjectionBuildLeaseRequest::new(
-        ProjectionBuildOwner::from_bytes(config.build_owner),
+    let wallet_lease_request = WalletProjectionBuildLeaseRequest::new(
+        WalletProjectionBuildOwner::from_bytes(config.build_owner),
         expected_wallet_source,
         WalletProjectionRetainedEventAnchor::new(canonical_ready.visible_event_sequence),
         initial_expiry,
@@ -357,7 +356,7 @@ async fn run_owned_projector(
         let mut canonical_control = canonical_control;
         let mut canonical_lease = canonical_lease;
         let mut heartbeat =
-            |phase, wallet_lease: zinder_wallet_projection::ProjectionBuildLease| {
+            |phase, wallet_lease: zinder_wallet_projection::WalletProjectionBuildLease| {
                 if build_cancel.is_cancelled() {
                     return Err(
                         zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled,
@@ -562,7 +561,7 @@ async fn run_continuous_wallet_following(
                 wallet_source.source_position().tip.height.value(),
             )));
             if let Some(command) = control.next_command_or_poll(&cancel).await? {
-                handle_projector_control_command(
+                apply_projector_control_command(
                     config,
                     readiness,
                     target_fence,
@@ -628,7 +627,7 @@ async fn run_continuous_wallet_following(
             config.lease_duration,
         )
         .await?;
-        let Some(reconciled_source) = execute_next_wallet_transition(
+        let Some(reconciled_source) = apply_next_wallet_transition(
             &mut wallet,
             &canonical,
             wallet_source,
@@ -738,7 +737,7 @@ impl ProjectorControlTasks {
     clippy::too_many_arguments,
     reason = "the wallet-owner command boundary keeps capture state and its sole mutable owners explicit"
 )]
-async fn handle_projector_control_command(
+async fn apply_projector_control_command(
     config: &config::ProjectorConfig,
     readiness: &Readiness,
     expected_fence: CanonicalEventFence,
@@ -983,7 +982,7 @@ async fn bootstrap_resumed_wallet_following(
             config.lease_duration,
         )
         .await?;
-        let Some(reconciled_source) = execute_next_wallet_transition(
+        let Some(reconciled_source) = apply_next_wallet_transition(
             &mut wallet,
             &canonical,
             wallet_source,
@@ -1059,7 +1058,7 @@ fn set_following_syncing(
     ));
 }
 
-/// Executes one earliest-safe retained-event unit.
+/// Executes one next retained-event transition.
 ///
 /// Append-only lag progresses one event at a time. Only a run whose
 /// intermediate results were overwritten by a later reorg becomes one direct
@@ -1068,7 +1067,7 @@ fn set_following_syncing(
     clippy::too_many_arguments,
     reason = "the transition execution keeps its source, replay, byte budget, and cancellation fence explicit"
 )]
-fn execute_next_wallet_transition(
+fn apply_next_wallet_transition(
     wallet: &mut RocksDbWalletFollowingStore,
     canonical: &RocksDbCanonicalSecondary,
     wallet_source: WalletCanonicalSourceIdentity,

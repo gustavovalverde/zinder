@@ -17,7 +17,9 @@ use zinder_proto::v1::explorer::{
     ConventionalFeeDistributionRequest, ConventionalFeeDistributionResponse,
     ConventionalFeeFrequency,
 };
-use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{
+    self, VisibleTipBlockRequest, wallet_query_client::WalletQueryClient,
+};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
@@ -26,7 +28,7 @@ use super::freshness::{
 };
 
 /// Executes one `ExplorerQuery.ConventionalFeeDistribution` request.
-pub(crate) async fn handle_conventional_fee_distribution(
+pub(crate) async fn query_conventional_fee_distribution(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -48,7 +50,7 @@ pub(crate) async fn handle_conventional_fee_distribution(
         .map_err(|error| ExplorerError::internal(error.to_string()))?
         .ok_or_else(|| {
             ExplorerError::not_materialized(
-                "conventional-fee distribution has no materialized projection coverage",
+                "conventional-fee distribution has no materialized-view coverage",
             )
         })?;
     let (chain_epoch, visible_tip_height) = fetch_current_chain_epoch(wallet_client).await?;
@@ -89,13 +91,13 @@ async fn fetch_current_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<(wallet::ChainEpoch, u32), Status> {
     let chain_epoch = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let visible_tip_height = chain_epoch
         .visible_tip

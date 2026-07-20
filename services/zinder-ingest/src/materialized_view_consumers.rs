@@ -1,8 +1,10 @@
 //! In-process materialized-view consumer dispatch driven by canonical chain events.
 //!
-//! `zinder-ingest` opens the materialized-view store as a primary, tails durable
-//! canonical chain events, hydrates each event's committed block contexts,
-//! and hands those contexts to [`zinder_materialized_views::MaterializedViewStore::write_chain_event`].
+//! This reusable library composition opens a materialized-view store as a
+//! primary, tails durable canonical chain events, hydrates each event's
+//! committed block contexts, and hands those contexts to
+//! [`zinder_materialized_views::MaterializedViewStore::write_chain_event`].
+//! The `zinder-ingest` executable does not start this composition.
 //! Consumer writes and cursor advances land in one materialized-view write batch
 //! per chain epoch.
 //!
@@ -30,13 +32,13 @@ use zinder_core::{
 };
 use zinder_materialized_views::{
     BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext,
-    BlockCommitPayload, BlockProductionTimeConsumer, BlockSummaryConsumer,
+    BlockCommitInput, BlockProductionTimeConsumer, BlockSummaryConsumer,
     COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
-    ChainEventDispatchInputs, CommitmentRootSearchConsumer, ConsumerProjectionState,
-    ConventionalFeeDistributionConsumer, IronwoodMigrationConsumer, MaterializedViewConsumerName,
-    MaterializedViewStore, MaterializedViewStoreOptions, PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
-    PaidFeeDistributionConsumer, ProjectionPreset, ProjectionWriteMeasurement,
-    RecentTransactionsConsumer, ReorgIncidentsConsumer,
+    ChainEventDispatchInputs, CommitmentRootSearchConsumer, ConventionalFeeDistributionConsumer,
+    IronwoodMigrationConsumer, MaterializedViewConsumerName, MaterializedViewPreset,
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreOptions,
+    MaterializedViewWriteMeasurement, PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
+    PaidFeeDistributionConsumer, RecentTransactionsConsumer, ReorgIncidentsConsumer,
     TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
     TransactionComponentSummaryConsumer, TransactionFeesConsumer, TransactionHistoryConsumer,
@@ -67,11 +69,11 @@ const MATERIALIZED_VIEW_REPLAY_STAGE_BUILD_BLOCK_CONTEXTS: &str = "build_block_c
 const MATERIALIZED_VIEW_REPLAY_STAGE_READ_TRANSPARENT_SPEND_FACTS: &str =
     "read_transparent_spend_facts";
 const MATERIALIZED_VIEW_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
-const PROJECTION_WRITE_SOURCE_CHAIN_EVENT: &str = "chain_event";
-static MATERIALIZED_VIEW_PROJECTION_WRITE_LOCK: Mutex<()> = parking_lot::const_mutex(());
+const MATERIALIZED_VIEW_WRITE_SOURCE_CHAIN_EVENT: &str = "chain_event";
+static MATERIALIZED_VIEW_WRITE_LOCK: Mutex<()> = parking_lot::const_mutex(());
 
-pub(crate) fn materialized_view_projection_write_guard() -> MutexGuard<'static, ()> {
-    MATERIALIZED_VIEW_PROJECTION_WRITE_LOCK.lock()
+pub(crate) fn materialized_view_write_guard() -> MutexGuard<'static, ()> {
+    MATERIALIZED_VIEW_WRITE_LOCK.lock()
 }
 
 /// Default poll cadence for the materialized-view tailer when the canonical store is
@@ -99,16 +101,16 @@ const RETENTION_RELEASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Internal cap on variable fan-out rows one materialized-view replay chunk should stage.
 ///
-/// `replay_batch_blocks` bounds block count, but transaction projections and
+/// `replay_batch_blocks` bounds block count, but transaction-derived rows and
 /// `transparent_address_transaction_history` scale with transaction/address
 /// fan-out. This cap keeps one materialized-view write batch from growing with a dense
 /// multi-block event. A single dense block is still admitted because replay
 /// cannot split below the block boundary.
-const MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK: usize = 50_000;
+const MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_ROWS_PER_CHUNK: usize = 50_000;
 
 /// Maximum blocks whose transaction facts one materialized-view hydration read may hold.
 ///
-/// The projection-row cap is evaluated only after transaction facts are
+/// The variable-row cap is evaluated only after transaction facts are
 /// decoded. Reading every configured replay block before applying that cap
 /// lets a dense historical span retain far more decoded facts than the chunk
 /// will dispatch. This independent prefetch bound limits that unavoidable
@@ -120,9 +122,9 @@ fn bounded_facts_read_groups<T>(staged_blocks: &[T]) -> std::slice::Chunks<'_, T
 }
 
 /// Read-ahead keeps at most one extra hydrated batch in memory, and only when
-/// the current batch is comfortably below the projection-row cap.
-const MATERIALIZED_VIEW_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS: usize =
-    MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK / 2;
+/// the current batch is comfortably below the variable-row cap.
+const MATERIALIZED_VIEW_REPLAY_READ_AHEAD_VARIABLE_ROWS: usize =
+    MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_ROWS_PER_CHUNK / 2;
 
 // Variant order is throttle severity; `Ord` picks the stricter state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -158,7 +160,7 @@ struct EffectiveMaterializedViewReplayLimits {
 /// Returns whether the current ingest phase gives the storage budget
 /// exclusively to canonical work by pausing materialized-view replay.
 ///
-/// Replay fails closed until the unified loop has positively classified
+/// Replay fails closed until the ingest loop has positively classified
 /// [`IngestPhase::FollowingTip`]. This prevents startup and upstream-wait
 /// windows from admitting materialized-view work before canonical ownership is known.
 const fn phase_engages_replay_gate(phase: Option<IngestPhase>) -> bool {
@@ -166,12 +168,12 @@ const fn phase_engages_replay_gate(phase: Option<IngestPhase>) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct MaterializedViewReplayProjectionRows {
+struct MaterializedViewReplayVariableRowCounts {
     transaction_rows: usize,
     transparent_address_transaction_history: usize,
 }
 
-impl MaterializedViewReplayProjectionRows {
+impl MaterializedViewReplayVariableRowCounts {
     const fn is_empty(self) -> bool {
         self.transaction_rows == 0 && self.transparent_address_transaction_history == 0
     }
@@ -191,10 +193,10 @@ impl MaterializedViewReplayProjectionRows {
     }
 }
 
-fn projection_rows_for_transactions(
+fn variable_row_counts_for_transactions(
     transactions: &[TransactionFactsArtifact],
-) -> MaterializedViewReplayProjectionRows {
-    MaterializedViewReplayProjectionRows {
+) -> MaterializedViewReplayVariableRowCounts {
+    MaterializedViewReplayVariableRowCounts {
         transaction_rows: RecentTransactionsConsumer::projected_row_count_for_transactions(
             transactions,
         )
@@ -208,13 +210,13 @@ fn projection_rows_for_transactions(
     }
 }
 
-fn should_start_new_projection_chunk(
-    current_rows: MaterializedViewReplayProjectionRows,
-    next_block_rows: MaterializedViewReplayProjectionRows,
+fn should_start_new_replay_chunk(
+    current_rows: MaterializedViewReplayVariableRowCounts,
+    next_block_rows: MaterializedViewReplayVariableRowCounts,
 ) -> bool {
     !current_rows.is_empty()
         && current_rows.saturating_add(next_block_rows).total()
-            > MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
+            > MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_ROWS_PER_CHUNK
 }
 
 #[derive(Clone, Debug)]
@@ -223,7 +225,7 @@ struct MaterializedViewReplayBudget {
     memory_state: MaterializedViewReplayBudgetState,
     applied_state: MaterializedViewReplayBudgetState,
     /// Live source of the ingest loop phase for the canonical-phase gate; the
-    /// unified ingest loop stamps [`IngestPhase`] on this shared handle every
+    /// phase-driven ingest loop stamps [`IngestPhase`] on this shared handle every
     /// iteration.
     phase_gate: Option<Readiness>,
     /// Point at which the current pass stops draining and returns. The tailer
@@ -370,7 +372,7 @@ fn next_memory_budget_state(
 ///
 /// The gate pauses materialized-view replay during canonical bulk catch-up for every
 /// policy, so `continuous` keeps its meaning only as an at-tip override.
-/// Rebuildable projections resume once canonical ingest enters tip follow.
+/// Rebuildable materialized views resume once canonical ingest enters tip follow.
 fn compose_replay_state(
     config: MaterializedViewReplayConfig,
     memory_state: MaterializedViewReplayBudgetState,
@@ -417,28 +419,27 @@ fn effective_replay_batch_blocks(
     }
 }
 
-/// Opens the ingest-owned materialized-view store primary for a canonical store path.
+/// Opens the replay-host-owned materialized-view store for a canonical store path.
 pub fn open_primary_materialized_view_store_for_canonical(
     canonical_path: &Path,
     rocksdb_resource_budget: RocksDbResourceBudget,
 ) -> Result<MaterializedViewStore, zinder_materialized_views::MaterializedViewStoreError> {
-    open_primary_materialized_view_store_for_canonical_with_projection_preset(
+    open_primary_materialized_view_store_for_canonical_with_materialized_view_preset(
         canonical_path,
         rocksdb_resource_budget,
-        ProjectionPreset::Explorer,
+        MaterializedViewPreset::Explorer,
     )
 }
 
-/// Opens the ingest-owned materialized-view store primary with one closed projection
-/// preset.
-pub fn open_primary_materialized_view_store_for_canonical_with_projection_preset(
+/// Opens the replay-host-owned materialized-view store with one closed preset.
+pub fn open_primary_materialized_view_store_for_canonical_with_materialized_view_preset(
     canonical_path: &Path,
     rocksdb_resource_budget: RocksDbResourceBudget,
-    projection_preset: ProjectionPreset,
+    materialized_view_preset: MaterializedViewPreset,
 ) -> Result<MaterializedViewStore, zinder_materialized_views::MaterializedViewStoreError> {
-    MaterializedViewStore::open_with_projection_preset(
+    MaterializedViewStore::open_with_materialized_view_preset(
         MaterializedViewStore::path_for_canonical(canonical_path),
-        projection_preset,
+        materialized_view_preset,
         MaterializedViewStoreOptions {
             sync_writes: false,
             rocksdb_resource_budget,
@@ -554,7 +555,7 @@ fn seed_block_production_time_cursor(
         );
     }
     if materialized_view_store
-        .consumer_projection_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)?
+        .consumer_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)?
         .is_none()
     {
         let chain_epoch = chain_store.current_chain_epoch()?.ok_or_else(|| {
@@ -563,7 +564,7 @@ fn seed_block_production_time_cursor(
                     .to_owned(),
             )
         })?;
-        let projection_tip_hash = chain_store
+        let tip_hash = chain_store
             .chain_epoch_reader_at(chain_epoch.id)?
             .block_header_at(authoritative_height)?
             .ok_or_else(|| {
@@ -573,12 +574,12 @@ fn seed_block_production_time_cursor(
                 ))
             })?
             .block_hash;
-        materialized_view_store.put_consumer_projection_state(
+        materialized_view_store.put_consumer_state(
             BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
-            ConsumerProjectionState {
-                projection_epoch_id: chain_epoch.id,
-                projection_tip_height: authoritative_height,
-                projection_tip_hash,
+            MaterializedViewState {
+                chain_epoch_id: chain_epoch.id,
+                tip_height: authoritative_height,
+                tip_hash,
                 revision: 1,
                 coverage: None,
             },
@@ -771,23 +772,15 @@ fn seed_transaction_component_cursor(
 pub(crate) fn backfill_consumer_tail_boundary(
     settled_tip_height: BlockHeight,
     authoritative_height: BlockHeight,
-    projection: &str,
+    consumer: &str,
 ) -> Result<BlockHeight, IngestError> {
     BlockHeight::new(settled_tip_height.value().min(authoritative_height.value()))
         .next()
         .ok_or_else(|| {
             IngestError::MaterializedViewDispatch(format!(
-                "{projection} live-tail boundary height overflow"
+                "{consumer} live-tail boundary height overflow"
             ))
         })
-}
-
-/// Compatibility wrapper for callers using the original root-specific API.
-pub fn seed_commitment_root_search_cursor_for_backfill(
-    chain_store: &PrimaryChainStore,
-    materialized_view_store: &MaterializedViewStore,
-) -> Result<(), IngestError> {
-    seed_backfill_owned_consumer_cursors(chain_store, materialized_view_store)
 }
 
 /// Spawns the ingest-owned chain-event tailer for materialized-view consumers.
@@ -1081,7 +1074,7 @@ impl MaterializedViewCatchUpBound {
     }
 
     /// Returns whether the catch-up has drained enough to hand off given a
-    /// selected projection head already known from the in-flight replay,
+    /// selected consumer head already known from the in-flight replay,
     /// sparing a store read.
     fn handoff_reached_at(self, replayed_through: BlockHeight) -> bool {
         let Self::Handoff {
@@ -1110,7 +1103,7 @@ fn lag_within(
 }
 
 /// Replays retained canonical chain events that have not reached the
-/// ingest-owned materialized-view store.
+/// replay-host-owned materialized-view store.
 ///
 /// The canonical store commits before the materialized-view store because they are
 /// separate `RocksDB` instances. Persisting the canonical chain-event
@@ -1286,11 +1279,11 @@ fn maybe_publish_retention_release_floor(
 /// Publishes verified contiguous transparent-outpoint-spend coverage as the
 /// canonical retention release floor.
 ///
-/// The settled-tip sweep releases a spend fact only once this projection has
+/// The settled-tip sweep releases a spend fact only once this consumer has
 /// durably recorded its spender identity, so the canonical store never deletes
-/// a fact the projection cannot yet resolve. The materialized-view write-ahead log is
+/// a fact the consumer cannot yet resolve. The materialized-view write-ahead log is
 /// fsynced before the floor is published: the materialized-view store writes unsynced, so
-/// without this a host crash could lose projection rows the floor already
+/// without this a host crash could lose materialized-view rows the floor already
 /// authorized the canonical sweep to delete. Best-effort: a failure is logged,
 /// never fatal, because the sweep clamps to the last published floor and a
 /// missed update only defers a sweep by one cycle.
@@ -1307,20 +1300,19 @@ fn publish_retention_release_floor(
         );
         return;
     }
-    let projection_state = match materialized_view_store
-        .consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
-    {
-        Ok(projection_state) => projection_state,
-        Err(error) => {
-            tracing::warn!(
-                target: "zinder::ingest",
-                event = "retention_release_floor_read_failed",
-                error = %error,
-                "failed to read verified transparent-outpoint-spend coverage",
-            );
-            return;
-        }
-    };
+    let consumer_state =
+        match materialized_view_store.consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME) {
+            Ok(consumer_state) => consumer_state,
+            Err(error) => {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "retention_release_floor_read_failed",
+                    error = %error,
+                    "failed to read verified transparent-outpoint-spend coverage",
+                );
+                return;
+            }
+        };
     let history_bounds = match chain_store.canonical_history_bounds() {
         Ok(history_bounds) => history_bounds,
         Err(error) => {
@@ -1333,10 +1325,10 @@ fn publish_retention_release_floor(
             return;
         }
     };
-    let (Some(projection_state), Some(history_bounds)) = (projection_state, history_bounds) else {
+    let (Some(consumer_state), Some(history_bounds)) = (consumer_state, history_bounds) else {
         return;
     };
-    let Some(coverage) = projection_state.coverage else {
+    let Some(coverage) = consumer_state.coverage else {
         return;
     };
     if coverage.complete_from_height > history_bounds.first_available_height() {
@@ -1506,17 +1498,13 @@ fn spawn_prepare_committed_block_replay_batch(
             effective_limits,
         ))
         .await?;
-        let finalized = replay_batch.block_range.end <= envelope.settled_tip_height;
-        let contexts = build_contexts_for_replay_batch(
-            &chain_store,
-            &envelope,
-            replay_batch.blocks,
-            finalized,
-        )
-        .await?;
+        let settled = replay_batch.block_range.end <= envelope.settled_tip_height;
+        let contexts =
+            build_contexts_for_replay_batch(&chain_store, &envelope, replay_batch.blocks, settled)
+                .await?;
         Ok(PreparedReplayBatch {
             block_range: replay_batch.block_range,
-            projection_rows: replay_batch.projection_rows,
+            variable_row_counts: replay_batch.variable_row_counts,
             contexts,
         })
     })
@@ -1524,10 +1512,10 @@ fn spawn_prepare_committed_block_replay_batch(
 
 fn should_read_ahead_materialized_view_replay(
     effective_limits: EffectiveMaterializedViewReplayLimits,
-    projection_rows: MaterializedViewReplayProjectionRows,
+    variable_row_counts: MaterializedViewReplayVariableRowCounts,
 ) -> bool {
     effective_limits.state == MaterializedViewReplayBudgetState::Normal
-        && projection_rows.total() <= MATERIALIZED_VIEW_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS
+        && variable_row_counts.total() <= MATERIALIZED_VIEW_REPLAY_READ_AHEAD_VARIABLE_ROWS
 }
 
 async fn replay_committed_event_to_materialized_views_in_batches(
@@ -1574,7 +1562,7 @@ async fn replay_committed_event_to_materialized_views_in_batches(
             chain_store,
             replay_budget,
             envelope: &envelope,
-            projection_rows: prepared_batch.projection_rows,
+            variable_row_counts: prepared_batch.variable_row_counts,
             following_height,
             committed_end: committed_range.end,
             final_chunk,
@@ -1702,13 +1690,14 @@ fn maybe_spawn_read_ahead_replay_batch(
         chain_store,
         replay_budget,
         envelope,
-        projection_rows,
+        variable_row_counts,
         following_height,
         committed_end,
         final_chunk,
         effective_limits,
     } = inputs;
-    if final_chunk || !should_read_ahead_materialized_view_replay(effective_limits, projection_rows)
+    if final_chunk
+        || !should_read_ahead_materialized_view_replay(effective_limits, variable_row_counts)
     {
         return None;
     }
@@ -1729,14 +1718,14 @@ async fn build_contexts_for_replay_batch(
     chain_store: &PrimaryChainStore,
     envelope: &ChainEventEnvelope,
     replay_blocks: Vec<CanonicalReplayBlock>,
-    finalized: bool,
+    settled: bool,
 ) -> Result<HashMap<BlockHeight, Arc<BlockCommitContext>>, IngestError> {
     let resolve_started_at = Instant::now();
     let contexts_outcome = build_block_contexts_from_committed_event(
         chain_store,
         envelope.chain_epoch.id,
         replay_blocks,
-        finalized,
+        settled,
     )
     .await;
     record_materialized_view_replay_stage(
@@ -1765,7 +1754,7 @@ fn record_committed_replay_progress(
     replayed_height: BlockHeight,
 ) -> Result<(), IngestError> {
     if let Some(tip_height) = record_current_materialized_view_replay_tip(chain_store)? {
-        record_materialized_view_replay_progress(
+        record_materialized_view_store_replay_progress(
             materialized_view_store,
             replayed_height,
             tip_height,
@@ -1828,7 +1817,7 @@ async fn replay_reorg_event_to_materialized_views(
 
     let resolve_started_at = Instant::now();
     // Reorg events touch reorg-window blocks that can still change, so keep the
-    // per-outpoint visibility check (finalized = false).
+    // per-outpoint visibility check (settled = false).
     let contexts_outcome = build_block_contexts_from_committed_event(
         chain_store,
         envelope.chain_epoch.id,
@@ -1940,7 +1929,7 @@ fn replay_event_only_chain_event_to_materialized_views(
     );
     dispatch_outcome?;
     if let Some(tip_height) = record_current_materialized_view_replay_tip(chain_store)? {
-        record_projection_replay_progress(
+        record_materialized_view_consumer_replay_progress(
             materialized_view_store.event_only_chain_event_consumer_names(),
             chain_event_replay_progress_height(&envelope),
             tip_height,
@@ -1974,7 +1963,11 @@ fn dispatch_event_only_chain_event(
             true,
         )
         .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
-    record_projection_write_measurements(&measurements, PROJECTION_WRITE_SOURCE_CHAIN_EVENT, 0);
+    record_materialized_view_write_measurements(
+        &measurements,
+        MATERIALIZED_VIEW_WRITE_SOURCE_CHAIN_EVENT,
+        0,
+    );
     Ok(())
 }
 
@@ -2132,11 +2125,11 @@ fn hydrate_committed_block_replay_batch(
         stage_committed_replay_blocks(&reader, envelope, start_height, end_height, max_blocks)?;
 
     // Phase 2: read and assemble transaction facts in bounded groups. The
-    // projection-row cap cannot be evaluated until facts are decoded, so a
+    // variable-row cap cannot be evaluated until facts are decoded, so a
     // separate facts-read bound prevents dense history from hydrating the
     // entire configured replay batch only to discard most of it.
     let mut replay_blocks = Vec::with_capacity(staged.len());
-    let mut projection_rows = MaterializedViewReplayProjectionRows::default();
+    let mut variable_row_counts = MaterializedViewReplayVariableRowCounts::default();
     'facts_groups: for staged_group in bounded_facts_read_groups(&staged) {
         let transaction_ids = staged_group
             .iter()
@@ -2161,11 +2154,11 @@ fn hydrate_committed_block_replay_batch(
                 };
                 transactions.push(transaction);
             }
-            let block_projection_rows = projection_rows_for_transactions(&transactions);
-            if should_start_new_projection_chunk(projection_rows, block_projection_rows) {
+            let block_row_counts = variable_row_counts_for_transactions(&transactions);
+            if should_start_new_replay_chunk(variable_row_counts, block_row_counts) {
                 break 'facts_groups;
             }
-            projection_rows = projection_rows.saturating_add(block_projection_rows);
+            variable_row_counts = variable_row_counts.saturating_add(block_row_counts);
             let transparent_spends = transparent_spent_outpoints_for_transactions(&transactions);
             replay_blocks.push(CanonicalReplayBlock {
                 height: staged_block.height,
@@ -2191,7 +2184,7 @@ fn hydrate_committed_block_replay_batch(
     Ok(CanonicalReplayBatch {
         block_range: BlockHeightRange::inclusive(first.height, last.height),
         blocks: replay_blocks,
-        projection_rows,
+        variable_row_counts,
     })
 }
 
@@ -2272,7 +2265,7 @@ pub(crate) fn dispatch_chain_event(
     blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>>,
     advance_cursor: bool,
 ) -> Result<(), IngestError> {
-    let _write_guard = materialized_view_projection_write_guard();
+    let _write_guard = materialized_view_write_guard();
     let mut block_production_time = BlockProductionTimeConsumer::new();
     let mut block_summary = BlockSummaryConsumer::new();
     let mut ironwood_migration = IronwoodMigrationConsumer::new();
@@ -2318,15 +2311,15 @@ pub(crate) fn dispatch_chain_event(
     let measurements = materialized_view_store
         .write_chain_event_chunk(consumers.as_mut_slice(), inputs, blocks, advance_cursor)
         .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
-    record_projection_write_measurements(
+    record_materialized_view_write_measurements(
         &measurements,
-        PROJECTION_WRITE_SOURCE_CHAIN_EVENT,
+        MATERIALIZED_VIEW_WRITE_SOURCE_CHAIN_EVENT,
         blocks.len(),
     );
     Ok(())
 }
 
-/// Hydrates one current canonical range for cursor-neutral startup projections.
+/// Hydrates one current canonical range for cursor-neutral startup consumers.
 pub(crate) async fn read_current_block_context_batch(
     chain_store: &PrimaryChainStore,
     start_height: BlockHeight,
@@ -2405,13 +2398,13 @@ async fn build_block_contexts_from_committed_event(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
     replay_blocks: Vec<CanonicalReplayBlock>,
-    finalized: bool,
+    settled: bool,
 ) -> Result<HashMap<BlockHeight, Arc<BlockCommitContext>>, IngestError> {
     let transparent_spends = read_transparent_spend_facts_for_committed_blocks(
         chain_store,
         chain_epoch_id,
         &replay_blocks,
-        finalized,
+        settled,
     )
     .await?;
     let transaction_intrinsic_value_balances =
@@ -2424,7 +2417,7 @@ async fn build_block_contexts_from_committed_event(
     let mut out = HashMap::with_capacity(replay_blocks.len());
     for block in replay_blocks {
         let context = BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: block.height,
                 block_hash: block.block_hash,
                 previous_block_hash: block.previous_block_hash,
@@ -2492,12 +2485,12 @@ struct CanonicalReplayBlock {
 struct CanonicalReplayBatch {
     block_range: BlockHeightRange,
     blocks: Vec<CanonicalReplayBlock>,
-    projection_rows: MaterializedViewReplayProjectionRows,
+    variable_row_counts: MaterializedViewReplayVariableRowCounts,
 }
 
 struct PreparedReplayBatch {
     block_range: BlockHeightRange,
-    projection_rows: MaterializedViewReplayProjectionRows,
+    variable_row_counts: MaterializedViewReplayVariableRowCounts,
     contexts: HashMap<BlockHeight, Arc<BlockCommitContext>>,
 }
 
@@ -2505,7 +2498,7 @@ struct ReadAheadReplayBatchInputs<'event> {
     chain_store: &'event PrimaryChainStore,
     replay_budget: &'event mut MaterializedViewReplayBudget,
     envelope: &'event ChainEventEnvelope,
-    projection_rows: MaterializedViewReplayProjectionRows,
+    variable_row_counts: MaterializedViewReplayVariableRowCounts,
     following_height: BlockHeight,
     committed_end: BlockHeight,
     final_chunk: bool,
@@ -2534,12 +2527,12 @@ fn transparent_spent_outpoints_for_transactions(
 /// on a multi-core host with idle IO bandwidth.
 const SPEND_FACT_RESOLVE_CONCURRENCY: usize = 16;
 
-/// Resolves a non-finalized batch's transparent spend facts across several
+/// Resolves an unsettled batch's transparent spend facts across several
 /// blocking readers.
 ///
 /// Outpoints are chain-unique, so chunk result maps have disjoint keys and
 /// merge without collision. Reorg-window replay still needs point-row
-/// visibility checks; finalized replay uses the block-local record below.
+/// visibility checks; settled replay uses the block-local record below.
 async fn resolve_spend_facts_concurrently(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
@@ -2577,7 +2570,7 @@ async fn resolve_spend_facts_concurrently(
     Ok(resolved)
 }
 
-async fn resolve_finalized_spend_facts_by_block(
+async fn resolve_settled_spend_facts_by_block(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
     replay_blocks: &[CanonicalReplayBlock],
@@ -2693,7 +2686,7 @@ async fn read_transparent_spend_facts_for_committed_blocks(
     chain_store: &PrimaryChainStore,
     chain_epoch_id: ChainEpochId,
     replay_blocks: &[CanonicalReplayBlock],
-    finalized: bool,
+    settled: bool,
 ) -> Result<Arc<HashMap<TransparentOutPoint, TransparentSpendFact>>, IngestError> {
     let mut requested_outpoints = HashSet::<TransparentOutPoint>::new();
     for block in replay_blocks {
@@ -2704,8 +2697,8 @@ async fn read_transparent_spend_facts_for_committed_blocks(
     record_transparent_spend_fact_requested_outpoints(unique_spent_outpoint_count);
     let outpoints = requested_outpoints.into_iter().collect::<Vec<_>>();
     let read_started_at = Instant::now();
-    let read_outcome = if finalized {
-        resolve_finalized_spend_facts_by_block(chain_store, chain_epoch_id, replay_blocks).await
+    let read_outcome = if settled {
+        resolve_settled_spend_facts_by_block(chain_store, chain_epoch_id, replay_blocks).await
     } else {
         resolve_spend_facts_concurrently(chain_store, chain_epoch_id, outpoints).await
     };
@@ -2729,7 +2722,7 @@ fn record_materialized_view_replay_stage<T>(
     outcome: &Result<T, IngestError>,
 ) {
     metrics::histogram!(
-        "zinder_ingest_materialized_view_replay_stage_duration_seconds",
+        "zinder_materialized_view_replay_stage_duration_seconds",
         "stage" => stage,
         "status" => outcome_status(outcome),
         "error_class" => ingest_error_class(outcome.as_ref().err())
@@ -2757,60 +2750,60 @@ fn record_materialized_view_replay_event(block_count: usize, error: Option<&Inge
     let status = if error.is_some() { "error" } else { "ok" };
     let error_class = ingest_error_class(error);
     metrics::counter!(
-        "zinder_ingest_materialized_view_replay_events_total",
+        "zinder_materialized_view_replay_events_total",
         "status" => status,
         "error_class" => error_class
     )
     .increment(1);
     metrics::counter!(
-        "zinder_ingest_materialized_view_replay_blocks_total",
+        "zinder_materialized_view_replay_blocks_total",
         "status" => status,
         "error_class" => error_class
     )
     .increment(usize_to_u64_saturating(block_count));
 }
 
-fn record_projection_write_measurements(
-    measurements: &[ProjectionWriteMeasurement],
+fn record_materialized_view_write_measurements(
+    measurements: &[MaterializedViewWriteMeasurement],
     source: &'static str,
     block_count: usize,
 ) {
     for measurement in measurements {
-        let projection = measurement.projection.as_str();
+        let consumer = measurement.consumer.as_str();
         metrics::counter!(
-            "zinder_ingest_projection_write_operations_total",
-            "projection" => projection,
+            "zinder_materialized_view_write_operations_total",
+            "consumer" => consumer,
             "source" => source
         )
         .increment(measurement.operations);
         metrics::counter!(
-            "zinder_ingest_projection_write_bytes_total",
-            "projection" => projection,
+            "zinder_materialized_view_write_bytes_total",
+            "consumer" => consumer,
             "source" => source
         )
         .increment(measurement.logical_bytes);
         metrics::histogram!(
-            "zinder_ingest_projection_dispatch_duration_seconds",
-            "projection" => projection,
+            "zinder_materialized_view_dispatch_duration_seconds",
+            "consumer" => consumer,
             "source" => source
         )
         .record(measurement.dispatch_duration);
-        if source == PROJECTION_WRITE_SOURCE_CHAIN_EVENT {
+        if source == MATERIALIZED_VIEW_WRITE_SOURCE_CHAIN_EVENT {
             metrics::counter!(
-                "zinder_ingest_projection_replay_dispatches_total",
-                "projection" => projection
+                "zinder_materialized_view_replay_dispatches_total",
+                "consumer" => consumer
             )
             .increment(1);
             metrics::counter!(
-                "zinder_ingest_projection_replay_blocks_total",
-                "projection" => projection
+                "zinder_materialized_view_replay_blocks_total",
+                "consumer" => consumer
             )
             .increment(usize_to_u64_saturating(block_count));
         }
     }
 }
 
-fn record_materialized_view_replay_progress(
+fn record_materialized_view_store_replay_progress(
     materialized_view_store: &MaterializedViewStore,
     progress_height: BlockHeight,
     canonical_tip_height: BlockHeight,
@@ -2819,31 +2812,31 @@ fn record_materialized_view_replay_progress(
         Some(progress_height.value()),
         Some(canonical_tip_height.value()),
     );
-    record_projection_replay_progress(
+    record_materialized_view_consumer_replay_progress(
         materialized_view_store.chain_event_consumer_names(),
         progress_height,
         canonical_tip_height,
     );
 }
 
-fn record_projection_replay_progress(
-    projections: impl IntoIterator<Item = MaterializedViewConsumerName>,
+fn record_materialized_view_consumer_replay_progress(
+    consumers: impl IntoIterator<Item = MaterializedViewConsumerName>,
     progress_height: BlockHeight,
     canonical_tip_height: BlockHeight,
 ) {
     let replay_lag_blocks = canonical_tip_height
         .value()
         .saturating_sub(progress_height.value());
-    for projection in projections {
-        let projection = projection.as_str();
+    for consumer in consumers {
+        let consumer = consumer.as_str();
         metrics::gauge!(
-            "zinder_ingest_projection_replay_height",
-            "projection" => projection
+            "zinder_materialized_view_replay_height",
+            "consumer" => consumer
         )
         .set(f64::from(progress_height.value()));
         metrics::gauge!(
-            "zinder_ingest_projection_replay_lag_blocks",
-            "projection" => projection
+            "zinder_materialized_view_replay_lag_blocks",
+            "consumer" => consumer
         )
         .set(f64::from(replay_lag_blocks));
     }
@@ -2855,10 +2848,10 @@ fn record_materialized_view_replay_status_metrics(
 ) {
     let indexed_height = indexed_height.unwrap_or(0);
     let canonical_tip_height = canonical_tip_height.unwrap_or(0);
-    metrics::gauge!("zinder_ingest_materialized_view_replay_height").set(f64::from(indexed_height));
-    metrics::gauge!("zinder_ingest_materialized_view_replay_tip_height")
+    metrics::gauge!("zinder_materialized_view_replay_height").set(f64::from(indexed_height));
+    metrics::gauge!("zinder_materialized_view_replay_tip_height")
         .set(f64::from(canonical_tip_height));
-    metrics::gauge!("zinder_ingest_materialized_view_replay_lag_blocks").set(f64::from(
+    metrics::gauge!("zinder_materialized_view_replay_lag_blocks").set(f64::from(
         canonical_tip_height.saturating_sub(indexed_height),
     ));
 }
@@ -2870,7 +2863,7 @@ fn record_current_materialized_view_replay_tip(
         .current_chain_epoch()?
         .map(|epoch| epoch.visible_tip_height);
     if let Some(tip_height) = canonical_tip_height {
-        metrics::gauge!("zinder_ingest_materialized_view_replay_tip_height")
+        metrics::gauge!("zinder_materialized_view_replay_tip_height")
             .set(f64::from(tip_height.value()));
     }
     Ok(canonical_tip_height)
@@ -2893,9 +2886,9 @@ fn persist_materialized_view_status(
         Err(error) => {
             tracing::warn!(
                 target: "zinder::ingest",
-                event = "materialized_view_status_projection_head_read_failed",
+                event = "materialized_view_status_consumer_head_read_failed",
                 error = %error,
-                "failed to read the shared wallet-correctness projection head",
+                "failed to read the shared wallet-correctness consumer head",
             );
             return;
         }
@@ -2957,12 +2950,12 @@ fn record_materialized_view_replay_budget(
     poll_interval: Duration,
 ) {
     metrics::gauge!(
-        "zinder_ingest_materialized_view_replay_policy",
+        "zinder_materialized_view_replay_policy",
         "policy" => replay_policy.as_kebab_case()
     )
     .set(1.0);
     metrics::gauge!(
-        "zinder_ingest_materialized_view_replay_budget_state",
+        "zinder_materialized_view_replay_budget_state",
         "state" => MaterializedViewReplayBudgetState::Normal.as_label()
     )
     .set(
@@ -2973,7 +2966,7 @@ fn record_materialized_view_replay_budget(
         },
     );
     metrics::gauge!(
-        "zinder_ingest_materialized_view_replay_budget_state",
+        "zinder_materialized_view_replay_budget_state",
         "state" => MaterializedViewReplayBudgetState::Degraded.as_label()
     )
     .set(
@@ -2984,7 +2977,7 @@ fn record_materialized_view_replay_budget(
         },
     );
     metrics::gauge!(
-        "zinder_ingest_materialized_view_replay_budget_state",
+        "zinder_materialized_view_replay_budget_state",
         "state" => MaterializedViewReplayBudgetState::Paused.as_label()
     )
     .set(
@@ -2994,27 +2987,27 @@ fn record_materialized_view_replay_budget(
             0.0
         },
     );
-    metrics::gauge!("zinder_ingest_materialized_view_replay_effective_batch_blocks")
+    metrics::gauge!("zinder_materialized_view_replay_effective_batch_blocks")
         .set(f64::from(effective_limits.batch_blocks));
     if let Some(memory_budget_bytes) = effective_limits.memory_budget_bytes {
-        metrics::gauge!("zinder_ingest_materialized_view_replay_memory_budget_bytes")
+        metrics::gauge!("zinder_materialized_view_replay_memory_budget_bytes")
             .set(u64_to_f64(memory_budget_bytes));
     }
-    metrics::gauge!("zinder_ingest_materialized_view_replay_paused").set(
+    metrics::gauge!("zinder_materialized_view_replay_paused").set(
         if effective_limits.state.is_paused() {
             1.0
         } else {
             0.0
         },
     );
-    metrics::gauge!("zinder_ingest_materialized_view_replay_phase_gate").set(
+    metrics::gauge!("zinder_materialized_view_replay_phase_gate").set(
         if effective_limits.phase_gate_engaged {
             1.0
         } else {
             0.0
         },
     );
-    metrics::gauge!("zinder_ingest_materialized_view_replay_budget_seconds").set(
+    metrics::gauge!("zinder_materialized_view_replay_budget_seconds").set(
         if effective_limits.state.is_paused() {
             0.0
         } else {
@@ -3025,13 +3018,13 @@ fn record_materialized_view_replay_budget(
 
 fn record_materialized_view_tailer_tick(started_at: Instant, outcome: &Result<(), IngestError>) {
     metrics::histogram!(
-        "zinder_ingest_materialized_view_tailer_tick_duration_seconds",
+        "zinder_materialized_view_tailer_tick_duration_seconds",
         "status" => outcome_status(outcome),
         "error_class" => ingest_error_class(outcome.as_ref().err())
     )
     .record(started_at.elapsed());
     metrics::counter!(
-        "zinder_ingest_materialized_view_tailer_ticks_total",
+        "zinder_materialized_view_tailer_ticks_total",
         "status" => outcome_status(outcome),
         "error_class" => ingest_error_class(outcome.as_ref().err())
     )
@@ -3099,9 +3092,9 @@ mod tests {
                 "create materialized-view test directory: {error}"
             ))
         })?;
-        let store = MaterializedViewStore::open_with_projection_preset(
+        let store = MaterializedViewStore::open_with_materialized_view_preset(
             tempdir.path(),
-            zinder_materialized_views::ProjectionPreset::Wallet,
+            zinder_materialized_views::MaterializedViewPreset::Wallet,
             MaterializedViewStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..MaterializedViewStoreOptions::default()
@@ -3163,7 +3156,7 @@ mod tests {
         let (_materialized_view_tempdir, materialized_view_store) =
             wallet_materialized_view_store()?;
         let cursor = [0xA5; 64];
-        for schema in zinder_materialized_views::ProjectionPreset::Wallet.consumer_schemas() {
+        for schema in zinder_materialized_views::MaterializedViewPreset::Wallet.consumer_schemas() {
             materialized_view_store.put_chain_event_cursor(schema.name, &cursor)?;
         }
 
@@ -3176,8 +3169,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_preset_reports_live_from_the_shared_spend_projection_head() -> Result<(), IngestError>
-    {
+    fn wallet_preset_reports_live_from_the_shared_spend_consumer_head() -> Result<(), IngestError> {
         let canonical_tempdir = tempfile::tempdir().map_err(|error| {
             IngestError::MaterializedViewDispatch(format!(
                 "create canonical test directory: {error}"
@@ -3327,7 +3319,7 @@ mod tests {
         Ok(())
     }
 
-    fn seed_authoritative_projection_height(
+    fn seed_authoritative_consumer_height(
         store: &MaterializedViewStore,
         height: BlockHeight,
     ) -> Result<(), IngestError> {
@@ -3375,7 +3367,7 @@ mod tests {
         let (_tempdir, store) = materialized_view_store()?;
         let cursor = [0xA5; 64];
         seed_existing_block_consumer_cursors(&store, &cursor)?;
-        seed_authoritative_projection_height(&store, BlockHeight::new(100))?;
+        seed_authoritative_consumer_height(&store, BlockHeight::new(100))?;
 
         seed_backfill_owned_consumer_cursors(&store)?;
 
@@ -3409,7 +3401,7 @@ mod tests {
         let (_tempdir, store) = materialized_view_store()?;
         let cursor = [0xA5; 64];
         seed_existing_block_consumer_cursors(&store, &cursor)?;
-        seed_authoritative_projection_height(&store, BlockHeight::new(100))?;
+        seed_authoritative_consumer_height(&store, BlockHeight::new(100))?;
         store.put_chain_event_cursor(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, &cursor)?;
 
         seed_backfill_owned_consumer_cursors(&store)?;
@@ -3438,7 +3430,7 @@ mod tests {
     fn backfill_consumers_stay_fresh_when_any_existing_cursor_is_missing() -> Result<(), IngestError>
     {
         let (_tempdir, store) = materialized_view_store()?;
-        seed_authoritative_projection_height(&store, BlockHeight::new(100))?;
+        seed_authoritative_consumer_height(&store, BlockHeight::new(100))?;
         let first_existing = MaterializedViewStore::bundled_chain_event_consumer_names()
             .iter()
             .copied()
@@ -3457,7 +3449,7 @@ mod tests {
     }
 
     #[test]
-    fn backfill_consumers_stay_fresh_without_authoritative_projection_height()
+    fn backfill_consumers_stay_fresh_without_authoritative_consumer_height()
     -> Result<(), IngestError> {
         let (_tempdir, store) = materialized_view_store()?;
         seed_existing_block_consumer_cursors(&store, &[0xA5; 64])?;
@@ -3477,7 +3469,7 @@ mod tests {
     {
         let (_tempdir, store) = materialized_view_store()?;
         seed_existing_block_consumer_cursors(&store, &[0xA5; 64])?;
-        seed_authoritative_projection_height(&store, BlockHeight::new(u32::MAX))?;
+        seed_authoritative_consumer_height(&store, BlockHeight::new(u32::MAX))?;
 
         let result = seed_backfill_owned_consumer_cursors(&store);
 
@@ -3496,7 +3488,7 @@ mod tests {
     fn backfill_consumer_seeding_rejects_disagreeing_existing_boundaries() -> Result<(), IngestError>
     {
         let (_tempdir, store) = materialized_view_store()?;
-        seed_authoritative_projection_height(&store, BlockHeight::new(100))?;
+        seed_authoritative_consumer_height(&store, BlockHeight::new(100))?;
         seed_existing_block_consumer_cursors(&store, &[0xA5; 64])?;
         let first_existing = MaterializedViewStore::bundled_chain_event_consumer_names()
             .iter()
@@ -3848,35 +3840,32 @@ mod tests {
     }
 
     #[test]
-    fn projection_row_cap_keeps_at_least_one_block_per_chunk() {
-        let oversized_block_rows = MaterializedViewReplayProjectionRows {
-            transaction_rows: MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
+    fn variable_row_cap_keeps_at_least_one_block_per_chunk() {
+        let oversized_block_rows = MaterializedViewReplayVariableRowCounts {
+            transaction_rows: MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_ROWS_PER_CHUNK
                 .saturating_add(1),
             transparent_address_transaction_history: 0,
         };
 
-        assert!(!should_start_new_projection_chunk(
-            MaterializedViewReplayProjectionRows::default(),
+        assert!(!should_start_new_replay_chunk(
+            MaterializedViewReplayVariableRowCounts::default(),
             oversized_block_rows,
         ));
     }
 
     #[test]
-    fn projection_row_cap_closes_chunk_before_next_block_exceeds_limit() {
-        let current_rows = MaterializedViewReplayProjectionRows {
-            transaction_rows: MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_PROJECTION_ROWS_PER_CHUNK
+    fn variable_row_cap_closes_chunk_before_next_block_exceeds_limit() {
+        let current_rows = MaterializedViewReplayVariableRowCounts {
+            transaction_rows: MATERIALIZED_VIEW_REPLAY_MAX_VARIABLE_ROWS_PER_CHUNK
                 .saturating_sub(1),
             transparent_address_transaction_history: 0,
         };
-        let next_block_rows = MaterializedViewReplayProjectionRows {
+        let next_block_rows = MaterializedViewReplayVariableRowCounts {
             transaction_rows: 2,
             transparent_address_transaction_history: 0,
         };
 
-        assert!(should_start_new_projection_chunk(
-            current_rows,
-            next_block_rows,
-        ));
+        assert!(should_start_new_replay_chunk(current_rows, next_block_rows,));
     }
 
     #[test]
@@ -3900,7 +3889,7 @@ mod tests {
     }
 
     #[test]
-    fn read_ahead_only_runs_for_normal_small_projection_batches() {
+    fn read_ahead_only_runs_for_normal_small_variable_row_batches() {
         let normal_limits = EffectiveMaterializedViewReplayLimits {
             state: MaterializedViewReplayBudgetState::Normal,
             batch_blocks: 100,
@@ -3912,13 +3901,12 @@ mod tests {
             state: MaterializedViewReplayBudgetState::Degraded,
             ..normal_limits
         };
-        let small_rows = MaterializedViewReplayProjectionRows {
-            transaction_rows: MATERIALIZED_VIEW_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS,
+        let small_rows = MaterializedViewReplayVariableRowCounts {
+            transaction_rows: MATERIALIZED_VIEW_REPLAY_READ_AHEAD_VARIABLE_ROWS,
             transparent_address_transaction_history: 0,
         };
-        let dense_rows = MaterializedViewReplayProjectionRows {
-            transaction_rows: MATERIALIZED_VIEW_REPLAY_READ_AHEAD_VARIABLE_PROJECTION_ROWS
-                .saturating_add(1),
+        let dense_rows = MaterializedViewReplayVariableRowCounts {
+            transaction_rows: MATERIALIZED_VIEW_REPLAY_READ_AHEAD_VARIABLE_ROWS.saturating_add(1),
             transparent_address_transaction_history: 0,
         };
 
@@ -3937,7 +3925,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_spend_replay_accepts_explicit_unresolved_checkpoint_parent()
+    fn settled_spend_replay_accepts_explicit_unresolved_checkpoint_parent()
     -> Result<(), IngestError> {
         let height = BlockHeight::new(100);
         let block_hash = BlockHash::from_bytes([10; 32]);
@@ -3957,7 +3945,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_spend_replay_rejects_a_missing_canonical_input() -> Result<(), IngestError> {
+    fn settled_spend_replay_rejects_a_missing_canonical_input() -> Result<(), IngestError> {
         let height = BlockHeight::new(100);
         let block_hash = BlockHash::from_bytes([10; 32]);
         let first = TransparentOutPoint::new(TransactionId::from_bytes([11; 32]), 1);

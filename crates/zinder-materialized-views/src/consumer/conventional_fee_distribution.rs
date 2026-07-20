@@ -1,6 +1,6 @@
 //! Exact ZIP-317 conventional-fee frequencies by block time and UTC day.
 //!
-//! This projection intentionally does not contain paid fees. It derives the
+//! This materialized view intentionally does not contain paid fees. It derives the
 //! ZIP-317 conventional fee from canonical transaction component counts,
 //! stores one contribution per block, and maintains exact UTC-day aggregates.
 
@@ -52,7 +52,7 @@ pub const CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA: MaterializedViewConsumerSchema =
         CONVENTIONAL_FEE_DISTRIBUTION_COLUMN_FAMILIES,
     );
 
-/// Capability advertised when this projection is ready.
+/// Capability advertised when this materialized view is ready.
 pub const CONVENTIONAL_FEE_DISTRIBUTION_CAPABILITIES: &[&str] =
     &[EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1];
 
@@ -479,7 +479,7 @@ impl ConventionalFeeDistributionConsumer {
             store.consumer_column_family(CONVENTIONAL_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY)?;
         ctx.batch
             .put_cf(&coverage_cf, COVERAGE_KEY, encode_coverage(next_coverage));
-        store.write_projection_batch(CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -500,7 +500,7 @@ impl ConventionalFeeDistributionConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_projection_batch(CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -1465,7 +1465,7 @@ mod tests {
 
     use super::*;
     use crate::MaterializedViewStoreOptions;
-    use crate::consumer::{BlockCommitPayload, TransparentSpendFacts};
+    use crate::consumer::{BlockCommitInput, TransparentSpendFacts};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -1515,7 +1515,7 @@ mod tests {
         let height = BlockHeight::new(height);
         let hash = block_hash(hash_seed);
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height,
                 block_hash: hash,
                 previous_block_hash: block_hash(hash_seed.wrapping_sub(1)),

@@ -1,10 +1,10 @@
 # Bulk-catchup resource tuning
 
 This runbook covers current memory, I/O, and concurrency controls for canonical
-construction and materialized-view replay. Zinder bounds RocksDB resources and
-construction queues by default; tune them only against observed pressure from
-the target deployment. The resolved output from `zinder-ingest --print-config`
-is the authoritative configuration for a running binary.
+construction. Zinder bounds RocksDB resources and construction queues by
+default; tune them only against observed pressure from the target deployment.
+The resolved output from `zinder-ingest --print-config` is the authoritative
+configuration for a running binary.
 
 ## Diagnose the constrained resource
 
@@ -18,12 +18,7 @@ Start with the process exit and the metrics immediately before it:
   preparation, and reassembly backlog.
 - `zinder_store_block_cache_usage_bytes`, `zinder_store_wal_bytes`, and
   `zinder_store_rocksdb_property` separate cache pressure, WAL growth,
-  memtables, compaction debt, and write stalls. Split these series by
-  `store_role` because canonical and materialized-view stores share the ingest
-  process.
-- `zinder_ingest_materialized_view_replay_budget_state{state}` and the replay
-  batch gauges show when projection work has degraded or paused to protect
-  canonical ingest.
+  memtables, compaction debt, and write stalls.
 
 Do not tune all limits together. Record one pressured stage, change its owning
 limit, and compare throughput and peak memory on the same chain range.
@@ -59,8 +54,9 @@ admission capacity.
 
 ## RocksDB budgets
 
-`[storage.canonical.rocksdb]` and `[storage.materialized_views.rocksdb]` merge
-role-specific overrides onto bounded writer or reader defaults. The shared
+`[storage.canonical.rocksdb]` configures canonical storage, while
+`[wallet.rocksdb]` configures the wallet projection. Both merge role-specific
+overrides onto bounded writer or reader defaults. The shared
 `RocksDbResourceBudget` controls block cache, WAL ceiling, open files, write
 buffers, aggregate memtable memory, and background jobs. Reader defaults are
 smaller; canonical reader cache size is also container-aware.
@@ -78,19 +74,6 @@ metrics prove that compaction is the bottleneck and the host has spare CPU and
 I/O. Raising caches or memtables to hide an undersized container merely moves
 the failure boundary.
 
-## Materialized-view replay
-
-`[ingest.materialized_views]` owns replay-specific pressure behavior. The
-default `canonical-first` policy pauses rebuildable materialized-view work while
-canonical ingest is under memory pressure. `replay_batch_blocks` is a maximum;
-the runtime shrinks the effective batch at `memory_degrade_ratio`, pauses at
-`memory_pause_ratio`, and resumes only after usage falls below
-`memory_resume_ratio`.
-
-During canonical bulk catchup, the phase gate keeps replay paused regardless of
-the pressure policy. After canonical reaches the upstream tip, replay must cover
-that tip before the historical-work gate opens.
-
 ## Recover after resource exhaustion
 
 Stop the restart loop, correct the container limit or the pressured stage's
@@ -98,11 +81,10 @@ configuration, and restart the same owner against the same storage paths. The
 bounded RocksDB open path replays the WAL within the configured resource
 envelope. Do not delete individual WAL or SST files.
 
-If startup reports `SchemaMismatch`, `StoreCorruption`, a network mismatch, or
-an invalid canonical/materialized-view pair, resource tuning is not the remedy.
-Follow [Initial sync](initial-sync.md) and create a fresh, empty pair of storage
-paths. Preserve the rejected paths for diagnosis until the replacement is
-ready.
+If startup reports `SchemaMismatch`, `StoreCorruption`, or a network mismatch,
+resource tuning is not the remedy. Follow [Initial sync](initial-sync.md) and
+create a fresh, empty storage path. Preserve the rejected path until the
+replacement is ready.
 
 ## References
 

@@ -8,7 +8,7 @@
 //!   per canonical block, keyed by ascending height, carrying the cumulative
 //!   Orchard and Ironwood value balances (net zatoshi that has left each pool)
 //!   summed over every transaction from the first replayed block. This is a
-//!   genuinely cumulative, non-idempotent-by-content projection: each block's
+//!   genuinely cumulative, non-idempotent-by-content materialized view: each block's
 //!   record depends on its predecessor's running total, and reverting a block
 //!   subtracts that block's own contribution back out of the running total
 //!   rather than only deleting the row.

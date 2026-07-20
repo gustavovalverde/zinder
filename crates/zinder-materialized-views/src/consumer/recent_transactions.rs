@@ -1,17 +1,14 @@
 //! `RecentTransactions` materialized-view consumer.
 //!
-//! Materializes a time-descending projection of canonical transactions
+//! Materializes a time-descending materialized view of canonical transactions
 //! into the consumer-owned `recent_transactions` column family. The key
 //! encoding `(reverse_height, in_block_position)` (8 bytes) lays the
 //! newest entries first lexicographically so the handler-side
 //! `ExplorerQuery.RecentTransactions` streams them as a single forward
 //! range scan.
 //!
-//! Replaces the round-trip tree a "recent transactions" panel would
-//! otherwise build: `BlockSummariesInRange` then per-block `BlockDetail`
-//! then per-tx `TransactionDetail`. The consumer pays the parse cost
-//! once at commit; the read path is a single bounded scan plus an
-//! optional batched fee lookup.
+//! The consumer pays the parse cost once at commit; the read path serves the
+//! stream with one bounded scan plus an optional batched fee lookup.
 
 use prost::Message as _;
 use zinder_core::wire::{

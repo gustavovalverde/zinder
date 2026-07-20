@@ -27,8 +27,8 @@ use zinder_explorer::{
     MaterializedViewStoreOptions,
 };
 use zinder_ingest::{
-    IngestControlGrpcAdapter, MaterializedViewReplayConfig, MaterializedViewReplayPolicy,
-    MempoolIndex, catch_up_materialized_view_store_to_canonical,
+    MaterializedViewReplayConfig, MaterializedViewReplayPolicy,
+    catch_up_materialized_view_store_to_canonical,
     open_primary_materialized_view_store_for_canonical, run_bulk_catchup,
 };
 use zinder_proto::capabilities::EXPLORER_FEE_SUMMARY_V1;
@@ -118,7 +118,6 @@ struct FeeSummaryFixture {
     sample_block_height: BlockHeight,
     explorer_adapter: ExplorerQueryGrpcAdapter,
     wallet_server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
-    ingest_control_handle: JoinHandle<Result<(), tonic::transport::Error>>,
     _store_tempdir: TempDir,
 }
 
@@ -131,14 +130,8 @@ impl FeeSummaryFixture {
             (),
             Arc::new(sample_regtest_upgrade_activations()),
         );
-        let (ingest_control_addr, ingest_control_handle) =
-            serve_ingest_control_grpc(network, store, MempoolIndex::new()).await?;
-        let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
-            wallet_query,
-            network,
-            format!("http://{ingest_control_addr}"),
-        )
-        .await?;
+        let (wallet_grpc_addr, wallet_server_handle) =
+            serve_wallet_query_grpc(wallet_query, network).await?;
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
         let materialized_view_store = MaterializedViewStore::open_secondary(
             MaterializedViewStore::path_for_canonical(&store_tempdir.path().join("zinder-store")),
@@ -163,7 +156,6 @@ impl FeeSummaryFixture {
             sample_block_height: tip_height,
             explorer_adapter,
             wallet_server_handle,
-            ingest_control_handle,
             _store_tempdir: store_tempdir,
         })
     }
@@ -186,9 +178,7 @@ impl FeeSummaryFixture {
 
     async fn shutdown(&mut self) {
         self.wallet_server_handle.abort();
-        self.ingest_control_handle.abort();
         let _ = (&mut self.wallet_server_handle).await;
-        let _ = (&mut self.ingest_control_handle).await;
     }
 }
 
@@ -319,37 +309,12 @@ fn materialized_view_replay_config() -> Result<MaterializedViewReplayConfig> {
 async fn serve_wallet_query_grpc(
     wallet_query: WalletQuery<PrimaryChainStore>,
     network: Network,
-    ingest_control_endpoint: String,
 ) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
     let server_info = ServerInfoSettings {
         network: encode_zinder_native_chain_name(network).to_owned(),
         ..ServerInfoSettings::default()
     };
-    let adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
-        wallet_query,
-        server_info,
-        ingest_control_endpoint,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
-async fn serve_ingest_control_grpc(
-    network: Network,
-    store: PrimaryChainStore,
-    mempool_index: MempoolIndex,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter =
-        IngestControlGrpcAdapter::new(network, store, zinder_runtime::Readiness::default())
-            .with_mempool(mempool_index);
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, server_info);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(async move {

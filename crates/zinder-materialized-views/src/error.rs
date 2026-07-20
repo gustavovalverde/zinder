@@ -92,22 +92,22 @@ pub enum MaterializedViewStoreError {
         /// Operator-facing reason describing the decode failure.
         reason: String,
     },
-    /// A writer staged consumer projection coverage whose bounds violate the
-    /// `complete_from_height <= complete_through_height <= projection_tip_height`
+    /// A writer staged materialized-view coverage whose bounds violate the
+    /// `complete_from_height <= complete_through_height <= tip_height`
     /// ordering the on-disk record requires. The store refuses to persist it so
     /// no reader can later decode an undecodable record.
     #[error(
-        "materialized-view store consumer `{consumer}` projection coverage bounds are invalid: complete_from_height={complete_from_height}, complete_through_height={complete_through_height}, projection_tip_height={projection_tip_height}"
+        "materialized-view store consumer `{consumer}` coverage bounds are invalid: complete_from_height={complete_from_height}, complete_through_height={complete_through_height}, tip_height={tip_height}"
     )]
-    InvalidProjectionCoverage {
+    InvalidMaterializedViewCoverage {
         /// Consumer whose coverage bounds were rejected.
         consumer: &'static str,
         /// Staged first verified height.
         complete_from_height: u32,
         /// Staged last verified height.
         complete_through_height: u32,
-        /// Staged projection tip height.
-        projection_tip_height: u32,
+        /// Staged materialized-view tip height.
+        tip_height: u32,
     },
     /// Persisted store-format version is incompatible with the running binary.
     #[error(
@@ -119,30 +119,27 @@ pub enum MaterializedViewStoreError {
         /// Store-format version the running binary expects.
         running: u16,
     },
-    /// The requested preset conflicts with the store's durable projection
+    /// The requested preset conflicts with the store's durable consumer
     /// identities.
     #[error(
-        "materialized-view store projection identities are incompatible with requested preset {requested}; configure a new empty canonical storage path and re-ingest from upstream because in-place preset changes are unsupported"
+        "materialized-view store consumer identities are incompatible with requested preset {requested}; configure a fresh empty materialized-view path and rebuild it from a certified recovery source because in-place preset changes are unsupported"
     )]
-    ProjectionPresetRequiresFreshStore {
+    MaterializedViewPresetRequiresFreshStore {
         /// Non-default preset requested by the opening process.
         requested: &'static str,
     },
-    /// A projection-owned write targeted an identity omitted by the opened
+    /// A consumer-owned write targeted an identity omitted by the opened
     /// workload.
-    #[error(
-        "materialized-view store projection `{projection}` is not selected by the opened workload"
-    )]
-    ProjectionNotSelected {
-        /// Stable projection identity rejected by the store.
-        projection: &'static str,
+    #[error("materialized-view store consumer `{consumer}` is not selected by the opened workload")]
+    ConsumerNotSelected {
+        /// Stable consumer identity rejected by the store.
+        consumer: &'static str,
     },
     /// A declared consumer's persisted schema contract cannot be read safely
-    /// by the running binary. Secondary readers reject this rather than decode
-    /// incompatible rows. A primary rebuilds older incompatible versions but
-    /// rejects newer persisted versions so rollback never destroys that
-    /// consumer's newer rows.
-    /// `persisted` is `None` when the primary has not recorded the consumer.
+    /// by the running binary. Every opener rejects any incompatible version or
+    /// column-family identity before it can decode consumer rows.
+    /// `persisted` is `None` when an existing manifest has no entry for the
+    /// declared consumer.
     #[error(
         "materialized-view store consumer `{consumer}` schema version mismatch: persisted={persisted:?}, running={running}"
     )]
@@ -157,8 +154,8 @@ pub enum MaterializedViewStoreError {
     /// The manifest contains a consumer the running binary did not declare.
     ///
     /// Consumer removal is destructive and therefore cannot be inferred from
-    /// absence in an older or differently configured binary. The store fails
-    /// closed until an explicit removal migration exists.
+    /// absence in an older or differently configured binary. The existing path
+    /// fails closed; a fresh store and certified rebuild are required.
     #[error(
         "materialized-view store manifest contains undeclared consumer `{consumer}` at schema version {persisted_schema_version}"
     )]
@@ -168,16 +165,23 @@ pub enum MaterializedViewStoreError {
         /// Latest writer schema version recorded for that consumer.
         persisted_schema_version: u16,
     },
-    /// Per-consumer schema reconciliation failed while opening the store.
-    ///
-    /// Returned when a consumer whose declared version moved could not have
-    /// its column-family rows cleared, or when the persisted consumer manifest
-    /// could not be read or rewritten.
+    /// The on-disk column-family set does not exactly match the persisted
+    /// consumer identity expected by the running binary.
     #[error(
-        "materialized-view store consumer schema reconciliation failed during {operation}: {reason}"
+        "materialized-view store column-family identity mismatch: persisted={persisted:?}, expected={expected:?}"
     )]
-    SchemaReconcile {
-        /// Reconciliation step that failed.
+    ColumnFamilyIdentityMismatch {
+        /// Column-family names recorded by `RocksDB`.
+        persisted: Vec<String>,
+        /// Column-family names required by the running declaration.
+        expected: Vec<String>,
+    },
+    /// Per-consumer manifest encoding or decoding failed.
+    #[error(
+        "materialized-view store consumer manifest operation failed during {operation}: {reason}"
+    )]
+    ConsumerManifest {
+        /// Manifest operation that failed.
         operation: &'static str,
         /// Operator-facing reason describing the failure.
         reason: String,
@@ -205,12 +209,12 @@ pub enum MaterializedViewStoreError {
         /// Column family name the consumer asked for.
         name: &'static str,
     },
-    /// A projection-specific cursor could not be decoded or did not match its
+    /// A consumer-specific cursor could not be decoded or did not match its
     /// read request.
-    #[error("materialized view {projection} cursor is invalid: {reason}")]
-    ProjectionCursorInvalid {
-        /// Stable projection identity that owns the cursor.
-        projection: &'static str,
+    #[error("materialized-view consumer {consumer} cursor is invalid: {reason}")]
+    ConsumerCursorInvalid {
+        /// Stable consumer identity that owns the cursor.
+        consumer: &'static str,
         /// Specific validation failure.
         reason: &'static str,
     },

@@ -21,7 +21,7 @@ use tonic::Request;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, Network};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::{IngestControlGrpcAdapter, MempoolIndex, run_bulk_catchup};
+use zinder_ingest::run_bulk_catchup;
 use zinder_proto::capabilities::{
     EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
 };
@@ -37,7 +37,7 @@ use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
     fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
-    zebra_source_from_bulk_catchup,
+    serve_test_ingest_control, zebra_source_from_bulk_catchup,
 };
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
@@ -136,8 +136,7 @@ impl MempoolFixture {
             (),
             Arc::new(sample_regtest_upgrade_activations()),
         );
-        let (ingest_control_addr, ingest_control_handle) =
-            serve_ingest_control_grpc(network, store, MempoolIndex::new()).await?;
+        let (ingest_control_addr, ingest_control_handle) = serve_test_ingest_control(None).await?;
         let (wallet_grpc_addr, wallet_server_handle) =
             serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
@@ -322,26 +321,6 @@ async fn serve_wallet_query_grpc(
         ServerInfoSettings::default(),
         ingest_control_endpoint,
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
-async fn serve_ingest_control_grpc(
-    network: Network,
-    store: PrimaryChainStore,
-    mempool_index: MempoolIndex,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter =
-        IngestControlGrpcAdapter::new(network, store, zinder_runtime::Readiness::default())
-            .with_mempool(mempool_index);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(async move {

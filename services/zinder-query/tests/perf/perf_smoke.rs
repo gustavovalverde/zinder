@@ -8,11 +8,9 @@
 //! These tests guarantee that a representative range read completes within
 //! a generous CI budget. They are not benchmarks; a dedicated benchmark suite
 //! should measure P50/P99 numbers, while this file catches catastrophic
-//! regressions on every CI run.
-//!
-//! Budgets are deliberately loose so this test stays green under contended
-//! CI workers. Tight per-percentile numbers live in
-//! [`docs/architecture/wallet-data-plane.md`] under §Published Budgets.
+//! regressions on every CI run. Budgets are deliberately loose so this test
+//! stays green under contended CI workers; live percentile measurements follow
+//! the testing runbook instead of becoming static assertions here.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -114,7 +112,7 @@ async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn latest_block_stays_under_budget() -> eyre::Result<()> {
+async fn visible_tip_block_stays_under_budget() -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
@@ -123,13 +121,13 @@ async fn latest_block_stays_under_budget() -> eyre::Result<()> {
     );
 
     let start = Instant::now();
-    let response = wallet_query.latest_block(None).await?;
+    let response = wallet_query.visible_tip_block(None).await?;
     let elapsed = start.elapsed();
 
     assert_eq!(response.height, BlockHeight::new(1));
     assert!(
         elapsed <= PERF_SMOKE_LATEST_BUDGET,
-        "latest_block read took {elapsed:?}, budget is {PERF_SMOKE_LATEST_BUDGET:?}"
+        "visible_tip_block read took {elapsed:?}, budget is {PERF_SMOKE_LATEST_BUDGET:?}"
     );
 
     Ok(())

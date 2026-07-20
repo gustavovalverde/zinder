@@ -37,7 +37,7 @@ use zinder_source::{NodeAuth, NodeConfigError, NodeTarget};
 use crate::auth::{BearerToken, BearerTokenError};
 use crate::env_diagnostics::{RejectedEnvVar, translate_env_error};
 use crate::sections::{
-    DEFAULT_ALLOW_PUBLIC_BIND, ServiceIdentifier, defaults::default_ops_listen_addr,
+    DEFAULT_ALLOW_PUBLIC_BIND, RuntimeService, defaults::default_ops_listen_addr,
 };
 
 const ENV_PREFIX: &str = "ZINDER_";
@@ -408,7 +408,7 @@ impl ConfigLoader {
     /// override binds the loopback default for its service. Operators opt
     /// out by setting `ops.listen_addr = ""` (or
     /// `ZINDER_OPS__LISTEN_ADDR=` to the empty string).
-    pub fn with_ops_section(self, service: ServiceIdentifier) -> Result<Self, ConfigError> {
+    pub fn with_ops_section(self, service: RuntimeService) -> Result<Self, ConfigError> {
         self.with_default("ops.listen_addr", default_ops_listen_addr(service))
     }
 

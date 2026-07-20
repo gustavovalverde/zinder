@@ -24,8 +24,7 @@ use zinder_core::{
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::WalletQuery;
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEvent, MempoolEventEnvelope, MempoolEventStreamFamily,
-    StreamCursorTokenV1,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEvent, MempoolEventEnvelope, StreamCursorTokenV1,
 };
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
@@ -582,7 +581,6 @@ impl ScriptedMempoolEventControl {
         Ok(MempoolEventEnvelope {
             cursor: StreamCursorTokenV1::mempool_event(
                 Network::ZcashRegtest,
-                MempoolEventStreamFamily::Mempool,
                 event_sequence,
                 event.transaction_id(),
                 [9; 32],

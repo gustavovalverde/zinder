@@ -5,14 +5,15 @@ Date: 2026-05-19
 Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
 [ADR-0011](0011-explorer-freshness-envelope.md),
 [Materialized-view plane](../architecture/materialized-view-plane.md),
-[Canonical and projection architecture](../architecture/canonical-projection-architecture.md)
+[Canonical and materialized-view architecture](../architecture/canonical-materialized-view-architecture.md)
 
-Bundled materialized-view writes run inside the ingest-hosted tailer. The durable
-contract in this ADR is the shared per-block fact context,
+The reusable replay host can apply bundled materialized-view writes from
+canonical events. The durable contract in this ADR is the shared per-block fact context,
 `BlockKeyedConsumer` range dispatch convention, key codecs in
 `zinder-core::wire`, and atomic materialized-view cursor persistence. Current
-implementations live in `crates/zinder-materialized-views`, and `zinder-ingest` hosts the
-bundled tailer.
+implementations live in `crates/zinder-materialized-views`; the `zinder-ingest`
+library exposes the replay composition, but the `zinder-ingest` executable does
+not start or configure it.
 
 ## Context
 
@@ -32,7 +33,7 @@ N and let drift between consumers compound.
 
 ### Per-block context shared across consumers
 
-`zinder-ingest`'s materialized-view tailer hydrates one `BlockCommitContext` per committed
+The reusable materialized-view replay host hydrates one `BlockCommitContext` per committed
 block and passes shared references to every chain-event consumer observing that
 height. The context carries block identity, block time, raw block size, ordered
 `TransactionFactsArtifact` rows, and hydrated `TransparentSpendFact` rows when
@@ -122,8 +123,8 @@ families it owns. Requiring the version at construction makes it impossible to
 register a column family without one. The bundled consumers ship as
 `MaterializedViewStore::bundled_consumers()`; every consumer starts at version 1.
 
-The persisted per-consumer manifest, the open-time scoped wipe-and-rebuild
-flow, and the narrowed container-format version are defined in
+The persisted per-consumer manifest, exact-version admission policy, and
+container-format version are defined in
 [ADR-0028](0028-materialized-view-schema-versioning.md).
 
 ## Rewind contract

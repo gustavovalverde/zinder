@@ -72,5 +72,5 @@ that a historical segment is a live event stream.
 
 - [Node source boundary](../architecture/node-source-boundary.md)
 - [Chain ingestion](../architecture/chain-ingestion.md)
-- [ADR-0015: Unified phase-driven ingest](0015-unified-phase-driven-ingest.md)
+- [ADR-0015: Phase-driven ingest](0015-phase-driven-ingest.md)
 - [ADR-0022: Resource-budgeted bulk catch-up](0022-resource-budgeted-bulk-catchup.md)

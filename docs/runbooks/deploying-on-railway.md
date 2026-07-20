@@ -37,7 +37,7 @@ coverage, transaction retention, reorg policy, operations listener, and private
 control listener through `ZINDER_*` variables.
 
 `/healthz` proves process liveness. `/readyz` proves only the canonical writer
-and mempool contract. It does not prove wallet projection, exact-pair serving,
+and mempool contract. It does not prove wallet projection, wallet-serving admission,
 public TLS, coherent recovery, or client compatibility.
 
 Record the image digest, network, starting and final fences, construction and

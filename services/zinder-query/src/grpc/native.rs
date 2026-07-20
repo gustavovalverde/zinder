@@ -10,14 +10,15 @@ use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
     BlockBlobArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
-    BroadcastUnknown, ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedDetails, Network,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    BroadcastUnknown, ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedTransactionChainContext,
+    Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
+use zinder_materialized_views::MaterializedViewPreset;
 use zinder_proto::capabilities::{
     CapabilitySurface, WalletAdvertiseInputs, capabilities_for_surface,
 };
@@ -27,11 +28,10 @@ use zinder_proto::wire::encode_transparent_utxo_set_commitment;
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
-    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, FullBlock,
-    LatestBlock, LatestSafeBlock, QueryError, SubtreeRoots, TransactionStatus,
-    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, FullBlock, QueryError,
+    SettledTipBlock, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, VisibleTipBlock, WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_view_message as build_chain_view_message;
 use zinder_store::{
@@ -111,10 +111,8 @@ pub struct ServerInfoSettings {
     pub transparent_address_history_available: bool,
     /// Whether durable transparent spender resolution is available.
     pub transparent_outpoint_spend_available: bool,
-    /// Closed projection workload detected from the durable materialized-view manifest.
-    pub projection_preset: String,
-    /// Effective stable projection identities selected by the workload.
-    pub projection_identities: Vec<String>,
+    /// Closed materialized-view workload when this service has an attached store.
+    pub materialized_view_preset: Option<MaterializedViewPreset>,
 }
 
 /// Snapshot of the upstream-node capability probe used by `ServerInfo`.
@@ -151,16 +149,9 @@ impl Default for ServerInfoSettings {
             block_blobs_retained: false,
             transaction_blobs_retained: false,
             utxo_set_commitment_enabled: false,
-            transparent_address_history_available: true,
-            transparent_outpoint_spend_available: true,
-            projection_preset: zinder_materialized_views::ProjectionPreset::Explorer
-                .as_str()
-                .to_owned(),
-            projection_identities: zinder_materialized_views::ProjectionPreset::Explorer
-                .consumer_schemas()
-                .iter()
-                .map(|schema| schema.name.as_str().to_owned())
-                .collect(),
+            transparent_address_history_available: false,
+            transparent_outpoint_spend_available: false,
+            materialized_view_preset: None,
         }
     }
 }
@@ -214,8 +205,19 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
             })
             .map(|spec| spec.string.to_owned())
             .collect(),
-        projection_preset: settings.projection_preset.clone(),
-        projection_identities: settings.projection_identities.clone(),
+        materialized_view_preset: settings
+            .materialized_view_preset
+            .map_or_else(String::new, |preset| preset.as_str().to_owned()),
+        materialized_view_identities: settings.materialized_view_preset.map_or_else(
+            Vec::new,
+            |preset| {
+                preset
+                    .consumer_schemas()
+                    .iter()
+                    .map(|schema| schema.name.as_str().to_owned())
+                    .collect()
+            },
+        ),
     }
 }
 
@@ -234,27 +236,27 @@ fn build_node_capabilities_descriptor(
     )
 }
 
-/// Reads the latest visible block and encodes the native wallet response.
-pub async fn latest_block_response<Q: WalletQueryApi + ?Sized>(
+/// Reads the visible-tip block and encodes the native wallet response.
+pub async fn visible_tip_block_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     at_epoch_id: Option<ChainEpochId>,
-) -> Result<wallet::LatestBlockResponse, QueryError> {
+) -> Result<wallet::VisibleTipBlockResponse, QueryError> {
     query_api
-        .latest_block(at_epoch_id)
+        .visible_tip_block(at_epoch_id)
         .await
-        .map(build_latest_block_response)
+        .map(build_visible_tip_block_response)
 }
 
 /// Reads the block at the chain epoch's settled tip and encodes the native
 /// wallet response.
-pub(super) async fn latest_safe_block_response<Q: WalletQueryApi + ?Sized>(
+pub(super) async fn settled_tip_block_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     at_epoch_id: Option<ChainEpochId>,
-) -> Result<wallet::LatestSafeBlockResponse, QueryError> {
+) -> Result<wallet::SettledTipBlockResponse, QueryError> {
     query_api
-        .latest_safe_block(at_epoch_id)
+        .settled_tip_block(at_epoch_id)
         .await
-        .map(build_latest_safe_block_response)
+        .map(build_settled_tip_block_response)
 }
 
 /// Aggregates the chain-wide transparent UTXO set at the settled tip and
@@ -628,44 +630,46 @@ fn build_transparent_unspent_outputs_by_outpoint_response(
     }
 }
 
-fn build_latest_block_response(latest_block: LatestBlock) -> wallet::LatestBlockResponse {
-    wallet::LatestBlockResponse {
-        chain_view: Some(build_chain_view_message(latest_block.chain_epoch)),
-        latest_block: Some(build_block_metadata_message(
-            latest_block.height,
-            latest_block.block_hash,
+fn build_visible_tip_block_response(
+    visible_tip_block: VisibleTipBlock,
+) -> wallet::VisibleTipBlockResponse {
+    wallet::VisibleTipBlockResponse {
+        chain_view: Some(build_chain_view_message(visible_tip_block.chain_epoch)),
+        visible_tip_block: Some(build_block_id_message(
+            visible_tip_block.height,
+            visible_tip_block.block_hash,
         )),
     }
 }
 
-fn build_latest_safe_block_response(
-    safe_block: LatestSafeBlock,
-) -> wallet::LatestSafeBlockResponse {
-    wallet::LatestSafeBlockResponse {
-        chain_view: Some(build_chain_view_message(safe_block.chain_epoch)),
-        settled_tip_block: Some(build_block_metadata_message(
-            safe_block.height,
-            safe_block.block_hash,
+fn build_settled_tip_block_response(
+    settled_tip_block: SettledTipBlock,
+) -> wallet::SettledTipBlockResponse {
+    wallet::SettledTipBlockResponse {
+        chain_view: Some(build_chain_view_message(settled_tip_block.chain_epoch)),
+        settled_tip_block: Some(build_block_id_message(
+            settled_tip_block.height,
+            settled_tip_block.block_hash,
         )),
     }
 }
 
-fn build_block_id_response(response: BlockIdResponseValue) -> wallet::BlockIdResponse {
+fn build_block_id_response(response: BlockIdAtEpoch) -> wallet::BlockIdResponse {
     wallet::BlockIdResponse {
         chain_view: Some(build_chain_view_message(response.chain_epoch)),
-        block_id: Some(build_block_metadata_message(
+        block_id: Some(build_block_id_message(
             response.block_id.height,
             response.block_id.hash,
         )),
     }
 }
 
-fn build_block_header_response(response: &BlockHeaderResponseValue) -> wallet::BlockHeaderResponse {
+fn build_block_header_response(response: &BlockHeaderAtEpoch) -> wallet::BlockHeaderResponse {
     let header = &response.block_header;
     wallet::BlockHeaderResponse {
         chain_view: Some(build_chain_view_message(response.chain_epoch)),
-        block_header: Some(wallet::BlockHeaderInfo {
-            block_id: Some(build_block_metadata_message(
+        block_header: Some(wallet::BlockHeader {
+            block_id: Some(build_block_id_message(
                 header.block_id.height,
                 header.block_id.hash,
             )),
@@ -706,7 +710,9 @@ fn build_transaction_status_response(
         TxStatus::Mined(mined) => {
             wallet::transaction_location::Location::Mined(wallet::MinedTransaction {
                 location: Some(build_mined_block_location_message(mined.location)),
-                details: Some(build_mined_details_message(mined.details)),
+                chain_context: Some(build_mined_transaction_chain_context_message(
+                    mined.chain_context,
+                )),
                 raw_transaction_bytes: mined.raw_transaction_bytes,
             })
         }
@@ -717,9 +723,6 @@ fn build_transaction_status_response(
                     .unwrap_or(i64::MAX),
             })
         }
-        TxStatus::ConflictingChain => wallet::transaction_location::Location::Conflicting(
-            wallet::ConflictingChainTransaction {},
-        ),
         TxStatus::NotFound => return Ok(None),
         _ => {
             return Err(QueryError::UnsupportedTransactionStatus {
@@ -735,11 +738,13 @@ fn build_transaction_status_response(
     }))
 }
 
-fn build_mined_details_message(details: MinedDetails) -> wallet::MinedDetails {
-    wallet::MinedDetails {
-        consensus_branch_id: details.consensus_branch_id.value(),
-        block_time: details.block_time,
-        confirmations: details.confirmations,
+fn build_mined_transaction_chain_context_message(
+    chain_context: MinedTransactionChainContext,
+) -> wallet::MinedTransactionChainContext {
+    wallet::MinedTransactionChainContext {
+        consensus_branch_id: chain_context.consensus_branch_id.value(),
+        block_time: chain_context.block_time,
+        confirmations: chain_context.confirmations,
     }
 }
 
@@ -779,32 +784,32 @@ fn build_subtree_roots_response(
 }
 
 fn build_broadcast_transaction_response(
-    broadcast_result: TransactionBroadcastResult,
+    broadcast_outcome: TransactionBroadcastOutcome,
 ) -> wallet::BroadcastTransactionResponse {
     use wallet::broadcast_transaction_response::Outcome;
 
-    let outcome = match broadcast_result {
-        TransactionBroadcastResult::Accepted(accepted) => {
+    let outcome = match broadcast_outcome {
+        TransactionBroadcastOutcome::Accepted(accepted) => {
             Outcome::Accepted(build_broadcast_accepted_message(accepted))
         }
-        TransactionBroadcastResult::Duplicate(duplicate) => {
+        TransactionBroadcastOutcome::Duplicate(duplicate) => {
             Outcome::Duplicate(build_broadcast_duplicate_message(duplicate))
         }
-        TransactionBroadcastResult::InvalidEncoding(invalid_encoding) => {
+        TransactionBroadcastOutcome::InvalidEncoding(invalid_encoding) => {
             Outcome::InvalidEncoding(build_broadcast_invalid_encoding_message(invalid_encoding))
         }
-        TransactionBroadcastResult::Queued(queued) => {
+        TransactionBroadcastOutcome::Queued(queued) => {
             Outcome::Queued(build_broadcast_queued_message(queued))
         }
-        TransactionBroadcastResult::Rejected(rejected) => {
+        TransactionBroadcastOutcome::Rejected(rejected) => {
             Outcome::Rejected(build_broadcast_rejected_message(rejected))
         }
-        TransactionBroadcastResult::Unknown(unknown) => {
+        TransactionBroadcastOutcome::Unknown(unknown) => {
             Outcome::Unknown(build_broadcast_unknown_message(unknown))
         }
         _ => Outcome::Unknown(wallet::BroadcastUnknown {
             error_code: None,
-            message: "unknown transaction broadcast result variant".to_owned(),
+            message: "unknown transaction broadcast outcome variant".to_owned(),
         }),
     };
 
@@ -903,11 +908,11 @@ fn map_chain_event_encode_error(error: ChainEventEncodeError) -> QueryError {
     }
 }
 
-fn build_block_metadata_message(
+fn build_block_id_message(
     height: BlockHeight,
     block_hash: zinder_core::BlockHash,
-) -> wallet::BlockMetadata {
-    wallet::BlockMetadata {
+) -> wallet::BlockId {
+    wallet::BlockId {
         height: height.value(),
         block_hash: encode_rpc_block_hash_hex(block_hash),
     }
@@ -964,7 +969,10 @@ mod server_info_tests {
         WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
     };
 
-    use super::{ServerInfoSettings, UpstreamNodeCapabilities, build_wallet_server_info};
+    use super::{
+        MaterializedViewPreset, ServerInfoSettings, UpstreamNodeCapabilities,
+        build_wallet_server_info,
+    };
 
     #[test]
     fn build_wallet_server_info_populates_node_when_upstream_known() {
@@ -989,26 +997,29 @@ mod server_info_tests {
         };
         assert_eq!(common.service_name, env!("CARGO_PKG_NAME"));
         assert!(!common.capabilities.is_empty());
-        assert_eq!(common.projection_preset, "explorer");
-        assert!(!common.projection_identities.is_empty());
+        assert!(common.materialized_view_preset.is_empty());
+        assert!(common.materialized_view_identities.is_empty());
     }
 
     #[test]
     fn server_info_reports_the_effective_wallet_workload() {
         let settings = ServerInfoSettings {
-            projection_preset: "wallet".to_owned(),
-            projection_identities: vec![
-                "transparent_address_transaction_history".to_owned(),
-                "transparent_outpoint_spend".to_owned(),
-            ],
+            materialized_view_preset: Some(MaterializedViewPreset::Wallet),
             ..ServerInfoSettings::default()
         };
         let common = build_wallet_server_info(&settings)
             .common
             .unwrap_or_default();
 
-        assert_eq!(common.projection_preset, "wallet");
-        assert_eq!(common.projection_identities, settings.projection_identities);
+        assert_eq!(common.materialized_view_preset, "wallet");
+        assert_eq!(
+            common.materialized_view_identities,
+            MaterializedViewPreset::Wallet
+                .consumer_schemas()
+                .iter()
+                .map(|schema| schema.name.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1071,15 +1082,11 @@ mod server_info_tests {
     }
 
     #[test]
-    fn server_info_gates_wallet_projection_capabilities_on_availability() {
-        let capabilities = build_wallet_server_info(&ServerInfoSettings {
-            transparent_address_history_available: false,
-            transparent_outpoint_spend_available: false,
-            ..ServerInfoSettings::default()
-        })
-        .common
-        .map(|common| common.capabilities)
-        .unwrap_or_default();
+    fn server_info_defaults_do_not_advertise_unwired_wallet_projections() {
+        let capabilities = build_wallet_server_info(&ServerInfoSettings::default())
+            .common
+            .map(|common| common.capabilities)
+            .unwrap_or_default();
         assert!(!advertises(
             &capabilities,
             WALLET_ADDRESS_TRANSPARENT_HISTORY_V1

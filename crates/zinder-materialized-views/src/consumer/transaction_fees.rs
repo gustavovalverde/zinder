@@ -73,8 +73,7 @@ pub const TRANSACTION_FEES_SCHEMA: MaterializedViewConsumerSchema =
         TRANSACTION_FEES_CONSUMER_NAME,
         2,
         TRANSACTION_FEES_COLUMN_FAMILIES,
-    )
-    .with_row_compatible_versions(&[1]);
+    );
 
 const TXID_LEN: usize = 32;
 
@@ -89,14 +88,14 @@ impl TransactionFeesConsumer {
         Self
     }
 
-    /// Returns the safe [`TransactionFeesRecord`] for `transaction_id`, when
-    /// one was materialized.
+    /// Returns the servable [`TransactionFeesRecord`] for `transaction_id`,
+    /// when one was materialized.
     ///
-    /// Schema-1 rows may contain a transparent value delta in `paid_fee_zat`
-    /// for shielding or mixed transactions. Requiring the independently
-    /// classified `privacy_shape` lets this reader suppress that legacy value
-    /// before it crosses the materialized-view boundary. Handlers never receive an
-    /// unsanitized stored record.
+    /// `paid_fee_zat` is provable only for an independently classified
+    /// [`PrivacyShape::TransparentOnly`] transaction. Requiring `privacy_shape`
+    /// lets this reader suppress an unprovable fee before it crosses the
+    /// materialized-view boundary. Handlers never receive an unservable stored
+    /// record.
     pub fn read_fees_record(
         store: &crate::store::MaterializedViewStore,
         transaction_id: TransactionId,
@@ -111,7 +110,7 @@ impl TransactionFeesConsumer {
             .map(|record| record_with_provable_paid_fee(record, privacy_shape)))
     }
 
-    /// Batch-reads safe fee records for transaction ids and their independently
+    /// Batch-reads servable fee records for transaction ids and their independently
     /// classified privacy shapes. Issues one `multi_get_cf` so the read path
     /// avoids N seeks for an N-transaction page.
     pub fn read_fees_records_many(
@@ -147,7 +146,7 @@ impl TransactionFeesConsumer {
 
     /// Resolves fee records from retained canonical transaction facts.
     ///
-    /// This is the non-destructive fallback for a missing or partial projection
+    /// This is the non-destructive fallback for a missing or partial materialized-view
     /// row. Parent transaction facts retain the output value, script hash, and
     /// mining location needed to reconstruct each spend even after the
     /// short-lived transparent-output and transparent-spend projections have
@@ -193,7 +192,7 @@ impl TransactionFeesConsumer {
     ///
     /// Values are matched by transparent input index. A resolved value from
     /// either source wins over absence, so a partial fallback never discards a
-    /// value the projection retained. The paid fee is recomputed only when the
+    /// value the materialized view retained. The paid fee is recomputed only when the
     /// merged input set is complete and the transaction is transparent-only.
     #[must_use]
     pub fn merge_fee_records(
@@ -323,7 +322,7 @@ impl BlockKeyedConsumer for TransactionFeesConsumer {
         block: &BlockCommitContext,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let transparent_spends = block.transparent_spends()?;
+        let transparent_spends = block.transparent_spends();
         let fees_cf = ctx
             .store
             .consumer_column_family(TRANSACTION_FEES_COLUMN_FAMILY)?;
@@ -648,8 +647,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_one_shielding_fee_is_suppressed_at_read_boundary() {
-        let legacy_record = TransactionFeesRecord {
+    fn non_transparent_paid_fee_is_suppressed_at_read_boundary() {
+        let stored_record = TransactionFeesRecord {
             paid_fee_zat: Some(TRANSPARENT_INPUT_VALUE_ZAT),
             prevout_resolution_status: PrevoutResolutionStatus::Resolved as i32,
             transparent_inputs: vec![TransparentInputValueRecord {
@@ -659,7 +658,7 @@ mod tests {
             logical_actions: 2,
         };
 
-        let record = record_with_provable_paid_fee(legacy_record, PrivacyShape::Shielding);
+        let record = record_with_provable_paid_fee(stored_record, PrivacyShape::Shielding);
 
         assert_eq!(record.paid_fee_zat, None);
         assert_eq!(record.transparent_inputs[0].value_zat, Some(50_000));
@@ -670,15 +669,15 @@ mod tests {
     }
 
     #[test]
-    fn schema_one_transparent_fee_remains_available_at_read_boundary() {
-        let legacy_record = TransactionFeesRecord {
+    fn transparent_only_paid_fee_remains_available_at_read_boundary() {
+        let stored_record = TransactionFeesRecord {
             paid_fee_zat: Some(10_000),
             prevout_resolution_status: PrevoutResolutionStatus::Resolved as i32,
             transparent_inputs: Vec::new(),
             logical_actions: 1,
         };
 
-        let record = record_with_provable_paid_fee(legacy_record, PrivacyShape::TransparentOnly);
+        let record = record_with_provable_paid_fee(stored_record, PrivacyShape::TransparentOnly);
 
         assert_eq!(record.paid_fee_zat, Some(10_000));
     }
@@ -735,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn merging_recovery_keeps_value_resolved_only_in_projection() {
+    fn merging_recovery_keeps_value_resolved_only_in_materialized_view() {
         let counts = TransactionComponentCounts {
             transparent_input_count: 1,
             transparent_output_count: 1,

@@ -18,7 +18,7 @@ use zinder_proto::v1::explorer::{
     TransparentAddressDeltasEntry, TransparentAddressDeltasRecord, TransparentAddressDeltasRequest,
     TransparentAddressDeltasResponse,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_transparent_delta_kind;
 use zinder_runtime::AuthenticatedChannel;
 
@@ -46,7 +46,7 @@ const KIND_OFFSET: usize = HEIGHT_KEY_END + 4;
 const DELTAS_KEY_LEN: usize = zinder_materialized_views::TRANSPARENT_ADDRESS_DELTAS_KEY_LEN;
 
 /// Executes one `ExplorerQuery.TransparentAddressDeltas` request.
-pub(crate) async fn handle_transparent_address_deltas(
+pub(crate) async fn query_transparent_address_deltas(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: Network,
@@ -74,14 +74,14 @@ pub(crate) async fn handle_transparent_address_deltas(
         },
     )?;
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,

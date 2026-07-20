@@ -15,7 +15,7 @@
 //! The consumer derives spender identity from the child transaction's intrinsic
 //! input and mined location, not from the parent output or the short-lived
 //! canonical spend-fact row. This keeps checkpoint-crossing spends observable
-//! and lets a scoped schema rebuild replay durable transaction facts. The
+//! and supplies durable transaction facts for a fresh-store schema rebuild. The
 //! retention sweep still releases canonical spend facts only after this
 //! projection durably materializes the corresponding height.
 
@@ -29,13 +29,13 @@ use zinder_core::wire::{
 use zinder_core::{BlockHeight, TransparentOutPoint, TransparentSpendEntry, TransparentSpendFact};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, BlockProjectionCheckpoint, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
-    advance_verified_projection_coverage,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockCheckpoint,
+    MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
+    MaterializedViewConsumerSchema, advance_verified_materialized_view_coverage,
 };
 use crate::error::{MaterializedViewStoreColumnFamily, MaterializedViewStoreError};
 use crate::store::{
-    ConsumerProjectionState, MaterializedViewStore, MaterializedViewStoreReadSnapshot,
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreReadSnapshot,
 };
 use zinder_store::ChainEvent;
 
@@ -234,29 +234,29 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
 
     fn stage_chain_event_checkpoint(
         &mut self,
-        checkpoint: BlockProjectionCheckpoint<'_>,
+        checkpoint: MaterializedViewBlockCheckpoint<'_>,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let projection_tip_height = checkpoint
-            .projection_tip_height
-            .ok_or(TransparentOutpointSpendConsumerError::IncompleteProjectionCheckpoint)?;
-        let projection_tip_hash = checkpoint
-            .projection_tip_hash
-            .ok_or(TransparentOutpointSpendConsumerError::IncompleteProjectionCheckpoint)?;
+        let tip_height = checkpoint
+            .tip_height
+            .ok_or(TransparentOutpointSpendConsumerError::IncompleteMaterializedViewCheckpoint)?;
+        let tip_hash = checkpoint
+            .tip_hash
+            .ok_or(TransparentOutpointSpendConsumerError::IncompleteMaterializedViewCheckpoint)?;
         let current = ctx
             .store
-            .consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?;
+            .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?;
         // Re-applying an earlier committed chunk must not regress coverage a
         // later chunk has already made durable.
         if let Some(state) = current
             && matches!(checkpoint.chain_event, ChainEvent::ChainCommitted { .. })
-            && projection_tip_height < state.projection_tip_height
+            && tip_height < state.tip_height
         {
             return Ok(());
         }
         let revision = current
             .map_or(Some(1), |state| state.revision.checked_add(1))
-            .ok_or(TransparentOutpointSpendConsumerError::ProjectionRevisionOverflow)?;
+            .ok_or(TransparentOutpointSpendConsumerError::MaterializedViewRevisionOverflow)?;
         let initial_complete_from = match checkpoint.chain_event {
             ChainEvent::ChainCommitted { committed }
             | ChainEvent::ChainReorged { committed, .. }
@@ -266,20 +266,20 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
             }
             ChainEvent::ChainCommitted { .. } | ChainEvent::ChainReorged { .. } | _ => None,
         };
-        let coverage = advance_verified_projection_coverage(
+        let coverage = advance_verified_materialized_view_coverage(
             current.and_then(|state| state.coverage),
             checkpoint,
-            projection_tip_height,
-            projection_tip_hash,
+            tip_height,
+            tip_hash,
             initial_complete_from,
         );
-        ctx.store.stage_consumer_projection_state(
+        ctx.store.stage_consumer_state(
             ctx.batch,
             TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
-            ConsumerProjectionState {
-                projection_epoch_id: checkpoint.chain_epoch.id,
-                projection_tip_height,
-                projection_tip_hash,
+            MaterializedViewState {
+                chain_epoch_id: checkpoint.chain_epoch.id,
+                tip_height,
+                tip_hash,
                 revision,
                 coverage,
             },
@@ -396,10 +396,10 @@ mod tests {
         TRANSPARENT_OUTPOINT_SPEND_SCHEMA, TransparentOutpointSpendConsumer,
     };
     use crate::consumer::block_commit_context::{
-        BlockCommitContext, BlockCommitPayload, TransparentSpendFacts,
+        BlockCommitContext, BlockCommitInput, TransparentSpendFacts,
     };
     use crate::consumer::{
-        BlockKeyedConsumer, BlockProjectionCheckpoint, MaterializedViewConsumerCtx,
+        BlockKeyedConsumer, MaterializedViewBlockCheckpoint, MaterializedViewConsumerCtx,
     };
     use crate::store::{MaterializedViewStore, MaterializedViewStoreOptions};
 
@@ -483,7 +483,7 @@ mod tests {
                 Vec::new(),
             );
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: SPEND_HEIGHT,
                 block_hash: block_hash(5),
                 previous_block_hash: block_hash(4),
@@ -508,7 +508,7 @@ mod tests {
                 Vec::new(),
             );
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: BlockHeight::new(106),
                 block_hash: block_hash(6),
                 previous_block_hash: block_hash(5),
@@ -570,18 +570,18 @@ mod tests {
             batch: &mut batch,
         };
         TransparentOutpointSpendConsumer::new().stage_chain_event_checkpoint(
-            BlockProjectionCheckpoint {
+            MaterializedViewBlockCheckpoint {
                 chain_epoch: epoch,
                 chain_event: &event,
-                projection_tip_height: Some(tip),
-                projection_tip_hash: Some(tip_hash),
+                tip_height: Some(tip),
+                tip_hash: Some(tip_hash),
             },
             &mut ctx,
         )?;
         store.write_batch(&batch)?;
 
         let state = store
-            .consumer_projection_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?
+            .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?
             .ok_or("projection state missing")?;
         let coverage = state.coverage.ok_or("projection coverage missing")?;
         assert_eq!(coverage.complete_from_height, BlockHeight::new(100));
@@ -759,10 +759,10 @@ pub enum TransparentOutpointSpendConsumerError {
         /// Byte length actually persisted.
         bytes: usize,
     },
-    /// A dispatch omitted one or more block contexts required by the projection.
-    #[error("transparent-outpoint-spend projection checkpoint is missing its indexed tip")]
-    IncompleteProjectionCheckpoint,
-    /// Projection-state revision exhausted its integer domain.
-    #[error("transparent-outpoint-spend projection revision overflowed")]
-    ProjectionRevisionOverflow,
+    /// A dispatch omitted one or more block contexts required by the consumer.
+    #[error("transparent-outpoint-spend materialized-view checkpoint is missing its indexed tip")]
+    IncompleteMaterializedViewCheckpoint,
+    /// Materialized-view revision exhausted its integer domain.
+    #[error("transparent-outpoint-spend materialized-view revision overflowed")]
+    MaterializedViewRevisionOverflow,
 }

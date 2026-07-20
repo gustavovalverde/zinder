@@ -12,7 +12,7 @@ use zinder_explorer::{
     MaterializedViewStoreError, MaterializedViewStoreOptions, describe_request_metrics,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, Readiness, ReadinessState, ServiceIdentifier, StartupPhase,
+    OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
     spawn_ops_endpoint_for,
 };
@@ -148,7 +148,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             return Err(error);
         }
     };
-    report_projection_workload(&readiness, materialized_view_store.as_ref());
+    report_materialized_view_workload(&readiness, materialized_view_store.as_ref());
 
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
@@ -169,7 +169,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
 
     let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::Explorer,
+        RuntimeService::Explorer,
         explorer_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(explorer_config.network),
@@ -213,18 +213,18 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     server_result.map_err(ExplorerConfigError::Transport)
 }
 
-fn report_projection_workload(
+fn report_materialized_view_workload(
     readiness: &Readiness,
     materialized_view_store: Option<&MaterializedViewStore>,
 ) {
-    let Some(projection_preset) =
-        materialized_view_store.map(MaterializedViewStore::effective_projection_preset)
+    let Some(materialized_view_preset) =
+        materialized_view_store.map(MaterializedViewStore::effective_materialized_view_preset)
     else {
         return;
     };
-    readiness.set_projection_workload(
-        projection_preset.as_str(),
-        projection_preset
+    readiness.set_materialized_view_workload(
+        materialized_view_preset.as_str(),
+        materialized_view_preset
             .consumer_schemas()
             .iter()
             .map(|schema| schema.name.as_str().to_owned())
@@ -335,39 +335,40 @@ fn open_materialized_view_store(
         .secondary_path
         .join("materialized-views");
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let projection_preset = match MaterializedViewStore::detect_projection_preset_at_path(
-        &materialized_view_path,
-    ) {
-        Ok(Some(projection_preset)) => projection_preset,
-        Ok(None) => {
-            tracing::info!(
-                target: "zinder::explorer",
-                event = "materialized_view_store_unavailable",
-                "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
-            );
-            open_storage_phase.complete();
-            return Ok(None);
-        }
-        Err(error @ MaterializedViewStoreError::Open { .. }) => {
-            tracing::info!(
-                target: "zinder::explorer",
-                event = "materialized_view_store_unavailable",
-                error = %error,
-                "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
-            );
-            open_storage_phase.complete();
-            return Ok(None);
-        }
-        Err(error) => {
-            let wrapped = ExplorerConfigError::Store(error);
-            open_storage_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
-    match MaterializedViewStore::open_secondary_with_projection_preset(
+    let materialized_view_preset =
+        match MaterializedViewStore::detect_materialized_view_preset_at_path(
+            &materialized_view_path,
+        ) {
+            Ok(Some(materialized_view_preset)) => materialized_view_preset,
+            Ok(None) => {
+                tracing::info!(
+                    target: "zinder::explorer",
+                    event = "materialized_view_store_unavailable",
+                    "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
+                );
+                open_storage_phase.complete();
+                return Ok(None);
+            }
+            Err(error @ MaterializedViewStoreError::Open { .. }) => {
+                tracing::info!(
+                    target: "zinder::explorer",
+                    event = "materialized_view_store_unavailable",
+                    error = %error,
+                    "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
+                );
+                open_storage_phase.complete();
+                return Ok(None);
+            }
+            Err(error) => {
+                let wrapped = ExplorerConfigError::Store(error);
+                open_storage_phase.fail(&wrapped);
+                return Err(wrapped);
+            }
+        };
+    match MaterializedViewStore::open_secondary_with_materialized_view_preset(
         &materialized_view_path,
         &secondary_path,
-        projection_preset,
+        materialized_view_preset,
         MaterializedViewStoreOptions {
             sync_writes: false,
             rocksdb_resource_budget: explorer_config.storage.materialized_view_rocksdb_budget,

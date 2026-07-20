@@ -13,15 +13,15 @@ Zinder has three event boundaries with different jobs:
 | -------- | -------- | -------- | ------- |
 | Source observations | `NodeSource` adapter | `zinder-ingest` | Report upstream node observations before canonical commit |
 | `ChainEvent` | `zinder-ingest` | ingest-owned publisher and private subscription endpoint | Describe the committed canonical transition |
-| `ChainEventEnvelope` | ingest subscription plane | `zinder-query`, `zinder-client`, `zinder-explorer`, and external derived consumers | Carry replayable, cursor-bound chain events over the wire |
+| `ChainEventEnvelope` | ingest subscription plane | native adapters using `zinder-query`, `zinder-client`, `zinder-explorer`, and external derived consumers | Carry replayable, cursor-bound chain events over the wire |
 
 Keep these layers distinct. A source observation is not a committed chain event. A wire envelope is not the internal state-machine event.
 
 ## Source Boundary
 
-`NodeSource` normalizes Zebra ReadState, zcashd JSON-RPC, and future streaming sources into source observations. It does not decide canonical state and does not build artifacts. Trait shape, capability model, and adapter rules live in [Node source boundary](node-source-boundary.md).
+`NodeSource` normalizes configured upstream adapters into source observations. It does not decide canonical state and does not build artifacts. Trait shape, capability model, and adapter rules live in [Node source boundary](node-source-boundary.md).
 
-For the event model: source observations are not committed chain events. A streaming follower will introduce explicit `chain_source_events` plus resume cursors when that backend lands; until then ingest drives the source through async polling. Best-chain selection uses cumulative chainwork, not tip height.
+For the event model: source observations are not committed chain events. Ingest drives the source through async polling. Best-chain selection uses cumulative chainwork, not tip height.
 
 ## Ingest State Machine
 
@@ -65,8 +65,8 @@ The replacement range must start at the first height where the old visible branc
 
 Reject the name `ReorgTooDeep`. It describes a symptom. `ReorgWindowExceeded` names the configured boundary that was violated.
 
-The unified ingest loop's `TipFollow` phase is the only producer of
-`ReorgWindowChange::Replace`; the `BulkCatchup` phase only appends and finalizes
+The phase-driven ingest loop's `TipFollow` phase is the only producer of
+`ReorgWindowChange::Replace`; the `BulkCatchup` phase only appends and settles
 already-stable ranges outside the reorg window.
 
 ## Wire Event Envelope
@@ -87,7 +87,7 @@ The envelope carries the cross-plane `ChainView` at field tag 3. The Substreams 
 
 The wallet-facing exposure of this envelope is settled by [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription): the same `ChainEventEnvelope` shape is published as a `zinder.v1.wallet` proto message and streamed by `WalletQuery.ChainEvents`. The cursor crosses the wire as opaque bytes so wallet clients persist the exact bytes they received and replay strictly after them on reconnect.
 
-The cursor body is not decorative state. `event_sequence` is the resume key, and the locator's `(height, hash)` pairs resolve the fork point against the canonical block index across reconnect. If future stream families add cursor fields that are not immediately consumed, the field must be documented as reserved in the stream-specific contract before it is serialized.
+The cursor body is not decorative state. `event_sequence` is the resume key, and the locator's `(height, hash)` pairs resolve the fork point against the canonical block index across reconnect. Every serialized cursor field belongs to its stream-specific contract; a field that is not consumed must be documented as reserved before serialization.
 
 ## Address Filters
 
@@ -101,9 +101,9 @@ The cursor body is not decorative state. `event_sequence` is the resume key, and
 
 ## Resume Semantics
 
-Ingest-hosted derived consumers resume through
+Library-hosted derived consumers resume through
 `chain_event_history(ChainEventHistoryRequest { from_cursor, max_events })`
-during startup repair. `zinder-ingest` reads the lowest durable materialized-view cursor,
+during startup repair. The replay host reads the lowest durable materialized-view cursor,
 replays retained events after that cursor, and dispatches each event through
 `zinder_materialized_views::MaterializedViewStore::write_chain_event`. The materialized-view store persists each
 cursor advance atomically with consumer writes. Fresh consumers whose persisted
@@ -128,10 +128,10 @@ Rules:
 
 `StreamCursorTokenV1`'s `flags` byte carries a family code in the lower nibble (per [Chain events §Cursor varieties](chain-events.md#cursor-varieties)). Two `ChainEvents` family codes are active:
 
-- **`0x0` `ChainEventTip`** — receives every `ChainCommitted` and `ChainReorged` envelope. Default for wallet consumers; clients must handle reorgs.
-- **`0x1` `ChainEventSafe`** — receives only envelopes whose `chain_epoch.tip_height <= settled_tip_height`. Never receives `ChainReorged`, including the synthesized reconnect reorg: a `Safe` cursor cannot be reorged out below the settled tip by definition, so a locator miss on a `Safe` cursor is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Safe` and `start = earliest_retained` ([ADR-0027](../adrs/0027-event-stream-start-positions.md)).
+- **`0x0` `ChainEventVisible`** — receives every `ChainCommitted` and `ChainReorged` envelope. Default for wallet consumers; clients must handle reorgs.
+- **`0x1` `ChainEventSettled`** — receives only non-reorg commits whose full range is at or below the settled tip. A `Settled` cursor cannot be reorged out below the settled tip by definition, so a locator miss is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Settled` and `start = earliest_retained` ([ADR-0027](../adrs/0027-event-stream-start-positions.md)).
 
-Future stream families (`Mempool`, `Derive`) are reserved in the family-code table but use parallel cursor body types under their own contracts.
+Only the active `ChainEvents` family codes are defined here.
 
 Do not use `epoch_history(from)` as the durable API name. It hides reorgs. Use `chain_event_history` or an explicitly equivalent gRPC name because consumers are replaying events, not only listing epochs.
 
@@ -154,8 +154,6 @@ Use these errors at the event and source boundaries:
 | `EventCursorExpired` | `ChainEpochReadApi` | The event cursor is older than retained event history |
 | `EventCursorInvalid` | `ChainEpochReadApi` | The cursor fails authentication, network, store, or stream-family validation |
 
-The streaming follower will reintroduce typed source-cursor and source-gap errors when the streaming method lands. Until then, those failure modes do not exist at the source boundary.
-
 Internal storage errors still map to API errors at service boundaries: `ChainEpochMissing` maps to `EpochNotFound`, and `ArtifactMissing` maps to `ArtifactUnavailable`.
 
 ## Retention And Backpressure
@@ -164,7 +162,6 @@ Internal storage errors still map to API errors at service boundaries: `ChainEpo
 
 Event streams must be bounded:
 
-- The future streaming source method applies backpressure to source adapters.
 - `ChainEventEnvelope` streams apply backpressure to `zinder-query` and `zinder-explorer`.
 - A slow consumer must not block `commit_chain_epoch`.
 - If a consumer exceeds retention, the system returns `EventCursorExpired` and requires replay from checkpoint or canonical artifacts.

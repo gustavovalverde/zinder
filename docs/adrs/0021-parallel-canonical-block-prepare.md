@@ -67,7 +67,7 @@ after including the block that reaches 2,048 inputs, or at the
 prepare-concurrency width. This bounds added latency without turning a dense
 two-block RocksDB request back into two single-block requests.
 
-The same concurrency vocabulary applies to materialized-view replay only when replay is
-hydrating typed canonical block contexts. Materialized-view replay has separate
-`ingest.materialized_views.replay_*` limits because it is rebuildable projection work, not
-canonical ingest work.
+Reusable materialized-view replay applies its own programmatic limits when it
+hydrates typed canonical block contexts. Those limits do not belong to the
+`zinder-ingest` executable configuration because that runtime does not compose
+the replay host.

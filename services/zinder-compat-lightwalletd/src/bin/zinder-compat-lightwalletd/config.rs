@@ -9,26 +9,29 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
-use zinder_materialized_views::MaterializedViewStoreError;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, ConfigError, ConfigLoader, IngestControlReaderToml,
-    IngestControlSection, NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml,
-    ResolvedIngestControlReader, ResolvedSecondaryStorage, SecondaryStorageSection,
-    SecondaryStorageToml, SecuritySection, SecurityToml, ServiceIdentifier,
-    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
-    resolve_allow_public_bind, resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_secondary_storage,
+    BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
+    ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
+    NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
+    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
+    RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
+    parse_socket_addr, require_field, resolve_allow_public_bind,
+    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_wallet_projection_reader_rocksdb_budget,
 };
 use zinder_source::{NodeSection, NodeTarget};
-use zinder_store::{CanonicalReorgPolicy, CanonicalStoreBuildPlanError, StoreError};
+use zinder_store::{
+    CanonicalReorgPolicy, CanonicalStoreBuildPlanError, RocksDbResourceBudget, StoreError,
+};
 
 /// Resolved lightwalletd compatibility runtime configuration.
 #[derive(Clone, Debug)]
 pub(crate) struct LightwalletdConfig {
     pub(crate) network: Network,
-    pub(crate) storage: ResolvedSecondaryStorage,
+    pub(crate) storage: ResolvedCanonicalSecondaryStorage,
     pub(crate) wallet_primary_path: PathBuf,
     pub(crate) wallet_secondary_root: PathBuf,
+    pub(crate) wallet_rocksdb_budget: RocksDbResourceBudget,
     pub(crate) ingest_control_addr: String,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
@@ -66,9 +69,6 @@ pub(crate) enum LightwalletdConfigError {
     Store(#[from] StoreError),
 
     #[error(transparent)]
-    MaterializedViewStore(#[from] MaterializedViewStoreError),
-
-    #[error(transparent)]
     CanonicalStore(#[from] zinder_store::CanonicalStoreError),
 
     #[error(transparent)]
@@ -104,7 +104,7 @@ pub(crate) fn load_lightwalletd_config(
     let raw_config: LightwalletdRawConfig = ConfigLoader::new()
         .with_default("compat.listen_addr", "127.0.0.1:9067")?
         .with_default("compat.reorg_window_blocks", 100_u32)?
-        .with_ops_section(ServiceIdentifier::CompatLightwalletd)?
+        .with_ops_section(RuntimeService::CompatLightwalletd)?
         .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?
@@ -147,7 +147,7 @@ pub(crate) fn lightwalletd_config_toml(
 struct LightwalletdRawConfig {
     network: NetworkSection,
     ops: OpsSection,
-    storage: SecondaryStorageSection,
+    storage: CanonicalSecondaryStorageSection,
     wallet: WalletSection,
     ingest_control: IngestControlSection,
     compat: CompatSection,
@@ -168,16 +168,19 @@ struct CompatSection {
 struct WalletSection {
     path: Option<PathBuf>,
     secondary_path: Option<PathBuf>,
+    rocksdb: RocksDbResourceBudgetSection,
 }
 
 fn resolve_lightwalletd_config(
     config: LightwalletdRawConfig,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
     let network = config.network.resolve()?;
-    let storage = resolve_secondary_storage(config.storage)?;
+    let storage = resolve_canonical_secondary_storage(config.storage)?;
     let wallet_primary_path = require_field(config.wallet.path, "wallet.path")?;
     let wallet_secondary_root =
         require_field(config.wallet.secondary_path, "wallet.secondary_path")?;
+    let wallet_rocksdb_budget =
+        resolve_wallet_projection_reader_rocksdb_budget(config.wallet.rocksdb)?;
     require_distinct_storage_paths(
         &storage.path,
         &storage.secondary_path,
@@ -209,6 +212,7 @@ fn resolve_lightwalletd_config(
         storage,
         wallet_primary_path,
         wallet_secondary_root,
+        wallet_rocksdb_budget,
         ingest_control_addr,
         ingest_control_bearer_token_path,
         ingest_control_bearer_token,
@@ -226,7 +230,7 @@ struct LightwalletdConfigToml {
     network: NetworkToml,
     ops: OpsToml,
     security: SecurityToml,
-    storage: SecondaryStorageToml,
+    storage: CanonicalSecondaryStorageToml,
     wallet: WalletToml,
     ingest_control: IngestControlReaderToml,
     compat: CompatToml,
@@ -240,10 +244,11 @@ impl LightwalletdConfigToml {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
-            storage: SecondaryStorageToml::from_resolved(&config.storage),
+            storage: CanonicalSecondaryStorageToml::from_resolved(&config.storage),
             wallet: WalletToml {
                 path: config.wallet_primary_path.clone(),
                 secondary_path: config.wallet_secondary_root.clone(),
+                rocksdb: RocksDbResourceBudgetToml::from_resolved(config.wallet_rocksdb_budget),
             },
             ingest_control: IngestControlReaderToml::from_resolved(
                 config.ingest_control_addr.clone(),
@@ -270,6 +275,7 @@ struct CompatToml {
 struct WalletToml {
     path: PathBuf,
     secondary_path: PathBuf,
+    rocksdb: RocksDbResourceBudgetToml,
 }
 
 const DEFAULT_PAIR_CONVERGENCE_ATTEMPTS: u8 = 12;

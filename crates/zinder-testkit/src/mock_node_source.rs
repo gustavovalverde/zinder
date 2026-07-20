@@ -89,8 +89,7 @@ impl NodeFailureScript {
     /// Models a best-chain race where the requested height was valid when
     /// resolved but is no longer addressable. Maps to
     /// [`SourceFailureClass::UpstreamViewChanged`](zinder_source::SourceFailureClass).
-    /// This is the shape of the 2026-05-15 production incident
-    /// (`"block height not in best chain"`).
+    /// Zebra reports this shape as `"block height not in best chain"`.
     #[must_use]
     pub fn fail_next_fetches_with_block_unavailable(count: u32, reason: impl Into<String>) -> Self {
         Self {

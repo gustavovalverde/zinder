@@ -34,7 +34,7 @@ The release canonical store exposes role-specific handles:
 - `CanonicalReader` is the query-layer contract consumed inside an admitted
   `WalletServingReadPair`.
 
-The older artifact-oriented store follows the same ownership rule through
+The artifact-oriented store follows the same ownership rule through
 `PrimaryChainStore`, `SecondaryChainStore`, and `ChainEpochReader` for optional
 explorer and materialized-view components.
 

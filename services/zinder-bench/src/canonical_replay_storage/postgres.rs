@@ -334,7 +334,7 @@ pub struct PostgresCanonicalReplayValidation {
     pub transaction_count: u64,
     /// Semantic replay format version decoded from every persisted row.
     pub replay_format_version: u32,
-    /// Ordered backend-neutral digest recomputed from persisted semantic facts.
+    /// Ordered backend-neutral digest recomputed from persisted replay records.
     pub sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
@@ -343,9 +343,9 @@ pub struct PostgresCanonicalReplayValidation {
 pub struct PostgresStorageMeasurements {
     /// Semantic replay encoding bytes submitted across all block rows.
     pub logical_replay_bytes: u64,
-    /// Fact-table heap, TOAST, free-space-map, and visibility-map bytes.
+    /// Replay-table heap, TOAST, free-space-map, and visibility-map bytes.
     pub replay_table_bytes: u64,
-    /// Deferred fact-table index bytes.
+    /// Deferred replay-table index bytes.
     pub index_bytes: u64,
     /// Total bytes across ordinary tables and their indexes in the fixed schema.
     pub schema_bytes: u64,
@@ -355,10 +355,10 @@ pub struct PostgresStorageMeasurements {
 
 /// Completed concrete `PostgreSQL` canonical-replay round trip.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PostgresCanonicalReplayResult {
+pub struct PostgresCanonicalReplayReport {
     /// Effective server and durability settings.
     pub server_settings: PostgresServerSettings,
-    /// Persisted facts validated before publication and through a fresh connection.
+    /// Persisted replay records validated before publication and through a fresh connection.
     pub validation: PostgresCanonicalReplayValidation,
     /// Logical and physical byte measurements.
     pub storage: PostgresStorageMeasurements,
@@ -378,7 +378,7 @@ pub struct PostgresCanonicalReplayResult {
 )]
 pub async fn run_postgres_canonical_replay_storage(
     config: PostgresCanonicalReplayConfig,
-) -> Result<PostgresCanonicalReplayResult, BenchError> {
+) -> Result<PostgresCanonicalReplayReport, BenchError> {
     let total_started_at = Instant::now();
     let initialization_started_at = Instant::now();
     config.validate()?;
@@ -404,7 +404,7 @@ pub async fn run_postgres_canonical_replay_storage(
     let load_transaction = client
         .transaction()
         .await
-        .map_err(|error| postgres_error("fact load transaction start", &error))?;
+        .map_err(|error| postgres_error("replay load transaction start", &error))?;
     timings.replay_persistence_seconds += load_transaction_started_at.elapsed().as_secs_f64();
     for descriptor in &manifest.segments {
         let prepare_started_at = Instant::now();
@@ -437,7 +437,7 @@ pub async fn run_postgres_canonical_replay_storage(
     load_transaction
         .commit()
         .await
-        .map_err(|error| postgres_error("fact load transaction commit", &error))?;
+        .map_err(|error| postgres_error("replay load transaction commit", &error))?;
     timings.replay_persistence_seconds += load_commit_started_at.elapsed().as_secs_f64();
 
     let indexes_started_at = Instant::now();
@@ -451,7 +451,7 @@ pub async fn run_postgres_canonical_replay_storage(
     client
         .batch_execute(ANALYZE_SQL)
         .await
-        .map_err(|error| postgres_error("fact-table analysis", &error))?;
+        .map_err(|error| postgres_error("replay-table analysis", &error))?;
     timings.storage_optimization_seconds = analyze_started_at.elapsed().as_secs_f64();
 
     let validation_started_at = Instant::now();
@@ -487,7 +487,7 @@ pub async fn run_postgres_canonical_replay_storage(
     timings.storage_measurement_seconds = storage_measurement_started_at.elapsed().as_secs_f64();
     timings.wall_clock_seconds = total_started_at.elapsed().as_secs_f64();
 
-    Ok(PostgresCanonicalReplayResult {
+    Ok(PostgresCanonicalReplayReport {
         server_settings,
         validation,
         storage,
@@ -496,7 +496,7 @@ pub async fn run_postgres_canonical_replay_storage(
 }
 
 /// Reconnects to an already completed candidate and revalidates every persisted
-/// fact encoding, digest, chain position, fixture oracle, and completion marker.
+/// replay encoding, digest, chain position, fixture oracle, and completion marker.
 ///
 /// The database URL is never included in returned errors.
 pub async fn validate_postgres_canonical_replay_storage_with_fresh_connection(
@@ -667,7 +667,7 @@ async fn copy_replay_segment(
     let copy = transaction
         .copy_in(COPY_SQL)
         .await
-        .map_err(|error| postgres_error("binary fact COPY start", &error))?;
+        .map_err(|error| postgres_error("binary replay COPY start", &error))?;
     let writer = BinaryCopyInWriter::new(
         copy,
         &[
@@ -704,17 +704,17 @@ async fn copy_replay_segment(
                 &replay_envelope_bytes,
             ])
             .await
-            .map_err(|error| postgres_error("binary fact COPY row", &error))?;
+            .map_err(|error| postgres_error("binary replay COPY row", &error))?;
     }
     let copied_rows = writer
         .as_mut()
         .finish()
         .await
-        .map_err(|error| postgres_error("binary fact COPY finish", &error))?;
+        .map_err(|error| postgres_error("binary replay COPY finish", &error))?;
     let expected_rows = u64::try_from(records.len()).unwrap_or(u64::MAX);
     if copied_rows != expected_rows {
         return Err(candidate_error(format!(
-            "binary fact COPY wrote {copied_rows} rows, expected {expected_rows}"
+            "binary replay COPY wrote {copied_rows} rows, expected {expected_rows}"
         )));
     }
     Ok(())
@@ -726,14 +726,14 @@ async fn validate_persisted_replay(
     let rows = client
         .query_raw(READ_BACK_SQL, std::iter::empty::<&(dyn ToSql + Sync)>())
         .await
-        .map_err(|error| postgres_error("persisted fact read-back start", &error))?;
+        .map_err(|error| postgres_error("persisted replay read-back start", &error))?;
     let mut rows = pin!(rows);
     let mut accumulator = CanonicalReplaySequenceAccumulator::new();
     let mut transaction_count = 0_u64;
     while let Some(row) = rows
         .try_next()
         .await
-        .map_err(|error| postgres_error("persisted fact read-back", &error))?
+        .map_err(|error| postgres_error("persisted replay read-back", &error))?
     {
         let record = decode_replay_row(&row)?;
         transaction_count = transaction_count
@@ -949,7 +949,7 @@ fn validate_completion(
         || completion.logical_replay_bytes != validation.position.logical_replay_bytes
     {
         return Err(candidate_error(
-            "completion marker does not match the fixture and persisted fact sequence",
+            "completion marker does not match the fixture and persisted replay sequence",
         ));
     }
     Ok(())

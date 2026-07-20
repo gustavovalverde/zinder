@@ -17,7 +17,7 @@ use zcash_primitives::merkle_tree::write_commitment_tree;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BroadcastAccepted, ConsensusBranchId, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
+    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
     NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor, SourceChainUpdate,
@@ -971,14 +971,14 @@ async fn broadcast_transaction_maps_success_to_transaction_id() -> eyre::Result<
         Duration::from_secs(5),
     )?;
 
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01, 0x02]))
         .await?;
     let requests = server.requests_for("sendrawtransaction")?;
 
     assert_eq!(
-        broadcast_result,
-        TransactionBroadcastResult::Accepted(BroadcastAccepted {
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted {
             transaction_id: TransactionId::from_bytes([0x11; 32]),
         })
     );
@@ -1004,13 +1004,13 @@ async fn broadcast_transaction_classifies_invalid_encoding() -> eyre::Result<()>
         Duration::from_secs(5),
     )?;
 
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x00]))
         .await?;
 
     assert!(matches!(
-        broadcast_result,
-        TransactionBroadcastResult::InvalidEncoding(invalid_encoding)
+        broadcast_outcome,
+        TransactionBroadcastOutcome::InvalidEncoding(invalid_encoding)
             if invalid_encoding.error_code == Some(-22)
                 && invalid_encoding.message == "TX decode failed"
     ));
@@ -1034,13 +1034,13 @@ async fn broadcast_transaction_classifies_duplicate() -> eyre::Result<()> {
         Duration::from_secs(5),
     )?;
 
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
         .await?;
 
     assert!(matches!(
-        broadcast_result,
-        TransactionBroadcastResult::Duplicate(duplicate)
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Duplicate(duplicate)
             if duplicate.error_code == Some(-27)
                 && duplicate.message == "transaction already in mempool"
     ));
@@ -1064,13 +1064,13 @@ async fn broadcast_transaction_classifies_mempool_duplicate_message() -> eyre::R
         Duration::from_secs(5),
     )?;
 
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
         .await?;
 
     assert!(matches!(
-        broadcast_result,
-        TransactionBroadcastResult::Duplicate(duplicate)
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Duplicate(duplicate)
             if duplicate.error_code == Some(-1)
                 && duplicate.message == "transaction already exists in mempool"
     ));
@@ -1094,13 +1094,13 @@ async fn broadcast_transaction_classifies_state_duplicate_message() -> eyre::Res
         Duration::from_secs(5),
     )?;
 
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
         .await?;
 
     assert!(matches!(
-        broadcast_result,
-        TransactionBroadcastResult::Duplicate(duplicate)
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Duplicate(duplicate)
             if duplicate.error_code == Some(-25)
                 && duplicate.message.ends_with("transaction is already in state")
     ));
@@ -1119,13 +1119,13 @@ async fn broadcast_transaction_does_not_classify_unknown_as_duplicate() -> eyre:
         Duration::from_secs(5),
     )?;
 
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
         .await?;
 
     assert!(matches!(
-        broadcast_result,
-        TransactionBroadcastResult::Rejected(rejected)
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Rejected(rejected)
             if rejected.error_code == Some(-8)
                 && rejected.message == "transaction unknown to node"
     ));
@@ -1145,15 +1145,15 @@ async fn broadcast_transaction_without_error_code_returns_unknown() -> eyre::Res
         Duration::from_secs(5),
     )?;
 
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
         .await?;
 
     // jsonrpsee's ErrorObject requires a code; an error without one comes
     // through as a rejected/unclassified result via the broadcast classifier.
     assert!(matches!(
-        broadcast_result,
-        TransactionBroadcastResult::Rejected(_) | TransactionBroadcastResult::Unknown(_),
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Rejected(_) | TransactionBroadcastOutcome::Unknown(_),
     ));
 
     Ok(())

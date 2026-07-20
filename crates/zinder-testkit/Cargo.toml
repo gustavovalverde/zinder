@@ -38,6 +38,7 @@ zinder-materialized-views.workspace = true
 zinder-proto.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
+zinder-wallet-rocksdb.workspace = true
 zip32 = "0.2"
 
 [dev-dependencies]

@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Canonical storage, wallet projection, serving admission, deployment topology |
-| Related | [Canonical and projection architecture](../architecture/canonical-projection-architecture.md), [Service boundaries](../architecture/service-boundaries.md), [Storage backend](../architecture/storage-backend.md) |
+| Related | [Canonical and materialized-view architecture](../architecture/canonical-materialized-view-architecture.md), [Service boundaries](../architecture/service-boundaries.md), [Storage backend](../architecture/storage-backend.md) |
 
 ## Context
 
@@ -58,7 +58,7 @@ construction manifest, and reorg policy. Wallet identity binds to the exact
 canonical source contract and sequence position it projects.
 
 Openers fail without mutation when identity or version does not match. Zinder
-does not adopt an unknown non-empty directory, silently reinterpret an old
+does not adopt an unknown non-empty directory, silently reinterpret an incompatible
 layout, or let a reader upgrade primary storage.
 
 ### Lifecycle ownership
@@ -74,8 +74,8 @@ following takes ownership before the construction leases are released.
 
 Serving admission catches canonical and wallet secondaries up independently and
 publishes a pair only when their identities and positions agree. In-flight
-requests retain the old immutable pair while new requests atomically switch to
-the new pair.
+requests retain their original immutable pair while later requests atomically
+switch to the replacement pair.
 
 ### Supported topology
 
@@ -95,7 +95,7 @@ not release topology members.
 
 PostgreSQL support in `zinder-bench` is a diagnostic persistence arm for the
 same canonical replay corpus and digest oracle. It does not provide the
-runtime ownership, wallet projection, exact-pair admission, replication,
+runtime ownership, wallet projection, wallet-serving admission, replication,
 recovery, or operational contracts required for a deployable topology. Zinder
 therefore does not advertise a PostgreSQL deployment mode.
 
@@ -103,7 +103,7 @@ therefore does not advertise a PostgreSQL deployment mode.
 
 A canonical checkpoint alone is not a wallet-serving backup. Production restore
 requires a coherent bundle that authenticates the canonical fence and wallet
-digest together, restores both stores into fresh paths, and passes exact-pair
+digest together, restores both stores into fresh paths, and passes wallet-serving
 admission before traffic becomes ready. Independently timed directory copies do
 not prove this contract.
 

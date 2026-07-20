@@ -20,14 +20,14 @@ use zinder_core::wire::{
     encode_zinder_native_chain_name,
 };
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector,
+    BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight, BlockHeightRange, BlockSelector,
     ChainEpoch, ChainEpochId, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact,
-    ConsensusBranchId, MempoolEntry, MinedDetails, MinedTransaction, Network, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentSpendEntry,
+    ConsensusBranchId, MempoolEntry, MinedTransaction, MinedTransactionChainContext, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentMempoolOutput, TransparentMempoolOutputsRequest, TransparentMempoolSpend,
+    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus, UnixTimestampMillis,
 };
@@ -48,9 +48,10 @@ use crate::{
     ChainEventStream, ChainIndex, ChainRangeReverted, EndpointBackedIndex, EventStreamStart,
     IndexStream, IndexerError, MempoolEvent, MempoolEventCursor, MempoolEventEnvelope,
     MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
-    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
-    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
-    TransparentHistoryCursor, TransparentUnspentOutputStreamItem, TransparentUtxoSetSummaryView,
+    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
+    TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
+    TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
 };
 
 /// Options for opening a remote chain index over the native wallet gRPC API.
@@ -158,7 +159,7 @@ impl RemoteChainIndex {
     /// like `Code::InvalidArgument` always preserve the channel even when
     /// the upstream omitted the trailer, since those are caller bugs that
     /// reconnecting would not fix.
-    fn handle_status(&self, status: tonic::Status) -> IndexerError {
+    fn map_status(&self, status: tonic::Status) -> IndexerError {
         let poisoned_transport = matches!(
             status.code(),
             tonic::Code::Unavailable | tonic::Code::Unknown
@@ -189,49 +190,52 @@ impl ChainIndex for RemoteChainIndex {
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
         let response = self
             .client()
-            .latest_block(Request::new(wallet::LatestBlockRequest {
+            .visible_tip_block(Request::new(wallet::VisibleTipBlockRequest {
                 at_epoch_id: None,
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
 
         chain_epoch_from_chain_view_with_network(self.network, response.chain_view)
     }
 
-    async fn latest_block(
+    async fn visible_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
             .client()
-            .latest_block(Request::new(wallet::LatestBlockRequest {
+            .visible_tip_block(Request::new(wallet::VisibleTipBlockRequest {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
-        let latest_block = response
-            .latest_block
-            .ok_or_else(|| IndexerError::malformed("latest_block", "field is missing"))?;
+        let visible_tip_block = response
+            .visible_tip_block
+            .ok_or_else(|| IndexerError::malformed("visible_tip_block", "field is missing"))?;
 
         Ok(BlockId {
-            height: BlockHeight::new(latest_block.height),
-            hash: block_hash_from_rpc_hex("latest_block.block_hash", &latest_block.block_hash)?,
+            height: BlockHeight::new(visible_tip_block.height),
+            hash: block_hash_from_rpc_hex(
+                "visible_tip_block.block_hash",
+                &visible_tip_block.block_hash,
+            )?,
         })
     }
 
-    async fn latest_safe_block(
+    async fn settled_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
             .client()
-            .latest_safe_block(Request::new(wallet::LatestSafeBlockRequest {
+            .settled_tip_block(Request::new(wallet::SettledTipBlockRequest {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         let settled_tip_block = response
             .settled_tip_block
@@ -258,7 +262,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         block_id_from_message(response.block_id)
     }
@@ -267,7 +271,7 @@ impl ChainIndex for RemoteChainIndex {
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockHeaderInfo, IndexerError> {
+    ) -> Result<BlockHeader, IndexerError> {
         let response = self
             .client()
             .block_header_by_selector(Request::new(wallet::BlockSelectorRequest {
@@ -275,12 +279,12 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         let header_message = response
             .block_header
             .ok_or_else(|| IndexerError::malformed("block_header", "field is missing"))?;
-        block_header_info_from_message(header_message)
+        block_header_from_message(header_message)
     }
 
     async fn compact_block_at(
@@ -295,7 +299,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         compact_block_from_message(
             response
@@ -317,10 +321,10 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?;
+            .map_err(|status| self.map_status(status))?;
         let recovery = self.clone();
         let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
+            let chunk = chunk_result.map_err(|status| recovery.map_status(status))?;
             compact_block_from_message(
                 chunk
                     .compact_block
@@ -343,7 +347,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         full_block_from_message(
             response
@@ -365,10 +369,10 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?;
+            .map_err(|status| self.map_status(status))?;
         let recovery = self.clone();
         let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(|status| recovery.handle_status(status))?;
+            let chunk = chunk_result.map_err(|status| recovery.map_status(status))?;
             full_block_from_message(
                 chunk
                     .full_block
@@ -391,7 +395,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         tree_state_from_response(response)
     }
@@ -406,7 +410,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         tree_state_from_response(response)
     }
@@ -426,7 +430,7 @@ impl ChainIndex for RemoteChainIndex {
                 at_epoch_id: at_epoch_id.map(ChainEpochId::value),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         let protocol = shielded_protocol_from_message(response.shielded_protocol)?;
         response
@@ -456,7 +460,7 @@ impl ChainIndex for RemoteChainIndex {
                 }
                 return self.lookup_in_mempool(transaction_id).await;
             }
-            Err(status) => return Err(self.handle_status(status)),
+            Err(status) => return Err(self.map_status(status)),
         };
         tx_status_from_message(self.network, response)
     }
@@ -478,7 +482,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_address_unspent_outputs(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?;
+            .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
         // The leading header pins the chain epoch for the whole stream; the
@@ -486,7 +490,7 @@ impl ChainIndex for RemoteChainIndex {
         let mut pinned_chain_epoch: Option<ChainEpoch> = None;
         let stream = response.into_inner().filter_map(move |message_result| {
             message_result
-                .map_err(|status| recovery.handle_status(status))
+                .map_err(|status| recovery.map_status(status))
                 .and_then(|message| {
                     transparent_unspent_output_stream_item(
                         expected_network,
@@ -524,7 +528,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_address_tx_ids_in_range(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?;
+            .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
         // The leading header pins the chain epoch for the whole stream; the
@@ -532,7 +536,7 @@ impl ChainIndex for RemoteChainIndex {
         let mut pinned_chain_epoch: Option<ChainEpoch> = None;
         let stream = response.into_inner().filter_map(move |chunk_result| {
             chunk_result
-                .map_err(|status| recovery.handle_status(status))
+                .map_err(|status| recovery.map_status(status))
                 .and_then(|chunk| {
                     transparent_address_tx_ids_stream_item(
                         expected_network,
@@ -566,7 +570,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_address_balance(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         transparent_address_balance_from_message(self.network, response)
     }
@@ -585,7 +589,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_outputs_by_outpoint(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         transparent_outputs_by_outpoint_response_from_message(self.network, response)
     }
@@ -604,7 +608,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_spends_by_outpoint(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         transparent_spends_by_outpoint_response_from_message(self.network, response)
     }
@@ -623,7 +627,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_unspent_outputs_by_outpoint(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         transparent_unspent_outputs_by_outpoint_response_from_message(self.network, response)
     }
@@ -639,7 +643,7 @@ impl ChainIndex for RemoteChainIndex {
             .client()
             .transparent_utxo_set_summary(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         let chain_epoch =
             chain_epoch_from_chain_view_with_network(self.network, response.chain_view)?;
@@ -667,7 +671,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .client()
             .server_info(Request::new(wallet::ServerInfoRequest {}))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         let wallet_info = response
             .info
@@ -685,7 +689,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .client()
             .chain_value_pools_at_tip(Request::new(wallet::ChainValuePoolsAtTipRequest {}))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         chain_value_pools_at_tip_from_message(self.network, response)
     }
@@ -693,16 +697,16 @@ impl EndpointBackedIndex for RemoteChainIndex {
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, IndexerError> {
+    ) -> Result<TransactionBroadcastOutcome, IndexerError> {
         let response = self
             .client()
             .broadcast_transaction(Request::new(wallet::BroadcastTransactionRequest {
                 raw_transaction: raw_transaction.as_slice().to_vec(),
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
-        transaction_broadcast_result_from_message(response)
+        transaction_broadcast_outcome_from_message(response)
     }
 
     async fn chain_events_for_family(
@@ -730,11 +734,11 @@ impl EndpointBackedIndex for RemoteChainIndex {
                 address_filter,
             }))
             .await
-            .map_err(|status| self.handle_status(status))?;
+            .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
         let stream = response.into_inner().map(move |event_result| {
-            let event = event_result.map_err(|status| recovery.handle_status(status))?;
+            let event = event_result.map_err(|status| recovery.map_status(status))?;
             chain_event_envelope_from_message(expected_network, event)
         });
 
@@ -756,7 +760,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
                 from_cursor,
             }))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         mempool_snapshot_view_from_message(self.network, response)
     }
@@ -771,14 +775,13 @@ impl EndpointBackedIndex for RemoteChainIndex {
                 start: Some(event_stream_start_to_message(&start, |cursor| {
                     cursor.as_bytes()
                 })),
-                family: wallet::MempoolEventStreamFamily::Mempool as i32,
             }))
             .await
-            .map_err(|status| self.handle_status(status))?;
+            .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
         let stream = response.into_inner().map(move |event_result| {
-            let envelope_message = event_result.map_err(|status| recovery.handle_status(status))?;
+            let envelope_message = event_result.map_err(|status| recovery.map_status(status))?;
             mempool_event_envelope_from_message(expected_network, envelope_message)
         });
         Ok(Box::pin(stream))
@@ -809,7 +812,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .client()
             .transparent_mempool_outputs_by_address(Request::new(wire_request))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         response
             .outputs
@@ -829,7 +832,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .client()
             .transparent_mempool_spends_by_outpoint(Request::new(wire_request))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         response
             .spends
@@ -850,7 +853,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .client()
             .transparent_mempool_outputs_by_outpoint(Request::new(request))
             .await
-            .map_err(|status| self.handle_status(status))?
+            .map_err(|status| self.map_status(status))?
             .into_inner();
         transparent_outputs_by_outpoint_response_from_message(self.network, response)
     }
@@ -1170,7 +1173,7 @@ fn transparent_address_tx_ids_stream_item(
     address_script_hash: TransparentAddressScriptHash,
     pinned_chain_epoch: &mut Option<ChainEpoch>,
     message: wallet::TransparentAddressTxIdsChunk,
-) -> Result<Option<TransparentAddressTxIdsStreamItem>, IndexerError> {
+) -> Result<Option<TransparentAddressTransactionChunk>, IndexerError> {
     match message.body.ok_or_else(|| {
         IndexerError::malformed("transparent_address_tx_ids_chunk.body", "field is missing")
     })? {
@@ -1195,7 +1198,7 @@ fn transparent_address_tx_ids_stream_item(
             } else {
                 Some(TransparentHistoryCursor::from_bytes(entry.cursor))
             };
-            Ok(Some(TransparentAddressTxIdsStreamItem {
+            Ok(Some(TransparentAddressTransactionChunk {
                 chain_epoch,
                 artifact,
                 cursor,
@@ -1214,7 +1217,7 @@ fn transparent_unspent_output_stream_item(
     expected_network: Network,
     pinned_chain_epoch: &mut Option<ChainEpoch>,
     message: wallet::TransparentUnspentOutputsChunk,
-) -> Result<Option<TransparentUnspentOutputStreamItem>, IndexerError> {
+) -> Result<Option<TransparentUnspentOutputChunk>, IndexerError> {
     match message.body.ok_or_else(|| {
         IndexerError::malformed("transparent_unspent_outputs_chunk.body", "field is missing")
     })? {
@@ -1247,7 +1250,7 @@ fn transparent_unspent_output_stream_item(
                 BlockHeight::new(output_message.block_height),
                 block_hash,
             );
-            Ok(Some(TransparentUnspentOutputStreamItem {
+            Ok(Some(TransparentUnspentOutputChunk {
                 chain_epoch,
                 output,
             }))
@@ -1302,9 +1305,9 @@ fn mined_block_location_from_message(
     ))
 }
 
-fn transaction_broadcast_result_from_message(
+fn transaction_broadcast_outcome_from_message(
     response: wallet::BroadcastTransactionResponse,
-) -> Result<TransactionBroadcastResult, IndexerError> {
+) -> Result<TransactionBroadcastOutcome, IndexerError> {
     use wallet::broadcast_transaction_response::Outcome;
     use zinder_core::{
         BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
@@ -1316,7 +1319,7 @@ fn transaction_broadcast_result_from_message(
         .ok_or_else(|| IndexerError::malformed("outcome", "field is missing"))?;
     match outcome {
         Outcome::Accepted(accepted) => {
-            Ok(TransactionBroadcastResult::Accepted(BroadcastAccepted {
+            Ok(TransactionBroadcastOutcome::Accepted(BroadcastAccepted {
                 transaction_id: transaction_id_from_rpc_hex(
                     "accepted.transaction_id",
                     &accepted.transaction_id,
@@ -1324,28 +1327,28 @@ fn transaction_broadcast_result_from_message(
             }))
         }
         Outcome::Duplicate(duplicate) => {
-            Ok(TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
+            Ok(TransactionBroadcastOutcome::Duplicate(BroadcastDuplicate {
                 error_code: duplicate.error_code,
                 message: duplicate.message,
             }))
         }
         Outcome::InvalidEncoding(invalid_encoding) => Ok(
-            TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {
+            TransactionBroadcastOutcome::InvalidEncoding(BroadcastInvalidEncoding {
                 error_code: invalid_encoding.error_code,
                 message: invalid_encoding.message,
             }),
         ),
-        Outcome::Queued(queued) => Ok(TransactionBroadcastResult::Queued(BroadcastQueued {
+        Outcome::Queued(queued) => Ok(TransactionBroadcastOutcome::Queued(BroadcastQueued {
             message: queued.message,
         })),
         Outcome::Rejected(rejected) => {
-            Ok(TransactionBroadcastResult::Rejected(BroadcastRejected {
+            Ok(TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                 kind: broadcast_rejection_reason_from_message(rejected.kind),
                 error_code: rejected.error_code,
                 message: rejected.message,
             }))
         }
-        Outcome::Unknown(unknown) => Ok(TransactionBroadcastResult::Unknown(BroadcastUnknown {
+        Outcome::Unknown(unknown) => Ok(TransactionBroadcastOutcome::Unknown(BroadcastUnknown {
             error_code: unknown.error_code,
             message: unknown.message,
         })),
@@ -1489,8 +1492,8 @@ fn chain_event_stream_family_to_message(
     family: ChainEventStreamFamily,
 ) -> wallet::ChainEventStreamFamily {
     match family {
-        ChainEventStreamFamily::Tip => wallet::ChainEventStreamFamily::Tip,
-        ChainEventStreamFamily::Safe => wallet::ChainEventStreamFamily::Safe,
+        ChainEventStreamFamily::Visible => wallet::ChainEventStreamFamily::Visible,
+        ChainEventStreamFamily::Settled => wallet::ChainEventStreamFamily::Settled,
     }
 }
 
@@ -1544,17 +1547,19 @@ fn tx_status_from_message(
                 mined_block_location_from_message(mined.location.ok_or_else(|| {
                     IndexerError::malformed("mined.location", "field is missing")
                 })?)?;
-            let details_message = mined
-                .details
-                .ok_or_else(|| IndexerError::malformed("mined.details", "field is missing"))?;
-            let details = MinedDetails {
-                consensus_branch_id: ConsensusBranchId::new(details_message.consensus_branch_id),
-                block_time: details_message.block_time,
-                confirmations: details_message.confirmations,
+            let chain_context_message = mined.chain_context.ok_or_else(|| {
+                IndexerError::malformed("mined.chain_context", "field is missing")
+            })?;
+            let chain_context = MinedTransactionChainContext {
+                consensus_branch_id: ConsensusBranchId::new(
+                    chain_context_message.consensus_branch_id,
+                ),
+                block_time: chain_context_message.block_time,
+                confirmations: chain_context_message.confirmations,
             };
             Ok(TxStatus::Mined(MinedTransaction::new(
                 location,
-                details,
+                chain_context,
                 mined.raw_transaction_bytes,
             )))
         }
@@ -1576,20 +1581,20 @@ fn tx_status_from_message(
             };
             Ok(TxStatus::InMempool(entry))
         }
-        wallet::transaction_location::Location::Conflicting(_) => Ok(TxStatus::ConflictingChain),
     }
 }
 
-fn block_id_from_message(block_id: Option<wallet::BlockMetadata>) -> Result<BlockId, IndexerError> {
-    let metadata =
+fn block_id_from_message(block_id: Option<wallet::BlockId>) -> Result<BlockId, IndexerError> {
+    let block_id_message =
         block_id.ok_or_else(|| IndexerError::malformed("block_id", "field is missing"))?;
-    let block_hash = block_hash_from_rpc_hex("block_id.block_hash", &metadata.block_hash)?;
-    Ok(BlockId::new(BlockHeight::new(metadata.height), block_hash))
+    let block_hash = block_hash_from_rpc_hex("block_id.block_hash", &block_id_message.block_hash)?;
+    Ok(BlockId::new(
+        BlockHeight::new(block_id_message.height),
+        block_hash,
+    ))
 }
 
-fn block_header_info_from_message(
-    message: wallet::BlockHeaderInfo,
-) -> Result<BlockHeaderInfo, IndexerError> {
+fn block_header_from_message(message: wallet::BlockHeader) -> Result<BlockHeader, IndexerError> {
     let block_id = block_id_from_message(message.block_id)?;
     let previous_block_hash = block_hash_from_rpc_hex(
         "block_header.previous_block_hash",
@@ -1600,7 +1605,7 @@ fn block_header_info_from_message(
     let commitment_bytes =
         fixed_32_bytes("block_header.commitment_bytes", message.commitment_bytes)?;
     let nonce = fixed_32_bytes("block_header.nonce", message.nonce)?;
-    Ok(BlockHeaderInfo::new(
+    Ok(BlockHeader::new(
         block_id,
         previous_block_hash,
         merkle_root_hash,
@@ -1748,9 +1753,6 @@ fn mempool_event_envelope_from_message(
             mined_height,
             block_hash,
         },
-        zinder_store::MempoolEvent::Suppressed { transaction_id } => {
-            MempoolEvent::Suppressed { transaction_id }
-        }
         _ => {
             return Err(IndexerError::malformed(
                 "mempool_event",
@@ -1985,11 +1987,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_status_swaps_channel_on_poisoned_unavailable() {
+    async fn map_status_swaps_channel_on_poisoned_unavailable() {
         let index = build_index();
         let before = current_client_ptr(&index);
 
-        let err = index.handle_status(Status::new(Code::Unavailable, ""));
+        let err = index.map_status(Status::new(Code::Unavailable, ""));
 
         let after = current_client_ptr(&index);
         assert!(
@@ -2007,11 +2009,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_status_keeps_channel_on_invalid_argument() {
+    async fn map_status_keeps_channel_on_invalid_argument() {
         let index = build_index();
         let before = current_client_ptr(&index);
 
-        let _ = index.handle_status(Status::new(Code::InvalidArgument, "bad cursor"));
+        let _ = index.map_status(Status::new(Code::InvalidArgument, "bad cursor"));
 
         let after = current_client_ptr(&index);
         assert_eq!(

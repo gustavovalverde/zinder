@@ -215,7 +215,7 @@ fn chain_event_history_encodes_requested_stream_family() -> eyre::Result<()> {
 
     let event_history = store.chain_event_history(ChainEventHistoryRequest::new_for_family(
         None,
-        ChainEventStreamFamily::Safe,
+        ChainEventStreamFamily::Settled,
         NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
     ))?;
     let event_envelope = event_history
@@ -583,9 +583,9 @@ fn live_tail_start_skips_prior_events_and_delivers_later_commits() -> eyre::Resu
 
     let resume = store.resolve_chain_event_stream_start(
         &EventStreamStartPosition::LiveTail,
-        ChainEventStreamFamily::Tip,
+        ChainEventStreamFamily::Visible,
     )?;
-    assert_eq!(resume.family, ChainEventStreamFamily::Tip);
+    assert_eq!(resume.family, ChainEventStreamFamily::Visible);
     let head_cursor = resume
         .cursor
         .ok_or_else(|| eyre!("live tail on a non-empty log must mint a head cursor"))?;
@@ -613,7 +613,7 @@ fn live_tail_start_skips_prior_events_and_delivers_later_commits() -> eyre::Resu
 }
 
 /// A `LiveTail` head cursor carries the requested family so later pages stay
-/// on the settled-tip stream.
+/// on the settled stream.
 #[test]
 fn live_tail_start_mints_a_cursor_in_the_requested_family() -> eyre::Result<()> {
     let tempdir = tempdir()?;
@@ -627,9 +627,9 @@ fn live_tail_start_mints_a_cursor_in_the_requested_family() -> eyre::Result<()> 
 
     let resume = store.resolve_chain_event_stream_start(
         &EventStreamStartPosition::LiveTail,
-        ChainEventStreamFamily::Safe,
+        ChainEventStreamFamily::Settled,
     )?;
-    assert_eq!(resume.family, ChainEventStreamFamily::Safe);
+    assert_eq!(resume.family, ChainEventStreamFamily::Settled);
     let head_cursor = resume
         .cursor
         .ok_or_else(|| eyre!("live tail on a non-empty log must mint a head cursor"))?;
@@ -647,11 +647,11 @@ fn live_tail_start_on_empty_log_starts_at_earliest_retained() -> eyre::Result<()
 
     let resume = store.resolve_chain_event_stream_start(
         &EventStreamStartPosition::LiveTail,
-        ChainEventStreamFamily::Tip,
+        ChainEventStreamFamily::Visible,
     )?;
 
     assert_eq!(resume.cursor, None);
-    assert_eq!(resume.family, ChainEventStreamFamily::Tip);
+    assert_eq!(resume.family, ChainEventStreamFamily::Visible);
 
     Ok(())
 }
@@ -668,24 +668,24 @@ fn after_cursor_start_takes_the_cursor_family_as_authoritative() -> eyre::Result
         vec![block],
         vec![compact_block],
     ))?;
-    let safe_page = store.chain_event_history(ChainEventHistoryRequest::new_for_family(
+    let settled_page = store.chain_event_history(ChainEventHistoryRequest::new_for_family(
         None,
-        ChainEventStreamFamily::Safe,
+        ChainEventStreamFamily::Settled,
         NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max events"))?,
     ))?;
-    let safe_cursor = safe_page
+    let settled_cursor = settled_page
         .first()
-        .ok_or_else(|| eyre!("expected a safe-family event"))?
+        .ok_or_else(|| eyre!("expected a settled-family event"))?
         .cursor
         .clone();
 
     let resume = store.resolve_chain_event_stream_start(
-        &EventStreamStartPosition::AfterCursor(safe_cursor.clone()),
-        ChainEventStreamFamily::Tip,
+        &EventStreamStartPosition::AfterCursor(settled_cursor.clone()),
+        ChainEventStreamFamily::Visible,
     )?;
 
-    assert_eq!(resume.family, ChainEventStreamFamily::Safe);
-    assert_eq!(resume.cursor, Some(safe_cursor));
+    assert_eq!(resume.family, ChainEventStreamFamily::Settled);
+    assert_eq!(resume.cursor, Some(settled_cursor));
 
     Ok(())
 }
@@ -702,11 +702,11 @@ fn after_cursor_start_rejects_request_family_mismatch() -> eyre::Result<()> {
         vec![block],
         vec![compact_block],
     ))?;
-    let tip_cursor = commit_outcome.event_envelope.cursor;
+    let visible_cursor = commit_outcome.event_envelope.cursor;
 
     let error = match store.resolve_chain_event_stream_start(
-        &EventStreamStartPosition::AfterCursor(tip_cursor),
-        ChainEventStreamFamily::Safe,
+        &EventStreamStartPosition::AfterCursor(visible_cursor),
+        ChainEventStreamFamily::Settled,
     ) {
         Ok(resume) => return Err(eyre!("expected family mismatch, got {resume:?}")),
         Err(error) => error,

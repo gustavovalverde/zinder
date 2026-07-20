@@ -23,7 +23,7 @@
 //! caller is expected to wrap the response in
 //! [`SEARCH_QUERY_MAX_BYTES`]-bounded transport limits as well.
 
-use crate::wire::{decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex};
+use crate::wire::decode_rpc_transaction_id_hex;
 use crate::{Network, TransparentAddressScriptHash};
 use zcash_address::unified::{Container as _, Receiver as UnifiedReceiver};
 use zcash_address::{
@@ -36,8 +36,7 @@ use zcash_protocol::consensus::NetworkType as ZcashNetworkType;
 ///
 /// Bounds the worst-case Bech32m / base58check decode cost a single
 /// request can trigger. The cap is generous enough to fit the longest
-/// Unified Address known today (well under 1 KiB) and reserved space for
-/// future ZIP-321 payment URIs that may be routed here later.
+/// currently supported Unified Address (well under 1 KiB).
 pub const SEARCH_QUERY_MAX_BYTES: usize = 4 * 1024;
 
 /// One structural classification of the raw query.
@@ -67,9 +66,8 @@ pub enum SearchClassification {
         /// ADR-0021).
         rpc_hex: String,
         /// Decoded 32 bytes in internal byte order, ready for storage
-        /// lookups and for round-trip validation through
-        /// [`decode_rpc_transaction_id_hex`] /
-        /// [`decode_rpc_block_hash_hex`].
+        /// lookups and round-trip validation through
+        /// [`decode_rpc_transaction_id_hex`].
         internal_bytes: [u8; 32],
     },
 
@@ -253,10 +251,6 @@ fn parse_rpc_hash_hex(query: &str) -> Option<SearchClassification> {
     // txid one since the classifier itself does not yet know which arm
     // the hex will resolve to.
     let transaction_id = decode_rpc_transaction_id_hex(query).ok()?;
-    // Also validate the block-hash helper to keep both wire helpers
-    // honest; the two reject identically today, but a future change to
-    // one without the other would surface here.
-    let _ = decode_rpc_block_hash_hex(query).ok()?;
     Some(SearchClassification::HashCandidate {
         rpc_hex: query.to_ascii_lowercase(),
         internal_bytes: transaction_id.as_bytes(),

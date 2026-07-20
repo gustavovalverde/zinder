@@ -611,7 +611,7 @@ pub enum CanonicalControlCommand {
     clippy::too_many_lines,
     reason = "the exhaustive owner-command dispatch keeps every primary mutation on one auditable queue"
 )]
-pub(crate) fn handle_canonical_control_command(
+pub(crate) fn apply_canonical_control_command(
     store: &mut RocksDbCanonicalStore,
     command: CanonicalControlCommand,
 ) {
@@ -627,34 +627,34 @@ pub(crate) fn handle_canonical_control_command(
             max_events,
             reply,
         } => {
-            handle_ingest_event_page(store, from_cursor.as_deref(), max_events, reply);
+            read_ingest_event_page(store, from_cursor.as_deref(), max_events, reply);
         }
         CanonicalControlCommand::AppendMempoolEvent {
             event,
             observed_at,
             reply,
         } => {
-            handle_append_mempool_event(store, event, observed_at, reply);
+            append_mempool_event(store, event, observed_at, reply);
         }
         CanonicalControlCommand::MempoolEventPage {
             from_cursor,
             max_events,
             reply,
         } => {
-            handle_mempool_event_page(store, from_cursor.as_deref(), max_events, reply);
+            read_mempool_event_page(store, from_cursor.as_deref(), max_events, reply);
         }
         CanonicalControlCommand::ResolveMempoolEventStart { start, reply } => {
-            handle_mempool_event_start(store, &start, reply);
+            resolve_mempool_event_start(store, &start, reply);
         }
         CanonicalControlCommand::BeginMempoolSnapshot { cursor, reply } => {
-            handle_mempool_snapshot_start(store, &cursor, reply);
+            begin_mempool_snapshot(store, &cursor, reply);
         }
         CanonicalControlCommand::EncodeMempoolSnapshotNextCursor {
             events_resume_anchor,
             after_transaction_id,
             reply,
         } => {
-            handle_mempool_snapshot_next_cursor(
+            encode_mempool_snapshot_next_cursor(
                 store,
                 events_resume_anchor,
                 after_transaction_id,
@@ -666,7 +666,7 @@ pub(crate) fn handle_canonical_control_command(
             retention,
             reply,
         } => {
-            handle_mempool_event_pruning(store, now, retention, reply);
+            prune_mempool_events(store, now, retention, reply);
         }
         CanonicalControlCommand::EventPage { request, reply } => {
             send_control_response(reply, event_page_response(store, &request));
@@ -707,7 +707,7 @@ pub(crate) fn handle_canonical_control_command(
     }
 }
 
-fn handle_ingest_event_page(
+fn read_ingest_event_page(
     store: &RocksDbCanonicalStore,
     from_cursor: Option<&[u8]>,
     max_events: NonZeroU32,
@@ -719,7 +719,7 @@ fn handle_ingest_event_page(
     );
 }
 
-fn handle_append_mempool_event(
+fn append_mempool_event(
     store: &RocksDbCanonicalStore,
     event: Box<MempoolEvent>,
     observed_at: UnixTimestampMillis,
@@ -733,7 +733,7 @@ fn handle_append_mempool_event(
     );
 }
 
-fn handle_mempool_event_page(
+fn read_mempool_event_page(
     store: &RocksDbCanonicalStore,
     from_cursor: Option<&[u8]>,
     max_events: NonZeroU32,
@@ -745,7 +745,7 @@ fn handle_mempool_event_page(
     );
 }
 
-fn handle_mempool_event_start(
+fn resolve_mempool_event_start(
     store: &RocksDbCanonicalStore,
     start: &EventStreamStartPosition,
     reply: oneshot::Sender<Result<Option<StreamCursorTokenV1>, Status>>,
@@ -758,7 +758,7 @@ fn handle_mempool_event_start(
     );
 }
 
-fn handle_mempool_snapshot_start(
+fn begin_mempool_snapshot(
     store: &RocksDbCanonicalStore,
     cursor: &[u8],
     reply: oneshot::Sender<Result<CanonicalMempoolSnapshotStart, Status>>,
@@ -771,7 +771,7 @@ fn handle_mempool_snapshot_start(
     );
 }
 
-fn handle_mempool_snapshot_next_cursor(
+fn encode_mempool_snapshot_next_cursor(
     store: &RocksDbCanonicalStore,
     events_resume_anchor: Option<MempoolEventPosition>,
     after_transaction_id: zinder_core::TransactionId,
@@ -785,7 +785,7 @@ fn handle_mempool_snapshot_next_cursor(
     );
 }
 
-fn handle_mempool_event_pruning(
+fn prune_mempool_events(
     store: &RocksDbCanonicalStore,
     now: UnixTimestampMillis,
     retention: MempoolEventRetentionConfig,
@@ -1196,7 +1196,7 @@ fn checkpoint_ready_evidence_message(
         block_digest_version: u32::from(evidence.block_digest_version.value()),
         replay_format_version: evidence.replay_format_version.value(),
         sequence_digest_version: u32::from(evidence.sequence_digest_version.value()),
-        visible_logical_block_facts_bytes: evidence.visible_logical_block_facts_bytes,
+        visible_logical_replay_bytes: evidence.visible_logical_replay_bytes,
         sequence_checkpoint: Some(CanonicalCheckpointSequenceEvidence {
             through: Some(checkpoint_block_id_message(sequence_checkpoint.through())),
             retained_block_count: sequence_checkpoint.retained_block_count(),
@@ -1478,7 +1478,7 @@ pub(crate) mod test_support {
         let status_handle = handle.clone();
         let command_task = tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
-                handle_canonical_control_command(&mut store, command);
+                apply_canonical_control_command(&mut store, command);
             }
         });
         let bearer_token = BearerToken::from_str("fixture-control-token")?;

@@ -105,7 +105,7 @@ pub(crate) fn read_transaction_facts_artifacts_batch(
 
 /// Keys to `multi_get` from the transaction-facts seek phase, alongside
 /// every input id's seek outcome (`None` when the id has no visible row).
-type TransactionFactsSeekResult = (Vec<StoreKey>, Vec<(TransactionId, Option<StoreKey>)>);
+type TransactionFactsSeekBatch = (Vec<StoreKey>, Vec<(TransactionId, Option<StoreKey>)>);
 
 /// Seek phase shared by the transaction-facts batch readers.
 ///
@@ -120,7 +120,7 @@ fn seek_transaction_facts_keys(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     transaction_ids: &[TransactionId],
-) -> Result<TransactionFactsSeekResult, StoreError> {
+) -> Result<TransactionFactsSeekBatch, StoreError> {
     // Seek phase: per unique id, locate the visibility row and derive the
     // Transaction-CF key. The visibility lookup is per-id because the seek
     // prefix differs; RocksDB has no batched `seek_for_prev`.

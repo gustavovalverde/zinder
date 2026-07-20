@@ -240,7 +240,7 @@ fn fixture_block_builds_canonical_facts() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         project_block_summary_record(persisted_replay.facts()),
         expected_block_summary,
-        "persisted replay must reproduce the block-summary projection without hydration"
+        "persisted replay must reproduce the BlockSummary materialized view without hydration"
     );
 
     Ok(())

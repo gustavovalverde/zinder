@@ -1,5 +1,4 @@
-//! Regression coverage for the 2026-05-15 production incident
-//! (Railway deployment `637cf727-3267-46ce-8e9c-008d3b448e7b`).
+//! Source-recovery contract coverage for the tip-follow loop.
 //!
 //! Each test pins one half of the [ADR-0013] contract: source-shaped errors
 //! drain readiness and continue, structural errors stay alive in an
@@ -37,9 +36,8 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::ChainFixture;
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-/// Exact production scenario: `BlockUnavailable` with the production reason
-/// string surfaces, the writer stays alive, and readiness payload reports
-/// the right class.
+/// `BlockUnavailable` with a best-chain view-change reason keeps the writer
+/// alive and reports the typed readiness class.
 #[tokio::test]
 async fn tip_follow_survives_block_unavailable_from_unknown_json_rpc_code() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
@@ -123,12 +121,10 @@ async fn tip_follow_stays_alive_under_protocol_mismatch() -> Result<()> {
 /// Outage tracker advances `consecutive_failures` across multiple failed
 /// iterations, then resets when the upstream view recovers.
 ///
-/// Models the production scenario where the writer cannot make progress
-/// (every `fetch_block_at` returns the view-stale `BlockUnavailable` shape
-/// from the 2026-05-15 incident), then the upstream node settles back to
-/// genesis so `tip_follow_plan` returns `Ok(None)` without needing a new
-/// fetch. That path clears the outage tracker and transitions readiness
-/// out of `NodeUnavailable`, which is the contract the test pins.
+/// Every `fetch_block_at` first returns a view-stale `BlockUnavailable`, then
+/// the upstream node settles back to genesis so `tip_follow_plan` returns
+/// `Ok(None)` without another fetch. That path clears the outage tracker and
+/// transitions readiness out of `NodeUnavailable`.
 #[tokio::test]
 async fn tip_follow_advances_outage_counter_then_clears_on_recovery() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
@@ -247,12 +243,10 @@ async fn wait_until_recovered(readiness: &Readiness) -> Result<()> {
     Ok(())
 }
 
-/// A `NodeSource` that returns the exact production failure on every call.
+/// A `NodeSource` that returns Zebra's best-chain view-change failure.
 ///
-/// Mirrors what Zebra produced during the 2026-05-15 testnet incident: a
-/// `getblockhash`-style failure whose reason is `"block height not in best
-/// chain"`. After ADR-0013, the loop must classify this as
-/// [`SourceFailureClass::UpstreamViewChanged`] and stay alive.
+/// The loop classifies `"block height not in best chain"` as
+/// [`SourceFailureClass::UpstreamViewChanged`] and stays alive.
 #[derive(Clone)]
 struct ViewChangingSource {
     chain: ChainFixture,

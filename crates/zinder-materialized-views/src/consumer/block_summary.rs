@@ -109,7 +109,7 @@ impl BlockKeyedConsumer for BlockSummaryConsumer {
 /// Projects immutable, block-local canonical facts into the persisted
 /// [`BlockSummaryRecord`] read model.
 ///
-/// The projection is pure: it does not parse retained raw bytes, resolve
+/// The materialized view is pure: it does not parse retained raw bytes, resolve
 /// previous outputs, read a store, or consult transaction-intrinsic value
 /// balances. Transaction order in `facts` is preserved in the record.
 ///
@@ -122,7 +122,7 @@ pub fn project_block_summary_record(facts: &CanonicalBlockFacts) -> BlockSummary
         .collect();
     let aggregates = aggregate_canonical_transaction_facts(&facts.transactions);
     build_block_summary_record(
-        BlockSummaryBlockMetadata {
+        BlockSummaryInput {
             height: facts.block_header.height,
             hash: facts.block_header.block_hash,
             previous_hash: facts.block_header.parent_hash,
@@ -144,7 +144,7 @@ fn project_block_summary_record_from_commit_context(
         .collect();
     let aggregates = aggregate_committed_transaction_facts(&block.transactions);
     build_block_summary_record(
-        BlockSummaryBlockMetadata {
+        BlockSummaryInput {
             height: block.height,
             hash: block.block_hash,
             previous_hash: block.previous_block_hash,
@@ -157,7 +157,7 @@ fn project_block_summary_record_from_commit_context(
 }
 
 fn build_block_summary_record(
-    block: BlockSummaryBlockMetadata,
+    block: BlockSummaryInput,
     transaction_ids: Vec<String>,
     aggregates: BlockFactsAggregate,
 ) -> BlockSummaryRecord {
@@ -188,7 +188,7 @@ fn build_block_summary_record(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct BlockSummaryBlockMetadata {
+struct BlockSummaryInput {
     height: BlockHeight,
     hash: BlockHash,
     previous_hash: BlockHash,
@@ -317,7 +317,7 @@ mod tests {
     };
 
     use super::{project_block_summary_record, project_block_summary_record_from_commit_context};
-    use crate::consumer::{BlockCommitContext, BlockCommitPayload, TransparentSpendFacts};
+    use crate::consumer::{BlockCommitContext, BlockCommitInput, TransparentSpendFacts};
 
     #[test]
     fn canonical_facts_projection_matches_commit_context_consumer() {
@@ -545,7 +545,7 @@ mod tests {
             })
             .collect();
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: facts.block_header.height,
                 block_hash: facts.block_header.block_hash,
                 previous_block_hash: facts.block_header.parent_hash,

@@ -28,7 +28,9 @@ use zinder_proto::v1::explorer::{
     MigrationDenominationsRequest, MigrationDenominationsResponse, MigrationOverviewRequest,
     MigrationOverviewResponse,
 };
-use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{
+    self, VisibleTipBlockRequest, wallet_query_client::WalletQueryClient,
+};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
@@ -50,7 +52,7 @@ const MAX_MIGRATION_BLOCK_SPAN: u32 = 4096;
 const MAX_MIGRATION_ROWS_PER_REQUEST: usize = 65_536;
 
 /// Executes one `ExplorerQuery.MigrationOverview` request.
-pub(crate) async fn handle_migration_overview(
+pub(crate) async fn query_migration_overview(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -99,7 +101,7 @@ pub(crate) async fn handle_migration_overview(
 }
 
 /// Executes one `ExplorerQuery.MigrationCohorts` request.
-pub(crate) async fn handle_migration_cohorts(
+pub(crate) async fn query_migration_cohorts(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -136,7 +138,7 @@ pub(crate) async fn handle_migration_cohorts(
 }
 
 /// Executes one `ExplorerQuery.MigrationDenominations` request.
-pub(crate) async fn handle_migration_denominations(
+pub(crate) async fn query_migration_denominations(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -384,13 +386,13 @@ async fn fetch_latest_chain_epoch(
     at_epoch_id: Option<u64>,
 ) -> Result<wallet::ChainEpoch, Status> {
     wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing").into()
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing").into()
         })
 }
 

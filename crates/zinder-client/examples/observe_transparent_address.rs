@@ -168,7 +168,7 @@ async fn subscribe_chain_events(
     let mut events = chain_index
         .chain_events_with_filter(
             EventStreamStart::EarliestRetained,
-            ChainEventStreamFamily::Tip,
+            ChainEventStreamFamily::Visible,
             vec![address.to_owned()],
         )
         .await?;

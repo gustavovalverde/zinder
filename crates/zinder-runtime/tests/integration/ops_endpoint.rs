@@ -43,7 +43,9 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
             service_name: "zinder-test",
             service_version: "0.0.0",
             network_name: "zcash-regtest",
-            advertised_capabilities: vec![zinder_proto::capabilities::WALLET_READ_LATEST_BLOCK_V1],
+            advertised_capabilities: vec![
+                zinder_proto::capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+            ],
         },
         readiness.clone(),
     );

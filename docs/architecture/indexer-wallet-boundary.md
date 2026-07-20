@@ -22,15 +22,15 @@ Zinder exposes the same indexed chain through 2 contracts. The native contract i
 
 ### Native Zinder contract
 
-`WalletQuery` and the Rust `zinder-client` expose typed errors, capability discovery, epoch-pinned reads, resumable chain events, transaction broadcast results, mempool views, and transparent-address artifacts. New integrations should prefer this contract when they need explicit consistency or Zinder-specific features.
+`WalletQuery` and the Rust `zinder-client` expose typed errors, capability discovery, epoch-pinned reads, resumable chain events, transaction broadcast outcomes, mempool views, and transparent-address artifacts. An integration that deploys the native adapter should prefer this contract when it needs explicit consistency or Zinder-specific features.
 
-The Rust client divides the contract by topology. `RemoteChainIndex` uses gRPC across a process or host boundary, while `LocalChainIndex` uses a colocated RocksDB secondary without a tonic round trip. Both implement `ChainIndex` for canonical and derived reads. Operations that require a live ingest-control endpoint, including broadcast and live subscriptions, use the `EndpointBackedIndex` extension and are available through `RemoteChainIndex`.
+The Rust client divides the contract by topology. `RemoteChainIndex` uses gRPC across a process or host boundary, while `LocalChainIndex` uses a colocated RocksDB secondary without a tonic round trip. Both implement `ChainIndex` for canonical and wallet-projection reads. Operations that require a live ingest-control endpoint, including broadcast and live subscriptions, use the `EndpointBackedIndex` extension and are available through `RemoteChainIndex`.
 
 ### Lightwalletd compatibility contract
 
-`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. It reads the same canonical and derived stores as the native query service; it does not maintain a second index, call Zebra independently, or construct parallel artifacts.
+`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `LightwalletdQueryApi`. `LightwalletdServingQuery` answers from an admitted pair of canonical and wallet-projection readers; it does not maintain a second index, read Explorer materialized views, use Zebra as a fallback for indexed history, or construct parallel artifacts. It may broadcast transactions, discover network-upgrade activations, and fill sparse tree state through `zinder-source` when the query contract explicitly delegates those operations upstream.
 
-For a client that already speaks the supported `CompactTxStreamer` protocol, adopting Zinder can be an endpoint substitution rather than a wallet rewrite. This is a wire-compatibility statement, not a claim that the Zinder binaries and configuration replace a lightwalletd deployment unchanged. Operators still deploy Zinder's ingest, storage, query, and compatibility services, and each named wallet requires its own end-to-end certification before the project claims tested support.
+For a client that already speaks the supported `CompactTxStreamer` protocol, adopting Zinder can be an endpoint substitution rather than a wallet rewrite. This is a wire-compatibility statement, not a claim that the Zinder binaries and configuration replace a lightwalletd deployment unchanged. Operators deploy Zinder's ingest, projector, and compatibility runtimes, and each named wallet requires its own end-to-end certification before the project claims tested support.
 
 ## Choose by ownership and topology
 
@@ -76,7 +76,7 @@ This boundary also preserves shielded privacy. Zinder serves compact chain artif
 
 ## Operational boundary
 
-Zinder's deployment target is a single operator backed by one upstream Zebra node. `zinder-ingest` is the only canonical writer; `zinder-query`, `zinder-compat-lightwalletd`, and explicit `LocalChainIndex` consumers open read-only secondary stores. Remote native and lightwalletd clients connect to those reader services instead of opening storage. Readers either see the previous `ChainEpoch` or the newly committed epoch, never a half-committed batch.
+Zinder's release topology is a single operator backed by one upstream Zebra node. `zinder-ingest` is the only canonical writer, `zinder-projector` is the only wallet-projection writer, and `zinder-compat-lightwalletd` serves admitted canonical and wallet-projection secondaries. `zinder-query` is a library, not a release runtime. A custom native `WalletQuery` deployment may embed that library for remote native consumers; release clients use the compatibility endpoint, and local consumers can open secondaries. Readers either see the previous `ChainEpoch` or the newly committed epoch, never a half-committed batch.
 
 Zinder does not provide tenant isolation, terminate public TLS, authenticate callers, or enforce per-client rate limits. Operators place an appropriate proxy or private network boundary in front of externally reachable services. Cross-host RocksDB secondaries are also outside the recommended topology; remote consumers should use gRPC.
 
@@ -84,16 +84,22 @@ Zinder does not provide tenant isolation, terminate public TLS, authenticate cal
 flowchart LR
     Zebra["Zebra<br/>canonical node state"]
     Ingest["zinder-ingest<br/>only canonical writer"]
-    Store[("Durable indexed chain view")]
-    Native["WalletQuery<br/>native Zinder contract"]
+    Canonical[("Canonical store")]
+    Projector["zinder-projector<br/>wallet-projection writer"]
+    Wallet[("Wallet projection")]
+    Native["Optional native WalletQuery<br/>adapter using zinder-query"]
     Compat["CompactTxStreamer<br/>lightwalletd compatibility"]
     Products["Wallets, explorers,<br/>payments, and custody"]
     LightClients["Existing lightwalletd clients"]
 
     Zebra -->|JSON-RPC| Ingest
-    Ingest --> Store
-    Store --> Native
-    Store --> Compat
+    Ingest --> Canonical
+    Canonical --> Projector
+    Projector --> Wallet
+    Canonical --> Native
+    Wallet --> Native
+    Canonical --> Compat
+    Wallet --> Compat
     Native --> Products
     Compat --> LightClients
 ```

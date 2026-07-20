@@ -1,6 +1,6 @@
 //! Durable block fact and blob values.
 
-use crate::{BlockHash, BlockHeaderInfo, BlockHeight};
+use crate::{BlockHash, BlockHeader, BlockHeight};
 
 /// Canonical block-header facts indexed by block height.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,17 +62,14 @@ impl BlockHeaderArtifact {
 
     /// Creates canonical block-header facts from the public read model.
     #[must_use]
-    pub const fn from_header_info(header: BlockHeaderInfo) -> Self {
-        Self::from_header_info_with_block_size(header, 0)
+    pub const fn from_header(header: BlockHeader) -> Self {
+        Self::from_header_with_block_size(header, 0)
     }
 
     /// Creates canonical block-header facts from the public read model and
     /// the serialized source block size.
     #[must_use]
-    pub const fn from_header_info_with_block_size(
-        header: BlockHeaderInfo,
-        block_size_bytes: u64,
-    ) -> Self {
+    pub const fn from_header_with_block_size(header: BlockHeader, block_size_bytes: u64) -> Self {
         Self {
             height: header.block_id.height,
             block_hash: header.block_id.hash,
@@ -89,8 +86,8 @@ impl BlockHeaderArtifact {
 
     /// Converts the persisted facts into the public header read model.
     #[must_use]
-    pub const fn into_header_info(self) -> BlockHeaderInfo {
-        BlockHeaderInfo::new(
+    pub const fn into_header(self) -> BlockHeader {
+        BlockHeader::new(
             crate::BlockId::new(self.height, self.block_hash),
             self.parent_hash,
             self.merkle_root_hash,

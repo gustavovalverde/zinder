@@ -170,8 +170,8 @@ fn rustdoc_block_contains_examples_marker(trait_body: &str, declaration_line_ind
 fn extract_chain_index_body_matches_known_method_set() -> Result<()> {
     let must_include = [
         "current_epoch",
-        "latest_block",
-        "latest_safe_block",
+        "visible_tip_block",
+        "settled_tip_block",
         "block_id_by_selector",
         "block_header_by_selector",
         "compact_block_at",

@@ -112,16 +112,16 @@ pub enum BenchError {
         #[source]
         source: zinder_wallet_rocksdb::RocksDbWalletError,
     },
-    /// A projection-store operation failed while constructing projections.
-    #[error("projection store error: {source}")]
-    Projection {
-        /// Underlying projection-store failure.
+    /// A materialized-view store operation failed while constructing projections.
+    #[error("materialized-view store error: {source}")]
+    MaterializedView {
+        /// Underlying materialized-view store failure.
         #[source]
         source: zinder_materialized_views::MaterializedViewStoreError,
     },
-    /// Projection construction returned without reaching the canonical event tip.
-    #[error("projection build incomplete: {reason}")]
-    ProjectionBuildIncomplete {
+    /// Materialized-view construction returned without reaching the canonical event tip.
+    #[error("materialized-view build incomplete: {reason}")]
+    MaterializedViewBuildIncomplete {
         /// Consumer cursor mismatch that prevents a completed build claim.
         reason: String,
     },
@@ -221,7 +221,7 @@ impl From<zinder_wallet_rocksdb::RocksDbWalletError> for BenchError {
 
 impl From<zinder_materialized_views::MaterializedViewStoreError> for BenchError {
     fn from(source: zinder_materialized_views::MaterializedViewStoreError) -> Self {
-        Self::Projection { source }
+        Self::MaterializedView { source }
     }
 }
 
@@ -312,10 +312,10 @@ impl BenchError {
         }
     }
 
-    /// Builds an incomplete-projection error from a cursor mismatch.
+    /// Builds an incomplete-materialized-view error from a cursor mismatch.
     #[must_use]
-    pub fn projection_build_incomplete(reason: impl Into<String>) -> Self {
-        Self::ProjectionBuildIncomplete {
+    pub fn materialized_view_build_incomplete(reason: impl Into<String>) -> Self {
+        Self::MaterializedViewBuildIncomplete {
             reason: reason.into(),
         }
     }

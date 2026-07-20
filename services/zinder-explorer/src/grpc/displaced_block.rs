@@ -32,7 +32,7 @@ const MAX_PAGE_SIZE: u32 = 4_096;
 const CURSOR_PREFIX: &[u8; 4] = b"zdb1";
 const CURSOR_LEN: usize = CURSOR_PREFIX.len() + size_of::<u64>() + size_of::<u32>() + 32;
 
-pub(crate) async fn handle_displaced_block_history(
+pub(crate) async fn query_displaced_block_history(
     chain_store: &SecondaryChainStore,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<DisplacedBlockHistoryRequest>,
@@ -92,7 +92,7 @@ pub(crate) async fn handle_displaced_block_history(
     }))
 }
 
-pub(crate) async fn handle_displaced_block_detail(
+pub(crate) async fn query_displaced_block_detail(
     chain_store: &SecondaryChainStore,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<DisplacedBlockDetailRequest>,

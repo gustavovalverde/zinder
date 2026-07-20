@@ -74,13 +74,13 @@ pub struct RocksDbCanonicalReplayValidation {
     pub logical_replay_bytes: u64,
     /// Semantic replay format version decoded from every persisted row.
     pub replay_format_version: u32,
-    /// Ordered digest recomputed from every decoded semantic fact aggregate.
+    /// Ordered digest recomputed from every decoded semantic replay record.
     pub sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
 /// Measurements and validated evidence from one `RocksDB` canonical-replay round trip.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RocksDbCanonicalReplayResult {
+pub struct RocksDbCanonicalReplayReport {
     /// Prepare concurrency applied to this run.
     pub block_prepare_concurrency: NonZeroU32,
     /// Per-phase elapsed time.
@@ -113,7 +113,7 @@ pub struct RocksDbCanonicalReplayResult {
 )]
 pub async fn run_rocksdb_canonical_replay_storage(
     config: RocksDbCanonicalReplayConfig,
-) -> Result<RocksDbCanonicalReplayResult, BenchError> {
+) -> Result<RocksDbCanonicalReplayReport, BenchError> {
     let wall_clock_started = Instant::now();
     let initialization_started = Instant::now();
     validate_resource_budget(config.rocksdb_resource_budget)?;
@@ -204,7 +204,7 @@ pub async fn run_rocksdb_canonical_replay_storage(
     timings.storage_measurement_seconds = storage_measurement_started.elapsed().as_secs_f64();
     timings.wall_clock_seconds = wall_clock_started.elapsed().as_secs_f64();
 
-    Ok(RocksDbCanonicalReplayResult {
+    Ok(RocksDbCanonicalReplayReport {
         block_prepare_concurrency: config.block_prepare_concurrency,
         timings,
         validation,
@@ -271,13 +271,11 @@ async fn build_canonical_replay_storage_sst(
 
         let persistence_started = Instant::now();
         for record in records {
-            let block_facts_key = canonical_replay_key(record.height);
+            let replay_key = canonical_replay_key(record.height);
             let row_encoding = encode_canonical_replay_storage_row(&record)?;
-            sst_writer
-                .put(block_facts_key, row_encoding)
-                .map_err(|source| {
-                    candidate_error(format!("external SST write failed: {source}"))
-                })?;
+            sst_writer.put(replay_key, row_encoding).map_err(|source| {
+                candidate_error(format!("external SST write failed: {source}"))
+            })?;
         }
         replay_persistence_seconds += persistence_started.elapsed().as_secs_f64();
     }

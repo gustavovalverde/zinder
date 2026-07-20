@@ -8,7 +8,7 @@ use crate::{BlockHash, BlockId};
 
 /// Typed block-header read-model value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockHeaderInfo {
+pub struct BlockHeader {
     /// Resolved block identity.
     pub block_id: BlockId,
     /// Hash of the previous block.
@@ -33,7 +33,7 @@ pub struct BlockHeaderInfo {
     pub version: u32,
 }
 
-impl BlockHeaderInfo {
+impl BlockHeader {
     /// Constructs a typed block-header read-model value from its fields.
     #[must_use]
     #[allow(

@@ -172,13 +172,6 @@ pub enum StoreError {
     #[error("canonical history bounds are missing from a non-empty store")]
     CanonicalHistoryBoundsMissing,
 
-    /// Legacy canonical-history metadata could not be reconciled safely.
-    #[error("canonical history bounds reconciliation failed: {reason}")]
-    CanonicalHistoryBoundsReconciliation {
-        /// Stable reason the legacy store could not be classified.
-        reason: &'static str,
-    },
-
     /// Requested history was intentionally omitted by checkpoint bootstrap.
     #[error(
         "canonical history at height {requested_height:?} is unavailable before retained height {first_available_height:?}"
@@ -241,6 +234,12 @@ pub enum StoreError {
         /// Schema version expected by the running binary.
         expected_version: u16,
     },
+
+    /// A populated canonical store has no durable schema and network metadata.
+    #[error(
+        "canonical store metadata is missing from a non-empty store; use a fresh store path and rebuild from a certified recovery source"
+    )]
+    StoreMetadataMissing,
 
     /// Persisted metadata declares the current schema but a required column family is absent.
     #[error("store schema is incomplete: missing column family {missing_column_family}")]
@@ -332,13 +331,6 @@ pub enum StoreError {
     /// Transparent output cursor failed validation.
     #[error("transparent output cursor is invalid: {reason}")]
     AddressOutputCursorInvalid {
-        /// Cursor validation failure reason.
-        reason: &'static str,
-    },
-
-    /// Transparent address tx-history cursor failed validation.
-    #[error("transparent history cursor is invalid: {reason}")]
-    TransparentHistoryCursorInvalid {
         /// Cursor validation failure reason.
         reason: &'static str,
     },

@@ -24,7 +24,7 @@ message ServerInfoResponse {
 // chain epoch.
 message WriterStatusRequest {}
 
-// Current phase of the unified ingest loop. Orthogonal to readiness
+// Current phase of the phase-driven ingest loop. Orthogonal to readiness
 // `cause`: a writer in `WRITER_PHASE_BULK_CATCHUP` may report `syncing`
 // (normal) or `upstream_not_ready` (Zebra itself is behind). See ADR-0015.
 enum WriterPhase {
@@ -36,16 +36,13 @@ enum WriterPhase {
   // exists to commit.
   WRITER_PHASE_AWAITING_UPSTREAM = 1;
   // Gap to the upstream tip is above `ingest.phase_classification.catchup_threshold_blocks`.
-  // The bulk-catchup driver runs pipelined block fetches and commits
-  // batches with `FinalizeThrough`.
+  // The bulk-catchup driver runs pipelined block fetches, commits batches,
+  // and advances the settled tip under the configured reorg-window policy.
   WRITER_PHASE_BULK_CATCHUP = 2;
   // Gap is within the catch-up threshold. The serial tip-follow driver
   // commits one block per poll cycle.
   WRITER_PHASE_FOLLOWING_TIP = 3;
 
-  // Reserved slots for additive growth. Removing a reserved range is a
-  // breaking change.
-  reserved 4 to 15;
 }
 
 // Private ingest control-plane response used by colocated secondary readers
@@ -61,16 +58,8 @@ message WriterStatusResponse {
   // `chain_view` because it is known before the first commit.
   string network_name = 2;
 
-  reserved 3, 4;
-  reserved "latest_writer_tip_height", "latest_writer_settled_tip_height";
-
-  // Current phase of the unified ingest loop. ADR-0015.
+  // Current phase of the phase-driven ingest loop. ADR-0015.
   WriterPhase phase = 5;
-
-  // Reserved by a future ADR for the bulk-catchup transport identity.
-  // Skipped today because the JSON-RPC adapter is the only backend; the
-  // value would carry no signal.
-  reserved 6;
 
   // Distance from the writer's visible tip to the observed upstream tip
   // when known. Drives phase classification; populated whenever the writer
@@ -91,7 +80,7 @@ message MempoolTransactionRequest {
   string transaction_id = 1;
 }
 
-// Exact authenticated fence published by the canonical version-1 writer.
+// Exact authenticated fence published by the canonical writer.
 message CanonicalWriterFence {
   uint64 chain_epoch_id = 1;
   uint64 event_sequence = 2;
@@ -231,7 +220,7 @@ message CanonicalOwnerCheckpointReadyEvidence {
   uint32 block_digest_version = 3;
   uint32 replay_format_version = 4;
   uint32 sequence_digest_version = 5;
-  uint64 visible_logical_block_facts_bytes = 6;
+  uint64 visible_logical_replay_bytes = 6;
   CanonicalCheckpointSequenceEvidence sequence_checkpoint = 7;
   // Immutable fresh-build construction-manifest format bound into READY.
   uint32 construction_manifest_version = 8;
@@ -343,8 +332,13 @@ service IngestControl {
   // Returns the writer's latest committed chain epoch.
   rpc WriterStatus(WriterStatusRequest) returns (WriterStatusResponse);
 
-  // Streams chain-event history from the ingest writer's primary store.
-  rpc ChainEvents(zinder.v1.wallet.ChainEventsRequest) returns (stream zinder.v1.wallet.ChainEventEnvelope);
+  // Streams visible-tip chain-event history from the canonical writer.
+  //
+  // This private control stream exists so compatibility runtimes can observe
+  // best-block changes without opening a source connection. Settled and
+  // address-filtered streams belong to WalletQuery, not the writer control
+  // plane.
+  rpc VisibleChainEvents(zinder.v1.wallet.EventStreamStart) returns (stream zinder.v1.wallet.ChainEventEnvelope);
 
   // Returns a bounded snapshot of the writer's live mempool index.
   //

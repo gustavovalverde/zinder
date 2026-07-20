@@ -1,6 +1,6 @@
 //! Configuration loading for the `zinder-ingest` binary.
 //!
-//! [`IngestCommandConfig`] resolves the unified loop's input
+//! [`IngestCommandConfig`] resolves the phase-driven ingest loop's input
 //! (`zinder-ingest --config X` default invocation and `zinder-ingest probe`).
 
 use std::{
@@ -14,23 +14,19 @@ use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_ingest::{
     CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalPipelineLimits,
-    CanonicalRunOverrides, ConventionalFeeDistributionBackfillConfig,
-    DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    CanonicalRunOverrides, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
-    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig,
-    MaterializedViewReplayConfig, MaterializedViewReplayPolicy, NodeSourceKind,
-    PhaseClassificationConfig, RawBlobPolicy, TransactionComponentBackfillConfig,
-    container_memory_budget_bytes,
+    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig, NodeSourceKind,
+    PhaseClassificationConfig, RawBlobPolicy, container_memory_budget_bytes,
 };
-use zinder_materialized_views::ProjectionPreset;
 use zinder_runtime::{
     ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
-    NetworkToml, NodeToml, OpsSection, OpsToml, PrimaryStorageSection, ResolvedIngestControlWriter,
-    ResolvedPrimaryStorage, ResolvedRetention, RetentionSection, RetentionToml, SecuritySection,
-    SecurityToml, ServiceIdentifier, StorageRoleSection, StorageRoleToml, duration_as_millis_u64,
-    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_writer,
-    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention,
+    NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedIngestControlWriter, ResolvedRetention,
+    RetentionSection, RetentionToml, RuntimeService, SecuritySection, SecurityToml,
+    StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
+    require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
+    resolve_ops_listen_addr, resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::RocksDbResourceBudget;
@@ -79,30 +75,16 @@ fn default_pipeline_queue_bytes_from_budget(
     })
 }
 const DEFAULT_FLUSH_INTERVAL_EPOCHS: u32 = 5;
-const DEFAULT_MATERIALIZED_VIEW_REPLAY_BATCH_BLOCKS: u32 = 100;
-const DEFAULT_MATERIALIZED_VIEW_REPLAY_MIN_BATCH_BLOCKS: u32 = 10;
-const DEFAULT_MATERIALIZED_VIEW_STARTUP_HANDOFF_LAG_BLOCKS: u32 = 1_000;
-const DEFAULT_MATERIALIZED_VIEW_REPLAY_MEMORY_DEGRADE_RATIO: f64 = 0.90;
-const DEFAULT_MATERIALIZED_VIEW_REPLAY_MEMORY_PAUSE_RATIO: f64 = 0.99;
-const DEFAULT_MATERIALIZED_VIEW_REPLAY_MEMORY_RESUME_RATIO: f64 = 0.80;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
-const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
-const DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_ENABLED: bool = true;
-const DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS: u32 = 256;
-const DEFAULT_TRANSACTION_COMPONENT_BACKFILL_ENABLED: bool = true;
-const DEFAULT_TRANSACTION_COMPONENT_BACKFILL_BATCH_BLOCKS: u32 = 256;
+const DEFAULT_ALLOW_REORG_WINDOW_SETTLEMENT: bool = false;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
 const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
-const DEFAULT_PROJECTION_PRESET: ProjectionPreset = ProjectionPreset::Wallet;
 
-/// Fully loaded command configuration for the unified `zinder-ingest`
+/// Fully loaded command configuration for the `zinder-ingest`
 /// run (no subcommand and the `probe` subcommand both consume this).
 #[derive(Debug)]
 pub(crate) struct IngestCommandConfig {
     pub(crate) runtime_config: IngestRuntimeConfig,
-    pub(crate) projection_preset: ProjectionPreset,
-    pub(crate) conventional_fee_distribution_backfill: ConventionalFeeDistributionBackfillConfig,
-    pub(crate) transaction_component_backfill: TransactionComponentBackfillConfig,
     pub(crate) coverage: IngestCoverage,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
@@ -122,7 +104,7 @@ pub(crate) enum IngestCoverage {
     /// Use explicitly supplied modifier heights as-is.
     Explicit,
     /// Derive the historical floor needed by lightwalletd-compatible
-    /// wallets. The unified loop looks up the checkpoint against the
+    /// wallets. The ingest loop looks up the checkpoint against the
     /// upstream node before entering the first phase.
     WalletServing,
 }
@@ -152,7 +134,7 @@ pub(crate) struct CanonicalReplayVerificationCommandConfig {
     pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
 }
 
-/// Command-line overrides for the unified ingest invocation.
+/// Command-line overrides for the phase-driven ingest invocation.
 #[derive(Debug, Default)]
 pub(crate) struct IngestConfigOverrides {
     pub(crate) network: Option<String>,
@@ -162,7 +144,6 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) node_auth_username: Option<String>,
     pub(crate) node_auth_path: Option<PathBuf>,
     pub(crate) storage_path: Option<PathBuf>,
-    pub(crate) projection_preset: Option<String>,
     pub(crate) request_timeout_secs: Option<u64>,
     pub(crate) max_response_bytes: Option<u64>,
     pub(crate) reorg_window_blocks: Option<u32>,
@@ -180,7 +161,7 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) lag_threshold_blocks: Option<u64>,
     pub(crate) target_height: Option<u32>,
     pub(crate) checkpoint_height: Option<u32>,
-    pub(crate) allow_near_tip_finalize: Option<bool>,
+    pub(crate) allow_reorg_window_settlement: Option<bool>,
     pub(crate) wallet_serving: Option<bool>,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
@@ -208,16 +189,13 @@ pub(crate) enum IngestConfigError {
     #[error(transparent)]
     CanonicalWriter(#[from] zinder_ingest::CanonicalWriterError),
 
-    #[error("canonical writer requires ingest.projection_preset=wallet")]
-    CanonicalWriterRequiresWallet,
-
     #[error(transparent)]
     CanonicalReplayVerification(
         #[from] crate::replay_verification::CanonicalReplayVerificationError,
     ),
 }
 
-/// Loads and validates the unified ingest configuration.
+/// Loads and validates the phase-driven ingest configuration.
 #[allow(
     clippy::too_many_lines,
     reason = "the override chain is one auditable list of TOML keys; splitting it into helpers would scatter the precedence contract across multiple sites."
@@ -232,10 +210,6 @@ pub(crate) fn load_ingest_config(
         // non-PaaS hosts override via `ZINDER_STORAGE__PATH` env var or the
         // `--storage-path` CLI flag.
         .with_default("storage.path", "/var/lib/zinder/store")?
-        .with_default(
-            "ingest.projection_preset",
-            DEFAULT_PROJECTION_PRESET.as_str(),
-        )?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
             "ingest.construction.canonical_batch_max_blocks",
@@ -258,50 +232,6 @@ pub(crate) fn load_ingest_config(
             default_pipeline_queue_bytes(FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES),
         )?
         .with_default(
-            "ingest.materialized_views.replay_batch_blocks",
-            DEFAULT_MATERIALIZED_VIEW_REPLAY_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.materialized_views.replay_policy",
-            MaterializedViewReplayPolicy::DEFAULT.as_kebab_case(),
-        )?
-        .with_default(
-            "ingest.materialized_views.memory_degrade_ratio",
-            DEFAULT_MATERIALIZED_VIEW_REPLAY_MEMORY_DEGRADE_RATIO,
-        )?
-        .with_default(
-            "ingest.materialized_views.memory_pause_ratio",
-            DEFAULT_MATERIALIZED_VIEW_REPLAY_MEMORY_PAUSE_RATIO,
-        )?
-        .with_default(
-            "ingest.materialized_views.memory_resume_ratio",
-            DEFAULT_MATERIALIZED_VIEW_REPLAY_MEMORY_RESUME_RATIO,
-        )?
-        .with_default(
-            "ingest.materialized_views.min_replay_batch_blocks",
-            DEFAULT_MATERIALIZED_VIEW_REPLAY_MIN_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.materialized_views.startup_handoff_lag_blocks",
-            DEFAULT_MATERIALIZED_VIEW_STARTUP_HANDOFF_LAG_BLOCKS,
-        )?
-        .with_default(
-            "ingest.conventional_fee_distribution_backfill.enabled",
-            DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_ENABLED,
-        )?
-        .with_default(
-            "ingest.conventional_fee_distribution_backfill.batch_blocks",
-            DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.transaction_component_backfill.enabled",
-            DEFAULT_TRANSACTION_COMPONENT_BACKFILL_ENABLED,
-        )?
-        .with_default(
-            "ingest.transaction_component_backfill.batch_blocks",
-            DEFAULT_TRANSACTION_COMPONENT_BACKFILL_BATCH_BLOCKS,
-        )?
-        .with_default(
             "ingest.construction.flush_interval_epochs",
             DEFAULT_FLUSH_INTERVAL_EPOCHS,
         )?
@@ -314,14 +244,14 @@ pub(crate) fn load_ingest_config(
             DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
         )?
         .with_default(
-            "ingest.run_overrides.allow_near_tip_finalize",
-            DEFAULT_ALLOW_NEAR_TIP_FINALIZE,
+            "ingest.run_overrides.allow_reorg_window_settlement",
+            DEFAULT_ALLOW_REORG_WINDOW_SETTLEMENT,
         )?
         .with_default(
             "ingest.run_overrides.coverage",
             DEFAULT_INGEST_COVERAGE.as_kebab_case(),
         )?
-        .with_ops_section(ServiceIdentifier::Ingest)?
+        .with_ops_section(RuntimeService::Ingest)?
         .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?
@@ -332,7 +262,6 @@ pub(crate) fn load_ingest_config(
         .with_override_if("node.auth.username", overrides.node_auth_username)?
         .with_override_path_if("node.auth.path", overrides.node_auth_path)?
         .with_override_path_if("storage.path", overrides.storage_path)?
-        .with_override_if("ingest.projection_preset", overrides.projection_preset)?
         .with_override_if("node.request_timeout_secs", overrides.request_timeout_secs)?
         .with_override_if("node.max_response_bytes", overrides.max_response_bytes)?
         .with_override_if("ingest.reorg_window_blocks", overrides.reorg_window_blocks)?
@@ -390,8 +319,8 @@ pub(crate) fn load_ingest_config(
             overrides.checkpoint_height,
         )?
         .with_override_if(
-            "ingest.run_overrides.allow_near_tip_finalize",
-            overrides.allow_near_tip_finalize,
+            "ingest.run_overrides.allow_reorg_window_settlement",
+            overrides.allow_reorg_window_settlement,
         )?
         .with_override_if(
             "ingest.run_overrides.coverage",
@@ -444,16 +373,7 @@ pub(crate) fn redacted_ingest_config_toml(
 ) -> Result<String, IngestConfigError> {
     let rendered = toml::to_string(&RedactedIngestConfigToml::from_ingest_config(config))
         .map_err(|source| ConfigError::Render { source })?;
-    let effective_projection_identities = config
-        .projection_preset
-        .consumer_schemas()
-        .iter()
-        .map(|schema| format!("\"{}\"", schema.name.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "# effective_projection_identities = [{effective_projection_identities}]\n{rendered}"
-    ))
+    Ok(rendered)
 }
 
 /// Renders the effective canonical replay verification configuration in the
@@ -486,18 +406,7 @@ struct IngestPrimaryStorageSection {
     path: Option<PathBuf>,
     secondary_path: Option<PathBuf>,
     canonical: StorageRoleSection,
-    materialized_views: StorageRoleSection,
     raw_blob_policy: Option<RawBlobPolicy>,
-}
-
-impl IngestPrimaryStorageSection {
-    fn into_primary_storage(self) -> PrimaryStorageSection {
-        PrimaryStorageSection {
-            path: self.path,
-            canonical: self.canonical,
-            materialized_views: self.materialized_views,
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -506,24 +415,16 @@ struct IngestSection {
     /// Canonical source-adapter selector. The supported value is
     /// `zebra-json-rpc`.
     source: Option<String>,
-    /// Closed materialized-view workload. Omitted configuration defaults to `explorer`.
-    projection_preset: Option<String>,
     /// Chain-truth invariant: how deep into the upstream tip the
     /// settled-tip cliff sits. Defaults to `100`.
     reorg_window_blocks: Option<u32>,
     /// Phase classifier knobs.
     phase_classification: IngestPhaseClassificationSection,
-    /// Shared materialized-view replay knobs.
-    materialized_views: IngestMaterializedViewsSection,
-    /// Historical ZIP-317 conventional-fee distribution projection.
-    conventional_fee_distribution_backfill: IngestConventionalFeeDistributionBackfillSection,
-    /// Settled historical transaction-component projection.
-    transaction_component_backfill: IngestTransactionComponentBackfillSection,
     /// Pipelined-fetch knobs for bulk catch-up.
     construction: IngestConstructionSection,
     /// Serial-loop knobs for tip-follow.
     follow: IngestFollowSection,
-    /// One-shot `run_overrides` for the unified loop.
+    /// One-shot `run_overrides` for the ingest loop.
     run_overrides: IngestRunOverridesSection,
 }
 
@@ -531,35 +432,6 @@ struct IngestSection {
 #[serde(default, deny_unknown_fields)]
 struct IngestPhaseClassificationSection {
     catchup_threshold_blocks: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestMaterializedViewsSection {
-    #[serde(rename = "replay_batch_blocks")]
-    batch_blocks: Option<u32>,
-    #[serde(rename = "replay_policy")]
-    policy: Option<String>,
-    memory_budget_bytes: Option<u64>,
-    memory_degrade_ratio: Option<f64>,
-    memory_pause_ratio: Option<f64>,
-    memory_resume_ratio: Option<f64>,
-    min_replay_batch_blocks: Option<u32>,
-    startup_handoff_lag_blocks: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestConventionalFeeDistributionBackfillSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestTransactionComponentBackfillSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -591,35 +463,13 @@ struct IngestFollowSection {
 struct IngestRunOverridesSection {
     target_height: Option<u32>,
     checkpoint_height: Option<u32>,
-    allow_near_tip_finalize: Option<bool>,
+    allow_reorg_window_settlement: Option<bool>,
     coverage: Option<IngestCoverage>,
 }
 
 const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
     match node_source {
         NodeSourceKind::ZebraJsonRpc => "zebra-json-rpc",
-    }
-}
-
-fn parse_materialized_view_replay_policy(
-    policy_text: &str,
-) -> Result<MaterializedViewReplayPolicy, ConfigError> {
-    match policy_text {
-        "canonical-first" => Ok(MaterializedViewReplayPolicy::CanonicalFirst),
-        "continuous" => Ok(MaterializedViewReplayPolicy::Continuous),
-        _ => Err(ConfigError::invalid(
-            "ingest.materialized_views.replay_policy must be one of: canonical-first, continuous",
-        )),
-    }
-}
-
-fn parse_projection_preset(preset_text: &str) -> Result<ProjectionPreset, ConfigError> {
-    match preset_text {
-        "wallet" => Ok(ProjectionPreset::Wallet),
-        "explorer" => Ok(ProjectionPreset::Explorer),
-        _ => Err(ConfigError::invalid(
-            "ingest.projection_preset must be one of: wallet, explorer",
-        )),
     }
 }
 
@@ -666,19 +516,9 @@ fn available_logical_core_count() -> NonZeroU32 {
         .unwrap_or(NonZeroU32::MIN)
 }
 
-fn ratio_config(amount: Option<f64>, path: &'static str) -> Result<f64, ConfigError> {
-    let amount = require_field(amount, path)?;
-    if amount > 0.0 && amount <= 1.0 {
-        return Ok(amount);
-    }
-    Err(ConfigError::invalid(format!(
-        "{path} must be greater than zero and less than or equal to one"
-    )))
-}
-
 #[allow(
     clippy::too_many_lines,
-    reason = "the unified ingest resolver composes the network, source, storage, phase, bulk-catchup, tip-follow, and modifier knobs in one auditable validation sequence."
+    reason = "the phase-driven ingest resolver composes the network, source, storage, phase, bulk-catchup, tip-follow, and modifier knobs in one auditable validation sequence."
 )]
 fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
@@ -688,11 +528,6 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         available_logical_core_count(),
         node_target.max_response_bytes,
     );
-    let projection_preset_text = require_field(
-        config.ingest.projection_preset.clone(),
-        "ingest.projection_preset",
-    )?;
-    let projection_preset = parse_projection_preset(&projection_preset_text)?;
     let node_source_text = config
         .ingest
         .source
@@ -700,11 +535,9 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
     let configured_raw_blob_policy = config.storage.raw_blob_policy;
-    let ResolvedPrimaryStorage {
-        path: storage_path,
-        canonical_rocksdb_budget,
-        materialized_view_rocksdb_budget,
-    } = resolve_primary_storage(config.storage.into_primary_storage())?;
+    let storage_path = require_field(config.storage.path, "storage.path")?;
+    let canonical_rocksdb_budget =
+        resolve_canonical_writer_rocksdb_budget(config.storage.canonical.rocksdb)?;
 
     let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
@@ -818,81 +651,6 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         ))
     })?;
 
-    let replay_batch_blocks_raw = require_field(
-        config.ingest.materialized_views.batch_blocks,
-        "ingest.materialized_views.replay_batch_blocks",
-    )?;
-    let replay_batch_blocks = NonZeroU32::new(replay_batch_blocks_raw).ok_or_else(|| {
-        ConfigError::invalid(
-            "ingest.materialized_views.replay_batch_blocks must be greater than zero",
-        )
-    })?;
-    let replay_policy_raw = require_field(
-        config.ingest.materialized_views.policy,
-        "ingest.materialized_views.replay_policy",
-    )?;
-    let replay_policy = parse_materialized_view_replay_policy(&replay_policy_raw)?;
-    let memory_budget_bytes = optional_nonzero_u64_config(
-        config.ingest.materialized_views.memory_budget_bytes,
-        "ingest.materialized_views.memory_budget_bytes",
-    )?;
-    let memory_degrade_ratio = ratio_config(
-        config.ingest.materialized_views.memory_degrade_ratio,
-        "ingest.materialized_views.memory_degrade_ratio",
-    )?;
-    let memory_pause_ratio = ratio_config(
-        config.ingest.materialized_views.memory_pause_ratio,
-        "ingest.materialized_views.memory_pause_ratio",
-    )?;
-    let memory_resume_ratio = ratio_config(
-        config.ingest.materialized_views.memory_resume_ratio,
-        "ingest.materialized_views.memory_resume_ratio",
-    )?;
-    if !(memory_resume_ratio < memory_degrade_ratio && memory_degrade_ratio < memory_pause_ratio) {
-        return Err(ConfigError::invalid(
-            "ingest.materialized_views memory ratios must satisfy memory_resume_ratio < memory_degrade_ratio < memory_pause_ratio",
-        )
-        .into());
-    }
-    let min_replay_batch_blocks = nonzero_u32_config(
-        config.ingest.materialized_views.min_replay_batch_blocks,
-        "ingest.materialized_views.min_replay_batch_blocks",
-    )?;
-    if min_replay_batch_blocks > replay_batch_blocks {
-        return Err(ConfigError::invalid(
-            "ingest.materialized_views.min_replay_batch_blocks must be less than or equal to ingest.materialized_views.replay_batch_blocks",
-        )
-        .into());
-    }
-    let startup_handoff_lag_blocks = u64::from(require_field(
-        config.ingest.materialized_views.startup_handoff_lag_blocks,
-        "ingest.materialized_views.startup_handoff_lag_blocks",
-    )?);
-
-    let conventional_fee_distribution_backfill = ConventionalFeeDistributionBackfillConfig {
-        enabled: require_field(
-            config.ingest.conventional_fee_distribution_backfill.enabled,
-            "ingest.conventional_fee_distribution_backfill.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config
-                .ingest
-                .conventional_fee_distribution_backfill
-                .batch_blocks,
-            "ingest.conventional_fee_distribution_backfill.batch_blocks",
-        )?,
-    };
-    let transaction_component_backfill = TransactionComponentBackfillConfig {
-        enabled: require_field(
-            config.ingest.transaction_component_backfill.enabled,
-            "ingest.transaction_component_backfill.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config.ingest.transaction_component_backfill.batch_blocks,
-            "ingest.transaction_component_backfill.batch_blocks",
-        )?,
-    };
-
     let flush_interval_epochs_raw = require_field(
         config.ingest.construction.flush_interval_epochs,
         "ingest.construction.flush_interval_epochs",
@@ -915,13 +673,13 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     let coverage = config.ingest.run_overrides.coverage.unwrap_or_default();
     let raw_blob_policy = resolve_raw_blob_policy(coverage, configured_raw_blob_policy)?;
 
-    let allow_near_tip_finalize = require_field(
-        config.ingest.run_overrides.allow_near_tip_finalize,
-        "ingest.run_overrides.allow_near_tip_finalize",
+    let allow_reorg_window_settlement = require_field(
+        config.ingest.run_overrides.allow_reorg_window_settlement,
+        "ingest.run_overrides.allow_reorg_window_settlement",
     )?;
-    if matches!(coverage, IngestCoverage::WalletServing) && allow_near_tip_finalize {
+    if matches!(coverage, IngestCoverage::WalletServing) && allow_reorg_window_settlement {
         return Err(ConfigError::invalid(
-            "ingest.run_overrides.coverage = \"wallet-serving\" cannot be combined with ingest.run_overrides.allow_near_tip_finalize = true; serving stores must stop outside the reorg window",
+            "ingest.run_overrides.coverage = \"wallet-serving\" cannot be combined with ingest.run_overrides.allow_reorg_window_settlement = true; serving stores must stop outside the reorg window",
         )
         .into());
     }
@@ -966,7 +724,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             .run_overrides
             .checkpoint_height
             .map(BlockHeight::new),
-        allow_near_tip_finalize,
+        allow_reorg_window_settlement,
         checkpoint: None,
     };
 
@@ -975,21 +733,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         node_source,
         storage_path,
         canonical_rocksdb_budget,
-        materialized_view_rocksdb_budget,
         raw_blob_policy,
         reorg_window_blocks,
         phase_classification: PhaseClassificationConfig {
             catchup_threshold_blocks,
-        },
-        materialized_views: MaterializedViewReplayConfig {
-            replay_batch_blocks,
-            replay_policy,
-            memory_budget_bytes,
-            memory_degrade_ratio,
-            memory_pause_ratio,
-            memory_resume_ratio,
-            min_replay_batch_blocks,
-            startup_handoff_lag_blocks,
         },
         construction: CanonicalConstructionSettings {
             canonical_batch_max_blocks,
@@ -1009,9 +756,6 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
 
     Ok(IngestCommandConfig {
         runtime_config,
-        projection_preset,
-        conventional_fee_distribution_backfill,
-        transaction_component_backfill,
         coverage,
         ingest_control_listen_addr,
         ingest_control_bearer_token_path,
@@ -1107,52 +851,15 @@ impl RedactedIngestConfigToml {
             storage: IngestStorageToml {
                 path: runtime_config.storage_path.display().to_string(),
                 canonical: StorageRoleToml::from_resolved(runtime_config.canonical_rocksdb_budget),
-                materialized_views: StorageRoleToml::from_resolved(
-                    runtime_config.materialized_view_rocksdb_budget,
-                ),
                 raw_blob_policy: runtime_config.raw_blob_policy,
             },
             ingest: IngestToml {
                 source: node_source_name(runtime_config.node_source),
-                projection_preset: config.projection_preset.as_str(),
                 reorg_window_blocks: runtime_config.reorg_window_blocks,
                 phase_classification: IngestPhaseClassificationToml {
                     catchup_threshold_blocks: runtime_config
                         .phase_classification
                         .catchup_threshold_blocks,
-                },
-                materialized_views: IngestMaterializedViewsToml {
-                    batch_blocks: runtime_config.materialized_views.replay_batch_blocks.get(),
-                    policy: runtime_config
-                        .materialized_views
-                        .replay_policy
-                        .as_kebab_case(),
-                    memory_budget_bytes: runtime_config
-                        .materialized_views
-                        .memory_budget_bytes
-                        .map(NonZeroU64::get),
-                    memory_degrade_ratio: runtime_config.materialized_views.memory_degrade_ratio,
-                    memory_pause_ratio: runtime_config.materialized_views.memory_pause_ratio,
-                    memory_resume_ratio: runtime_config.materialized_views.memory_resume_ratio,
-                    min_replay_batch_blocks: runtime_config
-                        .materialized_views
-                        .min_replay_batch_blocks
-                        .get(),
-                    startup_handoff_lag_blocks: runtime_config
-                        .materialized_views
-                        .startup_handoff_lag_blocks,
-                },
-                conventional_fee_distribution_backfill:
-                    IngestConventionalFeeDistributionBackfillToml {
-                        enabled: config.conventional_fee_distribution_backfill.enabled,
-                        batch_blocks: config
-                            .conventional_fee_distribution_backfill
-                            .batch_blocks
-                            .get(),
-                    },
-                transaction_component_backfill: IngestTransactionComponentBackfillToml {
-                    enabled: config.transaction_component_backfill.enabled,
-                    batch_blocks: config.transaction_component_backfill.batch_blocks.get(),
                 },
                 construction: IngestConstructionToml {
                     canonical_batch_max_blocks: runtime_config
@@ -1220,7 +927,9 @@ impl RedactedIngestConfigToml {
                         .run_overrides
                         .checkpoint_height
                         .map(BlockHeight::value),
-                    allow_near_tip_finalize: runtime_config.run_overrides.allow_near_tip_finalize,
+                    allow_reorg_window_settlement: runtime_config
+                        .run_overrides
+                        .allow_reorg_window_settlement,
                     coverage: config.coverage,
                 },
             },
@@ -1253,34 +962,17 @@ impl RedactedCanonicalReplayVerificationConfigToml {
 #[derive(Serialize)]
 struct IngestToml {
     source: &'static str,
-    projection_preset: &'static str,
     reorg_window_blocks: u32,
     phase_classification: IngestPhaseClassificationToml,
-    materialized_views: IngestMaterializedViewsToml,
-    conventional_fee_distribution_backfill: IngestConventionalFeeDistributionBackfillToml,
-    transaction_component_backfill: IngestTransactionComponentBackfillToml,
     construction: IngestConstructionToml,
     follow: IngestFollowToml,
     run_overrides: IngestRunOverridesToml,
 }
 
 #[derive(Serialize)]
-struct IngestConventionalFeeDistributionBackfillToml {
-    enabled: bool,
-    batch_blocks: u32,
-}
-
-#[derive(Serialize)]
-struct IngestTransactionComponentBackfillToml {
-    enabled: bool,
-    batch_blocks: u32,
-}
-
-#[derive(Serialize)]
 struct IngestStorageToml {
     path: String,
     canonical: StorageRoleToml,
-    materialized_views: StorageRoleToml,
     raw_blob_policy: RawBlobPolicy,
 }
 
@@ -1294,21 +986,6 @@ struct CanonicalReplayVerificationStorageToml {
 #[derive(Serialize)]
 struct IngestPhaseClassificationToml {
     catchup_threshold_blocks: u32,
-}
-
-#[derive(Serialize)]
-struct IngestMaterializedViewsToml {
-    #[serde(rename = "replay_batch_blocks")]
-    batch_blocks: u32,
-    #[serde(rename = "replay_policy")]
-    policy: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    memory_budget_bytes: Option<u64>,
-    memory_degrade_ratio: f64,
-    memory_pause_ratio: f64,
-    memory_resume_ratio: f64,
-    min_replay_batch_blocks: u32,
-    startup_handoff_lag_blocks: u64,
 }
 
 #[derive(Serialize)]
@@ -1339,7 +1016,7 @@ struct IngestRunOverridesToml {
     target_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint_height: Option<u32>,
-    allow_near_tip_finalize: bool,
+    allow_reorg_window_settlement: bool,
     coverage: IngestCoverage,
 }
 
@@ -1390,28 +1067,6 @@ mod tests {
         // 128 MiB so the pipeline can always make forward progress.
         let result = default_pipeline_queue_bytes_from_budget(Some(4 * ONE_GIB), fallback);
         assert_eq!(result, MIN_PIPELINE_QUEUE_BYTES);
-    }
-
-    #[test]
-    fn conventional_fee_distribution_backfill_batch_rejects_zero() {
-        let error = nonzero_u32_config(
-            Some(0),
-            "ingest.conventional_fee_distribution_backfill.batch_blocks",
-        )
-        .err()
-        .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn transaction_component_backfill_batch_rejects_zero() {
-        let error = nonzero_u32_config(
-            Some(0),
-            "ingest.transaction_component_backfill.batch_blocks",
-        )
-        .err()
-        .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
     }
 
     #[test]

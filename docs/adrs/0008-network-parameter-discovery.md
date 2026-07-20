@@ -11,7 +11,7 @@
 
 Three pieces of per-network consensus data flow through Zinder's read path: activation heights (Sapling, NU5, NU6, NU6\_1, ...), the consensus branch id active at a given height, and the human-facing upgrade name. Zinder serves them on at least three observable surfaces:
 
-- `WalletQuery.Transaction` (`MinedDetails.consensus_branch_id`), consumed by Zinder-native wallets via the native gRPC and by the in-process local client (`zinder-client/local`).
+- `WalletQuery.Transaction` (`MinedTransactionChainContext.consensus_branch_id`), consumed by Zinder-native wallets via the native gRPC and by the in-process local client (`zinder-client/local`).
 - `compat-lightwalletd::GetLightdInfo` (`saplingActivationHeight`, `consensusBranchId`, `upgradeName`, `upgradeHeight`), consumed by every lightwalletd-compatible wallet: Zodl, librustzcash-based wallets, and any future lightwalletd client.
 - Transparent V5 transaction signing in `zinder-testkit`, which needs the active branch id to compute ZIP-244 sighashes; mismatched heights cause Zebra to reject broadcasts with `incorrect consensus branch id`.
 
@@ -48,7 +48,7 @@ Production code does not consult `RegtestParameters::default()` or library-defau
 ### Wiring contract per service
 
 - **`zinder-ingest`** discovers the activations for bulk-catchup-floor resolution (the existing `--wallet-serving` path). Held in the binary main; no further plumbing in this ADR.
-- **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletQuery` as a required constructor parameter. `MinedDetails.consensus_branch_id` always reflects the running node's active branch at the mined height. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
+- **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletQuery` as a required constructor parameter. `MinedTransactionChainContext.consensus_branch_id` always reflects the running node's active branch at the mined height. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
 - **`zinder-compat-lightwalletd`** holds `Arc<NetworkUpgradeActivations>` on `LightwalletdGrpcAdapter` as a required constructor parameter. `GetLightdInfo` reads the table directly. Same startup-time failure if `[node]` is not configured.
 - **`zinder-client/local`** holds the same `Arc<NetworkUpgradeActivations>` on `LocalChainIndex` via a required `LocalOpenOptions.network_upgrade_activations` field.
 - **`zinder-testkit`** exposes `local_network_from_activations(&activations) -> LocalNetwork` for live tests; `TransparentTestKey::from_seed_with_local_network` accepts the result. `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the two regtest fixtures cannot drift.
@@ -62,10 +62,10 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 ### What this enables
 
 - Operators can iterate on regtest activation heights via their `zebrad.toml` without forking Zinder or coordinating a code change. Restart Zinder to pick up the new table.
-- `MinedDetails.consensus_branch_id` is correct on every network for every supported upgrade automatically; no Zinder code-change tax per upgrade.
+- `MinedTransactionChainContext.consensus_branch_id` is correct on every network for every supported upgrade automatically; no Zinder code-change tax per upgrade.
 - New consumers that need consensus parameters have one obvious answer: accept `Arc<NetworkUpgradeActivations>` in your constructor; the production binary already discovers and shares one.
 - Custom testnets become first-class: the table discovers itself from the node; nothing in Zinder hardcodes mainnet/testnet activation heights.
-- Required-at-construction wiring eliminates the "silently serves branch id 0 forever" failure mode: a misconfigured service refuses to start instead of misreporting `MinedDetails.consensus_branch_id` for its entire lifetime.
+- Required-at-construction wiring eliminates the "silently serves branch id 0 forever" failure mode: a misconfigured service refuses to start instead of misreporting `MinedTransactionChainContext.consensus_branch_id` for its entire lifetime.
 
 ### What this costs
 
@@ -75,7 +75,7 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 
 ### Out of scope for this ADR
 
-- Sharing the discovered table via `IngestControl` from the writer to readers. The current per-process discovery is the smallest correct fix; the unified-writer-source pattern is a future extension if cross-process drift becomes a real concern. The `NetworkUpgradeActivations` carrier type does not change shape in that future.
+- Sharing the discovered table via `IngestControl` from the writer to readers. Each process discovers the table from its configured node and owns its cached value for its lifetime.
 - Persisting the table in the on-disk store metadata. Discovery from the live node remains the source of truth; operators iterating on regtest must not be punished by a store-reset cost.
 
 ## Vocabulary

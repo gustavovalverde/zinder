@@ -160,7 +160,7 @@ fn decode_indexed_tip(payload: &[u8]) -> Result<IndexedTip, Status> {
 /// lag as `chain_view.chain_epoch.visible_tip.height -
 /// chain_view.indexed_tip.tip.height`. The materialized-view identity (indexed tip
 /// and materialized-view status) is carried whenever `materialized_view_store` is wired, so the
-/// bootstrap `ServerInfo` call reports how far the projections have
+/// bootstrap `ServerInfo` call reports how far the materialized views have
 /// materialized even though its `chain_epoch` is absent because it makes no
 /// snapshot-consistency claim. `chain_view` stays unset only when the response
 /// resolves no chain epoch and no materialized-view store is wired. The upstream tip is

@@ -20,8 +20,8 @@
 //! and codec convention.
 
 pub mod consumer;
+mod consumer_catalog;
 pub mod error;
-mod projection_catalog;
 pub mod store;
 pub mod value_pool_change;
 
@@ -162,25 +162,27 @@ pub use consumer::value_pool_flow_history::{
     ValuePoolFlowHistoryRow, ValuePoolFlowPool, ValuePoolFlowTailCoverage,
 };
 pub use consumer::{
-    BlockCommitContext, BlockCommitContextError, BlockCommitPayload, BlockKeyedConsumer,
-    BlockProjectionCheckpoint, BlockValuePoolBalanceFacts, ChainCommittedEvent, ChainReorgedEvent,
-    CommittedRange, MaterializedViewConsumer, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
-    MaterializedViewMempoolConsumer, MempoolConsumerEvent, MempoolConsumerEventVariant,
-    RevertedRange, TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
-    apply_chain_committed_in_memory, apply_chain_reorged_in_memory,
+    BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, BlockValuePoolBalanceFacts,
+    ChainCommittedEvent, ChainReorgedEvent, CommittedRange, MaterializedViewBlockCheckpoint,
+    MaterializedViewConsumer, MaterializedViewConsumerCtx, MaterializedViewConsumerError,
+    MaterializedViewConsumerName, MaterializedViewConsumerSchema, MaterializedViewMempoolConsumer,
+    MempoolConsumerEvent, MempoolConsumerEventVariant, RevertedRange,
+    TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts, apply_chain_committed_in_memory,
+    apply_chain_reorged_in_memory,
+};
+pub use consumer_catalog::{
+    CanonicalRetentionAuthority, MaterializedViewConsumerDefinition, MaterializedViewConsumerRole,
+    MaterializedViewPresetMembership, MaterializedViewRecoverySource,
+    bundled_materialized_view_consumer_definitions,
 };
 pub use error::{
     MaterializedViewError, MaterializedViewStoreColumnFamily, MaterializedViewStoreError,
 };
-pub use projection_catalog::{
-    CanonicalRetentionAuthority, ProjectionDefinition, ProjectionPresetMembership,
-    ProjectionRecoverySource, ProjectionRole, bundled_projection_definitions,
-};
 pub use store::{
     ChainEventDispatchConsumers, ChainEventDispatchInputs, ConsumerEntry,
-    ConsumerProjectionCoverage, ConsumerProjectionState, MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
-    MATERIALIZED_VIEW_STORE_SUBDIR, MaterializedViewCursorEntry, MaterializedViewStore,
-    MaterializedViewStoreOptions, MaterializedViewStoreReadSnapshot, MaterializedViewStoreTable,
-    ProjectionPreset, ProjectionStoreInspection, ProjectionWriteMeasurement,
+    MATERIALIZED_VIEW_STORE_FORMAT_VERSION, MATERIALIZED_VIEW_STORE_SUBDIR,
+    MaterializedViewCoverage, MaterializedViewCursorEntry, MaterializedViewPreset,
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreOptions,
+    MaterializedViewStoreReadSnapshot, MaterializedViewStoreTable,
+    MaterializedViewWriteMeasurement,
 };

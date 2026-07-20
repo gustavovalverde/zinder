@@ -50,7 +50,7 @@ pub struct MempoolEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MempoolEvictionReason {
-    /// Conflicting transaction was admitted instead.
+    /// A transaction spending the same inputs was admitted instead.
     Conflict,
     /// Source mempool expiry policy removed the transaction.
     Expired,

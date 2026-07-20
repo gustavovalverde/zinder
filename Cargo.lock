@@ -5774,7 +5774,6 @@ dependencies = [
  "zebra-chain",
  "zinder-core",
  "zinder-ingest",
- "zinder-materialized-views",
  "zinder-proto",
  "zinder-query",
  "zinder-runtime",
@@ -6108,6 +6107,7 @@ dependencies = [
  "zinder-proto",
  "zinder-source",
  "zinder-store",
+ "zinder-wallet-rocksdb",
  "zip32",
 ]
 

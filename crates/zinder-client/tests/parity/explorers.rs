@@ -14,6 +14,8 @@ use zinder_client::{
     TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact,
     TransparentAddressUnspentOutputsQuery, TransparentOutPoint, TransparentUnspentOutput,
 };
+use zinder_materialized_views::TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME;
+use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition};
 use zinder_testkit::{
     open_test_materialized_view_store_for_canonical, seed_transparent_address_transaction_history,
 };
@@ -27,7 +29,7 @@ fn parity_chain_index_surface_compiles_for_block_explorers() {
         let _ = T::block_id_by_selector;
         // typed block-header read model
         let _ = T::block_header_by_selector;
-        // typed TxStatus with mined / mempool / conflicting
+        // typed TxStatus with mined / mempool / not found
         let _ = T::transaction_by_id;
         // typed TransparentAddressBalance from the canonical unspent index
         let _ = T::transparent_address_balance;
@@ -85,6 +87,18 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
     seed_transparent_address_transaction_history(
         &materialized_view_store,
         std::slice::from_ref(&tx_history),
+    )?;
+    let chain_fence = store_fixture
+        .chain_store()
+        .resolve_chain_event_stream_start(
+            &EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Visible,
+        )?
+        .cursor
+        .ok_or_else(|| eyre!("committed fixture must have a visible chain fence"))?;
+    materialized_view_store.put_chain_event_cursor(
+        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+        chain_fence.as_bytes(),
     )?;
     let chain_index = open_local_chain_index(&store_fixture).await?;
 

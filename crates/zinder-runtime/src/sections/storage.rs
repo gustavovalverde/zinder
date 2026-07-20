@@ -1,10 +1,8 @@
 //! Shared `[storage]` config section.
 //!
-//! Two shapes ship to mirror the writer/reader split documented in
+//! Reader shapes mirror the storage boundaries documented in
 //! [ADR-0003](../../../../docs/adrs/0003-canonical-storage-access-boundary.md):
 //!
-//! - [`PrimaryStorageSection`] for the writer (`zinder-ingest`); a single
-//!   storage path.
 //! - [`SecondaryStorageSection`] for readers that open both canonical and
 //!   materialized-view stores (`zinder-query`, `zinder-explorer`).
 //! - [`CanonicalSecondaryStorageSection`] for readers that open only the
@@ -109,18 +107,6 @@ pub struct StorageRoleSection {
     pub rocksdb: RocksDbResourceBudgetSection,
 }
 
-/// Raw `[storage]` section consumed by the writer binary.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PrimaryStorageSection {
-    /// Filesystem path of the canonical (primary) `RocksDB` instance.
-    pub path: Option<PathBuf>,
-    /// Canonical store role budget.
-    pub canonical: StorageRoleSection,
-    /// Materialized-view store role budget.
-    pub materialized_views: StorageRoleSection,
-}
-
 /// Raw `[storage]` section consumed by reader binaries.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -166,17 +152,6 @@ pub struct CanonicalSecondaryStorageSection {
     pub secondary_replica_lag_threshold_chain_epochs: Option<u64>,
     /// Canonical store role budget.
     pub canonical: StorageRoleSection,
-}
-
-/// Resolved primary storage location.
-#[derive(Clone, Debug)]
-pub struct ResolvedPrimaryStorage {
-    /// Filesystem path of the canonical instance.
-    pub path: PathBuf,
-    /// Bounded `RocksDB` resource budget for the canonical store.
-    pub canonical_rocksdb_budget: RocksDbResourceBudget,
-    /// Bounded `RocksDB` resource budget for the materialized-view store.
-    pub materialized_view_rocksdb_budget: RocksDbResourceBudget,
 }
 
 /// Resolved secondary storage location with catchup cadence.
@@ -239,14 +214,15 @@ pub fn resolve_canonical_writer_rocksdb_budget(
     )
 }
 
-/// Merges materialized-view role overrides onto [`RocksDbResourceBudget::materialized_view_writer_defaults`].
-pub fn resolve_materialized_view_writer_rocksdb_budget(
+/// Merges wallet-projection writer overrides onto
+/// [`RocksDbResourceBudget::wallet_projection_writer_defaults`].
+pub fn resolve_wallet_projection_writer_rocksdb_budget(
     section: RocksDbResourceBudgetSection,
 ) -> Result<RocksDbResourceBudget, ConfigError> {
     resolve_rocksdb_resource_budget(
         section,
-        RocksDbResourceBudget::materialized_view_writer_defaults(),
-        "storage.materialized_views.rocksdb",
+        RocksDbResourceBudget::wallet_projection_writer_defaults(),
+        "wallet.rocksdb",
     )
 }
 
@@ -277,22 +253,16 @@ pub fn resolve_materialized_view_reader_rocksdb_budget(
     )
 }
 
-/// Validates and resolves a [`PrimaryStorageSection`].
-pub fn resolve_primary_storage(
-    section: PrimaryStorageSection,
-) -> Result<ResolvedPrimaryStorage, ConfigError> {
-    let path = section
-        .path
-        .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
-    let canonical_rocksdb_budget =
-        resolve_canonical_writer_rocksdb_budget(section.canonical.rocksdb)?;
-    let materialized_view_rocksdb_budget =
-        resolve_materialized_view_writer_rocksdb_budget(section.materialized_views.rocksdb)?;
-    Ok(ResolvedPrimaryStorage {
-        path,
-        canonical_rocksdb_budget,
-        materialized_view_rocksdb_budget,
-    })
+/// Merges wallet-projection reader overrides onto
+/// [`RocksDbResourceBudget::wallet_projection_reader_defaults`].
+pub fn resolve_wallet_projection_reader_rocksdb_budget(
+    section: RocksDbResourceBudgetSection,
+) -> Result<RocksDbResourceBudget, ConfigError> {
+    resolve_rocksdb_resource_budget(
+        section,
+        RocksDbResourceBudget::wallet_projection_reader_defaults(),
+        "wallet.rocksdb",
+    )
 }
 
 /// Validates and resolves a [`SecondaryStorageSection`], applying
@@ -441,31 +411,6 @@ impl StorageRoleToml {
     }
 }
 
-/// Redacted TOML projection of the writer-side `[storage]` section.
-#[derive(Debug, Serialize)]
-pub struct PrimaryStorageToml {
-    /// Filesystem path of the canonical instance.
-    pub path: String,
-    /// Canonical store role projection.
-    pub canonical: StorageRoleToml,
-    /// Materialized-view store role projection.
-    pub materialized_views: StorageRoleToml,
-}
-
-impl PrimaryStorageToml {
-    /// Builds a [`PrimaryStorageToml`] from a resolved storage location.
-    #[must_use]
-    pub fn from_resolved(resolved: &ResolvedPrimaryStorage) -> Self {
-        Self {
-            path: resolved.path.display().to_string(),
-            canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
-            materialized_views: StorageRoleToml::from_resolved(
-                resolved.materialized_view_rocksdb_budget,
-            ),
-        }
-    }
-}
-
 /// Redacted TOML projection of the reader-side `[storage]` section.
 #[derive(Debug, Serialize)]
 pub struct SecondaryStorageToml {
@@ -546,28 +491,6 @@ impl CanonicalSecondaryStorageToml {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn primary_storage_resolution_rejects_missing_path() {
-        let outcome = resolve_primary_storage(PrimaryStorageSection::default());
-        assert!(matches!(
-            outcome,
-            Err(ConfigError::MissingField {
-                field: "storage.path"
-            })
-        ));
-    }
-
-    #[test]
-    fn primary_storage_returns_resolved_path() -> Result<(), ConfigError> {
-        let resolved = resolve_primary_storage(PrimaryStorageSection {
-            path: Some(PathBuf::from("/tmp/store")),
-            canonical: StorageRoleSection::default(),
-            materialized_views: StorageRoleSection::default(),
-        })?;
-        assert_eq!(resolved.path, PathBuf::from("/tmp/store"));
-        Ok(())
-    }
 
     #[test]
     fn secondary_storage_requires_both_paths() {
@@ -692,14 +615,14 @@ mod tests {
     }
 
     #[test]
-    fn materialized_view_writer_budget_resolution_falls_through_to_writer_defaults()
+    fn wallet_projection_writer_budget_resolution_falls_through_to_writer_defaults()
     -> Result<(), ConfigError> {
-        let resolved = resolve_materialized_view_writer_rocksdb_budget(
+        let resolved = resolve_wallet_projection_writer_rocksdb_budget(
             RocksDbResourceBudgetSection::default(),
         )?;
         assert_eq!(
             resolved,
-            RocksDbResourceBudget::materialized_view_writer_defaults()
+            RocksDbResourceBudget::wallet_projection_writer_defaults()
         );
         Ok(())
     }
@@ -741,6 +664,19 @@ mod tests {
         assert_eq!(
             resolved,
             RocksDbResourceBudget::materialized_view_reader_defaults()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_projection_reader_budget_resolution_falls_through_to_reader_defaults()
+    -> Result<(), ConfigError> {
+        let resolved = resolve_wallet_projection_reader_rocksdb_budget(
+            RocksDbResourceBudgetSection::default(),
+        )?;
+        assert_eq!(
+            resolved,
+            RocksDbResourceBudget::wallet_projection_reader_defaults()
         );
         Ok(())
     }
@@ -803,33 +739,5 @@ mod tests {
             ..RocksDbResourceBudgetSection::default()
         });
         assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
-    }
-
-    #[test]
-    fn primary_storage_carries_role_scoped_budgets() -> Result<(), ConfigError> {
-        let resolved = resolve_primary_storage(PrimaryStorageSection {
-            path: Some(PathBuf::from("/tmp/store")),
-            canonical: StorageRoleSection {
-                rocksdb: RocksDbResourceBudgetSection {
-                    max_wal_bytes: Some(123 * 1024 * 1024),
-                    ..RocksDbResourceBudgetSection::default()
-                },
-            },
-            materialized_views: StorageRoleSection {
-                rocksdb: RocksDbResourceBudgetSection {
-                    max_wal_bytes: Some(64 * 1024 * 1024),
-                    ..RocksDbResourceBudgetSection::default()
-                },
-            },
-        })?;
-        assert_eq!(
-            resolved.canonical_rocksdb_budget.max_wal_bytes,
-            123 * 1024 * 1024
-        );
-        assert_eq!(
-            resolved.materialized_view_rocksdb_budget.max_wal_bytes,
-            64 * 1024 * 1024
-        );
-        Ok(())
     }
 }

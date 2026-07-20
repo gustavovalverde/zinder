@@ -11,7 +11,7 @@ use crate::{
     kv::{PrefixScanControl, RocksChainStoreRead, StorageTable},
 };
 
-/// Durable transparent spend replay data for one finalized block.
+/// Durable transparent spend replay data for one settled block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentSpendReplayBlock {
     /// Canonical hash of the block that produced these spends.
@@ -130,7 +130,7 @@ pub(crate) fn read_visible_transparent_spend_fact_block_outpoints(
 
 /// Reads complete block-local spend replay facts from the current projection.
 ///
-/// Correct only for finalized heights. Unlike the point rows used by serving
+/// Correct only for settled heights. Unlike the point rows used by serving
 /// queries, this replay record is durable across transparent spend retention.
 pub(crate) fn read_current_transparent_spend_fact_block_facts(
     inner: &impl RocksChainStoreRead,

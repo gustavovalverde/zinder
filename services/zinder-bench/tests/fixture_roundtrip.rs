@@ -159,8 +159,7 @@ fn write_regtest_fixture() -> Result<RegtestFixtureCase> {
         to_height: 603,
         block_count: 1,
         workload_density: measurements.workload_density,
-        projection_coupled_oracle_artifact_schema_version:
-            zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        canonical_artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         canonical_block_facts_digest_evidence: measurements
             .canonical_block_facts_digest_evidence()?,
         tip_hash_hex: hex::encode(block.hash.as_bytes()),
@@ -414,41 +413,12 @@ fn assert_canonical_fixture_ready_evidence(
     Ok(())
 }
 
-fn assert_no_legacy_canonical_families(canonical_store_path: &std::path::Path) -> Result<()> {
-    let column_families =
-        rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), canonical_store_path)?;
-    for legacy_or_materialized_view_family in [
-        "storage_control",
-        "block_transaction_index",
-        "transaction_facts",
-        "transaction_intrinsic_value_balances",
-        "tree_state",
-        "final_note_commitment_roots",
-        "block_value_pool_balances",
-        "address_output_index",
-        "transparent_output",
-        "transparent_output_block_index",
-        "transparent_spend_fact",
-        "transparent_spend_fact_block_index",
-        "reorg_window",
-        "displaced_block",
-        "chain_event_cursor",
-        "mempool_event_cursor",
-        "consumer_metadata",
-    ] {
-        assert!(
-            !column_families
-                .iter()
-                .any(|family| family == legacy_or_materialized_view_family),
-            "canonical v1 store must not create legacy or materialized-view family {legacy_or_materialized_view_family}"
-        );
-    }
+fn assert_no_materialized_view_store(canonical_store_path: &std::path::Path) {
     assert!(
         !zinder_materialized_views::MaterializedViewStore::path_for_canonical(canonical_store_path)
             .exists(),
         "canonical fixture replay must not create a materialized-view store"
     );
-    Ok(())
 }
 
 #[tokio::test]
@@ -610,7 +580,7 @@ async fn canonical_fixture_rocksdb_replay_publishes_and_cold_reopens_ready() -> 
 
     assert_canonical_fixture_load_evidence(&outcome, &fixture, &predecessor, &fixed_tip);
     assert_canonical_fixture_ready_evidence(&outcome, &fixture, &fixed_tip)?;
-    assert_no_legacy_canonical_families(&canonical_store_path)?;
+    assert_no_materialized_view_store(&canonical_store_path);
     Ok(())
 }
 
@@ -951,8 +921,7 @@ async fn canonical_fixture_checkpoint_capture_rejects_disconnected_segment_bound
             block_count: 2,
             ..WorkloadDensity::default()
         },
-        projection_coupled_oracle_artifact_schema_version:
-            zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        canonical_artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence {
             block_digest_version: zinder_core::CanonicalBlockFactsDigestVersion::CURRENT.value(),
             sequence_digest_version: zinder_core::CanonicalBlockFactsSequenceDigestVersion::CURRENT
@@ -984,7 +953,7 @@ async fn canonical_fixture_checkpoint_capture_rejects_disconnected_segment_bound
 }
 
 #[test]
-fn fixture_v1_requires_exact_contract_identity() -> Result<()> {
+fn fixture_v2_requires_exact_contract_identity() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_identity = serde_json::to_value(&fixture.manifest)?;
     missing_identity
@@ -996,37 +965,42 @@ fn fixture_v1_requires_exact_contract_identity() -> Result<()> {
         serde_json::to_vec_pretty(&missing_identity)?,
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
-        return Err(eyre!("fixture v1 contract identity must be mandatory"));
+        return Err(eyre!("fixture v2 contract identity must be mandatory"));
     };
     assert!(error.to_string().contains("contract_identity"));
 
-    let mut old_identity = fixture.manifest;
-    old_identity.contract_identity = "zinder-bench-fixture-manifest".to_owned();
+    let mut unrecognized_identity = fixture.manifest;
+    unrecognized_identity.contract_identity = "zinder-bench-fixture-manifest".to_owned();
     std::fs::write(
         fixture.directory.path().join("manifest.json"),
-        serde_json::to_vec_pretty(&old_identity)?,
+        serde_json::to_vec_pretty(&unrecognized_identity)?,
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
-        return Err(eyre!("fixture v1 must reject an earlier contract identity"));
+        return Err(eyre!(
+            "fixture v2 must reject an unrecognized contract identity"
+        ));
     };
     assert!(error.to_string().contains("fixture contract identity"));
     Ok(())
 }
 
 #[test]
-fn fixture_v1_rejects_unknown_manifest_fields() -> Result<()> {
+fn fixture_v2_rejects_unknown_manifest_fields() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_field = serde_json::to_value(&fixture.manifest)?;
     unknown_field
         .as_object_mut()
         .ok_or_else(|| eyre!("fixture manifest must encode as an object"))?
-        .insert("legacy_schema_version".to_owned(), serde_json::json!(14));
+        .insert(
+            "unexpected_schema_version".to_owned(),
+            serde_json::json!(14),
+        );
     std::fs::write(
         fixture.directory.path().join("manifest.json"),
         serde_json::to_vec_pretty(&unknown_field)?,
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
-        return Err(eyre!("fixture v1 must reject unknown manifest fields"));
+        return Err(eyre!("fixture v2 must reject unknown manifest fields"));
     };
     assert!(error.to_string().contains("unknown field"));
     Ok(())
@@ -1302,7 +1276,7 @@ async fn fixture_source_rejects_short_missing_or_disconnected_exact_subtree_rang
 }
 
 #[test]
-fn fixture_v1_requires_digest_evidence() -> Result<()> {
+fn fixture_v2_requires_digest_evidence() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_digest_evidence = serde_json::to_value(&fixture.manifest)?;
     missing_digest_evidence
@@ -1314,7 +1288,7 @@ fn fixture_v1_requires_digest_evidence() -> Result<()> {
         serde_json::to_vec_pretty(&missing_digest_evidence)?,
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
-        return Err(eyre!("fixture v1 digest evidence must be mandatory"));
+        return Err(eyre!("fixture v2 digest evidence must be mandatory"));
     };
     assert!(
         error
@@ -1325,7 +1299,7 @@ fn fixture_v1_requires_digest_evidence() -> Result<()> {
 }
 
 #[test]
-fn fixture_v1_rejects_inconsistent_counts() -> Result<()> {
+fn fixture_v2_rejects_inconsistent_counts() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut inconsistent_digest_count = fixture.manifest.clone();
     inconsistent_digest_count
@@ -1356,7 +1330,7 @@ fn fixture_v1_rejects_inconsistent_counts() -> Result<()> {
 }
 
 #[test]
-fn fixture_v1_rejects_unknown_digest_version() -> Result<()> {
+fn fixture_v2_rejects_unknown_digest_version() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_digest_version = fixture.manifest;
     unknown_digest_version
@@ -1381,7 +1355,7 @@ fn fixture_v1_rejects_unknown_digest_version() -> Result<()> {
 }
 
 #[test]
-fn fixture_v1_rejects_uppercase_sequence_digest_hex() -> Result<()> {
+fn fixture_v2_rejects_uppercase_sequence_digest_hex() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut uppercase_sequence_digest = fixture.manifest;
     uppercase_sequence_digest

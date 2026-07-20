@@ -42,7 +42,7 @@ pub struct CanonicalWriterConfig {
     pub follow: CanonicalFollowConfig,
 }
 
-/// Failure while opening or constructing the version-1 writer.
+/// Failure while opening or constructing the canonical writer.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CanonicalWriterError {
@@ -91,7 +91,7 @@ pub enum CanonicalWriterError {
     },
 }
 
-/// Opens or freshly constructs the version-1 store, then follows Zebra.
+/// Opens or freshly constructs the canonical store, then follows Zebra.
 pub async fn run_canonical_writer<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,

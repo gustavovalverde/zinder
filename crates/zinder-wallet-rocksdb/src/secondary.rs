@@ -7,7 +7,9 @@ use std::{
 };
 
 use rust_rocksdb::{DB, Options};
-use zinder_core::{BlockHeight, Network, TransparentAddressScriptHash, TransparentOutPoint};
+use zinder_core::{
+    BlockHeight, BlockHeightRange, Network, TransparentAddressScriptHash, TransparentOutPoint,
+};
 use zinder_store::{RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, open_bounded_rocksdb};
 use zinder_wallet_projection::{
     WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
@@ -203,6 +205,23 @@ impl RocksDbWalletSecondary {
             .address_unspent_outputs_page(address_script_hash, after, page_size)
     }
 
+    /// Returns one bounded page of current outputs for an address at or above
+    /// `start_height`.
+    pub fn address_unspent_outputs_page_from_height(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+        after: Option<WalletAddressUnspentOutputKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
+        self.store.address_unspent_outputs_page_from_height(
+            address_script_hash,
+            start_height,
+            after,
+            page_size,
+        )
+    }
+
     /// Returns one exact address-transaction row.
     pub fn find_address_transaction(
         &self,
@@ -220,6 +239,23 @@ impl RocksDbWalletSecondary {
     ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
         self.store
             .address_transaction_history_page(address_script_hash, after, page_size)
+    }
+
+    /// Returns one bounded page of address-touching transactions within an
+    /// inclusive height range.
+    pub fn address_transaction_history_range_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        height_range: BlockHeightRange,
+        after: Option<WalletAddressTransactionKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
+        self.store.address_transaction_history_range_page(
+            address_script_hash,
+            height_range,
+            after,
+            page_size,
+        )
     }
 
     /// Returns one retained reorg-undo record by block height.

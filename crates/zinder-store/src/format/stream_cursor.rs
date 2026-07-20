@@ -10,14 +10,17 @@ use crate::MempoolEventPosition;
 
 /// Fixed byte length of a fixed-body [`StreamCursorTokenV1`].
 ///
-/// Mempool, transparent-history, and address-output cursors are exactly this
-/// long. Chain-event cursors append a variable-length locator after the fixed
-/// body, so their length grows with the number of locator entries.
+/// Mempool-event and address-output cursors are exactly this long. Chain-event
+/// cursors append a variable-length locator after the fixed body, so their
+/// length grows with the number of locator entries.
 pub const STREAM_CURSOR_TOKEN_V1_LEN: usize = 82;
 
 const STREAM_CURSOR_SCHEMA_VERSION: u8 = 1;
 const STREAM_FAMILY_MASK: u8 = 0x0f;
 const STREAM_RESERVED_FLAGS_MASK: u8 = 0xf0;
+const MEMPOOL_EVENT_FLAGS: u8 = 0x2;
+const ADDRESS_OUTPUT_FLAGS: u8 = 0x4;
+const SNAPSHOT_PAGE_FLAGS: u8 = 0x5;
 const CURSOR_BODY_LEN: usize = 50;
 const AUTH_TAG_LEN: usize = 32;
 
@@ -41,18 +44,18 @@ type HmacSha256 = Hmac<Sha256>;
 /// Chain-event stream family encoded in the low nibble of a cursor flags byte.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChainEventStreamFamily {
-    /// Tip stream: every committed chain event, including reorg events.
-    Tip,
-    /// Safe stream: only commits whose range is past the reorg window;
-    /// never reorg events.
-    Safe,
+    /// Visible stream: every committed chain event, including reorg events.
+    Visible,
+    /// Settled stream: only non-reorg commits entirely at or below the
+    /// settled tip.
+    Settled,
 }
 
 impl ChainEventStreamFamily {
     pub(crate) const fn flags(self) -> u8 {
         match self {
-            Self::Tip => 0x0,
-            Self::Safe => 0x1,
+            Self::Visible => 0x0,
+            Self::Settled => 0x1,
         }
     }
 
@@ -62,42 +65,8 @@ impl ChainEventStreamFamily {
         }
 
         match flags & STREAM_FAMILY_MASK {
-            0x0 => Some(Self::Tip),
-            0x1 => Some(Self::Safe),
-            _ => None,
-        }
-    }
-}
-
-/// Mempool-event stream family encoded in the low nibble of a cursor flags
-/// byte.
-///
-/// Mempool cursors share the [`StreamCursorTokenV1`] envelope but carry a
-/// different body shape (sequence + last transaction id rather than
-/// sequence + last height/hash). The flags byte at offset 49 distinguishes
-/// the two; chain-event decoders reject mempool cursors with
-/// [`StreamCursorError::StreamFamilyMismatch`] and vice versa.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MempoolEventStreamFamily {
-    /// Single mempool event family (flag `0x2`). Reserved nibble values
-    /// `0x3..0xF` are available for future mempool-stream variants (e.g. a
-    /// transparent-only family).
-    Mempool,
-}
-
-impl MempoolEventStreamFamily {
-    pub(crate) const fn flags(self) -> u8 {
-        match self {
-            Self::Mempool => 0x2,
-        }
-    }
-
-    const fn from_flags(flags: u8) -> Option<Self> {
-        if flags & STREAM_RESERVED_FLAGS_MASK != 0 {
-            return None;
-        }
-        match flags & STREAM_FAMILY_MASK {
-            0x2 => Some(Self::Mempool),
+            0x0 => Some(Self::Visible),
+            0x1 => Some(Self::Settled),
             _ => None,
         }
     }
@@ -106,8 +75,6 @@ impl MempoolEventStreamFamily {
 /// Cursor payload decoded from a mempool-event stream cursor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MempoolEventCursorPayload {
-    /// Stream family encoded in the cursor flags byte.
-    pub family: MempoolEventStreamFamily,
     /// Mempool event sequence carried by the cursor.
     pub event_sequence: u64,
     /// Identifier of the mempool transaction last delivered before this
@@ -115,145 +82,13 @@ pub struct MempoolEventCursorPayload {
     pub last_transaction_id: TransactionId,
 }
 
-/// Transparent-history stream family encoded in a cursor flags byte.
-///
-/// The single variant `TransparentHistory` (flag `0x3`) bookmarks a
-/// position inside a transparent-address tx-history scan. The high nibble
-/// of the flags byte encodes the iteration direction so resume continues
-/// in the same order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransparentHistoryStreamFamily {
-    /// Transparent-address tx-history bookmark family (flag `0x3`).
-    TransparentHistory,
-}
-
-const STREAM_DIRECTION_FLAG_BIT: u8 = 0x10;
-
-impl TransparentHistoryStreamFamily {
-    pub(crate) const fn flags(self, descending: bool) -> u8 {
-        let direction_bit = if descending {
-            STREAM_DIRECTION_FLAG_BIT
-        } else {
-            0
-        };
-        match self {
-            Self::TransparentHistory => 0x3 | direction_bit,
-        }
-    }
-
-    const fn from_flags(flags: u8) -> Option<(Self, bool)> {
-        let reserved_mask = STREAM_RESERVED_FLAGS_MASK & !STREAM_DIRECTION_FLAG_BIT;
-        if flags & reserved_mask != 0 {
-            return None;
-        }
-        let descending = flags & STREAM_DIRECTION_FLAG_BIT != 0;
-        match flags & STREAM_FAMILY_MASK {
-            0x3 => Some((Self::TransparentHistory, descending)),
-            _ => None,
-        }
-    }
-}
-
-/// Anchor used to construct a transparent-history cursor token.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TransparentHistoryCursorAnchor {
-    /// Network the cursor is bound to.
-    pub network: Network,
-    /// Stream family encoded in the cursor flags byte.
-    pub family: TransparentHistoryStreamFamily,
-    /// Block height of the last yielded entry.
-    pub last_block_height: BlockHeight,
-    /// Position of the last yielded entry inside its block.
-    pub last_tx_index_in_block: u32,
-    /// Iteration direction at issue time.
-    pub descending: bool,
-}
-
-/// Cursor payload decoded from a transparent-history stream cursor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TransparentHistoryCursorPayload {
-    /// Stream family encoded in the cursor flags byte.
-    pub family: TransparentHistoryStreamFamily,
-    /// Descending iteration direction encoded in the cursor flags byte.
-    pub descending: bool,
-    /// Block height of the last yielded transaction.
-    pub last_block_height: BlockHeight,
-    /// Position of the last yielded transaction inside its block.
-    pub last_tx_index_in_block: u32,
-}
-
-/// Transparent-output stream family encoded in the low nibble of a cursor
-/// flags byte.
-///
-/// The single variant `AddressOutput` (flag `0x4`) bookmarks a position
-/// inside a `(network, address_script_hash)` prefix scan. The cursor body
-/// records the last yielded `(block_height, outpoint)` so resuming
-/// continues strictly after that output regardless of how the upstream
-/// iterator dedupes outpoints.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AddressOutputStreamFamily {
-    /// output bookmark family (flag `0x4`).
-    AddressOutput,
-}
-
-impl AddressOutputStreamFamily {
-    pub(crate) const fn flags(self) -> u8 {
-        match self {
-            Self::AddressOutput => 0x4,
-        }
-    }
-
-    const fn from_flags(flags: u8) -> Option<Self> {
-        if flags & STREAM_RESERVED_FLAGS_MASK != 0 {
-            return None;
-        }
-        match flags & STREAM_FAMILY_MASK {
-            0x4 => Some(Self::AddressOutput),
-            _ => None,
-        }
-    }
-}
-
 /// Cursor payload decoded from a transparent-output stream cursor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AddressOutputCursorPayload {
-    /// Stream family encoded in the cursor flags byte.
-    pub family: AddressOutputStreamFamily,
     /// Block height of the last yielded output.
     pub last_block_height: BlockHeight,
     /// Outpoint of the last yielded output.
     pub last_outpoint: TransparentOutPoint,
-}
-
-/// Snapshot-page stream family encoded in the low nibble of a cursor flags
-/// byte.
-///
-/// The single variant `SnapshotPage` (flag `0x5`) bookmarks a position inside
-/// one `MempoolSnapshot` paging walk. The body carries the snapshot sequence
-/// the page belongs to and the last yielded transaction id, so resuming
-/// continues strictly after that transaction within the same snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SnapshotPageStreamFamily {
-    /// Mempool snapshot paging family (flag `0x5`).
-    SnapshotPage,
-}
-
-impl SnapshotPageStreamFamily {
-    pub(crate) const fn flags(self) -> u8 {
-        match self {
-            Self::SnapshotPage => 0x5,
-        }
-    }
-
-    const fn from_flags(flags: u8) -> Option<Self> {
-        if flags & STREAM_RESERVED_FLAGS_MASK != 0 {
-            return None;
-        }
-        match flags & STREAM_FAMILY_MASK {
-            0x5 => Some(Self::SnapshotPage),
-            _ => None,
-        }
-    }
 }
 
 /// Anchor used to construct a mempool-snapshot paging cursor token.
@@ -265,8 +100,6 @@ impl SnapshotPageStreamFamily {
 pub struct SnapshotPageCursorAnchor {
     /// Network the cursor is bound to.
     pub network: Network,
-    /// Stream family encoded in the cursor flags byte.
-    pub family: SnapshotPageStreamFamily,
     /// Position of the last mempool event applied when the walk began;
     /// `None` when the walk began before any event was applied.
     pub events_resume_anchor: Option<MempoolEventPosition>,
@@ -278,8 +111,6 @@ pub struct SnapshotPageCursorAnchor {
 /// Cursor payload decoded from a mempool-snapshot paging cursor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotPageCursorPayload {
-    /// Stream family encoded in the cursor flags byte.
-    pub family: SnapshotPageStreamFamily,
     /// Position of the last mempool event applied when the walk began;
     /// `None` when the walk began before any event was applied.
     pub events_resume_anchor: Option<MempoolEventPosition>,
@@ -426,7 +257,7 @@ impl StreamCursorTokenV1 {
             .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
         if !matches!(
             family,
-            ChainEventStreamFamily::Tip | ChainEventStreamFamily::Safe
+            ChainEventStreamFamily::Visible | ChainEventStreamFamily::Settled
         ) {
             return Err(StreamCursorError::StreamFamilyMismatch { flags });
         }
@@ -471,7 +302,6 @@ impl StreamCursorTokenV1 {
     /// Builds a mempool-event cursor token.
     pub fn mempool_event(
         network: Network,
-        family: MempoolEventStreamFamily,
         event_sequence: u64,
         last_transaction_id: TransactionId,
         cursor_auth_key: [u8; 32],
@@ -481,10 +311,10 @@ impl StreamCursorTokenV1 {
         cursor_bytes.extend_from_slice(&network.id().to_be_bytes());
         cursor_bytes.extend_from_slice(&event_sequence.to_be_bytes());
         cursor_bytes.extend_from_slice(&last_transaction_id.as_bytes());
-        // Reserved padding to keep the body 50 bytes long (1 + 4 + 8 + 32 +
-        // 4 + 1) so chain and mempool cursors share the on-the-wire length.
+        // Padding keeps the body 50 bytes long (1 + 4 + 8 + 32 + 4 + 1), so
+        // chain and mempool cursors share the on-the-wire length.
         cursor_bytes.extend_from_slice(&[0u8; 4]);
-        cursor_bytes.push(family.flags());
+        cursor_bytes.push(MEMPOOL_EVENT_FLAGS);
 
         let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
         cursor_bytes.extend_from_slice(&auth_tag);
@@ -519,8 +349,11 @@ impl StreamCursorTokenV1 {
         }
 
         let flags = self.0[49];
-        let family = MempoolEventStreamFamily::from_flags(flags)
-            .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
+        if flags & STREAM_RESERVED_FLAGS_MASK != 0
+            || flags & STREAM_FAMILY_MASK != MEMPOOL_EVENT_FLAGS
+        {
+            return Err(StreamCursorError::StreamFamilyMismatch { flags });
+        }
 
         verify_auth_tag(
             cursor_auth_key,
@@ -535,76 +368,8 @@ impl StreamCursorTokenV1 {
         })?;
 
         Ok(MempoolEventCursorPayload {
-            family,
             event_sequence: read_u64_be(&self.0, 5)?,
             last_transaction_id: TransactionId::from_bytes(transaction_id_bytes),
-        })
-    }
-
-    /// Builds a transparent-history cursor token bookmarking
-    /// `(last_block_height, last_tx_index_in_block)` plus the iteration
-    /// direction.
-    pub fn transparent_history(
-        anchor: TransparentHistoryCursorAnchor,
-        cursor_auth_key: [u8; 32],
-    ) -> Result<Self, StreamCursorError> {
-        let mut cursor_bytes = Vec::with_capacity(STREAM_CURSOR_TOKEN_V1_LEN);
-        cursor_bytes.push(STREAM_CURSOR_SCHEMA_VERSION);
-        cursor_bytes.extend_from_slice(&anchor.network.id().to_be_bytes());
-        cursor_bytes.extend_from_slice(&anchor.last_block_height.value().to_be_bytes());
-        cursor_bytes.extend_from_slice(&anchor.last_tx_index_in_block.to_be_bytes());
-        // Reserved padding to keep the body 50 bytes long
-        // (1 + 4 + 4 + 4 + 36 + 1).
-        cursor_bytes.extend_from_slice(&[0u8; 36]);
-        cursor_bytes.push(anchor.family.flags(anchor.descending));
-
-        let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
-        cursor_bytes.extend_from_slice(&auth_tag);
-
-        Ok(Self(cursor_bytes))
-    }
-
-    /// Decodes a transparent-history cursor token.
-    pub fn decode_transparent_history(
-        &self,
-        expected_network: Network,
-        cursor_auth_key: [u8; 32],
-    ) -> Result<TransparentHistoryCursorPayload, StreamCursorError> {
-        if self.0.len() != STREAM_CURSOR_TOKEN_V1_LEN {
-            return Err(StreamCursorError::InvalidLength {
-                byte_count: self.0.len(),
-            });
-        }
-
-        if self.0[0] != STREAM_CURSOR_SCHEMA_VERSION {
-            return Err(StreamCursorError::UnsupportedSchemaVersion { version: self.0[0] });
-        }
-
-        let network_id = read_u32_be(&self.0, 1)?;
-        let network =
-            Network::from_id(network_id).ok_or(StreamCursorError::UnknownNetwork { network_id })?;
-        if network != expected_network {
-            return Err(StreamCursorError::NetworkMismatch {
-                expected: expected_network,
-                actual: network,
-            });
-        }
-
-        let flags = self.0[49];
-        let (family, descending) = TransparentHistoryStreamFamily::from_flags(flags)
-            .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
-
-        verify_auth_tag(
-            cursor_auth_key,
-            &self.0[..CURSOR_BODY_LEN],
-            &self.0[CURSOR_BODY_LEN..],
-        )?;
-
-        Ok(TransparentHistoryCursorPayload {
-            family,
-            descending,
-            last_block_height: BlockHeight::new(read_u32_be(&self.0, 5)?),
-            last_tx_index_in_block: read_u32_be(&self.0, 9)?,
         })
     }
 
@@ -612,7 +377,6 @@ impl StreamCursorTokenV1 {
     /// `(last_block_height, last_outpoint)`.
     pub fn address_output(
         network: Network,
-        family: AddressOutputStreamFamily,
         last_block_height: BlockHeight,
         last_outpoint: TransparentOutPoint,
         cursor_auth_key: [u8; 32],
@@ -623,10 +387,9 @@ impl StreamCursorTokenV1 {
         cursor_bytes.extend_from_slice(&last_block_height.value().to_be_bytes());
         cursor_bytes.extend_from_slice(&last_outpoint.transaction_id.as_bytes());
         cursor_bytes.extend_from_slice(&last_outpoint.output_index.to_be_bytes());
-        // Reserved padding to keep the body 50 bytes long
-        // (1 + 4 + 4 + 32 + 4 + 4 + 1).
+        // Padding keeps the body 50 bytes long (1 + 4 + 4 + 32 + 4 + 4 + 1).
         cursor_bytes.extend_from_slice(&[0u8; 4]);
-        cursor_bytes.push(family.flags());
+        cursor_bytes.push(ADDRESS_OUTPUT_FLAGS);
 
         let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
         cursor_bytes.extend_from_slice(&auth_tag);
@@ -661,8 +424,11 @@ impl StreamCursorTokenV1 {
         }
 
         let flags = self.0[49];
-        let family = AddressOutputStreamFamily::from_flags(flags)
-            .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
+        if flags & STREAM_RESERVED_FLAGS_MASK != 0
+            || flags & STREAM_FAMILY_MASK != ADDRESS_OUTPUT_FLAGS
+        {
+            return Err(StreamCursorError::StreamFamilyMismatch { flags });
+        }
 
         verify_auth_tag(
             cursor_auth_key,
@@ -676,7 +442,6 @@ impl StreamCursorTokenV1 {
             })?;
 
         Ok(AddressOutputCursorPayload {
-            family,
             last_block_height: BlockHeight::new(read_u32_be(&self.0, 5)?),
             last_outpoint: TransparentOutPoint {
                 transaction_id: TransactionId::from_bytes(transaction_id_bytes),
@@ -706,10 +471,9 @@ impl StreamCursorTokenV1 {
         cursor_bytes.extend_from_slice(&anchor.network.id().to_be_bytes());
         cursor_bytes.extend_from_slice(&events_resume_anchor.event_sequence.to_be_bytes());
         cursor_bytes.extend_from_slice(&anchor.after_transaction_id.as_bytes());
-        // Reserved padding to keep the fixed body 50 bytes long
-        // (1 + 4 + 8 + 32 + 4 + 1).
+        // Padding keeps the fixed body 50 bytes long (1 + 4 + 8 + 32 + 4 + 1).
         cursor_bytes.extend_from_slice(&[0u8; 4]);
-        cursor_bytes.push(anchor.family.flags());
+        cursor_bytes.push(SNAPSHOT_PAGE_FLAGS);
         cursor_bytes.extend_from_slice(&events_resume_anchor.transaction_id.as_bytes());
 
         let auth_tag = compute_auth_tag(cursor_auth_key, &cursor_bytes)?;
@@ -745,8 +509,11 @@ impl StreamCursorTokenV1 {
         }
 
         let flags = self.0[49];
-        let family = SnapshotPageStreamFamily::from_flags(flags)
-            .ok_or(StreamCursorError::StreamFamilyMismatch { flags })?;
+        if flags & STREAM_RESERVED_FLAGS_MASK != 0
+            || flags & STREAM_FAMILY_MASK != SNAPSHOT_PAGE_FLAGS
+        {
+            return Err(StreamCursorError::StreamFamilyMismatch { flags });
+        }
 
         let body_len = SNAPSHOT_PAGE_CURSOR_LEN - AUTH_TAG_LEN;
         verify_auth_tag(cursor_auth_key, &self.0[..body_len], &self.0[body_len..])?;
@@ -767,7 +534,6 @@ impl StreamCursorTokenV1 {
         });
 
         Ok(SnapshotPageCursorPayload {
-            family,
             events_resume_anchor,
             after_transaction_id: TransactionId::from_bytes(after_transaction_id_bytes),
         })
@@ -948,11 +714,11 @@ mod tests {
     use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
 
     use super::{
-        AUTH_TAG_LEN, AddressOutputCursorPayload, AddressOutputStreamFamily,
-        CHAIN_EVENT_LOCATOR_MAX, CURSOR_BODY_LEN, ChainEventCursorAnchor, ChainEventLocator,
-        ChainEventStreamFamily, MempoolEventPosition, STREAM_CURSOR_TOKEN_V1_LEN,
-        SnapshotPageCursorAnchor, SnapshotPageCursorPayload, SnapshotPageStreamFamily,
-        StreamCursorError, StreamCursorTokenV1,
+        ADDRESS_OUTPUT_FLAGS, AUTH_TAG_LEN, AddressOutputCursorPayload, CHAIN_EVENT_LOCATOR_MAX,
+        CURSOR_BODY_LEN, ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
+        MempoolEventPosition, SNAPSHOT_PAGE_FLAGS, STREAM_CURSOR_TOKEN_V1_LEN,
+        SnapshotPageCursorAnchor, SnapshotPageCursorPayload, StreamCursorError,
+        StreamCursorTokenV1,
     };
 
     const CURSOR_AUTH_KEY: [u8; 32] = [7; 32];
@@ -985,7 +751,7 @@ mod tests {
         assert_eq!(&cursor_bytes[5..13], &42_u64.to_be_bytes());
         assert_eq!(&cursor_bytes[13..17], &7_u32.to_be_bytes());
         assert_eq!(&cursor_bytes[17..49], &[9; 32]);
-        assert_eq!(cursor_bytes[49], ChainEventStreamFamily::Tip.flags());
+        assert_eq!(cursor_bytes[49], ChainEventStreamFamily::Visible.flags());
         assert_eq!(cursor_bytes[50], 0);
         assert_eq!(cursor_bytes[51..].len(), 32);
 
@@ -1010,7 +776,7 @@ mod tests {
         ])?;
         let cursor = StreamCursorTokenV1::chain_event(
             Network::ZcashRegtest,
-            ChainEventStreamFamily::Tip,
+            ChainEventStreamFamily::Visible,
             7,
             &locator,
             CURSOR_AUTH_KEY,
@@ -1018,7 +784,7 @@ mod tests {
 
         let decoded = cursor.decode_chain_event(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
         assert_eq!(decoded.event_sequence, 7);
-        assert_eq!(decoded.family, ChainEventStreamFamily::Tip);
+        assert_eq!(decoded.family, ChainEventStreamFamily::Visible);
         assert_eq!(decoded.locator, locator);
 
         Ok(())
@@ -1038,7 +804,7 @@ mod tests {
         let locator = ChainEventLocator::new(entries)?;
         let cursor = StreamCursorTokenV1::chain_event(
             Network::ZcashRegtest,
-            ChainEventStreamFamily::Safe,
+            ChainEventStreamFamily::Settled,
             123,
             &locator,
             CURSOR_AUTH_KEY,
@@ -1046,7 +812,7 @@ mod tests {
 
         let decoded = cursor.decode_chain_event(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
         assert_eq!(decoded.locator, locator);
-        assert_eq!(decoded.family, ChainEventStreamFamily::Safe);
+        assert_eq!(decoded.family, ChainEventStreamFamily::Settled);
 
         Ok(())
     }
@@ -1065,7 +831,7 @@ mod tests {
         ])?;
         let cursor = StreamCursorTokenV1::chain_event(
             Network::ZcashRegtest,
-            ChainEventStreamFamily::Tip,
+            ChainEventStreamFamily::Visible,
             7,
             &locator,
             CURSOR_AUTH_KEY,
@@ -1213,7 +979,7 @@ mod tests {
         }])?;
         StreamCursorTokenV1::chain_event(
             Network::ZcashRegtest,
-            ChainEventStreamFamily::Tip,
+            ChainEventStreamFamily::Visible,
             42,
             &locator,
             CURSOR_AUTH_KEY,
@@ -1228,24 +994,19 @@ mod tests {
         };
         let cursor = StreamCursorTokenV1::address_output(
             Network::ZcashRegtest,
-            AddressOutputStreamFamily::AddressOutput,
             BlockHeight::new(2024),
             last_outpoint,
             CURSOR_AUTH_KEY,
         )?;
 
         assert_eq!(cursor.as_bytes().len(), STREAM_CURSOR_TOKEN_V1_LEN);
-        assert_eq!(
-            cursor.as_bytes()[49],
-            AddressOutputStreamFamily::AddressOutput.flags()
-        );
+        assert_eq!(cursor.as_bytes()[49], ADDRESS_OUTPUT_FLAGS);
 
         let decoded = cursor.decode_address_output(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
 
         assert_eq!(
             decoded,
             AddressOutputCursorPayload {
-                family: AddressOutputStreamFamily::AddressOutput,
                 last_block_height: BlockHeight::new(2024),
                 last_outpoint,
             }
@@ -1271,7 +1032,6 @@ mod tests {
     fn address_output_cursor_rejects_wrong_network() -> Result<(), StreamCursorError> {
         let cursor = StreamCursorTokenV1::address_output(
             Network::ZcashRegtest,
-            AddressOutputStreamFamily::AddressOutput,
             BlockHeight::new(1),
             TransparentOutPoint {
                 transaction_id: TransactionId::from_bytes([0; 32]),
@@ -1296,7 +1056,6 @@ mod tests {
         let cursor = StreamCursorTokenV1::snapshot_page(
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
-                family: SnapshotPageStreamFamily::SnapshotPage,
                 events_resume_anchor,
                 after_transaction_id,
             },
@@ -1304,16 +1063,12 @@ mod tests {
         )?;
 
         assert_eq!(cursor.as_bytes().len(), STREAM_CURSOR_TOKEN_V1_LEN + 32);
-        assert_eq!(
-            cursor.as_bytes()[49],
-            SnapshotPageStreamFamily::SnapshotPage.flags()
-        );
+        assert_eq!(cursor.as_bytes()[49], SNAPSHOT_PAGE_FLAGS);
 
         let decoded = cursor.decode_snapshot_page(Network::ZcashRegtest, CURSOR_AUTH_KEY)?;
         assert_eq!(
             decoded,
             SnapshotPageCursorPayload {
-                family: SnapshotPageStreamFamily::SnapshotPage,
                 events_resume_anchor,
                 after_transaction_id,
             }
@@ -1327,7 +1082,6 @@ mod tests {
         let cursor = StreamCursorTokenV1::snapshot_page(
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
-                family: SnapshotPageStreamFamily::SnapshotPage,
                 events_resume_anchor: None,
                 after_transaction_id: TransactionId::from_bytes([3; 32]),
             },
@@ -1345,7 +1099,6 @@ mod tests {
         let cursor = StreamCursorTokenV1::snapshot_page(
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
-                family: SnapshotPageStreamFamily::SnapshotPage,
                 events_resume_anchor: Some(MempoolEventPosition {
                     event_sequence: 17,
                     transaction_id: TransactionId::from_bytes([8; 32]),
@@ -1373,7 +1126,6 @@ mod tests {
         let cursor = StreamCursorTokenV1::snapshot_page(
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
-                family: SnapshotPageStreamFamily::SnapshotPage,
                 events_resume_anchor: Some(MempoolEventPosition {
                     event_sequence: 17,
                     transaction_id: TransactionId::from_bytes([8; 32]),
@@ -1401,7 +1153,6 @@ mod tests {
         let cursor = StreamCursorTokenV1::snapshot_page(
             SnapshotPageCursorAnchor {
                 network: Network::ZcashRegtest,
-                family: SnapshotPageStreamFamily::SnapshotPage,
                 events_resume_anchor: Some(MempoolEventPosition {
                     event_sequence: 1,
                     transaction_id: TransactionId::from_bytes([8; 32]),
@@ -1411,7 +1162,7 @@ mod tests {
             CURSOR_AUTH_KEY,
         )?;
         let mut cursor_bytes = cursor.as_bytes().to_vec();
-        cursor_bytes[49] = AddressOutputStreamFamily::AddressOutput.flags();
+        cursor_bytes[49] = ADDRESS_OUTPUT_FLAGS;
         let wrong_family = StreamCursorTokenV1::from_bytes(cursor_bytes);
         assert!(matches!(
             wrong_family.decode_snapshot_page(Network::ZcashRegtest, CURSOR_AUTH_KEY),
@@ -1424,7 +1175,6 @@ mod tests {
     fn snapshot_page_cursor_rejects_fixed_length_cursor() -> Result<(), StreamCursorError> {
         let cursor = StreamCursorTokenV1::address_output(
             Network::ZcashRegtest,
-            AddressOutputStreamFamily::AddressOutput,
             BlockHeight::new(1),
             TransparentOutPoint {
                 transaction_id: TransactionId::from_bytes([0; 32]),

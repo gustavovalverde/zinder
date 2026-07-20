@@ -84,11 +84,7 @@ pub(super) fn encode_ready_store_control(
     encoded.extend_from_slice(&ready_evidence.replay_format_version.value().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.sequence_digest_version.value().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.visible_sequence_digest);
-    encoded.extend_from_slice(
-        &ready_evidence
-            .visible_logical_block_facts_bytes
-            .to_le_bytes(),
-    );
+    encoded.extend_from_slice(&ready_evidence.visible_logical_replay_bytes.to_le_bytes());
     let checkpoint = ready_evidence.sequence_checkpoint;
     encoded.extend_from_slice(&checkpoint.through().height.value().to_le_bytes());
     encoded.extend_from_slice(&checkpoint.through().hash.as_bytes());
@@ -407,11 +403,11 @@ impl<'encoded> Decoder<'encoded> {
         )
         .map_err(|source| CanonicalStoreError::admission(self.path, source.to_string()))?;
         let visible_sequence_digest = self.read_array::<32>("visible sequence digest")?;
-        let visible_logical_block_facts_bytes = self.read_u64("visible logical fact bytes")?;
+        let visible_logical_replay_bytes = self.read_u64("visible logical replay bytes")?;
         let sequence_checkpoint = self.decode_sequence_checkpoint(
             first_height,
             visible_tip_height,
-            visible_logical_block_facts_bytes,
+            visible_logical_replay_bytes,
         )?;
         let construction_manifest_version = self.read_u16("construction manifest version")?;
         let construction_manifest_sha256 = self.read_array::<32>("construction manifest digest")?;
@@ -434,7 +430,7 @@ impl<'encoded> Decoder<'encoded> {
                 "ready store control has an invalid chain position",
             ));
         }
-        if visible_logical_block_facts_bytes == 0 {
+        if visible_logical_replay_bytes == 0 {
             return Err(CanonicalStoreError::admission(
                 self.path,
                 "ready store control is missing validation evidence",
@@ -456,7 +452,7 @@ impl<'encoded> Decoder<'encoded> {
             replay_format_version,
             sequence_digest_version,
             visible_sequence_digest,
-            visible_logical_block_facts_bytes,
+            visible_logical_replay_bytes,
             sequence_checkpoint,
             construction_manifest_version,
             construction_manifest_sha256,
@@ -976,7 +972,7 @@ mod tests {
                 replay_format_version: CanonicalBlockReplayFormatVersion::V1,
                 sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
                 visible_sequence_digest: [3; 32],
-                visible_logical_block_facts_bytes: 1,
+                visible_logical_replay_bytes: 1,
                 sequence_checkpoint: CanonicalSequenceCheckpoint::from_admitted_parts(
                     BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
                     1,

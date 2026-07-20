@@ -42,8 +42,7 @@ use crate::{
     block_value_pool_balances::read_block_value_pool_balances,
     format::{
         CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator, ChainEventStreamFamily,
-        MempoolEventKind, MempoolEventStreamFamily, SnapshotPageCursorAnchor,
-        SnapshotPageCursorPayload, SnapshotPageStreamFamily, StoreKey,
+        MempoolEventKind, SnapshotPageCursorAnchor, SnapshotPageCursorPayload, StoreKey,
         decode_block_value_pool_balances, decode_canonical_history_bounds, decode_chain_epoch,
         decode_chain_event_envelope, decode_final_note_commitment_roots,
         decode_mempool_event_envelope, decode_mempool_event_kind, decode_mempool_event_observed_at,
@@ -75,7 +74,7 @@ use crate::{
     },
 };
 
-use schema_admission::validate_primary_store_schema;
+use schema_admission::{preflight_primary_store_schema, validate_primary_store_schema};
 use validation::{
     ValidatedBlockReplayOrder, committed_block_range, validate_chain_epoch_artifacts,
     validate_chain_store_options, validate_reorg_window_change, validate_retained_blob_artifacts,
@@ -157,74 +156,18 @@ impl ChainStoreOptions {
 }
 
 /// Durable canonical store schema version written by this binary.
-pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 14;
+///
+/// The current layout carries complete block-replay envelopes and the active
+/// three-kind mempool event encoding. Stores written with any earlier schema
+/// are refused at open and must be rebuilt from the source chain.
+pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 15;
 /// Durable artifact schema version written by this binary.
 ///
-/// Version 10 carried the canonical-block-facts layout with every hash-shaped proto
-/// field in stored artifacts encoded as `string` in RPC byte order. Its
-/// `address_output_index` rows were append-only history with an epoch
-/// suffix on the key, filtered at read time.
-/// See [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
-///
-/// Version 11 keeps every artifact payload from version 10 and converts
-/// `address_output_index` into a reorg-safe current projection: the key
-/// drops the epoch suffix, rows derive from `transparent_outputs_by_outpoint`
-/// at commit, and finalized-spent rows are deleted by the settled-tip
-/// retention sweep. A version-10 store is migrated in place at primary
-/// open by a one-shot streaming rebuild of the projection from
-/// `transparent_output` and `transparent_spend_fact`; no resync is needed.
-///
-/// Version 12 adds the Ironwood (NU6.3) shielded pool: `ChainEpochRecord`
-/// carries `ironwood_commitment_tree_size`, and each compact block's
-/// `payload_bytes` carries `ironwoodActions`/`ironwoodCommitmentTreeSize` in
-/// the vendored lightwalletd wire shape. A version-11 store has neither field
-/// and cannot be repaired in place (the omitted Ironwood action data was
-/// never derived from the source block), so it is rejected at open and must
-/// be rebuilt from genesis.
-///
-/// Version 13 adds the signed Orchard and Ironwood value balances and the
-/// Orchard shared anchor to `TransactionFactsArtifactRecord`. A version-12
-/// store has none of these fields (the data was never derived from the source
-/// block), so it is rejected at open and must be rebuilt from genesis.
-///
-/// Store schema version 12 removes the canonical
-/// `transparent_address_tx_index` column family. The typed
-/// `TransparentAddressTxIndexArtifact` remains the wallet/query response row,
-/// but materialization belongs to the materialized-view plane.
-///
-/// Store schema version 13 replaces the outpoint-only transparent spend block
-/// index with complete retained spend facts. Older stores may have swept the
-/// point facts needed to construct those records and are refused at open.
-///
-/// Store schema version 14 adds the `block_replay` column family. Schema
-/// 13 stores do not contain the complete semantic replay envelopes and are
-/// refused at open without creating the missing column family.
-///
-/// Artifact schema version 14 adds per-block Sapling, Orchard, and Ironwood final
-/// note-commitment roots.
-///
-/// Version 15 adds optional transaction-intrinsic Sprout, Sapling, Orchard,
-/// and Ironwood value balances.
-///
-/// Version 16 adds optional cumulative value-pool balances bound to an exact
-/// canonical block hash and time.
-///
-/// Version 17 adds optional final note-commitment roots to newly captured
-/// displaced-block rows, plus a writer-owned reverse index and an independent
-/// activation-limited coverage record. Archive rows captured before the
-/// coverage record's activation decode with unknown roots and are excluded
-/// from displaced-root coverage counters. The next canonical commit stamps
-/// version 17.
-///
-/// Version 18 stores every observed transparent input and its resolved spend
-/// facts in each block-local spend replay index. Point rows may still be
-/// deleted after settled-tip retention, while materialized-view rebuilds remain possible
-/// from the durable block records. Store schema 13 introduces this
-/// non-migratable payload.
-///
-/// Version 19 requires one complete semantic replay envelope for every
-/// committed block header. Older canonical histories cannot reconstruct fields
-/// that were never retained and must be rebuilt from the source chain.
+/// The current artifact contract includes complete semantic replay envelopes,
+/// transaction-intrinsic balances, cumulative value-pool balances, final
+/// note-commitment roots, and complete block-local transparent spend facts.
+/// Hash-shaped protobuf fields use RPC byte order as defined by
+/// [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
 pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(19);
 /// Oldest durable artifact schema version this binary can read.
 ///
@@ -343,7 +286,7 @@ impl<'cursor> ChainEventHistoryRequest<'cursor> {
         from_cursor: Option<&'cursor StreamCursorTokenV1>,
         max_events: NonZeroU32,
     ) -> Self {
-        Self::new_for_family(from_cursor, ChainEventStreamFamily::Tip, max_events)
+        Self::new_for_family(from_cursor, ChainEventStreamFamily::Visible, max_events)
     }
 
     /// Creates a bounded chain-event history read request for `family`.
@@ -405,13 +348,13 @@ impl TransparentRetentionSweepOutcome {
         self.swept_heights
     }
 
-    /// Number of finalized spent outpoints deleted by this pass.
+    /// Number of settled spent outpoints deleted by this pass.
     #[must_use]
     pub const fn swept_outpoints(self) -> u64 {
         self.swept_outpoints
     }
 
-    /// Remaining complete block heights below the current safe release ceiling.
+    /// Remaining complete block heights below the current settled release ceiling.
     #[must_use]
     pub const fn backlog_heights(self) -> u32 {
         self.backlog_heights
@@ -430,7 +373,7 @@ pub struct PrimaryChainStore {
     store: ChainStoreInner,
     /// Cache of the currently visible chain epoch, populated on first read
     /// and refreshed on every successful [`commit_chain_epoch`]. Lets the
-    /// mempool orchestrator stamp per-event `first_seen_chain_epoch` without
+    /// live mempool owner stamp per-event `first_seen_chain_epoch` without
     /// touching `RocksDB` on each observation.
     cached_visible_chain_epoch: Arc<RwLock<Option<ChainEpoch>>>,
 }
@@ -553,12 +496,13 @@ impl PrimaryChainStore {
     /// Opens or creates the canonical chain store as the primary writer.
     pub fn open(path: impl AsRef<Path>, options: ChainStoreOptions) -> Result<Self, StoreError> {
         validate_chain_store_options(options)?;
+        let initialized_from_empty_store = preflight_primary_store_schema(path.as_ref())?;
         let inner = Arc::new(RocksChainStore::open_primary(
-            path,
+            path.as_ref(),
             options.sync_writes,
             options.rocksdb_resource_budget,
         )?);
-        validate_primary_store_schema(&inner)?;
+        validate_primary_store_schema(&inner, initialized_from_empty_store)?;
         inner.ensure_all_storage_tables_are_present()?;
         let store =
             ChainStoreInner::from_primary_inner(inner, options, ChainStoreReadPosture::Snapshot)?;
@@ -598,20 +542,6 @@ impl PrimaryChainStore {
     /// Reads the durable boundary of intentionally retained canonical history.
     pub fn canonical_history_bounds(&self) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
         read_canonical_history_bounds(self.store.inner.as_ref())
-    }
-
-    /// Reconciles durable history bounds for a legacy store created before the bounds marker.
-    ///
-    /// Existing durable bounds are authoritative. An empty store remains unbounded until its
-    /// first commit. A non-empty store is classified as complete only when height 1 is readable;
-    /// otherwise a supplied checkpoint must match the artifactless first epoch and retained
-    /// boundary before checkpointed bounds are persisted.
-    pub fn reconcile_canonical_history_bounds(
-        &self,
-        configured_checkpoint: Option<BlockId>,
-    ) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
-        self.store
-            .reconcile_canonical_history_bounds(configured_checkpoint)
     }
 
     /// Reads the height through which transparent-retention maintenance has deleted
@@ -655,7 +585,7 @@ impl PrimaryChainStore {
 
     /// Runs one bounded transparent-projection retention maintenance pass.
     ///
-    /// The pass deletes only finalized spends already released by the durable
+    /// The pass deletes only settled spends already released by the durable
     /// materialized view. It is deliberately separate from
     /// [`Self::commit_chain_epoch`] so a large historical retention backlog
     /// cannot delay canonical chain advancement. The ingest scheduler calls
@@ -808,7 +738,6 @@ impl PrimaryChainStore {
         StreamCursorTokenV1::snapshot_page(
             SnapshotPageCursorAnchor {
                 network,
-                family: SnapshotPageStreamFamily::SnapshotPage,
                 events_resume_anchor,
                 after_transaction_id,
             },
@@ -857,7 +786,6 @@ impl PrimaryChainStore {
             })?;
         StreamCursorTokenV1::mempool_event(
             network,
-            MempoolEventStreamFamily::Mempool,
             anchor.event_sequence,
             anchor.transaction_id,
             self.store.cursor_auth_key,
@@ -1159,87 +1087,6 @@ impl ChainStoreInner {
         read_current_chain_epoch_id(&read_view)?
             .map(|chain_epoch_id| read_chain_epoch(&read_view, chain_epoch_id))
             .transpose()
-    }
-
-    fn reconcile_canonical_history_bounds(
-        &self,
-        configured_checkpoint: Option<BlockId>,
-    ) -> Result<Option<CanonicalHistoryBounds>, StoreError> {
-        let _control_guard = self.inner.lock_control();
-        if let Some(bounds) = read_persisted_canonical_history_bounds(self.inner.as_ref())? {
-            return Ok(Some(bounds));
-        }
-        let Some(current_epoch_id) = read_current_chain_epoch_id(self.inner.as_ref())? else {
-            return Ok(None);
-        };
-        let current_epoch = read_chain_epoch(self.inner.as_ref(), current_epoch_id)?;
-
-        match read_block_header_artifact(self.inner.as_ref(), current_epoch, BlockHeight::new(1)) {
-            Ok(Some(_)) => {
-                let bounds = CanonicalHistoryBounds::complete();
-                self.inner
-                    .write(vec![canonical_history_bounds_put(bounds)])?;
-                return Ok(Some(bounds));
-            }
-            Ok(None) | Err(StoreError::ArtifactMissing { .. }) => {}
-            Err(error) => return Err(error),
-        }
-
-        let checkpoint = configured_checkpoint.ok_or(StoreError::CanonicalHistoryBoundsMissing)?;
-        let first_epoch = read_chain_epoch(self.inner.as_ref(), ChainEpochId::new(1))?;
-        if first_epoch.visible_tip_height != checkpoint.height
-            || first_epoch.visible_tip_hash != checkpoint.hash
-            || first_epoch.settled_tip_height != checkpoint.height
-            || first_epoch.settled_tip_hash != checkpoint.hash
-        {
-            return Err(StoreError::CanonicalHistoryBoundsReconciliation {
-                reason: "configured checkpoint does not match the first canonical epoch",
-            });
-        }
-        if current_epoch.visible_tip_height < checkpoint.height {
-            return Err(StoreError::CanonicalHistoryBoundsReconciliation {
-                reason: "current canonical tip is below the configured checkpoint",
-            });
-        }
-        match read_block_header_artifact(self.inner.as_ref(), first_epoch, checkpoint.height) {
-            Err(StoreError::ArtifactMissing { .. }) => {}
-            Ok(None) => {
-                return Err(StoreError::CanonicalHistoryBoundsReconciliation {
-                    reason: "checkpoint height is outside its first canonical epoch",
-                });
-            }
-            Ok(Some(_)) => {
-                return Err(StoreError::CanonicalHistoryBoundsReconciliation {
-                    reason: "configured checkpoint has a canonical block artifact",
-                });
-            }
-            Err(error) => return Err(error),
-        }
-
-        let bounds = CanonicalHistoryBounds::checkpointed(checkpoint).map_err(|_| {
-            StoreError::CanonicalHistoryBoundsReconciliation {
-                reason: "configured checkpoint height has no successor",
-            }
-        })?;
-        if current_epoch.visible_tip_height >= bounds.first_available_height() {
-            let boundary = read_block_header_artifact(
-                self.inner.as_ref(),
-                current_epoch,
-                bounds.first_available_height(),
-            )?
-            .ok_or(StoreError::CanonicalHistoryBoundsReconciliation {
-                reason: "first retained canonical block is unavailable",
-            })?;
-            if boundary.parent_hash != checkpoint.hash {
-                return Err(StoreError::CanonicalHistoryBoundsReconciliation {
-                    reason: "first retained canonical block does not connect to the checkpoint",
-                });
-            }
-        }
-
-        self.inner
-            .write(vec![canonical_history_bounds_put(bounds)])?;
-        Ok(Some(bounds))
     }
 
     /// Opens a reader pinned to the currently visible chain epoch.
@@ -1796,7 +1643,6 @@ impl ChainStoreInner {
                 Some(output) => Some(
                     StreamCursorTokenV1::address_output(
                         chain_epoch.network,
-                        crate::format::AddressOutputStreamFamily::AddressOutput,
                         output.block_height,
                         output.outpoint,
                         self.cursor_auth_key,
@@ -2013,7 +1859,7 @@ impl ChainStoreInner {
             let event_envelope = decode_chain_event_envelope(
                 &key,
                 &record_bytes,
-                ChainEventStreamFamily::Tip,
+                ChainEventStreamFamily::Visible,
                 self.cursor_auth_key,
             )?;
             if event_envelope.chain_epoch.created_at >= cutoff_created_at {
@@ -2075,7 +1921,6 @@ impl ChainStoreInner {
             .ok_or(StoreError::MempoolEventSequenceOverflow)?;
         let cursor = StreamCursorTokenV1::mempool_event(
             network,
-            MempoolEventStreamFamily::Mempool,
             event_sequence,
             event.transaction_id(),
             self.cursor_auth_key,
@@ -2213,7 +2058,7 @@ impl ChainStoreInner {
                     .map_err(|_| StoreError::ChainEventCursorInvalid {
                         reason: "cursor token failed validation",
                     })?;
-                if requested_family != ChainEventStreamFamily::Tip
+                if requested_family != ChainEventStreamFamily::Visible
                     && requested_family != payload.family
                 {
                     return Err(StoreError::ChainEventCursorInvalid {
@@ -2239,7 +2084,7 @@ impl ChainStoreInner {
                     });
                 }
                 let chain_epoch = require_current_chain_epoch(&read_view)?;
-                let cursor = mint_tip_chain_event_cursor(
+                let cursor = mint_visible_chain_event_cursor(
                     &read_view,
                     chain_epoch,
                     requested_family,
@@ -2287,7 +2132,6 @@ impl ChainStoreInner {
                 let position = decode_mempool_event_position(&key, &record_bytes)?;
                 let cursor = StreamCursorTokenV1::mempool_event(
                     network,
-                    MempoolEventStreamFamily::Mempool,
                     position.event_sequence,
                     position.transaction_id,
                     self.cursor_auth_key,
@@ -2463,7 +2307,6 @@ impl ChainStoreInner {
             pruned_added_count: scan.pruned_added,
             pruned_mined_count: scan.pruned_mined,
             pruned_invalidated_count: scan.pruned_invalidated,
-            pruned_suppressed_count: scan.pruned_suppressed,
         })
     }
 
@@ -2487,7 +2330,6 @@ impl ChainStoreInner {
             pruned_added_count: 0,
             pruned_mined_count: 0,
             pruned_invalidated_count: 0,
-            pruned_suppressed_count: 0,
         })
     }
 
@@ -3154,10 +2996,10 @@ fn resolve_reorged_cursor_resume(
         bounds,
     } = resume;
 
-    if matches!(family, ChainEventStreamFamily::Safe) {
-        // A Safe cursor cannot be reorged out below the settled tip by
+    if matches!(family, ChainEventStreamFamily::Settled) {
+        // A Settled cursor cannot be reorged out below the settled tip by
         // definition; a locator miss is an expiry, never a synthesized reorg,
-        // and the Safe family never carries ChainReorged.
+        // and the Settled family never carries ChainReorged.
         return Err(StoreError::ChainEventCursorExpired {
             event_sequence,
             oldest_retained_sequence: bounds.oldest_retained_sequence,
@@ -3261,7 +3103,7 @@ fn build_synthetic_reorg_envelope(
 
 /// Mints a chain-event cursor anchored at the epoch's visible tip, carrying
 /// the full back-spaced locator.
-fn mint_tip_chain_event_cursor(
+fn mint_visible_chain_event_cursor(
     inner: &impl RocksChainStoreRead,
     chain_epoch: ChainEpoch,
     family: ChainEventStreamFamily,
@@ -3296,7 +3138,7 @@ fn enrich_chain_event_cursor(
     family: ChainEventStreamFamily,
     cursor_auth_key: [u8; 32],
 ) -> Result<(), StoreError> {
-    event_envelope.cursor = mint_tip_chain_event_cursor(
+    event_envelope.cursor = mint_visible_chain_event_cursor(
         inner,
         event_envelope.chain_epoch,
         family,
@@ -3358,13 +3200,13 @@ fn build_chain_event_envelope<R: RocksChainStoreRead>(
     } = inputs;
     let event = build_chain_event(committed, previous_chain_epoch, reorg_window_change)?;
     let chain_epoch = committed.chain_epoch;
-    // The just-committed tip block is not yet readable through the index, so
-    // the tip entry is taken from the epoch directly; the back-spaced
+    // The just-committed visible-tip block is not yet readable through the index, so
+    // the visible-tip entry is taken from the epoch directly; the back-spaced
     // ancestors resolve against already-committed blocks.
-    let cursor = mint_tip_chain_event_cursor(
+    let cursor = mint_visible_chain_event_cursor(
         inner,
         chain_epoch,
-        ChainEventStreamFamily::Tip,
+        ChainEventStreamFamily::Visible,
         event_sequence,
         cursor_auth_key,
     )?;
@@ -3383,8 +3225,8 @@ fn chain_event_matches_family(
     family: ChainEventStreamFamily,
 ) -> bool {
     match family {
-        ChainEventStreamFamily::Tip => true,
-        ChainEventStreamFamily::Safe => {
+        ChainEventStreamFamily::Visible => true,
+        ChainEventStreamFamily::Settled => {
             event_envelope.chain_epoch.visible_tip_height <= event_envelope.settled_tip_height
                 && matches!(&event_envelope.event, ChainEvent::ChainCommitted { .. })
         }
@@ -3666,7 +3508,7 @@ struct RetentionSweepAdvance {
 ///
 /// The scan runs outside the control lock so readiness and event-history
 /// reads stay responsive through a bounded chunk. This is sound because
-/// every row it reads is finalized: the range ends at or below the current
+/// every row it reads is settled: the range ends at or below the current
 /// settled tip, `validate_reorg_window_change` floors every `Replace` at
 /// `settled_tip + 1`, and the swept marker is written only by this sweep inside
 /// the serialized writer. The locked write still re-checks the marker via
@@ -3736,7 +3578,7 @@ struct SettledSpendSweepDeletes {
     swept_through: BlockHeight,
 }
 
-/// Collects the deletes for spend facts and spent-output rows finalized within
+/// Collects the deletes for spend facts and spent-output rows settled within
 /// `sweep_range`, stopping after the first fully-swept height that reaches
 /// `max_outpoints`.
 ///
@@ -3959,7 +3801,7 @@ fn missing_raw_blob_retention_error() -> StoreError {
     StoreError::ArtifactCorrupt {
         family: ArtifactFamily::ChainEpoch,
         key: StoreKey::raw_blob_retention().into(),
-        reason: "non-empty schema-14 store is missing its raw blob retention contract",
+        reason: "non-empty canonical store is missing its raw blob retention contract",
     }
 }
 
@@ -4836,7 +4678,7 @@ fn read_chain_event_created_at(
     let event_envelope = decode_chain_event_envelope(
         &key,
         &record_bytes,
-        ChainEventStreamFamily::Tip,
+        ChainEventStreamFamily::Visible,
         cursor_auth_key,
     )?;
 
@@ -5006,7 +4848,6 @@ struct MempoolPruneScan {
     pruned_added: u64,
     pruned_mined: u64,
     pruned_invalidated: u64,
-    pruned_suppressed: u64,
     new_oldest_retained: Option<u64>,
 }
 
@@ -5021,7 +4862,6 @@ fn scan_mempool_events_for_pruning(
     let mut pruned_added = 0_u64;
     let mut pruned_mined = 0_u64;
     let mut pruned_invalidated = 0_u64;
-    let mut pruned_suppressed = 0_u64;
     let mut new_oldest_retained: Option<u64> = None;
     let mut iter_error: Option<StoreError> = None;
 
@@ -5059,9 +4899,7 @@ fn scan_mempool_events_for_pruning(
             let retention_window = match kind {
                 MempoolEventKind::Added => retention.added_retention,
                 MempoolEventKind::Mined => retention.mined_retention,
-                MempoolEventKind::Invalidated | MempoolEventKind::Suppressed => {
-                    retention.invalidated_retention
-                }
+                MempoolEventKind::Invalidated => retention.invalidated_retention,
             };
             let should_prune =
                 retention_window.is_some_and(|window| age_exceeds_window(now, observed_at, window));
@@ -5075,9 +4913,6 @@ fn scan_mempool_events_for_pruning(
                     MempoolEventKind::Mined => pruned_mined = pruned_mined.saturating_add(1),
                     MempoolEventKind::Invalidated => {
                         pruned_invalidated = pruned_invalidated.saturating_add(1);
-                    }
-                    MempoolEventKind::Suppressed => {
-                        pruned_suppressed = pruned_suppressed.saturating_add(1);
                     }
                 }
             } else if new_oldest_retained.is_none() {
@@ -5095,7 +4930,6 @@ fn scan_mempool_events_for_pruning(
         pruned_added,
         pruned_mined,
         pruned_invalidated,
-        pruned_suppressed,
         new_oldest_retained,
     })
 }
@@ -5237,127 +5071,6 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_persists_complete_bounds_for_a_legacy_full_store()
-    -> Result<(), Box<dyn Error>> {
-        let tempdir = tempdir()?;
-        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-        let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
-        store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
-            chain_epoch,
-            vec![block],
-            vec![compact_block],
-        ))?;
-        store.store.inner.delete(
-            StorageTable::StorageControl,
-            &StoreKey::canonical_history_bounds(),
-        )?;
-
-        assert_eq!(
-            store.canonical_history_bounds()?,
-            Some(CanonicalHistoryBounds::complete())
-        );
-        assert_eq!(
-            store.reconcile_canonical_history_bounds(None)?,
-            Some(CanonicalHistoryBounds::complete())
-        );
-        assert_eq!(
-            read_persisted_canonical_history_bounds(store.store.inner.as_ref())?,
-            Some(CanonicalHistoryBounds::complete())
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn reconciliation_requires_explicit_matching_checkpoint_for_a_legacy_checkpoint_store()
-    -> Result<(), Box<dyn Error>> {
-        let tempdir = tempdir()?;
-        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-        let checkpoint_epoch = ChainEpoch {
-            id: ChainEpochId::new(1),
-            network: Network::ZcashRegtest,
-            visible_tip_height: BlockHeight::new(20),
-            visible_tip_hash: block_hash(20),
-            settled_tip_height: BlockHeight::new(20),
-            settled_tip_hash: block_hash(20),
-            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-            tip_metadata: ChainTipMetadata::empty(),
-            created_at: UnixTimestampMillis::new(1),
-        };
-        store.commit_artifactless_checkpoint(checkpoint_epoch)?;
-        let (next_epoch, next_block, next_compact_block) =
-            synthetic_epoch_with_hash_seed(2, 21, 21, 20);
-        store.commit_chain_epoch(synthetic_chain_epoch_artifacts(
-            next_epoch,
-            vec![next_block],
-            vec![next_compact_block],
-        ))?;
-        store.store.inner.delete(
-            StorageTable::StorageControl,
-            &StoreKey::canonical_history_bounds(),
-        )?;
-
-        assert!(matches!(
-            store.canonical_history_bounds(),
-            Err(StoreError::CanonicalHistoryBoundsMissing)
-        ));
-        assert!(matches!(
-            store.reconcile_canonical_history_bounds(None),
-            Err(StoreError::CanonicalHistoryBoundsMissing)
-        ));
-
-        let checkpoint = BlockId::new(BlockHeight::new(20), block_hash(20));
-        let expected = CanonicalHistoryBounds::checkpointed(checkpoint)?;
-        assert_eq!(
-            store.reconcile_canonical_history_bounds(Some(checkpoint))?,
-            Some(expected)
-        );
-        assert_eq!(
-            read_persisted_canonical_history_bounds(store.store.inner.as_ref())?,
-            Some(expected)
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn reconciliation_rejects_a_mismatched_legacy_checkpoint_without_persisting()
-    -> Result<(), Box<dyn Error>> {
-        let tempdir = tempdir()?;
-        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-        let checkpoint_epoch = ChainEpoch {
-            id: ChainEpochId::new(1),
-            network: Network::ZcashRegtest,
-            visible_tip_height: BlockHeight::new(20),
-            visible_tip_hash: block_hash(20),
-            settled_tip_height: BlockHeight::new(20),
-            settled_tip_hash: block_hash(20),
-            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-            tip_metadata: ChainTipMetadata::empty(),
-            created_at: UnixTimestampMillis::new(1),
-        };
-        store.commit_artifactless_checkpoint(checkpoint_epoch)?;
-        store.store.inner.delete(
-            StorageTable::StorageControl,
-            &StoreKey::canonical_history_bounds(),
-        )?;
-
-        assert!(matches!(
-            store.reconcile_canonical_history_bounds(Some(BlockId::new(
-                BlockHeight::new(20),
-                block_hash(99),
-            ))),
-            Err(StoreError::CanonicalHistoryBoundsReconciliation { .. })
-        ));
-        assert_eq!(
-            read_persisted_canonical_history_bounds(store.store.inner.as_ref())?,
-            None
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn missing_retained_full_history_row_is_not_treated_as_intentional_truncation()
     -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
@@ -5454,7 +5167,7 @@ mod tests {
         }])?;
         let cursor = StreamCursorTokenV1::chain_event(
             Network::ZcashRegtest,
-            ChainEventStreamFamily::Tip,
+            ChainEventStreamFamily::Visible,
             1,
             &locator,
             store.store.cursor_auth_key,
@@ -5553,6 +5266,156 @@ mod tests {
                 .is_some();
             assert_eq!(present, expected_present);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_noncurrent_schema_refuses_before_decoding_unsupported_event_rows()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("unsupported-event-row-store");
+        let unsupported_event_key = StoreKey::mempool_event(1);
+        // Schema 14 encoded event kind 4 with a transaction ID in nested field
+        // 5. The current schema intentionally has no decoder for that event
+        // kind.
+        let mut unsupported_event_record = vec![
+            0x08, 0x01, // event_sequence = 1
+            0x10, 0x01, // source_observed_unix_millis = 1
+            0x1a, 0x26, // event record, 38 bytes
+            0x08, 0x04, // unsupported event kind
+            0x2a, 0x22, // unsupported event payload, 34 bytes
+            0x0a, 0x20, // transaction_id, 32 bytes
+        ];
+        unsupported_event_record.extend_from_slice(&[7; 32]);
+
+        {
+            let store =
+                PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())?;
+            let mut metadata_bytes = Vec::with_capacity(6);
+            metadata_bytes.extend_from_slice(&14_u16.to_be_bytes());
+            metadata_bytes.extend_from_slice(&Network::ZcashRegtest.id().to_be_bytes());
+            store.store.inner.write(vec![
+                StoragePut {
+                    table: StorageTable::MempoolEvent,
+                    key: unsupported_event_key.clone(),
+                    value: unsupported_event_record.clone(),
+                },
+                StoragePut {
+                    table: StorageTable::StorageControl,
+                    key: StoreKey::store_metadata(),
+                    value: metadata_bytes,
+                },
+            ])?;
+        }
+
+        let Err(error) =
+            PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())
+        else {
+            return Err("expected schema-14 rejection on reopen".into());
+        };
+        assert!(
+            matches!(
+                error,
+                StoreError::SchemaMismatch {
+                    persisted_version: 14,
+                    expected_version: CURRENT_STORE_SCHEMA_VERSION,
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+
+        let column_families = DB::list_cf(&Options::default(), &storage_path)?;
+        let database = DB::open_cf(&Options::default(), &storage_path, column_families)?;
+        let mempool_events = database
+            .cf_handle(StorageTable::MempoolEvent.column_family_name())
+            .ok_or("mempool event column family must remain present")?;
+        assert_eq!(
+            database.get_cf(&mempool_events, unsupported_event_key.as_bytes())?,
+            Some(unsupported_event_record),
+            "failed admission must not mutate unsupported event rows"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_populated_store_without_metadata_refuses_without_mutation()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("missing-metadata-store");
+        let mempool_event_key = StoreKey::mempool_event(1);
+        let mempool_event_value = vec![7, 11, 19];
+        {
+            let store =
+                PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())?;
+            store.store.inner.write(vec![StoragePut {
+                table: StorageTable::MempoolEvent,
+                key: mempool_event_key.clone(),
+                value: mempool_event_value.clone(),
+            }])?;
+        }
+
+        let column_families = DB::list_cf(&Options::default(), &storage_path)?;
+        let database = DB::open_cf(&Options::default(), &storage_path, &column_families)?;
+        let storage_control = database
+            .cf_handle(StorageTable::StorageControl.column_family_name())
+            .ok_or("storage-control column family must exist")?;
+        database.delete_cf(&storage_control, StoreKey::store_metadata().as_bytes())?;
+        drop(storage_control);
+        drop(database);
+
+        let Err(error) =
+            PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())
+        else {
+            return Err("expected missing-metadata rejection on reopen".into());
+        };
+        assert!(
+            matches!(error, StoreError::StoreMetadataMissing),
+            "unexpected error: {error:?}"
+        );
+
+        let database = DB::open_cf(&Options::default(), &storage_path, &column_families)?;
+        let mempool_events = database
+            .cf_handle(StorageTable::MempoolEvent.column_family_name())
+            .ok_or("mempool-event column family must remain present")?;
+        let storage_control = database
+            .cf_handle(StorageTable::StorageControl.column_family_name())
+            .ok_or("storage-control column family must remain present")?;
+        assert_eq!(
+            database.get_cf(&mempool_events, mempool_event_key.as_bytes())?,
+            Some(mempool_event_value),
+            "failed admission must not mutate persisted rows"
+        );
+        assert_eq!(
+            database.get_cf(&storage_control, StoreKey::store_metadata().as_bytes())?,
+            None,
+            "failed admission must not recreate metadata"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_fresh_store_initializes_current_metadata() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("fresh-store");
+        assert!(!storage_path.exists());
+
+        let store = PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_local_tests())?;
+        let metadata_key = StoreKey::store_metadata();
+        let metadata_bytes = store
+            .store
+            .inner
+            .get(
+                StoreReadCaller::Query,
+                StorageTable::StorageControl,
+                &metadata_key,
+            )?
+            .ok_or("fresh store metadata must be initialized")?;
+        let metadata = decode_store_metadata(&metadata_key, &metadata_bytes)?;
+        assert_eq!(metadata.schema_version, CURRENT_STORE_SCHEMA_VERSION);
+        assert_eq!(metadata.network, Network::ZcashRegtest);
 
         Ok(())
     }

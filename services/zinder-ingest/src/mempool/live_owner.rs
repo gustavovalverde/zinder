@@ -330,11 +330,6 @@ impl LiveMempoolOwner {
                     .terminal_events
                     .insert(transaction_id, (event.clone(), observed_at));
             }
-            MempoolEvent::Suppressed { .. } => {
-                staged_generation
-                    .side_events
-                    .push((event.clone(), observed_at));
-            }
             _ => {
                 self.mark_rebuild_required();
                 return Err(Status::failed_precondition(
@@ -847,7 +842,6 @@ fn apply_to_index(
         MempoolEvent::Mined { transaction_id, .. } => {
             Ok(index.apply_mined(transaction_id, position))
         }
-        MempoolEvent::Suppressed { .. } => Ok(MempoolApplyOutcome::Applied),
         _ => Err(Status::failed_precondition(
             "mempool event variant is unsupported",
         )),
@@ -912,7 +906,7 @@ mod tests {
     use crate::{
         MempoolReadyGate, mempool_ready_channel,
         writer::control::{
-            CanonicalControlHandle, canonical_control_channel, handle_canonical_control_command,
+            CanonicalControlHandle, apply_canonical_control_command, canonical_control_channel,
             test_support::published_fixture_store,
         },
     };
@@ -927,7 +921,7 @@ mod tests {
         let (canonical, mut commands) = canonical_control_channel();
         let command_task = tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
-                handle_canonical_control_command(&mut store, command);
+                apply_canonical_control_command(&mut store, command);
             }
         });
         let (source, source_control) = MockMempoolSource::streaming();
@@ -1124,7 +1118,7 @@ mod tests {
         let (canonical, mut commands) = canonical_control_channel();
         let command_task = tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
-                handle_canonical_control_command(&mut store, command);
+                apply_canonical_control_command(&mut store, command);
             }
         });
 

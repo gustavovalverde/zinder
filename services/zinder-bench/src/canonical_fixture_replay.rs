@@ -40,7 +40,7 @@ use crate::{
     fixture::{FixtureManifest, FixtureNodeSource, read_segment_blocks},
 };
 
-/// Digest-bound checkpoint sidecar written beside a version-1 fixture manifest.
+/// Digest-bound checkpoint sidecar written beside a format-2 fixture manifest.
 pub const CANONICAL_FIXTURE_REPLAY_PLAN_FILE_NAME: &str = "canonical-replay-plan.json";
 const CANONICAL_FIXTURE_REPLAY_PLAN_TEMP_FILE_NAME: &str = "canonical-replay-plan.json.tmp";
 const CANONICAL_FIXTURE_REPLAY_PLAN_CONTRACT_IDENTITY: &str = "canonical-fixture-replay-plan";
@@ -56,7 +56,7 @@ pub struct CanonicalFixtureReplayPlan {
     pub contract_identity: String,
     /// Sidecar format version.
     pub format_version: u32,
-    /// SHA-256 identity of the exact version-1 fixture manifest.
+    /// SHA-256 identity of the exact format-2 fixture manifest.
     pub fixture_manifest_sha256: String,
     /// Fingerprint algorithm used for the captured activation table.
     pub network_upgrade_activations_fingerprint_version: u16,

@@ -529,7 +529,7 @@ lag_threshold_blocks = 2
 
 [ingest.run_overrides]
 checkpoint_height = ${CHECKPOINT_HEIGHT}
-allow_near_tip_finalize = true
+allow_reorg_window_settlement = true
 
 [ingest_control]
 listen_addr = "${INGEST_CONTROL_ADDR}"
@@ -548,7 +548,9 @@ name = "${network}"
 [storage]
 canonical_path = "${storage_path}"
 canonical_secondary_path = "${projector_canonical_secondary_path}"
-wallet_path = "${wallet_path}"
+
+[wallet]
+path = "${wallet_path}"
 
 [projector]
 reorg_window_blocks = 100
@@ -858,13 +860,13 @@ build_binaries() {
 run_bulk_catchup_seed() {
   local log_file="${LOG_DIR}/bulk-catchup.log"
   local started_at ended_at
-  log "running unified ingest until target_height ${BULK_CATCHUP_TO_HEIGHT} from checkpoint ${CHECKPOINT_HEIGHT}; log: ${log_file}"
+  log "running phase-driven ingest until target_height ${BULK_CATCHUP_TO_HEIGHT} from checkpoint ${CHECKPOINT_HEIGHT}; log: ${log_file}"
   started_at="$(python3 - <<'PY'
 import time
 print(time.time())
 PY
 )"
-  # The unified loop honours --target-height and exits cleanly when
+  # The ingest loop honours --target-height and exits cleanly when
   # reached. The same binary handles bulk-catchup and tip-follow in one
   # process per ADR-0015; the long-running invocation below omits the
   # flag so it continues into FollowingTip after the seed completes.
@@ -1332,8 +1334,8 @@ snapshot() {
   print_query_summary "bulk reorder bytes" 'zinder_ingest_bulk_pipeline_reorder_buffer_bytes'
   print_query_summary "bulk watermark blocked" 'sum by (stage) (rate(zinder_ingest_bulk_pipeline_watermark_blocked_total[15m]))'
   print_query_summary "memory pressure 15m" 'avg_over_time(zinder_ingest_memory_pressure_ratio[15m])'
-  print_query_summary "materialized-view replay state" 'zinder_ingest_materialized_view_replay_budget_state'
-  print_query_summary "materialized-view replay effective batch" 'zinder_ingest_materialized_view_replay_effective_batch_blocks'
+  print_query_summary "materialized-view replay state" 'zinder_materialized_view_replay_budget_state'
+  print_query_summary "materialized-view replay effective batch" 'zinder_materialized_view_replay_effective_batch_blocks'
   print_query_summary "ingest commits" 'sum by (service, status, error_class) (zinder_ingest_commit_duration_seconds_count)'
   print_query_summary "ingest writer progress" 'zinder_ingest_writer_chain_epoch_id'
   print_query_summary "ingest writer status requests" 'sum by (service, status, error_class) (zinder_ingest_writer_status_request_total)'
@@ -1484,12 +1486,12 @@ write_readiness_report() {
   report_canonical_writer_height="$(prometheus_max_value 'max(zinder_ingest_writer_tip_height)')"
   report_canonical_lag_blocks="$(prometheus_max_value 'max(zinder_ingest_canonical_lag_blocks)')"
   report_canonical_rate_blocks_per_second="$(prometheus_max_value 'sum(rate(zinder_ingest_commit_batch_block_count_sum{status="ok"}[5m]))')"
-  report_materialized_view_replay_height="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_height)')"
-  report_materialized_view_replay_tip_height="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_tip_height)')"
-  report_materialized_view_replay_lag_blocks="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_lag_blocks)')"
-  report_materialized_view_replay_rate_blocks_per_second="$(prometheus_max_value 'sum(rate(zinder_ingest_materialized_view_replay_blocks_total{status="ok"}[5m]))')"
-  report_materialized_view_replay_phase_gate="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_phase_gate)')"
-  report_materialized_view_replay_caught_up="$(prometheus_max_value 'max(zinder_ingest_materialized_view_replay_caught_up)')"
+  report_materialized_view_replay_height="$(prometheus_max_value 'max(zinder_materialized_view_replay_height)')"
+  report_materialized_view_replay_tip_height="$(prometheus_max_value 'max(zinder_materialized_view_replay_tip_height)')"
+  report_materialized_view_replay_lag_blocks="$(prometheus_max_value 'max(zinder_materialized_view_replay_lag_blocks)')"
+  report_materialized_view_replay_rate_blocks_per_second="$(prometheus_max_value 'sum(rate(zinder_materialized_view_replay_blocks_total{status="ok"}[5m]))')"
+  report_materialized_view_replay_phase_gate="$(prometheus_max_value 'max(zinder_materialized_view_replay_phase_gate)')"
+  report_materialized_view_replay_caught_up="$(prometheus_max_value 'max(zinder_materialized_view_replay_caught_up)')"
   report_memory_pressure_ratio="$(prometheus_max_value 'max(zinder_ingest_memory_pressure_ratio)')"
   report_node_rpc_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[15m]))))')"
   report_store_read_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le, operation, table, caller) (rate(zinder_store_read_duration_seconds_bucket[15m]))))')"
@@ -1820,7 +1822,7 @@ run_stack() {
   run_bulk_catchup_seed
   record_restore_unavailability
 
-  # Long-running unified ingest. No --target-height here, so the loop
+  # Long-running ingest. No --target-height here, so the loop
   # runs indefinitely (transitioning to FollowingTip once the store
   # catches up to the upstream tip).
   start_service zinder-ingest

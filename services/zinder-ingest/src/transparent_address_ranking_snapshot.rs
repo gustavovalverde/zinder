@@ -1,4 +1,4 @@
-//! No-wipe startup construction of the transparent-address ranking projection.
+//! Startup construction of the transparent-address ranking materialized view.
 
 use zinder_core::{BlockHash, BlockHeight, ChainEpoch};
 use zinder_materialized_views::{
@@ -19,10 +19,10 @@ use crate::{
 const SNAPSHOT_WRITE_BATCH_ROWS: usize = 2_048;
 const TAIL_SEED_BATCH_BLOCKS: u32 = 64;
 
-/// Result of attempting to construct the optional ranking projection.
+/// Result of attempting to construct the optional ranking materialized view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransparentAddressRankingBootstrapOutcome {
-    /// The projection was already current or became current during this call.
+    /// The materialized view was already current or became current during this call.
     Ready,
     /// Existing historical sources cannot prove complete lifetime statistics.
     SourceCoverageIncomplete,
@@ -48,7 +48,7 @@ struct SnapshotBuildInputs {
     cursor_bytes: Vec<u8>,
 }
 
-/// Builds the ranking projection without rewriting canonical Zinder data.
+/// Builds the ranking materialized view without rewriting canonical Zinder data.
 pub async fn bootstrap_transparent_address_ranking(
     chain_store: &PrimaryChainStore,
     materialized_view_store: &MaterializedViewStore,

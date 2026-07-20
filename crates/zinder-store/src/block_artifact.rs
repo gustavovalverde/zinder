@@ -75,7 +75,7 @@ pub(crate) fn read_block_header_artifact(
         chain_epoch,
         height,
         ArtifactFamily::BlockHeader,
-        HeightVisibilityIndex::SafeBlock,
+        HeightVisibilityIndex::BlockHeader,
     )?;
     let key = StoreKey::block_header(chain_epoch.network, source_epoch, height);
     if let Some(envelope_bytes) = inner.get(StorageTable::BlockHeader, &key)? {
@@ -108,7 +108,7 @@ pub(crate) fn read_block_header_artifacts(
             chain_epoch,
             height,
             ArtifactFamily::BlockHeader,
-            HeightVisibilityIndex::SafeBlock,
+            HeightVisibilityIndex::BlockHeader,
         ) {
             Ok(source_epoch) => source_epoch,
             Err(StoreError::ArtifactMissing { .. }) => {
@@ -177,7 +177,7 @@ pub(crate) fn read_block_blob_artifact(
         chain_epoch,
         height,
         ArtifactFamily::BlockBlob,
-        HeightVisibilityIndex::SafeBlock,
+        HeightVisibilityIndex::BlockHeader,
     )?;
     let key = StoreKey::block_blob(chain_epoch.network, source_epoch, height);
     let Some(envelope_bytes) = inner.get(StorageTable::BlockBlob, &key)? else {
@@ -206,7 +206,7 @@ pub(crate) fn read_block_blob_artifacts(
             chain_epoch,
             height,
             ArtifactFamily::BlockBlob,
-            HeightVisibilityIndex::SafeBlock,
+            HeightVisibilityIndex::BlockHeader,
         ) {
             Ok(source_epoch) => source_epoch,
             Err(StoreError::ArtifactMissing { .. }) => {
@@ -274,7 +274,7 @@ pub(crate) fn read_block_transaction_index_artifact(
         chain_epoch,
         height,
         ArtifactFamily::BlockTransactionIndex,
-        HeightVisibilityIndex::SafeBlock,
+        HeightVisibilityIndex::BlockHeader,
     )?;
     let key = StoreKey::block_transaction_index(
         chain_epoch.network,
@@ -311,7 +311,7 @@ pub(crate) fn read_block_transaction_index_artifacts_at_height(
         chain_epoch,
         height,
         ArtifactFamily::BlockTransactionIndex,
-        HeightVisibilityIndex::SafeBlock,
+        HeightVisibilityIndex::BlockHeader,
     )?;
     let prefix =
         StoreKey::block_transaction_index_prefix(chain_epoch.network, source_epoch, height);

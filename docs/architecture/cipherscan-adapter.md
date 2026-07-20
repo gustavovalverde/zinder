@@ -21,7 +21,7 @@ canonical store and replayable materialized views
 
 ## Boundaries
 
-- **Zinder** owns canonical facts, durable reusable projections, capability and
+- **Zinder** owns canonical data, durable reusable materialized views, capability and
   coverage metadata, epoch-coherent reads, and explicit absence. Native names
   remain product-neutral.
 - **The adapter** owns HTTP routing, request coercion, Cipherscan response
@@ -31,7 +31,7 @@ canonical store and replayable materialized views
 - **Sidecars** own product enrichments that are not Zcash chain facts, including
   labels, market data, mining attribution, external-node monitoring, names,
   bridges, and identity-oriented risk analytics. They do not require Zinder
-  schema or projection changes.
+  schema or materialized-view changes.
 - **Unavailable** marks an intentional boundary: the adapter returns an
   explicit unavailable or degraded response until an owner provides the source
   fact. It is not a request to synthesize an approximation in Zinder.
@@ -41,7 +41,7 @@ page needs a reusable chain fact that native queries cannot supply truthfully,
 that fact is added as a narrow Zinder surface rather than joined from direct
 Zebra calls or copied into adapter storage.
 
-For arbitrary time-window block-production reads, projection identity, frozen
+For arbitrary time-window block-production reads, materialized-view identity, frozen
 continuations, reorg handling, and completeness are defined by
 [ADR 0033](../adrs/0033-time-indexed-block-production.md). This document only
 records how the adapter consumes that contract. The executable acceptance
@@ -52,17 +52,17 @@ procedure lives in the
 
 | Route family | Current status | Zinder source | Adapter responsibility | Remaining requirement | Ownership (Zinder, adapter, sidecar, unavailable) |
 | --- | --- | --- | --- | --- | --- |
-| Chain identity and health: `/api/info`, `/api/blockchain-info`, `/api/network/health` | Complete | `WalletQuery.LatestBlock`, `ExplorerQuery.ServerInfo`, `WalletQuery.ServerInfo`, operations readiness | Preserve Cipherscan envelopes and distinguish query-plane health from direct-node availability | None for current fields | Zinder, adapter |
+| Chain identity and health: `/api/info`, `/api/blockchain-info`, `/api/network/health` | Complete | `WalletQuery.VisibleTipBlock`, `ExplorerQuery.ServerInfo`, `WalletQuery.ServerInfo`, operations readiness | Preserve Cipherscan envelopes and distinguish query-plane health from direct-node availability | None for current fields | Zinder, adapter |
 | Recent blocks and block detail: `/api/blocks`, `/api/blocks/list`, `/api/network/blocks/recent`, `/api/block/:heightOrHash` | Complete | `ExplorerQuery.BlockProductionSeries`, `ExplorerQuery.BlockTransactions`, `WalletQuery.Transaction`, final-note commitment-root artifacts | Pagination, difficulty and display units, standard-script address decoding, coinbase presentation, Cipherscan row names | Pool branding is external; nonstandard or absent facts remain unavailable | Zinder, adapter, sidecar |
 | Mined transaction detail and bytes: `/api/tx/:txid`, `/api/tx/:txid/raw`, `/api/tx/raw/batch`, `/api/tx/:txid/verbose` | Complete for retained bytes and mined detail; verbose decoding is deliberately degraded | `ExplorerQuery.TransactionDetail`, `WalletQuery.Transaction`, transaction-byte retention | Map inputs, outputs, spent state, fee fields, pool balances, and raw-byte envelopes | Historical bytes outside retention and a reusable decoded-transaction contract are unavailable | Zinder, adapter, unavailable |
 | Broadcast and transaction browsing: `/api/tx/broadcast`, `/api/transactions/list`, `/api/tx/shielded` | Complete | `WalletQuery.BroadcastTransaction`, `ExplorerQuery.TransactionHistory` v2 | Map typed broadcast outcomes; translate Cipherscan paging to filter- and fence-bound native cursors | None for the supported confirmed-history contract | Zinder, adapter |
 | Commitment-root search: `/api/search/anchor/:root` | Complete for canonical matches; displaced matches are activation-limited | `ExplorerQuery.CommitmentRootSearch`, final-note commitment-root artifacts, displaced-root archive capability | Map canonical and retained displaced positives into Cipherscan arrays; retain indeterminate state for empty displaced results | Pre-activation displaced history cannot prove absence; displaced miner identity remains unavailable without a retained standard payout | Zinder, adapter, unavailable |
 | Mempool and realtime: `/api/mempool`, `/api/mempool/tx/:txid`, root WebSocket | Complete | `MempoolSnapshot`, `IngestControl.MempoolTransaction`, `ExplorerQuery.TransactionDetail`, `WalletQuery.ChainEvents`, `WalletQuery.MempoolEvents` | Preserve mempool fallback behavior and `new_block`, `mempool_tx`, and `mempool_removed` frames; manage reconnect cursors internally | Parent-input enrichment, shielded balances, and paid fees for pending transactions remain unavailable | Zinder, adapter, unavailable |
 | Transparent addresses and ranking: `/api/address/:address`, `/api/rich-list`, `/api/labels`, `/api/label/:address` | Address and ranking complete; label routes are degraded | `ExplorerQuery.TransparentAddressActivity`, `ExplorerQuery.TransparentAddressRanking`, retained transaction facts | Address encoding, page coercion, Cipherscan units, field names, and typed degradation | Labels and counterparty annotations require a registry sidecar | Zinder, adapter, sidecar |
-| Supply, activity, and economics: `/api/network/stats`, `/api/supply`, `/api/circulating-supply`, `/api/supply/transparent-breakdown`, `/api/network/halving`, `/api/network/emission` | Complete for current supply, bounded activity, script breakdown, consensus subsidy, and observed issuance | `ValuePoolSummary`, `BlockProductionSeries`, `TransparentAddressRanking`, `UtxoSetSummary`, `ValuePoolBalanceHistory` | Formatting, Cipherscan periods, supply presentation, and consensus-backed calculations | Category labels are sidecar data; historical subsidy allocation needs a proven cross-product requirement before a new projection | Zinder, adapter, sidecar |
+| Supply, activity, and economics: `/api/network/stats`, `/api/supply`, `/api/circulating-supply`, `/api/supply/transparent-breakdown`, `/api/network/halving`, `/api/network/emission` | Complete for current supply, bounded activity, script breakdown, consensus subsidy, and observed issuance | `ValuePoolSummary`, `BlockProductionSeries`, `TransparentAddressRanking`, `UtxoSetSummary`, `ValuePoolBalanceHistory` | Formatting, Cipherscan periods, supply presentation, and consensus-backed calculations | Category labels are sidecar data; historical subsidy allocation needs a proven cross-product requirement before a new materialized view | Zinder, adapter, sidecar |
 | Fees: `/api/network/fees`, `/api/network/fee-distribution` | Complete | `FeeSummary`, conventional-fee distribution, `PaidFeeDistribution`, intrinsic value balances | Expose Cipherscan periods, percentiles, units, and the distinction between conventional and actual paid fees | Conventional fees are only a degraded fallback when paid-fee coverage is unavailable | Zinder, adapter |
 | Value pools and shielded flows: `/api/shielded/list`, `/api/pools/overview`, `/api/pools/flows`, `/api/network/pool-history` | Complete | `ValuePoolSummary`, `ValuePoolBalanceHistory`, `ValuePoolFlowHistory`, `ValuePoolFlowSummary` | Cipherscan period rules, fixed pool fields, ZEC/zatoshi output, labels, and pagination | Address attribution remains unavailable; product labels remain sidecar-owned | Zinder, adapter, sidecar, unavailable |
-| Mining production: `/api/mining/rewards`, `/api/network/mining-metrics`, `/api/mining/pool-distribution` | Complete for the current Cipherscan contract | `BlockProductionSeries`, `BlockProductionInTimeRange`, `PaidFeeDistribution` | Period coercion, rolling formulas, solrate units, adapter-owned pool registry, grouping, response shape, and caching | Longer reward history needs a daily reward projection only when a product requirement justifies it | Zinder, adapter |
+| Mining production: `/api/mining/rewards`, `/api/network/mining-metrics`, `/api/mining/pool-distribution` | Complete for the current Cipherscan contract | `BlockProductionSeries`, `BlockProductionInTimeRange`, `PaidFeeDistribution` | Period coercion, rolling formulas, solrate units, adapter-owned pool registry, grouping, response shape, and caching | Longer reward history needs a daily reward materialized view only when a product requirement justifies it | Zinder, adapter |
 | Mining attribution products: `/api/mining/pool-ranking`, `/api/mining/hashrate-share`, `/api/mining/miner-behavior`, `/api/mining/zodl-leaderboard` | Degraded | None | Return stable unavailable responses | Pool branding, destination classification, behavior scoring, and leaderboard data require a sidecar | Sidecar |
 | Protocol, activity, and privacy summaries: `/api/network/protocol-stats`, `/api/stats/shielded-count`, `/api/stats/shielded-daily`, `/api/analytics/usage-clock`, `/api/privacy-stats`, `/api/analytics/anonymity-set`, `/api/analytics/shielding-distribution` | Complete | `TransactionComponentSummary`, `BlockActivityDistribution`, `ValuePoolSummary`, `ValuePoolBalanceHistory`, `ValuePoolFlowHistory`, amount-threshold summaries | Product scores, thresholds, buckets, trends, cache policy, WebSocket refresh, and JSON | None for the implemented chain-derived views | Zinder, adapter |
 | Blend, common amounts, and transaction linkability: `/api/blend-check`, `/api/blend-check/split`, `/api/privacy/common-amounts`, `/api/tx/:txid/linkability` | Complete when bounded native coverage is complete | Value-pool amount-threshold and rounded-amount summaries, `TransactionDetail`, `ValuePoolFlowEventsInRange` | Candidate policy, scoring, split rules, labels, coercion, cache, warnings, and JSON | Results are product heuristics, not identity or safety claims; unavailable native coverage produces a truthful degraded result | Zinder, adapter |
@@ -83,7 +83,7 @@ procedure lives in the
 2. A response that cannot prove its requested data must expose the relevant
    capability, coverage, or unavailable state. It must not fabricate rows,
    zeroes, finality, prices, labels, or risk conclusions.
-3. Reusable durable facts are projection-owned with reorg, checkpoint, and
+3. Reusable durable facts are materialized-view-owned with reorg, checkpoint, and
    restart semantics. Product-only joins stay in the adapter or sidecar.
 4. Displaced-block and displaced-root results are positive evidence within the
    archive activation range, not proof of complete historical fork coverage.

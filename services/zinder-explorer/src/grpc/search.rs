@@ -35,7 +35,7 @@ use zinder_proto::v1::explorer::{
     unified_address_receiver,
 };
 use zinder_proto::v1::wallet::{
-    self, BlockSelector, LatestBlockRequest, block_selector, transaction_location,
+    self, BlockSelector, VisibleTipBlockRequest, block_selector, transaction_location,
     wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
@@ -50,7 +50,7 @@ const CONFIDENCE_HIGH: f32 = 1.0;
 const CONFIDENCE_AMBIGUOUS: f32 = 0.5;
 
 /// Executes one `ExplorerQuery.Search` request.
-pub(crate) async fn handle_search(
+pub(crate) async fn query_search(
     materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: Network,
@@ -215,7 +215,7 @@ async fn probe_hash_candidate(
 async fn resolve_block_by_hash(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     rpc_hex: &str,
-) -> Result<Option<wallet::BlockMetadata>, Status> {
+) -> Result<Option<wallet::BlockId>, Status> {
     match wallet_client
         .block_id_by_selector(Request::new(wallet::BlockSelectorRequest {
             selector: Some(BlockSelector {
@@ -272,7 +272,6 @@ fn build_transaction_match(
             mined_block_height: 0,
             mined_block_hash: String::new(),
         }),
-        transaction_location::Location::Conflicting(_) => None,
     }
 }
 
@@ -392,13 +391,13 @@ async fn build_freshness(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<ExplorerFreshness, Status> {
     let chain_epoch = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     build_explorer_freshness(
         materialized_view_store,

@@ -510,8 +510,9 @@ impl<'store> ChainEpochReader<'store> {
     ///
     /// Streams the whole current-UTXO projection and folds it into an unspent
     /// count and total value over the outputs created at or below
-    /// `settled_tip_height`, where the projection is the irreversible unspent
-    /// set. Request-time, full-set scan with constant memory.
+    /// `settled_tip_height`, where the projection is the settled-tip unspent set
+    /// under the configured reorg policy; a deeper reorg fails closed.
+    /// Request-time, full-set scan with constant memory.
     ///
     /// When `commitment_enabled` is set, the same scan also folds the `LtHash16`
     /// homomorphic commitment over the full set; otherwise the commitment field
@@ -627,8 +628,8 @@ impl<'store> ChainEpochReader<'store> {
     /// Resolves transparent spend facts from the current projection, skipping
     /// the per-outpoint reorg-visibility header reads.
     ///
-    /// Correct only when every referenced block is finalized (at or below
-    /// `settled_tip_height`): such blocks are immutable, so the visibility filter
+    /// Correct only when every referenced block is settled (at or below
+    /// `settled_tip_height`): such blocks are outside the configured reorg window, so the visibility filter
     /// that [`Self::transparent_spend_facts_by_outpoints`] applies on a
     /// non-current reader can never drop a fact. Skipping it turns two reads per
     /// outpoint into a single `multi_get`, which is the dominant cost of
@@ -644,7 +645,7 @@ impl<'store> ChainEpochReader<'store> {
         )
     }
 
-    /// Reads the complete transparent spend facts produced by one finalized
+    /// Reads the complete transparent spend facts produced by one settled
     /// block from its durable block-local replay record.
     ///
     /// This path remains available after point-row retention and performs one
@@ -657,7 +658,7 @@ impl<'store> ChainEpochReader<'store> {
     }
 
     /// Reads the complete transparent input set and resolved spend facts for
-    /// one finalized block.
+    /// one settled block.
     pub fn current_transparent_spend_replay_at_height(
         &self,
         height: BlockHeight,

@@ -84,7 +84,6 @@ fn blob_policies_never_advertise_on_explorer_or_ingest() {
         canonical_store_online: true,
         materialized_view_store_online: true,
         prevout_resolution_online: true,
-        payment_disclosure_verifier_online: true,
         ..ExplorerReadiness::default()
     };
     assert!(!AdvertisePolicy::RequiresBlockBlobs.explorer_satisfied(readiness));

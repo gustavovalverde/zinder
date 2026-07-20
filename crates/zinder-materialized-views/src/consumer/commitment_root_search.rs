@@ -68,7 +68,7 @@ pub struct CommitmentRootIndexEntry {
     pub protocol: ShieldedProtocol,
     /// Block height encoded by the reverse index key.
     pub block_height: BlockHeight,
-    /// Block hash observed when the projection row was written.
+    /// Block hash observed when the materialized-view row was written.
     pub block_hash: BlockHash,
     /// Block timestamp as Unix seconds.
     pub block_time_unix_seconds: i64,
@@ -172,7 +172,7 @@ impl CommitmentRootSearchConsumer {
             store.consumer_column_family(COMMITMENT_ROOT_SEARCH_COVERAGE_COLUMN_FAMILY)?;
         ctx.batch
             .put_cf(&coverage_cf, COVERAGE_KEY, encode_coverage(next_coverage));
-        store.write_projection_batch(COMMITMENT_ROOT_SEARCH_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(COMMITMENT_ROOT_SEARCH_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 }
@@ -383,7 +383,7 @@ fn decode_error(reason: impl Into<String>) -> MaterializedViewStoreError {
     }
 }
 
-/// Root-search projection failures.
+/// Root-search materialized-view failures.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CommitmentRootSearchConsumerError {
@@ -429,7 +429,7 @@ mod tests {
         COMMITMENT_ROOT_SEARCH_SCHEMA, CommitmentRootBackfillCoverage, CommitmentRootSearchConsumer,
     };
     use crate::consumer::{
-        BlockCommitContext, BlockCommitPayload, BlockKeyedConsumer, MaterializedViewConsumerCtx,
+        BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, MaterializedViewConsumerCtx,
         TransparentSpendFacts,
     };
     use crate::{MaterializedViewStore, MaterializedViewStoreOptions};
@@ -444,7 +444,7 @@ mod tests {
         let block_height = BlockHeight::new(height);
         let block_hash = BlockHash::from_bytes([height.to_le_bytes()[0]; 32]);
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: block_height,
                 block_hash,
                 previous_block_hash: BlockHash::from_bytes(

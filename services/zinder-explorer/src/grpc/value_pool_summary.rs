@@ -19,7 +19,7 @@ use super::freshness::{
 use zinder_materialized_views::MaterializedViewStore;
 
 /// Executes one `ExplorerQuery.ValuePoolSummary` request.
-pub(crate) async fn handle_value_pool_summary(
+pub(crate) async fn query_value_pool_summary(
     materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,

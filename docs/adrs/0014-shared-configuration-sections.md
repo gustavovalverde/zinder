@@ -42,8 +42,6 @@ Shared names keep the same meaning across services:
 - `[ingest.phase_classification]` selects construction versus following;
 - `[ingest.construction]` bounds source and canonical construction work;
 - `[ingest.follow]` controls steady-state polling and lag readiness;
-- `[ingest.materialized_views]` controls materialized-view replay where that
-  subsystem is used; and
 - `[ingest.run_overrides]` contains one-run targeting and checkpoint inputs.
 
 `--print-config` renders the resolved service configuration using the same

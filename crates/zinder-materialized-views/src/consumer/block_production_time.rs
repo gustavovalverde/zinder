@@ -1,6 +1,6 @@
 //! Canonical block production times ordered by exact signed timestamp.
 //!
-//! The projection stores one row per canonical block. Its primary key is the
+//! The materialized view stores one row per canonical block. Its primary key is the
 //! signed block time followed by height and block hash, so equal and
 //! non-monotonic timestamps remain lossless. A height index makes rewinds
 //! deterministic. No unrelated transaction metadata is interpreted.
@@ -15,11 +15,12 @@ use zinder_core::wire::{
 use zinder_core::{BlockHash, BlockHeight};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, BlockProjectionCheckpoint, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockCheckpoint,
+    MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
+    MaterializedViewConsumerSchema,
 };
 use crate::{
-    ConsumerProjectionState, MaterializedViewStore, MaterializedViewStoreError,
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreError,
     MaterializedViewStoreReadSnapshot,
 };
 
@@ -665,36 +666,36 @@ impl BlockKeyedConsumer for BlockProductionTimeConsumer {
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         self.stage_tail_coverage(ctx)?;
-        // The projection-checkpoint hook runs after this method and needs the
+        // The materialized-view checkpoint hook runs after this method and needs the
         // same batch-local overlay to reconcile historical coverage on reorg.
         Ok(())
     }
 
     fn stage_chain_event_checkpoint(
         &mut self,
-        checkpoint: BlockProjectionCheckpoint<'_>,
+        checkpoint: MaterializedViewBlockCheckpoint<'_>,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let projection_tip_height = checkpoint
-            .projection_tip_height
-            .ok_or(BlockProductionTimeConsumerError::IncompleteProjectionCheckpoint)?;
-        let projection_tip_hash = checkpoint
-            .projection_tip_hash
-            .ok_or(BlockProductionTimeConsumerError::IncompleteProjectionCheckpoint)?;
-        self.stage_backfill_coverage_at_tip(ctx, projection_tip_height)?;
+        let tip_height = checkpoint
+            .tip_height
+            .ok_or(BlockProductionTimeConsumerError::IncompleteMaterializedViewCheckpoint)?;
+        let tip_hash = checkpoint
+            .tip_hash
+            .ok_or(BlockProductionTimeConsumerError::IncompleteMaterializedViewCheckpoint)?;
+        self.stage_backfill_coverage_at_tip(ctx, tip_height)?;
         let current = ctx
             .store
-            .consumer_projection_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)?;
+            .consumer_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)?;
         let revision = current
             .map_or(Some(1), |state| state.revision.checked_add(1))
-            .ok_or(BlockProductionTimeConsumerError::ProjectionRevisionOverflow)?;
-        ctx.store.stage_consumer_projection_state(
+            .ok_or(BlockProductionTimeConsumerError::MaterializedViewRevisionOverflow)?;
+        ctx.store.stage_consumer_state(
             ctx.batch,
             BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
-            ConsumerProjectionState {
-                projection_epoch_id: checkpoint.chain_epoch.id,
-                projection_tip_height,
-                projection_tip_hash,
+            MaterializedViewState {
+                chain_epoch_id: checkpoint.chain_epoch.id,
+                tip_height,
+                tip_hash,
                 revision,
                 coverage: None,
             },
@@ -707,7 +708,7 @@ impl BlockProductionTimeConsumer {
     fn stage_backfill_coverage_at_tip(
         &self,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
-        projection_tip_height: BlockHeight,
+        tip_height: BlockHeight,
     ) -> Result<(), BlockProductionTimeConsumerError> {
         let Some(existing) = Self::backfill_coverage(ctx.store)? else {
             return Ok(());
@@ -715,7 +716,7 @@ impl BlockProductionTimeConsumer {
         let coverage_cf = ctx
             .store
             .consumer_column_family(BLOCK_PRODUCTION_TIME_COVERAGE_COLUMN_FAMILY)?;
-        let mut through = existing.complete_through_height.min(projection_tip_height);
+        let mut through = existing.complete_through_height.min(tip_height);
         while through >= existing.complete_from_height
             && self.row_after_batch(ctx.store, through)?.is_none()
         {
@@ -1205,12 +1206,12 @@ fn coverage_decode_error(error: &BlockProductionTimeConsumerError) -> Materializ
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BlockProductionTimeConsumerError {
-    /// A dispatched chain event did not provide one complete projection tip.
-    #[error("block-production-time projection checkpoint is incomplete")]
-    IncompleteProjectionCheckpoint,
-    /// The persisted projection revision cannot advance further.
-    #[error("block-production-time projection revision overflow")]
-    ProjectionRevisionOverflow,
+    /// A dispatched chain event did not provide one complete materialized-view tip.
+    #[error("block-production-time materialized-view checkpoint is incomplete")]
+    IncompleteMaterializedViewCheckpoint,
+    /// The persisted materialized-view revision cannot advance further.
+    #[error("block-production-time materialized-view revision overflow")]
+    MaterializedViewRevisionOverflow,
     /// A primary key had the wrong length or invalid components.
     #[error("block-production-time primary key is malformed ({bytes} bytes)")]
     MalformedPrimaryKey {
@@ -1315,7 +1316,7 @@ mod tests {
 
     use super::*;
     use crate::MaterializedViewStoreOptions;
-    use crate::consumer::{BlockCommitPayload, TransparentSpendFacts};
+    use crate::consumer::{BlockCommitInput, TransparentSpendFacts};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -1348,7 +1349,7 @@ mod tests {
             },
         );
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height,
                 block_hash,
                 previous_block_hash: hash(hash_seed.wrapping_sub(1)),
@@ -1542,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_height_pages_skip_later_projection_rows_without_losing_eligible_rows() -> TestResult {
+    fn frozen_height_pages_skip_later_rows_without_losing_eligible_rows() -> TestResult {
         let (_tempdir, store) = open_store()?;
         let mut consumer = BlockProductionTimeConsumer::new();
         mutate_blocks(

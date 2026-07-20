@@ -78,7 +78,7 @@ the artifact-oriented canonical path. Its shared container is versioned by
 `MATERIALIZED_VIEW_STORE_FORMAT_VERSION`; each consumer separately versions its
 owned row contract through `MaterializedViewConsumerSchema`.
 
-Consumer rows, cursors, projection state, coverage, and schema metadata remain
+Consumer rows, cursors, materialized-view state, coverage, and schema metadata remain
 separate from both release canonical and wallet storage. See
 [Materialized-view plane](materialized-view-plane.md).
 
@@ -132,15 +132,17 @@ materialized-view container format, and individual consumer schemas advance
 only when their own bytes or semantics change.
 
 When a layout has no explicit compatible path, the operator constructs a fresh
-store or restores a certified coherent bundle. A reader never upgrades a
-primary, and Zinder never adopts an unknown non-empty directory.
+store or restores a certified coherent bundle. This includes every
+materialized-view container mismatch: a store open returns `SchemaMismatch`
+without deleting or rebuilding the existing directory. A reader never upgrades
+a primary, and Zinder never adopts an unknown non-empty directory.
 
 ## Checkpoints and recovery
 
 Physical RocksDB checkpoints are useful building blocks, not sufficient backup
 evidence. A wallet-serving restore must authenticate canonical and wallet state
 together at one source fence, restore them into fresh paths, and pass normal
-owner and exact-pair admission before traffic becomes ready.
+owner and wallet-serving admission before traffic becomes ready.
 
 Checkpoint preparation is owner-coordinated. Cold admission reopens the
 checkpoint with bounded resources and compares its database identity and ready

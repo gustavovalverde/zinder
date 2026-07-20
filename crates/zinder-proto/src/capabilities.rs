@@ -19,8 +19,8 @@ use crate::v1::explorer::ExplorerServerInfo;
 use crate::v1::ops::ServerInfo as OpsServerInfo;
 use crate::v1::wallet::WalletServerInfo;
 
-/// Capability advertised for `WalletQuery.LatestBlock`.
-pub const WALLET_READ_LATEST_BLOCK_V1: &str = "wallet.read.latest_block_v1";
+/// Capability advertised for `WalletQuery.VisibleTipBlock`.
+pub const WALLET_READ_VISIBLE_TIP_BLOCK_V1: &str = "wallet.read.visible_tip_block_v1";
 /// Capability advertised for `WalletQuery.BlockIdBySelector`.
 pub const WALLET_READ_BLOCK_ID_BY_SELECTOR_V1: &str = "wallet.read.block_id_by_selector_v1";
 /// Capability advertised for `WalletQuery.BlockHeaderBySelector`.
@@ -325,7 +325,7 @@ pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1
 /// network-upgrade activation table alongside the canonical tip height, so a
 /// consumer can render whether an upgrade is active and how far the tip is
 /// from a not-yet-active activation. The tip height rides on the wallet-plane
-/// `LatestBlock` primitive.
+/// `VisibleTipBlock` primitive.
 pub const EXPLORER_NETWORK_UPGRADE_STATUS_V1: &str = "explorer.network_upgrade.status_v1";
 /// Capability advertised for `ExplorerQuery.ValuePoolFlowHistory`.
 ///
@@ -411,20 +411,18 @@ pub const EXPLORER_TRANSACTION_HISTORY_V1: &str = "explorer.transaction.history_
 pub const EXPLORER_TRANSACTION_HISTORY_V2: &str = "explorer.transaction.history_v2";
 /// Field capability gating transaction-detail and transaction-history intrinsic balances.
 ///
-/// Advertised when the canonical secondary is online at artifact schema 15 or
-/// newer. A retained canonical transaction blob may bridge an unsettled artifact
-/// lag. Otherwise missing historical artifacts remain absent; clients must not
-/// interpret absence as an all-zero balance.
+/// Advertised when the canonical secondary admits transaction-intrinsic value
+/// balances. A retained canonical transaction blob may bridge an unsettled
+/// artifact lag. Otherwise missing historical artifacts remain absent; clients
+/// must not interpret absence as an all-zero balance.
 pub const EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1: &str =
     "explorer.transaction.intrinsic_value_balances_v1";
 /// Capability advertised for `ExplorerQuery.MempoolEventCounts`.
 ///
 /// Signals that the explorer plane materializes per-second counters of
-/// `Added`, `Mined`, `Invalidated`, and `Suppressed` mempool events into
-/// a materialized-view column family. Replaces the in-memory ring buffer the BFF
-/// used to keep alongside its own `WalletQuery.MempoolEvents`
-/// subscription; the count surface survives consumer restarts and works
-/// across horizontally scaled consumer replicas.
+/// `Added`, `Mined`, and `Invalidated` mempool events into a durable
+/// materialized-view column family. The count surface survives consumer
+/// restarts and works across horizontally scaled consumer replicas.
 pub const EXPLORER_MEMPOOL_EVENT_COUNTS_V1: &str = "explorer.mempool.event_counts_v1";
 /// Capability advertised for `ExplorerQuery.ChainReorgHistory`.
 ///
@@ -445,15 +443,6 @@ pub const EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1: &str =
 /// counterpart at the former height against one pinned chain epoch.
 pub const EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1: &str =
     "explorer.chain.displaced_block_detail_v1";
-/// Capability advertised for `ExplorerQuery.VerifyPaymentDisclosure`.
-///
-/// Signals that the explorer plane runs the
-/// [ZIP-311](https://zips.z.cash/zip-0311) payment-disclosure verifier
-/// in-process with strict request-bytes redaction. Operator opt-in:
-/// disabled by default. When the capability is absent, the consumer
-/// falls back to its own local verifier; presence is the consumer's
-/// signal to route to the hosted path.
-pub const EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1: &str = "explorer.payment_disclosure.verify_v1";
 /// Capability advertised for `ExplorerQuery.OverviewSnapshot`.
 ///
 /// Signals that the explorer plane composes a single coherent overview
@@ -489,8 +478,8 @@ pub const EXPLORER_MIGRATION_DENOMINATIONS_V1: &str = "explorer.migration.denomi
 pub const INGEST_CONTROL_SERVER_INFO_V1: &str = "ingest.control.server_info_v1";
 /// Capability advertised for `IngestControl.WriterStatus`.
 pub const INGEST_CONTROL_WRITER_STATUS_V1: &str = "ingest.control.writer_status_v1";
-/// Capability advertised for `IngestControl.ChainEvents`.
-pub const INGEST_CONTROL_CHAIN_EVENTS_V1: &str = "ingest.control.chain_events_v1";
+/// Capability advertised for `IngestControl.VisibleChainEvents`.
+pub const INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1: &str = "ingest.control.visible_chain_events_v1";
 /// Capability advertised for `IngestControl.MempoolSnapshot`.
 pub const INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1: &str = "ingest.control.mempool_snapshot_v1";
 /// Capability advertised for `IngestControl.MempoolTransaction`.
@@ -517,7 +506,7 @@ pub const INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1: &str =
 ///
 /// Advertises the classifier-driven `zinder.v1.ingest.WriterPhase`
 /// vocabulary wired in
-/// [ADR-0015](../../../docs/adrs/0015-unified-phase-driven-ingest.md). Gates a
+/// [ADR-0015](../../../docs/adrs/0015-phase-driven-ingest.md). Gates a
 /// field on `WriterStatus` rather than a dedicated RPC.
 pub const INGEST_WRITER_PHASE_V1: &str = "ingest.writer.phase_v1";
 
@@ -578,9 +567,6 @@ pub enum AdvertisePolicy {
     /// Explorer: advertised when the transparent-output prevout resolution
     /// path is online (which itself requires a `WalletQuery` endpoint).
     RequiresPrevoutResolution,
-    /// Explorer: advertised when the in-process payment-disclosure verifier
-    /// is enabled.
-    RequiresPaymentDisclosureVerifier,
     /// Explorer: advertised when transaction history has materialized a typed
     /// projection position and the wallet-query dependency is online.
     RequiresTransactionHistory,
@@ -629,7 +615,6 @@ impl AdvertisePolicy {
             | Self::RequiresMaterializedViewStoreAndCanonicalStore
             | Self::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore
             | Self::RequiresPrevoutResolution
-            | Self::RequiresPaymentDisclosureVerifier
             | Self::RequiresTransactionHistory
             | Self::RequiresCompleteTransactionHistory => false,
         }
@@ -661,7 +646,6 @@ impl AdvertisePolicy {
                     && readiness.canonical_store_online
             }
             Self::RequiresPrevoutResolution => readiness.prevout_resolution_online,
-            Self::RequiresPaymentDisclosureVerifier => readiness.payment_disclosure_verifier_online,
             Self::RequiresTransactionHistory => {
                 readiness.transaction_history_available && readiness.wallet_query_online
             }
@@ -698,7 +682,6 @@ impl AdvertisePolicy {
             | Self::RequiresMaterializedViewStoreAndCanonicalStore
             | Self::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore
             | Self::RequiresPrevoutResolution
-            | Self::RequiresPaymentDisclosureVerifier
             | Self::RequiresBlockBlobs
             | Self::RequiresTransactionBlobs
             | Self::RequiresUtxoSetCommitment
@@ -760,8 +743,6 @@ pub struct ExplorerReadiness {
     /// Transparent-output prevout resolution is online (implies
     /// `wallet_query_online`).
     pub prevout_resolution_online: bool,
-    /// The in-process payment-disclosure verifier is enabled.
-    pub payment_disclosure_verifier_online: bool,
     /// Transaction history has a typed materialized projection position.
     pub transaction_history_available: bool,
     /// Transaction history has verified complete coverage through its position.
@@ -814,9 +795,9 @@ impl CapabilitySpec {
 /// compiled `FileDescriptorSet`.
 pub const CAPABILITIES: &[CapabilitySpec] = &[
     CapabilitySpec::new(
-        WALLET_READ_LATEST_BLOCK_V1,
+        WALLET_READ_VISIBLE_TIP_BLOCK_V1,
         CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.LatestBlock"),
+        Some("zinder.v1.wallet.WalletQuery.VisibleTipBlock"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
@@ -1252,12 +1233,6 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore,
     ),
     CapabilitySpec::new(
-        EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1,
-        CapabilitySurface::Explorer,
-        Some("zinder.v1.explorer.ExplorerQuery.VerifyPaymentDisclosure"),
-        AdvertisePolicy::RequiresPaymentDisclosureVerifier,
-    ),
-    CapabilitySpec::new(
         EXPLORER_OVERVIEW_SNAPSHOT_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.OverviewSnapshot"),
@@ -1294,9 +1269,9 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        INGEST_CONTROL_CHAIN_EVENTS_V1,
+        INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1,
         CapabilitySurface::Ingest,
-        Some("zinder.v1.ingest.IngestControl.ChainEvents"),
+        Some("zinder.v1.ingest.IngestControl.VisibleChainEvents"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(

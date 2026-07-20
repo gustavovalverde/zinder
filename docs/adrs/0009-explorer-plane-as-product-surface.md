@@ -25,7 +25,7 @@ The decisions to record here are:
 
 1. The service binary, config namespace, capability namespace, and Prometheus prefix use `explorer`.
 2. The SDK names (`MaterializedViewConsumer`, `MaterializedViewStore`, etc.) stay because they describe the pattern, not the product.
-3. The explorer plane must not call upstream node RPCs directly. Source-boundary extensions land first; the explorer consumes canonical artifacts and chain/mempool events.
+3. Canonical chain facts come from canonical artifacts and replayable events; explorer-local source use is limited to parsing and optional upstream-health observation.
 
 ## Decision
 
@@ -83,13 +83,11 @@ The noun is a domain category (`transaction`, `block`, `mempool`, `transparent_a
 
 The `domain.noun.capability_v{N}` shape is identical to the wallet plane's `wallet.subdomain.capability_v{N}` pattern so the namespace stays predictable across surfaces.
 
-### The explorer plane never calls upstream node RPCs
+### Explorer source boundary
 
-The explorer plane consumes canonical artifacts (via `ChainEpochReadApi` colocated reads or `WalletQuery` over gRPC) and replayable event streams (`WalletQuery.ChainEvents`, `WalletQuery.MempoolEvents`). It does not import `zinder-source`. It does not call Zebra.
+The explorer plane consumes canonical artifacts (via `ChainEpochReadApi` colocated reads or `WalletQuery` over gRPC) and replayable event streams. It may use `zinder-source` to parse transaction bytes and to poll an optional upstream-health observation for its freshness envelope. Those uses do not supply authoritative chain facts, change a response's pinned chain view, or provide a fallback when canonical data is unavailable.
 
-If an explorer view needs a fact the canonical artifact and event surface do not expose (chain value pools, hypothetical future block-level analytics), the source boundary extends first. The new source fact lands on `NodeSource`, gets included in `SourceBlock` or a typed `Source*` value, then surfaces through a canonical artifact or chain event the explorer consumer can subscribe to.
-
-This rule is structural: it keeps canonical artifacts as the single source of truth for chain facts, prevents the explorer plane from becoming a parallel chain-following process, and preserves the invariant that any explorer view is deterministically rebuildable from canonical state.
+An explorer view that needs a new authoritative chain fact extends the source and canonical boundaries first, then consumes the resulting canonical artifact or event. `zinder-explorer` must not become a parallel chain follower or substitute direct node reads for a missing canonical fact. This preserves canonical state as the authority and keeps rebuildable views reproducible from retained canonical inputs.
 
 ## Consequences
 
@@ -98,20 +96,6 @@ This rule is structural: it keeps canonical artifacts as the single source of tr
 - Operators configure the explorer through `[explorer]` and `ZINDER_EXPLORER__*`.
 - Prometheus scrapes use the `zinder_explorer_*` metric prefix.
 - A deployment that does not run `zinder-explorer` continues to advertise only the `wallet.*` capabilities, including `wallet.address.transparent_balance_v1`. The wallet plane answers balance from canonical UTXOs and degrades the mempool overlay to a zero delta when no ingest-control endpoint is wired.
-
-### Implementation
-
-- `services/zinder-explorer/` owns the explorer binary and gRPC service.
-- `crates/zinder-proto/src/capabilities.rs` exposes the `EXPLORER_*` constants.
-- `services/zinder-query/src/grpc/adapter.rs` computes `TransparentAddressBalance` in-process and overlays the mempool delta through the ingest-control endpoint.
-- `materialized-view-plane.md` documents the SDK boundary. `explorer-plane.md` documents the product surface. Both reference each other.
-- The capability docs tests enforce that the wallet and explorer rows of the `CAPABILITIES` table match the public-interfaces capability list.
-
-### Testing
-
-- The validation gate covers capability strings and env-var docs. The `capability_coverage.rs` test in `zinder-client` references the explorer capability strings; the env-var docs mirror test in `zinder-runtime` references the explorer env-var names.
-- The balance overflow, saturation, and per-request address-cap unit tests live in the wallet plane (`zinder-core` and `services/zinder-query/tests/integration/transparent_address_balance.rs`).
-- Live tests under `services/zinder-explorer/tests/live/` retain their previous coverage and adjust env-var names.
 
 ## Alternatives Considered
 

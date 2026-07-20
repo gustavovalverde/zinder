@@ -1,6 +1,6 @@
-//! Phase classifier for the unified ingest loop.
+//! Phase classifier for the phase-driven ingest loop.
 //!
-//! Per [ADR-0015](../../../docs/adrs/0015-unified-phase-driven-ingest.md),
+//! Per [ADR-0015](../../../docs/adrs/0015-phase-driven-ingest.md),
 //! the writer dispatches its work into one of three phases on every
 //! iteration: [`IngestPhase::AwaitingUpstream`],
 //! [`IngestPhase::BulkCatchup`], and [`IngestPhase::FollowingTip`]. This
@@ -45,7 +45,7 @@ pub fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
 ///   `AdvanceSettledTipTo`.
 /// - [`IngestPhase::FollowingTip`] otherwise. The serial driver
 ///   commits one block per poll cycle and advances the settled-tip
-///   boundary through `finalize_tip_if_ready`.
+///   boundary through `advance_settled_tip_if_ready`.
 ///
 /// An empty store (`store_tip = None`) is treated as height `0` so the
 /// gap is the upstream tip itself. A store ahead of the upstream tip
@@ -55,7 +55,7 @@ pub fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
 /// replacement chain re-emerges.
 ///
 /// [ADR-0015 §Decision]:
-///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#decision
+///     ../../../docs/adrs/0015-phase-driven-ingest.md#decision
 #[must_use]
 pub fn classify_phase(
     store_tip: Option<u32>,

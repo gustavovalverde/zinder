@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use zinder_core::{
     BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, CommitmentTreeCheckpoint,
     NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastResult,
+    SubtreeRootRange, TransactionBroadcastOutcome,
 };
 
 use crate::{
@@ -187,7 +187,7 @@ pub trait NodeSource: Send + Sync + 'static {
     /// degrading.
     ///
     /// [ADR-0015 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+    ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
     async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
         Err(SourceError::NodeCapabilityMissing {
             capability: crate::NodeCapability::ReadinessProbe,
@@ -202,7 +202,7 @@ pub trait TransactionBroadcaster: Send + Sync + 'static {
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, SourceError>;
+    ) -> Result<TransactionBroadcastOutcome, SourceError>;
 }
 
 #[async_trait]
@@ -210,7 +210,7 @@ impl TransactionBroadcaster for () {
     async fn broadcast_transaction(
         &self,
         _raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, SourceError> {
+    ) -> Result<TransactionBroadcastOutcome, SourceError> {
         Err(SourceError::TransactionBroadcastDisabled)
     }
 }
@@ -223,7 +223,7 @@ where
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, SourceError> {
+    ) -> Result<TransactionBroadcastOutcome, SourceError> {
         match self {
             Some(broadcaster) => broadcaster.broadcast_transaction(raw_transaction).await,
             None => Err(SourceError::TransactionBroadcastDisabled),
@@ -278,7 +278,7 @@ mod tests {
 
     use zinder_core::{BroadcastAccepted, RawTransactionBytes, TransactionId};
 
-    use super::{SourceError, TransactionBroadcastResult, TransactionBroadcaster};
+    use super::{SourceError, TransactionBroadcastOutcome, TransactionBroadcaster};
 
     #[derive(Clone, Default)]
     struct CountingBroadcaster {
@@ -290,9 +290,9 @@ mod tests {
         async fn broadcast_transaction(
             &self,
             _raw_transaction: RawTransactionBytes,
-        ) -> Result<TransactionBroadcastResult, SourceError> {
+        ) -> Result<TransactionBroadcastOutcome, SourceError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(TransactionBroadcastResult::Accepted(BroadcastAccepted {
+            Ok(TransactionBroadcastOutcome::Accepted(BroadcastAccepted {
                 transaction_id: TransactionId::from_bytes([0; 32]),
             }))
         }
@@ -310,7 +310,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            Ok(TransactionBroadcastResult::Accepted(_))
+            Ok(TransactionBroadcastOutcome::Accepted(_))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }

@@ -2,7 +2,7 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Accepted; revised 2026-06-03 (tree-state-at-height upstream fill) |
+| Status | Accepted |
 | Product | Zinder |
 | Domain | Wallet data plane, external wallet compatibility, typed client boundary |
 | Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Chain ingestion](../architecture/chain-ingestion.md), [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md) |
@@ -47,7 +47,7 @@ The core contract is:
 Serving coverage fails closed:
 
 - `wallet-serving` rejects explicit `from_height` and `checkpoint_height` overrides.
-- `wallet-serving` rejects `allow_near_tip_finalize`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
+- `wallet-serving` rejects `allow_reorg_window_settlement`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
 - Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes, with one bounded exception: `tree_state_at(height)` fills from the configured upstream node on a cache-miss (see the tree-state-at-height carve-out under Tradeoffs).
 - Readiness does not claim production traffic is safe before secondary catchup and writer-status validation have established the reader's state.
 

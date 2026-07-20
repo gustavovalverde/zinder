@@ -123,11 +123,6 @@ pub struct MempoolEventRetentionReport {
     pub pruned_mined_count: u64,
     /// Number of `Invalidated` rows deleted by this pass.
     pub pruned_invalidated_count: u64,
-    /// Number of `Suppressed` rows deleted by this pass. Suppressed events
-    /// share the `invalidated_retention` window since both signal "this
-    /// txid is not coming through this node"; the per-variant count keeps
-    /// the report honest about which rows were actually pruned.
-    pub pruned_suppressed_count: u64,
 }
 
 impl MempoolEventRetentionReport {
@@ -137,6 +132,5 @@ impl MempoolEventRetentionReport {
         self.pruned_added_count
             .saturating_add(self.pruned_mined_count)
             .saturating_add(self.pruned_invalidated_count)
-            .saturating_add(self.pruned_suppressed_count)
     }
 }

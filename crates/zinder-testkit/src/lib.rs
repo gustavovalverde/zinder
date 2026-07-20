@@ -12,6 +12,8 @@
 //!   height, plus fork helpers for reorg shape construction.
 //! - [`StoreFixture`] is a tempdir-backed [`PrimaryChainStore`] with a builder that
 //!   commits a [`ChainFixture`] before handing the store to tests.
+//! - [`WalletServingStoreFixture`] builds the production canonical and wallet
+//!   stores, then opens immutable secondaries at one admitted serving fence.
 //! - [`MockNodeSource`] implements [`zinder_source::NodeSource`]
 //!   against a [`ChainFixture`]. It supports tip mutation, error injection,
 //!   and configurable capabilities.
@@ -49,6 +51,7 @@ pub mod mock_transaction_broadcaster;
 pub mod network_upgrade_fixtures;
 pub mod store_fixture;
 pub mod transparent_signer;
+pub mod wallet_serving_store_fixture;
 
 pub use chain_fixture::{
     ChainFixture, FixtureBlock, FixtureTransactionRows, build_fixture_transaction_rows,
@@ -78,3 +81,4 @@ pub use transparent_signer::{
     TransparentSignerError, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
     regtest_local_network,
 };
+pub use wallet_serving_store_fixture::WalletServingStoreFixture;

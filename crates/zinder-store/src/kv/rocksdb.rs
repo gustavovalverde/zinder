@@ -62,7 +62,7 @@ pub enum StoreReadCaller {
     BlockPrefetch,
     /// Writer-commit spend-fact resolution and reorg-window projection repairs.
     CommitFallback,
-    /// Safe-tip retention sweep scans.
+    /// Settled-tip retention sweep scans.
     RetentionSweep,
     /// Materialized-view replay spend-fact and block/transaction hydration.
     MaterializedViewHydration,

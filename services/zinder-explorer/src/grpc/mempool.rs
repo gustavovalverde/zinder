@@ -143,7 +143,7 @@ struct MempoolSnapshotPage {
 }
 
 /// Executes one `ExplorerQuery.MempoolSummary` request.
-pub(crate) async fn handle_mempool_summary(
+pub(crate) async fn query_mempool_summary(
     materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
@@ -191,7 +191,7 @@ pub(crate) async fn handle_mempool_summary(
 }
 
 /// Executes one `ExplorerQuery.MempoolSnapshot` request.
-pub(crate) async fn handle_mempool_snapshot(
+pub(crate) async fn query_mempool_snapshot(
     materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,
@@ -296,7 +296,7 @@ fn build_mempool_snapshot_page(
 }
 
 /// Executes one `ExplorerQuery.MempoolActivity` request.
-pub(crate) async fn handle_mempool_activity(
+pub(crate) async fn query_mempool_activity(
     materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: zinder_core::Network,

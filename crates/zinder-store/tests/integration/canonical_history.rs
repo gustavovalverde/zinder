@@ -70,45 +70,6 @@ fn artifactless_checkpoint_commit_publishes_checkpointed_history_bounds() -> eyr
 }
 
 #[test]
-fn reconciliation_leaves_empty_store_unbounded() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-
-    assert_eq!(
-        store.reconcile_canonical_history_bounds(Some(BlockId::new(
-            BlockHeight::new(20),
-            BlockHash::from_bytes([7; 32]),
-        )))?,
-        None
-    );
-    assert_eq!(store.canonical_history_bounds()?, None);
-
-    Ok(())
-}
-
-#[test]
-fn reconciliation_keeps_durable_bounds_authoritative() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    store.commit_artifactless_checkpoint(epoch(1, 20, 7))?;
-    let durable = CanonicalHistoryBounds::checkpointed(BlockId::new(
-        BlockHeight::new(20),
-        BlockHash::from_bytes([7; 32]),
-    ))?;
-
-    assert_eq!(
-        store.reconcile_canonical_history_bounds(Some(BlockId::new(
-            BlockHeight::new(30),
-            BlockHash::from_bytes([9; 32]),
-        )))?,
-        Some(durable)
-    );
-    assert_eq!(store.canonical_history_bounds()?, Some(durable));
-
-    Ok(())
-}
-
-#[test]
 fn invalid_artifactless_checkpoint_publishes_neither_epoch_nor_bounds() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;

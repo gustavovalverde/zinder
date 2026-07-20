@@ -39,7 +39,7 @@ use zinder_core::{BlockHash, BlockHeight, ChainEpoch};
 use zinder_store::ChainEvent;
 
 pub use block_commit_context::{
-    BlockCommitContext, BlockCommitContextError, BlockCommitPayload, BlockValuePoolBalanceFacts,
+    BlockCommitContext, BlockCommitInput, BlockValuePoolBalanceFacts,
     TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
 };
 pub use commitment_root_search::{
@@ -50,7 +50,7 @@ pub use commitment_root_search::{
     CommitmentRootSearchConsumerError,
 };
 
-use crate::store::{ConsumerProjectionCoverage, MaterializedViewStore};
+use crate::store::{MaterializedViewCoverage, MaterializedViewStore};
 
 /// Stable name of a materialized-view consumer used to scope cursor and metadata rows.
 ///
@@ -88,16 +88,12 @@ impl AsRef<[u8]> for MaterializedViewConsumerName {
 ///
 /// One declaration binds a consumer's stable [`MaterializedViewConsumerName`] to the
 /// version of its persisted row contract and the set of column families it
-/// owns. The materialized-view store records the declared version per consumer and scopes
-/// reconciliation to the single consumer whose declaration changed, leaving
-/// every other consumer's rows and cursor untouched.
+/// owns. The materialized-view store admits only the exact persisted
+/// declaration set.
 ///
-/// A version change rebuilds the consumer by default. A reader-compatible
-/// semantic change can explicitly name older
-/// [`row_compatible_versions`](Self::row_compatible_versions); the store then
-/// adopts those rows and advances the manifest without clearing them or
-/// resetting the cursor. This exception is valid only when the owned column
-/// families and payload encoding are unchanged.
+/// A version or column-family change requires a fresh materialized-view store
+/// rebuilt from a certified recovery source. This keeps every reader on one
+/// row encoding without mutating an existing store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct MaterializedViewConsumerSchema {
@@ -107,12 +103,6 @@ pub struct MaterializedViewConsumerSchema {
     pub schema_version: u16,
     /// Column families this consumer reads and writes.
     pub column_families: &'static [&'static str],
-    /// Older schema versions whose rows this binary can interpret safely.
-    ///
-    /// Compatibility preserves the rows and cursor while advancing the
-    /// manifest. Every listed version must use the same column-family set and
-    /// payload encoding as [`schema_version`](Self::schema_version).
-    pub row_compatible_versions: &'static [u16],
 }
 
 impl MaterializedViewConsumerSchema {
@@ -129,22 +119,7 @@ impl MaterializedViewConsumerSchema {
             name,
             schema_version,
             column_families,
-            row_compatible_versions: &[],
         }
-    }
-
-    /// Declares older row contracts that this schema can read without a
-    /// projection rebuild.
-    ///
-    /// Use this only for semantic migrations whose reader handles both the old
-    /// and new meanings safely. Layout or payload changes must rebuild instead.
-    #[must_use]
-    pub const fn with_row_compatible_versions(
-        mut self,
-        row_compatible_versions: &'static [u16],
-    ) -> Self {
-        self.row_compatible_versions = row_compatible_versions;
-        self
     }
 }
 
@@ -173,37 +148,37 @@ pub struct MaterializedViewConsumerCtx<'a> {
     pub batch: &'a mut WriteBatch,
 }
 
-/// Projection fence derived from one block-consumer dispatch batch.
+/// Materialized-view checkpoint derived from one block-consumer dispatch batch.
 #[derive(Clone, Copy, Debug)]
-pub struct BlockProjectionCheckpoint<'event> {
+pub struct MaterializedViewBlockCheckpoint<'event> {
     /// Canonical epoch carried by the chain event.
     pub chain_epoch: ChainEpoch,
     /// Event or replay chunk whose rows were staged.
     pub chain_event: &'event ChainEvent,
     /// Highest staged canonical height when every required block context was present.
-    pub projection_tip_height: Option<BlockHeight>,
-    /// Canonical hash at [`Self::projection_tip_height`].
-    pub projection_tip_hash: Option<BlockHash>,
+    pub tip_height: Option<BlockHeight>,
+    /// Canonical hash at [`Self::tip_height`].
+    pub tip_hash: Option<BlockHash>,
 }
 
 /// Advances one consumer's verified contiguous coverage through a checkpoint.
 ///
-/// `initial_complete_from` is supplied only by projections whose event replay
-/// itself proves their first covered height. Projections that require a
+/// `initial_complete_from` is supplied only by consumers whose event replay
+/// itself proves their first covered height. Consumers that require a
 /// separate historical verifier leave it `None` until that verifier seeds the
 /// first range.
-pub(crate) fn advance_verified_projection_coverage(
-    coverage: Option<ConsumerProjectionCoverage>,
-    checkpoint: BlockProjectionCheckpoint<'_>,
-    projection_tip_height: BlockHeight,
-    projection_tip_hash: BlockHash,
+pub(crate) fn advance_verified_materialized_view_coverage(
+    coverage: Option<MaterializedViewCoverage>,
+    checkpoint: MaterializedViewBlockCheckpoint<'_>,
+    tip_height: BlockHeight,
+    tip_hash: BlockHash,
     initial_complete_from: Option<BlockHeight>,
-) -> Option<ConsumerProjectionCoverage> {
+) -> Option<MaterializedViewCoverage> {
     let Some(coverage) = coverage else {
-        return initial_complete_from.map(|complete_from_height| ConsumerProjectionCoverage {
+        return initial_complete_from.map(|complete_from_height| MaterializedViewCoverage {
             complete_from_height,
-            complete_through_height: projection_tip_height,
-            complete_through_hash: projection_tip_hash,
+            complete_through_height: tip_height,
+            complete_through_hash: tip_hash,
         });
     };
     match checkpoint.chain_event {
@@ -213,10 +188,10 @@ pub(crate) fn advance_verified_projection_coverage(
                 return Some(coverage);
             }
             if coverage.complete_through_height.next() == Some(range.start) {
-                return Some(ConsumerProjectionCoverage {
+                return Some(MaterializedViewCoverage {
                     complete_from_height: coverage.complete_from_height,
-                    complete_through_height: projection_tip_height,
-                    complete_through_hash: projection_tip_hash,
+                    complete_through_height: tip_height,
+                    complete_through_hash: tip_hash,
                 });
             }
             Some(coverage)
@@ -230,10 +205,10 @@ pub(crate) fn advance_verified_projection_coverage(
             let covers_reverted_boundary = coverage.complete_through_height >= reverted_start;
             let replacement_starts_at_reverted_boundary = replacement.start == reverted_start;
             if covers_reverted_boundary && replacement_starts_at_reverted_boundary {
-                return Some(ConsumerProjectionCoverage {
+                return Some(MaterializedViewCoverage {
                     complete_from_height: coverage.complete_from_height,
-                    complete_through_height: projection_tip_height,
-                    complete_through_hash: projection_tip_hash,
+                    complete_through_height: tip_height,
+                    complete_through_hash: tip_hash,
                 });
             }
             if coverage.complete_through_height < reverted_start {
@@ -466,14 +441,14 @@ pub trait BlockKeyedConsumer: Send + Sync {
         Ok(())
     }
 
-    /// Stages event-aware projection metadata in the same batch as rows.
+    /// Stages event-aware materialized-view metadata in the same batch as rows.
     ///
     /// The default is a no-op. Consumers that publish coverage or read fences
     /// use this hook because [`Self::finish_batch`] deliberately has no chain
     /// event semantics.
     fn stage_chain_event_checkpoint(
         &mut self,
-        _checkpoint: BlockProjectionCheckpoint<'_>,
+        _checkpoint: MaterializedViewBlockCheckpoint<'_>,
         _ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         Ok(())
@@ -615,12 +590,5 @@ pub enum MempoolConsumerEventVariant<'a> {
         mined_height: BlockHeight,
         /// Hash of the mining block (32 bytes).
         block_hash: &'a [u8],
-    },
-    /// Upstream node refused admission of the transaction. Reserved for
-    /// ZIP-401 `RecentlyEvicted`; source-side emission is pending node-side
-    /// visibility as documented by the mempool topology.
-    Suppressed {
-        /// Transaction id of the suppressed transaction.
-        transaction_id: &'a [u8],
     },
 }

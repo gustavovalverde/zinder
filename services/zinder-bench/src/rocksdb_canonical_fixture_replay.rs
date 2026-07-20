@@ -68,7 +68,7 @@ pub(crate) struct RocksDbCanonicalFixtureReplayArgs {
     /// Concrete raw-block source. Transport sources are fixture-authenticated.
     #[arg(long, value_enum, default_value_t = CanonicalFixtureBlockSource::Fixture)]
     block_source: CanonicalFixtureBlockSource,
-    /// JSON-RPC endpoint for the current batched block source and gRPC control facts.
+    /// JSON-RPC endpoint for block retrieval and Zebra Indexer control-plane setup.
     #[arg(long)]
     json_rpc_addr: Option<String>,
     /// Zebra indexer gRPC endpoint for unary historical `GetBlock`.
@@ -517,7 +517,7 @@ fn ready_summary(
         visible_block_count: reopened.visible_block_count,
         replay_format_version: reopened.replay_format_version.value(),
         sequence_digest: ready_sequence_digest(&reopened),
-        logical_replay_bytes: reopened.visible_logical_block_facts_bytes,
+        logical_replay_bytes: reopened.visible_logical_replay_bytes,
         settled_tip: block_id(outcome.settled_tip),
         event_fence: RocksDbCanonicalFixtureEventFenceSummary {
             chain_epoch_id: fence.chain_epoch_id().value(),

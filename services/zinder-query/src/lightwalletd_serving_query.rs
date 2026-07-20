@@ -1,4 +1,4 @@
-//! Wallet query implementation over admitted canonical and wallet stores.
+//! Lightwalletd query implementation over admitted canonical and wallet stores.
 
 use std::{
     collections::HashSet,
@@ -10,43 +10,356 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use zinder_core::{
-    BlockHeight, BlockId, BlockSelector, ChainEpoch, ChainEpochId, MinedDetails, MinedTransaction,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, TransactionId,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
-    TransparentUnspentOutput, TransparentUnspentOutputsByOutpointResponse,
-    TransparentUtxoSetSummary, TxStatus,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
+    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, ChainEpoch,
+    ChainEpochId, MinedTransaction, MinedTransactionChainContext, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
+    TxStatus,
 };
 use zinder_source::{TransactionBroadcaster, TreeStateUpstream};
-use zinder_store::{
-    ArtifactFamily, ChainEventStreamFamily, EventStreamStartPosition, StreamCursorTokenV1,
+use zinder_store::{ArtifactFamily, StreamCursorTokenV1};
+use zinder_wallet_projection::{
+    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
+    WalletProjectionSourcePosition,
 };
-use zinder_wallet_projection::{WalletAddressTransactionKey, WalletAddressUnspentOutputKey};
 
 use crate::{
-    ArtifactKey, BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock,
-    CompactBlockRange, FullBlock, FullBlockStream, LatestBlock, LatestSafeBlock, QueryError,
-    RawTransaction, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    ArtifactKey, BlockIdAtEpoch, CompactBlock, CompactBlockRange, LightwalletdQueryApi, QueryError,
+    RawTransaction, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingReadPair,
+    TransparentAddressUnspentOutputsRequest, TreeState, VisibleTipBlock, WalletServingReadPair,
 };
 
 const WALLET_READ_PAGE_SIZE: NonZeroU16 = NonZeroU16::MAX;
+const LIGHTWALLETD_TRANSPARENT_HISTORY_CURSOR_MAGIC: [u8; 4] = *b"lwh1";
+const LIGHTWALLETD_TRANSPARENT_HISTORY_CURSOR_LEN: usize = 174;
 
-/// Exact-fence wallet query over canonical and wallet-projection stores.
+/// Exact continuation state for one lightwalletd transparent-history page.
+///
+/// The cursor carries the immutable wallet source that issued it. A publisher
+/// can replace the serving pair between client page requests, so resuming with
+/// only the ordered row key could otherwise combine histories from two forks.
+#[derive(Clone, Copy)]
+struct LightwalletdTransparentHistoryCursor {
+    source: WalletCanonicalSourceIdentity,
+    after: WalletAddressTransactionKey,
+}
+
+impl LightwalletdTransparentHistoryCursor {
+    fn issue(
+        source: WalletCanonicalSourceIdentity,
+        after: WalletAddressTransactionKey,
+    ) -> StreamCursorTokenV1 {
+        let source_position = source.source_position();
+        let sequence_digest = source.source_sequence_digest();
+        let settled_tip = source.settled_tip();
+        let mut encoded = Vec::with_capacity(LIGHTWALLETD_TRANSPARENT_HISTORY_CURSOR_LEN);
+        encoded.extend_from_slice(&LIGHTWALLETD_TRANSPARENT_HISTORY_CURSOR_MAGIC);
+        encoded.extend_from_slice(&source_position.chain_epoch_id.value().to_be_bytes());
+        append_block_id(&mut encoded, source_position.tip);
+        encoded.extend_from_slice(&source_position.event_sequence.to_be_bytes());
+        encoded.extend_from_slice(&sequence_digest.version().value().to_be_bytes());
+        encoded.extend_from_slice(&sequence_digest.block_count().to_be_bytes());
+        encoded.extend_from_slice(&sequence_digest.as_bytes());
+        append_block_id(&mut encoded, settled_tip);
+        encoded.extend_from_slice(after.as_bytes());
+        StreamCursorTokenV1::from_bytes(encoded)
+    }
+
+    fn resume(
+        cursor: &StreamCursorTokenV1,
+        expected_source: WalletCanonicalSourceIdentity,
+    ) -> Result<WalletAddressTransactionKey, QueryError> {
+        let decoded = Self::decode(cursor.as_bytes())?;
+        if decoded.source != expected_source {
+            return Err(QueryError::ChainEpochPinUnavailable {
+                chain_epoch_id: decoded.source.source_position().chain_epoch_id,
+            });
+        }
+        Ok(decoded.after)
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, QueryError> {
+        if encoded.len() != LIGHTWALLETD_TRANSPARENT_HISTORY_CURSOR_LEN
+            || !encoded.starts_with(&LIGHTWALLETD_TRANSPARENT_HISTORY_CURSOR_MAGIC)
+        {
+            return Err(invalid_transparent_history_cursor());
+        }
+
+        let chain_epoch_id = ChainEpochId::new(u64::from_be_bytes(cursor_bytes(encoded, 4..12)?));
+        let tip = decode_block_id(encoded, 12)?;
+        let event_sequence = u64::from_be_bytes(cursor_bytes(encoded, 48..56)?);
+        let digest_version = u16::from_be_bytes(cursor_bytes(encoded, 56..58)?);
+        let digest_version = CanonicalBlockFactsSequenceDigestVersion::try_from(digest_version)
+            .map_err(|_| invalid_transparent_history_cursor())?;
+        let digest_block_count = u64::from_be_bytes(cursor_bytes(encoded, 58..66)?);
+        let digest = CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            digest_version,
+            digest_block_count,
+            cursor_bytes(encoded, 66..98)?,
+        );
+        let settled_tip = decode_block_id(encoded, 98)?;
+        if chain_epoch_id.value() == 0
+            || event_sequence == 0
+            || digest.block_count() == 0
+            || !settled_tip_is_within_source(tip, settled_tip)
+        {
+            return Err(invalid_transparent_history_cursor());
+        }
+        let after = WalletAddressTransactionKey::decode(&encoded[134..])
+            .map_err(|_| invalid_transparent_history_cursor())?;
+        Ok(Self {
+            source: WalletCanonicalSourceIdentity::new(
+                WalletProjectionSourcePosition::new(chain_epoch_id, tip, event_sequence),
+                digest,
+                settled_tip,
+            ),
+            after,
+        })
+    }
+}
+
+fn append_block_id(encoded: &mut Vec<u8>, block_id: BlockId) {
+    encoded.extend_from_slice(&block_id.height.value().to_be_bytes());
+    encoded.extend_from_slice(&block_id.hash.as_bytes());
+}
+
+fn decode_block_id(encoded: &[u8], start: usize) -> Result<BlockId, QueryError> {
+    let height = BlockHeight::new(u32::from_be_bytes(cursor_bytes(encoded, start..start + 4)?));
+    let hash = BlockHash::from_bytes(cursor_bytes(encoded, start + 4..start + 36)?);
+    Ok(BlockId::new(height, hash))
+}
+
+fn settled_tip_is_within_source(source_tip: BlockId, settled_tip: BlockId) -> bool {
+    settled_tip.height < source_tip.height
+        || (settled_tip.height == source_tip.height && settled_tip.hash == source_tip.hash)
+}
+
+fn cursor_bytes<const N: usize>(
+    encoded: &[u8],
+    range: std::ops::Range<usize>,
+) -> Result<[u8; N], QueryError> {
+    encoded
+        .get(range)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(invalid_transparent_history_cursor)
+}
+
+fn invalid_transparent_history_cursor() -> QueryError {
+    QueryError::TransparentHistoryCursorInvalid {
+        reason: "cursor is not a lightwalletd transparent-history continuation",
+    }
+}
+
+fn validate_transparent_history_cursor_key(
+    key: WalletAddressTransactionKey,
+    request: &TransparentAddressTxIdsInRangeRequest,
+) -> Result<(), QueryError> {
+    if key.address_script_hash() != request.address_script_hash {
+        return Err(QueryError::TransparentHistoryCursorInvalid {
+            reason: "cursor address does not match request address",
+        });
+    }
+    let height = key.block_height();
+    if height < request.start_height || height > request.end_height {
+        return Err(QueryError::TransparentHistoryCursorInvalid {
+            reason: "cursor height is outside request range",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use zinder_core::{
+        BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
+        CanonicalBlockFactsSequenceDigestVersion, ChainEpochId, TransparentAddressScriptHash,
+    };
+    use zinder_wallet_projection::{
+        WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
+    };
+
+    use super::{
+        LightwalletdTransparentHistoryCursor, QueryError, TransparentAddressTxIdsInRangeRequest,
+        validate_transparent_history_cursor_key,
+    };
+
+    #[test]
+    fn transparent_history_continuation_rejects_pair_replacement_and_preserves_current_paging()
+    -> Result<(), Box<dyn Error>> {
+        let first_page_source = source_identity(1, 0x11);
+        let replacement_pair_source = source_identity(1, 0x22);
+        let address = TransparentAddressScriptHash::from_bytes([0xa5; 32]);
+        let first_page_after = WalletAddressTransactionKey::new(address, BlockHeight::new(12), 0);
+        let second_page_after = WalletAddressTransactionKey::new(address, BlockHeight::new(13), 0);
+        let first_page_cursor =
+            LightwalletdTransparentHistoryCursor::issue(first_page_source, first_page_after);
+
+        // The pair remains current while the client reads its second page.
+        assert_eq!(
+            LightwalletdTransparentHistoryCursor::resume(&first_page_cursor, first_page_source)?,
+            first_page_after
+        );
+        let second_page_cursor =
+            LightwalletdTransparentHistoryCursor::issue(first_page_source, second_page_after);
+        assert_eq!(
+            LightwalletdTransparentHistoryCursor::resume(&second_page_cursor, first_page_source)?,
+            second_page_after
+        );
+
+        // A pair replacement between pages must never resume its raw key on
+        // the replacement fork.
+        let Err(error) = LightwalletdTransparentHistoryCursor::resume(
+            &first_page_cursor,
+            replacement_pair_source,
+        ) else {
+            return Err("replacement pair unexpectedly accepted prior-page cursor".into());
+        };
+        assert!(matches!(
+            error,
+            QueryError::ChainEpochPinUnavailable {
+                chain_epoch_id
+            } if chain_epoch_id == ChainEpochId::new(1)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_transparent_history_continuation_remains_invalid_input()
+    -> Result<(), Box<dyn Error>> {
+        let source = source_identity(1, 0x11);
+        let malformed = zinder_store::StreamCursorTokenV1::from_bytes(vec![0; 40]);
+        let Err(error) = LightwalletdTransparentHistoryCursor::resume(&malformed, source) else {
+            return Err("malformed transparent-history cursor unexpectedly resumed".into());
+        };
+        assert!(matches!(
+            error,
+            QueryError::TransparentHistoryCursorInvalid { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn structurally_impossible_transparent_history_source_is_invalid_input()
+    -> Result<(), Box<dyn Error>> {
+        let source = source_identity(1, 0x11);
+        let after = WalletAddressTransactionKey::new(
+            TransparentAddressScriptHash::from_bytes([0xa5; 32]),
+            BlockHeight::new(12),
+            0,
+        );
+        let cursor = LightwalletdTransparentHistoryCursor::issue(source, after);
+        let mut zero_event_sequence = cursor.as_bytes().to_vec();
+        let Some(event_sequence) = zero_event_sequence.get_mut(48..56) else {
+            return Err("transparent-history cursor did not contain an event sequence".into());
+        };
+        event_sequence.fill(0);
+        let zero_event_sequence =
+            zinder_store::StreamCursorTokenV1::from_bytes(zero_event_sequence);
+
+        let Err(error) = LightwalletdTransparentHistoryCursor::resume(&zero_event_sequence, source)
+        else {
+            return Err("zero event sequence unexpectedly resumed".into());
+        };
+        assert!(matches!(
+            error,
+            QueryError::TransparentHistoryCursorInvalid { .. }
+        ));
+
+        let mut zero_digest_block_count = cursor.as_bytes().to_vec();
+        let Some(digest_block_count) = zero_digest_block_count.get_mut(58..66) else {
+            return Err("transparent-history cursor did not contain a digest block count".into());
+        };
+        digest_block_count.fill(0);
+        let zero_digest_block_count =
+            zinder_store::StreamCursorTokenV1::from_bytes(zero_digest_block_count);
+        let Err(error) =
+            LightwalletdTransparentHistoryCursor::resume(&zero_digest_block_count, source)
+        else {
+            return Err("zero digest block count unexpectedly resumed".into());
+        };
+        assert!(matches!(
+            error,
+            QueryError::TransparentHistoryCursorInvalid { .. }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn transparent_history_continuation_must_match_its_request_scope() -> Result<(), Box<dyn Error>>
+    {
+        let request_address = TransparentAddressScriptHash::from_bytes([0xa5; 32]);
+        let request = TransparentAddressTxIdsInRangeRequest {
+            address_script_hash: request_address,
+            start_height: BlockHeight::new(10),
+            end_height: BlockHeight::new(20),
+            max_entries: std::num::NonZeroU32::MIN,
+            from_cursor: None,
+            descending: false,
+        };
+        let other_address = WalletAddressTransactionKey::new(
+            TransparentAddressScriptHash::from_bytes([0xa6; 32]),
+            BlockHeight::new(12),
+            0,
+        );
+        let Err(error) = validate_transparent_history_cursor_key(other_address, &request) else {
+            return Err("address-mismatched cursor unexpectedly validated".into());
+        };
+        assert!(matches!(
+            error,
+            QueryError::TransparentHistoryCursorInvalid {
+                reason: "cursor address does not match request address"
+            }
+        ));
+
+        let outside_range =
+            WalletAddressTransactionKey::new(request_address, BlockHeight::new(21), 0);
+        let Err(error) = validate_transparent_history_cursor_key(outside_range, &request) else {
+            return Err("range-mismatched cursor unexpectedly validated".into());
+        };
+        assert!(matches!(
+            error,
+            QueryError::TransparentHistoryCursorInvalid {
+                reason: "cursor height is outside request range"
+            }
+        ));
+
+        Ok(())
+    }
+
+    fn source_identity(chain_epoch: u64, hash_byte: u8) -> WalletCanonicalSourceIdentity {
+        let tip = BlockId::new(BlockHeight::new(13), BlockHash::from_bytes([hash_byte; 32]));
+        WalletCanonicalSourceIdentity::new(
+            WalletProjectionSourcePosition::new(ChainEpochId::new(chain_epoch), tip, 9),
+            CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                CanonicalBlockFactsSequenceDigestVersion::V1,
+                13,
+                [hash_byte; 32],
+            ),
+            tip,
+        )
+    }
+}
+
+/// Exact-fence lightwalletd query over canonical and wallet-projection stores.
 #[derive(Clone)]
-pub struct WalletServingQuery<Broadcaster> {
+pub struct LightwalletdServingQuery<Broadcaster> {
     serving_pair_slot: Arc<ArcSwap<WalletServingReadPair>>,
     broadcaster: Broadcaster,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     tree_state_upstream: Option<Arc<dyn TreeStateUpstream>>,
 }
 
-impl<Broadcaster> std::fmt::Debug for WalletServingQuery<Broadcaster> {
+impl<Broadcaster> std::fmt::Debug for LightwalletdServingQuery<Broadcaster> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let pair = self.capture_pair();
         formatter
-            .debug_struct("WalletServingQuery")
+            .debug_struct("LightwalletdServingQuery")
             .field("canonical_fence", &pair.canonical_fence())
             .field("wallet_fence", &pair.wallet_source())
             .field("tree_state_upstream", &self.tree_state_upstream.is_some())
@@ -54,10 +367,10 @@ impl<Broadcaster> std::fmt::Debug for WalletServingQuery<Broadcaster> {
     }
 }
 
-impl<Broadcaster> WalletServingQuery<Broadcaster> {
+impl<Broadcaster> LightwalletdServingQuery<Broadcaster> {
     /// Builds a query over a swappable slot of already-admitted immutable pairs.
     ///
-    /// Every [`WalletQueryApi`] method captures one `Arc` from this slot before
+    /// Every [`LightwalletdQueryApi`] method captures one `Arc` from this slot before
     /// reading. A publisher can therefore atomically replace the pair without
     /// changing the canonical or wallet reader observed by an in-flight request.
     #[must_use]
@@ -112,7 +425,7 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
         pair: &WalletServingReadPair,
         selector: BlockSelector,
         chain_epoch: ChainEpoch,
-    ) -> Result<BlockIdResponseValue, QueryError> {
+    ) -> Result<BlockIdAtEpoch, QueryError> {
         let block_id = match selector {
             BlockSelector::Height(height) if height <= chain_epoch.visible_tip_height => {
                 Self::block_id_at(pair, height)?
@@ -129,7 +442,7 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
                 });
             }
         };
-        Ok(BlockIdResponseValue {
+        Ok(BlockIdAtEpoch {
             chain_epoch,
             block_id,
         })
@@ -137,37 +450,19 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
 }
 
 #[async_trait]
-impl<Broadcaster> WalletQueryApi for WalletServingQuery<Broadcaster>
+impl<Broadcaster> LightwalletdQueryApi for LightwalletdServingQuery<Broadcaster>
 where
     Broadcaster: TransactionBroadcaster + Clone,
 {
-    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
-        let _pair = self.capture_pair();
-        Ok((*self.network_upgrade_activations).clone())
-    }
-
-    async fn latest_block(
+    async fn visible_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestBlock, QueryError> {
+    ) -> Result<VisibleTipBlock, QueryError> {
         let pair = self.capture_pair();
         let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        Ok(LatestBlock {
+        Ok(VisibleTipBlock {
             height: chain_epoch.visible_tip_height,
             block_hash: chain_epoch.visible_tip_hash,
-            chain_epoch,
-        })
-    }
-
-    async fn latest_safe_block(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestSafeBlock, QueryError> {
-        let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        Ok(LatestSafeBlock {
-            height: chain_epoch.settled_tip_height,
-            block_hash: chain_epoch.settled_tip_hash,
             chain_epoch,
         })
     }
@@ -176,29 +471,10 @@ where
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockIdResponseValue, QueryError> {
+    ) -> Result<BlockIdAtEpoch, QueryError> {
         let pair = self.capture_pair();
         let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
         Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)
-    }
-
-    async fn block_header_by_selector(
-        &self,
-        selector: BlockSelector,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockHeaderResponseValue, QueryError> {
-        let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let resolved = Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)?;
-        let block_header = pair
-            .canonical()
-            .block_header_at(resolved.block_id.height)?
-            .ok_or(QueryError::BlockNotInBestChain)?
-            .into_header_info();
-        Ok(BlockHeaderResponseValue {
-            chain_epoch: resolved.chain_epoch,
-            block_header,
-        })
     }
 
     async fn compact_block_at(
@@ -239,27 +515,6 @@ where
         })
     }
 
-    async fn full_block_at(
-        &self,
-        height: BlockHeight,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<FullBlock, QueryError> {
-        let _pair = self.capture_pair();
-        Err(artifact_unavailable(ArtifactFamily::BlockBlob, height))
-    }
-
-    async fn full_blocks_in_range(
-        &self,
-        block_range: zinder_core::BlockHeightRange,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<FullBlockStream, QueryError> {
-        let _pair = self.capture_pair();
-        Err(artifact_unavailable(
-            ArtifactFamily::BlockBlob,
-            block_range.start,
-        ))
-    }
-
     async fn transaction(
         &self,
         transaction_id: TransactionId,
@@ -285,7 +540,7 @@ where
             .canonical()
             .transaction_blob(location)?
             .map(|blob| blob.raw_transaction_bytes);
-        let details = MinedDetails::from_response_epoch(
+        let chain_context = MinedTransactionChainContext::from_response_epoch(
             &chain_epoch,
             location.block_height,
             self.network_upgrade_activations
@@ -296,23 +551,10 @@ where
             chain_epoch,
             status: TxStatus::Mined(MinedTransaction::new(
                 location,
-                details,
+                chain_context,
                 raw_transaction_bytes,
             )),
         })
-    }
-
-    async fn transaction_at_block_index(
-        &self,
-        height: BlockHeight,
-        _tx_index: u64,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<Transaction, QueryError> {
-        let _pair = self.capture_pair();
-        Err(artifact_unavailable(
-            ArtifactFamily::TransactionLocation,
-            height,
-        ))
     }
 
     async fn raw_transaction(
@@ -342,39 +584,6 @@ where
         })
     }
 
-    async fn transparent_outputs_by_outpoint(
-        &self,
-        _outpoints: Vec<TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentOutputsByOutpointResponse, QueryError> {
-        let _pair = self.capture_pair();
-        Err(QueryError::MaterializedViewUnavailable {
-            capability: "canonical transparent output lookup",
-        })
-    }
-
-    async fn transparent_spends_by_outpoint(
-        &self,
-        _outpoints: Vec<TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentSpendsByOutpointResponse, QueryError> {
-        let _pair = self.capture_pair();
-        Err(QueryError::MaterializedViewUnavailable {
-            capability: "canonical transparent spend lookup",
-        })
-    }
-
-    async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        _outpoints: Vec<TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUnspentOutputsByOutpointResponse, QueryError> {
-        let _pair = self.capture_pair();
-        Err(QueryError::MaterializedViewUnavailable {
-            capability: "canonical transparent outpoint lookup",
-        })
-    }
-
     async fn transparent_address_unspent_outputs(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
@@ -385,22 +594,21 @@ where
         let mut outputs = Vec::new();
         let mut after: Option<WalletAddressUnspentOutputKey> = None;
         loop {
-            let page = pair.wallet().address_unspent_outputs_page(
+            let page = pair.wallet().address_unspent_outputs_page_from_height(
                 request.address_script_hash,
+                request.start_height,
                 after,
                 WALLET_READ_PAGE_SIZE,
             )?;
-            outputs.extend(page.outputs.into_iter().filter_map(|output| {
-                (output.created_at.block.height >= request.start_height).then(|| {
-                    TransparentUnspentOutput::new(
-                        output.address_script_hash,
-                        output.script_pub_key,
-                        output.outpoint,
-                        output.value_zat,
-                        output.created_at.block.height,
-                        output.created_at.block.hash,
-                    )
-                })
+            outputs.extend(page.outputs.into_iter().map(|output| {
+                TransparentUnspentOutput::new(
+                    output.address_script_hash,
+                    output.script_pub_key,
+                    output.outpoint,
+                    output.value_zat,
+                    output.created_at.block.height,
+                    output.created_at.block.hash,
+                )
             }));
             let Some(next) = page.next_page_after else {
                 break;
@@ -427,26 +635,25 @@ where
         let after = request
             .from_cursor
             .as_ref()
-            .map(|cursor| WalletAddressTransactionKey::decode(cursor.as_bytes()))
-            .transpose()
-            .map_err(|_| QueryError::TransparentHistoryCursorInvalid {
-                reason: "cursor is not a wallet history key",
-            })?;
+            .map(|cursor| {
+                LightwalletdTransparentHistoryCursor::resume(cursor, pair.wallet_source())
+            })
+            .transpose()?;
+        if let Some(after) = after {
+            validate_transparent_history_cursor_key(after, &request)?;
+        }
         let page_size =
             NonZeroU16::new(u16::try_from(request.max_entries.get()).unwrap_or(u16::MAX))
                 .unwrap_or(NonZeroU16::MAX);
-        let page = pair.wallet().address_transaction_history_page(
+        let page = pair.wallet().address_transaction_history_range_page(
             request.address_script_hash,
+            BlockHeightRange::inclusive(request.start_height, request.end_height),
             after,
             page_size,
         )?;
         let artifacts = page
             .transactions
             .into_iter()
-            .filter(|row| {
-                let height = row.key.block_height();
-                height >= request.start_height && height <= request.end_height
-            })
             .map(|row| {
                 TransparentAddressTxIndexArtifact::new(
                     request.address_script_hash,
@@ -462,7 +669,7 @@ where
             artifacts,
             next_cursor: page
                 .next_page_after
-                .map(|key| StreamCursorTokenV1::from_bytes(key.as_bytes().to_vec())),
+                .map(|key| LightwalletdTransparentHistoryCursor::issue(pair.wallet_source(), key)),
         })
     }
 
@@ -489,17 +696,6 @@ where
             unconfirmed_delta_zat: 0,
             address_count: u32::try_from(addresses.len()).unwrap_or(u32::MAX),
             chain_epoch,
-        })
-    }
-
-    async fn transparent_utxo_set_summary(
-        &self,
-        _at_epoch_id: Option<ChainEpochId>,
-        _commitment_enabled: bool,
-    ) -> Result<TransparentUtxoSetSummary, QueryError> {
-        let _pair = self.capture_pair();
-        Err(QueryError::MaterializedViewUnavailable {
-            capability: "native UTXO summary encoding",
         })
     }
 
@@ -590,32 +786,10 @@ where
         })
     }
 
-    async fn chain_events(
-        &self,
-        _from_cursor: Option<StreamCursorTokenV1>,
-        _family: ChainEventStreamFamily,
-    ) -> Result<ChainEvents, QueryError> {
-        let _pair = self.capture_pair();
-        Err(QueryError::UnsupportedChainEvent {
-            event: "canonical chain-event serving is not wired",
-        })
-    }
-
-    async fn resolve_chain_events_start(
-        &self,
-        _start: EventStreamStartPosition,
-        _requested_family: ChainEventStreamFamily,
-    ) -> Result<zinder_store::ChainEventStreamResume, QueryError> {
-        let _pair = self.capture_pair();
-        Err(QueryError::UnsupportedChainEvent {
-            event: "canonical chain-event serving is not wired",
-        })
-    }
-
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<zinder_core::TransactionBroadcastResult, QueryError> {
+    ) -> Result<zinder_core::TransactionBroadcastOutcome, QueryError> {
         let _pair = self.capture_pair();
         if raw_transaction.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
             return Err(QueryError::BroadcastTransactionTooLarge {

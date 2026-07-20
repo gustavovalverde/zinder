@@ -67,7 +67,6 @@ convention. Specifically:
    - probing the upstream's `ServerInfo`
      (`wallet.read.transparent_outputs_by_outpoint_v1` flips on when the wallet
      advertises it);
-   - local opt-in (the `payment_disclosure_verifier_online` flag);
    - whether the materialized-view store has been wired
      (`materialized_view_store_online` covers `BlockSummary`, `BlockDetail`,
      `MempoolEventCounts`, `RecentTransactions`, and
@@ -119,12 +118,12 @@ The signal travels in a `StorageControl` `raw_blob_policy` singleton
 commit. After that commit, the value is the store's immutable historical
 coverage contract: opening the primary with another policy fails with
 `RawBlobRetentionMismatch` and requires a rebuild. Readers use only the
-persisted value. A non-empty schema-14 store with no signal is corrupt and
+persisted value. A non-empty store with no signal is corrupt and
 fails closed; it is never treated as `none`.
 
-## Projection capabilities require projection evidence
+## Materialized-view capabilities require materialized-view evidence
 
-An online materialized-view store is not enough to advertise a backfilled projection as complete. The service evaluates the named consumer's checkpoint and coverage from one read snapshot. A base capability may be advertised when partial rows are useful and the response exposes their bounds. A completeness capability is advertised only when verified contiguous coverage reaches the fenced projection tip and the ending hash matches. Canonical artifact schema, block-summary freshness, and global ingest readiness are inputs, not substitutes for this evidence.
+An online materialized-view store is not enough to advertise a backfilled materialized view as complete. The service evaluates the named consumer's materialized-view checkpoint and coverage from one read snapshot. A base capability may be advertised when partial rows are useful and the response exposes their bounds. A completeness capability is advertised only when verified contiguous coverage reaches the fenced materialized-view tip and the ending hash matches. Canonical artifact schema, block-summary freshness, and global ingest readiness are inputs, not substitutes for this evidence.
 
 ## Consequences
 

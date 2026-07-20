@@ -1,4 +1,4 @@
-use std::{path::Path, process::Command};
+use std::{fs, path::Path, process::Command};
 
 use tempfile::tempdir;
 
@@ -52,13 +52,12 @@ fn print_config_renders_the_complete_fail_closed_contract() -> eyre::Result<()> 
         )),
         "{stdout}"
     );
+    assert!(stdout.contains("[wallet]"), "{stdout}");
     assert!(
-        stdout.contains(&format!(
-            "wallet_path = {:?}",
-            wallet_path.display().to_string()
-        )),
+        stdout.contains(&format!("path = {:?}", wallet_path.display().to_string())),
         "{stdout}"
     );
+    assert!(stdout.contains("[wallet.rocksdb]"), "{stdout}");
     assert!(stdout.contains("reorg_window_blocks = 100"), "{stdout}");
     assert!(
         stdout.contains("lease_duration_seconds = 14400"),
@@ -222,6 +221,48 @@ fn print_config_rejects_an_implicit_construction_lease() -> eyre::Result<()> {
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains("projector.lease_duration_seconds"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_storage_field_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-projector.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"[network]
+name = "zcash-regtest"
+
+[storage]
+canonical_path = "{}"
+canonical_secondary_path = "{}"
+unsupported_path = "{}"
+
+[projector]
+reorg_window_blocks = 100
+build_owner_hex = "00112233445566778899aabbccddeeff"
+lease_duration_seconds = 14400
+
+[node]
+json_rpc_addr = "http://127.0.0.1:18232"
+"#,
+            path_str(&tempdir.path().join("canonical"))?,
+            path_str(&tempdir.path().join("canonical-secondary"))?,
+            path_str(&tempdir.path().join("wallet"))?,
+        ),
+    )?;
+
+    let output = projector_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("unknown field `unsupported_path`"),
         "{stderr}"
     );
     Ok(())

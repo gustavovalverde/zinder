@@ -475,8 +475,8 @@ fn transparent_spend_facts_by_outpoint_read_current_rows() -> eyre::Result<()> {
 }
 
 #[test]
-fn current_transparent_spend_facts_match_visible_for_finalized_outpoints() -> eyre::Result<()> {
-    // A finalized spend (block_2 == settled_tip): the visibility-skipping
+fn current_transparent_spend_facts_match_visible_for_settled_outpoints() -> eyre::Result<()> {
+    // A settled spend (block_2 == settled_tip): the visibility-skipping
     // current path the materialized-view replay uses must equal the visible path, since
     // an immutable block can never be filtered out. Guards the fast-path
     // optimization in `read_transparent_spend_facts_for_committed_blocks`.

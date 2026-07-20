@@ -39,12 +39,12 @@ use super::native::{
     build_compact_block_message, build_full_block_message, build_transparent_address_tx_ids_chunk,
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
     build_transparent_unspent_outputs_header, build_wallet_server_info, compact_block_response,
-    full_block_response, latest_block_response, latest_safe_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    subtree_roots_response, transaction_response, transparent_address_unspent_outputs_response,
+    full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, settled_tip_block_response, subtree_roots_response,
+    transaction_response, transparent_address_unspent_outputs_response,
     transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
     transparent_unspent_outputs_by_outpoint_response, transparent_utxo_set_summary_response,
-    tree_state_at_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 use super::status_from_query_error;
 
@@ -61,9 +61,8 @@ const TRANSACTION_NOT_FOUND_REASON: &str =
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
 ///
-/// Wallet queries that touch in-process state owned by the ingest writer
-/// (`ChainEvents` retained replay, the live mempool index, and the mempool
-/// event log) are proxied through the colocated `IngestControl` private
+/// Wallet queries that touch live in-process mempool state owned by the ingest
+/// writer are proxied through the colocated `IngestControl` private
 /// gRPC endpoint when one is wired. Direct (in-process) handling remains
 /// available for development/test deployments that compose ingest and
 /// query in one binary.
@@ -97,8 +96,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     /// Creates a gRPC adapter that proxies in-process ingest-owned reads
     /// through `IngestControl`.
     ///
-    /// The same endpoint serves `ChainEvents`, `MempoolSnapshot`,
-    /// `MempoolEvents`, and the live mempool overlay on
+    /// The same endpoint serves `MempoolSnapshot`, `MempoolEvents`, and the live mempool overlay on
     /// `TransparentAddressBalance`; secondary readers cannot observe the
     /// live writer state otherwise.
     #[must_use]
@@ -148,11 +146,11 @@ where
     type TransparentAddressUnspentOutputsStream = TransparentUnspentOutputsStream;
     type TransparentAddressTxIdsInRangeStream = TransparentAddressTxIdsStream;
 
-    async fn latest_block(
+    async fn visible_tip_block(
         &self,
-        request: Request<wallet::LatestBlockRequest>,
-    ) -> Result<Response<wallet::LatestBlockResponse>, Status> {
-        latest_block_response(
+        request: Request<wallet::VisibleTipBlockRequest>,
+    ) -> Result<Response<wallet::VisibleTipBlockResponse>, Status> {
+        visible_tip_block_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
         )
@@ -161,11 +159,11 @@ where
         .map_err(|error| status_from_query_error(&error))
     }
 
-    async fn latest_safe_block(
+    async fn settled_tip_block(
         &self,
-        request: Request<wallet::LatestSafeBlockRequest>,
-    ) -> Result<Response<wallet::LatestSafeBlockResponse>, Status> {
-        latest_safe_block_response(
+        request: Request<wallet::SettledTipBlockRequest>,
+    ) -> Result<Response<wallet::SettledTipBlockResponse>, Status> {
+        settled_tip_block_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
         )
@@ -398,18 +396,6 @@ where
     ) -> Result<Response<Self::ChainEventsStream>, Status> {
         let started_at = Instant::now();
         let outcome: Result<Response<ChainEventsStream>, Status> = async {
-            if self.ingest_control_proxy_endpoint.is_some() {
-                let mut client = self
-                    .ingest_control_client(
-                        "ChainEvents requires the ingest-control proxy; \
-                         configure the writer endpoint",
-                    )
-                    .await?;
-                let response = client.chain_events(request).await?;
-                let stream: ChainEventsStream = Box::pin(response.into_inner());
-                return Ok(Response::new(stream));
-            }
-
             let request = request.into_inner();
             let start = event_stream_start_from_request(request.start)?;
             let requested_family = chain_event_stream_family_from_request(request.family)?;

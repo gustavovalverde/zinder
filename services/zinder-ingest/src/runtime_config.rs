@@ -42,7 +42,7 @@ impl HistoricalWorkGate {
     #[must_use]
     pub fn new(readiness: Readiness) -> Self {
         metrics::gauge!("zinder_ingest_historical_work_gate_open").set(0.0);
-        metrics::gauge!("zinder_ingest_materialized_view_replay_caught_up").set(0.0);
+        metrics::gauge!("zinder_materialized_view_replay_caught_up").set(0.0);
         Self {
             readiness,
             materialized_views_caught_up: Arc::new(AtomicBool::new(false)),
@@ -61,7 +61,7 @@ impl HistoricalWorkGate {
         let was_caught_up = self
             .materialized_views_caught_up
             .swap(caught_up, Ordering::AcqRel);
-        metrics::gauge!("zinder_ingest_materialized_view_replay_caught_up").set(if caught_up {
+        metrics::gauge!("zinder_materialized_view_replay_caught_up").set(if caught_up {
             1.0
         } else {
             0.0
@@ -114,17 +114,13 @@ pub struct IngestRuntimeConfig {
     pub storage_path: PathBuf,
     /// Bounded `RocksDB` resource budget for the canonical store.
     pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
-    /// Bounded `RocksDB` resource budget for the materialized-view store.
-    pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional raw-byte blob write policy for canonical ingest.
     pub raw_blob_policy: RawBlobPolicy,
-    /// Reorg-window invariant. Bulk catch-up never finalizes blocks inside
-    /// this window unless `run_overrides.allow_near_tip_finalize` is true.
+    /// Reorg-window invariant. Bulk catch-up never advances the settled tip inside
+    /// this window unless `run_overrides.allow_reorg_window_settlement` is true.
     pub reorg_window_blocks: u32,
     /// Phase-classifier knobs (`[ingest.phase_classification]`).
     pub phase_classification: PhaseClassificationConfig,
-    /// Shared materialized-view replay knobs (`[ingest.materialized_views]`).
-    pub materialized_views: MaterializedViewReplayConfig,
     /// Pipelined-fetch and commit knobs (`[ingest.construction]`).
     pub construction: CanonicalConstructionSettings,
     /// Serial-loop knobs (`[ingest.follow]`).
@@ -155,7 +151,7 @@ pub struct PhaseClassificationConfig {
     pub catchup_threshold_blocks: u32,
 }
 
-/// Resolved `[ingest.materialized_views]` configuration.
+/// Programmatic limits for reusable materialized-view replay workers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaterializedViewReplayConfig {
     /// Maximum block contexts hydrated and dispatched in one materialized-view replay
@@ -267,13 +263,13 @@ pub struct CanonicalRunOverrides {
     /// Stop committing after reaching this height. `None` means run
     /// indefinitely.
     pub target_height: Option<BlockHeight>,
-    /// Seed an empty store from this height when set. The unified loop
+    /// Seed an empty store from this height when set. The ingest loop
     /// looks the corresponding checkpoint up against the upstream node
     /// before entering the first phase.
     pub checkpoint_height: Option<BlockHeight>,
-    /// Allow bulk-catchup batches to finalize blocks inside the upstream
+    /// Allow bulk-catchup batches to advance the settled tip inside the upstream
     /// node's reorg window. Disposable-store recovery only.
-    pub allow_near_tip_finalize: bool,
+    pub allow_reorg_window_settlement: bool,
     /// Optional starting checkpoint resolved against the upstream node
     /// before the loop starts. Populated by the binary entrypoint after
     /// the `checkpoint_height` lookup completes.

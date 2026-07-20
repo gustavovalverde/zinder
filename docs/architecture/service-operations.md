@@ -115,7 +115,7 @@ labels.
 
 Compatibility metrics report writer-status availability, catch-up duration,
 pair convergence attempts, published generation, replica lag, pair admission
-failure, and exact-pair replacement. gRPC request metrics remain separate from
+failure, and wallet-serving pair replacement. gRPC request metrics remain separate from
 pair-maintenance metrics.
 
 ### RocksDB
@@ -139,13 +139,11 @@ events include:
 - `canonical_unpublished_construction_restarted`
 - `canonical_live_append_committed`
 - `canonical_live_replacement_committed`
-- `materialized_view_replay_caught_up`
-- `materialized_view_replay_fell_behind`
 
 Messages explain the event for humans; automation keys on structured fields.
 Logs may include bounded heights, epoch numbers, sequence numbers, durations,
 and enum labels. They must not include raw authorization headers, bearer tokens,
-cookie contents, disclosure bytes, viewing keys, or unbounded payloads.
+cookie contents, viewing keys, or unbounded payloads.
 
 ## Security boundary
 
@@ -175,7 +173,7 @@ Production wallet recovery is one coherent state-bundle operation:
 3. bind both checkpoints to one canonical event fence and wallet digest;
 4. restore into fresh paths;
 5. cold-admit each checkpoint under bounded resources; and
-6. start ingest, projector, then compatibility and require normal exact-pair
+6. start ingest, projector, then compatibility and require normal wallet-serving admission
    admission before traffic.
 
 An independently timed copy of the canonical and wallet directories is not a

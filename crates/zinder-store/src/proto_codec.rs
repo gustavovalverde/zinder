@@ -18,7 +18,7 @@ use zinder_proto::v1::wallet;
 use crate::{
     ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventStreamFamily,
     ChainRangeReverted, EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope,
-    MempoolEventStreamFamily, StreamCursorTokenV1,
+    StreamCursorTokenV1,
 };
 
 /// Error returned when a store chain event cannot be represented on the v1 wallet proto.
@@ -36,7 +36,7 @@ pub enum ChainEventEncodeError {
 /// Encodes a store chain-event envelope into the wallet protocol message.
 #[allow(
     unreachable_patterns,
-    reason = "ChainEvent is expected to grow; this encoder must fail closed for future variants."
+    reason = "This encoder fails closed when it receives a chain-event variant the current wire contract cannot represent."
 )]
 pub fn chain_event_envelope_message(
     event_envelope: &ChainEventEnvelope,
@@ -114,7 +114,7 @@ pub fn mempool_entry_message(entry: &MempoolEntry) -> wallet::MempoolEntry {
 /// Encodes a mempool-event envelope into the wallet protocol message.
 #[allow(
     unreachable_patterns,
-    reason = "MempoolEvent is expected to grow; this encoder must fail closed for future variants."
+    reason = "This encoder fails closed when it receives a mempool-event variant the current wire contract cannot represent."
 )]
 pub fn mempool_event_envelope_message(
     event_envelope: &MempoolEventEnvelope,
@@ -141,11 +141,6 @@ pub fn mempool_event_envelope_message(
             mined_height: mined_height.value(),
             block_hash: encode_rpc_block_hash_hex(*block_hash),
         }),
-        MempoolEvent::Suppressed { transaction_id } => {
-            wallet::mempool_event_envelope::Event::Suppressed(wallet::MempoolSuppressedEvent {
-                transaction_id: encode_rpc_transaction_id_hex(*transaction_id),
-            })
-        }
         _ => {
             return Err(ChainEventEncodeError::UnsupportedChainEvent {
                 event: "unknown mempool event variant",
@@ -238,23 +233,8 @@ pub fn stream_cursor_from_message_bytes(cursor_bytes: Vec<u8>) -> Option<StreamC
 #[must_use]
 pub fn chain_event_stream_family_from_message(family: i32) -> Option<ChainEventStreamFamily> {
     match wallet::ChainEventStreamFamily::try_from(family) {
-        Ok(wallet::ChainEventStreamFamily::Tip) => Some(ChainEventStreamFamily::Tip),
-        Ok(wallet::ChainEventStreamFamily::Safe) => Some(ChainEventStreamFamily::Safe),
-        Err(_) => None,
-    }
-}
-
-/// Decodes the mempool-event stream family carried by a request message.
-///
-/// `Unspecified` resolves to the single `Mempool` family; unknown integers
-/// return `None` and map to `INVALID_ARGUMENT` at the transport boundary.
-#[must_use]
-pub fn mempool_event_stream_family_from_message(family: i32) -> Option<MempoolEventStreamFamily> {
-    match wallet::MempoolEventStreamFamily::try_from(family) {
-        Ok(
-            wallet::MempoolEventStreamFamily::Unspecified
-            | wallet::MempoolEventStreamFamily::Mempool,
-        ) => Some(MempoolEventStreamFamily::Mempool),
+        Ok(wallet::ChainEventStreamFamily::Visible) => Some(ChainEventStreamFamily::Visible),
+        Ok(wallet::ChainEventStreamFamily::Settled) => Some(ChainEventStreamFamily::Settled),
         Err(_) => None,
     }
 }
@@ -599,12 +579,6 @@ pub fn mempool_event_envelope_from_message(
             block_hash: block_hash_from_rpc_hex(
                 "mempool_event_envelope.mined.block_hash",
                 &mined.block_hash,
-            )?,
-        },
-        wallet::mempool_event_envelope::Event::Suppressed(suppressed) => MempoolEvent::Suppressed {
-            transaction_id: transaction_id_from_rpc_hex(
-                "mempool_event_envelope.suppressed.transaction_id",
-                &suppressed.transaction_id,
             )?,
         },
     };

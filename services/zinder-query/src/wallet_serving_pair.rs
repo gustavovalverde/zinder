@@ -20,7 +20,7 @@ use zinder_wallet_rocksdb::{
 
 use crate::QueryError;
 
-/// Read-only canonical facts held at one immutable admitted fence.
+/// Read-only canonical data held at one immutable admitted fence.
 ///
 /// Implementations must never catch up or otherwise mutate their observed
 /// fence while a caller holds the same instance in a [`WalletServingReadPair`].
@@ -83,7 +83,7 @@ pub trait CanonicalReader: Send + Sync + 'static {
     ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError>;
 }
 
-/// Read-only wallet facts held at one immutable READY source identity.
+/// Read-only wallet projection state held at one immutable READY source identity.
 ///
 /// Implementations must never follow a primary or mutate their observed READY
 /// evidence while a caller holds the instance in a [`WalletServingReadPair`].
@@ -102,10 +102,30 @@ pub trait WalletProjectionReader: Send + Sync + 'static {
         page_size: NonZeroU16,
     ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError>;
 
+    /// Reads one bounded page of unspent outputs at or above a creation-height
+    /// lower bound.
+    fn address_unspent_outputs_page_from_height(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+        after: Option<WalletAddressUnspentOutputKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError>;
+
     /// Reads one bounded page of address-touching transaction history.
     fn address_transaction_history_page(
         &self,
         address_script_hash: TransparentAddressScriptHash,
+        after: Option<WalletAddressTransactionKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError>;
+
+    /// Reads one bounded page of address-touching transactions within an
+    /// inclusive height range.
+    fn address_transaction_history_range_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        height_range: BlockHeightRange,
         after: Option<WalletAddressTransactionKey>,
         page_size: NonZeroU16,
     ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError>;
@@ -134,7 +154,7 @@ pub enum WalletServingAdmissionError {
         wallet: Network,
     },
     /// The canonical reader could not decode its visible epoch.
-    #[error("canonical reader failed while validating an exact read pair")]
+    #[error("canonical reader failed while validating a wallet-serving read pair")]
     CanonicalRead {
         /// Exact canonical storage failure.
         #[source]
@@ -247,6 +267,21 @@ impl WalletProjectionReader for RocksDbWalletSecondary {
         self.address_unspent_outputs_page(address_script_hash, after, page_size)
     }
 
+    fn address_unspent_outputs_page_from_height(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+        after: Option<WalletAddressUnspentOutputKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
+        self.address_unspent_outputs_page_from_height(
+            address_script_hash,
+            start_height,
+            after,
+            page_size,
+        )
+    }
+
     fn address_transaction_history_page(
         &self,
         address_script_hash: TransparentAddressScriptHash,
@@ -254,6 +289,21 @@ impl WalletProjectionReader for RocksDbWalletSecondary {
         page_size: NonZeroU16,
     ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
         self.address_transaction_history_page(address_script_hash, after, page_size)
+    }
+
+    fn address_transaction_history_range_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        height_range: BlockHeightRange,
+        after: Option<WalletAddressTransactionKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
+        self.address_transaction_history_range_page(
+            address_script_hash,
+            height_range,
+            after,
+            page_size,
+        )
     }
 
     fn address_balance(

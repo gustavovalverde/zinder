@@ -1,10 +1,10 @@
-# Canonical and projection architecture
+# Canonical and materialized-view architecture
 
 Zinder separates chain truth from consumer-shaped state. The canonical writer
 persists one ordered, replayable representation of the best chain. Independent
-projection owners turn that representation into wallet or explorer read models.
+read-model owners turn that representation into wallet or explorer read models.
 Serving processes admit immutable readers at an exact canonical event fence so
-one request cannot combine incompatible chain and projection states.
+one request cannot combine incompatible chain and materialized-view states.
 
 [ADR-0035](../adrs/0035-canonical-storage-topologies.md) owns the deployment
 topology decision. [Service boundaries](service-boundaries.md) owns process
@@ -109,7 +109,7 @@ wallet rows represent.
 
 An absent wallet store is built at a pinned canonical fence under two leases:
 
-- `ProjectionBuildLease` prevents a competing projector generation from
+- `WalletProjectionBuildLease` prevents a competing projector generation from
   constructing or publishing the same wallet store; and
 - the writer-owned canonical retention lease keeps the pinned event history
   available until continuous following takes ownership.
@@ -134,7 +134,7 @@ secondary generations, catches both up, and publishes a
 - both readers are immutable for the lifetime of the pair; and
 - replica lag stays within the configured readiness boundary.
 
-`WalletServingQuery` captures one published pair at request start. Its
+`LightwalletdServingQuery` captures one published pair at request start. Its
 `CanonicalReader` and `WalletProjectionReader` therefore cannot advance to
 different generations during a response. Pair replacement is atomic for new
 requests and does not mutate readers held by in-flight requests.
@@ -146,7 +146,7 @@ ownership.
 
 ## Explorer materialized views
 
-`zinder-materialized-views` is the reusable SDK for explorer-shaped projections.
+`zinder-materialized-views` is the reusable SDK for explorer-shaped materialized views.
 Each `MaterializedViewConsumer` declares its stable name, owned column families,
 schema version, and event application logic. The materialized-view store keeps
 consumer rows, cursors, coverage, and schema metadata together so a consumer can
@@ -171,7 +171,7 @@ but moving a primary path behind a network filesystem is outside this contract.
 
 The PostgreSQL code in `zinder-bench` is a diagnostic implementation of the
 canonical block-facts persistence benchmark. It does not implement runtime
-ownership, projection storage, writer fencing, replica admission, backup,
+ownership, materialized-view storage, writer fencing, replica admission, backup,
 restore, readiness, TLS, or failover. PostgreSQL is therefore not a supported
 deployment topology.
 

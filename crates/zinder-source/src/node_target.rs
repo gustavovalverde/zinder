@@ -84,7 +84,7 @@ pub struct NodeTarget {
     /// [ADR-0015 §Upstream sync detection].
     ///
     /// [ADR-0015 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+    ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
     pub health: Option<NodeHealthConfig>,
 }
 
@@ -339,7 +339,7 @@ pub struct NodeSection {
 /// [ADR-0015 §Upstream sync detection].
 ///
 /// [ADR-0015 §Upstream sync detection]:
-///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeHealthSection {

@@ -335,7 +335,7 @@ impl TransparentAddressRankingConsumer {
             BUILD_MANIFEST_KEY,
             encode_snapshot_build_manifest(requested),
         );
-        store.write_projection_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
+        store.write_consumer_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(())
     }
 
@@ -416,7 +416,7 @@ impl TransparentAddressRankingConsumer {
             BUILD_MANIFEST_KEY,
             encode_snapshot_build_manifest(manifest),
         );
-        store.write_projection_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
+        store.write_consumer_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(())
     }
 
@@ -445,7 +445,7 @@ impl TransparentAddressRankingConsumer {
         Ok(())
     }
 
-    /// Applies one canonical unsettled block to an inactive finalized base.
+    /// Applies one canonical unsettled block to an inactive settled base.
     ///
     /// The write is cursor-neutral and persists the same undo journal normal
     /// live dispatch would need if a later reorg reaches this height.
@@ -490,7 +490,7 @@ impl TransparentAddressRankingConsumer {
         let metadata_cf =
             store.consumer_column_family(TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY)?;
         batch.put_cf(&metadata_cf, BUILD_METADATA_KEY, encode_metadata(updated));
-        store.write_projection_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
+        store.write_consumer_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(())
     }
 
@@ -546,7 +546,7 @@ impl TransparentAddressRankingConsumer {
             TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
             cursor_bytes,
         )?;
-        store.write_projection_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
+        store.write_consumer_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(metadata)
     }
 
@@ -713,7 +713,7 @@ impl BlockKeyedConsumer for TransparentAddressRankingConsumer {
         block: &BlockCommitContext,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let spends = block.transparent_spends()?;
+        let spends = block.transparent_spends();
         validate_transparent_spends(block, spends.as_deref())?;
 
         let mut metadata = self.current_metadata(ctx.store)?;
@@ -1925,7 +1925,7 @@ fn store_decode_error(error: impl ToString) -> MaterializedViewStoreError {
     }
 }
 
-/// Ranking projection failures.
+/// Ranking materialized-view failures.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransparentAddressRankingConsumerError {
@@ -2104,7 +2104,7 @@ mod tests {
         TransparentAddressSummary, apply_delta, decode_summary, encode_summary, ranking_key,
     };
     use crate::consumer::{
-        BlockCommitContext, BlockCommitPayload, BlockKeyedConsumer, MaterializedViewConsumerCtx,
+        BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, MaterializedViewConsumerCtx,
         TransparentSpendFacts,
     };
     use crate::{MaterializedViewStore, MaterializedViewStoreOptions};
@@ -2254,7 +2254,7 @@ mod tests {
                     )],
                 );
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: block_height,
                 block_hash,
                 previous_block_hash: BlockHash::from_bytes(
@@ -2282,7 +2282,7 @@ mod tests {
                 Vec::new(),
             );
         BlockCommitContext::new(
-            BlockCommitPayload {
+            BlockCommitInput {
                 height: block_height,
                 block_hash,
                 previous_block_hash: BlockHash::from_bytes([0; 32]),

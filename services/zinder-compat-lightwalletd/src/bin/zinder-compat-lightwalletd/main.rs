@@ -9,7 +9,7 @@ use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
-    Readiness, ServiceIdentifier, StartupPhase, TrafficReadinessInterceptor,
+    Readiness, RuntimeService, StartupPhase, TrafficReadinessInterceptor,
     cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
@@ -123,7 +123,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let readiness = Readiness::default();
     let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::CompatLightwalletd,
+        RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(lightwalletd_config.network),
@@ -171,13 +171,6 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    readiness.set_projection_workload(
-        "wallet",
-        vec![
-            "transparent-address-history-v1".to_owned(),
-            "transparent-utxo-v1".to_owned(),
-        ],
-    );
     let (serving_pair_publisher, serving_pair_slot) = WalletServingPairPublisher::bootstrap(
         WalletServingPairConfig {
             canonical_primary_path: lightwalletd_config.storage.path.clone(),
@@ -188,7 +181,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             network_upgrade_activations: Arc::clone(&network_upgrade_activations),
             canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
             canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
-            wallet_resource_budget: lightwalletd_config.storage.materialized_view_rocksdb_budget,
+            wallet_resource_budget: lightwalletd_config.wallet_rocksdb_budget,
             catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
             convergence_timeout: lightwalletd_config.storage.initial_catchup_timeout,
             convergence_attempts: lightwalletd_config.pair_convergence_attempts,
@@ -211,7 +204,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
     open_storage_phase.complete();
 
-    let mut wallet_query = zinder_query::WalletServingQuery::from_serving_pair_slot(
+    let mut wallet_query = zinder_query::LightwalletdServingQuery::from_serving_pair_slot(
         Arc::clone(&serving_pair_slot),
         broadcaster,
         network_upgrade_activations.clone(),

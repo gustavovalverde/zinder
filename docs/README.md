@@ -9,13 +9,13 @@ Start with these documents:
 - [Indexer and wallet boundary](architecture/indexer-wallet-boundary.md) explains when Zinder is the right integration boundary.
 - [Service boundaries](architecture/service-boundaries.md) assigns runtime and storage ownership.
 - [Public interfaces](architecture/public-interfaces.md) is the vocabulary spine for Rust APIs, protocol fields, configuration, errors, and capabilities.
-- [Canonical and projection architecture](architecture/canonical-projection-architecture.md) explains how canonical storage, wallet state, and explorer materialized views fit together.
+- [Canonical and materialized-view architecture](architecture/canonical-materialized-view-architecture.md) explains how canonical storage, wallet state, and explorer materialized views fit together.
 - [Service operations](architecture/service-operations.md) defines health, readiness, metrics, security, and recovery behavior.
 - [Testing](runbooks/testing.md) defines the validation tiers and commands.
 
 ## Architecture
 
-- [Canonical and projection architecture](architecture/canonical-projection-architecture.md)
+- [Canonical and materialized-view architecture](architecture/canonical-materialized-view-architecture.md)
 - [Chain ingestion](architecture/chain-ingestion.md)
 - [Chain events](architecture/chain-events.md)
 - [Storage backend](architecture/storage-backend.md)

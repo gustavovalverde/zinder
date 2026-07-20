@@ -15,7 +15,7 @@ use zinder_client::{
     LocalOpenOptions, Network, RemoteChainIndex, RemoteOpenOptions, TransactionId,
     TransparentAddressScriptHash, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentOutPoint, TransparentUnspentOutput,
-    TransparentUnspentOutputStreamItem,
+    TransparentUnspentOutputChunk,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
@@ -28,7 +28,7 @@ const SCRIPT_PUB_KEY: &[u8] = &[
 
 async fn drain(
     stream: TransparentAddressUnspentOutputsStream,
-) -> eyre::Result<Vec<TransparentUnspentOutputStreamItem>> {
+) -> eyre::Result<Vec<TransparentUnspentOutputChunk>> {
     let mut items = Vec::new();
     let mut stream = stream;
     while let Some(stream_item) = stream.next().await {

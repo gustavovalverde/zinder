@@ -5,8 +5,8 @@ use zinder_core::{
 };
 use zinder_store::RocksDbResourceBudget;
 use zinder_wallet_projection::{
-    ProjectionBuildLease, ProjectionBuildLeaseRequest, ProjectionBuildOwner,
-    WalletCanonicalSourceIdentity, WalletProjectionRetainedEventAnchor,
+    WalletCanonicalSourceIdentity, WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest,
+    WalletProjectionBuildOwner, WalletProjectionRetainedEventAnchor,
     WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletBuildStore, RocksDbWalletError};
@@ -26,10 +26,13 @@ fn active_build_lease_refuses_a_competing_owner() -> Result<(), Box<dyn std::err
     let lease =
         build.try_acquire_lease(request(0x11, source, UnixTimestampMillis::new(200)), now)?;
 
-    assert_eq!(lease.owner(), ProjectionBuildOwner::from_bytes([0x11; 16]));
+    assert_eq!(
+        lease.owner(),
+        WalletProjectionBuildOwner::from_bytes([0x11; 16])
+    );
     assert!(matches!(
         build.try_acquire_lease(request(0x22, source, UnixTimestampMillis::new(300)), now),
-        Err(RocksDbWalletError::ProjectionBuildLeaseHeld { .. })
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld { .. })
     ));
     drop(build);
     Ok(())
@@ -70,10 +73,10 @@ fn expired_lease_takeover_persists_and_rejects_stale_capabilities()
             UnixTimestampMillis::new(500),
             UnixTimestampMillis::new(201)
         ),
-        Err(RocksDbWalletError::ProjectionBuildLeaseOwnerMismatch { .. })
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseOwnerMismatch { .. })
     ));
 
-    let stale_generation = ProjectionBuildLease::from_request(
+    let stale_generation = WalletProjectionBuildLease::from_request(
         request(0x22, source, UnixTimestampMillis::new(400)),
         original.generation(),
         Network::ZcashRegtest,
@@ -84,7 +87,7 @@ fn expired_lease_takeover_persists_and_rejects_stale_capabilities()
             UnixTimestampMillis::new(500),
             UnixTimestampMillis::new(201),
         ),
-        Err(RocksDbWalletError::ProjectionBuildLeaseGenerationMismatch { .. })
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseGenerationMismatch { .. })
     ));
 
     let renewed = reopened.renew_lease(
@@ -127,17 +130,17 @@ fn build_lease_rejects_a_stale_canonical_or_retained_event_anchor()
             request(0x11, stale_source, UnixTimestampMillis::new(200)),
             UnixTimestampMillis::new(100),
         ),
-        Err(RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch { .. })
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch { .. })
     ));
-    let invalid_retention = ProjectionBuildLeaseRequest::new(
-        ProjectionBuildOwner::from_bytes([0x11; 16]),
+    let invalid_retention = WalletProjectionBuildLeaseRequest::new(
+        WalletProjectionBuildOwner::from_bytes([0x11; 16]),
         source,
         WalletProjectionRetainedEventAnchor::new(2),
         UnixTimestampMillis::new(200),
     );
     assert!(matches!(
         build.try_acquire_lease(invalid_retention, UnixTimestampMillis::new(100)),
-        Err(RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch { .. })
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch { .. })
     ));
     Ok(())
 }
@@ -163,7 +166,7 @@ fn discard_unpublished_refuses_a_live_owner_then_removes_an_expired_build()
         build
             .clone()
             .discard_unpublished(UnixTimestampMillis::new(199)),
-        Err(RocksDbWalletError::ProjectionBuildLeaseHeld { .. })
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld { .. })
     ));
     build.discard_unpublished(UnixTimestampMillis::new(200))?;
     assert!(!path.exists());
@@ -190,9 +193,9 @@ fn request(
     owner: u8,
     source: WalletCanonicalSourceIdentity,
     expires_at: UnixTimestampMillis,
-) -> ProjectionBuildLeaseRequest {
-    ProjectionBuildLeaseRequest::new(
-        ProjectionBuildOwner::from_bytes([owner; 16]),
+) -> WalletProjectionBuildLeaseRequest {
+    WalletProjectionBuildLeaseRequest::new(
+        WalletProjectionBuildOwner::from_bytes([owner; 16]),
         source,
         WalletProjectionRetainedEventAnchor::new(1),
         expires_at,

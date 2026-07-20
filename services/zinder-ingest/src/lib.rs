@@ -9,7 +9,6 @@ pub mod bench_support;
 mod bulk_catchup;
 mod chain_ingest;
 mod conventional_fee_distribution_backfill;
-mod ingest_control;
 mod materialized_view_consumers;
 mod materialized_view_status_reader;
 mod memory_pressure;
@@ -40,14 +39,13 @@ pub use conventional_fee_distribution_backfill::{
     ConventionalFeeDistributionBackfillConfig, ConventionalFeeDistributionBackfillContext,
     spawn_conventional_fee_distribution_backfill_task,
 };
-pub use ingest_control::{IngestControlGrpcAdapter, MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE};
 pub use materialized_view_consumers::{
     DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, catch_up_materialized_view_store_to_canonical,
     catch_up_materialized_view_store_to_canonical_until_handoff,
     open_primary_materialized_view_store_for_canonical,
-    open_primary_materialized_view_store_for_canonical_with_projection_preset,
-    seed_backfill_owned_consumer_cursors, seed_commitment_root_search_cursor_for_backfill,
-    spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
+    open_primary_materialized_view_store_for_canonical_with_materialized_view_preset,
+    seed_backfill_owned_consumer_cursors, spawn_materialized_view_replay_budget_metrics_task,
+    spawn_materialized_view_tailer_task,
 };
 pub use materialized_view_status_reader::{
     MaterializedViewStatusReadError, MaterializedViewStatusReader,

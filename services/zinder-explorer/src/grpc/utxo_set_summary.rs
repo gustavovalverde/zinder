@@ -19,7 +19,7 @@ use super::freshness::{
 use zinder_materialized_views::MaterializedViewStore;
 
 /// Executes one `ExplorerQuery.UtxoSetSummary` request.
-pub(crate) async fn handle_utxo_set_summary(
+pub(crate) async fn query_utxo_set_summary(
     materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,

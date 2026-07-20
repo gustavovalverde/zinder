@@ -143,7 +143,7 @@ struct FenceSummary {
 
 #[derive(Serialize)]
 struct ReadyEvidenceSummary {
-    projection_digest_hex: String,
+    wallet_projection_digest_hex: String,
     row_counts: RowCountSummary,
     utxo_count: u64,
     utxo_total_value_zat: u64,
@@ -844,7 +844,7 @@ fn fence_summary(fence: CanonicalEventFence, settled_tip: BlockId) -> FenceSumma
 
 fn ready_evidence_summary(evidence: &WalletProjectionReadyEvidence) -> ReadyEvidenceSummary {
     ReadyEvidenceSummary {
-        projection_digest_hex: hex::encode(evidence.projection_digest.as_bytes()),
+        wallet_projection_digest_hex: hex::encode(evidence.projection_digest.as_bytes()),
         row_counts: row_count_summary(evidence.row_counts),
         utxo_count: evidence.utxo_summary.utxo_count,
         utxo_total_value_zat: evidence.utxo_summary.total_value_zat,

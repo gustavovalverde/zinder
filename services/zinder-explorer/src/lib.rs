@@ -12,9 +12,9 @@ mod grpc;
 pub use grpc::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
 pub use zinder_materialized_views::{
     BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
-    BlockCommitContext, BlockCommitContextError, BlockKeyedConsumer, BlockSummaryConsumer,
-    BlockSummaryConsumerError, ChainCommittedEvent, ChainReorgedEvent, CommittedRange,
-    ConsumerEntry, MATERIALIZED_VIEW_STORE_FORMAT_VERSION, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
+    BlockCommitContext, BlockKeyedConsumer, BlockSummaryConsumer, BlockSummaryConsumerError,
+    ChainCommittedEvent, ChainReorgedEvent, CommittedRange, ConsumerEntry,
+    MATERIALIZED_VIEW_STORE_FORMAT_VERSION, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
     MEMPOOL_EVENT_COUNTS_CONSUMER_NAME, MEMPOOL_EVENT_COUNTS_RETENTION_SECONDS,
     MaterializedViewConsumer, MaterializedViewConsumerCtx, MaterializedViewConsumerError,
     MaterializedViewConsumerName, MaterializedViewCursorEntry, MaterializedViewError,

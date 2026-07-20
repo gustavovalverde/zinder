@@ -51,7 +51,7 @@ pub struct CanonicalLiveAppend {
 }
 
 impl CanonicalLiveAppend {
-    /// Creates one live append command with explicit finality and observation time.
+    /// Creates one live append command with explicit settlement and observation time.
     #[must_use]
     pub const fn new(
         expected_fence: CanonicalEventFence,
@@ -138,7 +138,7 @@ impl CanonicalAppendAnchor {
         self.event_fence
     }
 
-    /// Returns the current durable finality boundary.
+    /// Returns the current durable settlement boundary.
     #[must_use]
     pub const fn settled_tip(&self) -> BlockId {
         self.settled_tip
@@ -287,7 +287,7 @@ impl PreparedLiveAppendCommit {
             &append.block,
         )?;
         let (chain_epoch_id, chain_event_sequence) = next_live_fence(&store.ready_evidence)?;
-        let (visible_block_count, visible_sequence_digest, visible_logical_block_facts_bytes) =
+        let (visible_block_count, visible_sequence_digest, visible_logical_replay_bytes) =
             advance_visible_sequence(&store.ready_evidence, &append.block)?;
         let ready_evidence = CanonicalStoreReadyEvidence {
             visible_tip,
@@ -295,7 +295,7 @@ impl PreparedLiveAppendCommit {
             visible_event_sequence: chain_event_sequence,
             visible_block_count,
             visible_sequence_digest,
-            visible_logical_block_facts_bytes,
+            visible_logical_replay_bytes,
             sequence_checkpoint,
             ..store.ready_evidence
         };
@@ -450,14 +450,14 @@ fn advance_visible_sequence(
     let visible_digest = digest_builder.finish();
     let replay_bytes = u64::try_from(block.replay_envelope.as_bytes().len())
         .map_err(|_| CanonicalStoreError::live_commit("live replay bytes exceed u64::MAX"))?;
-    let visible_logical_block_facts_bytes = ready_evidence
-        .visible_logical_block_facts_bytes
+    let visible_logical_replay_bytes = ready_evidence
+        .visible_logical_replay_bytes
         .checked_add(replay_bytes)
         .ok_or_else(|| CanonicalStoreError::live_commit("visible replay bytes exceed u64::MAX"))?;
     Ok((
         visible_digest.block_count(),
         visible_digest.as_bytes(),
-        visible_logical_block_facts_bytes,
+        visible_logical_replay_bytes,
     ))
 }
 

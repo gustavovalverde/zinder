@@ -1,7 +1,7 @@
 //! `ChainReorgHistory` materialized-view consumer.
 //!
 //! Materializes one durable row for each `ChainReorged` event observed by the
-//! materialized-view tailer. The projection backfills from the earliest retained
+//! materialized-view tailer. The materialized view backfills from the earliest retained
 //! chain-event row on first deployment and then preserves future incidents
 //! independently of chain-event retention. It cannot reconstruct incidents
 //! already pruned before this consumer first ran.

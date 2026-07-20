@@ -49,9 +49,7 @@ enum ErrorReason {
   CHAIN_EVENT_CURSOR_EXPIRED = 12;
   MEMPOOL_EVENT_CURSOR_EXPIRED = 13;
   SNAPSHOT_PAGE_CURSOR_EXPIRED = 45;
-  CHAIN_EPOCH_PIN_UNSUPPORTED = 14;
   CHAIN_EPOCH_PIN_UNAVAILABLE = 15;
-  CHAIN_EPOCH_PIN_MISMATCH = 16;
   SCHEMA_MISMATCH = 17;
   SCHEMA_TOO_NEW = 18;
   REORG_WINDOW_EXCEEDED = 19;
@@ -81,7 +79,6 @@ enum ErrorReason {
 
   // FAILED_PRECONDITION family (materialized-view and node-capability gates).
   MATERIALIZED_VIEW_UNAVAILABLE = 34;
-  MATERIALIZED_VIEW_LAGGING = 35;
   NODE_CAPABILITY_MISSING = 36;
   EXPLORER_PRECONDITION_UNSATISFIED = 40;
 
@@ -92,7 +89,7 @@ enum ErrorReason {
   EXPLORER_METHOD_DISABLED = 39;
 
   // FAILED_PRECONDITION family (operator must reconfigure the deployment).
-  // A federated dependency the request needs (the canonical fact store, a
+  // A federated dependency the request needs (the canonical store, a
   // materialized view, or a wallet-query endpoint) is not wired on this deployment.
   // Waiting never clears it; the operator must configure the dependency.
   DEPENDENCY_NOT_CONFIGURED = 41;
@@ -102,7 +99,4 @@ enum ErrorReason {
   // restart, or transient network fault). Retrying with backoff clears it.
   UPSTREAM_UNREACHABLE = 42;
 
-  // Reserved slots for additive growth. Removing a reserved range is a
-  // breaking change.
-  reserved 47 to 63;
 }

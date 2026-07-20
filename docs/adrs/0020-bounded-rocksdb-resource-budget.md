@@ -4,7 +4,7 @@ Status: Accepted
 Date: 2026-05-20
 Related: [ADR-0001](0001-rocksdb-canonical-store.md),
 [ADR-0003](0003-canonical-storage-access-boundary.md),
-[ADR-0015](0015-unified-phase-driven-ingest.md),
+[ADR-0015](0015-phase-driven-ingest.md),
 [ADR-0022](0022-resource-budgeted-bulk-catchup.md)
 
 ## Context

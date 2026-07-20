@@ -20,13 +20,13 @@ use zinder_bench::{
     capture::{CaptureConfig, capture_fixed_range},
     fixture::FixtureManifest,
     recorder::install_recorder,
-    replay::{ProjectionReplayScope, ReplayConfig, replay_fixture},
+    replay::{MaterializedViewReplayScope, ReplayConfig, replay_fixture},
     report::{AcceptanceThresholds, BenchmarkReport, FixtureCachePolicy},
 };
 use zinder_core::{
     BlockHeight, Network, UnixTimestampMillis, wire::decode_zinder_native_chain_name,
 };
-use zinder_materialized_views::ProjectionPreset;
+use zinder_materialized_views::MaterializedViewPreset;
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
 #[path = "canonical_replay_storage/command.rs"]
@@ -68,8 +68,8 @@ enum Command {
     /// Capture predecessor and fixed-tip checkpoints for canonical fixture replay.
     #[command(name = "capture-canonical-fixture-checkpoints")]
     CaptureCanonicalFixtureCheckpoints(CaptureCanonicalFixtureCheckpointsArgs),
-    /// Replay the current projection-coupled schema over a captured fixture.
-    ProjectionCoupledReplay(ProjectionCoupledReplayArgs),
+    /// Replay a captured range into an existing canonical store.
+    CanonicalStoreRangeReplay(CanonicalStoreRangeReplayArgs),
     /// Persist and read back backend-neutral canonical replay records.
     #[command(name = "canonical-replay-storage")]
     CanonicalReplayStorage(CanonicalReplayStorageArgs),
@@ -175,7 +175,7 @@ struct CaptureCanonicalFixtureCheckpointsArgs {
 }
 
 #[derive(Args)]
-struct ProjectionCoupledReplayArgs {
+struct CanonicalStoreRangeReplayArgs {
     /// Captured fixture directory.
     #[arg(long)]
     fixture: PathBuf,
@@ -209,20 +209,20 @@ struct ProjectionCoupledReplayArgs {
     /// Optional canonical block-cache override in bytes.
     #[arg(long = "block-cache-bytes")]
     block_cache_bytes: Option<u64>,
-    /// Projection preset to replay after canonical ingest. `explorer` is a
-    /// diagnostic replay, not projection-readiness certification. Omit for a
+    /// Materialized-view preset to replay after canonical ingest. `explorer` is a
+    /// diagnostic replay, not materialized-view-readiness certification. Omit for a
     /// canonical-only run.
-    #[arg(long = "projection-preset")]
-    projection_preset: Option<CliProjectionPreset>,
-    /// Projection history to replay. Fixed-range seeds fresh projection
+    #[arg(long = "materialized-view-preset")]
+    materialized_view_preset: Option<CliMaterializedViewPreset>,
+    /// Materialized-view history to replay. Fixed-range seeds fresh materialized-view
     /// cursors at the cloned canonical tip; retained-history rebuilds all
     /// retained events.
     #[arg(
-        long = "projection-replay-scope",
+        long = "materialized-view-replay-scope",
         value_enum,
-        default_value_t = CliProjectionReplayScope::FixedRange
+        default_value_t = CliMaterializedViewReplayScope::FixedRange
     )]
-    projection_replay_scope: CliProjectionReplayScope,
+    materialized_view_replay_scope: CliMaterializedViewReplayScope,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -235,7 +235,7 @@ struct ProjectionCoupledReplayArgs {
     /// Controlled fixture-cache treatment; requires `--trial-id`.
     #[arg(long = "fixture-cache-policy", value_enum)]
     fixture_cache_policy: Option<FixtureCachePolicy>,
-    /// Stable operator label for the runner; resource facts are separate flags.
+    /// Stable operator label for the runner; resource limits are separate flags.
     #[arg(long = "runner-id")]
     runner_id: Option<String>,
     /// CPU limit applied to the benchmark container, in logical cores.
@@ -259,32 +259,32 @@ struct ProjectionCoupledReplayArgs {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum CliProjectionPreset {
+enum CliMaterializedViewPreset {
     Wallet,
     Explorer,
 }
 
-impl From<CliProjectionPreset> for ProjectionPreset {
-    fn from(preset: CliProjectionPreset) -> Self {
+impl From<CliMaterializedViewPreset> for MaterializedViewPreset {
+    fn from(preset: CliMaterializedViewPreset) -> Self {
         match preset {
-            CliProjectionPreset::Wallet => Self::Wallet,
-            CliProjectionPreset::Explorer => Self::Explorer,
+            CliMaterializedViewPreset::Wallet => Self::Wallet,
+            CliMaterializedViewPreset::Explorer => Self::Explorer,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum CliProjectionReplayScope {
+enum CliMaterializedViewReplayScope {
     #[default]
     FixedRange,
     RetainedHistory,
 }
 
-impl From<CliProjectionReplayScope> for ProjectionReplayScope {
-    fn from(scope: CliProjectionReplayScope) -> Self {
+impl From<CliMaterializedViewReplayScope> for MaterializedViewReplayScope {
+    fn from(scope: CliMaterializedViewReplayScope) -> Self {
         match scope {
-            CliProjectionReplayScope::FixedRange => Self::FixedRange,
-            CliProjectionReplayScope::RetainedHistory => Self::RetainedHistory,
+            CliMaterializedViewReplayScope::FixedRange => Self::FixedRange,
+            CliMaterializedViewReplayScope::RetainedHistory => Self::RetainedHistory,
         }
     }
 }
@@ -315,7 +315,7 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::CaptureCanonicalFixtureCheckpoints(args) => {
             run_capture_canonical_fixture_checkpoints(args).await
         }
-        Command::ProjectionCoupledReplay(args) => run_projection_coupled_replay(args).await,
+        Command::CanonicalStoreRangeReplay(args) => run_canonical_store_range_replay(args).await,
         Command::CanonicalReplayStorage(args) => {
             let output = run_canonical_replay_storage(args).await?;
             emit_report(&output.report, output.report_path.as_deref())?;
@@ -438,8 +438,8 @@ async fn run_capture(args: CaptureArgs) -> Result<(), BenchError> {
     Ok(())
 }
 
-async fn run_projection_coupled_replay(
-    args: ProjectionCoupledReplayArgs,
+async fn run_canonical_store_range_replay(
+    args: CanonicalStoreRangeReplayArgs,
 ) -> Result<(), BenchError> {
     let run_started_at_unix_millis = UnixTimestampMillis::now().value();
     let canonical_fixture_replay_thresholds = canonical_fixture_replay_thresholds(&args)?;
@@ -477,8 +477,10 @@ async fn run_projection_coupled_replay(
             .transpose()?,
         source_segment_delay_millis: args.source_segment_delay_millis,
         canonical_block_cache_bytes: args.block_cache_bytes,
-        projection_preset: args.projection_preset.map(ProjectionPreset::from),
-        projection_replay_scope: args.projection_replay_scope.into(),
+        materialized_view_preset: args
+            .materialized_view_preset
+            .map(MaterializedViewPreset::from),
+        materialized_view_replay_scope: args.materialized_view_replay_scope.into(),
         software_revision: args.software_revision,
         trial_id: args.trial_id,
         fixture_cache_policy: args.fixture_cache_policy,
@@ -497,7 +499,7 @@ async fn run_projection_coupled_replay(
 }
 
 fn canonical_fixture_replay_thresholds(
-    args: &ProjectionCoupledReplayArgs,
+    args: &CanonicalStoreRangeReplayArgs,
 ) -> Result<Option<AcceptanceThresholds>, BenchError> {
     let thresholds = match (
         args.canonical_fixture_replay_target_secs,
@@ -574,10 +576,10 @@ mod tests {
 
     use super::{Cli, Command, canonical_fixture_replay_thresholds, create_report_file};
 
-    fn projection_coupled_replay_args(extra: &[&str]) -> Vec<String> {
+    fn canonical_store_range_replay_args(extra: &[&str]) -> Vec<String> {
         [
             "zinder-bench",
-            "projection-coupled-replay",
+            "canonical-store-range-replay",
             "--fixture",
             "fixture",
             "--store",
@@ -587,37 +589,6 @@ mod tests {
         .chain(extra.iter().copied())
         .map(str::to_owned)
         .collect()
-    }
-
-    #[test]
-    fn removed_target_plane_and_old_canonical_flags_are_rejected() {
-        for removed_flag in [
-            "--canonical-build-target-secs",
-            "--canonical-build-hard-limit-secs",
-            "--wallet-build-target-secs",
-            "--wallet-build-hard-limit-secs",
-            "--wallet-build-lifecycle-target-secs",
-            "--wallet-build-lifecycle-hard-limit-secs",
-        ] {
-            assert!(
-                Cli::try_parse_from(projection_coupled_replay_args(&[removed_flag, "10"])).is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn ambiguous_legacy_replay_command_is_rejected() {
-        assert!(
-            Cli::try_parse_from([
-                "zinder-bench",
-                "replay",
-                "--fixture",
-                "fixture",
-                "--store",
-                "store",
-            ])
-            .is_err()
-        );
     }
 
     #[test]
@@ -722,12 +693,12 @@ mod tests {
 
     #[test]
     fn acceptance_threshold_flags_must_be_supplied_as_a_pair() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(projection_coupled_replay_args(&[
+        let cli = Cli::try_parse_from(canonical_store_range_replay_args(&[
             "--canonical-fixture-replay-target-secs",
             "10",
         ]))?;
-        let Command::ProjectionCoupledReplay(args) = cli.command else {
-            return Err("expected projection-coupled-replay command".into());
+        let Command::CanonicalStoreRangeReplay(args) = cli.command else {
+            return Err("expected canonical-store-range-replay command".into());
         };
 
         let Some(error) = canonical_fixture_replay_thresholds(&args).err() else {
@@ -741,14 +712,14 @@ mod tests {
 
     #[test]
     fn acceptance_threshold_pair_parses() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(projection_coupled_replay_args(&[
+        let cli = Cli::try_parse_from(canonical_store_range_replay_args(&[
             "--canonical-fixture-replay-target-secs",
             "10",
             "--canonical-fixture-replay-hard-limit-secs",
             "20",
         ]))?;
-        let Command::ProjectionCoupledReplay(args) = cli.command else {
-            return Err("expected projection-coupled-replay command".into());
+        let Command::CanonicalStoreRangeReplay(args) = cli.command else {
+            return Err("expected canonical-store-range-replay command".into());
         };
 
         assert!(canonical_fixture_replay_thresholds(&args)?.is_some());
@@ -757,9 +728,9 @@ mod tests {
 
     #[test]
     fn unthresholded_replay_allows_omitted_provenance() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(projection_coupled_replay_args(&[]))?;
-        let Command::ProjectionCoupledReplay(args) = cli.command else {
-            return Err("expected projection-coupled-replay command".into());
+        let cli = Cli::try_parse_from(canonical_store_range_replay_args(&[]))?;
+        let Command::CanonicalStoreRangeReplay(args) = cli.command else {
+            return Err("expected canonical-store-range-replay command".into());
         };
 
         assert!(canonical_fixture_replay_thresholds(&args)?.is_none());
@@ -768,7 +739,7 @@ mod tests {
 
     #[test]
     fn source_admission_experiment_flags_parse() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from(projection_coupled_replay_args(&[
+        let cli = Cli::try_parse_from(canonical_store_range_replay_args(&[
             "--max-response-bytes",
             "67108864",
             "--source-segment-max-blocks",
@@ -784,8 +755,8 @@ mod tests {
             "--source-segment-delay-millis",
             "250",
         ]))?;
-        let Command::ProjectionCoupledReplay(args) = cli.command else {
-            return Err("expected projection-coupled-replay command".into());
+        let Command::CanonicalStoreRangeReplay(args) = cli.command else {
+            return Err("expected canonical-store-range-replay command".into());
         };
 
         assert_eq!(args.max_response_bytes, Some(67_108_864));

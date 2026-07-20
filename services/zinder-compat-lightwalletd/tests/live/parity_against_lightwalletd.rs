@@ -1074,7 +1074,7 @@ async fn taddress_history_matches_reference_for_unused_address() -> Result<()> {
         return Ok(());
     };
     let address = unused_parity_transparent_address();
-    let latest_block = zinder.get_latest_block(ChainSpec {}).await?.into_inner();
+    let visible_tip_block = zinder.get_latest_block(ChainSpec {}).await?.into_inner();
 
     let history_request = || lightwalletd::TransparentAddressBlockFilter {
         address: address.clone(),
@@ -1084,7 +1084,7 @@ async fn taddress_history_matches_reference_for_unused_address() -> Result<()> {
                 hash: Vec::new(),
             }),
             end: Some(BlockId {
-                height: latest_block.height,
+                height: visible_tip_block.height,
                 hash: Vec::new(),
             }),
             pool_types: Vec::new(),
@@ -1182,7 +1182,7 @@ async fn taddress_history_matches_reference_for_miner_address() -> Result<()> {
     };
     let address = parity_transparent_address()?;
 
-    let latest_block = zinder.get_latest_block(ChainSpec {}).await?.into_inner();
+    let visible_tip_block = zinder.get_latest_block(ChainSpec {}).await?.into_inner();
     let request = || lightwalletd::TransparentAddressBlockFilter {
         address: address.clone(),
         range: Some(BlockRange {
@@ -1191,7 +1191,7 @@ async fn taddress_history_matches_reference_for_miner_address() -> Result<()> {
                 hash: Vec::new(),
             }),
             end: Some(BlockId {
-                height: latest_block.height,
+                height: visible_tip_block.height,
                 hash: Vec::new(),
             }),
             pool_types: Vec::new(),

@@ -11,7 +11,7 @@ use zinder_core::{
     TransactionVersion,
 };
 use zinder_materialized_views::{
-    BlockCommitContext, BlockCommitPayload, BlockKeyedConsumer, IRONWOOD_MIGRATION_SCHEMA,
+    BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, IRONWOOD_MIGRATION_SCHEMA,
     IronwoodMigrationConsumer, MaterializedViewConsumerCtx, MaterializedViewConsumerSchema,
     MaterializedViewStore, MaterializedViewStoreOptions, TransparentSpendFacts,
 };
@@ -94,7 +94,7 @@ fn balance_transaction(
 
 fn block(height: u32, transactions: Vec<TransactionFactsArtifact>) -> BlockCommitContext {
     BlockCommitContext::new(
-        BlockCommitPayload {
+        BlockCommitInput {
             height: BlockHeight::new(height),
             block_hash: BlockHash::from_bytes([0xAB; 32]),
             previous_block_hash: BlockHash::from_bytes([0xCD; 32]),

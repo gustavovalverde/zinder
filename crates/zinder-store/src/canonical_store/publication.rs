@@ -57,10 +57,10 @@ const REVERTED_RANGE_PRESENT: u8 = 1;
 const EPOCH_VALUE_LENGTH: usize = 1 + 4 + 32 + 4 + 32 + 12 + 8;
 const EVENT_VALUE_LENGTH: usize = 1 + 1 + 8 + 8 + 1 + 4 + 4 + 4 + 4 + 4 + 32 + 8 + 32;
 
-/// Explicit finality and observation time for the first visible canonical epoch.
+/// Explicit settlement and observation time for the first visible canonical epoch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalBaselinePublication {
-    /// Highest block whose canonical identity is safe under the caller's reorg policy.
+    /// Highest block whose canonical identity is settled under the caller's reorg policy.
     pub settled_tip: BlockId,
     /// Wall-clock time at which epoch 1 became visible.
     pub created_at: UnixTimestampMillis,
@@ -422,7 +422,7 @@ fn ready_evidence_from_cold_replay(
         replay_format_version: evidence.replay_format_version,
         sequence_digest_version: evidence.sequence_digest_version,
         visible_sequence_digest: evidence.sequence_digest.as_bytes(),
-        visible_logical_block_facts_bytes: evidence.logical_replay_bytes,
+        visible_logical_replay_bytes: evidence.logical_replay_bytes,
         sequence_checkpoint,
         construction_manifest_version: 0,
         construction_manifest_sha256: [0; 32],
@@ -462,7 +462,7 @@ fn ready_evidence_from_trusted_fresh(
         replay_format_version: evidence.replay_format_version,
         sequence_digest_version: evidence.sequence_digest_version,
         visible_sequence_digest: evidence.sequence_digest.as_bytes(),
-        visible_logical_block_facts_bytes: logical_replay_bytes,
+        visible_logical_replay_bytes: logical_replay_bytes,
         sequence_checkpoint,
         construction_manifest_version: 0,
         construction_manifest_sha256: [0; 32],
@@ -573,7 +573,7 @@ fn validate_cold_evidence_matches_writer(
 }
 
 impl ValidatedRocksDbCanonicalBuild {
-    /// Validates baseline finality and time without consuming the expensive build.
+    /// Validates baseline settlement and time without consuming the expensive build.
     pub fn prepare_baseline(
         &self,
         publication: CanonicalBaselinePublication,
@@ -905,7 +905,7 @@ pub(super) fn validate_ready_sequence_checkpoint(
             ready_evidence.visible_block_count,
             ready_evidence.visible_sequence_digest,
         ),
-        ready_evidence.visible_logical_block_facts_bytes,
+        ready_evidence.visible_logical_replay_bytes,
     );
     if resumed != expected_visible {
         return Err(CanonicalStoreError::publication(
@@ -1912,7 +1912,7 @@ mod tests {
             replay_format_version: CanonicalBlockReplayFormatVersion::V1,
             sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
             visible_sequence_digest: [4; 32],
-            visible_logical_block_facts_bytes: 1,
+            visible_logical_replay_bytes: 1,
             sequence_checkpoint: CanonicalSequenceCheckpoint::from_admitted_parts(
                 BlockId::new(BlockHeight::new(20), BlockHash::from_bytes([2; 32])),
                 11,

@@ -16,7 +16,7 @@ use serde::Serialize;
 use tonic::{Request, Status, service::Interceptor};
 use zinder_proto::v1::{ingest as ingest_proto, ops as ops_proto};
 
-/// Current phase of the unified ingest loop ([ADR-0015]).
+/// Current phase of the phase-driven ingest loop ([ADR-0015]).
 ///
 /// `phase` is orthogonal to [`ReadinessCause`]: an ingest writer in
 /// [`IngestPhase::BulkCatchup`] may report `cause=syncing` (normal) or
@@ -28,7 +28,7 @@ use zinder_proto::v1::{ingest as ingest_proto, ops as ops_proto};
 /// `zinder.v1.ingest.WriterPhase` enum. The wire shape is part of the
 /// public contract; the Rust enum spelling is an implementation detail.
 ///
-/// [ADR-0015]: ../../../docs/adrs/0015-unified-phase-driven-ingest.md
+/// [ADR-0015]: ../../../docs/adrs/0015-phase-driven-ingest.md
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -202,7 +202,7 @@ pub struct NodeUnavailableDetail {
 /// [ADR-0015 §Upstream sync detection].
 ///
 /// [ADR-0015 §Upstream sync detection]:
-///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UpstreamNotReadyDetail {
     /// Upstream's last committed tip height when known.
@@ -416,15 +416,15 @@ pub struct ReadinessReport {
     /// reader binaries serialize `phase: null` (omitted from JSON via
     /// `skip_serializing_if`). Orthogonal to [`Self::cause`].
     ///
-    /// [ADR-0015]: ../../../docs/adrs/0015-unified-phase-driven-ingest.md
+    /// [ADR-0015]: ../../../docs/adrs/0015-phase-driven-ingest.md
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<IngestPhase>,
-    /// Selected closed projection workload, when this service opened one.
+    /// Selected closed materialized-view workload, when this service opened one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub projection_preset: Option<String>,
-    /// Stable identities selected by [`Self::projection_preset`].
+    pub materialized_view_preset: Option<String>,
+    /// Stable identities selected by [`Self::materialized_view_preset`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub projection_identities: Vec<String>,
+    pub materialized_view_identities: Vec<String>,
 }
 
 impl ReadinessReport {
@@ -437,14 +437,14 @@ impl ReadinessReport {
             current_height: None,
             target_height: None,
             phase: None,
-            projection_preset: None,
-            projection_identities: Vec::new(),
+            materialized_view_preset: None,
+            materialized_view_identities: Vec::new(),
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
-struct ProjectionWorkload {
+struct MaterializedViewWorkload {
     preset: Option<String>,
     identities: Vec<String>,
 }
@@ -454,7 +454,7 @@ struct ProjectionWorkload {
 #[derive(Clone, Debug)]
 pub struct Readiness {
     inner: Arc<Mutex<ReadinessState>>,
-    projection_workload: Arc<Mutex<ProjectionWorkload>>,
+    materialized_view_workload: Arc<Mutex<MaterializedViewWorkload>>,
 }
 
 impl Default for Readiness {
@@ -469,13 +469,17 @@ impl Readiness {
     pub fn new(state: ReadinessState) -> Self {
         Self {
             inner: Arc::new(Mutex::new(state)),
-            projection_workload: Arc::new(Mutex::new(ProjectionWorkload::default())),
+            materialized_view_workload: Arc::new(Mutex::new(MaterializedViewWorkload::default())),
         }
     }
 
-    /// Sets the closed projection workload exposed by readiness and metrics.
-    pub fn set_projection_workload(&self, preset: impl Into<String>, identities: Vec<String>) {
-        *self.projection_workload.lock() = ProjectionWorkload {
+    /// Sets the closed materialized-view workload exposed by readiness and metrics.
+    pub fn set_materialized_view_workload(
+        &self,
+        preset: impl Into<String>,
+        identities: Vec<String>,
+    ) {
+        *self.materialized_view_workload.lock() = MaterializedViewWorkload {
             preset: Some(preset.into()),
             identities,
         };
@@ -522,7 +526,7 @@ impl Readiness {
     }
 
     /// Sets the [`IngestPhase`] on the current state without disturbing
-    /// any other field. Used by the unified ingest loop's per-iteration
+    /// any other field. Used by the phase-driven ingest loop's per-iteration
     /// classifier stamp.
     pub fn set_phase(&self, phase: IngestPhase) {
         self.inner.lock().phase = Some(phase);
@@ -550,15 +554,15 @@ impl Readiness {
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
         let state = self.inner.lock().clone();
-        let projection_workload = self.projection_workload.lock().clone();
+        let materialized_view_workload = self.materialized_view_workload.lock().clone();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
             cause: state.cause,
             current_height: state.current_height,
             target_height: state.target_height,
             phase: state.phase,
-            projection_preset: projection_workload.preset,
-            projection_identities: projection_workload.identities,
+            materialized_view_preset: materialized_view_workload.preset,
+            materialized_view_identities: materialized_view_workload.identities,
         }
     }
 }
@@ -606,7 +610,7 @@ pub struct ReadinessState {
     /// for the life of the process. The ingest binary updates it on every
     /// classifier iteration via [`Self::with_phase`].
     ///
-    /// [ADR-0015]: ../../../docs/adrs/0015-unified-phase-driven-ingest.md
+    /// [ADR-0015]: ../../../docs/adrs/0015-phase-driven-ingest.md
     pub phase: Option<IngestPhase>,
 }
 
@@ -824,7 +828,7 @@ impl ReadinessState {
     /// sentinel string per [ADR-0015 §Upstream sync detection].
     ///
     /// [ADR-0015 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+    ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
     #[must_use]
     pub fn upstream_not_ready_with_detail(
         detail: UpstreamNotReadyDetail,
@@ -972,8 +976,8 @@ impl From<&ReadinessReport> for ops_proto::ReadinessReport {
             current_height: report.current_height,
             target_height: report.target_height,
             detail: Option::<ops_proto::ReadinessCauseDetail>::from(&report.cause),
-            projection_preset: report.projection_preset.clone().unwrap_or_default(),
-            projection_identities: report.projection_identities.clone(),
+            materialized_view_preset: report.materialized_view_preset.clone().unwrap_or_default(),
+            materialized_view_identities: report.materialized_view_identities.clone(),
         }
     }
 }
@@ -1078,9 +1082,10 @@ mod tests {
     }
 
     #[test]
-    fn projection_workload_survives_readiness_state_changes() -> Result<(), serde_json::Error> {
+    fn materialized_view_workload_survives_readiness_state_changes() -> Result<(), serde_json::Error>
+    {
         let readiness = Readiness::default();
-        readiness.set_projection_workload(
+        readiness.set_materialized_view_workload(
             "wallet",
             vec![
                 "transparent_address_transaction_history".to_owned(),
@@ -1090,12 +1095,14 @@ mod tests {
         readiness.set(ReadinessState::ready(Some(10)));
 
         let report = readiness.report();
-        assert_eq!(report.projection_preset.as_deref(), Some("wallet"));
-        assert_eq!(report.projection_identities.len(), 2);
+        assert_eq!(report.materialized_view_preset.as_deref(), Some("wallet"));
+        assert_eq!(report.materialized_view_identities.len(), 2);
         let rendered = serde_json::to_value(report)?;
-        assert_eq!(rendered["projection_preset"], "wallet");
+        assert_eq!(rendered["materialized_view_preset"], "wallet");
         assert_eq!(
-            rendered["projection_identities"].as_array().map(Vec::len),
+            rendered["materialized_view_identities"]
+                .as_array()
+                .map(Vec::len),
             Some(2)
         );
         Ok(())
@@ -1411,8 +1418,8 @@ mod tests {
             current_height: Some(100),
             target_height: None,
             phase: None,
-            projection_preset: Some("wallet".to_owned()),
-            projection_identities: vec!["transparent_outpoint_spend".to_owned()],
+            materialized_view_preset: Some("wallet".to_owned()),
+            materialized_view_identities: vec!["transparent_outpoint_spend".to_owned()],
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1422,8 +1429,11 @@ mod tests {
         );
         assert_eq!(proto.current_height, Some(100));
         assert_eq!(proto.target_height, None);
-        assert_eq!(proto.projection_preset, "wallet");
-        assert_eq!(proto.projection_identities, ["transparent_outpoint_spend"]);
+        assert_eq!(proto.materialized_view_preset, "wallet");
+        assert_eq!(
+            proto.materialized_view_identities,
+            ["transparent_outpoint_spend"]
+        );
 
         let Some(detail) = proto.detail else {
             unreachable!("parametric cause must carry detail")
@@ -1447,8 +1457,8 @@ mod tests {
             current_height: None,
             target_height: None,
             phase: None,
-            projection_preset: None,
-            projection_identities: Vec::new(),
+            materialized_view_preset: None,
+            materialized_view_identities: Vec::new(),
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1472,8 +1482,8 @@ mod tests {
             current_height: Some(4_013_801),
             target_height: None,
             phase: None,
-            projection_preset: None,
-            projection_identities: Vec::new(),
+            materialized_view_preset: None,
+            materialized_view_identities: Vec::new(),
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);

@@ -58,7 +58,7 @@ pub(crate) enum CanonicalReplayVerificationError {
         actual_block_count: usize,
     },
 
-    /// The bounded legacy header read returned an unexpected number of rows.
+    /// The bounded canonical header read returned an unexpected number of rows.
     #[error(
         "canonical block-header batch at height {start_height} returned {actual_block_count} rows; expected {expected_block_count}"
     )]
@@ -68,7 +68,7 @@ pub(crate) enum CanonicalReplayVerificationError {
         actual_block_count: usize,
     },
 
-    /// The legacy block-header family did not contain the replayed height.
+    /// The canonical block-header family did not contain the replayed height.
     #[error("canonical block header is missing at replay height {height}")]
     CanonicalHeaderMissing { height: u32 },
 

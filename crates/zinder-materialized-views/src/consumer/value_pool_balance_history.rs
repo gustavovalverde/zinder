@@ -252,7 +252,7 @@ impl ValuePoolBalanceHistoryConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_projection_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -287,7 +287,7 @@ impl ValuePoolBalanceHistoryConsumer {
             BACKFILL_COVERAGE_KEY,
             encode_backfill_coverage(next_coverage),
         );
-        store.write_projection_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -308,7 +308,7 @@ impl ValuePoolBalanceHistoryConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
-        store.write_projection_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
+        store.write_consumer_batch(VALUE_POOL_BALANCE_HISTORY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
 
@@ -544,7 +544,7 @@ impl BlockKeyedConsumer for ValuePoolBalanceHistoryConsumer {
                 },
             ));
         }
-        let pools = block.block_value_pool_balances()?.ok_or_else(|| {
+        let pools = block.block_value_pool_balances().ok_or_else(|| {
             Box::new(ValuePoolBalanceHistoryConsumerError::MissingValuePools {
                 height: block.height.value(),
             }) as MaterializedViewConsumerError
@@ -1058,9 +1058,6 @@ pub enum ValuePoolBalanceHistoryConsumerError {
     /// Materialized-view store operation failed.
     #[error(transparent)]
     Store(#[from] MaterializedViewStoreError),
-    /// Shared block-context hydration failed.
-    #[error(transparent)]
-    BlockContext(#[from] crate::consumer::BlockCommitContextError),
     /// The block did not carry an authoritative chain value-pool snapshot.
     #[error("block {height} is missing chain value-pool facts")]
     MissingValuePools {

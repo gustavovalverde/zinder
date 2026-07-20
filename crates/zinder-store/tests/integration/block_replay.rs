@@ -24,7 +24,7 @@ use zinder_store::{
 
 const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
 const REORG_WINDOW_COLUMN_FAMILY: &str = "reorg_window";
-const SAFE_BLOCK_VISIBILITY_KEY_KIND: u8 = 33;
+const BLOCK_HEADER_VISIBILITY_KEY_KIND: u8 = 33;
 
 #[test]
 fn append_reorg_and_reopen_expose_only_epoch_canonical_replay() -> eyre::Result<()> {
@@ -471,7 +471,7 @@ fn missing_and_corrupt_visibility_rows_fail_closed_on_batch_reads() -> eyre::Res
             let store = PrimaryChainStore::open(&path, ChainStoreOptions::for_local_tests())?;
             store.commit_chain_epoch(single_block_artifacts())?;
         }
-        mutate_first_safe_block_visibility_row(&path, mutation)?;
+        mutate_first_block_header_visibility_row(&path, mutation)?;
 
         let store = PrimaryChainStore::open(&path, ChainStoreOptions::for_local_tests())?;
         let error = match store.current_chain_epoch_reader()?.block_replay_batch(
@@ -514,7 +514,7 @@ fn valid_length_visibility_pointer_to_displaced_replay_fails_closed() -> eyre::R
         store.commit_chain_epoch(initial_artifacts())?;
         store.commit_chain_epoch(replacement_artifacts())?;
     }
-    rewrite_safe_block_visibility_pointer(
+    rewrite_block_header_visibility_pointer(
         &path,
         BlockHeight::new(2),
         ChainEpochId::new(2),
@@ -590,7 +590,7 @@ fn mutate_first_replay_row(path: &Path, mutation: StoredRowMutation) -> eyre::Re
     Ok(())
 }
 
-fn mutate_first_safe_block_visibility_row(
+fn mutate_first_block_header_visibility_row(
     path: &Path,
     mutation: StoredRowMutation,
 ) -> eyre::Result<()> {
@@ -604,7 +604,7 @@ fn mutate_first_safe_block_visibility_row(
     let mut visibility_key = None;
     while iterator.valid() {
         if let Some(key) = iterator.key()
-            && key.get(1) == Some(&SAFE_BLOCK_VISIBILITY_KEY_KIND)
+            && key.get(1) == Some(&BLOCK_HEADER_VISIBILITY_KEY_KIND)
         {
             visibility_key = Some(key.to_vec());
             break;
@@ -612,7 +612,7 @@ fn mutate_first_safe_block_visibility_row(
         iterator.next();
     }
     iterator.status()?;
-    let key = visibility_key.ok_or_else(|| eyre!("missing safe-block visibility row"))?;
+    let key = visibility_key.ok_or_else(|| eyre!("missing block-header visibility row"))?;
     drop(iterator);
     match mutation {
         StoredRowMutation::Delete => database.delete_cf(&column_family, key)?,
@@ -622,7 +622,7 @@ fn mutate_first_safe_block_visibility_row(
     Ok(())
 }
 
-fn rewrite_safe_block_visibility_pointer(
+fn rewrite_block_header_visibility_pointer(
     path: &Path,
     height: BlockHeight,
     publication_epoch: ChainEpochId,
@@ -640,7 +640,7 @@ fn rewrite_safe_block_visibility_pointer(
     let mut visibility_key = None;
     while iterator.valid() {
         if let Some(key) = iterator.key()
-            && key.get(1) == Some(&SAFE_BLOCK_VISIBILITY_KEY_KIND)
+            && key.get(1) == Some(&BLOCK_HEADER_VISIBILITY_KEY_KIND)
             && key.get(key.len().saturating_sub(12)..key.len().saturating_sub(8))
                 == Some(expected_height_bytes.as_slice())
             && key.get(key.len().saturating_sub(8)..)
@@ -652,7 +652,8 @@ fn rewrite_safe_block_visibility_pointer(
         iterator.next();
     }
     iterator.status()?;
-    let key = visibility_key.ok_or_else(|| eyre!("missing selected safe-block visibility row"))?;
+    let key =
+        visibility_key.ok_or_else(|| eyre!("missing selected block-header visibility row"))?;
     drop(iterator);
     database.put_cf(&column_family, key, source_epoch.value().to_be_bytes())?;
     database.flush_cf(&column_family)?;

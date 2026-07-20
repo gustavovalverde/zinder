@@ -23,8 +23,8 @@ use zinder_core::{
     CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
     CommitmentTreeFrontiers, ConsensusBranchId, FinalNoteCommitmentRoot, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult, TransactionId,
-    ValuePoolBalance,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
+    TransactionId, ValuePoolBalance,
 };
 
 use crate::{
@@ -492,7 +492,7 @@ impl ZebraJsonRpcSource {
     /// [ADR-0015 §Upstream sync detection].
     ///
     /// [ADR-0015 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+    ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
     #[must_use]
     pub fn with_health_config(mut self, health_config: Option<NodeHealthConfig>) -> Self {
         self.ready_http_client = health_config
@@ -1269,7 +1269,7 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, SourceError> {
+    ) -> Result<TransactionBroadcastOutcome, SourceError> {
         let raw_transaction_hex = hex::encode(raw_transaction.as_slice());
         let params = positional_params([Value::from(raw_transaction_hex)])?;
 
@@ -1299,9 +1299,11 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
         ));
 
         match response {
-            Ok(transaction_id_hex) => Ok(TransactionBroadcastResult::Accepted(BroadcastAccepted {
-                transaction_id: decode_display_transaction_id(&transaction_id_hex)?,
-            })),
+            Ok(transaction_id_hex) => {
+                Ok(TransactionBroadcastOutcome::Accepted(BroadcastAccepted {
+                    transaction_id: decode_display_transaction_id(&transaction_id_hex)?,
+                }))
+            }
             Err(ClientError::Call(error)) => {
                 Ok(classify_broadcast_error(JsonRpcCallError::from(error)))
             }
@@ -1927,11 +1929,11 @@ fn decode_subtree_root_hash(root_hash: &str) -> Result<SubtreeRootHash, SourceEr
     Ok(SubtreeRootHash::from_bytes(root_hash_bytes))
 }
 
-fn classify_broadcast_error(error: JsonRpcCallError) -> TransactionBroadcastResult {
+fn classify_broadcast_error(error: JsonRpcCallError) -> TransactionBroadcastOutcome {
     let JsonRpcCallError { code, message } = error;
 
     let Some(numeric_error_code) = code else {
-        return TransactionBroadcastResult::Unknown(BroadcastUnknown {
+        return TransactionBroadcastOutcome::Unknown(BroadcastUnknown {
             error_code: None,
             message,
         });
@@ -1940,29 +1942,29 @@ fn classify_broadcast_error(error: JsonRpcCallError) -> TransactionBroadcastResu
     let error_code = Some(numeric_error_code);
     match i32::try_from(numeric_error_code).ok() {
         Some(JSON_RPC_INVALID_ENCODING_CODE) => {
-            TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {
+            TransactionBroadcastOutcome::InvalidEncoding(BroadcastInvalidEncoding {
                 error_code,
                 message,
             })
         }
         Some(JSON_RPC_DUPLICATE_TRANSACTION_CODE) => {
-            TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
+            TransactionBroadcastOutcome::Duplicate(BroadcastDuplicate {
                 error_code,
                 message,
             })
         }
         _ if is_duplicate_transaction_message(&message) => {
-            TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
+            TransactionBroadcastOutcome::Duplicate(BroadcastDuplicate {
                 error_code,
                 message,
             })
         }
         _ => {
             if is_already_queued_message(&message) {
-                TransactionBroadcastResult::Queued(BroadcastQueued { message })
+                TransactionBroadcastOutcome::Queued(BroadcastQueued { message })
             } else {
                 let kind = classify_rejection_reason(&message);
-                TransactionBroadcastResult::Rejected(BroadcastRejected {
+                TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                     kind,
                     error_code,
                     message,
@@ -2169,19 +2171,19 @@ struct ZebraGetBlockchainInfoUpgrades {
     // active one; a `BTreeMap` would reorder by branch-id hex and resolve the
     // tie to the wrong upgrade.
     #[serde(deserialize_with = "deserialize_upgrades_in_advertised_order")]
-    upgrades: Vec<(String, ZebraNetworkUpgradeInfo)>,
+    upgrades: Vec<(String, ZebraNetworkUpgradeActivation)>,
 }
 
 fn deserialize_upgrades_in_advertised_order<'de, D>(
     deserializer: D,
-) -> Result<Vec<(String, ZebraNetworkUpgradeInfo)>, D::Error>
+) -> Result<Vec<(String, ZebraNetworkUpgradeActivation)>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     struct AdvertisedOrderVisitor;
 
     impl<'de> serde::de::Visitor<'de> for AdvertisedOrderVisitor {
-        type Value = Vec<(String, ZebraNetworkUpgradeInfo)>;
+        type Value = Vec<(String, ZebraNetworkUpgradeActivation)>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("a map of consensus branch id to network upgrade info")
@@ -2229,7 +2231,7 @@ struct ZebraValuePoolEntry {
 }
 
 #[derive(Deserialize)]
-struct ZebraNetworkUpgradeInfo {
+struct ZebraNetworkUpgradeActivation {
     name: String,
     #[serde(rename = "activationheight")]
     activation_height: u32,
@@ -2432,7 +2434,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            TransactionBroadcastResult::Queued(BroadcastQueued { ref message })
+            TransactionBroadcastOutcome::Queued(BroadcastQueued { ref message })
                 if message == "transaction was already queued for download"
         ));
     }
@@ -2446,7 +2448,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            TransactionBroadcastResult::Rejected(BroadcastRejected {
+            TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                 kind: BroadcastRejectionReason::InvalidSignature,
                 ..
             })
@@ -2462,7 +2464,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            TransactionBroadcastResult::Rejected(BroadcastRejected {
+            TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                 kind: BroadcastRejectionReason::BadExpiryHeight,
                 ..
             })
@@ -2478,7 +2480,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            TransactionBroadcastResult::Rejected(BroadcastRejected {
+            TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                 kind: BroadcastRejectionReason::BadConsensusBranch,
                 ..
             })
@@ -2494,7 +2496,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            TransactionBroadcastResult::Rejected(BroadcastRejected {
+            TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                 kind: BroadcastRejectionReason::MempoolFull,
                 ..
             })
@@ -2510,7 +2512,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            TransactionBroadcastResult::Rejected(BroadcastRejected {
+            TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                 kind: BroadcastRejectionReason::Unknown,
                 ..
             })

@@ -194,17 +194,16 @@ if [[ -n "$release_images_workflow" ]]; then
   if grep -Fq 'zinder-single-container' "$release_images_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the image workflow would publish the mixed
-zinder-single-container bundle. Phase 7 must supply and certify a complete
-topology before a bundled production image can be published.
+zinder-single-container bundle. The Railway image set contains only the
+ingest-only diagnostic or canary runtime.
 EOF
     exit 1
   fi
 
   if grep -Eq '"zinder-(query|explorer):zinder-(query|explorer)"' "$release_images_workflow"; then
     cat >&2 <<'EOF'
-release admission rejected: the image workflow would publish a superseded
-query or explorer ownership runtime. Those images return only after their
-separate canonical secondary migrations pass parity and deletion gates.
+release admission rejected: the Railway image set does not publish query or
+explorer ownership runtimes.
 EOF
     exit 1
   fi
@@ -245,7 +244,7 @@ case "$deployment_class:$target" in
   production:zinder-single-container)
     cat >&2 <<'EOF'
 release admission rejected: zinder-single-container combines canonical
-ingest with legacy reader ownership and omits zinder-compat-lightwalletd.
+ingest with reader ownership and omits zinder-compat-lightwalletd.
 It is not a production candidate.
 EOF
     exit 1
@@ -262,14 +261,14 @@ EOF
     cat >&2 <<'EOF'
 release admission rejected: Railway requires an explicit admitted deployment
 class and target. Only the zinder-canonical-runtime diagnostic/canary target
-is admitted before Phase 7.
+is admitted.
 EOF
     exit 1
     ;;
   production:*)
     cat >&2 <<EOF
 release admission rejected: $target is not a certified complete version-1
-production topology. Phase 7 admission is still required.
+production topology.
 EOF
     exit 1
     ;;

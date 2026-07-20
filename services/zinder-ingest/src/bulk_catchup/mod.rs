@@ -73,7 +73,7 @@ pub struct BulkCatchupRunConfig {
     pub storage_path: PathBuf,
     /// Bounded `RocksDB` resource budget applied when opening the canonical store.
     pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
-    /// Reorg window used by the canonical writer and historical finality checks.
+    /// Reorg window used by the canonical writer and historical settlement checks.
     pub reorg_window_blocks: u32,
     /// First block height to ingest.
     pub from_height: BlockHeight,
@@ -101,12 +101,12 @@ pub struct BulkCatchupRunConfig {
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     /// Pre-observed upstream tip height. When set, `run_bulk_catchup_with_store`
     /// uses this in place of an internal `tip_id()` round-trip for its
-    /// finality-bound validation. The unified ingest loop reuses the tip
+    /// settlement-bound validation. The phase-driven ingest loop reuses the tip
     /// it observed at the top of each iteration; one-shot callers leave
     /// this `None` so the call observes the tip itself.
     pub upstream_tip_hint: Option<BlockHeight>,
-    /// Allows finalizing blocks inside the upstream node's current reorg window.
-    pub allow_near_tip_finalize: bool,
+    /// Allows advancing the settled tip inside the upstream node's current reorg window.
+    pub allow_reorg_window_settlement: bool,
     /// Optional starting checkpoint for an empty store.
     ///
     /// When present and the store is empty, ingest seeds a stub chain epoch
@@ -130,7 +130,7 @@ impl BulkCatchupRunConfig {
 
 /// Mutable state carried across bulk-catchup batches.
 ///
-/// The unified ingest loop invokes `run_bulk_catchup_until_complete` once per
+/// The phase-driven ingest loop invokes `run_bulk_catchup_until_complete` once per
 /// bulk-catchup batch so it can re-classify the phase after each commit.
 /// This state keeps the WAL flush cadence and source-density sizing tied to
 /// the continuous bulk range rather than to that one-batch call boundary.
@@ -250,7 +250,7 @@ where
 ///
 /// When [`BulkCatchupRunConfig::upstream_tip_hint`] is `Some`, the call skips
 /// its own `tip_id()` round-trip and uses the caller-supplied tip for
-/// the finality-bound validation. The unified ingest loop sets the hint
+/// the settlement-bound validation. The phase-driven ingest loop sets the hint
 /// from the tip it already observed at the top of each iteration, which
 /// removes a serial RPC per batch on the bulk-catchup hot path.
 pub async fn run_bulk_catchup_with_store<Source>(
@@ -285,7 +285,7 @@ where
         Some(height) => height,
         None => run.source.tip_id().await?.height,
     };
-    validate_bulk_catchup_finality_bound(config, node_tip_height, config.reorg_window_blocks)?;
+    validate_bulk_catchup_settlement_bound(config, node_tip_height, config.reorg_window_blocks)?;
     warn_if_checkpoint_within_reorg_window(config, node_tip_height, config.reorg_window_blocks);
 
     let current_chain_epoch = match bootstrap_from_checkpoint_if_needed(
@@ -545,7 +545,7 @@ where
         + 'static,
 {
     let store_options = config.canonical_store_options();
-    validate_bulk_catchup_finality_bound(
+    validate_bulk_catchup_settlement_bound(
         config,
         source.tip_id().await?.height,
         store_options.reorg_window_blocks,
@@ -727,12 +727,12 @@ fn bulk_catchup_start(
     })
 }
 
-fn validate_bulk_catchup_finality_bound(
+fn validate_bulk_catchup_settlement_bound(
     config: &BulkCatchupRunConfig,
     tip_height: BlockHeight,
     reorg_window_blocks: u32,
 ) -> Result<(), IngestError> {
-    if config.allow_near_tip_finalize {
+    if config.allow_reorg_window_settlement {
         return Ok(());
     }
 
@@ -742,7 +742,7 @@ fn validate_bulk_catchup_finality_bound(
         return Ok(());
     }
 
-    Err(IngestError::NearTipBulkCatchupRequiresExplicitFinalize {
+    Err(IngestError::BulkCatchupInsideReorgWindowRequiresOverride {
         to_height: config.to_height,
         tip_height,
         reorg_window_blocks,
@@ -768,14 +768,14 @@ fn warn_if_checkpoint_within_reorg_window(
     {
         return;
     }
-    let safe_floor = tip_height.value().saturating_sub(reorg_window_blocks);
+    let settled_floor = tip_height.value().saturating_sub(reorg_window_blocks);
     tracing::warn!(
         target: "zinder::ingest",
         event = "bulk_catchup_checkpoint_within_reorg_window",
         checkpoint_height = checkpoint.block_id.height.value(),
         tip_height = tip_height.value(),
         reorg_window_blocks,
-        safe_checkpoint_floor = safe_floor,
+        settled_checkpoint_floor = settled_floor,
         "checkpoint sits inside the node-reported reorg window; first reorg may surface ReorgWindowExceeded"
     );
 }
@@ -1138,7 +1138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_catchup_rejects_near_tip_finalize_without_explicit_override()
+    async fn bulk_catchup_rejects_reorg_window_settlement_without_explicit_override()
     -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let storage_path = tempdir.path().join("near-tip-store");
@@ -1161,7 +1161,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            IngestError::NearTipBulkCatchupRequiresExplicitFinalize {
+            IngestError::BulkCatchupInsideReorgWindowRequiresOverride {
                 to_height,
                 tip_height,
                 reorg_window_blocks: 100,
@@ -2379,8 +2379,8 @@ mod tests {
 
     #[test]
     fn checkpoint_within_reorg_window_marks_only_inside_window() {
-        // Tip 200, window 100 -> safe historical floor at height 100. A
-        // checkpoint at 99 finalizes outside the window; 100 sits exactly on
+        // Tip 200, window 100 -> settled historical floor at height 100. A
+        // checkpoint at 99 settles outside the window; 100 sits exactly on
         // the floor so the next commit needs no rewind. Anything above 100 is
         // inside the window and should warn.
         assert!(!checkpoint_within_reorg_window(
@@ -2403,7 +2403,7 @@ mod tests {
             BlockHeight::new(200),
             100,
         ));
-        // Tip below the window: the safe floor saturates at 0, so every
+        // Tip below the window: the settled floor saturates at 0, so every
         // checkpoint above 0 is inside the window.
         assert!(checkpoint_within_reorg_window(
             BlockHeight::new(1),
@@ -2466,7 +2466,7 @@ mod tests {
             + 'static,
     {
         let store_options = config.canonical_store_options();
-        validate_bulk_catchup_finality_bound(
+        validate_bulk_catchup_settlement_bound(
             config,
             source.tip_id().await?.height,
             store_options.reorg_window_blocks,
@@ -2500,7 +2500,7 @@ mod tests {
         from_height: u32,
         to_height: u32,
         canonical_batch_max_blocks: u32,
-        allow_near_tip_finalize: bool,
+        allow_reorg_window_settlement: bool,
     ) -> Result<BulkCatchupRunConfig, Box<dyn Error>> {
         Ok(BulkCatchupRunConfig {
             node: NodeTarget::new(
@@ -2551,7 +2551,7 @@ mod tests {
                 .ok_or("invalid test commit reassembly bytes")?,
             flush_interval_epochs: NonZeroU32::new(5).ok_or("invalid test flush cadence")?,
             upstream_tip_hint: None,
-            allow_near_tip_finalize,
+            allow_reorg_window_settlement,
             checkpoint: None,
         })
     }

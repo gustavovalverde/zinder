@@ -26,7 +26,7 @@ Test functions under `tests/live/` use plain `snake_case_describing_behavior` na
 
 ## Testing Guidelines
 
-Tests should exercise public boundaries and contract shapes: append, reorg, finality, cursor validation, storage recovery, and parser edge cases. Tier organization is by directory: T0 unit (`#[cfg(test)] mod tests` in `src/`), T1 integration (`tests/integration/`), T2 perf (`tests/perf/`), T3 live (`tests/live/`). T3 tests are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` and `zinder_testkit::live::require_live()`; mainnet is rejected by default. Mutation testing is targeted at critical storage and parser functions through the CI workflow; expand that target set when changing those contracts.
+Tests should exercise public boundaries and contract shapes: append, reorg, settlement, cursor validation, storage recovery, and parser edge cases. Tier organization is by directory: T0 unit (`#[cfg(test)] mod tests` in `src/`), T1 integration (`tests/integration/`), T2 perf (`tests/perf/`), T3 live (`tests/live/`). T3 tests are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` and `zinder_testkit::live::require_live()`; mainnet is rejected by default. Mutation testing is targeted at critical storage and parser functions through the CI workflow; expand that target set when changing those contracts.
 
 ## Commit & Pull Request Guidelines
 

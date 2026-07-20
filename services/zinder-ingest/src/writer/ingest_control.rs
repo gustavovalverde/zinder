@@ -18,7 +18,7 @@ use zinder_core::{
     wire::{decode_rpc_transaction_id_hex, encode_zinder_native_chain_name},
 };
 use zinder_proto::{
-    capabilities::{CapabilitySurface, INGEST_CONTROL_CHAIN_EVENTS_V1, capabilities_for_surface},
+    capabilities::{CapabilitySurface, capabilities_for_surface},
     v1::{
         ingest::{
             MempoolTransactionRequest, ServerInfoRequest, ServerInfoResponse, WriterPhase,
@@ -44,7 +44,7 @@ use crate::{
 };
 
 type IngestControlStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
-type ChainEventsStream = IngestControlStream<wallet::ChainEventEnvelope>;
+type VisibleChainEventsStream = IngestControlStream<wallet::ChainEventEnvelope>;
 type MempoolEventsStream = IngestControlStream<wallet::MempoolEventEnvelope>;
 
 const DEFAULT_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 256;
@@ -113,7 +113,6 @@ impl CanonicalIngestControlGrpcAdapter {
             .capabilities()
             .supports(NodeCapability::ChainValuePools);
         capabilities_for_surface(CapabilitySurface::Ingest)
-            .filter(|spec| spec.string != INGEST_CONTROL_CHAIN_EVENTS_V1)
             .filter(|spec| spec.policy.ingest_satisfied(chain_value_pools_supported))
             .map(|spec| spec.string.to_owned())
             .collect()
@@ -126,7 +125,7 @@ impl CanonicalIngestControlGrpcAdapter {
 
 #[tonic::async_trait]
 impl IngestControl for CanonicalIngestControlGrpcAdapter {
-    type ChainEventsStream = ChainEventsStream;
+    type VisibleChainEventsStream = VisibleChainEventsStream;
     type MempoolEventsStream = MempoolEventsStream;
 
     async fn server_info(
@@ -140,8 +139,8 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 service_version: env!("CARGO_PKG_VERSION").to_owned(),
                 capabilities: self.advertised_capabilities(),
                 contract_revision: zinder_proto::CONTRACT_REVISION,
-                projection_preset: "wallet".to_owned(),
-                projection_identities: Vec::new(),
+                materialized_view_preset: String::new(),
+                materialized_view_identities: Vec::new(),
             }),
         }))
     }
@@ -158,24 +157,12 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         )))
     }
 
-    async fn chain_events(
+    async fn visible_chain_events(
         &self,
-        request: Request<wallet::ChainEventsRequest>,
-    ) -> Result<Response<Self::ChainEventsStream>, Status> {
-        let request = request.into_inner();
-        if request.family != wallet::ChainEventStreamFamily::Tip as i32 {
-            return Err(Status::unimplemented(
-                "version-1 ingest control supports only the tip chain-event family",
-            ));
-        }
-        if !request.address_filter.is_empty() {
-            return Err(Status::unimplemented(
-                "version-1 ingest control does not retain address-filtered chain events",
-            ));
-        }
+        request: Request<wallet::EventStreamStart>,
+    ) -> Result<Response<Self::VisibleChainEventsStream>, Status> {
         let after_cursor = match request
-            .start
-            .ok_or_else(|| Status::invalid_argument("event stream start is required"))?
+            .into_inner()
             .position
             .ok_or_else(|| Status::invalid_argument("event stream start position is required"))?
         {
@@ -196,7 +183,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                     .transpose()?
             }
         };
-        Ok(Response::new(spawn_chain_event_stream(
+        Ok(Response::new(spawn_visible_chain_event_stream(
             self.canonical.clone(),
             after_cursor,
         )))
@@ -259,11 +246,6 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         request: Request<wallet::MempoolEventsRequest>,
     ) -> Result<Response<Self::MempoolEventsStream>, Status> {
         let request = request.into_inner();
-        if request.family != wallet::MempoolEventStreamFamily::Mempool as i32 {
-            return Err(Status::unimplemented(
-                "version-1 ingest control supports only the mempool event family",
-            ));
-        }
         let start = event_stream_start_from_message(request.start)
             .ok_or_else(|| Status::invalid_argument("event stream start is required"))?;
         let after_cursor = self
@@ -377,10 +359,10 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
     }
 }
 
-fn spawn_chain_event_stream(
+fn spawn_visible_chain_event_stream(
     canonical: CanonicalControlHandle,
     mut after_cursor: Option<Vec<u8>>,
-) -> ChainEventsStream {
+) -> VisibleChainEventsStream {
     let (event_sender, event_receiver) = mpsc::channel(16);
     tokio::spawn(async move {
         loop {
@@ -644,42 +626,51 @@ fn outpoint_from_request_message(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, str::FromStr as _, sync::Arc, time::Duration};
+    use std::{fs, num::NonZeroU32, str::FromStr as _, sync::Arc, time::Duration};
 
+    use async_trait::async_trait;
     use tokio::net::TcpListener;
     use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
     use tokio_util::sync::CancellationToken;
     use tonic::{Code, Request, transport::Server};
     use zinder_core::{
-        ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
-        ChainTipMetadata, MempoolEntry, RawTransactionBytes, TransactionId, UnixTimestampMillis,
+        ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
+        ChainEpochId, ChainTipMetadata, ChainValuePool, ChainValuePools, MempoolEntry,
+        RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, TransactionId,
+        TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
+        TransparentOutPoint, UnixTimestampMillis, wire::encode_rpc_transaction_id_hex,
     };
     use zinder_proto::{
-        capabilities::INGEST_CONTROL_CHAIN_EVENTS_V1,
+        capabilities::INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1,
         v1::{
             ingest::{
-                CanonicalWriterStatusRequest, ServerInfoRequest, WriterStatusRequest,
-                canonical_control_client::CanonicalControlClient,
-                ingest_control_client::IngestControlClient,
+                CanonicalWriterStatusRequest, MempoolTransactionRequest, ServerInfoRequest,
+                WriterPhase, WriterStatusRequest, canonical_control_client::CanonicalControlClient,
+                ingest_control_client::IngestControlClient, ingest_control_server::IngestControl,
             },
             wallet::{
-                ChainEventEnvelope, ChainEventStreamFamily, ChainEventsRequest,
-                MempoolEventEnvelope, MempoolEventStreamFamily, MempoolEventsRequest,
-                MempoolSnapshotRequest, chain_event_envelope, mempool_event_envelope,
+                AddressLookup, ChainEventEnvelope, MempoolEventEnvelope, MempoolEventsRequest,
+                MempoolSnapshotRequest, OutPoint, TransparentMempoolOutputsByAddressRequest,
+                TransparentMempoolOutputsByOutpointRequest,
+                TransparentMempoolSpendsByOutpointRequest, address_lookup, chain_event_envelope,
+                mempool_event_envelope, transaction_location,
             },
         },
     };
-    use zinder_runtime::{BearerToken, Readiness, ReadinessState};
-    use zinder_source::{NodeAuth, NodeSource, ZebraJsonRpcSource};
+    use zinder_runtime::{BearerToken, IngestPhase, Readiness, ReadinessState};
+    use zinder_source::{
+        NodeAuth, NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError,
+        SourceSubtreeRoots, ZebraJsonRpcSource,
+    };
     use zinder_store::{
         CanonicalEventCursor, CanonicalEventKind, EventStreamStartPosition, MempoolEvent,
-        RocksDbResourceBudget, event_stream_start_message,
+        MempoolEventRetentionConfig, RocksDbResourceBudget, event_stream_start_message,
     };
 
     use crate::{
         CanonicalCheckpointStagingRoot, CanonicalControlGrpcAdapter, LiveMempoolOwner,
         writer::control::{
-            canonical_control_channel, handle_canonical_control_command,
+            apply_canonical_control_command, canonical_control_channel,
             test_support::published_fixture_store,
         },
     };
@@ -734,7 +725,7 @@ mod tests {
         let mut fixture = shared_control_fixture().await?;
         assert_control_authentication(&mut fixture.canonical_client, &mut fixture.ingest_client)
             .await?;
-        let chain_events = assert_chain_events_contract(&mut fixture.ingest_client).await?;
+        let chain_events = assert_visible_chain_events_contract(&mut fixture.ingest_client).await?;
         let mempool_events = assert_mempool_contract(&mut fixture.ingest_client).await?;
 
         drop(mempool_events);
@@ -742,10 +733,429 @@ mod tests {
         fixture.shutdown().await
     }
 
+    /// The retained adapter must bind snapshot paging, transaction lookups, and
+    /// durable event replay to the same live mempool owner.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The snapshot anchor, post-anchor mutation, page resume, point lookup, and replay assertion form one end-to-end adapter contract."
+    )]
+    async fn shared_listener_pages_snapshots_and_replays_only_post_anchor_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        for transaction_id_byte in [0xB2, 0xC3] {
+            fixture
+                .mempool
+                .apply_event(
+                    &fixture.canonical,
+                    MempoolEvent::Added {
+                        entry: fixture_mempool_entry_with_id(transaction_id_byte, chain_epoch),
+                    },
+                    UnixTimestampMillis::new(1_750_000_000_200),
+                )
+                .await?;
+        }
+
+        let first_page = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first_page.entries.len(), 1);
+        assert!(!first_page.next_cursor.is_empty());
+        let resume_cursor = first_page.events_resume_cursor.clone();
+
+        let late_entry = fixture_mempool_entry_with_id(0xD4, chain_epoch);
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added {
+                    entry: late_entry.clone(),
+                },
+                UnixTimestampMillis::new(1_750_000_000_300),
+            )
+            .await?;
+
+        let mut next_cursor = first_page.next_cursor;
+        while !next_cursor.is_empty() {
+            let later_page = fixture
+                .ingest_client
+                .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                    max_entries: 1,
+                    from_cursor: next_cursor,
+                }))
+                .await?
+                .into_inner();
+            assert_eq!(later_page.events_resume_cursor, resume_cursor);
+            next_cursor = later_page.next_cursor;
+        }
+
+        let transaction = fixture
+            .ingest_client
+            .mempool_transaction(authenticated(MempoolTransactionRequest {
+                transaction_id: encode_rpc_transaction_id_hex(late_entry.transaction_id),
+            }))
+            .await?
+            .into_inner();
+        let Some(transaction_location::Location::InMempool(transaction)) =
+            transaction.location.and_then(|location| location.location)
+        else {
+            return Err("expected the late transaction in the live mempool".into());
+        };
+        assert_eq!(
+            transaction.payload_bytes,
+            late_entry.raw_transaction_bytes.as_slice()
+        );
+
+        let mut events = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::AfterCursor(
+                        zinder_store::StreamCursorTokenV1::from_bytes(resume_cursor),
+                    ),
+                )),
+            }))
+            .await?
+            .into_inner();
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await?
+            .ok_or("mempool event stream ended before the post-anchor entry")??;
+        assert_eq!(event.event_sequence, 4);
+        assert!(matches!(
+            event.event,
+            Some(mempool_event_envelope::Event::Added(_))
+        ));
+
+        drop(events);
+        fixture.shutdown().await
+    }
+
+    /// All three transparent point lookup RPCs resolve the same current
+    /// in-memory entry and preserve absent entries as omissions/empty slots.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_listener_serves_transparent_mempool_lookups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = shared_control_fixture().await?;
+        let transaction_id = TransactionId::from_bytes([0xA1; 32]);
+        let known_outpoint = OutPoint {
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            output_index: 0,
+        };
+
+        let by_address = fixture
+            .ingest_client
+            .transparent_mempool_outputs_by_address(authenticated(
+                TransparentMempoolOutputsByAddressRequest {
+                    address: Some(AddressLookup {
+                        selector: Some(address_lookup::Selector::ScriptHash(vec![0xA1; 32])),
+                    }),
+                    max_entries: None,
+                },
+            ))
+            .await?
+            .into_inner();
+        assert_eq!(by_address.outputs.len(), 1);
+        assert_eq!(by_address.outputs[0].value_zat, 1_000);
+
+        let spends = fixture
+            .ingest_client
+            .transparent_mempool_spends_by_outpoint(authenticated(
+                TransparentMempoolSpendsByOutpointRequest {
+                    outpoints: vec![
+                        OutPoint {
+                            transaction_id: "55".repeat(32),
+                            output_index: 0,
+                        },
+                        OutPoint {
+                            transaction_id: "ff".repeat(32),
+                            output_index: 7,
+                        },
+                    ],
+                },
+            ))
+            .await?
+            .into_inner();
+        assert_eq!(spends.spends.len(), 1);
+        assert_eq!(
+            spends.spends[0].spending_transaction_id,
+            encode_rpc_transaction_id_hex(transaction_id)
+        );
+
+        let outputs = fixture
+            .ingest_client
+            .transparent_mempool_outputs_by_outpoint(authenticated(
+                TransparentMempoolOutputsByOutpointRequest {
+                    outpoints: vec![
+                        known_outpoint,
+                        OutPoint {
+                            transaction_id: "ff".repeat(32),
+                            output_index: 0,
+                        },
+                    ],
+                },
+            ))
+            .await?
+            .into_inner();
+        assert_eq!(outputs.entries.len(), 2);
+        assert_eq!(
+            outputs.entries[0]
+                .output
+                .as_ref()
+                .map(|output| output.value_zat),
+            Some(1_000)
+        );
+        assert!(outputs.entries[1].output.is_none());
+
+        fixture.shutdown().await
+    }
+
+    /// Retention is owned by the canonical writer: once a mined envelope is
+    /// pruned, its cursor must be rejected at the public replay boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The retention setup, stream request, and failed-precondition assertion describe one public replay contract."
+    )]
+    async fn shared_listener_rejects_replay_from_a_pruned_mined_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        let observed_at = UnixTimestampMillis::new(1_750_000_000_400);
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Mined {
+                    transaction_id: TransactionId::from_bytes([0xA1; 32]),
+                    mined_height: BlockHeight::new(41),
+                    block_hash: BlockHash::from_bytes([0xA1; 32]),
+                },
+                observed_at,
+            )
+            .await?;
+        let entry = fixture_mempool_entry_with_id(0xE5, chain_epoch);
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added {
+                    entry: entry.clone(),
+                },
+                observed_at,
+            )
+            .await?;
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Mined {
+                    transaction_id: entry.transaction_id,
+                    mined_height: BlockHeight::new(42),
+                    block_hash: BlockHash::from_bytes([0xE5; 32]),
+                },
+                observed_at,
+            )
+            .await?;
+
+        let mut events = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::EarliestRetained,
+                )),
+            }))
+            .await?
+            .into_inner();
+        let mut mined_cursor = None;
+        for _ in 0..4 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await?
+                .ok_or("mempool event stream ended before the mined event")??;
+            if mined_cursor.is_none()
+                && matches!(event.event, Some(mempool_event_envelope::Event::Mined(_)))
+            {
+                mined_cursor = Some(event.cursor);
+            }
+        }
+        drop(events);
+        let mined_cursor = mined_cursor.ok_or("fixture did not emit a mined event")?;
+
+        let report = fixture
+            .mempool
+            .prune_events(
+                &fixture.canonical,
+                UnixTimestampMillis::now(),
+                MempoolEventRetentionConfig::new(Some(Duration::from_millis(1)), None),
+            )
+            .await?;
+        assert!(report.pruned_mined_count >= 1);
+
+        let status = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::AfterCursor(
+                        zinder_store::StreamCursorTokenV1::from_bytes(mined_cursor),
+                    ),
+                )),
+            }))
+            .await
+            .err()
+            .ok_or("pruned mempool cursor unexpectedly remained replayable")?;
+        assert_eq!(status.code(), Code::FailedPrecondition);
+
+        fixture.shutdown().await
+    }
+
+    /// Value-pool capability discovery and its response remain coupled to the
+    /// configured upstream source, while the chain view remains writer-owned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adapter_advertises_and_reads_value_pools_from_the_configured_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let expected_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        let source = StaticValuePoolSource {
+            capabilities: NodeCapabilities::new([NodeCapability::ChainValuePools])?,
+            value_pools: ChainValuePools::new(
+                BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
+                vec![ChainValuePool::new("transparent", true, Some(1_000))],
+            ),
+        };
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            Arc::new(source),
+            Readiness::default(),
+        );
+
+        let server_info = IngestControl::server_info(&adapter, Request::new(ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .server_info
+            .ok_or("ingest server info was absent")?;
+        assert!(server_info.capabilities.iter().any(|capability| {
+            capability == zinder_proto::capabilities::INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1
+        }));
+        assert!(server_info.materialized_view_preset.is_empty());
+        assert!(server_info.materialized_view_identities.is_empty());
+
+        let response = IngestControl::chain_value_pools_at_tip(
+            &adapter,
+            Request::new(zinder_proto::v1::wallet::ChainValuePoolsAtTipRequest {}),
+        )
+        .await?
+        .into_inner();
+        assert_eq!(response.source_tip.map(|tip| tip.height), Some(42));
+        assert_eq!(response.pools[0].chain_value_zat, Some(1_000));
+        assert_eq!(
+            response
+                .chain_view
+                .and_then(|view| view.chain_epoch)
+                .map(|epoch| epoch.chain_epoch_id),
+            Some(expected_epoch.id.value())
+        );
+
+        fixture.shutdown().await
+    }
+
+    /// Writer status derives its epoch from the canonical owner and its phase
+    /// and upstream gap from readiness, without opening a second store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adapter_combines_canonical_epoch_with_readiness_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        let visible_height = chain_epoch.visible_tip_height.value();
+        let upstream_height = visible_height.saturating_add(2);
+        let readiness = Readiness::new(
+            ReadinessState::syncing(Some(2), Some(visible_height), Some(upstream_height))
+                .with_phase(IngestPhase::BulkCatchup),
+        );
+        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            source,
+            readiness,
+        );
+
+        let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(response.phase(), WriterPhase::BulkCatchup);
+        assert_eq!(response.gap_blocks, Some(2));
+        assert_eq!(
+            response
+                .chain_view
+                .and_then(|view| view.chain_epoch)
+                .map(|epoch| epoch.chain_epoch_id),
+            Some(chain_epoch.id.value())
+        );
+
+        fixture.shutdown().await
+    }
+
+    #[derive(Clone)]
+    struct StaticValuePoolSource {
+        capabilities: NodeCapabilities,
+        value_pools: ChainValuePools,
+    }
+
+    #[async_trait]
+    impl NodeSource for StaticValuePoolSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            self.capabilities
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            Err(SourceError::BlockUnavailable {
+                height,
+                reason: "value-pool test source does not serve blocks".to_owned(),
+            })
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            Err(SourceError::NodeUnavailable {
+                reason: "value-pool test source does not serve tips".to_owned(),
+            })
+        }
+
+        async fn fetch_subtree_roots(
+            &self,
+            protocol: ShieldedProtocol,
+            start_index: SubtreeRootIndex,
+            max_entries: NonZeroU32,
+        ) -> Result<SourceSubtreeRoots, SourceError> {
+            let _ignored = (protocol, start_index, max_entries);
+            Err(SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::SubtreeRoots,
+            })
+        }
+
+        async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
+            Ok(self.value_pools.clone())
+        }
+    }
+
     struct SharedControlFixture {
         temporary: tempfile::TempDir,
         canonical_client: CanonicalControlClient<tonic::transport::Channel>,
         ingest_client: IngestControlClient<tonic::transport::Channel>,
+        canonical: crate::CanonicalControlHandle,
+        mempool: LiveMempoolOwner,
         cancel: CancellationToken,
         server_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
         command_task: tokio::task::JoinHandle<()>,
@@ -772,7 +1182,7 @@ mod tests {
         let (canonical, mut commands) = canonical_control_channel();
         let command_task = tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
-                handle_canonical_control_command(&mut store, command);
+                apply_canonical_control_command(&mut store, command);
             }
         });
 
@@ -809,8 +1219,8 @@ mod tests {
         .with_bearer_token(Some(bearer_token.clone()));
         let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
             zinder_core::Network::ZcashTestnet,
-            canonical,
-            owner,
+            canonical.clone(),
+            owner.clone(),
             node_source,
             readiness,
         )
@@ -833,6 +1243,8 @@ mod tests {
             temporary,
             canonical_client,
             ingest_client,
+            canonical,
+            mempool: owner,
             cancel,
             server_task,
             command_task,
@@ -876,7 +1288,7 @@ mod tests {
         Ok(())
     }
 
-    async fn assert_chain_events_contract(
+    async fn assert_visible_chain_events_contract(
         ingest_client: &mut IngestControlClient<tonic::transport::Channel>,
     ) -> Result<tonic::Streaming<ChainEventEnvelope>, Box<dyn std::error::Error>> {
         let server_info = ingest_client
@@ -886,56 +1298,30 @@ mod tests {
             .server_info
             .ok_or("ingest server info was absent")?;
         assert!(
-            !server_info
+            server_info
                 .capabilities
                 .iter()
-                .any(|capability| capability == INGEST_CONTROL_CHAIN_EVENTS_V1),
-            "the whole-RPC ChainEvents capability must remain absent while SAFE and address filters are unsupported"
+                .any(|capability| capability == INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1),
+            "the implemented visible chain-event control stream must be advertised"
         );
+        assert!(server_info.materialized_view_preset.is_empty());
+        assert!(server_info.materialized_view_identities.is_empty());
 
         let mut chain_events = ingest_client
-            .chain_events(authenticated(ChainEventsRequest {
-                start: Some(event_stream_start_message(
-                    &EventStreamStartPosition::EarliestRetained,
-                )),
-                family: ChainEventStreamFamily::Tip as i32,
-                address_filter: Vec::new(),
-            }))
+            .visible_chain_events(authenticated(event_stream_start_message(
+                &EventStreamStartPosition::EarliestRetained,
+            )))
             .await?
             .into_inner();
         let first_chain_event = tokio::time::timeout(Duration::from_secs(1), chain_events.next())
             .await?
-            .ok_or("tip event stream ended before the fixture event")??;
+            .ok_or("visible event stream ended before the fixture event")??;
         assert_eq!(first_chain_event.event_sequence, 1);
         assert!(matches!(
             first_chain_event.event,
             Some(chain_event_envelope::Event::ChainCommitted(_))
         ));
 
-        let safe_status = ingest_client
-            .chain_events(authenticated(ChainEventsRequest {
-                start: Some(event_stream_start_message(
-                    &EventStreamStartPosition::EarliestRetained,
-                )),
-                family: ChainEventStreamFamily::Safe as i32,
-                address_filter: Vec::new(),
-            }))
-            .await
-            .err()
-            .ok_or("SAFE chain events unexpectedly succeeded")?;
-        assert_eq!(safe_status.code(), Code::Unimplemented);
-        let filter_status = ingest_client
-            .chain_events(authenticated(ChainEventsRequest {
-                start: Some(event_stream_start_message(
-                    &EventStreamStartPosition::EarliestRetained,
-                )),
-                family: ChainEventStreamFamily::Tip as i32,
-                address_filter: vec!["t1unsupported".to_owned()],
-            }))
-            .await
-            .err()
-            .ok_or("address-filtered chain events unexpectedly succeeded")?;
-        assert_eq!(filter_status.code(), Code::Unimplemented);
         Ok(chain_events)
     }
 
@@ -955,7 +1341,6 @@ mod tests {
                 start: Some(event_stream_start_message(
                     &EventStreamStartPosition::EarliestRetained,
                 )),
-                family: MempoolEventStreamFamily::Mempool as i32,
             }))
             .await?
             .into_inner();
@@ -980,15 +1365,40 @@ mod tests {
     }
 
     fn fixture_mempool_entry(chain_epoch: zinder_core::ChainEpoch) -> MempoolEntry {
+        fixture_mempool_entry_with_id(0xA1, chain_epoch)
+    }
+
+    fn fixture_mempool_entry_with_id(
+        transaction_id_byte: u8,
+        chain_epoch: ChainEpoch,
+    ) -> MempoolEntry {
+        let transaction_id = TransactionId::from_bytes([transaction_id_byte; 32]);
         MempoolEntry {
-            transaction_id: TransactionId::from_bytes([0xA1; 32]),
+            transaction_id,
             auth_digest: None,
-            raw_transaction_bytes: RawTransactionBytes::new(vec![0xA1; 8]),
-            compact_transaction_bytes: vec![0xA1; 4],
+            raw_transaction_bytes: RawTransactionBytes::new(vec![transaction_id_byte; 8]),
+            compact_transaction_bytes: vec![transaction_id_byte; 4],
             first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_100),
             first_seen_chain_epoch: chain_epoch,
-            transparent_outputs: Vec::new(),
-            transparent_spends: Vec::new(),
+            transparent_outputs: vec![TransparentMempoolOutput {
+                address_script_hash: TransparentAddressScriptHash::from_bytes([0xA1; 32]),
+                script_pub_key: vec![0xA1; 25],
+                outpoint: TransparentOutPoint::new(transaction_id, 0),
+                value_zat: 1_000,
+            }],
+            transparent_spends: vec![TransparentMempoolSpend {
+                spent_outpoint: TransparentOutPoint::new(
+                    TransactionId::from_bytes(
+                        [if transaction_id_byte == 0xA1 {
+                            0x55
+                        } else {
+                            transaction_id_byte
+                        }; 32],
+                    ),
+                    0,
+                ),
+                spending_transaction_id: transaction_id,
+            }],
         }
     }
 

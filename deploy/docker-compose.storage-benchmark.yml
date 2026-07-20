@@ -1,4 +1,4 @@
-# Resource-bounded storage environment for projection-coupled and canonical-replay-storage measurements.
+# Resource-bounded storage environment for canonical-store range replay and canonical-replay-storage measurements.
 #
 # This file stays separate from deploy/docker-compose.yml. The application
 # deployment owns long-running Zinder services; this topology owns disposable
@@ -6,14 +6,14 @@
 name: ${ZINDER_BENCH_PROJECT_NAME:-zinder-storage-benchmark}
 
 services:
-  rocksdb-projection-coupled-oracle:
+  rocksdb-canonical-store-range-replay:
     image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
     profiles: [oracle, comparison]
     restart: "no"
     init: true
     cgroup: private
-    cpus: ${ZINDER_BENCH_ROCKSDB_ORACLE_CPUS:-8.0}
-    mem_limit: ${ZINDER_BENCH_ROCKSDB_ORACLE_MEMORY_LIMIT_BYTES:-17179869184}
+    cpus: ${ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_CPUS:-8.0}
+    mem_limit: ${ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_MEMORY_LIMIT_BYTES:-17179869184}
     networks: [storage-benchmark]
     ulimits:
       nofile:
@@ -38,12 +38,12 @@ services:
         bind:
           create_host_path: false
       - type: volume
-        source: rocksdb-projection-coupled-store
+        source: rocksdb-canonical-store-range-replay-store
         target: /var/lib/zinder/benchmark-store
         volume:
           nocopy: true
     command:
-      - projection-coupled-replay
+      - canonical-store-range-replay
       - --fixture
       - /benchmark/fixture
       - --store
@@ -59,15 +59,15 @@ services:
       - --runner-id
       - ${ZINDER_BENCH_RUNNER_ID:?set ZINDER_BENCH_RUNNER_ID to the immutable hardware, storage, and resource profile identity}
       - --cpu-limit-cores
-      - ${ZINDER_BENCH_ROCKSDB_ORACLE_CPUS:-8.0}
+      - ${ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_CPUS:-8.0}
       - --memory-limit-bytes
-      - ${ZINDER_BENCH_ROCKSDB_ORACLE_MEMORY_LIMIT_BYTES:-17179869184}
+      - ${ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_MEMORY_LIMIT_BYTES:-17179869184}
       - --storage-class
       - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
       - --image-reference
       - ${ZINDER_BENCH_IMAGE}
       - --report
-      - /benchmark/results/rocksdb-projection-coupled-oracle-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
+      - /benchmark/results/rocksdb-canonical-store-range-replay-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
 
   rocksdb-canonical-replay-storage:
     image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
@@ -75,8 +75,8 @@ services:
     restart: "no"
     init: true
     cgroup: private
-    cpus: ${ZINDER_BENCH_ROCKSDB_FACT_CPUS:-8.0}
-    mem_limit: ${ZINDER_BENCH_ROCKSDB_FACT_MEMORY_LIMIT_BYTES:-17179869184}
+    cpus: ${ZINDER_BENCH_ROCKSDB_REPLAY_CPUS:-8.0}
+    mem_limit: ${ZINDER_BENCH_ROCKSDB_REPLAY_MEMORY_LIMIT_BYTES:-17179869184}
     networks: [storage-benchmark]
     environment:
       ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
@@ -129,9 +129,9 @@ services:
       - --runner-id
       - ${ZINDER_BENCH_RUNNER_ID:?set ZINDER_BENCH_RUNNER_ID to the immutable hardware, storage, and resource profile identity}
       - --cpu-limit-cores
-      - ${ZINDER_BENCH_ROCKSDB_FACT_CPUS:-8.0}
+      - ${ZINDER_BENCH_ROCKSDB_REPLAY_CPUS:-8.0}
       - --memory-limit-bytes
-      - ${ZINDER_BENCH_ROCKSDB_FACT_MEMORY_LIMIT_BYTES:-17179869184}
+      - ${ZINDER_BENCH_ROCKSDB_REPLAY_MEMORY_LIMIT_BYTES:-17179869184}
       - --storage-class
       - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
       - --image-reference
@@ -189,9 +189,9 @@ services:
       - --runner-id
       - ${ZINDER_BENCH_RUNNER_ID:?set ZINDER_BENCH_RUNNER_ID to the immutable hardware, storage, and resource profile identity}
       - --cpu-limit-cores
-      - ${ZINDER_BENCH_POSTGRES_ARM_CPUS:-8.0}
+      - ${ZINDER_BENCH_POSTGRES_TOTAL_CPUS:-8.0}
       - --memory-limit-bytes
-      - ${ZINDER_BENCH_POSTGRES_ARM_MEMORY_LIMIT_BYTES:-17179869184}
+      - ${ZINDER_BENCH_POSTGRES_TOTAL_MEMORY_LIMIT_BYTES:-17179869184}
       - --client-cpu-limit-cores
       - ${ZINDER_BENCH_POSTGRES_CLIENT_CPUS:-2.0}
       - --client-memory-limit-bytes
@@ -321,6 +321,6 @@ networks:
   postgres-host-access:
 
 volumes:
-  rocksdb-projection-coupled-store:
+  rocksdb-canonical-store-range-replay-store:
   rocksdb-canonical-replay-storage-store:
   postgres-data:

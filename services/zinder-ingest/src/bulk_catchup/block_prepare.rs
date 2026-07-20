@@ -38,7 +38,7 @@ use super::{
     BULK_STAGE_CANONICAL_BLOCK_PREPARE, BULK_STAGE_CANONICAL_PREVOUT_RESOLVE, IngestError,
     record_bulk_pipeline_stage_duration, usize_to_u32_saturating, usize_to_u64_saturating,
 };
-use crate::artifact_builder::{PreparedCanonicalBlock, projection_coupled_transparent_outputs};
+use crate::artifact_builder::{PreparedCanonicalBlock, canonical_transparent_outputs_by_outpoint};
 use crate::chain_ingest::{
     prefetched_spent_transparent_output_bytes, record_ingest_block_prepare_outcome,
 };
@@ -652,7 +652,7 @@ async fn resolve_prevouts_for_window<F>(
     let mut resolution_stats = PrevoutResolutionStats::default();
     let created_outputs_by_block = queued_blocks
         .iter()
-        .map(|queued| projection_coupled_transparent_outputs(&queued.prepared.facts))
+        .map(|queued| canonical_transparent_outputs_by_outpoint(&queued.prepared.facts))
         .collect::<Vec<_>>();
 
     for (block_index, queued) in queued_blocks.iter().enumerate() {
@@ -1007,8 +1007,8 @@ mod tests {
         BLOCK_PREPARE_FIXED_PEAK_BYTES, BLOCK_PREPARE_PEAK_RAW_BYTE_MULTIPLIER,
         BlockPrepareStreamState, ByteWatermark, FuturesUnordered, IngestError, QueuedPreparedBlock,
         block_commit_preparation_resident_bytes, canonical_block_facts_heap_bytes,
-        compact_block_heap_bytes, estimated_peak_block_prepare_bytes, prepare_resolved_window,
-        prepared_block_resident_bytes, projection_coupled_transparent_outputs,
+        canonical_transparent_outputs_by_outpoint, compact_block_heap_bytes,
+        estimated_peak_block_prepare_bytes, prepare_resolved_window, prepared_block_resident_bytes,
         retained_raw_blob_heap_bytes, schedule_block_prepare,
     };
     use crate::artifact_builder::{RawBlobPolicy, prepare_canonical_block};
@@ -1060,7 +1060,7 @@ mod tests {
             &sample_regtest_upgrade_activations(),
             RawBlobPolicy::All,
         )?;
-        let created_outputs = projection_coupled_transparent_outputs(&prepared.facts);
+        let created_outputs = canonical_transparent_outputs_by_outpoint(&prepared.facts);
         assert!(!created_outputs.is_empty());
 
         let prepared_resident_bytes = prepared_block_resident_bytes(&prepared);

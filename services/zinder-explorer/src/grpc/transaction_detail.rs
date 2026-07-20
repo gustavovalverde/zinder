@@ -65,7 +65,7 @@ pub(crate) struct TransactionDetailContext<'context> {
 }
 
 /// Executes one `ExplorerQuery.TransactionDetail` request.
-pub(crate) async fn handle_transaction_detail(
+pub(crate) async fn query_transaction_detail(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     context: TransactionDetailContext<'_>,
     request: Request<TransactionDetailRequest>,
@@ -224,10 +224,9 @@ async fn resolve_transparent_rows(
 /// Resolves the parsed public facts and the wire location for one transaction.
 ///
 /// The `location` oneof is carried through verbatim so the explorer detail
-/// returns the same `{ mined, in_mempool, conflicting }` shape the wallet
-/// plane answered with. Facts come from the canonical store for mined,
-/// from the raw bytes for mempool, and from the minimal txid-only shape for
-/// conflicting (which carries no transaction bytes).
+/// returns the same `{ mined, in_mempool }` shape the wallet plane answered
+/// with. Facts come from the canonical store for mined transactions and from
+/// raw bytes for mempool transactions.
 fn resolve_facts_and_location(
     canonical_reader: Option<&ChainEpochReader<'_>>,
     network: zinder_core::Network,
@@ -268,12 +267,6 @@ fn resolve_facts_and_location(
                 Some(fact_set),
             )
         }
-        wire_location::Location::Conflicting(conflicting) => (
-            conflicting_public_facts(transaction_id),
-            wire_location::Location::Conflicting(conflicting),
-            None,
-            None,
-        ),
     };
     Ok(ResolvedTransactionDetail {
         facts,
@@ -328,7 +321,7 @@ fn canonical_reader_for_location<'store>(
     }
     let store = chain_store.ok_or_else(|| {
         ExplorerError::dependency_not_configured(
-            "TransactionDetail requires the canonical fact store; configure --storage-path",
+            "TransactionDetail requires the canonical store; configure --storage-path",
         )
     })?;
     store
@@ -356,7 +349,7 @@ fn read_parent_transaction_facts(
     }
     let reader = canonical_reader.ok_or_else(|| {
         ExplorerError::dependency_not_configured(
-            "TransactionDetail prevout resolution requires the canonical fact store",
+            "TransactionDetail prevout resolution requires the canonical store",
         )
     })?;
     reader
@@ -386,7 +379,7 @@ async fn resolve_transparent_output_spends(
         requested_outpoints.iter().copied().collect();
     if requested_outpoint_set.len() != requested_outpoints.len() {
         return Err(ExplorerError::internal(
-            "TransactionDetail canonical facts contain duplicate transparent output indexes",
+            "TransactionDetail transaction artifact contains duplicate transparent output indexes",
         )
         .into());
     }
@@ -510,7 +503,7 @@ fn read_mined_transaction_facts(
 ) -> Result<TransactionFactsArtifact, Status> {
     let reader = canonical_reader.ok_or_else(|| {
         ExplorerError::dependency_not_configured(
-            "TransactionDetail requires the canonical fact store; configure --storage-path",
+            "TransactionDetail requires the canonical store; configure --storage-path",
         )
     })?;
     let artifact = reader
@@ -527,40 +520,11 @@ fn read_mined_transaction_facts(
 fn mined_consensus_branch_id(
     mined: &wallet::MinedTransaction,
 ) -> Result<ConsensusBranchId, Status> {
-    let details = mined
-        .details
+    let chain_context = mined
+        .chain_context
         .as_ref()
-        .ok_or_else(|| ExplorerError::internal("MinedTransaction missing details"))?;
-    Ok(ConsensusBranchId::new(details.consensus_branch_id))
-}
-
-/// Builds the minimal public facts for a conflicting-chain transaction.
-///
-/// A conflicting-chain status carries no transaction bytes and is not in the
-/// canonical fact store, so the only fact the explorer can assert is the
-/// requested transaction id. The remaining fields surface the
-/// not-decodable shape: `Unsupported` version, `Unclassified` privacy.
-fn conflicting_public_facts(transaction_id: zinder_core::TransactionId) -> CoreFacts {
-    CoreFacts {
-        transaction_id,
-        auth_digest: None,
-        wtxid: None,
-        version: CoreTransactionVersion::Unsupported {
-            effective_version: 0,
-            version_group_id: None,
-        },
-        consensus_branch_id: None,
-        lock_time: CoreLockTime::Unlocked,
-        expiry_height: None,
-        size_bytes: 0,
-        counts: zinder_core::TransactionComponentCounts::EMPTY,
-        orchard_value_balance_zat: None,
-        orchard_anchor: None,
-        ironwood_value_balance_zat: None,
-        privacy_shape: zinder_core::PrivacyShape::Unclassified,
-        is_coinbase: false,
-        unsupported_sections: Vec::new(),
-    }
+        .ok_or_else(|| ExplorerError::internal("MinedTransaction missing chain context"))?;
+    Ok(ConsensusBranchId::new(chain_context.consensus_branch_id))
 }
 
 pub(crate) fn encode_public_facts(facts: &CoreFacts) -> WireFacts {

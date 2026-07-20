@@ -593,7 +593,7 @@ fn validate_reconciliation_rollback_range(
     }
     let rollback_count = inclusive_range_len(rollback_range)?;
     if rollback_count > u64::from(planner.supported_reorg_depth) {
-        return Err(RocksDbWalletError::ProjectionRebuildRequired {
+        return Err(RocksDbWalletError::WalletProjectionRebuildRequired {
             reason: "requested reconciliation rollback exceeds the wallet's retained undo capacity",
         });
     }
@@ -742,7 +742,7 @@ fn validate_reorg_event_shape(
             reason: "reorg range has no positive bounded depth",
         })?;
     if depth > planner.supported_reorg_depth {
-        return Err(RocksDbWalletError::ProjectionRebuildRequired {
+        return Err(RocksDbWalletError::WalletProjectionRebuildRequired {
             reason: "requested canonical reorg exceeds the wallet's retained undo capacity",
         });
     }
@@ -1152,7 +1152,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         loop {
             let block_height = BlockHeight::new(height);
             let (undo, encoded) = self.load_undo(block_height)?.ok_or(
-                RocksDbWalletError::ProjectionRebuildRequired {
+                RocksDbWalletError::WalletProjectionRebuildRequired {
                     reason: "durable undo suffix cannot roll back the requested canonical range",
                 },
             )?;
@@ -1209,7 +1209,7 @@ impl<'store> WalletTransitionPlanner<'store> {
                 },
             )?;
             let (successor, _) = self.load_undo(successor_height)?.ok_or(
-                RocksDbWalletError::ProjectionRebuildRequired {
+                RocksDbWalletError::WalletProjectionRebuildRequired {
                     reason: "durable undo suffix cannot authenticate the advanced canonical settled tip",
                 },
             )?;
@@ -1229,7 +1229,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         )?;
         loop {
             let (undo, encoded) = self.load_undo(height)?.ok_or(
-                RocksDbWalletError::ProjectionRebuildRequired {
+                RocksDbWalletError::WalletProjectionRebuildRequired {
                     reason: "durable undo suffix cannot prune the advanced canonical settled range",
                 },
             )?;
@@ -1265,7 +1265,7 @@ impl<'store> WalletTransitionPlanner<'store> {
                 reason: "wallet settled tip lies beyond the planned source tip",
             })?;
         if expected_count > u64::from(self.supported_reorg_depth) {
-            return Err(RocksDbWalletError::ProjectionRebuildRequired {
+            return Err(RocksDbWalletError::WalletProjectionRebuildRequired {
                 reason: "canonical unsettled suffix exceeds the wallet's configured undo capacity",
             });
         }
@@ -1838,9 +1838,9 @@ mod tests {
         RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbResourceBudget,
     };
     use zinder_wallet_projection::{
-        ProjectionBuildLeaseRequest, ProjectionBuildOwner, WalletProjectionDigestBuilder,
-        WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
-        WalletProjectionSourcePosition, WalletUtxoSetSummary,
+        WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
+        WalletProjectionDigestBuilder, WalletProjectionReadyEvidence,
+        WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition, WalletUtxoSetSummary,
     };
 
     use super::{extend_source_sequence_digest, source_identity_from_fence};
@@ -1927,8 +1927,8 @@ mod tests {
             1,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        let lease_request = ProjectionBuildLeaseRequest::new(
-            ProjectionBuildOwner::from_bytes([0x42; 16]),
+        let lease_request = WalletProjectionBuildLeaseRequest::new(
+            WalletProjectionBuildOwner::from_bytes([0x42; 16]),
             initial_source,
             WalletProjectionRetainedEventAnchor::new(initial_fence.chain_event_sequence()),
             UnixTimestampMillis::new(u64::MAX),

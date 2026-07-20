@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeaderArtifact, BlockHeight, CanonicalHistoryBounds, TransactionId};
 use zinder_materialized_views::{
-    BlockCommitContext, BlockCommitPayload, MaterializedViewStore,
+    BlockCommitContext, BlockCommitInput, MaterializedViewStore,
     TransactionComponentBackfillCoverage, TransactionComponentSummaryConsumer,
     TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
 };
@@ -15,7 +15,7 @@ use zinder_store::PrimaryChainStore;
 
 use crate::{
     IngestError,
-    materialized_view_consumers::materialized_view_projection_write_guard,
+    materialized_view_consumers::materialized_view_write_guard,
     runtime_config::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
 };
 
@@ -60,7 +60,7 @@ pub(crate) fn seed_transaction_component_visible_tail(
                 .min(through_height.value()),
         );
         let contexts = read_canonical_context_batch(chain_store, next_height, batch_end)?;
-        let _write_guard = materialized_view_projection_write_guard();
+        let _write_guard = materialized_view_write_guard();
         TransactionComponentSummaryConsumer::new()
             .write_tail_seed_batch(materialized_view_store, &contexts)
             .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
@@ -279,7 +279,7 @@ fn backfill_next_batch_blocking(
         }),
         last_block_time,
     );
-    let _write_guard = materialized_view_projection_write_guard();
+    let _write_guard = materialized_view_write_guard();
     TransactionComponentSummaryConsumer::new()
         .write_backfill_batch(&context.materialized_view_store, &contexts, next_coverage)
         .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
@@ -503,7 +503,7 @@ fn hydrate_staged_blocks(
         }
         contexts.push(
             BlockCommitContext::new(
-                BlockCommitPayload {
+                BlockCommitInput {
                     height: staged_block.header.height,
                     block_hash: staged_block.header.block_hash,
                     previous_block_hash: staged_block.header.parent_hash,

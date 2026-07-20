@@ -1,4 +1,4 @@
-//! Shared fact-sequence preparation and validation for the concrete storage
+//! Shared replay-record preparation and validation for the concrete storage
 //! round-trip benchmark arms.
 
 pub mod postgres;
@@ -50,11 +50,11 @@ pub struct CanonicalReplayStorageTimings {
     pub storage_measurement_seconds: f64,
 }
 
-/// Complete block-local fact payload lowered for one concrete storage writer.
+/// Complete block-local replay record lowered for one concrete storage writer.
 ///
-/// The replay encoding reconstructs the complete semantic fact aggregate. The
+/// The replay encoding reconstructs the complete semantic record. The
 /// scalar identity columns support ordered access, while read-back validation
-/// ties them to the decoded facts before using them for continuity checks.
+/// ties them to the decoded record before using them for continuity checks.
 #[derive(Clone, Debug)]
 struct CanonicalReplayRecord {
     /// Source block height.
@@ -83,7 +83,7 @@ struct PersistedCanonicalReplayRow {
     parent_hash: BlockHash,
     /// Persisted transaction count.
     transaction_count: u32,
-    /// Digest contract used for the persisted canonical facts.
+    /// Digest contract used for the persisted canonical replay record.
     digest_version: CanonicalBlockFactsDigestVersion,
     /// Digest stored alongside the semantic replay encoding.
     stored_digest: [u8; 32],
@@ -123,7 +123,7 @@ impl CanonicalReplayRecord {
     }
 
     /// Reconstructs a read-back row and rejects a stored digest or scalar
-    /// column that does not match the decoded canonical facts.
+    /// column that does not match the decoded canonical replay record.
     fn from_persisted(row: PersistedCanonicalReplayRow) -> Result<Self, BenchError> {
         let PersistedCanonicalReplayRow {
             height,
@@ -155,7 +155,7 @@ impl CanonicalReplayRecord {
         if digest.as_bytes() != stored_digest {
             return Err(BenchError::canonical_replay_storage_sequence_mismatch(
                 format!(
-                    "block {} persisted fact digest does not match its decoded facts",
+                    "block {} persisted replay digest does not match its decoded replay record",
                     height.value()
                 ),
             ));
@@ -189,7 +189,7 @@ impl CanonicalReplayRecord {
         })
     }
 
-    /// Returns the logical fact-envelope byte count submitted to storage.
+    /// Returns the logical replay-envelope byte count submitted to storage.
     #[must_use]
     fn logical_bytes(&self) -> u64 {
         u64::try_from(self.replay_envelope_bytes.len()).unwrap_or(u64::MAX)
@@ -198,12 +198,12 @@ impl CanonicalReplayRecord {
 
 fn persisted_scalar_mismatch(height: BlockHeight, field_name: &'static str) -> BenchError {
     BenchError::canonical_replay_storage_sequence_mismatch(format!(
-        "block {} persisted {field_name} does not match its decoded facts",
+        "block {} persisted {field_name} does not match its decoded replay record",
         height.value()
     ))
 }
 
-/// Ordered position and reference digest accumulated from fact records.
+/// Ordered position and reference digest accumulated from replay records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalReplaySequencePosition {
     /// First block height, or `None` before any append.
@@ -231,7 +231,7 @@ struct CanonicalReplaySequenceAccumulator {
 }
 
 impl CanonicalReplaySequenceAccumulator {
-    /// Starts an empty ordered fact sequence.
+    /// Starts an empty ordered replay sequence.
     #[must_use]
     fn new() -> Self {
         Self {
@@ -301,7 +301,7 @@ impl CanonicalReplaySequenceAccumulator {
             .checked_add(record.logical_bytes())
             .ok_or_else(|| {
                 BenchError::canonical_replay_storage_sequence_mismatch(
-                    "logical fact byte count exceeds u64::MAX",
+                    "logical replay byte count exceeds u64::MAX",
                 )
             })?;
         let mut next_digest_builder = self.digest_builder.clone();

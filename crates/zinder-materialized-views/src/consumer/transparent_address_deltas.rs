@@ -416,7 +416,7 @@ impl BlockKeyedConsumer for TransparentAddressDeltasConsumer {
         block: &BlockCommitContext,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let transparent_spends = block.transparent_spends()?;
+        let transparent_spends = block.transparent_spends();
         let value_events = address_value_events(block, transparent_spends.as_deref());
         let primary_cf = ctx
             .store

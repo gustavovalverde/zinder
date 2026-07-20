@@ -1,6 +1,6 @@
 //! `ExplorerQuery.RecentTransactions` handler.
 //!
-//! Streams the newest-first projection materialized by
+//! Streams the newest-first view materialized by
 //! [`zinder_materialized_views::RecentTransactionsConsumer`]
 //! out of the consumer-owned `recent_transactions` column family. Joins
 //! the per-tx `transaction_fees` rows in a single `multi_get` so the page
@@ -18,7 +18,7 @@ use zinder_proto::v1::explorer::{
     RecentTransactionEntry, RecentTransactionsChunk, RecentTransactionsRequest,
     TransactionFeesRecord,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
 use zinder_store::{SecondaryChainStore, chain_epoch_from_message, status_from_store_error};
@@ -38,7 +38,7 @@ const MAX_RECENT_TRANSACTIONS_PER_REQUEST: u32 = 1024;
 /// Default `max_entries` when the caller passes zero.
 const DEFAULT_RECENT_TRANSACTIONS: u32 = 64;
 
-/// Length of one row key in the projection (`reverse_height` + position).
+/// Length of one row key in the materialized view (`reverse_height` + position).
 const ROW_KEY_LEN: usize = 8;
 
 /// Stream type returned by the RPC.
@@ -50,7 +50,7 @@ pub(crate) type RecentTransactionsStream =
     clippy::too_many_lines,
     reason = "the streaming handler keeps admission, hydration, and response construction together"
 )]
-pub(crate) async fn handle_recent_transactions(
+pub(crate) async fn query_recent_transactions(
     materialized_view_store: &MaterializedViewStore,
     chain_store: Option<&SecondaryChainStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
@@ -108,14 +108,14 @@ pub(crate) async fn handle_recent_transactions(
     }
 
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     join_paid_fees(
         materialized_view_store,
@@ -143,7 +143,7 @@ pub(crate) async fn handle_recent_transactions(
     Ok(Response::new(Box::pin(stream)))
 }
 
-/// Hydrates `entries[*].paid_fee_zat` from the `transaction_fees` projection
+/// Hydrates `entries[*].paid_fee_zat` from the `transaction_fees` materialized view
 /// in a single batched read.
 ///
 /// Coinbase rows are skipped (no fee record exists). Missing fee records

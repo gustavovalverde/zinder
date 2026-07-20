@@ -1,17 +1,14 @@
 //! Canonical transaction-history materialized-view consumer.
 //!
-//! Materializes every canonical transaction into a time-descending projection.
-//! The projection owns a separate `transaction_history` column family and
+//! Materializes every canonical transaction into a time-descending view.
+//! The consumer owns a separate `transaction_history` column family and
 //! consumer identity so the established `RecentTransactions` contract and
 //! persisted rows remain available independently. The key encoding
 //! `(reverse_height, in_block_position)` (8 bytes) lays the
 //! newest blocks first lexicographically.
 //!
-//! Replaces the round-trip tree a "recent transactions" panel would
-//! otherwise build: `BlockSummariesInRange` then per-block `BlockDetail`
-//! then per-tx `TransactionDetail`. The consumer pays the parse cost
-//! once at commit; the read path is a single bounded scan plus an
-//! optional batched fee lookup.
+//! The consumer pays the parse cost once at commit; the read path serves a
+//! page with one bounded scan plus an optional batched fee lookup.
 
 use prost::Message as _;
 use zinder_core::wire::{
@@ -24,11 +21,11 @@ use zinder_proto::v1::explorer::{
 };
 use zinder_proto::wire::encode_privacy_shape;
 
-use crate::ConsumerProjectionState;
+use crate::MaterializedViewState;
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, BlockProjectionCheckpoint, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
-    advance_verified_projection_coverage,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockCheckpoint,
+    MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
+    MaterializedViewConsumerSchema, advance_verified_materialized_view_coverage,
 };
 use zinder_store::ChainEvent;
 
@@ -41,8 +38,8 @@ pub const TRANSACTION_HISTORY_CONSUMER_NAME: MaterializedViewConsumerName =
 
 /// On-disk schema declaration for canonical transaction history.
 ///
-/// Version 1 includes the full history entry and atomic projection-state
-/// maintenance. The projection has no predecessor because it is additive to
+/// Version 1 includes the full history entry and atomic materialized-view state
+/// maintenance. The consumer has no predecessor because it is additive to
 /// the separately retained `recent_transactions` consumer.
 pub const TRANSACTION_HISTORY_SCHEMA: MaterializedViewConsumerSchema =
     MaterializedViewConsumerSchema::new(
@@ -91,7 +88,7 @@ impl TransactionHistoryConsumer {
         key
     }
 
-    /// Builds the persisted projection row for one canonical transaction.
+    /// Builds the persisted row for one canonical transaction.
     #[must_use]
     pub fn project_entry(
         block: &BlockCommitContext,
@@ -202,42 +199,42 @@ impl BlockKeyedConsumer for TransactionHistoryConsumer {
 
     fn stage_chain_event_checkpoint(
         &mut self,
-        checkpoint: BlockProjectionCheckpoint<'_>,
+        checkpoint: MaterializedViewBlockCheckpoint<'_>,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
-        let projection_tip_height = checkpoint
-            .projection_tip_height
-            .ok_or(TransactionHistoryConsumerError::IncompleteProjectionCheckpoint)?;
-        let projection_tip_hash = checkpoint
-            .projection_tip_hash
-            .ok_or(TransactionHistoryConsumerError::IncompleteProjectionCheckpoint)?;
+        let tip_height = checkpoint
+            .tip_height
+            .ok_or(TransactionHistoryConsumerError::IncompleteMaterializedViewCheckpoint)?;
+        let tip_hash = checkpoint
+            .tip_hash
+            .ok_or(TransactionHistoryConsumerError::IncompleteMaterializedViewCheckpoint)?;
         let current = ctx
             .store
-            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)?;
+            .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)?;
         // Re-applied committed chunks must not regress the fence a later chunk advanced.
         if let Some(state) = current
             && matches!(checkpoint.chain_event, ChainEvent::ChainCommitted { .. })
-            && projection_tip_height < state.projection_tip_height
+            && tip_height < state.tip_height
         {
             return Ok(());
         }
         let revision = current
             .map_or(Some(1), |state| state.revision.checked_add(1))
-            .ok_or(TransactionHistoryConsumerError::ProjectionRevisionOverflow)?;
-        let coverage = advance_verified_projection_coverage(
+            .ok_or(TransactionHistoryConsumerError::MaterializedViewRevisionOverflow)?;
+        let coverage = advance_verified_materialized_view_coverage(
             current.and_then(|state| state.coverage),
             checkpoint,
-            projection_tip_height,
-            projection_tip_hash,
+            tip_height,
+            tip_hash,
             None,
         );
-        ctx.store.stage_consumer_projection_state(
+        ctx.store.stage_consumer_state(
             ctx.batch,
             TRANSACTION_HISTORY_CONSUMER_NAME,
-            ConsumerProjectionState {
-                projection_epoch_id: checkpoint.chain_epoch.id,
-                projection_tip_height,
-                projection_tip_hash,
+            MaterializedViewState {
+                chain_epoch_id: checkpoint.chain_epoch.id,
+                tip_height,
+                tip_hash,
                 revision,
                 coverage,
             },
@@ -303,12 +300,12 @@ pub enum TransactionHistoryConsumerError {
     /// Materialized-view store read failed.
     #[error(transparent)]
     Store(#[from] crate::MaterializedViewStoreError),
-    /// A dispatch omitted one or more block contexts required by the projection.
-    #[error("transaction-history projection checkpoint is missing its indexed tip")]
-    IncompleteProjectionCheckpoint,
-    /// Projection-state revision exhausted its integer domain.
-    #[error("transaction-history projection revision overflowed")]
-    ProjectionRevisionOverflow,
+    /// A dispatch omitted one or more block contexts required by the consumer.
+    #[error("transaction-history materialized-view checkpoint is missing its indexed tip")]
+    IncompleteMaterializedViewCheckpoint,
+    /// Materialized-view revision exhausted its integer domain.
+    #[error("transaction-history materialized-view revision overflowed")]
+    MaterializedViewRevisionOverflow,
 }
 
 #[cfg(test)]
@@ -325,12 +322,12 @@ mod tests {
     use zinder_store::{ChainEpochCommitted, ChainEvent};
 
     use super::{
-        BlockProjectionCheckpoint, ConsumerProjectionState, TRANSACTION_HISTORY_CONSUMER_NAME,
+        MaterializedViewBlockCheckpoint, MaterializedViewState, TRANSACTION_HISTORY_CONSUMER_NAME,
         TransactionHistoryConsumer,
     };
     use crate::consumer::{BlockKeyedConsumer, MaterializedViewConsumerCtx};
     use crate::store::{
-        ConsumerProjectionCoverage, MaterializedViewStore, MaterializedViewStoreOptions,
+        MaterializedViewCoverage, MaterializedViewStore, MaterializedViewStoreOptions,
     };
 
     fn chain_epoch(id: u64, tip: u32) -> ChainEpoch {
@@ -359,23 +356,23 @@ mod tests {
         }
     }
 
-    fn seed_projection_state(
+    fn seed_materialized_view_state(
         store: &MaterializedViewStore,
         tip: u32,
         complete_through_height: u32,
-    ) -> Result<ConsumerProjectionState> {
-        let state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(1),
-            projection_tip_height: BlockHeight::new(tip),
-            projection_tip_hash: BlockHash::from_bytes([0x33; 32]),
+    ) -> Result<MaterializedViewState> {
+        let state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(1),
+            tip_height: BlockHeight::new(tip),
+            tip_hash: BlockHash::from_bytes([0x33; 32]),
             revision: 5,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(1),
                 complete_through_height: BlockHeight::new(complete_through_height),
                 complete_through_hash: BlockHash::from_bytes([0x44; 32]),
             }),
         };
-        store.put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, state)?;
+        store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, state)?;
         Ok(state)
     }
 
@@ -385,11 +382,11 @@ mod tests {
         chunk_event: &ChainEvent,
         tip: u32,
     ) -> Result<()> {
-        let checkpoint = BlockProjectionCheckpoint {
+        let checkpoint = MaterializedViewBlockCheckpoint {
             chain_epoch,
             chain_event: chunk_event,
-            projection_tip_height: Some(BlockHeight::new(tip)),
-            projection_tip_hash: Some(BlockHash::from_bytes([0x55; 32])),
+            tip_height: Some(BlockHeight::new(tip)),
+            tip_hash: Some(BlockHash::from_bytes([0x55; 32])),
         };
         let mut batch = WriteBatch::default();
         let mut ctx = MaterializedViewConsumerCtx {
@@ -408,15 +405,15 @@ mod tests {
         let tempdir = tempdir()?;
         let store =
             MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
-        let armed = seed_projection_state(&store, 180_512, 180_512)?;
+        let armed = seed_materialized_view_state(&store, 180_512, 180_512)?;
 
         let epoch = chain_epoch(1, 180_512);
         let re_applied_chunk = committed_chunk_event(epoch, 180_001, 180_256);
         stage_and_commit_checkpoint(&store, epoch, &re_applied_chunk, 180_256)?;
 
         let stored = store
-            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)?
-            .ok_or_else(|| eyre::eyre!("expected the seeded projection state to survive"))?;
+            .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("expected the seeded materialized-view state to survive"))?;
         assert_eq!(stored, armed);
         Ok(())
     }
@@ -426,16 +423,16 @@ mod tests {
         let tempdir = tempdir()?;
         let store =
             MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
-        seed_projection_state(&store, 180_256, 180_256)?;
+        seed_materialized_view_state(&store, 180_256, 180_256)?;
 
         let epoch = chain_epoch(1, 180_512);
         let next_chunk = committed_chunk_event(epoch, 180_257, 180_512);
         stage_and_commit_checkpoint(&store, epoch, &next_chunk, 180_512)?;
 
         let stored = store
-            .consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME)?
-            .ok_or_else(|| eyre::eyre!("expected an advanced projection state"))?;
-        assert_eq!(stored.projection_tip_height, BlockHeight::new(180_512));
+            .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("expected an advanced materialized-view state"))?;
+        assert_eq!(stored.tip_height, BlockHeight::new(180_512));
         let coverage = stored
             .coverage
             .ok_or_else(|| eyre::eyre!("expected verified coverage to advance"))?;

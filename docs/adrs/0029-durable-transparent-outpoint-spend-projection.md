@@ -15,8 +15,8 @@ then cannot resolve the spender of anything spent longer ago than the reorg
 window, which breaks wallet offline-recovery: a wallet backend maps that RPC to
 its spender-resolution path and expects an answer for arbitrarily old spends.
 
-Spender identity must therefore outlive the canonical fact. The canonical store
-cannot retain every spend fact forever without unbounded growth, and it must
+Spender identity must therefore outlive canonical retention. The canonical store
+cannot retain every spend record forever without unbounded growth, and it must
 stay ignorant of the materialized-view plane ([ADR-0003](0003-canonical-storage-access-boundary.md)).
 
 ## Decision
@@ -44,7 +44,7 @@ output index) valued with the spending transaction id, spending block hash,
 spending height, and transparent input index. A per-height index column family,
 written for every applied block even when empty, drives reorg rewind and reports
 the projection's durable height through `last_materialized_height_ascending`.
-The consumer also persists `ConsumerProjectionState` in the same write batch as
+The consumer also persists `MaterializedViewState` in the same write batch as
 its rows and chain-event cursor. Its coverage starts at the first committed
 height actually materialized, advances only across a contiguous commit or
 connected reorg replacement, and cannot be inferred from the latest index key.
@@ -55,12 +55,12 @@ mined block. A spend of an output below a checkpoint therefore produces the
 same durable row as a spend whose parent output is retained. Missing or offline
 parent facts must not cause the consumer to skip that row.
 
-Artifact schema 18 stores every observed input and the resolved spend facts in
-the canonical block-local spend index. Transparent-retention maintenance deletes the
+The canonical block-local spend index stores every observed input and the
+resolved spend facts. Transparent-retention maintenance deletes the
 per-outpoint serving row but retains that block record. A materialized-view consumer schema
-bump may rebuild only when retained canonical events still begin at the durable
-canonical history boundary; a retained suffix is not proof that every historical
-row will be revisited. Finalized replay
+bump requires a fresh materialized-view store. Its recovery source must still
+begin at the durable canonical history boundary; a retained suffix is not proof
+that every historical row will be revisited. Settled replay
 verifies the block record's input set and producing-block identity against the
 canonical transactions before advancing the durable projection height. Facts
 whose parents predate a configured checkpoint remain explicitly unresolved;
@@ -72,15 +72,15 @@ The canonical store persists a `transparent_retention_release_height` marker
 alongside the existing swept-through marker. A dedicated ingest maintenance
 worker runs only after canonical and materialized views are caught up, independently of
 chain commits, and clamps its ceiling to `min(current settled tip, release height)`, so a settled spend
-above the release height stays retained. `zinder-ingest` publishes the release
-height from the materialized-view tailer's verified contiguous coverage, so canonical
+above the release height stays retained. The materialized-view replay host publishes the release
+height from the materialized-view replay host's verified contiguous coverage, so canonical
 retention releases only what the projection proves it has recorded from the
 canonical history boundary. A latest index height without that coverage holds
 retention in place. A release
 height below the swept marker is ignored safely; the sweep never regresses.
 
 The release floor is a durability barrier, not just a progress signal. The
-materialized-view store writes unsynced, so `zinder-ingest` fsyncs the materialized-view
+materialized-view store writes unsynced, so the replay host fsyncs the materialized-view
 write-ahead log before publishing a higher floor. Without that a host crash
 could lose projection rows the floor already authorized the canonical sweep to
 delete, stranding spender identities the guard cannot recover. Publication is
@@ -89,39 +89,34 @@ write, and a floor that lags by the throttle interval only defers a sweep.
 
 ### Deleted-through marker and replay source
 
-Deletion provenance is recorded, not inferred. Every batch that deletes a spend
-fact (transparent-retention maintenance, and the in-place address-projection migration) writes
-the highest deleted height into a `transparent_retention_deleted_through_height`
-marker in the same batch. A checkpoint bootstrap that only advances the swept
-cursor, and a migration that deletes nothing, leave the marker unset.
+Deletion provenance is recorded, not inferred. Every transparent-retention
+maintenance batch that deletes at least one spend fact writes its highest
+fully swept height into a `transparent_retention_deleted_through_height`
+marker in the same batch. A pass that only advances the swept cursor leaves the
+deleted-through marker unset.
 
 The marker still distinguishes an ambiguous canonical point miss from an
 outpoint that was never observed, which keeps union-routed serving fail-closed
-while materialized views lag. It also defines the startup recovery obligation: before any
-schema reconciliation can clear rows, ingest requires preserved contiguous
-projection coverage from the canonical history boundary through the deleted
-height, or retained chain events that prove a destructive rebuild can replay
-from that same boundary. Store schema 13 remains a hard boundary because older
-stores recorded only outpoints in that index and may already have deleted the
-facts needed to fill it. Such stores are refused at primary open and require a
-genesis rebuild; there is no unsafe best-effort migration.
+while materialized views lag. It also defines the replacement-store recovery
+obligation: the replay host requires preserved contiguous materialized-view
+coverage from the canonical history boundary through the deleted height, or
+retained chain events that prove a fresh store can replay from that same
+boundary. An incompatible canonical volume is refused at primary open and
+requires a genesis rebuild; there is no unsafe best-effort recovery.
 
 ### Serving
 
-`WalletQuery.TransparentSpendsByOutpoint` deepens without a wire change, a new
-capability, or a new RPC: the response already carries spend entries, and
-`wallet.read.transparent_spends_by_outpoint_v1` strengthens in place from a
-reorg-window-scoped answer to a durable one. The strengthening ships in the
-same release that introduces `contract_revision` 1, so revision 1 already
-denotes the durable semantics and no in-place-revision bump marks it. Canonical
-epoch-pinned read first; for canonical misses the union read consults the
-projection and surfaces settled hits whose stored block hash still matches the
-retained canonical header at that height, so a stale row from a reorged-out
-branch (a reorg the tailer has not yet replayed) never surfaces as the spender.
-If the materialized-view head trails the deleted-through marker the read refuses with the
-existing materialized-view lag vocabulary rather than answering incompletely; a store that
-never deleted a fact keeps the canonical-only absent semantics even with an empty
-projection.
+`WalletQuery.TransparentSpendsByOutpoint` returns durable spender identities
+under `wallet.read.transparent_spends_by_outpoint_v1`; `contract_revision` 1
+denotes these semantics. The canonical epoch-pinned read runs first. For
+canonical misses, the union read consults the projection and surfaces settled
+hits whose stored block hash still matches the retained canonical header at
+that height, so a stale row from a reorged-out branch (a reorg the tailer has
+not yet replayed) never surfaces as the spender.
+If the materialized-view head trails the deleted-through marker the read
+refuses with `MATERIALIZED_VIEW_UNAVAILABLE` rather than answering
+incompletely; a store that never deleted a fact keeps the canonical-only absent
+semantics even with an empty projection.
 
 ## Consequences
 
@@ -133,9 +128,9 @@ projection.
   pressure) holds canonical spend-fact storage until it catches up.
 - A materialized view can be rebuilt after point-row retention only when its
   retained chain-event source still covers the full canonical history boundary;
-  otherwise startup fails before destructive reconciliation.
-- Deploying artifact schema 18/store schema 13 onto any older canonical volume
-  fails closed and requires one genesis rebuild to establish that durable source.
-- The projection's schema can rebuild from retained transaction inputs, but a
-  new version must still preserve durable-commit-before-retention-release
-  ordering before it replaces the active projection.
+  otherwise startup fails before it activates a replacement store.
+- Deploying this layout onto an incompatible canonical volume fails closed and
+  requires one genesis rebuild to establish that durable source.
+- The projection's schema can be rebuilt from retained transaction inputs in a
+  fresh store, but durable-commit-before-retention-release ordering still
+  applies before that replacement becomes active.

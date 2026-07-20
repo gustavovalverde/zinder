@@ -16,14 +16,14 @@ and wire contracts that actually carry versions.
 | `NodeSource` | Typed upstream observations and block acquisition |
 | `ChainEpoch` | One immutable visible best-chain state |
 | `CanonicalEventFence` | Authenticated chain epoch, event sequence, visible tip, and sequence digest |
-| `CanonicalBlockFacts` | Complete block-local semantic input for replay and projection |
+| `CanonicalBlockFacts` | Complete block-local semantic input for replay and materialized-view construction |
 | `CanonicalBlockReplay` | Reversible storage envelope for canonical block facts |
 | `CanonicalReader` | Immutable canonical side of an admitted serving pair |
 | `WalletProjectionReader` | Immutable wallet side of an admitted serving pair |
 | `WalletServingReadPair` | Canonical and wallet readers proven to describe one exact fence |
-| `WalletServingQuery` | `WalletQueryApi` implementation over an atomically replaceable serving pair |
+| `LightwalletdServingQuery` | `LightwalletdQueryApi` implementation over an atomically replaceable serving pair |
 | `WalletServingPairPublisher` | Compatibility-runtime owner that catches up, admits, and publishes serving pairs |
-| `MaterializedViewConsumer` | Explorer projection that applies retained canonical events |
+| `MaterializedViewConsumer` | Explorer materialized-view consumer that applies retained canonical events |
 | `MaterializedViewStore` | Independent store for materialized-view rows, cursors, coverage, and schemas |
 | `ChainEvent` | Durable canonical append or replacement transition |
 | `MempoolEvent` | Typed live-pool transition: added, invalidated, or mined |
@@ -40,7 +40,7 @@ topology, migration, or backend label.
 | --- | --- |
 | `zinder-ingest` | Canonical writer and live mempool owner |
 | `zinder-projector` | Wallet projection writer |
-| `zinder-compat-lightwalletd` | Lightwalletd protocol adapter and exact-pair reader |
+| `zinder-compat-lightwalletd` | Lightwalletd protocol adapter and wallet-serving reader |
 | `zinder-query` | Rust wallet query contract, not a runtime |
 | `zinder-explorer` | Optional ExplorerQuery runtime |
 | `zinder-compat-cipherscan` | Optional Cipherscan REST and WebSocket adapter |
@@ -48,7 +48,7 @@ topology, migration, or backend label.
 | `zinder-rocksdb-bulk-load` | RocksDB sorted-file bulk-load support |
 
 Modules name the domain behavior they contain. Current examples are
-`canonical_replay_storage`, `wallet_serving_pair`, `wallet_serving_query`,
+`canonical_replay_storage`, `wallet_serving_pair`, `lightwalletd_serving_query`,
 `wallet_serving_pair_publisher`, `canonical_writer_control`,
 `materialized_view_consumers`, `materialized_view_status_reader`, and
 `runtime_config`.
@@ -62,7 +62,7 @@ must contain a technology-specific boundary, as
 ## Chain-view vocabulary
 
 `ChainView` is the protocol envelope for freshness and source identity.
-`ChainEpoch` carries the visible and settled chain tips. Optional projection
+`ChainEpoch` carries the visible and settled chain tips. Optional materialized-view
 fields report independently queryable state.
 
 | Field | Meaning |
@@ -94,14 +94,14 @@ The release writer uses these source types:
 remains valid for the artifact-oriented ingestion library and test harness, but
 it is not the name of the release store or a backend.
 
-## Projection vocabulary
+## Wallet and materialized-view vocabulary
 
 Wallet projection names begin with `Wallet` when the type belongs to wallet
-state, source identity, rows, build leases, or serving. Explorer projection
-names begin with `MaterializedView` only when they belong to the reusable
+state, source identity, rows, build leases, or serving. Explorer materialized-view
+names begin with `MaterializedView` when they belong to the reusable
 consumer and store framework.
 
-`ProjectionPreset` selects a closed set of bundled materialized-view consumers.
+`MaterializedViewPreset` selects a closed set of bundled materialized-view consumers.
 The stable values are `wallet` and `explorer`. A preset does not select a
 database engine, raw-byte retention policy, or release topology.
 
@@ -136,7 +136,6 @@ Important current reasons include:
 | `REORG_WINDOW_EXCEEDED` | Replacement crosses the configured reorg policy |
 | `BLOCK_NOT_IN_BEST_CHAIN` | Requested block is not visible in the admitted epoch |
 | `MATERIALIZED_VIEW_UNAVAILABLE` | Required materialized view is not configured or admitted |
-| `MATERIALIZED_VIEW_LAGGING` | Required materialized view has not covered the requested fence |
 | `DEPENDENCY_NOT_CONFIGURED` | A required federated dependency is absent |
 | `UPSTREAM_UNREACHABLE` | A configured dependency is temporarily unreachable |
 | `NODE_CAPABILITY_MISSING` | The source node cannot provide a required capability |
@@ -197,7 +196,7 @@ stay synchronized with it.
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. |
 | `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. |
-| `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, the writer polls it as the primary upstream-sync signal; when unset, the writer falls back to `getblockchaininfo.verificationprogress`/`estimatedheight`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
+| `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, the writer polls it as the primary upstream-sync signal; when unset, the writer falls back to `getblockchaininfo.verificationprogress`/`estimatedheight`. See [ADR-0015](../adrs/0015-phase-driven-ingest.md). |
 | `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
 | `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest | Optional | `node.health.estimated_gap_floor_blocks` | Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10. |
@@ -216,9 +215,16 @@ stay synchronized with it.
 | `ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS` | zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.initial_catchup_timeout_ms` | Maximum startup RocksDB secondary catchup duration before a reader starts with the opened secondary and lets /readyz report replica lag. Defaults to 30000. |
 | `ZINDER_STORAGE__CANONICAL_PATH` | zinder-projector | Optional | `storage.canonical_path` | Canonical primary RocksDB path the projector opens as a read-only secondary. Defaults to `/var/lib/zinder/canonical`. |
 | `ZINDER_STORAGE__CANONICAL_SECONDARY_PATH` | zinder-projector | Optional | `storage.canonical_secondary_path` | Projector-local RocksDB secondary metadata directory for canonical reads. Defaults to `/var/lib/zinder/projector/canonical-secondary`; never share it with another process. |
-| `ZINDER_STORAGE__WALLET_PATH` | zinder-projector | Optional | `storage.wallet_path` | Wallet-projection RocksDB primary path owned exclusively by the projector. Defaults to `/var/lib/zinder/wallet`. |
-| `ZINDER_WALLET__PATH` | zinder-compat-lightwalletd | Required | `wallet.path` | Wallet-projection RocksDB primary path the compatibility server opens as a read-only secondary. |
+| `ZINDER_WALLET__PATH` | zinder-projector, zinder-compat-lightwalletd | When `running zinder-compat-lightwalletd` | `wallet.path` | Wallet-projection RocksDB primary path. The projector owns it as the primary writer and defaults to `/var/lib/zinder/wallet`; compatibility opens it as a read-only secondary and requires an explicit path. |
 | `ZINDER_WALLET__SECONDARY_PATH` | zinder-compat-lightwalletd | Required | `wallet.secondary_path` | Compatibility-server root for immutable wallet-secondary generations. Must be distinct from every primary and canonical-secondary path. |
+| `ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-projector, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.block_cache_bytes` | Wallet-projection RocksDB block cache budget in bytes. Defaults to 268435456 for the writer and 67108864 for the compatibility reader. |
+| `ZINDER_WALLET__ROCKSDB__MAX_WAL_BYTES` | zinder-projector, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_wal_bytes` | Wallet-projection RocksDB live WAL ceiling in bytes. Defaults to 268435456 for the writer and 16777216 for the compatibility reader. |
+| `ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES` | zinder-projector, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_open_files` | Wallet-projection RocksDB open SST file cap. Defaults to 512 for the writer and 64 for the compatibility reader. |
+| `ZINDER_WALLET__ROCKSDB__WRITE_BUFFER_BYTES` | zinder-projector, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.write_buffer_bytes` | Wallet-projection RocksDB per-column-family write buffer size. Defaults to 16777216 for the writer and 4194304 for the compatibility reader. |
+| `ZINDER_WALLET__ROCKSDB__MAX_WRITE_BUFFER_COUNT` | zinder-projector, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_write_buffer_count` | Wallet-projection RocksDB mutable plus immutable write buffer count. Defaults to 4 for the writer and 2 for the compatibility reader. |
+| `ZINDER_WALLET__ROCKSDB__MAX_BACKGROUND_JOBS` | zinder-projector, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_background_jobs` | Wallet-projection primary-writer RocksDB background job cap shared by flush and compaction work. Defaults to 2 and is not applied to secondary opens, including compatibility readers. |
+| `ZINDER_WALLET__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-projector, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.memtable_budget_bytes` | Wallet-projection RocksDB total memtable budget across column families. Defaults to 536870912 for the writer and 16777216 for the compatibility reader. |
+| `ZINDER_WALLET__ROCKSDB__STATISTICS_LEVEL` | zinder-projector, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.statistics_level` | Wallet-projection RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.block_cache_bytes` | Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912 for writers and 134217728 for readers. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_wal_bytes` | Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for writers and 33554432 for readers. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_open_files` | Canonical-store RocksDB open SST file cap. Defaults to 512 for writers and 128 for readers. |
@@ -227,18 +233,16 @@ stay synchronized with it.
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_BACKGROUND_JOBS` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_background_jobs` | Canonical-store primary-writer RocksDB background job cap shared by flush and compaction work. Defaults to 2 and is not applied to secondary opens. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.memtable_budget_bytes` | Canonical-store total RocksDB memtable budget across column families. Defaults to 268435456 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.statistics_level` | Canonical-store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.materialized_views.rocksdb.block_cache_bytes` | Materialized-view store RocksDB block cache budget in bytes. Defaults to 268435456 for writers and 67108864 for readers. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_wal_bytes` | Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for writers and 16777216 for readers. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_open_files` | Materialized-view store RocksDB open SST file cap. Defaults to 512 for writers and 64 for readers. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__WRITE_BUFFER_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.materialized_views.rocksdb.write_buffer_bytes` | Materialized-view store per-column-family RocksDB write buffer size. Defaults to 16777216 for writers and 4194304 for readers. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WRITE_BUFFER_COUNT` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_write_buffer_count` | Materialized-view store per-column-family mutable plus immutable RocksDB write buffer count. Defaults to 4 for writers and 2 for readers. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_background_jobs` | Materialized-view store primary-writer RocksDB background job cap shared by flush and compaction work. Defaults to 2 and is not applied to secondary opens. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.materialized_views.rocksdb.memtable_budget_bytes` | Materialized-view store total RocksDB memtable budget across column families. Defaults to 536870912 for writers and 16777216 for readers. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-projector, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.materialized_views.rocksdb.statistics_level` | Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
+| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-explorer | Optional | `storage.materialized_views.rocksdb.block_cache_bytes` | Materialized-view store RocksDB block cache budget in bytes. Defaults to 67108864. |
+| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES` | zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_wal_bytes` | Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to 16777216. |
+| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES` | zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_open_files` | Materialized-view store RocksDB open SST file cap. Defaults to 64. |
+| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__WRITE_BUFFER_BYTES` | zinder-explorer | Optional | `storage.materialized_views.rocksdb.write_buffer_bytes` | Materialized-view store per-column-family RocksDB write buffer size. Defaults to 4194304. |
+| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WRITE_BUFFER_COUNT` | zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_write_buffer_count` | Materialized-view store per-column-family mutable plus immutable RocksDB write buffer count. Defaults to 2. |
+| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-explorer | Optional | `storage.materialized_views.rocksdb.memtable_budget_bytes` | Materialized-view store total RocksDB memtable budget across column families. Defaults to 16777216. |
+| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL` | zinder-explorer | Optional | `storage.materialized_views.rocksdb.statistics_level` | Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-segment-fetching.md). |
 | `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Immutable raw-blob retention contract: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so canonical indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because lightwalletd transaction and transparent-history methods require retained bytes. The first canonical commit fixes historical coverage; changing a non-empty store requires a rebuild. |
-| `ZINDER_INGEST__PROJECTION_PRESET` | zinder-ingest | Optional | `ingest.projection_preset` | Closed materialized-view workload: `"wallet"` or `"explorer"`. Defaults to `"explorer"`. Selection is supported only when creating a fresh canonical-plus-projection store. |
-| `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds finalization, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
+| `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds settlement, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical-store replacement-depth identity expected by the compatibility reader. It must match the writer's `ingest.reorg_window_blocks`; admission fails closed on mismatch. Must be greater than zero. Defaults to 100. |
 | `ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS` | zinder-compat-lightwalletd | Optional | `compat.pair_convergence_attempts` | Bounded attempts to catch canonical and wallet secondaries to one exact authenticated publication fence before reporting replica lag. Defaults to 12 and must not exceed 64. |
 | `ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS` | zinder-projector | Optional | `projector.reorg_window_blocks` | Wallet undo suffix depth and expected canonical replacement policy. Must match the canonical writer. Defaults to 100. |
@@ -250,7 +254,7 @@ stay synchronized with it.
 | `ZINDER_PROJECTOR__BUILD__SST_TARGET_LOGICAL_BYTES` | zinder-projector | Optional | `projector.build.sst_target_logical_bytes` | Target logical payload per externally built wallet SST file. Defaults to 134217728. |
 | `ZINDER_PROJECTOR__BUILD__MAX_ACCOUNTED_REORG_UNDO_BYTES` | zinder-projector | Optional | `projector.build.max_accounted_reorg_undo_bytes` | Maximum logical wallet undo bytes admitted during fixed-tip construction. Defaults to 536870912. |
 | `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` | zinder-projector | Optional | `projector.follow.max_transition_logical_bytes` | Maximum logical planner and write-batch bytes for one atomic wallet following transition. Defaults to 536870912. |
-| `ZINDER_INGEST__PHASE_CLASSIFICATION__CATCHUP_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.phase_classification.catchup_threshold_blocks` | Gap (in blocks) at which the unified loop transitions between `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. See [ADR-0015](../adrs/0015-unified-phase-driven-ingest.md). |
+| `ZINDER_INGEST__PHASE_CLASSIFICATION__CATCHUP_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.phase_classification.catchup_threshold_blocks` | Gap (in blocks) at which the phase-driven ingest loop transitions between `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. See [ADR-0015](../adrs/0015-phase-driven-ingest.md). |
 | `ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.construction.canonical_batch_max_blocks` | Block count per bulk-catchup commit batch. Defaults to 1000. |
 | `ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.construction.canonical_batch_max_artifact_bytes` | Canonical artifact bytes accumulated before closing a bulk-catchup batch. Defaults to 536870912. |
 | `ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES` | zinder-ingest | Optional | `ingest.construction.canonical_batch_max_estimated_write_bytes` | Estimated canonical write bytes accumulated before closing a bulk-catchup batch. Defaults to 536870912. |
@@ -262,20 +266,12 @@ stay synchronized with it.
 | `ZINDER_INGEST__CONSTRUCTION__BLOCK_PREPARE_CONCURRENCY` | zinder-ingest | Optional | `ingest.construction.block_prepare_concurrency` | Diagnostic override for parallel canonical block-prepare slots. The default is `min(available_parallelism(), 16)`. |
 | `ZINDER_INGEST__CONSTRUCTION__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES` | zinder-ingest | Optional | `ingest.construction.block_prepare_memory_watermark_bytes` | Diagnostic override for the prepare and resident-handoff admission watermark. The default is `clamp(container_memory / 64, 134217728, 536870912)`. |
 | `ZINDER_INGEST__CONSTRUCTION__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES` | zinder-ingest | Optional | `ingest.construction.commit_reassembly_max_queued_artifact_bytes` | Maximum settled-tip artifact bytes that can accumulate while the previous bulk-catchup batch is attaching metadata, committing, or flushing. Defaults to 536870912. |
-| `ZINDER_INGEST__MATERIALIZED_VIEWS__REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.materialized_views.replay_batch_blocks` | Maximum block contexts hydrated and dispatched in one materialized-view replay write. Must be greater than zero. Defaults to 100. |
-| `ZINDER_INGEST__MATERIALIZED_VIEWS__REPLAY_POLICY` | zinder-ingest | Optional | `ingest.materialized_views.replay_policy` | Materialized-view replay pressure policy. `canonical-first` pauses rebuildable materialized-view work replay under memory pressure so canonical ingest keeps the process budget. `continuous` replays retained chain events whenever they are available while the writer is at tip; during bulk catch-up the canonical-phase gate pauses replay regardless of policy. Defaults to `canonical-first`. |
-| `ZINDER_INGEST__MATERIALIZED_VIEWS__MEMORY_BUDGET_BYTES` | zinder-ingest | Optional | `ingest.materialized_views.memory_budget_bytes` | Explicit materialized-view replay memory budget in bytes. When unset, materialized-view replay uses the runtime cgroup `memory.high` or `memory.max` value when present. |
-| `ZINDER_INGEST__MATERIALIZED_VIEWS__MEMORY_DEGRADE_RATIO` | zinder-ingest | Optional | `ingest.materialized_views.memory_degrade_ratio` | Memory pressure ratio at which materialized-view replay shrinks the effective replay batch size. Defaults to 0.90. |
-| `ZINDER_INGEST__MATERIALIZED_VIEWS__MEMORY_PAUSE_RATIO` | zinder-ingest | Optional | `ingest.materialized_views.memory_pause_ratio` | Memory pressure ratio at which canonical-first materialized-view replay pauses. Defaults to 0.99. |
-| `ZINDER_INGEST__MATERIALIZED_VIEWS__MEMORY_RESUME_RATIO` | zinder-ingest | Optional | `ingest.materialized_views.memory_resume_ratio` | Memory pressure ratio below which degraded materialized-view replay returns to the normal replay batch size. Paused replay resumes as degraded work once pressure falls below memory_pause_ratio. Defaults to 0.80. |
-| `ZINDER_INGEST__MATERIALIZED_VIEWS__MIN_REPLAY_BATCH_BLOCKS` | zinder-ingest | Optional | `ingest.materialized_views.min_replay_batch_blocks` | Smallest effective materialized-view replay batch size under memory degradation. Must be greater than zero and no larger than replay_batch_blocks. Defaults to 10. |
-| `ZINDER_INGEST__MATERIALIZED_VIEWS__STARTUP_HANDOFF_LAG_BLOCKS` | zinder-ingest | Optional | `ingest.materialized_views.startup_handoff_lag_blocks` | Residual materialized-view lag in blocks at which a FollowingTip startup stops replaying synchronously and hands the remainder to the always-on tailer. BulkCatchup, AwaitingUpstream, failed observation, and unclassified startup states skip synchronous replay. A bounded wall-clock budget caps an admitted startup catch-up regardless of this value. Defaults to 1000. |
 | `ZINDER_INGEST__CONSTRUCTION__FLUSH_INTERVAL_EPOCHS` | zinder-ingest | Optional | `ingest.construction.flush_interval_epochs` | Bulk-catchup RocksDB flush cadence in committed epochs. Must be greater than zero. Defaults to 5. |
 | `ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS` | zinder-ingest | Optional | `ingest.follow.poll_interval_ms` | Tip-follow poll cadence in milliseconds. Must be greater than zero. Defaults to 1000. |
 | `ZINDER_INGEST__FOLLOW__LAG_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.follow.lag_threshold_blocks` | Block lag at which tip-follow reports `cause=syncing`. Defaults to 1. |
-| `ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT` | zinder-ingest | Optional | `ingest.run_overrides.target_height` | One-shot stop-at modifier; the loop exits 0 after committing this height. Renamed from `to_height`. |
+| `ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT` | zinder-ingest | Optional | `ingest.run_overrides.target_height` | One-shot stop-at modifier; the loop exits 0 after committing this height. |
 | `ZINDER_INGEST__RUN_OVERRIDES__CHECKPOINT_HEIGHT` | zinder-ingest | Optional | `ingest.run_overrides.checkpoint_height` | Pre-seed an empty store from an upstream-supplied checkpoint at this height. |
-| `ZINDER_INGEST__RUN_OVERRIDES__ALLOW_NEAR_TIP_FINALIZE` | zinder-ingest | Optional | `ingest.run_overrides.allow_near_tip_finalize` | Disposable-store override: lets bulk-catchup finalize inside the reorg window. Invalid combined with `coverage = "wallet-serving"`. |
+| `ZINDER_INGEST__RUN_OVERRIDES__ALLOW_REORG_WINDOW_SETTLEMENT` | zinder-ingest | Optional | `ingest.run_overrides.allow_reorg_window_settlement` | Disposable-store override: lets bulk-catchup advance the settled tip inside the reorg window. Invalid combined with `coverage = "wallet-serving"`. |
 | `ZINDER_INGEST__RUN_OVERRIDES__COVERAGE` | zinder-ingest | Optional | `ingest.run_overrides.coverage` | Ingest coverage mode: `"explicit"` or `"wallet-serving"`. Defaults to `"explicit"`. |
 | `ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS` | zinder-ingest | Optional | `retention.chain_event_retention_hours` | Chain-event retention window in hours, enforced by `zinder-ingest`. Defaults to 168 (7 days). `0` disables eviction. |
 | `ZINDER_RETENTION__CHAIN_EVENT_RETENTION_CHECK_INTERVAL_MS` | zinder-ingest | Optional | `retention.chain_event_retention_check_interval_ms` | Chain-event retention sweep cadence in milliseconds. Must be greater than zero. Defaults to 60000 (one minute). |
@@ -308,7 +304,7 @@ wallet capability unless it is the actual public boundary.
 
 <!-- capability-list:public-interfaces:start -->
 ```text
-wallet.read.latest_block_v1
+wallet.read.visible_tip_block_v1
 wallet.read.block_id_by_selector_v1
 wallet.read.block_header_by_selector_v1
 wallet.read.compact_block_at_v1
@@ -381,7 +377,6 @@ explorer.transaction.history_v2
 explorer.transaction.intrinsic_value_balances_v1
 explorer.transaction.component_summary_v2
 explorer.transparent_address.ranking_v1
-explorer.payment_disclosure.verify_v1
 explorer.overview.snapshot_v1
 explorer.migration.overview_v1
 explorer.migration.cohorts_v1

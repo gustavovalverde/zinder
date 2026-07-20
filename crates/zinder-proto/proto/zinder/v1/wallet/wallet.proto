@@ -133,8 +133,8 @@ message MaterializedViewStatus {
   uint64 observed_at_millis = 4;
 }
 
-// Metadata for one block.
-message BlockMetadata {
+// Identity of one canonical block.
+message BlockId {
   // Height of the block.
   uint32 height = 1;
 
@@ -143,17 +143,17 @@ message BlockMetadata {
   string block_hash = 2;
 }
 
-// Latest visible block metadata response bound to one chain epoch.
-message LatestBlockResponse {
+// Visible-tip block identity response bound to one chain epoch.
+message VisibleTipBlockResponse {
   // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
   ChainView chain_view = 1;
 
-  // Latest visible block in this chain epoch.
-  BlockMetadata latest_block = 2;
+  // Visible-tip block in this chain epoch.
+  BlockId visible_tip_block = 2;
 }
 
-// Latest visible block metadata request.
-message LatestBlockRequest {
+// Visible-tip block identity request.
+message VisibleTipBlockRequest {
   // Optional chain-epoch id that must be used to answer the request. When
   // absent, the server uses the visible epoch at request time.
   optional uint64 at_epoch_id = 1;
@@ -162,16 +162,16 @@ message LatestBlockRequest {
 // Settled-tip block metadata response bound to one chain epoch. Returns the
 // block at the chain epoch's settled_tip, which the wallet uses as its scan
 // ceiling.
-message LatestSafeBlockResponse {
+message SettledTipBlockResponse {
   // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
   ChainView chain_view = 1;
 
   // Block at chain_view.chain_epoch.settled_tip.height.
-  BlockMetadata settled_tip_block = 2;
+  BlockId settled_tip_block = 2;
 }
 
-// Safe-tip block metadata request.
-message LatestSafeBlockRequest {
+// Settled-tip block metadata request.
+message SettledTipBlockRequest {
   // Optional chain-epoch id that must be used to answer the request. When
   // absent, the server uses the visible epoch at request time.
   optional uint64 at_epoch_id = 1;
@@ -211,14 +211,14 @@ message BlockIdResponse {
   ChainView chain_view = 1;
 
   // Resolved block identity in the canonical best chain.
-  BlockMetadata block_id = 2;
+  BlockId block_id = 2;
 }
 
 // Typed block-header read-model response. The shape is Zinder-native and
 // does not re-export upstream-node JSON-RPC fields.
-message BlockHeaderInfo {
+message BlockHeader {
   // Resolved block identity.
-  BlockMetadata block_id = 1;
+  BlockId block_id = 1;
 
   // Previous block hash in RPC byte order (64 lowercase hex characters).
   // Reference: Zcash protocol spec term `\rpcByteOrder`.
@@ -252,7 +252,7 @@ message BlockHeaderResponse {
   ChainView chain_view = 1;
 
   // Block-header read-model value at the resolved selector.
-  BlockHeaderInfo block_header = 2;
+  BlockHeader block_header = 2;
 }
 
 // A wallet-facing compact block payload from one chain epoch.
@@ -398,13 +398,14 @@ message MinedBlockLocation {
 
 // Mined-transaction enrichment bound to a response's chain epoch.
 //
-// `MinedDetails` is response-shape, not artifact-shape. `confirmations`
+// `MinedTransactionChainContext` is response-shape, not artifact-shape.
+// `confirmations`
 // MUST be computed from the response's
 // `chain_view.chain_epoch.visible_tip.height` and the transaction's mined
 // height; `consensus_branch_id` and `block_time` are derived from the
 // source-aware layer that owns Zcash consensus parameters and block-header
 // parsing.
-message MinedDetails {
+message MinedTransactionChainContext {
   // Consensus branch identifier in effect at the mined height.
   uint32 consensus_branch_id = 1;
 
@@ -422,8 +423,8 @@ message MinedTransaction {
   // Mined-transaction block coordinates.
   MinedBlockLocation location = 1;
 
-  // Epoch-bound enrichment fields.
-  MinedDetails details = 2;
+  // Epoch-bound chain context: consensus branch id, block time, and confirmations.
+  MinedTransactionChainContext chain_context = 2;
 
   // Serialized consensus transaction bytes. Carries the same value the
   // mempool arm exposes as `MempoolTransaction.payload_bytes`, so a verbose
@@ -446,20 +447,14 @@ message MempoolTransaction {
   int64 first_seen_unix_seconds = 2;
 }
 
-// Conflicting-chain transaction response carrier (reserved shape).
-message ConflictingChainTransaction {
-  // Reserved for future fields once non-best-chain transaction lookup
-  // ships. Empty today; the conflicting-chain status is its own signal.
-}
-
 // Canonical transaction-location discriminator shared by every read surface.
 //
 // One match shape answers "where does this transaction live": mined in the
-// canonical chain, visible in the live mempool, or conflicting with the
-// visible canonical chain. `NotFound` is never an arm here; the read surface
-// conveys it out of band (gRPC `NOT_FOUND`) so typed errors do not consume
-// oneof slots. `WalletQuery.Transaction` and `ExplorerQuery.TransactionDetail`
-// both embed this message so a consumer writes the match once.
+// canonical chain or visible in the live mempool. `NotFound` is never an arm
+// here; the read surface conveys it out of band (gRPC `NOT_FOUND`) so typed
+// errors do not consume oneof slots. `WalletQuery.Transaction` and
+// `ExplorerQuery.TransactionDetail` both embed this message so a consumer
+// writes the match once.
 message TransactionLocation {
   oneof location {
     // Transaction is mined in the canonical chain.
@@ -468,8 +463,6 @@ message TransactionLocation {
     // Transaction is currently visible in the live mempool.
     MempoolTransaction in_mempool = 2;
 
-    // Transaction is known to conflict with the visible canonical chain.
-    ConflictingChainTransaction conflicting = 3;
   }
 }
 
@@ -716,12 +709,11 @@ message BroadcastTransactionResponse {
   }
 }
 
-// Chain-event stream family. Tip receives every chain event. Safe receives
-// only commits whose entire range is past the reorg window, and never reorg
-// events.
+// Chain-event stream family. Visible receives every chain event. Settled
+// receives only non-reorg commits entirely at or below the settled tip.
 enum ChainEventStreamFamily {
-  CHAIN_EVENT_STREAM_FAMILY_TIP = 0;
-  CHAIN_EVENT_STREAM_FAMILY_SAFE = 1;
+  CHAIN_EVENT_STREAM_FAMILY_VISIBLE = 0;
+  CHAIN_EVENT_STREAM_FAMILY_SETTLED = 1;
 }
 
 // Marker for the earliest-retained start position of an event stream.
@@ -799,7 +791,7 @@ message ChainRangeReverted {
 
 // Chain-committed event.
 //
-// Carries a non-reorg commit that advanced the canonical tip or the safe
+// Carries a non-reorg commit that advanced the canonical tip or the settled
 // prefix. The architectural-spine name; preferred over "tip-advance"
 // because Zinder commits to either the visible tip or the settled tip under
 // the same event variant.
@@ -853,7 +845,7 @@ message WalletServerInfo {
   uint32 schema_version = 3;
 
   // Configured reorg window depth, in blocks. A block becomes part of the
-  // safe prefix (settled_tip_height) once it is buried at least this deep.
+  // settled prefix (settled_tip_height) once it is buried at least this deep.
   uint32 reorg_window_blocks = 4;
 
   // Chain-event retention window in seconds. 0 indicates unbounded retention
@@ -1199,23 +1191,12 @@ message TransparentMempoolOutputsByOutpointRequest {
   repeated OutPoint outpoints = 1;
 }
 
-// Mempool-event stream family. Reserved for future extensions; today only
-// MEMPOOL_EVENT_STREAM_FAMILY_MEMPOOL is populated.
-enum MempoolEventStreamFamily {
-  MEMPOOL_EVENT_STREAM_FAMILY_UNSPECIFIED = 0;
-  MEMPOOL_EVENT_STREAM_FAMILY_MEMPOOL = 1;
-}
-
 // Replayable mempool-event stream request.
 message MempoolEventsRequest {
   // Required start position. `after_cursor` carries the opaque cursor
   // bytes from a previously delivered envelope.
   EventStreamStart start = 1;
 
-  // Stream family for the `earliest_retained` and `live_tail` start
-  // positions. With `after_cursor`, the cursor's encoded family is
-  // authoritative and this field must be unset/default or match it.
-  MempoolEventStreamFamily family = 2;
 }
 
 // New mempool transaction observed.
@@ -1252,24 +1233,6 @@ message MempoolMinedEvent {
   string block_hash = 3;
 }
 
-// Mempool-admission suppression observed by Zinder.
-//
-// Emitted when the upstream node refuses to admit a transaction that Zinder
-// would otherwise publish as an `Added` event. The documented cause is
-// ZIP-401 RecentlyEvicted: the node remembers a recently evicted txid and
-// drops re-broadcast attempts silently. Suppression differs from
-// invalidation: the transaction never entered the live index.
-//
-// Source-side emission is reserved. The wire surface and store-side event
-// log accept this variant today so external integrators can subscribe; the
-// upstream node must expose pre-admission rejects before Zinder populates
-// the event. See docs/architecture/wallet-data-plane.md.
-message MempoolSuppressedEvent {
-  // Canonical transaction id in RPC byte order (64 lowercase hex
-  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string transaction_id = 1;
-}
-
 // Cursor-bound mempool event envelope.
 message MempoolEventEnvelope {
   // Opaque StreamCursorTokenV1 bytes for resuming strictly after this event.
@@ -1286,7 +1249,6 @@ message MempoolEventEnvelope {
     MempoolAddedEvent added = 10;
     MempoolInvalidatedEvent invalidated = 11;
     MempoolMinedEvent mined = 12;
-    MempoolSuppressedEvent suppressed = 13;
   }
 }
 
@@ -1430,9 +1392,6 @@ message ChainValuePoolsAtTipRequest {}
 
 // Wallet-plane response for chain-wide value-pool totals.
 message ChainValuePoolsAtTipResponse {
-  reserved 3;
-  reserved "tip_height";
-
   // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
   // Visible to Zinder when the upstream value-pool read was answered.
   ChainView chain_view = 1;
@@ -1485,7 +1444,8 @@ message TransparentUtxoSetCommitment {
 //
 // `at_epoch_id` pins the canonical read. Absent resolves against the visible
 // tip. The aggregate is always taken at the resolved epoch's settled tip,
-// where the current-UTXO projection is the irreversible unspent set.
+// where the current-UTXO projection is the settled-tip unspent set under the
+// configured reorg policy; a deeper reorg fails closed.
 message TransparentUtxoSetSummaryRequest {
   // Optional chain-epoch id pin for the canonical read. Absent resolves
   // against the visible tip; present pins the read to a specific epoch.
@@ -1511,7 +1471,8 @@ message TransparentUtxoSetSummaryResponse {
   uint64 total_value_zat = 3;
 
   // Settled tip height the aggregate was taken at. Below this height the
-  // projection is the irreversible unspent set.
+  // projection is the settled-tip unspent set under the configured reorg policy;
+  // a deeper reorg fails closed.
   uint32 summarized_height = 4;
 
   // Homomorphic commitment to the full unspent set. Present only when the
@@ -1588,13 +1549,13 @@ message TransparentAddressTxIdsChunk {
 
 // Native Zinder wallet and wallet-like application query service.
 service WalletQuery {
-  // Return latest visible block metadata.
-  rpc LatestBlock(LatestBlockRequest) returns (LatestBlockResponse);
+  // Return the visible-tip block identity.
+  rpc VisibleTipBlock(VisibleTipBlockRequest) returns (VisibleTipBlockResponse);
 
   // Return the block at the settled tip height: the highest height at which
   // both compact blocks and a coherent tree-state checkpoint are
   // guaranteed available. The wallet uses this as its scan ceiling.
-  rpc LatestSafeBlock(LatestSafeBlockRequest) returns (LatestSafeBlockResponse);
+  rpc SettledTipBlock(SettledTipBlockRequest) returns (SettledTipBlockResponse);
 
   // Resolve a typed block selector against the canonical best chain.
   rpc BlockIdBySelector(BlockSelectorRequest) returns (BlockIdResponse);
@@ -1619,8 +1580,8 @@ service WalletQuery {
   rpc FullBlocksInRange(FullBlocksInRangeRequest) returns (stream FullBlocksInRangeChunk);
 
   // Return the typed status of one transaction by transaction id. NotFound
-  // maps to gRPC NOT_FOUND; mempool, mined, and conflicting-chain states
-  // are typed in the response location oneof.
+  // maps to gRPC NOT_FOUND; mempool and mined states are typed in the
+  // response location oneof.
   rpc Transaction(TransactionRequest) returns (TransactionStatusResponse);
 
   // Return the tree state at one exact block height. Served from a stored

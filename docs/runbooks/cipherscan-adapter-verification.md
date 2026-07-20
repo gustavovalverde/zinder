@@ -9,8 +9,8 @@ environment run.
 - Custom-composed `WalletQuery` and `ExplorerQuery` endpoints and the Cipherscan
   adapter are healthy on the same network. The release Compose file does not
   provide these native query endpoints.
-- The block-production time projection reports complete coverage through its
-  projection tip.
+- The block-production time materialized view reports complete coverage through its
+  materialized-view tip.
 - Cipherscan uses the adapter as its API base URL without source changes.
 - Required materialized views report complete coverage for the ranges under
   test.
@@ -32,7 +32,7 @@ For every response, verify:
 5. Two requests with the same effective raw period string within five minutes
    return the same `generatedAt`. Distinct raw strings use distinct cache keys.
 6. A multi-page request remains valid while the chain extends. A reorg that
-   displaces the frozen projection tip invalidates the continuation.
+   displaces the frozen materialized-view tip invalidates the continuation.
 
 Compare each response with the public testnet Cipherscan API by structure,
 types, period behavior, grouping semantics, and cache behavior. Moving windows

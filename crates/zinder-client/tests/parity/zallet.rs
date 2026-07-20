@@ -21,13 +21,13 @@ use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixtur
 #[test]
 fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
     fn assert_base_compiles<T: ChainIndex>() {
-        // typed BlockId from latest_block
-        let _ = T::latest_block;
+        // typed BlockId from visible_tip_block
+        let _ = T::visible_tip_block;
         // typed BlockSelector resolver
         let _ = T::block_id_by_selector;
-        // typed BlockHeaderInfo
+        // typed BlockHeader
         let _ = T::block_header_by_selector;
-        // typed TxStatus envelope (mined / mempool / conflicting)
+        // typed TxStatus envelope (mined / mempool / not found)
         let _ = T::transaction_by_id;
         // tree_state_at with Option<ChainEpoch>
         let _ = T::tree_state_at;
@@ -73,7 +73,7 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
 
     let current_epoch = chain_index.current_epoch().await?;
     let pinned = Some(current_epoch.id);
-    let latest_block = chain_index.latest_block(pinned).await?;
+    let visible_tip_block = chain_index.visible_tip_block(pinned).await?;
     let resolved_by_height = chain_index
         .block_id_by_selector(BlockSelector::Height(BlockHeight::new(2)), pinned)
         .await?;
@@ -100,8 +100,8 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
         .transaction_by_id(TransactionId::from_bytes([0x24; 32]), pinned)
         .await?;
 
-    assert_eq!(latest_block, resolved_by_height);
-    assert_eq!(latest_block, resolved_by_hash);
+    assert_eq!(visible_tip_block, resolved_by_height);
+    assert_eq!(visible_tip_block, resolved_by_hash);
     assert_eq!(tree_state.height, BlockHeight::new(2));
     assert_eq!(tree_state.block_hash, transaction_block_hash);
     assert_eq!(subtree_roots.len(), 1);
@@ -118,7 +118,7 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     );
     assert_eq!(mined.location.block_hash, transaction_location.block_hash);
     assert_eq!(mined.location.tx_index_in_block, 0);
-    assert_eq!(mined.details.confirmations, 1);
+    assert_eq!(mined.chain_context.confirmations, 1);
     assert_eq!(
         mined.raw_transaction_bytes,
         Some(b"zallet-transaction-payload".to_vec()),

@@ -9,7 +9,7 @@
 //! `Ready`/`Syncing` writes carry the operator-visible status.
 //!
 //! [ADR-0015 §Upstream sync detection]:
-//!     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+//!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
 
 use std::{sync::Arc, time::Duration};
 

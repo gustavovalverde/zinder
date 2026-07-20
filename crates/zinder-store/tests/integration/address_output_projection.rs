@@ -260,24 +260,24 @@ fn spend_reverted_by_replace_resurfaces_address_row_without_new_writes() -> eyre
 }
 
 #[test]
-fn settled_tip_sweep_deletes_finalized_spends_and_keeps_in_window_spends() -> eyre::Result<()> {
+fn settled_tip_sweep_deletes_settled_spends_and_keeps_in_window_spends() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let finalized_output = output_at(BlockHeight::new(1), [21; 32]);
+    let settled_output = output_at(BlockHeight::new(1), [21; 32]);
     let in_window_output = output_at(BlockHeight::new(1), [22; 32]);
     let unspent_output = output_at(BlockHeight::new(1), [23; 32]);
-    let finalized_spend = spend_at(BlockHeight::new(2), &finalized_output);
+    let settled_spend = spend_at(BlockHeight::new(2), &settled_output);
     let in_window_spend = spend_at(BlockHeight::new(5), &in_window_output);
 
     super::commit_synthetic_chain_epoch(
         &store,
         epoch_artifacts(1, 1, 5)
             .with_transparent_outputs_by_outpoint(vec![
-                finalized_output.clone(),
+                settled_output.clone(),
                 in_window_output.clone(),
                 unspent_output.clone(),
             ])
-            .with_transparent_spend_facts(vec![finalized_spend.clone(), in_window_spend]),
+            .with_transparent_spend_facts(vec![settled_spend.clone(), in_window_spend]),
     )?;
     // The durable spend projection has consumed through the tip, so the sweep
     // may release retention up to the settled tip.
@@ -285,20 +285,20 @@ fn settled_tip_sweep_deletes_finalized_spends_and_keeps_in_window_spends() -> ey
     super::commit_synthetic_chain_epoch(&store, advance_settled_tip_artifacts(2, 5, 3, 3))?;
 
     // Canonical settled-tip advancement stays independent from historical
-    // retention maintenance, so the finalized rows remain until the worker
+    // retention maintenance, so the settled rows remain until the worker
     // explicitly runs a bounded pass.
     let before_sweep = store.current_chain_epoch_reader()?;
     assert!(
         before_sweep
-            .transparent_spend_facts_by_outpoints(&[finalized_output.outpoint])?
-            .contains_key(&finalized_output.outpoint)
+            .transparent_spend_facts_by_outpoints(&[settled_output.outpoint])?
+            .contains_key(&settled_output.outpoint)
     );
     drop(before_sweep);
     store.sweep_transparent_retention_once()?;
 
     let reader = store.current_chain_epoch_reader()?;
     let outpoints = [
-        finalized_output.outpoint,
+        settled_output.outpoint,
         in_window_output.outpoint,
         unspent_output.outpoint,
     ];
@@ -306,12 +306,12 @@ fn settled_tip_sweep_deletes_finalized_spends_and_keeps_in_window_spends() -> ey
     // Spent at height 2 (at or below the new settled tip 3): physically gone
     // from all three projections.
     let outputs = reader.transparent_outputs_by_outpoints(&outpoints)?;
-    assert!(!outputs.contains_key(&finalized_output.outpoint));
+    assert!(!outputs.contains_key(&settled_output.outpoint));
     let spends = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
-    assert!(!spends.contains_key(&finalized_output.outpoint));
+    assert!(!spends.contains_key(&settled_output.outpoint));
     assert_eq!(
         reader.current_transparent_spend_facts_at_height(BlockHeight::new(2))?,
-        vec![finalized_spend]
+        vec![settled_spend]
     );
 
     // Spent at height 5 (above the settled tip): retained for reorg repair.
@@ -334,13 +334,13 @@ fn settled_tip_sweep_deletes_finalized_spends_and_keeps_in_window_spends() -> ey
 fn real_sweep_records_the_deleted_through_marker() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let finalized_output = output_at(BlockHeight::new(1), [26; 32]);
+    let settled_output = output_at(BlockHeight::new(1), [26; 32]);
 
     super::commit_synthetic_chain_epoch(
         &store,
         epoch_artifacts(1, 1, 5)
-            .with_transparent_outputs_by_outpoint(vec![finalized_output.clone()])
-            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &finalized_output)]),
+            .with_transparent_outputs_by_outpoint(vec![settled_output.clone()])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &settled_output)]),
     )?;
     store.set_transparent_retention_release_height(BlockHeight::new(5))?;
     super::commit_synthetic_chain_epoch(&store, advance_settled_tip_artifacts(2, 5, 3, 3))?;
@@ -511,13 +511,13 @@ fn secondary_reader_replays_settled_tip_sweep_deletes() -> eyre::Result<()> {
     let secondary_dir = tempdir.path().join("secondary");
     let primary_path = tempdir.path().join("primary");
     let store = PrimaryChainStore::open(&primary_path, ChainStoreOptions::for_local_tests())?;
-    let finalized_output = output_at(BlockHeight::new(1), [41; 32]);
+    let settled_output = output_at(BlockHeight::new(1), [41; 32]);
 
     super::commit_synthetic_chain_epoch(
         &store,
         epoch_artifacts(1, 1, 5)
-            .with_transparent_outputs_by_outpoint(vec![finalized_output.clone()])
-            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &finalized_output)]),
+            .with_transparent_outputs_by_outpoint(vec![settled_output.clone()])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &settled_output)]),
     )?;
     let secondary = SecondaryChainStore::open(
         &primary_path,
@@ -528,8 +528,8 @@ fn secondary_reader_replays_settled_tip_sweep_deletes() -> eyre::Result<()> {
     let pre_sweep_reader = secondary.current_chain_epoch_reader()?;
     assert!(
         pre_sweep_reader
-            .transparent_outputs_by_outpoints(&[finalized_output.outpoint])?
-            .contains_key(&finalized_output.outpoint)
+            .transparent_outputs_by_outpoints(&[settled_output.outpoint])?
+            .contains_key(&settled_output.outpoint)
     );
     drop(pre_sweep_reader);
 
@@ -541,18 +541,18 @@ fn secondary_reader_replays_settled_tip_sweep_deletes() -> eyre::Result<()> {
     let reader = secondary.current_chain_epoch_reader()?;
     assert!(
         reader
-            .transparent_outputs_by_outpoints(&[finalized_output.outpoint])?
+            .transparent_outputs_by_outpoints(&[settled_output.outpoint])?
             .is_empty()
     );
     assert!(
         reader
-            .transparent_spend_facts_by_outpoints(&[finalized_output.outpoint])?
+            .transparent_spend_facts_by_outpoints(&[settled_output.outpoint])?
             .is_empty()
     );
     assert!(
         reader
             .address_output_index(
-                finalized_output.address_script_hash,
+                settled_output.address_script_hash,
                 BlockHeight::new(1),
                 NonZeroU32::new(10).ok_or_else(|| eyre!("invalid max entries"))?,
             )?
@@ -629,7 +629,7 @@ fn utxo_set_summary_counts_unspent_below_the_settled_tip_and_excludes_swept_spen
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let unspent_low = output_at(BlockHeight::new(1), [61; 32]);
     let unspent_mid = output_at(BlockHeight::new(2), [62; 32]);
-    let finalized_spent = output_at(BlockHeight::new(1), [63; 32]);
+    let settled_spent = output_at(BlockHeight::new(1), [63; 32]);
 
     super::commit_synthetic_chain_epoch(
         &store,
@@ -637,9 +637,9 @@ fn utxo_set_summary_counts_unspent_below_the_settled_tip_and_excludes_swept_spen
             .with_transparent_outputs_by_outpoint(vec![
                 unspent_low,
                 unspent_mid,
-                finalized_spent.clone(),
+                settled_spent.clone(),
             ])
-            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &finalized_spent)]),
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &settled_spent)]),
     )?;
     store.set_transparent_retention_release_height(BlockHeight::new(5))?;
     super::commit_synthetic_chain_epoch(&store, advance_settled_tip_artifacts(2, 5, 3, 3))?;
@@ -845,13 +845,13 @@ fn sweep_backlog_larger_than_cap_advances_one_cap_per_pass() -> eyre::Result<()>
 fn sweep_backlog_within_cap_advances_to_the_full_ceiling() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = store_with_sweep_cap(tempdir.path(), 25_000)?;
-    let finalized_output = output_at(BlockHeight::new(1), [121; 32]);
+    let settled_output = output_at(BlockHeight::new(1), [121; 32]);
 
     super::commit_synthetic_chain_epoch(
         &store,
         epoch_artifacts(1, 1, 5)
-            .with_transparent_outputs_by_outpoint(vec![finalized_output.clone()])
-            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &finalized_output)]),
+            .with_transparent_outputs_by_outpoint(vec![settled_output.clone()])
+            .with_transparent_spend_facts(vec![spend_at(BlockHeight::new(2), &settled_output)]),
     )?;
     store.set_transparent_retention_release_height(BlockHeight::new(5))?;
 
@@ -867,8 +867,8 @@ fn sweep_backlog_within_cap_advances_to_the_full_ceiling() -> eyre::Result<()> {
         Some(BlockHeight::new(3))
     );
     let reader = store.current_chain_epoch_reader()?;
-    let spends = reader.transparent_spend_facts_by_outpoints(&[finalized_output.outpoint])?;
-    assert!(!spends.contains_key(&finalized_output.outpoint));
+    let spends = reader.transparent_spend_facts_by_outpoints(&[settled_output.outpoint])?;
+    assert!(!spends.contains_key(&settled_output.outpoint));
 
     Ok(())
 }

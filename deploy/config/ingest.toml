@@ -20,7 +20,6 @@ raw_blob_policy = "transactions"
 
 [ingest]
 source = "zebra-json-rpc"
-projection_preset = "wallet"
 reorg_window_blocks = 100
 
 [ingest.run_overrides]

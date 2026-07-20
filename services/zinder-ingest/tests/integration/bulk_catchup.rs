@@ -25,8 +25,8 @@ use zinder_ingest::{
     run_bulk_catchup, run_bulk_catchup_until_complete,
 };
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewStoreError,
-    ProjectionPreset, decode_stored_record,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewPreset,
+    MaterializedViewStoreError, decode_stored_record,
 };
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
@@ -132,7 +132,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
-        allow_near_tip_finalize: false,
+        allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
 
@@ -196,7 +196,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "scenario covers checkpoint bootstrap, run_bulk_catchup, materialized-view replay, and materialized projection assertions end to end"
+    reason = "scenario covers checkpoint bootstrap, run_bulk_catchup, materialized-view replay, and materialized-view assertions end to end"
 )]
 async fn materialized_view_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
     let source_block = fixture_source_block()?;
@@ -246,7 +246,7 @@ async fn materialized_view_replay_catches_up_checkpoint_bootstrap_and_block_comm
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
-        allow_near_tip_finalize: false,
+        allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
     let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
@@ -292,9 +292,9 @@ async fn materialized_view_replay_catches_up_checkpoint_bootstrap_and_block_comm
     assert_paid_fee_live_tail_seeded(&materialized_view_store, source_block.height)?;
 
     let wallet_materialized_view_store =
-        zinder_materialized_views::MaterializedViewStore::open_with_projection_preset(
+        zinder_materialized_views::MaterializedViewStore::open_with_materialized_view_preset(
             storage_path.join("wallet-materialized-views"),
-            ProjectionPreset::Wallet,
+            MaterializedViewPreset::Wallet,
             zinder_materialized_views::MaterializedViewStoreOptions {
                 rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
                 ..zinder_materialized_views::MaterializedViewStoreOptions::default()
@@ -306,7 +306,7 @@ async fn materialized_view_replay_catches_up_checkpoint_bootstrap_and_block_comm
         materialized_view_config,
     )
     .await?;
-    for schema in ProjectionPreset::Wallet.consumer_schemas() {
+    for schema in MaterializedViewPreset::Wallet.consumer_schemas() {
         assert!(
             wallet_materialized_view_store
                 .get_chain_event_cursor(schema.name)?
@@ -434,7 +434,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_valid_nonzero_checkpoint() -> 
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
-        allow_near_tip_finalize: false,
+        allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
 
@@ -501,7 +501,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
-        allow_near_tip_finalize: false,
+        allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
     let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;

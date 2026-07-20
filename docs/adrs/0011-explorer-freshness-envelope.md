@@ -66,11 +66,10 @@ stay absent when their source fact, parser support, privacy boundary, or
 materialized-view coverage is unavailable; zero is never used as an absence
 sentinel.
 
-Materialized-view lag is computed from
-`chain_view.chain_epoch.visible_tip.height - chain_view.indexed_tip.tip.height`
-when both axes are present. Requests that require fresher indexed state fail
-with the typed `MATERIALIZED_VIEW_LAGGING` reason. Missing storage or wiring uses
-`MATERIALIZED_VIEW_UNAVAILABLE` or `DEPENDENCY_NOT_CONFIGURED` as defined by the
+Materialized-view coverage is explicit in `chain_view.indexed_tip`. Requests
+whose required materialized view is unavailable use
+`MATERIALIZED_VIEW_UNAVAILABLE`; missing storage or wiring uses
+`DEPENDENCY_NOT_CONFIGURED` as defined by the
 [error vocabulary](../reference/error-vocabulary.md).
 
 ## Consequences

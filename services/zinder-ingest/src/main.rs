@@ -16,7 +16,7 @@ use zinder_ingest::{
     run_mempool_retention, spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, Readiness, ReadinessState, ServiceIdentifier, StartupPhase,
+    OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
     spawn_ops_endpoint_for,
 };
@@ -78,9 +78,6 @@ struct Cli {
     /// Canonical Zinder store path.
     #[arg(long = "storage-path", global = true)]
     storage_path: Option<PathBuf>,
-    /// Closed materialized-view workload to materialize: wallet or explorer.
-    #[arg(long = "projection-preset", value_parser = ["wallet", "explorer"], global = true)]
-    projection_preset: Option<String>,
     /// Node request timeout in seconds.
     #[arg(long = "request-timeout-secs", global = true)]
     request_timeout_secs: Option<u64>,
@@ -133,13 +130,13 @@ struct Cli {
     #[arg(long = "target-height", global = true)]
     target_height: Option<u32>,
     /// Bootstrap an empty store from the upstream node's chain state at
-    /// this height (the unified loop begins at `checkpoint_height + 1`).
+    /// this height (the ingest loop begins at `checkpoint_height + 1`).
     #[arg(long = "checkpoint-height", global = true)]
     checkpoint_height: Option<u32>,
-    /// Allow bulk-catchup batches to finalize blocks inside the upstream
+    /// Allow bulk-catchup batches to advance the settled tip inside the upstream
     /// node's reorg window. Disposable-store recovery only.
-    #[arg(long = "allow-near-tip-finalize", action = clap::ArgAction::SetTrue, global = true)]
-    allow_near_tip_finalize: bool,
+    #[arg(long = "allow-reorg-window-settlement", action = clap::ArgAction::SetTrue, global = true)]
+    allow_reorg_window_settlement: bool,
     /// Derive the bulk-catchup floor needed by lightwalletd-compatible
     /// wallets from node-advertised activation heights.
     #[arg(long = "wallet-serving", action = clap::ArgAction::SetTrue, global = true)]
@@ -256,15 +253,10 @@ async fn run_ingest(
     let load_config_phase = StartupPhase::LoadConfig.start();
     let mut command_config = config::load_ingest_config(config_path, overrides)?;
     load_config_phase.complete();
-    if command_config.projection_preset != zinder_materialized_views::ProjectionPreset::Wallet {
-        return Err(IngestConfigError::CanonicalWriterRequiresWallet);
-    }
-
     let readiness = Readiness::default();
-    readiness.set_projection_workload("wallet", vec!["canonical".to_owned()]);
     let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::Ingest,
+        RuntimeService::Ingest,
         command_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(command_config.runtime_config.node.network),
@@ -570,7 +562,7 @@ fn log_canonical_writer_start(
         target_height = ?writer_config.follow.target_height.map(BlockHeight::value),
         historical_prevout_reads = 0_u64,
         cross_block_wallet_reads = 0_u64,
-        "canonical writer started without legacy storage composition"
+        "canonical writer started"
     );
 }
 
@@ -604,10 +596,10 @@ fn resolve_wallet_serving_modifiers(
     command_config.runtime_config.run_overrides = CanonicalRunOverrides {
         target_height: command_config.runtime_config.run_overrides.target_height,
         checkpoint_height: Some(checkpoint_height),
-        allow_near_tip_finalize: command_config
+        allow_reorg_window_settlement: command_config
             .runtime_config
             .run_overrides
-            .allow_near_tip_finalize,
+            .allow_reorg_window_settlement,
         checkpoint: command_config
             .runtime_config
             .run_overrides
@@ -839,7 +831,6 @@ fn ingest_overrides_with_ops(
         node_auth_username: cli.node_auth_username.clone(),
         node_auth_path: cli.node_auth_path.clone(),
         storage_path: cli.storage_path.clone(),
-        projection_preset: cli.projection_preset.clone(),
         request_timeout_secs: cli.request_timeout_secs,
         max_response_bytes: cli.max_response_bytes,
         reorg_window_blocks: cli.reorg_window_blocks,
@@ -858,7 +849,7 @@ fn ingest_overrides_with_ops(
         lag_threshold_blocks: cli.lag_threshold_blocks,
         target_height: cli.target_height,
         checkpoint_height: cli.checkpoint_height,
-        allow_near_tip_finalize: cli.allow_near_tip_finalize.then_some(true),
+        allow_reorg_window_settlement: cli.allow_reorg_window_settlement.then_some(true),
         wallet_serving: cli.wallet_serving.then_some(true),
         ingest_control_listen_addr: cli.ingest_control_listen_addr,
         ingest_control_bearer_token_path: cli.ingest_control_token_path.clone(),

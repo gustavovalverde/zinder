@@ -1,18 +1,18 @@
-//! Projection preset storage contracts.
+//! Materialized-view preset storage contracts.
 
 use eyre::Result;
 use tempfile::TempDir;
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
-    MaterializedViewStore, MaterializedViewStoreError, MaterializedViewStoreOptions,
-    ProjectionPreset, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
-    TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY, bundled_projection_definitions,
+    MaterializedViewPreset, MaterializedViewStore, MaterializedViewStoreError,
+    MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
+    TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY, bundled_materialized_view_consumer_definitions,
 };
 use zinder_store::RocksDbResourceBudget;
 
 const FOREIGN_CONSUMER_NAME: MaterializedViewConsumerName =
-    MaterializedViewConsumerName::from_static("foreign_projection");
-const FOREIGN_COLUMN_FAMILY: &str = "foreign_projection_rows";
+    MaterializedViewConsumerName::from_static("foreign_materialized_view");
+const FOREIGN_COLUMN_FAMILY: &str = "foreign_consumer_rows";
 const FOREIGN_SCHEMA: MaterializedViewConsumerSchema =
     MaterializedViewConsumerSchema::new(FOREIGN_CONSUMER_NAME, 1, &[FOREIGN_COLUMN_FAMILY]);
 
@@ -24,14 +24,14 @@ fn options() -> MaterializedViewStoreOptions {
 }
 
 #[test]
-fn wallet_preset_persists_only_wallet_projection_schemas() -> Result<()> {
+fn wallet_preset_persists_only_wallet_materialized_view_schemas() -> Result<()> {
     let primary = TempDir::new()?;
     let secondary = TempDir::new()?;
 
     {
-        let store = MaterializedViewStore::open_with_projection_preset(
+        let store = MaterializedViewStore::open_with_materialized_view_preset(
             primary.path(),
-            ProjectionPreset::Wallet,
+            MaterializedViewPreset::Wallet,
             options(),
         )?;
         store.consumer_column_family(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY)?;
@@ -43,10 +43,10 @@ fn wallet_preset_persists_only_wallet_projection_schemas() -> Result<()> {
         ));
     }
 
-    MaterializedViewStore::open_secondary_with_projection_preset(
+    MaterializedViewStore::open_secondary_with_materialized_view_preset(
         primary.path(),
         secondary.path(),
-        ProjectionPreset::Wallet,
+        MaterializedViewPreset::Wallet,
         options(),
     )?;
     Ok(())
@@ -57,54 +57,54 @@ fn persisted_workload_detection_distinguishes_wallet_explorer_and_missing_paths(
     let wallet = TempDir::new()?;
     let explorer = TempDir::new()?;
     let missing = TempDir::new()?;
-    MaterializedViewStore::open_with_projection_preset(
+    MaterializedViewStore::open_with_materialized_view_preset(
         wallet.path(),
-        ProjectionPreset::Wallet,
+        MaterializedViewPreset::Wallet,
         options(),
     )?;
-    MaterializedViewStore::open_with_projection_preset(
+    MaterializedViewStore::open_with_materialized_view_preset(
         explorer.path(),
-        ProjectionPreset::Explorer,
+        MaterializedViewPreset::Explorer,
         options(),
     )?;
 
     assert_eq!(
-        MaterializedViewStore::detect_projection_preset_at_path(wallet.path())?,
-        Some(ProjectionPreset::Wallet)
+        MaterializedViewStore::detect_materialized_view_preset_at_path(wallet.path())?,
+        Some(MaterializedViewPreset::Wallet)
     );
     assert_eq!(
-        MaterializedViewStore::detect_projection_preset_at_path(explorer.path())?,
-        Some(ProjectionPreset::Explorer)
+        MaterializedViewStore::detect_materialized_view_preset_at_path(explorer.path())?,
+        Some(MaterializedViewPreset::Explorer)
     );
     assert_eq!(
-        MaterializedViewStore::detect_projection_preset_at_path(missing.path())?,
+        MaterializedViewStore::detect_materialized_view_preset_at_path(missing.path())?,
         None
     );
     Ok(())
 }
 
 #[test]
-fn changing_a_persisted_projection_preset_fails_before_manifest_mutation() -> Result<()> {
+fn changing_a_persisted_materialized_view_preset_fails_before_manifest_mutation() -> Result<()> {
     let primary = TempDir::new()?;
     {
-        MaterializedViewStore::open_with_projection_preset(
+        MaterializedViewStore::open_with_materialized_view_preset(
             primary.path(),
-            ProjectionPreset::Wallet,
+            MaterializedViewPreset::Wallet,
             options(),
         )?;
     }
     let column_families_before =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
 
-    let outcome = MaterializedViewStore::open_with_projection_preset(
+    let outcome = MaterializedViewStore::open_with_materialized_view_preset(
         primary.path(),
-        ProjectionPreset::Explorer,
+        MaterializedViewPreset::Explorer,
         options(),
     );
     assert!(matches!(
         outcome,
         Err(
-            MaterializedViewStoreError::ProjectionPresetRequiresFreshStore {
+            MaterializedViewStoreError::MaterializedViewPresetRequiresFreshStore {
                 requested: "explorer",
             }
         )
@@ -113,9 +113,9 @@ fn changing_a_persisted_projection_preset_fails_before_manifest_mutation() -> Re
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
     assert_eq!(column_families_after, column_families_before);
 
-    let store = MaterializedViewStore::open_with_projection_preset(
+    let store = MaterializedViewStore::open_with_materialized_view_preset(
         primary.path(),
-        ProjectionPreset::Wallet,
+        MaterializedViewPreset::Wallet,
         options(),
     )?;
     assert!(matches!(
@@ -130,24 +130,24 @@ fn changing_a_persisted_projection_preset_fails_before_manifest_mutation() -> Re
 fn reducing_explorer_to_wallet_fails_before_column_family_mutation() -> Result<()> {
     let primary = TempDir::new()?;
     {
-        MaterializedViewStore::open_with_projection_preset(
+        MaterializedViewStore::open_with_materialized_view_preset(
             primary.path(),
-            ProjectionPreset::Explorer,
+            MaterializedViewPreset::Explorer,
             options(),
         )?;
     }
     let column_families_before =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
 
-    let outcome = MaterializedViewStore::open_with_projection_preset(
+    let outcome = MaterializedViewStore::open_with_materialized_view_preset(
         primary.path(),
-        ProjectionPreset::Wallet,
+        MaterializedViewPreset::Wallet,
         options(),
     );
     assert!(matches!(
         outcome,
         Err(
-            MaterializedViewStoreError::ProjectionPresetRequiresFreshStore {
+            MaterializedViewStoreError::MaterializedViewPresetRequiresFreshStore {
                 requested: "wallet",
             }
         )
@@ -175,10 +175,7 @@ fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
     let column_families_before =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
 
-    let outcome = MaterializedViewStore::inspect_projection_store_at_path(
-        primary.path(),
-        ProjectionPreset::Explorer,
-    );
+    let outcome = MaterializedViewStore::detect_materialized_view_preset_at_path(primary.path());
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerNotDeclared {
@@ -209,30 +206,30 @@ fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
 }
 
 #[test]
-fn projection_catalog_declares_every_explorer_and_wallet_identity_once() {
-    let definitions = bundled_projection_definitions();
+fn consumer_catalog_declares_every_explorer_and_wallet_identity_once() {
+    let definitions = bundled_materialized_view_consumer_definitions();
     assert_eq!(
         definitions.len(),
-        ProjectionPreset::Explorer.consumer_schemas().len()
+        MaterializedViewPreset::Explorer.consumer_schemas().len()
     );
-    for schema in ProjectionPreset::Explorer.consumer_schemas() {
+    for schema in MaterializedViewPreset::Explorer.consumer_schemas() {
         assert_eq!(
             definitions
                 .iter()
                 .filter(|definition| definition.schema.name == schema.name)
                 .count(),
             1,
-            "projection {} must have exactly one product declaration",
+            "consumer {} must have exactly one product declaration",
             schema.name.as_str()
         );
     }
     let wallet_identities = definitions
         .iter()
-        .filter(|definition| definition.included_in(ProjectionPreset::Wallet))
+        .filter(|definition| definition.included_in(MaterializedViewPreset::Wallet))
         .map(|definition| definition.schema.name)
         .collect::<Vec<_>>();
     assert_eq!(wallet_identities.len(), 2);
-    for schema in ProjectionPreset::Wallet.consumer_schemas() {
+    for schema in MaterializedViewPreset::Wallet.consumer_schemas() {
         assert!(wallet_identities.contains(&schema.name));
     }
 }

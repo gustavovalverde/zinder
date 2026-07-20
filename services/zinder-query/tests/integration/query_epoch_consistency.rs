@@ -13,8 +13,8 @@ use zinder_core::{
     SubtreeRootIndex, SubtreeRootRange, TreeStateArtifact,
 };
 use zinder_query::{
-    WalletQuery, WalletQueryApi, latest_block_response, latest_tree_state_checkpoint_response,
-    subtree_roots_response, tree_state_at_response,
+    WalletQuery, WalletQueryApi, latest_tree_state_checkpoint_response, subtree_roots_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 use zinder_store::{
     ChainEpochArtifacts, ChainEpochReadApi, ChainEpochReader, ChainEventEnvelope,
@@ -72,7 +72,7 @@ async fn compact_block_range_stays_bound_to_reader_epoch_if_current_epoch_advanc
 }
 
 #[tokio::test]
-async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_advances()
+async fn visible_tip_block_response_stays_bound_to_reader_epoch_if_current_epoch_advances()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -100,19 +100,22 @@ async fn latest_block_response_stays_bound_to_reader_epoch_if_current_epoch_adva
     let wallet_query =
         WalletQuery::new(read_api, (), Arc::new(sample_regtest_upgrade_activations()));
 
-    let response = latest_block_response(&wallet_query, None).await?;
+    let response = visible_tip_block_response(&wallet_query, None).await?;
     let response_chain_epoch = response
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
-    let latest_block = response
-        .latest_block
-        .ok_or_else(|| eyre!("missing latest block metadata"))?;
+    let visible_tip_block = response
+        .visible_tip_block
+        .ok_or_else(|| eyre!("missing visible-tip block identity"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, first_epoch.id.value());
-    assert_eq!(latest_block.height, first_epoch.visible_tip_height.value());
     assert_eq!(
-        latest_block.block_hash,
+        visible_tip_block.height,
+        first_epoch.visible_tip_height.value()
+    );
+    assert_eq!(
+        visible_tip_block.block_hash,
         encode_rpc_block_hash_hex(first_epoch.visible_tip_hash)
     );
 

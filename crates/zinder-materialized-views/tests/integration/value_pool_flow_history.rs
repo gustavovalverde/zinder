@@ -8,7 +8,7 @@ use zinder_core::{
     TransactionLocation, TransactionPublicFacts, TransactionVersion,
 };
 use zinder_materialized_views::{
-    BlockCommitContext, BlockCommitPayload, BlockKeyedConsumer, MaterializedViewConsumerCtx,
+    BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, MaterializedViewConsumerCtx,
     MaterializedViewStore, MaterializedViewStoreOptions, TransactionIntrinsicValueBalanceFacts,
     TransparentSpendFacts, VALUE_POOL_FLOW_HISTORY_COLUMN_FAMILY,
     VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, VALUE_POOL_FLOW_HISTORY_INDEX_COLUMN_FAMILY,
@@ -68,7 +68,7 @@ fn block(
         .map(|(transaction, balances)| (transaction.location.transaction_id, *balances))
         .collect();
     BlockCommitContext::new(
-        BlockCommitPayload {
+        BlockCommitInput {
             height,
             block_hash,
             previous_block_hash: BlockHash::from_bytes([0; 32]),
@@ -292,7 +292,7 @@ fn time_range_visitor_rejects_malformed_rows() -> TestResult {
 }
 
 #[test]
-fn reorg_replacement_removes_old_events_before_writing_new_events() -> TestResult {
+fn reorg_replacement_removes_displaced_events_before_writing_replacement_events() -> TestResult {
     let (_tempdir, store) = open_store()?;
     apply(
         &store,
