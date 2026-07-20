@@ -26,7 +26,7 @@ pub(crate) struct RocksDbCompactBlockRangeArgs {
     /// Directory containing the fixture manifest used to construct the store.
     #[arg(long)]
     fixture: PathBuf,
-    /// Existing READY canonical-v1 primary store.
+    /// Existing READY canonical primary store.
     #[arg(long = "canonical-store")]
     canonical_store: PathBuf,
     /// Absent directory used for process-local secondary metadata.

@@ -71,18 +71,16 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `CHAIN_EVENT_CURSOR_EXPIRED` | Cursor sequence is older than retained history (consumer fell behind) | `type=CHAIN_EVENT_CURSOR_EXPIRED, subject=chain_event:<seq>` |
 | `MEMPOOL_EVENT_CURSOR_EXPIRED` | Same as above for the mempool event stream | `type=MEMPOOL_EVENT_CURSOR_EXPIRED, subject=mempool_event:<seq>` |
 | `SNAPSHOT_PAGE_CURSOR_EXPIRED` | `MempoolSnapshot` paging cursor is anchored ahead of the mempool-event sequence the writer has applied | `type=SNAPSHOT_PAGE_CURSOR_EXPIRED, subject=snapshot_page:<anchor_seq>` |
-| `CHAIN_EPOCH_PIN_UNSUPPORTED` | Request pinned `at_epoch_id` but the query implementation does not support it | `subject=at_epoch` |
 | `CHAIN_EPOCH_PIN_UNAVAILABLE` | Pinned chain epoch is no longer retained | `subject=chain_epoch:<id>` |
-| `CHAIN_EPOCH_PIN_MISMATCH` | Wire-reserved and not produced. Requests pin by bare epoch id, so there is no echoed epoch body to mismatch. | — |
 | `SCHEMA_MISMATCH` | Persistent store schema is incompatible with the running binary | — |
 | `SCHEMA_TOO_NEW` | Store was opened by a newer Zinder; rolling back is unsafe | — |
 | `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured reorg window; operator must reconcile | — |
 | `CHAIN_EPOCH_CONFLICT` | Detected chain-epoch contention between writer and reader | — |
 | `CHAIN_EPOCH_NETWORK_MISMATCH` | Store opened against the wrong `network` | — |
-| `DERIVE_PROJECTION_UNAVAILABLE` | A derive-backed wallet/explorer projection is not configured for this deployment | `type=DERIVE_PROJECTION_UNAVAILABLE, subject=<capability>` |
-| `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical fact store, a derive view, or a wallet-query endpoint) is not wired on this deployment | — |
+| `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer materialized view is not configured for this deployment | `type=MATERIALIZED_VIEW_UNAVAILABLE, subject=<capability>` |
+| `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
 | `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires; the operator must reconfigure the node | — |
-| `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state (for example a conflicting-chain transaction) | — |
+| `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
 
 ### `NOT_FOUND` family
 
@@ -90,7 +88,7 @@ The requested resource does not exist. Retry disposition: **RetryAfterBackoff** 
 
 | Reason | What it means | Example metadata |
 | --- | --- | --- |
-| `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized derive row) | `resource_type=<family>, resource_name=<key>` |
+| `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized materialized-view row) | `resource_type=<family>, resource_name=<key>` |
 | `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned) | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
 | `BLOCK_NOT_IN_BEST_CHAIN` | The requested block exists but is not on the visible best chain | — |
 
@@ -112,20 +110,19 @@ Service is reachable but a dependency is not, or the operation is not yet suppor
 | `NODE_UNAVAILABLE` | Upstream node (Zebra) is unreachable or returning errors |
 | `STORAGE_UNAVAILABLE` | Local storage cannot serve the request (fall-through case) |
 | `BLOCKING_TASK_FAILED` | An internal background task failed unexpectedly |
-| `UNSUPPORTED_CHAIN_EVENT` | A future event type is not yet supported by this binary |
-| `UNSUPPORTED_BLOCK_SELECTOR` | A future selector shape is not yet supported |
-| `UNSUPPORTED_TRANSACTION_STATUS` | A future tx-status variant is not yet decodable |
-| `DERIVE_PROJECTION_LAGGING` | The derive projection has not caught up to the canonical tip the request needs; a later retry succeeds once it materializes |
+| `UNSUPPORTED_CHAIN_EVENT` | The requested event variant cannot be represented by this binary |
+| `UNSUPPORTED_BLOCK_SELECTOR` | The requested selector shape cannot be represented |
+| `UNSUPPORTED_TRANSACTION_STATUS` | The received transaction-status variant cannot be decoded |
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint) is temporarily unreachable |
 | `NO_VISIBLE_CHAIN_EPOCH` | No visible chain epoch has been committed yet (the store is empty or still bootstrapping) |
 
 ### `UNIMPLEMENTED` family
 
-The method is intentionally disabled on this server. Retry disposition: **NonRetryable**.
+The selected deployment cannot serve this method. Retry disposition: **NonRetryable**.
 
 | Reason | What it means |
 | --- | --- |
-| `EXPLORER_METHOD_DISABLED` | An opt-in explorer method (for example payment-disclosure verification) is off; the consumer falls back to local handling |
+| `EXPLORER_METHOD_DISABLED` | The configured explorer materialized view omits the method's required product view |
 
 ### `INTERNAL` family
 
@@ -134,7 +131,7 @@ A self-inflicted failure that needs investigation. Retry disposition: **NonRetry
 | Reason | What it means |
 | --- | --- |
 | `ENTROPY_UNAVAILABLE` | The deployment cannot read OS-level entropy (very rare) |
-| `EXPLORER_INTERNAL` | An explorer read hit an unexpected condition: a stored derive record failed to decode, a federated wallet response omitted a required field, or an index key had the wrong shape |
+| `EXPLORER_INTERNAL` | An explorer read hit an unexpected condition: a stored materialized-view record failed to decode, a federated wallet response omitted a required field, or an index key had the wrong shape |
 
 ### Sentinel
 
@@ -142,7 +139,7 @@ A self-inflicted failure that needs investigation. Retry disposition: **NonRetry
 
 ## Stability
 
-The set above is the v1 contract. Additions are allowed within a major version; the reserved range in [`error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto) leaves room for additive growth. Existing reasons' semantics are stable within a major version. Removing or repurposing a reason requires a major-version boundary because clients make retry and alerting decisions from this vocabulary.
+The set above is the v1 contract. Existing reasons' semantics are stable within a major version. Removing or repurposing a reason requires a major-version boundary because clients make retry and alerting decisions from this vocabulary.
 
 ## References
 

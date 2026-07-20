@@ -13,11 +13,12 @@
 //!   per-column-family write buffers, and total memtable memory surfaces so a
 //!   crash-replay open or bulk write does not OOM the host. The defaults target
 //!   a mainnet-sized store and are documented in
-//!   [the OOM-recovery runbook](../../../docs/runbooks/bulk-catchup-oom-recovery.md).
+//!   [the resource-tuning runbook](../../../docs/runbooks/bulk-catchup-resource-tuning.md).
 //!
 //! Construct one with writer defaults for primary stores and reader defaults
 //! for `RocksDB` secondaries. Operators may override individual fields through
-//! `[storage.canonical.rocksdb]` and `[storage.derive.rocksdb]` in their TOML.
+//! `[storage.canonical.rocksdb]`, `[storage.materialized_views.rocksdb]`, and
+//! `[wallet.rocksdb]` in their TOML.
 
 /// Bounded `RocksDB` resource budget applied to one DB instance at open.
 ///
@@ -124,7 +125,7 @@ impl RocksDbResourceBudget {
         }
     }
 
-    /// Derive-store writer defaults sized for sustained multi-CF replay.
+    /// Materialized-view store writer defaults sized for sustained multi-CF replay.
     ///
     /// `256 MiB` block cache, `256 MiB` WAL ceiling, `512` open file handles,
     /// `16 MiB x 4` write buffers per column family, `2` background jobs, and
@@ -134,7 +135,7 @@ impl RocksDbResourceBudget {
     /// churn into write stalls. The write-buffer manager remains the hard
     /// aggregate bound.
     #[must_use]
-    pub const fn derive_writer_defaults() -> Self {
+    pub const fn materialized_view_writer_defaults() -> Self {
         Self {
             block_cache_bytes: 256 * MIB,
             max_wal_bytes: 256 * MIB,
@@ -145,6 +146,16 @@ impl RocksDbResourceBudget {
             memtable_budget_bytes: 512 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
+    }
+
+    /// Wallet-projection writer defaults.
+    ///
+    /// The wallet projection currently has the same multi-column-family write
+    /// posture as a materialized-view consumer, but it is a distinct durable
+    /// ownership domain and therefore has its own named profile.
+    #[must_use]
+    pub const fn wallet_projection_writer_defaults() -> Self {
+        Self::materialized_view_writer_defaults()
     }
 
     /// Canonical-store reader defaults for secondary processes.
@@ -169,15 +180,15 @@ impl RocksDbResourceBudget {
         }
     }
 
-    /// Derive-store reader defaults for secondary processes.
+    /// Materialized-view store reader defaults for secondary processes.
     ///
     /// `64 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
     /// `4 MiB x 2` write buffers per column family, and `16 MiB` total memtable
     /// budget. The uniform budget retains the primary-only background-job value
-    /// at `2`, but secondary opens do not apply it. Derive reader stores are
+    /// at `2`, but secondary opens do not apply it. Materialized-view reader stores are
     /// rebuildable and subordinate to the canonical reader path.
     #[must_use]
-    pub const fn derive_reader_defaults() -> Self {
+    pub const fn materialized_view_reader_defaults() -> Self {
         Self {
             block_cache_bytes: 64 * MIB,
             max_wal_bytes: 16 * MIB,
@@ -188,6 +199,16 @@ impl RocksDbResourceBudget {
             memtable_budget_bytes: 16 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
         }
+    }
+
+    /// Wallet-projection reader defaults for immutable serving secondaries.
+    ///
+    /// The serving secondary currently uses the same resource profile as a
+    /// materialized-view reader, while retaining a distinct domain name at the
+    /// configuration boundary.
+    #[must_use]
+    pub const fn wallet_projection_reader_defaults() -> Self {
+        Self::materialized_view_reader_defaults()
     }
 
     /// Defaults for throwaway local test stores.
@@ -254,12 +275,11 @@ pub enum RocksDbStatisticsLevel {
     /// `zinder_store_rocksdb_ticker` exports nothing at this level.
     Off,
     /// Ticker counters only (`StatsLevel::ExceptHistogramOrTimers`), the
-    /// production default since the 2026-07-12 telemetry audit.
+    /// production default.
     #[default]
     Tickers,
     /// `RocksDB`'s own default level: tickers plus per-operation timer
-    /// histograms. Reserved for a live bloom/block-cache experiment that
-    /// needs histogram detail.
+    /// histograms. Use when histogram detail is required.
     Full,
 }
 
@@ -307,17 +327,26 @@ mod tests {
     }
 
     #[test]
-    fn derive_writer_defaults_reserve_multi_family_compaction_headroom() {
+    fn materialized_view_writer_defaults_reserve_multi_family_compaction_headroom() {
         let canonical = RocksDbResourceBudget::canonical_writer_defaults();
-        let derive = RocksDbResourceBudget::derive_writer_defaults();
-        assert_eq!(derive.block_cache_bytes * 2, canonical.block_cache_bytes);
-        assert_eq!(derive.max_wal_bytes, canonical.max_wal_bytes);
-        assert_eq!(derive.max_open_files, canonical.max_open_files);
-        assert_eq!(derive.write_buffer_bytes, canonical.write_buffer_bytes);
-        assert_eq!(derive.max_write_buffer_count, 4);
-        assert_eq!(derive.max_background_jobs, canonical.max_background_jobs);
+        let materialized_view = RocksDbResourceBudget::materialized_view_writer_defaults();
         assert_eq!(
-            derive.memtable_budget_bytes,
+            materialized_view.block_cache_bytes * 2,
+            canonical.block_cache_bytes
+        );
+        assert_eq!(materialized_view.max_wal_bytes, canonical.max_wal_bytes);
+        assert_eq!(materialized_view.max_open_files, canonical.max_open_files);
+        assert_eq!(
+            materialized_view.write_buffer_bytes,
+            canonical.write_buffer_bytes
+        );
+        assert_eq!(materialized_view.max_write_buffer_count, 4);
+        assert_eq!(
+            materialized_view.max_background_jobs,
+            canonical.max_background_jobs
+        );
+        assert_eq!(
+            materialized_view.memtable_budget_bytes,
             canonical.memtable_budget_bytes * 2
         );
     }
@@ -329,8 +358,20 @@ mod tests {
                 < RocksDbResourceBudget::canonical_writer_defaults().block_cache_bytes
         );
         assert!(
-            RocksDbResourceBudget::derive_reader_defaults().block_cache_bytes
-                < RocksDbResourceBudget::derive_writer_defaults().block_cache_bytes
+            RocksDbResourceBudget::materialized_view_reader_defaults().block_cache_bytes
+                < RocksDbResourceBudget::materialized_view_writer_defaults().block_cache_bytes
+        );
+    }
+
+    #[test]
+    fn wallet_projection_profiles_match_the_current_multi_family_profiles() {
+        assert_eq!(
+            RocksDbResourceBudget::wallet_projection_writer_defaults(),
+            RocksDbResourceBudget::materialized_view_writer_defaults()
+        );
+        assert_eq!(
+            RocksDbResourceBudget::wallet_projection_reader_defaults(),
+            RocksDbResourceBudget::materialized_view_reader_defaults()
         );
     }
 
@@ -388,9 +429,11 @@ mod tests {
     fn every_default_budget_preserves_two_background_jobs() {
         for budget in [
             RocksDbResourceBudget::canonical_writer_defaults(),
-            RocksDbResourceBudget::derive_writer_defaults(),
+            RocksDbResourceBudget::materialized_view_writer_defaults(),
+            RocksDbResourceBudget::wallet_projection_writer_defaults(),
             RocksDbResourceBudget::canonical_reader_defaults(),
-            RocksDbResourceBudget::derive_reader_defaults(),
+            RocksDbResourceBudget::materialized_view_reader_defaults(),
+            RocksDbResourceBudget::wallet_projection_reader_defaults(),
             RocksDbResourceBudget::for_local_tests(),
         ] {
             assert_eq!(budget.max_background_jobs, 2);
@@ -410,9 +453,11 @@ mod tests {
     fn every_default_budget_starts_at_tickers() {
         for budget in [
             RocksDbResourceBudget::canonical_writer_defaults(),
-            RocksDbResourceBudget::derive_writer_defaults(),
+            RocksDbResourceBudget::materialized_view_writer_defaults(),
+            RocksDbResourceBudget::wallet_projection_writer_defaults(),
             RocksDbResourceBudget::canonical_reader_defaults(),
-            RocksDbResourceBudget::derive_reader_defaults(),
+            RocksDbResourceBudget::materialized_view_reader_defaults(),
+            RocksDbResourceBudget::wallet_projection_reader_defaults(),
             RocksDbResourceBudget::for_local_tests(),
         ] {
             assert_eq!(budget.statistics_level, RocksDbStatisticsLevel::Tickers);

@@ -4,13 +4,13 @@ use std::{io, path::PathBuf};
 
 use thiserror::Error;
 use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis};
-use zinder_rocksdb::BulkLoadError;
+use zinder_rocksdb_bulk_load::BulkLoadError;
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
-    ProjectionBuildOwner, WalletCanonicalSourceIdentity, WalletProjectionContractError,
+    WalletCanonicalSourceIdentity, WalletProjectionBuildOwner, WalletProjectionContractError,
 };
 
-/// Failure to create, publish, admit, or query a version-1 wallet store.
+/// Failure to create, publish, admit, or query a wallet store.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RocksDbWalletError {
@@ -95,7 +95,7 @@ pub enum RocksDbWalletError {
     },
     /// Logical row, SST byte, or file accounting exceeded `u64::MAX`.
     #[error("wallet RocksDB projection load accounting exceeds u64::MAX")]
-    ProjectionLoadAccountingOverflow,
+    WalletProjectionLoadAccountingOverflow,
     /// Equal address-history keys carried conflicting transaction identities.
     #[error("canonical facts produce conflicting values for one address-transaction key")]
     AddressTransactionConflict,
@@ -108,7 +108,7 @@ pub enum RocksDbWalletError {
         #[source]
         source: rust_rocksdb::Error,
     },
-    /// The database does not contain exactly the version-1 wallet families.
+    /// The database does not contain exactly the wallet families.
     #[error(
         "wallet RocksDB column families do not match version 1; expected {expected:?}, observed {observed:?}"
     )]
@@ -150,33 +150,33 @@ pub enum RocksDbWalletError {
     },
     /// A different owner holds an unexpired durable projection-build lease.
     #[error("wallet projection build lease is held until {expires_at:?}")]
-    ProjectionBuildLeaseHeld {
+    WalletProjectionBuildLeaseHeld {
         /// The first instant at which takeover may be attempted.
         expires_at: UnixTimestampMillis,
     },
     /// The supplied lease is no longer live at the caller's explicit clock.
     #[error("wallet projection build lease expired at {expires_at:?}")]
-    ProjectionBuildLeaseExpired {
+    WalletProjectionBuildLeaseExpired {
         /// Durable expiry bound that was reached.
         expires_at: UnixTimestampMillis,
     },
     /// The caller supplied a non-future expiry for an acquire or renewal.
     #[error("wallet projection build lease expiry must be after the supplied clock")]
-    ProjectionBuildLeaseExpiryNotFuture,
+    WalletProjectionBuildLeaseExpiryNotFuture,
     /// A lease renewal did not extend the existing durable expiry.
     #[error("wallet projection build lease renewal must extend the durable expiry")]
-    ProjectionBuildLeaseRenewalNotExtended,
+    WalletProjectionBuildLeaseRenewalNotExtended,
     /// The supplied capability is owned by a different process identity.
     #[error("wallet projection build lease owner does not match the durable owner")]
-    ProjectionBuildLeaseOwnerMismatch {
+    WalletProjectionBuildLeaseOwnerMismatch {
         /// Owner identity persisted by the active lease.
-        expected: ProjectionBuildOwner,
+        expected: WalletProjectionBuildOwner,
         /// Owner identity supplied by the caller.
-        observed: ProjectionBuildOwner,
+        observed: WalletProjectionBuildOwner,
     },
     /// The supplied capability belongs to an obsolete ownership generation.
     #[error("wallet projection build lease generation does not match the durable generation")]
-    ProjectionBuildLeaseGenerationMismatch {
+    WalletProjectionBuildLeaseGenerationMismatch {
         /// Monotonic generation persisted by the active lease.
         expected: u64,
         /// Generation supplied by the caller.
@@ -184,16 +184,16 @@ pub enum RocksDbWalletError {
     },
     /// A requested or promoted source differs from the durable lease anchor.
     #[error("wallet projection build lease canonical anchor mismatch: {reason}")]
-    ProjectionBuildLeaseCanonicalAnchorMismatch {
+    WalletProjectionBuildLeaseCanonicalAnchorMismatch {
         /// Stable source-anchor mismatch reason.
         reason: &'static str,
     },
     /// A control record has no active build lease to authorize the mutation.
     #[error("wallet projection build lease is absent")]
-    ProjectionBuildLeaseMissing,
+    WalletProjectionBuildLeaseMissing,
     /// The monotonic lease-generation domain is exhausted.
     #[error("wallet projection build lease generation exceeds u64::MAX")]
-    ProjectionBuildLeaseGenerationOverflow,
+    WalletProjectionBuildLeaseGenerationOverflow,
     /// A caller stopped a projection build before READY promotion.
     #[error("wallet projection build was cancelled")]
     ProjectionBuildCancelled,
@@ -237,7 +237,7 @@ pub enum RocksDbWalletError {
     #[error(
         "wallet projection rebuild is required before following this canonical transition: {reason}"
     )]
-    ProjectionRebuildRequired {
+    WalletProjectionRebuildRequired {
         /// Stable rebuild trigger suitable for operator and projector policy.
         reason: &'static str,
     },

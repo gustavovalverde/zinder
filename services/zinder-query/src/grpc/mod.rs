@@ -19,12 +19,12 @@ pub use native::{
     broadcast_transaction_response, build_transparent_address_tx_ids_chunk,
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
     build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
-    compact_block_response, full_block_response, latest_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
-    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
-    tree_state_at_response,
+    compact_block_response, full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, subtree_roots_response, transaction_response,
+    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
+    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
+    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
+    visible_tip_block_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
@@ -62,9 +62,8 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::UnsupportedShieldedProtocol { .. }
         | QueryError::BroadcastTransactionTooLarge { .. } => bad_request_details(error),
         QueryError::TransactionBroadcastDisabled
-        | QueryError::DeriveUnavailable { .. }
+        | QueryError::MaterializedViewUnavailable { .. }
         | QueryError::ChainEventCursorExpired { .. }
-        | QueryError::ChainEpochPinUnsupported
         | QueryError::ChainEpochPinUnavailable { .. } => precondition_failure_details(error),
         QueryError::ArtifactUnavailable { family, key } => ErrorDetails::with_resource_info(
             family.wire_label(),
@@ -145,11 +144,11 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
                 "transaction broadcast is not configured for this deployment",
             )
         }
-        QueryError::DeriveUnavailable { capability } => {
+        QueryError::MaterializedViewUnavailable { capability } => {
             ErrorDetails::with_precondition_failure_violation(
-                "DERIVE_PROJECTION_UNAVAILABLE",
+                "MATERIALIZED_VIEW_UNAVAILABLE",
                 *capability,
-                "derive projection is not configured for this deployment",
+                "materialized view is not configured for this deployment",
             )
         }
         QueryError::ChainEventCursorExpired {
@@ -160,11 +159,6 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
             format!("chain_event:{event_sequence}"),
             format!("oldest retained chain event sequence is {oldest_retained_sequence}"),
         )]),
-        QueryError::ChainEpochPinUnsupported => ErrorDetails::with_precondition_failure_violation(
-            "CHAIN_EPOCH_PIN_UNSUPPORTED",
-            "at_epoch",
-            "query implementation does not support request-side epoch pinning",
-        ),
         QueryError::ChainEpochPinUnavailable { chain_epoch_id } => {
             ErrorDetails::with_precondition_failure_violation(
                 "CHAIN_EPOCH_PIN_UNAVAILABLE",

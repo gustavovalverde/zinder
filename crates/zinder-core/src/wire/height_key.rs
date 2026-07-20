@@ -1,23 +1,23 @@
-//! Block-height key encoders for derive-store column families.
+//! Block-height key encoders for materialized-view column families.
 //!
-//! Derive consumers persist per-height rows in `RocksDB` column families. The
+//! Materialized-view consumers persist per-height rows in `RocksDB` column families. The
 //! ascending encoder lays heights down in lexicographic order so a forward
 //! range scan returns oldest-first; the descending encoder returns
 //! `u32::MAX - height` so the same scan returns newest-first. Both encoders
 //! produce four-byte big-endian payloads suitable as full keys or as the
 //! leading discriminator in a composite key.
 //!
-//! Inline `height.to_be_bytes()` at derive-store boundaries is a forbidden
+//! Inline `height.to_be_bytes()` at materialized-view boundaries is a forbidden
 //! pattern enforced by
 //! `crates/zinder-core/tests/integration/wire_invariants.rs`.
 
 use crate::BlockHeight;
 use crate::wire::WireDecodeError;
 
-/// Number of bytes a height occupies in a derive-store key.
+/// Number of bytes a height occupies in a materialized-view key.
 pub const HEIGHT_KEY_LEN: usize = 4;
 
-/// Encodes a block height into its ascending derive-store key bytes.
+/// Encodes a block height into its ascending materialized-view key bytes.
 ///
 /// The output is the height's big-endian byte representation. `RocksDB` scans
 /// keys in lexicographic order, so the encoded payload sorts oldest-first.
@@ -26,7 +26,7 @@ pub const fn encode_height_key_ascending(height: BlockHeight) -> [u8; HEIGHT_KEY
     height.value().to_be_bytes()
 }
 
-/// Decodes the ascending derive-store key bytes back into a block height.
+/// Decodes the ascending materialized-view key bytes back into a block height.
 ///
 /// Returns [`WireDecodeError::InvalidLength`] when `bytes` is not exactly
 /// [`HEIGHT_KEY_LEN`] bytes long.
@@ -35,7 +35,7 @@ pub fn decode_height_key_ascending(bytes: &[u8]) -> Result<BlockHeight, WireDeco
     Ok(BlockHeight::new(u32::from_be_bytes(array)))
 }
 
-/// Encodes a block height into its descending derive-store key bytes.
+/// Encodes a block height into its descending materialized-view key bytes.
 ///
 /// The output is `u32::MAX - height` in big-endian, so `RocksDB`
 /// lexicographic order sorts the resulting payloads newest-first. Use
@@ -47,7 +47,7 @@ pub const fn encode_height_key_descending(height: BlockHeight) -> [u8; HEIGHT_KE
     (u32::MAX - height.value()).to_be_bytes()
 }
 
-/// Decodes the descending derive-store key bytes back into a block height.
+/// Decodes the descending materialized-view key bytes back into a block height.
 ///
 /// Inverts [`encode_height_key_descending`]: returns the original height that
 /// was encoded as `u32::MAX - height`. Returns [`WireDecodeError::InvalidLength`]

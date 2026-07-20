@@ -95,7 +95,7 @@ impl RawTransactionBytes {
 /// Result of submitting a raw transaction to a node or network path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum TransactionBroadcastResult {
+pub enum TransactionBroadcastOutcome {
     /// The node accepted the transaction for mempool admission or relay.
     Accepted(BroadcastAccepted),
     /// The node reported the transaction was already known.
@@ -104,7 +104,7 @@ pub enum TransactionBroadcastResult {
     InvalidEncoding(BroadcastInvalidEncoding),
     /// The node has the transaction queued for download or verification.
     ///
-    /// Distinct from [`TransactionBroadcastResult::Duplicate`]: queued means
+    /// Distinct from [`TransactionBroadcastOutcome::Duplicate`]: queued means
     /// the upstream node has already accepted the broadcast into its
     /// download or verification queue but has not yet produced a final
     /// verdict. Callers that submit the same bytes again while a prior
@@ -353,14 +353,15 @@ impl TransactionBlobArtifact {
 
 /// Mined-transaction enrichment fields bound to a response's [`ChainEpoch`].
 ///
-/// `MinedDetails` is a *response/read-model* value, not a persisted field on
+/// `MinedTransactionChainContext` is a *response/read-model* value, not a
+/// persisted field on
 /// [`TransactionLocation`]. The only public constructor takes the response
 /// epoch and the mined block's identity together, which prevents the racy
 /// `tip_height - block_height` confirmations computation by construction:
 /// the epoch is in scope when confirmations are computed, so callers cannot
 /// accidentally re-read the tip.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MinedDetails {
+pub struct MinedTransactionChainContext {
     /// Consensus branch identifier in effect at the mined height.
     pub consensus_branch_id: ConsensusBranchId,
     /// Block-time as Unix seconds, taken from the mined block header.
@@ -370,8 +371,8 @@ pub struct MinedDetails {
     pub confirmations: u32,
 }
 
-impl MinedDetails {
-    /// Constructs the only canonical mined-details value, binding
+impl MinedTransactionChainContext {
+    /// Constructs the canonical mined-transaction chain context, binding
     /// confirmations to the response's chain epoch.
     ///
     /// Callers supply pre-computed `consensus_branch_id` and `block_time`;
@@ -403,8 +404,8 @@ impl MinedDetails {
 pub struct MinedTransaction {
     /// Canonical mined transaction location.
     pub location: TransactionLocation,
-    /// Response-bound enrichment fields.
-    pub details: MinedDetails,
+    /// Chain context bound to the response's [`ChainEpoch`].
+    pub chain_context: MinedTransactionChainContext,
     /// Serialized consensus transaction bytes.
     ///
     /// `None` when the deployment does not retain raw transaction blobs
@@ -420,12 +421,12 @@ impl MinedTransaction {
     #[must_use]
     pub fn new(
         location: TransactionLocation,
-        details: MinedDetails,
+        chain_context: MinedTransactionChainContext,
         raw_transaction_bytes: Option<Vec<u8>>,
     ) -> Self {
         Self {
             location,
-            details,
+            chain_context,
             raw_transaction_bytes,
         }
     }
@@ -448,12 +449,10 @@ pub enum TxStatus {
     /// Transaction is mined in the canonical chain.
     ///
     /// Carries the durable [`TransactionLocation`] together with
-    /// epoch-bound [`MinedDetails`] enrichment.
+    /// epoch-bound [`MinedTransactionChainContext`].
     Mined(MinedTransaction),
     /// Transaction is not indexed in the visible canonical chain.
     NotFound,
     /// Transaction is known to be in the mempool.
     InMempool(MempoolEntry),
-    /// Transaction conflicts with the visible canonical chain.
-    ConflictingChain,
 }

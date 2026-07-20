@@ -1,6 +1,6 @@
 //! Configuration loading for the `zinder-ingest` binary.
 //!
-//! [`IngestCommandConfig`] resolves the unified loop's input
+//! [`IngestCommandConfig`] resolves the phase-driven ingest loop's input
 //! (`zinder-ingest --config X` default invocation and `zinder-ingest probe`).
 
 use std::{
@@ -12,25 +12,21 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::BlockHeight;
-use zinder_derive::ProjectionPreset;
 use zinder_ingest::{
-    BulkCatchupConfig, CanonicalPipelineLimits, CommitmentRootBackfillConfig,
-    ConventionalFeeDistributionBackfillConfig, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
+    CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalPipelineLimits,
+    CanonicalRunOverrides, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
-    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, DeriveReplayPolicy, IngestDeriveConfig, IngestError,
-    IngestLoopConfig, IngestModifiers, NodeSourceKind, PaidFeeDistributionBackfillConfig,
-    PhasesConfig, RawBlobPolicy, TipFollowPhaseConfig, TransactionComponentBackfillConfig,
-    TransactionHistoryVerifierConfig, ValuePoolBalanceBackfillConfig, ValuePoolFlowBackfillConfig,
-    container_memory_budget_bytes,
+    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig, NodeSourceKind,
+    PhaseClassificationConfig, RawBlobPolicy, container_memory_budget_bytes,
 };
 use zinder_runtime::{
     ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
-    NetworkToml, NodeToml, OpsSection, OpsToml, PrimaryStorageSection, ResolvedIngestControlWriter,
-    ResolvedPrimaryStorage, ResolvedRetention, RetentionSection, RetentionToml, SecuritySection,
-    SecurityToml, ServiceIdentifier, StorageRoleSection, StorageRoleToml, duration_as_millis_u64,
-    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_writer,
-    resolve_ops_listen_addr, resolve_primary_storage, resolve_retention,
+    NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedIngestControlWriter, ResolvedRetention,
+    RetentionSection, RetentionToml, RuntimeService, SecuritySection, SecurityToml,
+    StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
+    require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
+    resolve_ops_listen_addr, resolve_retention,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::RocksDbResourceBudget;
@@ -79,50 +75,16 @@ fn default_pipeline_queue_bytes_from_budget(
     })
 }
 const DEFAULT_FLUSH_INTERVAL_EPOCHS: u32 = 5;
-const DEFAULT_DERIVE_REPLAY_BATCH_BLOCKS: u32 = 100;
-const DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS: u32 = 10;
-const DEFAULT_DERIVE_STARTUP_HANDOFF_LAG_BLOCKS: u32 = 1_000;
-const DEFAULT_DERIVE_REPLAY_MEMORY_DEGRADE_RATIO: f64 = 0.90;
-const DEFAULT_DERIVE_REPLAY_MEMORY_PAUSE_RATIO: f64 = 0.99;
-const DEFAULT_DERIVE_REPLAY_MEMORY_RESUME_RATIO: f64 = 0.80;
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
-const DEFAULT_ALLOW_NEAR_TIP_FINALIZE: bool = false;
-const DEFAULT_COMMITMENT_ROOT_BACKFILL_ENABLED: bool = true;
-const DEFAULT_COMMITMENT_ROOT_BACKFILL_BATCH_BLOCKS: u32 = 256;
-const DEFAULT_COMMITMENT_ROOT_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
-const DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_ENABLED: bool = true;
-const DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS: u32 = 256;
-const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_ENABLED: bool = true;
-const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS: u32 = 256;
-const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
-const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_HISTORY_DAYS: u32 = 365;
-const DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_TIMESTAMP_SAFETY_SECONDS: u64 = 7_200;
-const DEFAULT_TRANSACTION_COMPONENT_BACKFILL_ENABLED: bool = true;
-const DEFAULT_TRANSACTION_COMPONENT_BACKFILL_BATCH_BLOCKS: u32 = 256;
-const DEFAULT_TRANSACTION_HISTORY_VERIFIER_ENABLED: bool = true;
-const DEFAULT_TRANSACTION_HISTORY_VERIFIER_BATCH_BLOCKS: u32 = 256;
-const DEFAULT_VALUE_POOL_FLOW_BACKFILL_ENABLED: bool = true;
-const DEFAULT_VALUE_POOL_FLOW_BACKFILL_BATCH_BLOCKS: u32 = 256;
-const DEFAULT_VALUE_POOL_FLOW_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
-const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_ENABLED: bool = true;
-const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_BATCH_BLOCKS: u32 = 10_000;
-const DEFAULT_VALUE_POOL_BALANCE_BACKFILL_FETCH_CONCURRENCY: u32 = 8;
+const DEFAULT_ALLOW_REORG_WINDOW_SETTLEMENT: bool = false;
 const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
 const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
-const DEFAULT_PROJECTION_PRESET: ProjectionPreset = ProjectionPreset::Wallet;
 
-/// Fully loaded command configuration for the unified `zinder-ingest`
+/// Fully loaded command configuration for the `zinder-ingest`
 /// run (no subcommand and the `probe` subcommand both consume this).
 #[derive(Debug)]
 pub(crate) struct IngestCommandConfig {
-    pub(crate) loop_config: IngestLoopConfig,
-    pub(crate) projection_preset: ProjectionPreset,
-    pub(crate) conventional_fee_distribution_backfill: ConventionalFeeDistributionBackfillConfig,
-    pub(crate) paid_fee_distribution_backfill: PaidFeeDistributionBackfillConfig,
-    pub(crate) transaction_component_backfill: TransactionComponentBackfillConfig,
-    pub(crate) transaction_history_verifier: TransactionHistoryVerifierConfig,
-    pub(crate) value_pool_flow_backfill: ValuePoolFlowBackfillConfig,
-    pub(crate) value_pool_balance_backfill: ValuePoolBalanceBackfillConfig,
+    pub(crate) runtime_config: IngestRuntimeConfig,
     pub(crate) coverage: IngestCoverage,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
@@ -135,14 +97,14 @@ pub(crate) struct IngestCommandConfig {
     pub(crate) retention: ResolvedRetention,
 }
 
-/// Coverage policy applied to the [`IngestModifiers`] bootstrap path.
+/// Coverage policy applied to the [`CanonicalRunOverrides`] bootstrap path.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum IngestCoverage {
     /// Use explicitly supplied modifier heights as-is.
     Explicit,
     /// Derive the historical floor needed by lightwalletd-compatible
-    /// wallets. The unified loop looks up the checkpoint against the
+    /// wallets. The ingest loop looks up the checkpoint against the
     /// upstream node before entering the first phase.
     WalletServing,
 }
@@ -172,7 +134,7 @@ pub(crate) struct CanonicalReplayVerificationCommandConfig {
     pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
 }
 
-/// Command-line overrides for the unified ingest invocation.
+/// Command-line overrides for the phase-driven ingest invocation.
 #[derive(Debug, Default)]
 pub(crate) struct IngestConfigOverrides {
     pub(crate) network: Option<String>,
@@ -182,7 +144,6 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) node_auth_username: Option<String>,
     pub(crate) node_auth_path: Option<PathBuf>,
     pub(crate) storage_path: Option<PathBuf>,
-    pub(crate) projection_preset: Option<String>,
     pub(crate) request_timeout_secs: Option<u64>,
     pub(crate) max_response_bytes: Option<u64>,
     pub(crate) reorg_window_blocks: Option<u32>,
@@ -200,7 +161,7 @@ pub(crate) struct IngestConfigOverrides {
     pub(crate) lag_threshold_blocks: Option<u64>,
     pub(crate) target_height: Option<u32>,
     pub(crate) checkpoint_height: Option<u32>,
-    pub(crate) allow_near_tip_finalize: Option<bool>,
+    pub(crate) allow_reorg_window_settlement: Option<bool>,
     pub(crate) wallet_serving: Option<bool>,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
@@ -226,18 +187,15 @@ pub(crate) enum IngestConfigError {
     Ingest(#[from] IngestError),
 
     #[error(transparent)]
-    CanonicalRuntime(#[from] zinder_ingest::CanonicalRuntimeError),
-
-    #[error("version-1 canonical runtime requires ingest.projection_preset=wallet")]
-    CanonicalRuntimeRequiresWallet,
+    CanonicalWriter(#[from] zinder_ingest::CanonicalWriterError),
 
     #[error(transparent)]
     CanonicalReplayVerification(
-        #[from] crate::canonical_replay_verification::CanonicalReplayVerificationError,
+        #[from] crate::replay_verification::CanonicalReplayVerificationError,
     ),
 }
 
-/// Loads and validates the unified ingest configuration.
+/// Loads and validates the phase-driven ingest configuration.
 #[allow(
     clippy::too_many_lines,
     reason = "the override chain is one auditable list of TOML keys; splitting it into helpers would scatter the precedence contract across multiple sites."
@@ -252,160 +210,48 @@ pub(crate) fn load_ingest_config(
         // non-PaaS hosts override via `ZINDER_STORAGE__PATH` env var or the
         // `--storage-path` CLI flag.
         .with_default("storage.path", "/var/lib/zinder/store")?
-        .with_default(
-            "ingest.projection_preset",
-            DEFAULT_PROJECTION_PRESET.as_str(),
-        )?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
-            "ingest.bulk_catchup.canonical_batch_max_blocks",
+            "ingest.construction.canonical_batch_max_blocks",
             DEFAULT_CANONICAL_BATCH_MAX_BLOCKS,
         )?
         .with_default(
-            "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
+            "ingest.construction.canonical_batch_max_artifact_bytes",
             DEFAULT_CANONICAL_BATCH_MAX_ARTIFACT_BYTES,
         )?
         .with_default(
-            "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
+            "ingest.construction.canonical_batch_max_estimated_write_bytes",
             default_pipeline_queue_bytes(DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES),
         )?
         .with_default(
-            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
+            "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close",
             DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
         )?
         .with_default(
-            "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
+            "ingest.construction.commit_reassembly_max_queued_artifact_bytes",
             default_pipeline_queue_bytes(FALLBACK_COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES),
         )?
         .with_default(
-            "ingest.derive.replay_batch_blocks",
-            DEFAULT_DERIVE_REPLAY_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.derive.replay_policy",
-            DeriveReplayPolicy::DEFAULT.as_kebab_case(),
-        )?
-        .with_default(
-            "ingest.derive.memory_degrade_ratio",
-            DEFAULT_DERIVE_REPLAY_MEMORY_DEGRADE_RATIO,
-        )?
-        .with_default(
-            "ingest.derive.memory_pause_ratio",
-            DEFAULT_DERIVE_REPLAY_MEMORY_PAUSE_RATIO,
-        )?
-        .with_default(
-            "ingest.derive.memory_resume_ratio",
-            DEFAULT_DERIVE_REPLAY_MEMORY_RESUME_RATIO,
-        )?
-        .with_default(
-            "ingest.derive.min_replay_batch_blocks",
-            DEFAULT_DERIVE_REPLAY_MIN_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.derive.startup_handoff_lag_blocks",
-            DEFAULT_DERIVE_STARTUP_HANDOFF_LAG_BLOCKS,
-        )?
-        .with_default(
-            "ingest.commitment_root_backfill.enabled",
-            DEFAULT_COMMITMENT_ROOT_BACKFILL_ENABLED,
-        )?
-        .with_default(
-            "ingest.commitment_root_backfill.batch_blocks",
-            DEFAULT_COMMITMENT_ROOT_BACKFILL_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.commitment_root_backfill.fetch_concurrency",
-            DEFAULT_COMMITMENT_ROOT_BACKFILL_FETCH_CONCURRENCY,
-        )?
-        .with_default(
-            "ingest.conventional_fee_distribution_backfill.enabled",
-            DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_ENABLED,
-        )?
-        .with_default(
-            "ingest.conventional_fee_distribution_backfill.batch_blocks",
-            DEFAULT_CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.paid_fee_distribution_backfill.enabled",
-            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_ENABLED,
-        )?
-        .with_default(
-            "ingest.paid_fee_distribution_backfill.batch_blocks",
-            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.paid_fee_distribution_backfill.fetch_concurrency",
-            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_FETCH_CONCURRENCY,
-        )?
-        .with_default(
-            "ingest.paid_fee_distribution_backfill.history_days",
-            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_HISTORY_DAYS,
-        )?
-        .with_default(
-            "ingest.paid_fee_distribution_backfill.timestamp_safety_seconds",
-            DEFAULT_PAID_FEE_DISTRIBUTION_BACKFILL_TIMESTAMP_SAFETY_SECONDS,
-        )?
-        .with_default(
-            "ingest.transaction_component_backfill.enabled",
-            DEFAULT_TRANSACTION_COMPONENT_BACKFILL_ENABLED,
-        )?
-        .with_default(
-            "ingest.transaction_component_backfill.batch_blocks",
-            DEFAULT_TRANSACTION_COMPONENT_BACKFILL_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.transaction_history_verifier.enabled",
-            DEFAULT_TRANSACTION_HISTORY_VERIFIER_ENABLED,
-        )?
-        .with_default(
-            "ingest.transaction_history_verifier.batch_blocks",
-            DEFAULT_TRANSACTION_HISTORY_VERIFIER_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.value_pool_flow_backfill.enabled",
-            DEFAULT_VALUE_POOL_FLOW_BACKFILL_ENABLED,
-        )?
-        .with_default(
-            "ingest.value_pool_flow_backfill.batch_blocks",
-            DEFAULT_VALUE_POOL_FLOW_BACKFILL_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.value_pool_flow_backfill.fetch_concurrency",
-            DEFAULT_VALUE_POOL_FLOW_BACKFILL_FETCH_CONCURRENCY,
-        )?
-        .with_default(
-            "ingest.value_pool_balance_backfill.enabled",
-            DEFAULT_VALUE_POOL_BALANCE_BACKFILL_ENABLED,
-        )?
-        .with_default(
-            "ingest.value_pool_balance_backfill.batch_blocks",
-            DEFAULT_VALUE_POOL_BALANCE_BACKFILL_BATCH_BLOCKS,
-        )?
-        .with_default(
-            "ingest.value_pool_balance_backfill.fetch_concurrency",
-            DEFAULT_VALUE_POOL_BALANCE_BACKFILL_FETCH_CONCURRENCY,
-        )?
-        .with_default(
-            "ingest.bulk_catchup.flush_interval_epochs",
+            "ingest.construction.flush_interval_epochs",
             DEFAULT_FLUSH_INTERVAL_EPOCHS,
         )?
         .with_default(
-            "ingest.tip_follow.poll_interval_ms",
+            "ingest.follow.poll_interval_ms",
             DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS,
         )?
         .with_default(
-            "ingest.tip_follow.lag_threshold_blocks",
+            "ingest.follow.lag_threshold_blocks",
             DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
         )?
         .with_default(
-            "ingest.modifiers.allow_near_tip_finalize",
-            DEFAULT_ALLOW_NEAR_TIP_FINALIZE,
+            "ingest.run_overrides.allow_reorg_window_settlement",
+            DEFAULT_ALLOW_REORG_WINDOW_SETTLEMENT,
         )?
         .with_default(
-            "ingest.modifiers.coverage",
+            "ingest.run_overrides.coverage",
             DEFAULT_INGEST_COVERAGE.as_kebab_case(),
         )?
-        .with_ops_section(ServiceIdentifier::Ingest)?
+        .with_ops_section(RuntimeService::Ingest)?
         .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?
@@ -416,69 +262,68 @@ pub(crate) fn load_ingest_config(
         .with_override_if("node.auth.username", overrides.node_auth_username)?
         .with_override_path_if("node.auth.path", overrides.node_auth_path)?
         .with_override_path_if("storage.path", overrides.storage_path)?
-        .with_override_if("ingest.projection_preset", overrides.projection_preset)?
         .with_override_if("node.request_timeout_secs", overrides.request_timeout_secs)?
         .with_override_if("node.max_response_bytes", overrides.max_response_bytes)?
         .with_override_if("ingest.reorg_window_blocks", overrides.reorg_window_blocks)?
         .with_override_if(
-            "ingest.phases.catchup_threshold_blocks",
+            "ingest.phase_classification.catchup_threshold_blocks",
             overrides.catchup_threshold_blocks,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.canonical_batch_max_blocks",
+            "ingest.construction.canonical_batch_max_blocks",
             overrides.canonical_batch_max_blocks,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
+            "ingest.construction.canonical_batch_max_artifact_bytes",
             overrides.canonical_batch_max_artifact_bytes,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
+            "ingest.construction.canonical_batch_max_estimated_write_bytes",
             overrides.canonical_batch_max_estimated_write_bytes,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
+            "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close",
             overrides.canonical_batch_min_blocks_before_estimated_write_close,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.source_segment_max_blocks",
+            "ingest.construction.source_segment_max_blocks",
             overrides.source_segment_max_blocks,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.source_segment_target_response_bytes",
+            "ingest.construction.source_segment_target_response_bytes",
             overrides.source_segment_target_response_bytes,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
+            "ingest.construction.source_fetch_max_in_flight_requests",
             overrides.source_fetch_max_in_flight_requests,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
+            "ingest.construction.source_fetch_max_in_flight_bytes",
             overrides.source_fetch_max_in_flight_bytes,
         )?
         .with_override_if(
-            "ingest.bulk_catchup.block_prepare_concurrency",
+            "ingest.construction.block_prepare_concurrency",
             overrides.block_prepare_concurrency,
         )?
+        .with_override_if("ingest.follow.poll_interval_ms", overrides.poll_interval_ms)?
         .with_override_if(
-            "ingest.tip_follow.poll_interval_ms",
-            overrides.poll_interval_ms,
-        )?
-        .with_override_if(
-            "ingest.tip_follow.lag_threshold_blocks",
+            "ingest.follow.lag_threshold_blocks",
             overrides.lag_threshold_blocks,
         )?
-        .with_override_if("ingest.modifiers.target_height", overrides.target_height)?
         .with_override_if(
-            "ingest.modifiers.checkpoint_height",
+            "ingest.run_overrides.target_height",
+            overrides.target_height,
+        )?
+        .with_override_if(
+            "ingest.run_overrides.checkpoint_height",
             overrides.checkpoint_height,
         )?
         .with_override_if(
-            "ingest.modifiers.allow_near_tip_finalize",
-            overrides.allow_near_tip_finalize,
+            "ingest.run_overrides.allow_reorg_window_settlement",
+            overrides.allow_reorg_window_settlement,
         )?
         .with_override_if(
-            "ingest.modifiers.coverage",
+            "ingest.run_overrides.coverage",
             (overrides.wallet_serving == Some(true))
                 .then_some(IngestCoverage::WalletServing.as_kebab_case()),
         )?
@@ -528,16 +373,7 @@ pub(crate) fn redacted_ingest_config_toml(
 ) -> Result<String, IngestConfigError> {
     let rendered = toml::to_string(&RedactedIngestConfigToml::from_ingest_config(config))
         .map_err(|source| ConfigError::Render { source })?;
-    let effective_projection_identities = config
-        .projection_preset
-        .consumer_schemas()
-        .iter()
-        .map(|schema| format!("\"{}\"", schema.name.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "# effective_projection_identities = [{effective_projection_identities}]\n{rendered}"
-    ))
+    Ok(rendered)
 }
 
 /// Renders the effective canonical replay verification configuration in the
@@ -570,137 +406,37 @@ struct IngestPrimaryStorageSection {
     path: Option<PathBuf>,
     secondary_path: Option<PathBuf>,
     canonical: StorageRoleSection,
-    derive: StorageRoleSection,
     raw_blob_policy: Option<RawBlobPolicy>,
-}
-
-impl IngestPrimaryStorageSection {
-    fn into_primary_storage(self) -> PrimaryStorageSection {
-        PrimaryStorageSection {
-            path: self.path,
-            canonical: self.canonical,
-            derive: self.derive,
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestSection {
-    /// Source-adapter selector. Today only `zebra-json-rpc` is
-    /// implemented; [ADR-0016](../../../docs/adrs/0016-source-streaming-pipeline.md)
-    /// reserves `auto`, `zebra-indexer-grpc`, and `zebra-in-process`.
+    /// Canonical source-adapter selector. The supported value is
+    /// `zebra-json-rpc`.
     source: Option<String>,
-    /// Closed derive workload. Omitted configuration defaults to `explorer`.
-    projection_preset: Option<String>,
     /// Chain-truth invariant: how deep into the upstream tip the
-    /// safe-tip cliff sits. Defaults to `100`.
+    /// settled-tip cliff sits. Defaults to `100`.
     reorg_window_blocks: Option<u32>,
     /// Phase classifier knobs.
-    phases: IngestPhasesSection,
-    /// Shared derive execution knobs.
-    derive: IngestDeriveSection,
-    /// Settled historical final-root enrichment.
-    commitment_root_backfill: IngestCommitmentRootBackfillSection,
-    /// Historical ZIP-317 conventional-fee distribution projection.
-    conventional_fee_distribution_backfill: IngestConventionalFeeDistributionBackfillSection,
-    /// Exact paid-fee startup seed and newest-first historical projection.
-    paid_fee_distribution_backfill: IngestPaidFeeDistributionBackfillSection,
-    /// Settled historical transaction-component projection.
-    transaction_component_backfill: IngestTransactionComponentBackfillSection,
-    /// Canonical verification for the transaction-history projection.
-    transaction_history_verifier: IngestTransactionHistoryVerifierSection,
-    /// Settled historical value-pool flow projection.
-    value_pool_flow_backfill: IngestValuePoolFlowBackfillSection,
-    /// Source-backed cumulative value-pool balance history.
-    value_pool_balance_backfill: IngestValuePoolBalanceBackfillSection,
+    phase_classification: IngestPhaseClassificationSection,
     /// Pipelined-fetch knobs for bulk catch-up.
-    bulk_catchup: IngestBulkCatchupSection,
+    construction: IngestConstructionSection,
     /// Serial-loop knobs for tip-follow.
-    tip_follow: IngestTipFollowSection,
-    /// One-shot modifiers for the unified loop.
-    modifiers: IngestModifiersSection,
+    follow: IngestFollowSection,
+    /// One-shot `run_overrides` for the ingest loop.
+    run_overrides: IngestRunOverridesSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct IngestPhasesSection {
+struct IngestPhaseClassificationSection {
     catchup_threshold_blocks: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct IngestDeriveSection {
-    #[serde(rename = "replay_batch_blocks")]
-    batch_blocks: Option<u32>,
-    #[serde(rename = "replay_policy")]
-    policy: Option<String>,
-    memory_budget_bytes: Option<u64>,
-    memory_degrade_ratio: Option<f64>,
-    memory_pause_ratio: Option<f64>,
-    memory_resume_ratio: Option<f64>,
-    min_replay_batch_blocks: Option<u32>,
-    startup_handoff_lag_blocks: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestCommitmentRootBackfillSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
-    fetch_concurrency: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestConventionalFeeDistributionBackfillSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestPaidFeeDistributionBackfillSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
-    fetch_concurrency: Option<u32>,
-    history_days: Option<u32>,
-    timestamp_safety_seconds: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestTransactionComponentBackfillSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestTransactionHistoryVerifierSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestValuePoolFlowBackfillSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
-    fetch_concurrency: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestValuePoolBalanceBackfillSection {
-    enabled: Option<bool>,
-    batch_blocks: Option<u32>,
-    fetch_concurrency: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestBulkCatchupSection {
+struct IngestConstructionSection {
     canonical_batch_max_blocks: Option<u32>,
     canonical_batch_max_artifact_bytes: Option<u64>,
     canonical_batch_max_estimated_write_bytes: Option<u64>,
@@ -717,43 +453,23 @@ struct IngestBulkCatchupSection {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct IngestTipFollowSection {
+struct IngestFollowSection {
     poll_interval_ms: Option<u64>,
     lag_threshold_blocks: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct IngestModifiersSection {
+struct IngestRunOverridesSection {
     target_height: Option<u32>,
     checkpoint_height: Option<u32>,
-    allow_near_tip_finalize: Option<bool>,
+    allow_reorg_window_settlement: Option<bool>,
     coverage: Option<IngestCoverage>,
 }
 
 const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
     match node_source {
         NodeSourceKind::ZebraJsonRpc => "zebra-json-rpc",
-    }
-}
-
-fn parse_derive_replay_policy(policy_text: &str) -> Result<DeriveReplayPolicy, ConfigError> {
-    match policy_text {
-        "canonical-first" => Ok(DeriveReplayPolicy::CanonicalFirst),
-        "continuous" => Ok(DeriveReplayPolicy::Continuous),
-        _ => Err(ConfigError::invalid(
-            "ingest.derive.replay_policy must be one of: canonical-first, continuous",
-        )),
-    }
-}
-
-fn parse_projection_preset(preset_text: &str) -> Result<ProjectionPreset, ConfigError> {
-    match preset_text {
-        "wallet" => Ok(ProjectionPreset::Wallet),
-        "explorer" => Ok(ProjectionPreset::Explorer),
-        _ => Err(ConfigError::invalid(
-            "ingest.projection_preset must be one of: wallet, explorer",
-        )),
     }
 }
 
@@ -800,19 +516,9 @@ fn available_logical_core_count() -> NonZeroU32 {
         .unwrap_or(NonZeroU32::MIN)
 }
 
-fn ratio_config(amount: Option<f64>, path: &'static str) -> Result<f64, ConfigError> {
-    let amount = require_field(amount, path)?;
-    if amount > 0.0 && amount <= 1.0 {
-        return Ok(amount);
-    }
-    Err(ConfigError::invalid(format!(
-        "{path} must be greater than zero and less than or equal to one"
-    )))
-}
-
 #[allow(
     clippy::too_many_lines,
-    reason = "the unified ingest resolver composes the network, source, storage, phase, bulk-catchup, tip-follow, and modifier knobs in one auditable validation sequence."
+    reason = "the phase-driven ingest resolver composes the network, source, storage, phase, bulk-catchup, tip-follow, and modifier knobs in one auditable validation sequence."
 )]
 fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
@@ -822,11 +528,6 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         available_logical_core_count(),
         node_target.max_response_bytes,
     );
-    let projection_preset_text = require_field(
-        config.ingest.projection_preset.clone(),
-        "ingest.projection_preset",
-    )?;
-    let projection_preset = parse_projection_preset(&projection_preset_text)?;
     let node_source_text = config
         .ingest
         .source
@@ -834,11 +535,9 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
     let configured_raw_blob_policy = config.storage.raw_blob_policy;
-    let ResolvedPrimaryStorage {
-        path: storage_path,
-        canonical_rocksdb_budget,
-        derive_rocksdb_budget,
-    } = resolve_primary_storage(config.storage.into_primary_storage())?;
+    let storage_path = require_field(config.storage.path, "storage.path")?;
+    let canonical_rocksdb_budget =
+        resolve_canonical_writer_rocksdb_budget(config.storage.canonical.rocksdb)?;
 
     let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
@@ -848,13 +547,13 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
 
     let catchup_threshold_blocks = config
         .ingest
-        .phases
+        .phase_classification
         .catchup_threshold_blocks
         .unwrap_or(reorg_window_blocks);
 
     let canonical_batch_max_blocks_raw = require_field(
-        config.ingest.bulk_catchup.canonical_batch_max_blocks,
-        "ingest.bulk_catchup.canonical_batch_max_blocks",
+        config.ingest.construction.canonical_batch_max_blocks,
+        "ingest.construction.canonical_batch_max_blocks",
     )?;
     let canonical_batch_max_blocks =
         parse_canonical_batch_max_blocks(canonical_batch_max_blocks_raw)?;
@@ -862,78 +561,78 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     let canonical_batch_max_artifact_bytes = nonzero_u64_config(
         config
             .ingest
-            .bulk_catchup
+            .construction
             .canonical_batch_max_artifact_bytes,
-        "ingest.bulk_catchup.canonical_batch_max_artifact_bytes",
+        "ingest.construction.canonical_batch_max_artifact_bytes",
     )?;
     let canonical_batch_max_estimated_write_bytes = nonzero_u64_config(
         config
             .ingest
-            .bulk_catchup
+            .construction
             .canonical_batch_max_estimated_write_bytes,
-        "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes",
+        "ingest.construction.canonical_batch_max_estimated_write_bytes",
     )?;
     let canonical_batch_min_blocks_before_estimated_write_close = nonzero_u32_config(
         config
             .ingest
-            .bulk_catchup
+            .construction
             .canonical_batch_min_blocks_before_estimated_write_close,
-        "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close",
+        "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close",
     )?;
     if canonical_batch_min_blocks_before_estimated_write_close.get()
         > canonical_batch_max_blocks.get()
     {
         return Err(ConfigError::invalid(
-            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.bulk_catchup.canonical_batch_max_blocks",
+            "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.construction.canonical_batch_max_blocks",
         )
         .into());
     }
 
     let source_segment_max_blocks = optional_nonzero_u32_config(
-        config.ingest.bulk_catchup.source_segment_max_blocks,
-        "ingest.bulk_catchup.source_segment_max_blocks",
+        config.ingest.construction.source_segment_max_blocks,
+        "ingest.construction.source_segment_max_blocks",
     )?
     .unwrap_or(resolved_pipeline_limits.source_segment_max_blocks);
     let block_prepare_concurrency = optional_nonzero_u32_config(
-        config.ingest.bulk_catchup.block_prepare_concurrency,
-        "ingest.bulk_catchup.block_prepare_concurrency",
+        config.ingest.construction.block_prepare_concurrency,
+        "ingest.construction.block_prepare_concurrency",
     )?
     .unwrap_or(resolved_pipeline_limits.block_prepare_concurrency);
     let block_prepare_memory_watermark_bytes = optional_nonzero_u64_config(
         config
             .ingest
-            .bulk_catchup
+            .construction
             .block_prepare_memory_watermark_bytes,
-        "ingest.bulk_catchup.block_prepare_memory_watermark_bytes",
+        "ingest.construction.block_prepare_memory_watermark_bytes",
     )?
     .unwrap_or(resolved_pipeline_limits.block_prepare_memory_watermark_bytes);
     let commit_reassembly_max_queued_artifact_bytes = nonzero_u64_config(
         config
             .ingest
-            .bulk_catchup
+            .construction
             .commit_reassembly_max_queued_artifact_bytes,
-        "ingest.bulk_catchup.commit_reassembly_max_queued_artifact_bytes",
+        "ingest.construction.commit_reassembly_max_queued_artifact_bytes",
     )?;
 
     let source_segment_target_response_bytes = optional_nonzero_u64_config(
         config
             .ingest
-            .bulk_catchup
+            .construction
             .source_segment_target_response_bytes,
-        "ingest.bulk_catchup.source_segment_target_response_bytes",
+        "ingest.construction.source_segment_target_response_bytes",
     )?
     .unwrap_or(resolved_pipeline_limits.source_segment_target_response_bytes);
     let source_fetch_max_in_flight_requests = optional_nonzero_u32_config(
         config
             .ingest
-            .bulk_catchup
+            .construction
             .source_fetch_max_in_flight_requests,
-        "ingest.bulk_catchup.source_fetch_max_in_flight_requests",
+        "ingest.construction.source_fetch_max_in_flight_requests",
     )?
     .unwrap_or(resolved_pipeline_limits.source_fetch_max_in_flight_requests);
     let source_fetch_max_in_flight_bytes = optional_nonzero_u64_config(
-        config.ingest.bulk_catchup.source_fetch_max_in_flight_bytes,
-        "ingest.bulk_catchup.source_fetch_max_in_flight_bytes",
+        config.ingest.construction.source_fetch_max_in_flight_bytes,
+        "ingest.construction.source_fetch_max_in_flight_bytes",
     )?
     .unwrap_or(resolved_pipeline_limits.source_fetch_max_in_flight_bytes);
     let pipeline_limits = CanonicalPipelineLimits {
@@ -948,198 +647,47 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     .validate()
     .map_err(|error| {
         ConfigError::invalid(format!(
-            "invalid ingest.bulk_catchup pipeline limits: {error}"
+            "invalid ingest.construction pipeline limits: {error}"
         ))
     })?;
 
-    let replay_batch_blocks_raw = require_field(
-        config.ingest.derive.batch_blocks,
-        "ingest.derive.replay_batch_blocks",
-    )?;
-    let replay_batch_blocks = NonZeroU32::new(replay_batch_blocks_raw).ok_or_else(|| {
-        ConfigError::invalid("ingest.derive.replay_batch_blocks must be greater than zero")
-    })?;
-    let replay_policy_raw =
-        require_field(config.ingest.derive.policy, "ingest.derive.replay_policy")?;
-    let replay_policy = parse_derive_replay_policy(&replay_policy_raw)?;
-    let memory_budget_bytes = optional_nonzero_u64_config(
-        config.ingest.derive.memory_budget_bytes,
-        "ingest.derive.memory_budget_bytes",
-    )?;
-    let memory_degrade_ratio = ratio_config(
-        config.ingest.derive.memory_degrade_ratio,
-        "ingest.derive.memory_degrade_ratio",
-    )?;
-    let memory_pause_ratio = ratio_config(
-        config.ingest.derive.memory_pause_ratio,
-        "ingest.derive.memory_pause_ratio",
-    )?;
-    let memory_resume_ratio = ratio_config(
-        config.ingest.derive.memory_resume_ratio,
-        "ingest.derive.memory_resume_ratio",
-    )?;
-    if !(memory_resume_ratio < memory_degrade_ratio && memory_degrade_ratio < memory_pause_ratio) {
-        return Err(ConfigError::invalid(
-            "ingest.derive memory ratios must satisfy memory_resume_ratio < memory_degrade_ratio < memory_pause_ratio",
-        )
-        .into());
-    }
-    let min_replay_batch_blocks = nonzero_u32_config(
-        config.ingest.derive.min_replay_batch_blocks,
-        "ingest.derive.min_replay_batch_blocks",
-    )?;
-    if min_replay_batch_blocks > replay_batch_blocks {
-        return Err(ConfigError::invalid(
-            "ingest.derive.min_replay_batch_blocks must be less than or equal to ingest.derive.replay_batch_blocks",
-        )
-        .into());
-    }
-    let startup_handoff_lag_blocks = u64::from(require_field(
-        config.ingest.derive.startup_handoff_lag_blocks,
-        "ingest.derive.startup_handoff_lag_blocks",
-    )?);
-
-    let commitment_root_backfill = CommitmentRootBackfillConfig {
-        enabled: require_field(
-            config.ingest.commitment_root_backfill.enabled,
-            "ingest.commitment_root_backfill.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config.ingest.commitment_root_backfill.batch_blocks,
-            "ingest.commitment_root_backfill.batch_blocks",
-        )?,
-        fetch_concurrency: nonzero_u32_config(
-            config.ingest.commitment_root_backfill.fetch_concurrency,
-            "ingest.commitment_root_backfill.fetch_concurrency",
-        )?,
-    };
-    let transaction_component_backfill = TransactionComponentBackfillConfig {
-        enabled: require_field(
-            config.ingest.transaction_component_backfill.enabled,
-            "ingest.transaction_component_backfill.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config.ingest.transaction_component_backfill.batch_blocks,
-            "ingest.transaction_component_backfill.batch_blocks",
-        )?,
-    };
-    let transaction_history_verifier = TransactionHistoryVerifierConfig {
-        enabled: require_field(
-            config.ingest.transaction_history_verifier.enabled,
-            "ingest.transaction_history_verifier.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config.ingest.transaction_history_verifier.batch_blocks,
-            "ingest.transaction_history_verifier.batch_blocks",
-        )?,
-    };
-    let value_pool_flow_backfill = ValuePoolFlowBackfillConfig {
-        enabled: require_field(
-            config.ingest.value_pool_flow_backfill.enabled,
-            "ingest.value_pool_flow_backfill.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config.ingest.value_pool_flow_backfill.batch_blocks,
-            "ingest.value_pool_flow_backfill.batch_blocks",
-        )?,
-        fetch_concurrency: nonzero_u32_config(
-            config.ingest.value_pool_flow_backfill.fetch_concurrency,
-            "ingest.value_pool_flow_backfill.fetch_concurrency",
-        )?,
-    };
-    let value_pool_balance_backfill = ValuePoolBalanceBackfillConfig {
-        enabled: require_field(
-            config.ingest.value_pool_balance_backfill.enabled,
-            "ingest.value_pool_balance_backfill.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config.ingest.value_pool_balance_backfill.batch_blocks,
-            "ingest.value_pool_balance_backfill.batch_blocks",
-        )?,
-        fetch_concurrency: nonzero_u32_config(
-            config.ingest.value_pool_balance_backfill.fetch_concurrency,
-            "ingest.value_pool_balance_backfill.fetch_concurrency",
-        )?,
-    };
-    let conventional_fee_distribution_backfill = ConventionalFeeDistributionBackfillConfig {
-        enabled: require_field(
-            config.ingest.conventional_fee_distribution_backfill.enabled,
-            "ingest.conventional_fee_distribution_backfill.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config
-                .ingest
-                .conventional_fee_distribution_backfill
-                .batch_blocks,
-            "ingest.conventional_fee_distribution_backfill.batch_blocks",
-        )?,
-    };
-    let paid_fee_distribution_backfill = PaidFeeDistributionBackfillConfig {
-        enabled: require_field(
-            config.ingest.paid_fee_distribution_backfill.enabled,
-            "ingest.paid_fee_distribution_backfill.enabled",
-        )?,
-        batch_blocks: nonzero_u32_config(
-            config.ingest.paid_fee_distribution_backfill.batch_blocks,
-            "ingest.paid_fee_distribution_backfill.batch_blocks",
-        )?,
-        fetch_concurrency: nonzero_u32_config(
-            config
-                .ingest
-                .paid_fee_distribution_backfill
-                .fetch_concurrency,
-            "ingest.paid_fee_distribution_backfill.fetch_concurrency",
-        )?,
-        history_days: nonzero_u32_config(
-            config.ingest.paid_fee_distribution_backfill.history_days,
-            "ingest.paid_fee_distribution_backfill.history_days",
-        )?,
-        timestamp_safety_seconds: require_field(
-            config
-                .ingest
-                .paid_fee_distribution_backfill
-                .timestamp_safety_seconds,
-            "ingest.paid_fee_distribution_backfill.timestamp_safety_seconds",
-        )?,
-    };
-
     let flush_interval_epochs_raw = require_field(
-        config.ingest.bulk_catchup.flush_interval_epochs,
-        "ingest.bulk_catchup.flush_interval_epochs",
+        config.ingest.construction.flush_interval_epochs,
+        "ingest.construction.flush_interval_epochs",
     )?;
     let flush_interval_epochs = NonZeroU32::new(flush_interval_epochs_raw).ok_or_else(|| {
-        ConfigError::invalid("ingest.bulk_catchup.flush_interval_epochs must be greater than zero")
+        ConfigError::invalid("ingest.construction.flush_interval_epochs must be greater than zero")
     })?;
 
     let poll_interval_ms = require_field(
-        config.ingest.tip_follow.poll_interval_ms,
-        "ingest.tip_follow.poll_interval_ms",
+        config.ingest.follow.poll_interval_ms,
+        "ingest.follow.poll_interval_ms",
     )?;
     let poll_interval = parse_poll_interval_ms(poll_interval_ms)?;
 
     let lag_threshold_blocks = require_field(
-        config.ingest.tip_follow.lag_threshold_blocks,
-        "ingest.tip_follow.lag_threshold_blocks",
+        config.ingest.follow.lag_threshold_blocks,
+        "ingest.follow.lag_threshold_blocks",
     )?;
 
-    let coverage = config.ingest.modifiers.coverage.unwrap_or_default();
+    let coverage = config.ingest.run_overrides.coverage.unwrap_or_default();
     let raw_blob_policy = resolve_raw_blob_policy(coverage, configured_raw_blob_policy)?;
 
-    let allow_near_tip_finalize = require_field(
-        config.ingest.modifiers.allow_near_tip_finalize,
-        "ingest.modifiers.allow_near_tip_finalize",
+    let allow_reorg_window_settlement = require_field(
+        config.ingest.run_overrides.allow_reorg_window_settlement,
+        "ingest.run_overrides.allow_reorg_window_settlement",
     )?;
-    if matches!(coverage, IngestCoverage::WalletServing) && allow_near_tip_finalize {
+    if matches!(coverage, IngestCoverage::WalletServing) && allow_reorg_window_settlement {
         return Err(ConfigError::invalid(
-            "ingest.modifiers.coverage = \"wallet-serving\" cannot be combined with ingest.modifiers.allow_near_tip_finalize = true; serving stores must stop outside the reorg window",
+            "ingest.run_overrides.coverage = \"wallet-serving\" cannot be combined with ingest.run_overrides.allow_reorg_window_settlement = true; serving stores must stop outside the reorg window",
         )
         .into());
     }
     if matches!(coverage, IngestCoverage::WalletServing)
-        && config.ingest.modifiers.checkpoint_height.is_some()
+        && config.ingest.run_overrides.checkpoint_height.is_some()
     {
         return Err(ConfigError::invalid(
-            "ingest.modifiers.coverage = \"wallet-serving\" derives checkpoint_height from the node; remove ingest.modifiers.checkpoint_height",
+            "ingest.run_overrides.coverage = \"wallet-serving\" derives checkpoint_height from the node; remove ingest.run_overrides.checkpoint_height",
         )
         .into());
     }
@@ -1165,40 +713,32 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         ingest_control_bearer_token.as_ref(),
     )?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let modifiers = IngestModifiers {
-        target_height: config.ingest.modifiers.target_height.map(BlockHeight::new),
+    let run_overrides = CanonicalRunOverrides {
+        target_height: config
+            .ingest
+            .run_overrides
+            .target_height
+            .map(BlockHeight::new),
         checkpoint_height: config
             .ingest
-            .modifiers
+            .run_overrides
             .checkpoint_height
             .map(BlockHeight::new),
-        allow_near_tip_finalize,
+        allow_reorg_window_settlement,
         checkpoint: None,
     };
 
-    let loop_config = IngestLoopConfig {
+    let runtime_config = IngestRuntimeConfig {
         node: node_target,
         node_source,
         storage_path,
         canonical_rocksdb_budget,
-        derive_rocksdb_budget,
         raw_blob_policy,
         reorg_window_blocks,
-        phases: PhasesConfig {
+        phase_classification: PhaseClassificationConfig {
             catchup_threshold_blocks,
         },
-        derive: IngestDeriveConfig {
-            replay_batch_blocks,
-            replay_policy,
-            memory_budget_bytes,
-            memory_degrade_ratio,
-            memory_pause_ratio,
-            memory_resume_ratio,
-            min_replay_batch_blocks,
-            startup_handoff_lag_blocks,
-        },
-        commitment_root_backfill,
-        bulk_catchup: BulkCatchupConfig {
+        construction: CanonicalConstructionSettings {
             canonical_batch_max_blocks,
             canonical_batch_max_artifact_bytes,
             canonical_batch_max_estimated_write_bytes,
@@ -1207,22 +747,15 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             commit_reassembly_max_queued_artifact_bytes,
             flush_interval_epochs,
         },
-        tip_follow: TipFollowPhaseConfig {
+        follow: CanonicalFollowSettings {
             poll_interval,
             lag_threshold_blocks,
         },
-        modifiers,
+        run_overrides,
     };
 
     Ok(IngestCommandConfig {
-        loop_config,
-        projection_preset,
-        conventional_fee_distribution_backfill,
-        paid_fee_distribution_backfill,
-        transaction_component_backfill,
-        transaction_history_verifier,
-        value_pool_flow_backfill,
-        value_pool_balance_backfill,
+        runtime_config,
         coverage,
         ingest_control_listen_addr,
         ingest_control_bearer_token_path,
@@ -1278,7 +811,7 @@ fn resolve_raw_blob_policy(
     match (coverage, configured_policy) {
         (IngestCoverage::WalletServing, None) => Ok(RawBlobPolicy::Transactions),
         (IngestCoverage::WalletServing, Some(RawBlobPolicy::None)) => Err(ConfigError::invalid(
-            "ingest.modifiers.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
+            "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
         )),
         (_, Some(raw_blob_policy)) => Ok(raw_blob_policy),
         (_, None) => Ok(DEFAULT_RAW_BLOB_POLICY),
@@ -1309,145 +842,94 @@ impl RedactedIngestConfigToml {
         reason = "redacted print-config mirrors the resolved ingest TOML shape field by field"
     )]
     fn from_ingest_config(config: &IngestCommandConfig) -> Self {
-        let loop_config = &config.loop_config;
+        let runtime_config = &config.runtime_config;
         Self {
-            network: NetworkToml::from_network(loop_config.node.network),
+            network: NetworkToml::from_network(runtime_config.node.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
-            node: NodeToml::from_node_target(&loop_config.node),
+            node: NodeToml::from_node_target(&runtime_config.node),
             storage: IngestStorageToml {
-                path: loop_config.storage_path.display().to_string(),
-                canonical: StorageRoleToml::from_resolved(loop_config.canonical_rocksdb_budget),
-                derive: StorageRoleToml::from_resolved(loop_config.derive_rocksdb_budget),
-                raw_blob_policy: loop_config.raw_blob_policy,
+                path: runtime_config.storage_path.display().to_string(),
+                canonical: StorageRoleToml::from_resolved(runtime_config.canonical_rocksdb_budget),
+                raw_blob_policy: runtime_config.raw_blob_policy,
             },
             ingest: IngestToml {
-                source: node_source_name(loop_config.node_source),
-                projection_preset: config.projection_preset.as_str(),
-                reorg_window_blocks: loop_config.reorg_window_blocks,
-                phases: IngestPhasesToml {
-                    catchup_threshold_blocks: loop_config.phases.catchup_threshold_blocks,
+                source: node_source_name(runtime_config.node_source),
+                reorg_window_blocks: runtime_config.reorg_window_blocks,
+                phase_classification: IngestPhaseClassificationToml {
+                    catchup_threshold_blocks: runtime_config
+                        .phase_classification
+                        .catchup_threshold_blocks,
                 },
-                derive: IngestDeriveToml {
-                    batch_blocks: loop_config.derive.replay_batch_blocks.get(),
-                    policy: loop_config.derive.replay_policy.as_kebab_case(),
-                    memory_budget_bytes: loop_config
-                        .derive
-                        .memory_budget_bytes
-                        .map(NonZeroU64::get),
-                    memory_degrade_ratio: loop_config.derive.memory_degrade_ratio,
-                    memory_pause_ratio: loop_config.derive.memory_pause_ratio,
-                    memory_resume_ratio: loop_config.derive.memory_resume_ratio,
-                    min_replay_batch_blocks: loop_config.derive.min_replay_batch_blocks.get(),
-                    startup_handoff_lag_blocks: loop_config.derive.startup_handoff_lag_blocks,
-                },
-                commitment_root_backfill: IngestCommitmentRootBackfillToml {
-                    enabled: loop_config.commitment_root_backfill.enabled,
-                    batch_blocks: loop_config.commitment_root_backfill.batch_blocks.get(),
-                    fetch_concurrency: loop_config.commitment_root_backfill.fetch_concurrency.get(),
-                },
-                conventional_fee_distribution_backfill:
-                    IngestConventionalFeeDistributionBackfillToml {
-                        enabled: config.conventional_fee_distribution_backfill.enabled,
-                        batch_blocks: config
-                            .conventional_fee_distribution_backfill
-                            .batch_blocks
-                            .get(),
-                    },
-                paid_fee_distribution_backfill: IngestPaidFeeDistributionBackfillToml {
-                    enabled: config.paid_fee_distribution_backfill.enabled,
-                    batch_blocks: config.paid_fee_distribution_backfill.batch_blocks.get(),
-                    fetch_concurrency: config
-                        .paid_fee_distribution_backfill
-                        .fetch_concurrency
-                        .get(),
-                    history_days: config.paid_fee_distribution_backfill.history_days.get(),
-                    timestamp_safety_seconds: config
-                        .paid_fee_distribution_backfill
-                        .timestamp_safety_seconds,
-                },
-                transaction_component_backfill: IngestTransactionComponentBackfillToml {
-                    enabled: config.transaction_component_backfill.enabled,
-                    batch_blocks: config.transaction_component_backfill.batch_blocks.get(),
-                },
-                transaction_history_verifier: IngestTransactionHistoryVerifierToml {
-                    enabled: config.transaction_history_verifier.enabled,
-                    batch_blocks: config.transaction_history_verifier.batch_blocks.get(),
-                },
-                value_pool_flow_backfill: IngestValuePoolFlowBackfillToml {
-                    enabled: config.value_pool_flow_backfill.enabled,
-                    batch_blocks: config.value_pool_flow_backfill.batch_blocks.get(),
-                    fetch_concurrency: config.value_pool_flow_backfill.fetch_concurrency.get(),
-                },
-                value_pool_balance_backfill: IngestValuePoolBalanceBackfillToml {
-                    enabled: config.value_pool_balance_backfill.enabled,
-                    batch_blocks: config.value_pool_balance_backfill.batch_blocks.get(),
-                    fetch_concurrency: config.value_pool_balance_backfill.fetch_concurrency.get(),
-                },
-                bulk_catchup: IngestBulkCatchupToml {
-                    canonical_batch_max_blocks: loop_config
-                        .bulk_catchup
+                construction: IngestConstructionToml {
+                    canonical_batch_max_blocks: runtime_config
+                        .construction
                         .canonical_batch_max_blocks
                         .get(),
-                    canonical_batch_max_artifact_bytes: loop_config
-                        .bulk_catchup
+                    canonical_batch_max_artifact_bytes: runtime_config
+                        .construction
                         .canonical_batch_max_artifact_bytes
                         .get(),
-                    canonical_batch_max_estimated_write_bytes: loop_config
-                        .bulk_catchup
+                    canonical_batch_max_estimated_write_bytes: runtime_config
+                        .construction
                         .canonical_batch_max_estimated_write_bytes
                         .get(),
-                    canonical_batch_min_blocks_before_estimated_write_close: loop_config
-                        .bulk_catchup
+                    canonical_batch_min_blocks_before_estimated_write_close: runtime_config
+                        .construction
                         .canonical_batch_min_blocks_before_estimated_write_close
                         .get(),
-                    source_segment_max_blocks: loop_config
-                        .bulk_catchup
+                    source_segment_max_blocks: runtime_config
+                        .construction
                         .pipeline_limits
                         .source_segment_max_blocks
                         .get(),
-                    source_segment_target_response_bytes: loop_config
-                        .bulk_catchup
+                    source_segment_target_response_bytes: runtime_config
+                        .construction
                         .pipeline_limits
                         .source_segment_target_response_bytes
                         .get(),
-                    source_fetch_max_in_flight_requests: loop_config
-                        .bulk_catchup
+                    source_fetch_max_in_flight_requests: runtime_config
+                        .construction
                         .pipeline_limits
                         .source_fetch_max_in_flight_requests
                         .get(),
-                    source_fetch_max_in_flight_bytes: loop_config
-                        .bulk_catchup
+                    source_fetch_max_in_flight_bytes: runtime_config
+                        .construction
                         .pipeline_limits
                         .source_fetch_max_in_flight_bytes
                         .get(),
-                    block_prepare_concurrency: loop_config
-                        .bulk_catchup
+                    block_prepare_concurrency: runtime_config
+                        .construction
                         .pipeline_limits
                         .block_prepare_concurrency
                         .get(),
-                    block_prepare_memory_watermark_bytes: loop_config
-                        .bulk_catchup
+                    block_prepare_memory_watermark_bytes: runtime_config
+                        .construction
                         .pipeline_limits
                         .block_prepare_memory_watermark_bytes
                         .get(),
-                    commit_reassembly_max_queued_artifact_bytes: loop_config
-                        .bulk_catchup
+                    commit_reassembly_max_queued_artifact_bytes: runtime_config
+                        .construction
                         .commit_reassembly_max_queued_artifact_bytes
                         .get(),
-                    flush_interval_epochs: loop_config.bulk_catchup.flush_interval_epochs.get(),
+                    flush_interval_epochs: runtime_config.construction.flush_interval_epochs.get(),
                 },
-                tip_follow: IngestTipFollowToml {
-                    poll_interval_ms: duration_as_millis_u64(loop_config.tip_follow.poll_interval),
-                    lag_threshold_blocks: loop_config.tip_follow.lag_threshold_blocks,
+                follow: IngestFollowToml {
+                    poll_interval_ms: duration_as_millis_u64(runtime_config.follow.poll_interval),
+                    lag_threshold_blocks: runtime_config.follow.lag_threshold_blocks,
                 },
-                modifiers: IngestModifiersToml {
-                    target_height: loop_config.modifiers.target_height.map(BlockHeight::value),
-                    checkpoint_height: loop_config
-                        .modifiers
+                run_overrides: IngestRunOverridesToml {
+                    target_height: runtime_config
+                        .run_overrides
+                        .target_height
+                        .map(BlockHeight::value),
+                    checkpoint_height: runtime_config
+                        .run_overrides
                         .checkpoint_height
                         .map(BlockHeight::value),
-                    allow_near_tip_finalize: loop_config.modifiers.allow_near_tip_finalize,
+                    allow_reorg_window_settlement: runtime_config
+                        .run_overrides
+                        .allow_reorg_window_settlement,
                     coverage: config.coverage,
                 },
             },
@@ -1480,75 +962,17 @@ impl RedactedCanonicalReplayVerificationConfigToml {
 #[derive(Serialize)]
 struct IngestToml {
     source: &'static str,
-    projection_preset: &'static str,
     reorg_window_blocks: u32,
-    phases: IngestPhasesToml,
-    derive: IngestDeriveToml,
-    commitment_root_backfill: IngestCommitmentRootBackfillToml,
-    conventional_fee_distribution_backfill: IngestConventionalFeeDistributionBackfillToml,
-    paid_fee_distribution_backfill: IngestPaidFeeDistributionBackfillToml,
-    transaction_component_backfill: IngestTransactionComponentBackfillToml,
-    transaction_history_verifier: IngestTransactionHistoryVerifierToml,
-    value_pool_flow_backfill: IngestValuePoolFlowBackfillToml,
-    value_pool_balance_backfill: IngestValuePoolBalanceBackfillToml,
-    bulk_catchup: IngestBulkCatchupToml,
-    tip_follow: IngestTipFollowToml,
-    modifiers: IngestModifiersToml,
-}
-
-#[derive(Serialize)]
-struct IngestCommitmentRootBackfillToml {
-    enabled: bool,
-    batch_blocks: u32,
-    fetch_concurrency: u32,
-}
-
-#[derive(Serialize)]
-struct IngestConventionalFeeDistributionBackfillToml {
-    enabled: bool,
-    batch_blocks: u32,
-}
-
-#[derive(Serialize)]
-struct IngestPaidFeeDistributionBackfillToml {
-    enabled: bool,
-    batch_blocks: u32,
-    fetch_concurrency: u32,
-    history_days: u32,
-    timestamp_safety_seconds: u64,
-}
-
-#[derive(Serialize)]
-struct IngestTransactionComponentBackfillToml {
-    enabled: bool,
-    batch_blocks: u32,
-}
-
-#[derive(Serialize)]
-struct IngestTransactionHistoryVerifierToml {
-    enabled: bool,
-    batch_blocks: u32,
-}
-
-#[derive(Serialize)]
-struct IngestValuePoolFlowBackfillToml {
-    enabled: bool,
-    batch_blocks: u32,
-    fetch_concurrency: u32,
-}
-
-#[derive(Serialize)]
-struct IngestValuePoolBalanceBackfillToml {
-    enabled: bool,
-    batch_blocks: u32,
-    fetch_concurrency: u32,
+    phase_classification: IngestPhaseClassificationToml,
+    construction: IngestConstructionToml,
+    follow: IngestFollowToml,
+    run_overrides: IngestRunOverridesToml,
 }
 
 #[derive(Serialize)]
 struct IngestStorageToml {
     path: String,
     canonical: StorageRoleToml,
-    derive: StorageRoleToml,
     raw_blob_policy: RawBlobPolicy,
 }
 
@@ -1560,27 +984,12 @@ struct CanonicalReplayVerificationStorageToml {
 }
 
 #[derive(Serialize)]
-struct IngestPhasesToml {
+struct IngestPhaseClassificationToml {
     catchup_threshold_blocks: u32,
 }
 
 #[derive(Serialize)]
-struct IngestDeriveToml {
-    #[serde(rename = "replay_batch_blocks")]
-    batch_blocks: u32,
-    #[serde(rename = "replay_policy")]
-    policy: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    memory_budget_bytes: Option<u64>,
-    memory_degrade_ratio: f64,
-    memory_pause_ratio: f64,
-    memory_resume_ratio: f64,
-    min_replay_batch_blocks: u32,
-    startup_handoff_lag_blocks: u64,
-}
-
-#[derive(Serialize)]
-struct IngestBulkCatchupToml {
+struct IngestConstructionToml {
     canonical_batch_max_blocks: u32,
     canonical_batch_max_artifact_bytes: u64,
     canonical_batch_max_estimated_write_bytes: u64,
@@ -1596,18 +1005,18 @@ struct IngestBulkCatchupToml {
 }
 
 #[derive(Serialize)]
-struct IngestTipFollowToml {
+struct IngestFollowToml {
     poll_interval_ms: u64,
     lag_threshold_blocks: u64,
 }
 
 #[derive(Serialize)]
-struct IngestModifiersToml {
+struct IngestRunOverridesToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint_height: Option<u32>,
-    allow_near_tip_finalize: bool,
+    allow_reorg_window_settlement: bool,
     coverage: IngestCoverage,
 }
 
@@ -1658,122 +1067,6 @@ mod tests {
         // 128 MiB so the pipeline can always make forward progress.
         let result = default_pipeline_queue_bytes_from_budget(Some(4 * ONE_GIB), fallback);
         assert_eq!(result, MIN_PIPELINE_QUEUE_BYTES);
-    }
-
-    #[test]
-    fn commitment_root_backfill_batch_rejects_zero() {
-        let error = nonzero_u32_config(Some(0), "ingest.commitment_root_backfill.batch_blocks")
-            .err()
-            .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn commitment_root_backfill_concurrency_rejects_zero() {
-        let error =
-            nonzero_u32_config(Some(0), "ingest.commitment_root_backfill.fetch_concurrency")
-                .err()
-                .unwrap_or_else(|| ConfigError::invalid("zero fetch concurrency was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn transaction_component_backfill_batch_rejects_zero() {
-        let error = nonzero_u32_config(
-            Some(0),
-            "ingest.transaction_component_backfill.batch_blocks",
-        )
-        .err()
-        .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn transaction_history_verifier_batch_rejects_zero() {
-        let error = nonzero_u32_config(Some(0), "ingest.transaction_history_verifier.batch_blocks")
-            .err()
-            .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn value_pool_flow_backfill_batch_rejects_zero() {
-        let error = nonzero_u32_config(Some(0), "ingest.value_pool_flow_backfill.batch_blocks")
-            .err()
-            .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn value_pool_flow_backfill_concurrency_rejects_zero() {
-        let error =
-            nonzero_u32_config(Some(0), "ingest.value_pool_flow_backfill.fetch_concurrency")
-                .err()
-                .unwrap_or_else(|| ConfigError::invalid("zero fetch concurrency was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn value_pool_balance_backfill_batch_rejects_zero() {
-        let error = nonzero_u32_config(Some(0), "ingest.value_pool_balance_backfill.batch_blocks")
-            .err()
-            .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn value_pool_balance_backfill_concurrency_rejects_zero() {
-        let error = nonzero_u32_config(
-            Some(0),
-            "ingest.value_pool_balance_backfill.fetch_concurrency",
-        )
-        .err()
-        .unwrap_or_else(|| ConfigError::invalid("zero fetch concurrency was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn conventional_fee_distribution_backfill_batch_rejects_zero() {
-        let error = nonzero_u32_config(
-            Some(0),
-            "ingest.conventional_fee_distribution_backfill.batch_blocks",
-        )
-        .err()
-        .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn paid_fee_distribution_backfill_batch_rejects_zero() {
-        let error = nonzero_u32_config(
-            Some(0),
-            "ingest.paid_fee_distribution_backfill.batch_blocks",
-        )
-        .err()
-        .unwrap_or_else(|| ConfigError::invalid("zero batch size was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn paid_fee_distribution_backfill_concurrency_rejects_zero() {
-        let error = nonzero_u32_config(
-            Some(0),
-            "ingest.paid_fee_distribution_backfill.fetch_concurrency",
-        )
-        .err()
-        .unwrap_or_else(|| ConfigError::invalid("zero fetch concurrency was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn paid_fee_distribution_backfill_history_rejects_zero_days() {
-        let error = nonzero_u32_config(
-            Some(0),
-            "ingest.paid_fee_distribution_backfill.history_days",
-        )
-        .err()
-        .unwrap_or_else(|| ConfigError::invalid("zero history days was accepted"));
-        assert!(error.to_string().contains("must be greater than zero"));
     }
 
     #[test]

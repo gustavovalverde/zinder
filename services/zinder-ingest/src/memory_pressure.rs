@@ -1,8 +1,8 @@
 //! Runtime memory pressure sampling for ingest scheduling.
 //!
-//! Canonical ingest and derive replay share one process in the standard
+//! Canonical ingest and materialized-view replay share one process in the standard
 //! deployment. The scheduler needs cheap, lossy memory signals so rebuildable
-//! derive projections can back off before they compete with canonical writes.
+//! materialized views can back off before they compete with canonical writes.
 
 use std::{
     fs,
@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{task::JoinHandle, time::Instant};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -113,9 +113,9 @@ pub(crate) fn container_memory_budget_from_snapshot(
 
 /// Spawns the runtime memory gauge sampler for the ingest process.
 ///
-/// Memory metrics are operational state, not derive replay state. Sampling them
+/// Memory metrics are operational state, not materialized-view replay state. Sampling them
 /// in an independent task keeps `/metrics` fresh even while canonical catchup or
-/// derive replay spends a long time inside a single work pass.
+/// materialized-view replay spends a long time inside a single work pass.
 #[must_use = "drop the handle to detach the runtime memory sampler or await it for symmetric shutdown"]
 pub fn spawn_runtime_memory_metrics_task(
     interval: Duration,
@@ -139,196 +139,18 @@ pub fn spawn_runtime_memory_metrics_task(
     })
 }
 
-/// Backoff applied once when memory pressure sits between the configured
-/// degrade and pause ratios before the next bulk-catchup batch starts.
-const BULK_CATCHUP_MEMORY_DEGRADE_BACKOFF: Duration = Duration::from_secs(2);
-
-/// Poll interval while memory pressure holds at or above the configured
-/// pause ratio, waiting for it to drop back below the resume ratio.
-const BULK_CATCHUP_MEMORY_PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Wall-clock a pause holds without meaningful reclaim before it expires.
-///
-/// Long enough for in-flight `RocksDB` flush and compaction memory to drain,
-/// short enough that allocator or cache retention pinning the ratio cannot
-/// stall a from-genesis rebuild. A drop of at least
-/// [`BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_MIN_DELTA`] resets the budget.
-const BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_BUDGET: Duration = Duration::from_mins(1);
-
-/// Pressure-ratio drop since the last reset that counts as real reclaim and
-/// extends the pause; smaller drift does not.
-const BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_MIN_DELTA: f64 = 0.02;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BulkCatchupHeadroomOutcome {
-    Clear,
-    DegradeBackoff,
-    PauseRecovered,
-    PauseExpired,
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PauseStep {
-    Recovered,
-    Reclaimed,
-    Expired,
-    Wait,
-}
-
-/// Decides what a paused caller does with one memory sample.
-///
-/// Recovery and genuine reclaim take priority over the elapsed budget: an
-/// improvement of at least [`BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_MIN_DELTA`] resets
-/// the deadline even once it has passed, so a pause that is actually freeing
-/// memory keeps waiting, while one pinned by retention expires.
-fn decide_pause_step(
-    pressure_ratio: f64,
-    reference_pressure: f64,
-    resume_ratio: f64,
-    reclaim_budget_elapsed: bool,
-) -> PauseStep {
-    if pressure_ratio < resume_ratio {
-        PauseStep::Recovered
-    } else if pressure_ratio <= reference_pressure - BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_MIN_DELTA {
-        PauseStep::Reclaimed
-    } else if reclaim_budget_elapsed {
-        PauseStep::Expired
-    } else {
-        PauseStep::Wait
-    }
-}
-
-/// Holds the caller between bulk-catchup batches while memory pressure is
-/// elevated, using the same degrade/pause/resume ratios
-/// [`crate::IngestDeriveConfig`] applies to derive replay.
-///
-/// The yield point gives a container approaching its cgroup memory ceiling
-/// a chance to flush and reclaim before the next batch accumulates more.
-/// At or above `pause_ratio`, this holds until pressure drops back below
-/// `resume_ratio` or the reclaim budget elapses without meaningful reclaim;
-/// between `degrade_ratio` and `pause_ratio`, it applies one short backoff.
-/// Below `degrade_ratio` it returns immediately.
-pub(crate) async fn wait_for_bulk_catchup_memory_headroom(
-    degrade_ratio: f64,
-    pause_ratio: f64,
-    resume_ratio: f64,
-    cancel: &CancellationToken,
-) {
-    run_bulk_catchup_headroom(degrade_ratio, pause_ratio, resume_ratio, cancel, || {
-        RuntimeMemorySnapshot::sample().pressure_ratio()
-    })
-    .await;
-}
-
-async fn run_bulk_catchup_headroom(
-    degrade_ratio: f64,
-    pause_ratio: f64,
-    resume_ratio: f64,
-    cancel: &CancellationToken,
-    mut sample: impl FnMut() -> Option<f64>,
-) -> BulkCatchupHeadroomOutcome {
-    let Some(pressure_ratio) = sample() else {
-        return BulkCatchupHeadroomOutcome::Clear;
-    };
-    if pressure_ratio >= pause_ratio {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "bulk_catchup_memory_pressure_paused",
-            pressure_ratio,
-            pause_ratio,
-            resume_ratio,
-            "memory pressure at or above the pause threshold; holding bulk catchup until it recovers or the reclaim budget expires"
-        );
-        return hold_bulk_catchup_until_reclaim(
-            pressure_ratio,
-            pause_ratio,
-            resume_ratio,
-            cancel,
-            &mut sample,
-        )
-        .await;
-    }
-    if pressure_ratio >= degrade_ratio {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "bulk_catchup_memory_pressure_degraded",
-            pressure_ratio,
-            degrade_ratio,
-            "memory pressure elevated before the next bulk-catchup batch; backing off briefly"
-        );
-        if cancellable_sleep(BULK_CATCHUP_MEMORY_DEGRADE_BACKOFF, cancel).await {
-            return BulkCatchupHeadroomOutcome::Cancelled;
-        }
-        return BulkCatchupHeadroomOutcome::DegradeBackoff;
-    }
-    BulkCatchupHeadroomOutcome::Clear
-}
-
-async fn hold_bulk_catchup_until_reclaim(
-    mut reference_pressure: f64,
-    pause_ratio: f64,
-    resume_ratio: f64,
-    cancel: &CancellationToken,
-    sample: &mut impl FnMut() -> Option<f64>,
-) -> BulkCatchupHeadroomOutcome {
-    let mut reclaim_deadline = Instant::now() + BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_BUDGET;
-    loop {
-        if cancellable_sleep(BULK_CATCHUP_MEMORY_PAUSE_POLL_INTERVAL, cancel).await {
-            return BulkCatchupHeadroomOutcome::Cancelled;
-        }
-        let Some(pressure_ratio) = sample() else {
-            return BulkCatchupHeadroomOutcome::Clear;
-        };
-        match decide_pause_step(
-            pressure_ratio,
-            reference_pressure,
-            resume_ratio,
-            Instant::now() >= reclaim_deadline,
-        ) {
-            PauseStep::Recovered => return BulkCatchupHeadroomOutcome::PauseRecovered,
-            PauseStep::Reclaimed => {
-                reference_pressure = pressure_ratio;
-                reclaim_deadline = Instant::now() + BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_BUDGET;
-            }
-            PauseStep::Expired => {
-                tracing::warn!(
-                    target: "zinder::ingest",
-                    event = "bulk_catchup_memory_pressure_pause_expired",
-                    pressure_ratio,
-                    pause_ratio,
-                    resume_ratio,
-                    reclaim_budget_secs = BULK_CATCHUP_MEMORY_PAUSE_RECLAIM_BUDGET.as_secs(),
-                    "memory pressure held at or above the pause threshold without reclaiming; idle waiting is not freeing memory, so proceeding with the next bulk-catchup batch"
-                );
-                return BulkCatchupHeadroomOutcome::PauseExpired;
-            }
-            PauseStep::Wait => {}
-        }
-    }
-}
-
-/// Sleeps for `duration` or returns early when `cancel` fires; returns
-/// whether the sleep was cut short by cancellation.
-async fn cancellable_sleep(duration: Duration, cancel: &CancellationToken) -> bool {
-    tokio::select! {
-        () = cancel.cancelled() => true,
-        () = tokio::time::sleep(duration) => false,
-    }
-}
-
 /// Number of `interval` ticks between operational memory log lines.
 ///
 /// The gauge sampler runs every second; logging every sample would flood the
 /// deploy log, so the cgroup limit and pressure ratio surface roughly once a
 /// minute. This is the denominator (`memory.high`/`memory.max`) that makes the
-/// derive replay pressure ratio interpretable from logs alone.
+/// materialized-view replay pressure ratio interpretable from logs alone.
 const RUNTIME_MEMORY_LOG_EVERY_TICKS: u32 = 60;
 
 /// Logs the cgroup memory limit, working set, anon memory, and pressure ratio at INFO.
 ///
 /// Without this the container memory budget is only on the (often unscraped)
-/// metrics endpoint, so a paused or memory-throttled derive plane is hard to
+/// metrics endpoint, so a paused or memory-throttled materialized-view plane is hard to
 /// diagnose from logs. Best-effort and lossy: unset cgroup fields log as
 /// `None`.
 fn log_runtime_memory_observation(snapshot: RuntimeMemorySnapshot) {
@@ -650,42 +472,5 @@ mod tests {
             ..RuntimeMemorySnapshot::default()
         };
         assert_eq!(container_memory_budget_from_snapshot(snapshot), None);
-    }
-
-    #[test]
-    fn pause_step_recovers_below_resume_ratio() {
-        assert_eq!(
-            decide_pause_step(0.60, 0.85, 0.65, true),
-            PauseStep::Recovered
-        );
-    }
-
-    #[test]
-    fn pause_step_expires_when_static_pressure_burns_the_budget() {
-        assert_eq!(
-            decide_pause_step(0.85, 0.85, 0.65, true),
-            PauseStep::Expired
-        );
-    }
-
-    #[test]
-    fn pause_step_waits_before_the_budget_elapses() {
-        assert_eq!(decide_pause_step(0.85, 0.85, 0.65, false), PauseStep::Wait);
-    }
-
-    #[test]
-    fn pause_step_resets_deadline_on_genuine_improvement_even_after_budget() {
-        assert_eq!(
-            decide_pause_step(0.82, 0.86, 0.65, true),
-            PauseStep::Reclaimed
-        );
-    }
-
-    #[tokio::test]
-    async fn headroom_pause_exits_promptly_on_cancellation() {
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let outcome = run_bulk_catchup_headroom(0.75, 0.85, 0.65, &cancel, || Some(0.90)).await;
-        assert_eq!(outcome, BulkCatchupHeadroomOutcome::Cancelled);
     }
 }

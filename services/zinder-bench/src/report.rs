@@ -8,7 +8,7 @@ use zinder_core::CanonicalBlockReplayFormatVersion;
 use zinder_store::RocksDbResourceBudget;
 
 use crate::{
-    canonical_fact_round_trip::postgres::PostgresCanonicalFactServerSettings,
+    canonical_replay_storage::postgres::PostgresServerSettings,
     error::BenchError,
     fixture::{
         CanonicalBlockFactsDigestEvidence, FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION,
@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Machine-readable report schema version.
-pub const REPORT_FORMAT_VERSION: u32 = 2;
+pub const REPORT_FORMAT_VERSION: u32 = 3;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 /// CPU envelope used to derive canonical fixture replay defaults.
@@ -58,7 +58,7 @@ const MULTI_GET_RESOLVED_TOTAL: &str = "zinder_store_multi_get_resolved_total";
 const ROCKSDB_TICKER: &str = "zinder_store_rocksdb_ticker";
 const ROCKSDB_COMPACT_READ_BYTES: &str = "rocksdb.compact.read.bytes";
 const ROCKSDB_COMPACT_WRITE_BYTES: &str = "rocksdb.compact.write.bytes";
-const PROJECTION_STORE_METRIC_ROLE: &str = "derive_primary";
+const MATERIALIZED_VIEW_STORE_METRIC_ROLE: &str = "materialized_view_primary";
 const COMMIT_DURATION_COUNT: &str = "zinder_ingest_commit_duration_seconds_count";
 const COMMIT_FALLBACK_CALLER: &str = "commit_fallback";
 const SOURCE_REQUEST_TOTAL: &str = "zinder_ingest_source_request_total";
@@ -117,9 +117,9 @@ pub struct FixtureSummary {
     pub contract_identity: String,
     /// Fixture manifest format version.
     pub fixture_format_version: u32,
-    /// Current-schema oracle artifact version used when capturing the fixture.
-    pub current_schema_oracle_artifact_schema_version: u16,
-    /// Backend-neutral canonical-fact digest oracle captured with the fixture.
+    /// Canonical artifact schema version used when capturing the fixture.
+    pub canonical_artifact_schema_version: u16,
+    /// Backend-neutral canonical-replay digest oracle captured with the fixture.
     pub canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence,
     /// Captured range tip hash, hex-encoded in internal byte order.
     pub tip_hash_hex: String,
@@ -146,8 +146,7 @@ impl TryFrom<&FixtureManifest> for FixtureSummary {
         Ok(Self {
             contract_identity: manifest.contract_identity.clone(),
             fixture_format_version: manifest.fixture_format_version,
-            current_schema_oracle_artifact_schema_version: manifest
-                .current_schema_oracle_artifact_schema_version,
+            canonical_artifact_schema_version: manifest.canonical_artifact_schema_version,
             canonical_block_facts_digest_evidence: manifest
                 .canonical_block_facts_digest_evidence
                 .clone(),
@@ -165,7 +164,7 @@ impl TryFrom<&FixtureManifest> for FixtureSummary {
 
 /// Direct measurements taken around the replay call.
 #[derive(Clone, Debug)]
-pub struct CurrentSchemaFixtureReplayMeasurements {
+pub struct CanonicalStoreRangeReplayMeasurements {
     /// Prepare concurrency the run used.
     pub block_prepare_concurrency: u32,
     /// Maximum accepted source-segment response size in bytes.
@@ -183,12 +182,12 @@ pub struct CurrentSchemaFixtureReplayMeasurements {
     /// Deterministic delay applied to each captured source-segment response.
     pub source_segment_delay_millis: u64,
     /// Effective canonical writer schema, resource, and durability settings.
-    pub canonical_writer: CurrentSchemaReplayWriterSettings,
-    /// Projection preset replayed after canonical ingest, or `None` for a
+    pub canonical_writer: CanonicalStoreRangeReplayWriterSettings,
+    /// Materialized-view preset replayed after canonical ingest, or `None` for a
     /// canonical-only run.
-    pub projection_preset: Option<&'static str>,
-    /// Projection history scope, or `None` for a canonical-only run.
-    pub projection_replay_scope: Option<&'static str>,
+    pub materialized_view_preset: Option<&'static str>,
+    /// Materialized-view history scope, or `None` for a canonical-only run.
+    pub materialized_view_replay_scope: Option<&'static str>,
     /// Wall-clock seconds spent in the canonical replay call.
     pub wall_clock_seconds: f64,
     /// Logical canonical position and checkpoint identity before replay.
@@ -198,18 +197,18 @@ pub struct CurrentSchemaFixtureReplayMeasurements {
     /// Store tip hash after replay, in the same internal byte order as
     /// [`FixtureSummary::tip_hash_hex`].
     pub tip_hash_after_hex: Option<String>,
-    /// Wall-clock seconds spent constructing projections, when driven.
-    pub projection_build_wall_clock_seconds: Option<f64>,
+    /// Wall-clock seconds spent constructing materialized views, when driven.
+    pub materialized_view_build_wall_clock_seconds: Option<f64>,
     /// Total rows across the selected consumers' owned column families.
-    pub projection_row_count: Option<u64>,
-    /// Whether every selected projection cursor equals the canonical event tip.
-    pub projection_event_cursor_at_tip: Option<bool>,
-    /// Final on-disk bytes under the projection-store directory.
-    pub projection_store_bytes: Option<u64>,
-    /// Seconds required to close and reopen the populated projection store.
-    pub projection_store_reopen_seconds: Option<f64>,
-    /// Serialized bytes submitted in successful projection write batches.
-    pub projection_logical_write_bytes: Option<u64>,
+    pub materialized_view_row_count: Option<u64>,
+    /// Whether every selected materialized-view cursor equals the canonical event tip.
+    pub materialized_view_event_cursor_at_tip: Option<bool>,
+    /// Final on-disk bytes under the materialized-view store directory.
+    pub materialized_view_store_bytes: Option<u64>,
+    /// Seconds required to close and reopen the populated materialized-view store.
+    pub materialized_view_store_reopen_seconds: Option<f64>,
+    /// Serialized bytes submitted in successful materialized-view write batches.
+    pub materialized_view_logical_write_bytes: Option<u64>,
     /// Peak resident-set-size reading.
     pub peak_rss: PeakRss,
     /// Storage implementation measured by this run.
@@ -247,8 +246,8 @@ pub struct StorageCandidateIdentity {
     pub canonical_engine: &'static str,
     /// Canonical logical model exercised by this candidate.
     pub canonical_model: &'static str,
-    /// Engine used for current diagnostic projections, when driven.
-    pub diagnostic_projection_engine: Option<&'static str>,
+    /// Engine used for current diagnostic materialized views, when driven.
+    pub diagnostic_materialized_view_engine: Option<&'static str>,
     /// Deployment/storage topology used by the candidate.
     pub topology: &'static str,
 }
@@ -256,78 +255,78 @@ pub struct StorageCandidateIdentity {
 impl StorageCandidateIdentity {
     /// Identifies the existing single-host canonical `RocksDB` implementation.
     #[must_use]
-    pub const fn rocksdb_current_schema_oracle() -> Self {
+    pub const fn rocksdb_canonical_store_range_replay() -> Self {
         Self {
-            id: "rocksdb-current-schema-oracle",
+            id: "rocksdb-canonical-store-range-replay",
             canonical_engine: "rocksdb",
-            canonical_model: "projection-coupled-current-schema",
-            diagnostic_projection_engine: None,
+            canonical_model: "canonical-store",
+            diagnostic_materialized_view_engine: None,
             topology: "rocksdb-single-host",
         }
     }
 
     /// Identifies the single-host canonical store plus the current diagnostic
-    /// projection store.
+    /// materialized-view store.
     #[must_use]
-    pub const fn rocksdb_current_schema_with_diagnostic_projections() -> Self {
+    pub const fn rocksdb_canonical_store_range_replay_with_diagnostic_materialized_view() -> Self {
         Self {
-            diagnostic_projection_engine: Some("rocksdb"),
-            ..Self::rocksdb_current_schema_oracle()
+            diagnostic_materialized_view_engine: Some("rocksdb"),
+            ..Self::rocksdb_canonical_store_range_replay()
         }
     }
 
-    /// Identifies the diagnostic fact-first `RocksDB` round-trip arm.
+    /// Identifies the diagnostic canonical-replay `RocksDB` round-trip arm.
     #[must_use]
-    pub const fn rocksdb_fact_first() -> Self {
+    pub const fn rocksdb_canonical_replay_storage() -> Self {
         Self {
-            id: "rocksdb-fact-first",
+            id: "rocksdb-canonical-replay-storage",
             canonical_engine: "rocksdb",
-            canonical_model: "block-granular-canonical-facts",
-            diagnostic_projection_engine: None,
+            canonical_model: "block-granular-canonical-replays",
+            diagnostic_materialized_view_engine: None,
             topology: "rocksdb-single-host",
         }
     }
 
-    /// Identifies the diagnostic fact-first Postgres round-trip arm.
+    /// Identifies the diagnostic canonical-replay Postgres round-trip arm.
     #[must_use]
-    pub const fn postgres_fact_first() -> Self {
+    pub const fn postgres_canonical_replay_storage() -> Self {
         Self {
-            id: "postgres-fact-first",
+            id: "postgres-canonical-replay-storage",
             canonical_engine: "postgres",
-            canonical_model: "block-granular-canonical-facts",
-            diagnostic_projection_engine: None,
+            canonical_model: "block-granular-canonical-replays",
+            diagnostic_materialized_view_engine: None,
             topology: "postgres-scale-out",
         }
     }
 
-    /// Identifies the single-host version-1 canonical and wallet storage lifecycle.
+    /// Identifies the single-host canonical and wallet storage lifecycle.
     #[must_use]
     pub const fn rocksdb_storage_lifecycle() -> Self {
         Self {
             id: "rocksdb-storage-lifecycle",
             canonical_engine: "rocksdb",
-            canonical_model: "version-1-canonical-facts",
-            diagnostic_projection_engine: None,
+            canonical_model: "canonical-replay-storage",
+            diagnostic_materialized_view_engine: None,
             topology: "rocksdb-single-host",
         }
     }
 
-    /// Identifies authenticated checkpointed fixture replay into canonical-v1 `RocksDB`.
+    /// Identifies authenticated checkpointed fixture replay into canonical `RocksDB`.
     #[must_use]
     pub const fn rocksdb_canonical_fixture_replay() -> Self {
         Self {
             id: "rocksdb-canonical-fixture-replay",
             canonical_engine: "rocksdb",
-            canonical_model: "version-1-canonical-facts",
-            diagnostic_projection_engine: None,
+            canonical_model: "canonical-replay-storage",
+            diagnostic_materialized_view_engine: None,
             topology: "rocksdb-single-host",
         }
     }
 }
 
-/// Effective settings for the current-schema canonical replay writer.
+/// Effective settings for the canonical-store range replay writer.
 #[derive(Clone, Copy, Debug, Serialize)]
-pub struct CurrentSchemaReplayWriterSettings {
+pub struct CanonicalStoreRangeReplayWriterSettings {
     /// Durable canonical store schema written by this binary.
     pub store_schema_version: u16,
     /// Durable artifact schema written by this binary.
@@ -534,7 +533,7 @@ pub struct AcceptanceThresholdSummary {
 
 /// Acceptance results for boundaries this command directly drives.
 #[derive(Clone, Copy, Debug, Serialize)]
-pub struct CurrentSchemaFixtureReplayAcceptance {
+pub struct CanonicalStoreRangeReplayAcceptance {
     /// Fixture replay into the supplied canonical-store clone.
     pub canonical_fixture_replay: AcceptanceMeasurementSummary,
 }
@@ -599,9 +598,9 @@ pub struct StageDurationStat {
 /// Required proof that canonical construction did not cross a prohibited read boundary.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct CanonicalProhibitedReadSummary {
-    /// Historical canonical prevout reads; fact-first construction requires zero.
+    /// Historical canonical prevout reads; canonical construction requires zero.
     pub historical_prevout_read_count: u64,
-    /// Cross-block wallet-state reads; fact-first construction requires zero.
+    /// Cross-block wallet-state reads; canonical construction requires zero.
     pub cross_block_wallet_read_count: u64,
 }
 
@@ -633,7 +632,7 @@ pub struct TickerStat {
 
 /// Replay-derived scalars folded into the report.
 #[derive(Clone, Debug, Serialize)]
-pub struct CurrentSchemaFixtureReplaySummary {
+pub struct CanonicalStoreRangeReplaySummary {
     /// Prepare concurrency the run used.
     pub block_prepare_concurrency: u32,
     /// Maximum accepted source-segment response size in bytes.
@@ -651,12 +650,12 @@ pub struct CurrentSchemaFixtureReplaySummary {
     /// Deterministic delay applied to each captured source-segment response.
     pub source_segment_delay_millis: u64,
     /// Effective canonical writer schema, resource, and durability settings.
-    pub canonical_writer: CurrentSchemaReplayWriterSettings,
-    /// Projection preset replayed after canonical ingest, or `None` for a
+    pub canonical_writer: CanonicalStoreRangeReplayWriterSettings,
+    /// Materialized-view preset replayed after canonical ingest, or `None` for a
     /// canonical-only run.
-    pub projection_preset: Option<&'static str>,
-    /// Projection history scope, or `None` for a canonical-only run.
-    pub projection_replay_scope: Option<&'static str>,
+    pub materialized_view_preset: Option<&'static str>,
+    /// Materialized-view history scope, or `None` for a canonical-only run.
+    pub materialized_view_replay_scope: Option<&'static str>,
     /// Wall-clock seconds spent in the canonical replay call.
     pub wall_clock_seconds: f64,
     /// Logical canonical position and checkpoint identity before replay.
@@ -677,20 +676,20 @@ pub struct CurrentSchemaFixtureReplaySummary {
     /// Source request, response, and adaptive-prefetch attribution, when the
     /// in-process metrics recorder observed completed segment requests.
     pub source_fetch_attribution: Option<SourceFetchAttributionSummary>,
-    /// Wall-clock seconds spent constructing projections, when driven.
-    pub projection_build_wall_clock_seconds: Option<f64>,
+    /// Wall-clock seconds spent constructing materialized views, when driven.
+    pub materialized_view_build_wall_clock_seconds: Option<f64>,
     /// Total rows across the selected consumers' owned column families.
-    pub projection_row_count: Option<u64>,
-    /// Whether every selected projection cursor equals the canonical event tip.
-    pub projection_event_cursor_at_tip: Option<bool>,
-    /// Final on-disk bytes under the projection-store directory.
-    pub projection_store_bytes: Option<u64>,
-    /// Serialized bytes submitted in successful projection write batches.
-    pub projection_logical_write_bytes: Option<u64>,
-    /// Bytes read plus written by projection-store compactions.
-    pub projection_compaction_bytes: Option<u64>,
-    /// Seconds required to close and reopen the populated projection store.
-    pub projection_store_reopen_seconds: Option<f64>,
+    pub materialized_view_row_count: Option<u64>,
+    /// Whether every selected materialized-view cursor equals the canonical event tip.
+    pub materialized_view_event_cursor_at_tip: Option<bool>,
+    /// Final on-disk bytes under the materialized-view store directory.
+    pub materialized_view_store_bytes: Option<u64>,
+    /// Serialized bytes submitted in successful materialized-view write batches.
+    pub materialized_view_logical_write_bytes: Option<u64>,
+    /// Bytes read plus written by materialized-view store compactions.
+    pub materialized_view_compaction_bytes: Option<u64>,
+    /// Seconds required to close and reopen the populated materialized-view store.
+    pub materialized_view_store_reopen_seconds: Option<f64>,
     /// Peak resident-set-size reading.
     pub peak_rss: PeakRss,
 }
@@ -738,9 +737,9 @@ pub struct SourceFetchAttributionSummary {
     pub source_watermark_blocks_per_second: f64,
 }
 
-/// Digest evidence recomputed from persisted canonical fact encodings.
+/// Digest evidence recomputed from persisted canonical replay encodings.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct CanonicalFactSequenceDigestSummary {
+pub struct CanonicalBlockFactsSequenceDigestSummary {
     /// Per-block reference-encoding digest version.
     pub block_digest_version: u16,
     /// Ordered sequence-digest version.
@@ -751,7 +750,7 @@ pub struct CanonicalFactSequenceDigestSummary {
     pub sha256: String,
 }
 
-impl CanonicalFactSequenceDigestSummary {
+impl CanonicalBlockFactsSequenceDigestSummary {
     /// Converts the typed core digest into report-safe scalar evidence.
     #[must_use]
     pub fn from_digest(
@@ -782,10 +781,10 @@ pub struct PostgresBenchmarkRuntimeEvidence {
     pub database_memory_limit_bytes: Option<u64>,
 }
 
-/// Engine-specific settings and physical write evidence for one fact-first arm.
+/// Engine-specific settings and physical write evidence for one canonical-replay round-trip arm.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "engine", rename_all = "kebab-case")]
-pub enum CanonicalBlockFactsStorageEvidence {
+pub enum CanonicalReplayStorageEvidence {
     /// `RocksDB` external-SST construction settings.
     #[serde(rename = "rocksdb")]
     RocksDb {
@@ -812,15 +811,15 @@ pub enum CanonicalBlockFactsStorageEvidence {
         storage_schema_version: u16,
         /// Stable construction mechanism label.
         ingestion_mode: &'static str,
-        /// Whether the candidate fact table is durable and WAL logged.
+        /// Whether the candidate replay table is durable and WAL logged.
         tables_logged: bool,
         /// Explicit TOAST compression used for canonical replay encodings.
         replay_envelope_compression: &'static str,
         /// Queried performance and durability settings for the measured database arm.
-        server_settings: Box<PostgresCanonicalFactServerSettings>,
-        /// Bytes owned by the canonical-fact heap and its auxiliary forks.
-        fact_table_bytes: u64,
-        /// Bytes owned by indexes created after fact loading.
+        server_settings: Box<PostgresServerSettings>,
+        /// Bytes owned by the canonical-replay heap and its auxiliary forks.
+        replay_table_bytes: u64,
+        /// Bytes owned by indexes created after replay loading.
         index_bytes: u64,
         /// WAL bytes advanced during construction and publication.
         wal_bytes: u64,
@@ -829,9 +828,9 @@ pub enum CanonicalBlockFactsStorageEvidence {
     },
 }
 
-/// Direct measurements from a persisted canonical-block-facts round trip.
+/// Direct measurements from a persisted canonical-replay-storage round trip.
 #[derive(Clone, Debug)]
-pub struct CanonicalBlockFactsRoundTripMeasurements {
+pub struct CanonicalReplayStorageMeasurements {
     /// Prepare concurrency used while parsing fixture blocks.
     pub block_prepare_concurrency: u32,
     /// Total measured round-trip seconds, including validation and publication.
@@ -839,10 +838,10 @@ pub struct CanonicalBlockFactsRoundTripMeasurements {
     /// Fixture metadata validation plus fresh backend and physical-schema initialization.
     pub storage_initialization_wall_clock_seconds: f64,
     /// Fixture read, parse, and semantic replay encoding seconds.
-    pub fact_preparation_wall_clock_seconds: f64,
+    pub replay_preparation_wall_clock_seconds: f64,
     /// Primary table or external-SST construction and ingestion seconds.
-    pub fact_persistence_wall_clock_seconds: f64,
-    /// Index construction performed after primary fact loading.
+    pub replay_persistence_wall_clock_seconds: f64,
+    /// Index construction performed after primary replay loading.
     pub index_construction_wall_clock_seconds: f64,
     /// Post-load storage optimization, such as `PostgreSQL` `ANALYZE`.
     pub storage_optimization_wall_clock_seconds: f64,
@@ -863,17 +862,17 @@ pub struct CanonicalBlockFactsRoundTripMeasurements {
     /// Last persisted block hash in internal byte order.
     pub tip_hash_hex: String,
     /// Logical semantic replay encoding bytes submitted to storage.
-    pub logical_fact_bytes: u64,
+    pub logical_replay_bytes: u64,
     /// Final physical bytes owned by the candidate tables/store.
     pub physical_storage_bytes: u64,
     /// Ordered digest recomputed from persisted rows.
-    pub persisted_sequence_digest: CanonicalFactSequenceDigestSummary,
+    pub persisted_sequence_digest: CanonicalBlockFactsSequenceDigestSummary,
     /// Semantic replay format version decoded from every persisted row.
     pub replay_format_version: u32,
-    /// Whether every persisted replay envelope decoded into complete canonical facts.
+    /// Whether every persisted replay envelope decoded into complete canonical replay records.
     pub semantic_replay_validated: bool,
     /// Engine-specific settings and physical write evidence.
-    pub storage: CanonicalBlockFactsStorageEvidence,
+    pub storage: CanonicalReplayStorageEvidence,
     /// Peak resident-set-size reading for the benchmark client process.
     ///
     /// This includes the embedded database in the `RocksDB` arm and excludes
@@ -903,10 +902,12 @@ pub struct CanonicalBlockFactsRoundTripMeasurements {
     pub image_reference: Option<String>,
 }
 
-/// Persisted fact-round-trip scalars. This is evidence for the fact aggregate
-/// only, not a chain epoch, query-readiness, reorg, or projection lifecycle.
+/// Persisted canonical-replay-storage scalars.
+///
+/// This is storage evidence for block-local replay records, not a chain epoch,
+/// query-readiness, reorg, or materialized-view lifecycle.
 #[derive(Clone, Debug, Serialize)]
-pub struct CanonicalBlockFactsRoundTripSummary {
+pub struct CanonicalReplayStorageSummary {
     /// Exact diagnostic boundary this report drove.
     pub scope: &'static str,
     /// Prepare concurrency used while parsing fixture blocks.
@@ -916,10 +917,10 @@ pub struct CanonicalBlockFactsRoundTripSummary {
     /// Fixture metadata validation plus fresh backend and physical-schema initialization.
     pub storage_initialization_wall_clock_seconds: f64,
     /// Fixture read, parse, and semantic replay encoding seconds.
-    pub fact_preparation_wall_clock_seconds: f64,
+    pub replay_preparation_wall_clock_seconds: f64,
     /// Primary table or external-SST construction and ingestion seconds.
-    pub fact_persistence_wall_clock_seconds: f64,
-    /// Index construction performed after primary fact loading.
+    pub replay_persistence_wall_clock_seconds: f64,
+    /// Index construction performed after primary replay loading.
     pub index_construction_wall_clock_seconds: f64,
     /// Post-load storage optimization seconds.
     pub storage_optimization_wall_clock_seconds: f64,
@@ -946,19 +947,19 @@ pub struct CanonicalBlockFactsRoundTripSummary {
     /// End-to-end persisted blocks per second.
     pub blocks_per_second: f64,
     /// Logical semantic replay encoding bytes submitted to storage.
-    pub logical_fact_bytes: u64,
+    pub logical_replay_bytes: u64,
     /// Final physical bytes owned by the candidate tables/store.
     pub physical_storage_bytes: u64,
     /// Ordered digest recomputed from persisted rows.
-    pub persisted_sequence_digest: CanonicalFactSequenceDigestSummary,
+    pub persisted_sequence_digest: CanonicalBlockFactsSequenceDigestSummary,
     /// Whether the persisted sequence equals the fixture capture oracle.
     pub fixture_sequence_digest_match: bool,
     /// Semantic replay format version decoded from every persisted row.
     pub replay_format_version: u32,
-    /// Whether every persisted replay envelope decoded into complete canonical facts.
+    /// Whether every persisted replay envelope decoded into complete canonical replay records.
     pub semantic_replay_validated: bool,
     /// Engine-specific settings and physical write evidence.
-    pub storage: CanonicalBlockFactsStorageEvidence,
+    pub storage: CanonicalReplayStorageEvidence,
     /// Peak resident-set-size reading for the benchmark client process.
     ///
     /// This includes the embedded database in the `RocksDB` arm and excludes
@@ -966,9 +967,9 @@ pub struct CanonicalBlockFactsRoundTripSummary {
     pub benchmark_client_peak_rss: PeakRss,
 }
 
-/// Full report for one canonical-block-facts persisted round trip.
+/// Full report for one canonical-replay-storage persisted round trip.
 #[derive(Clone, Debug, Serialize)]
-pub struct CanonicalBlockFactsRoundTripReport {
+pub struct CanonicalReplayStorageReport {
     /// Stable report contract identity.
     pub contract_identity: String,
     /// Machine-readable report schema version.
@@ -979,13 +980,13 @@ pub struct CanonicalBlockFactsRoundTripReport {
     pub fixture: FixtureSummary,
     /// Storage candidate measured by this invocation.
     pub storage_candidate: StorageCandidateIdentity,
-    /// Fact-only round-trip evidence.
-    pub round_trip: CanonicalBlockFactsRoundTripSummary,
+    /// Canonical replay storage evidence.
+    pub round_trip: CanonicalReplayStorageSummary,
 }
 
-/// Current-schema fixture replay report.
+/// Canonical-store range replay report.
 #[derive(Clone, Debug, Serialize)]
-pub struct CurrentSchemaFixtureReplayReport {
+pub struct CanonicalStoreRangeReplayReport {
     /// Stable report contract identity.
     pub contract_identity: String,
     /// Machine-readable report schema version.
@@ -997,9 +998,9 @@ pub struct CurrentSchemaFixtureReplayReport {
     /// Storage candidate measured by this invocation.
     pub storage_candidate: StorageCandidateIdentity,
     /// Acceptance results for boundaries driven by this command.
-    pub acceptance: CurrentSchemaFixtureReplayAcceptance,
+    pub acceptance: CanonicalStoreRangeReplayAcceptance,
     /// Replay-derived scalars.
-    pub replay: CurrentSchemaFixtureReplaySummary,
+    pub replay: CanonicalStoreRangeReplaySummary,
     /// Per-caller canonical-store read timing.
     pub store_reads: Vec<CallerReadStat>,
     /// Per-caller `multi_get` key accounting.
@@ -1012,7 +1013,7 @@ pub struct CurrentSchemaFixtureReplayReport {
     pub rocksdb_tickers: Vec<TickerStat>,
 }
 
-/// Exact resource profile and effective limits used by one canonical-v1 fixture replay.
+/// Exact resource profile and effective limits used by one canonical fixture replay.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct RocksDbCanonicalFixtureReplayResourceLimits {
     /// Concrete block transport admitted for this replay.
@@ -1049,7 +1050,7 @@ pub struct RocksDbCanonicalFixtureReplayResourceLimits {
     pub canonical_rocksdb: RocksDbResourceBudgetSummary,
 }
 
-/// Report-safe block and SST evidence from the production canonical-v1 loader.
+/// Report-safe block and SST evidence from the production canonical loader.
 #[derive(Clone, Debug, Serialize)]
 pub struct RocksDbCanonicalFixtureSourceLoadSummary {
     /// First retained block.
@@ -1090,8 +1091,8 @@ pub struct RocksDbCanonicalFixtureSourceLoadSummary {
     pub sst_file_count: u64,
     /// Canonical replay-envelope contract admitted for every block.
     pub replay_format_version: u32,
-    /// Ordered canonical fact digest loaded into the store.
-    pub sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Ordered canonical replay digest loaded into the store.
+    pub sequence_digest: CanonicalBlockFactsSequenceDigestSummary,
 }
 
 /// Event fence authenticated by READY publication and independent cold reopen.
@@ -1103,11 +1104,11 @@ pub struct RocksDbCanonicalFixtureEventFenceSummary {
     pub chain_event_sequence: u64,
     /// Visible canonical tip.
     pub visible_tip: StorageLifecycleBlockId,
-    /// Ordered canonical fact digest at the fence.
-    pub sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Ordered canonical replay digest at the fence.
+    pub sequence_digest: CanonicalBlockFactsSequenceDigestSummary,
 }
 
-/// Canonical-v1 READY, cold-reopen, and full-scan evidence for a checkpointed fixture.
+/// Canonical-store READY, cold-reopen, and full-scan evidence for a checkpointed fixture.
 #[derive(Clone, Debug, Serialize)]
 pub struct RocksDbCanonicalFixtureReadySummary {
     /// Exact boundary certified by this report section.
@@ -1127,7 +1128,7 @@ pub struct RocksDbCanonicalFixtureReadySummary {
     /// Canonical replay-envelope version.
     pub replay_format_version: u32,
     /// Ordered READY sequence digest.
-    pub sequence_digest: CanonicalFactSequenceDigestSummary,
+    pub sequence_digest: CanonicalBlockFactsSequenceDigestSummary,
     /// Logical replay bytes authenticated by READY.
     pub logical_replay_bytes: u64,
     /// Settled baseline tip selected from the retained range.
@@ -1144,7 +1145,7 @@ pub struct RocksDbCanonicalFixtureReadySummary {
     pub full_scan_block_count: u64,
 }
 
-/// Direct measurements for one canonical-v1 fixture replay report.
+/// Direct measurements for one canonical fixture replay report.
 #[derive(Clone, Debug)]
 pub struct RocksDbCanonicalFixtureReplayMeasurements {
     /// Fixture manifest digest bound into the admitted replay plan.
@@ -1171,7 +1172,7 @@ pub struct RocksDbCanonicalFixtureReplayMeasurements {
     pub run_completed_at_unix_millis: u64,
 }
 
-/// Authenticated checkpointed fixture replay into the real canonical-v1 store.
+/// Authenticated checkpointed fixture replay into the real canonical store.
 #[derive(Clone, Debug, Serialize)]
 pub struct RocksDbCanonicalFixtureReplayReport {
     /// Stable report contract identity.
@@ -1204,7 +1205,7 @@ pub struct RocksDbCanonicalFixtureReplayReport {
     pub physical_store_bytes: u64,
     /// Source request, response, and adaptive-prefetch attribution.
     pub source_fetch_attribution: Option<SourceFetchAttributionSummary>,
-    /// Required zero-read evidence for the fact-first construction boundary.
+    /// Required zero-read evidence for the canonical construction boundary.
     pub prohibited_reads: Option<CanonicalProhibitedReadSummary>,
     /// Full publication scans grouped by canonical family; empty for trusted fresh-writer proof.
     pub publication_family_scans: Vec<CanonicalPublicationFamilyScanStat>,
@@ -1246,7 +1247,7 @@ pub struct StorageLifecycleBlockId {
     pub hash_hex: String,
 }
 
-/// Fixed version-1 identities exercised by the lifecycle command.
+/// Fixed storage identities exercised by the lifecycle command.
 #[derive(Clone, Debug, Serialize)]
 pub struct StorageLifecycleContractSummary {
     /// Canonical store contract identity.
@@ -1257,7 +1258,7 @@ pub struct StorageLifecycleContractSummary {
     pub wallet_store_identity: &'static str,
     /// Wallet physical schema version.
     pub wallet_store_schema_version: u16,
-    /// Wallet projection schema version.
+    /// Wallet materialized-view schema version.
     pub wallet_projection_schema_version: u16,
     /// Wallet row-value encoding version.
     pub wallet_value_encoding_version: u16,
@@ -1355,8 +1356,8 @@ pub struct CanonicalStorageReadySummary {
     pub subtree_root_count: u64,
     /// Canonical semantic replay format version.
     pub replay_format_version: u32,
-    /// Ordered canonical fact digest evidence.
-    pub sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Ordered canonical replay digest evidence.
+    pub sequence_digest: CanonicalBlockFactsSequenceDigestSummary,
     /// Logical semantic replay bytes authenticated by READY.
     pub logical_replay_bytes: u64,
     /// Total logical key-and-value bytes submitted to canonical SST writers.
@@ -1375,7 +1376,7 @@ pub struct CanonicalStorageReadySummary {
     pub cold_reopen_evidence_match: bool,
 }
 
-/// Version-1 wallet row counts rendered without coupling report consumers to Rust types.
+/// Wallet row counts rendered without coupling report consumers to Rust types.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct WalletStorageRowCounts {
     /// Current transparent output rows.
@@ -1472,7 +1473,7 @@ pub struct WalletStoragePhaseDurations {
     pub outpoint_merge_seconds: f64,
     /// Secondary sorting, balances, history, and retained undo derivation.
     pub secondary_row_derivation_seconds: f64,
-    /// Row-count and version-1 projection-digest finalization.
+    /// Row-count and version-1 wallet-projection-digest finalization.
     pub logical_evidence_seconds: f64,
     /// External SST ingestion into the unpublished wallet store.
     pub row_load_seconds: f64,
@@ -1491,16 +1492,16 @@ pub struct WalletStoragePhaseDurations {
 pub struct WalletStorageReadySummary {
     /// Exact boundary certified by this section.
     pub scope: &'static str,
-    /// Canonical source epoch represented by the projection.
+    /// Canonical source epoch represented by the wallet projection.
     pub source_epoch_id: u64,
-    /// Canonical source tip represented by the projection.
+    /// Canonical source tip represented by the wallet projection.
     pub source_tip: StorageLifecycleBlockId,
-    /// Canonical source event represented by the projection.
+    /// Canonical source event represented by the wallet projection.
     pub source_event_sequence: u64,
-    /// Ordered canonical sequence digest represented by the projection.
-    pub source_sequence_digest: CanonicalFactSequenceDigestSummary,
+    /// Ordered canonical sequence digest represented by the wallet projection.
+    pub source_sequence_digest: CanonicalBlockFactsSequenceDigestSummary,
     /// Digest of every durable wallet row.
-    pub projection_digest_hex: String,
+    pub wallet_projection_digest_hex: String,
     /// Exact durable row counts by wallet family.
     pub row_counts: WalletStorageRowCounts,
     /// Current transparent UTXO aggregate.
@@ -1530,7 +1531,7 @@ pub struct RocksDbStorageLifecycleMeasurements {
     pub provenance: ReportProvenance,
     /// Frozen node source identity.
     pub source: StorageLifecycleSourceSummary,
-    /// Fixed version-1 contracts.
+    /// Fixed storage contracts.
     pub contracts: StorageLifecycleContractSummary,
     /// Exact resource ceilings.
     pub resource_limits: StorageLifecycleResourceLimits,
@@ -1559,7 +1560,7 @@ pub struct RocksDbStorageLifecycleReport {
     pub storage_candidate: StorageCandidateIdentity,
     /// Frozen node source identity.
     pub source: StorageLifecycleSourceSummary,
-    /// Fixed version-1 contracts.
+    /// Fixed storage contracts.
     pub contracts: StorageLifecycleContractSummary,
     /// Exact resource ceilings.
     pub resource_limits: StorageLifecycleResourceLimits,
@@ -1578,32 +1579,32 @@ pub struct RocksDbStorageLifecycleReport {
 /// One versioned benchmark report with a closed, candidate-honest measurement
 /// shape.
 ///
-/// The tagged variants deliberately prevent fact-only storage comparisons
-/// from serializing current-schema lifecycle acceptance or telemetry fields.
+/// The tagged variants deliberately prevent block-local replay comparisons
+/// from serializing canonical-store range-replay acceptance or telemetry fields.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "measurement_kind", rename_all = "kebab-case")]
 pub enum BenchmarkReport {
-    /// Existing bulk-catchup replay into the projection-coupled schema.
-    CurrentSchemaFixtureReplay(Box<CurrentSchemaFixtureReplayReport>),
-    /// Persisted round trip of block-local canonical facts only.
-    CanonicalBlockFactsRoundTrip(Box<CanonicalBlockFactsRoundTripReport>),
-    /// Authenticated checkpointed fixture replay into canonical-v1 `RocksDB`.
+    /// Existing bulk-catchup replay into an existing canonical store.
+    CanonicalStoreRangeReplay(Box<CanonicalStoreRangeReplayReport>),
+    /// Persisted round trip of block-local canonical replay records only.
+    CanonicalReplayStorage(Box<CanonicalReplayStorageReport>),
+    /// Authenticated checkpointed fixture replay into canonical `RocksDB`.
     #[serde(rename = "rocksdb-canonical-fixture-replay")]
     RocksDbCanonicalFixtureReplay(Box<RocksDbCanonicalFixtureReplayReport>),
-    /// Fixed-tip version-1 canonical and wallet `RocksDB` storage lifecycle.
+    /// Fixed-tip canonical and wallet `RocksDB` storage lifecycle.
     #[serde(rename = "rocksdb-storage-lifecycle")]
     RocksDbStorageLifecycle(Box<RocksDbStorageLifecycleReport>),
 }
 
-impl From<CurrentSchemaFixtureReplayReport> for BenchmarkReport {
-    fn from(report: CurrentSchemaFixtureReplayReport) -> Self {
-        Self::CurrentSchemaFixtureReplay(Box::new(report))
+impl From<CanonicalStoreRangeReplayReport> for BenchmarkReport {
+    fn from(report: CanonicalStoreRangeReplayReport) -> Self {
+        Self::CanonicalStoreRangeReplay(Box::new(report))
     }
 }
 
-impl From<CanonicalBlockFactsRoundTripReport> for BenchmarkReport {
-    fn from(report: CanonicalBlockFactsRoundTripReport) -> Self {
-        Self::CanonicalBlockFactsRoundTrip(Box::new(report))
+impl From<CanonicalReplayStorageReport> for BenchmarkReport {
+    fn from(report: CanonicalReplayStorageReport) -> Self {
+        Self::CanonicalReplayStorage(Box::new(report))
     }
 }
 
@@ -1624,18 +1625,18 @@ impl BenchmarkReport {
     pub fn validate(&self) -> Result<(), BenchError> {
         self.validate_contract_identity()?;
         match self {
-            Self::CurrentSchemaFixtureReplay(report) => report.validate_acceptance(),
-            Self::CanonicalBlockFactsRoundTrip(report) => {
+            Self::CanonicalStoreRangeReplay(report) => report.validate_acceptance(),
+            Self::CanonicalReplayStorage(report) => {
                 if report.round_trip.replay_format_version
                     != CanonicalBlockReplayFormatVersion::CURRENT.value()
                     || !report.round_trip.semantic_replay_validated
                 {
-                    return Err(BenchError::canonical_fact_sequence_mismatch(
-                        "persisted canonical facts lack complete semantic replay validation",
+                    return Err(BenchError::canonical_replay_storage_sequence_mismatch(
+                        "persisted canonical replay records lack complete semantic replay validation",
                     ));
                 }
                 if !report.round_trip.fixture_sequence_digest_match {
-                    return Err(BenchError::canonical_fact_sequence_mismatch(
+                    return Err(BenchError::canonical_replay_storage_sequence_mismatch(
                         "persisted sequence digest does not match the fixture capture oracle",
                     ));
                 }
@@ -1644,17 +1645,19 @@ impl BenchmarkReport {
                     || report.round_trip.tip_height != report.fixture.to_height
                     || report.round_trip.tip_hash_hex != report.fixture.tip_hash_hex
                 {
-                    return Err(BenchError::canonical_fact_sequence_mismatch(format!(
-                        "expected {} blocks over heights {}..={} ending at hash {}, observed {} blocks over heights {}..={} ending at hash {}",
-                        report.fixture.block_count,
-                        report.fixture.from_height,
-                        report.fixture.to_height,
-                        report.fixture.tip_hash_hex,
-                        report.round_trip.block_count,
-                        report.round_trip.first_height,
-                        report.round_trip.tip_height,
-                        report.round_trip.tip_hash_hex
-                    )));
+                    return Err(BenchError::canonical_replay_storage_sequence_mismatch(
+                        format!(
+                            "expected {} blocks over heights {}..={} ending at hash {}, observed {} blocks over heights {}..={} ending at hash {}",
+                            report.fixture.block_count,
+                            report.fixture.from_height,
+                            report.fixture.to_height,
+                            report.fixture.tip_hash_hex,
+                            report.round_trip.block_count,
+                            report.round_trip.first_height,
+                            report.round_trip.tip_height,
+                            report.round_trip.tip_hash_hex
+                        ),
+                    ));
                 }
                 Ok(())
             }
@@ -1665,11 +1668,11 @@ impl BenchmarkReport {
 
     fn validate_contract_identity(&self) -> Result<(), BenchError> {
         let (contract_identity, report_format_version) = match self {
-            Self::CurrentSchemaFixtureReplay(report) => (
+            Self::CanonicalStoreRangeReplay(report) => (
                 report.contract_identity.as_str(),
                 report.report_format_version,
             ),
-            Self::CanonicalBlockFactsRoundTrip(report) => (
+            Self::CanonicalReplayStorage(report) => (
                 report.contract_identity.as_str(),
                 report.report_format_version,
             ),
@@ -1693,8 +1696,8 @@ impl BenchmarkReport {
             )));
         }
         let fixture = match self {
-            Self::CurrentSchemaFixtureReplay(report) => Some(&report.fixture),
-            Self::CanonicalBlockFactsRoundTrip(report) => Some(&report.fixture),
+            Self::CanonicalStoreRangeReplay(report) => Some(&report.fixture),
+            Self::CanonicalReplayStorage(report) => Some(&report.fixture),
             Self::RocksDbCanonicalFixtureReplay(report) => Some(&report.fixture),
             Self::RocksDbStorageLifecycle(_) => None,
         };
@@ -1717,33 +1720,31 @@ impl BenchmarkReport {
 
     /// Validates telemetry coverage and the configured hard acceptance limit.
     pub fn validate_acceptance(&self) -> Result<(), BenchError> {
-        let Self::CurrentSchemaFixtureReplay(report) = self else {
+        let Self::CanonicalStoreRangeReplay(report) = self else {
             return Ok(());
         };
         report.validate_acceptance()
     }
 
-    /// Returns the current-schema measurement when this is the oracle variant.
+    /// Returns the canonical-store range-replay measurement when present.
     #[must_use]
-    pub const fn current_schema_fixture_replay(&self) -> Option<&CurrentSchemaFixtureReplayReport> {
+    pub const fn canonical_store_range_replay(&self) -> Option<&CanonicalStoreRangeReplayReport> {
         match self {
-            Self::CurrentSchemaFixtureReplay(report) => Some(report),
-            Self::CanonicalBlockFactsRoundTrip(_)
+            Self::CanonicalStoreRangeReplay(report) => Some(report),
+            Self::CanonicalReplayStorage(_)
             | Self::RocksDbCanonicalFixtureReplay(_)
             | Self::RocksDbStorageLifecycle(_) => None,
         }
     }
 
-    /// Returns the fact round-trip measurement when this is a fact-first arm.
+    /// Returns the canonical replay storage measurement when present.
     #[must_use]
-    pub const fn canonical_block_facts_round_trip(
-        &self,
-    ) -> Option<&CanonicalBlockFactsRoundTripReport> {
+    pub const fn canonical_replay_storage(&self) -> Option<&CanonicalReplayStorageReport> {
         match self {
-            Self::CurrentSchemaFixtureReplay(_)
+            Self::CanonicalStoreRangeReplay(_)
             | Self::RocksDbCanonicalFixtureReplay(_)
             | Self::RocksDbStorageLifecycle(_) => None,
-            Self::CanonicalBlockFactsRoundTrip(report) => Some(report),
+            Self::CanonicalReplayStorage(report) => Some(report),
         }
     }
 
@@ -1752,14 +1753,14 @@ impl BenchmarkReport {
     pub const fn rocksdb_storage_lifecycle(&self) -> Option<&RocksDbStorageLifecycleReport> {
         match self {
             Self::RocksDbStorageLifecycle(report) => Some(report),
-            Self::CurrentSchemaFixtureReplay(_)
-            | Self::CanonicalBlockFactsRoundTrip(_)
+            Self::CanonicalStoreRangeReplay(_)
+            | Self::CanonicalReplayStorage(_)
             | Self::RocksDbCanonicalFixtureReplay(_) => None,
         }
     }
 }
 
-impl CurrentSchemaFixtureReplayReport {
+impl CanonicalStoreRangeReplayReport {
     /// Validates telemetry coverage and the configured hard acceptance limit.
     pub fn validate_acceptance(&self) -> Result<(), BenchError> {
         if self
@@ -1878,7 +1879,7 @@ fn validate_canonical_fixture_report_identity_and_resources(
 ) -> Result<(), BenchError> {
     if report.storage_candidate.id != "rocksdb-canonical-fixture-replay"
         || report.storage_candidate.canonical_engine != "rocksdb"
-        || report.storage_candidate.canonical_model != "version-1-canonical-facts"
+        || report.storage_candidate.canonical_model != "canonical-replay-storage"
         || report.storage_candidate.topology != "rocksdb-single-host"
         || !is_lowercase_sha256(&report.replay_plan_digest_sha256)
         || report.replay_plan_fixture_manifest_sha256 != report.fixture.digest_sha256
@@ -1963,7 +1964,7 @@ fn validate_canonical_fixture_ready(
     ready: &RocksDbCanonicalFixtureReadySummary,
 ) -> Result<(), BenchError> {
     let fence = &ready.event_fence;
-    if ready.scope != "canonical-v1-fixture-ready"
+    if ready.scope != "canonical-fixture-ready"
         || ready.workload != "wallet"
         || !ready.source_tip_checkpoint_authenticated
         || !ready.published_and_reopened_ready_match
@@ -2018,7 +2019,7 @@ fn is_lowercase_sha256(digest: &str) -> bool {
 }
 
 impl RocksDbStorageLifecycleReport {
-    /// Validates the exact version-1 storage fences and configured hard limits.
+    /// Validates the exact storage fences and configured hard limits.
     #[allow(
         clippy::too_many_lines,
         reason = "the closed report contract validates every storage fence and resource ceiling together"
@@ -2049,7 +2050,7 @@ impl RocksDbStorageLifecycleReport {
             || self.contracts.wallet_value_encoding_version != 2
         {
             return Err(BenchError::report_format(
-                "storage lifecycle report does not carry the current fixed fact-first contracts",
+                "storage lifecycle report does not carry the current fixed storage contracts",
             ));
         }
         if canonical.scope != "canonical-storage-ready"
@@ -2202,16 +2203,16 @@ fn validate_wallet_sort_evidence(
 
 /// Builds the report from direct measurements and the scraped exposition text.
 #[must_use]
-pub fn build_current_schema_fixture_replay_report(
+pub fn build_canonical_store_range_replay_report(
     fixture: FixtureSummary,
-    measurements: &CurrentSchemaFixtureReplayMeasurements,
+    measurements: &CanonicalStoreRangeReplayMeasurements,
     exposition: Option<&str>,
-) -> CurrentSchemaFixtureReplayReport {
+) -> CanonicalStoreRangeReplayReport {
     let samples = exposition.map(parse_prometheus_samples).unwrap_or_default();
     let store_reads = aggregate_store_reads(&samples);
     let rocksdb_tickers = aggregate_tickers(&samples);
     let replay = build_replay_summary(measurements, &samples, &store_reads, &rocksdb_tickers);
-    CurrentSchemaFixtureReplayReport {
+    CanonicalStoreRangeReplayReport {
         contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
         report_format_version: REPORT_FORMAT_VERSION,
         provenance: ReportProvenance {
@@ -2245,7 +2246,7 @@ pub fn build_current_schema_fixture_replay_report(
     }
 }
 
-/// Builds the closed canonical-v1 checkpointed fixture replay report.
+/// Builds the closed canonical checkpointed fixture replay report.
 #[must_use]
 pub fn build_rocksdb_canonical_fixture_replay_report(
     fixture: FixtureSummary,
@@ -2327,15 +2328,15 @@ pub fn build_rocksdb_storage_lifecycle_report(
     .into()
 }
 
-/// Builds a fact-only persisted round-trip report.
+/// Builds a block-local replay persisted round-trip report.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
     reason = "the report builder keeps the versioned measurement-to-contract mapping explicit"
 )]
-pub fn build_canonical_block_facts_round_trip_report(
+pub fn build_canonical_replay_storage_report(
     fixture: FixtureSummary,
-    measurements: CanonicalBlockFactsRoundTripMeasurements,
+    measurements: CanonicalReplayStorageMeasurements,
 ) -> BenchmarkReport {
     let block_count = measurements.persisted_sequence_digest.block_count;
     let blocks_per_second = if measurements.wall_clock_seconds > 0.0 {
@@ -2379,22 +2380,22 @@ pub fn build_canonical_block_facts_round_trip_report(
         target_arch: std::env::consts::ARCH,
     };
     let attributed_wall_clock_seconds = measurements.storage_initialization_wall_clock_seconds
-        + measurements.fact_preparation_wall_clock_seconds
-        + measurements.fact_persistence_wall_clock_seconds
+        + measurements.replay_preparation_wall_clock_seconds
+        + measurements.replay_persistence_wall_clock_seconds
         + measurements.index_construction_wall_clock_seconds
         + measurements.storage_optimization_wall_clock_seconds
         + measurements.validation_wall_clock_seconds
         + measurements.publication_wall_clock_seconds
         + measurements.fresh_reader_validation_wall_clock_seconds
         + measurements.storage_measurement_wall_clock_seconds;
-    let round_trip = CanonicalBlockFactsRoundTripSummary {
-        scope: "canonical-block-facts-fixture-round-trip",
+    let round_trip = CanonicalReplayStorageSummary {
+        scope: "block-local-canonical-replay",
         block_prepare_concurrency: measurements.block_prepare_concurrency,
         wall_clock_seconds: measurements.wall_clock_seconds,
         storage_initialization_wall_clock_seconds: measurements
             .storage_initialization_wall_clock_seconds,
-        fact_preparation_wall_clock_seconds: measurements.fact_preparation_wall_clock_seconds,
-        fact_persistence_wall_clock_seconds: measurements.fact_persistence_wall_clock_seconds,
+        replay_preparation_wall_clock_seconds: measurements.replay_preparation_wall_clock_seconds,
+        replay_persistence_wall_clock_seconds: measurements.replay_persistence_wall_clock_seconds,
         index_construction_wall_clock_seconds: measurements.index_construction_wall_clock_seconds,
         storage_optimization_wall_clock_seconds: measurements
             .storage_optimization_wall_clock_seconds,
@@ -2412,7 +2413,7 @@ pub fn build_canonical_block_facts_round_trip_report(
         tip_hash_hex: measurements.tip_hash_hex,
         block_count,
         blocks_per_second,
-        logical_fact_bytes: measurements.logical_fact_bytes,
+        logical_replay_bytes: measurements.logical_replay_bytes,
         physical_storage_bytes: measurements.physical_storage_bytes,
         persisted_sequence_digest: measurements.persisted_sequence_digest,
         fixture_sequence_digest_match,
@@ -2421,7 +2422,7 @@ pub fn build_canonical_block_facts_round_trip_report(
         storage: measurements.storage,
         benchmark_client_peak_rss: measurements.benchmark_client_peak_rss,
     };
-    CanonicalBlockFactsRoundTripReport {
+    CanonicalReplayStorageReport {
         contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
         report_format_version: REPORT_FORMAT_VERSION,
         provenance,
@@ -2433,9 +2434,9 @@ pub fn build_canonical_block_facts_round_trip_report(
 }
 
 fn build_acceptance_summary(
-    measurements: &CurrentSchemaFixtureReplayMeasurements,
-) -> CurrentSchemaFixtureReplayAcceptance {
-    CurrentSchemaFixtureReplayAcceptance {
+    measurements: &CanonicalStoreRangeReplayMeasurements,
+) -> CanonicalStoreRangeReplayAcceptance {
+    CanonicalStoreRangeReplayAcceptance {
         canonical_fixture_replay: summarize_acceptance_measurement(
             "fixture-range",
             measurements.wall_clock_seconds,
@@ -2445,21 +2446,21 @@ fn build_acceptance_summary(
 }
 
 fn build_replay_summary(
-    measurements: &CurrentSchemaFixtureReplayMeasurements,
+    measurements: &CanonicalStoreRangeReplayMeasurements,
     samples: &[MetricSample],
     store_reads: &[CallerReadStat],
     rocksdb_tickers: &[TickerStat],
-) -> CurrentSchemaFixtureReplaySummary {
-    let projection_compaction_bytes = measurements.projection_preset.and_then(|_| {
+) -> CanonicalStoreRangeReplaySummary {
+    let materialized_view_compaction_bytes = measurements.materialized_view_preset.and_then(|_| {
         ticker_reading(
             rocksdb_tickers,
             ROCKSDB_COMPACT_READ_BYTES,
-            PROJECTION_STORE_METRIC_ROLE,
+            MATERIALIZED_VIEW_STORE_METRIC_ROLE,
         )
         .zip(ticker_reading(
             rocksdb_tickers,
             ROCKSDB_COMPACT_WRITE_BYTES,
-            PROJECTION_STORE_METRIC_ROLE,
+            MATERIALIZED_VIEW_STORE_METRIC_ROLE,
         ))
         .map(|(read_bytes, write_bytes)| read_bytes.saturating_add(write_bytes))
     });
@@ -2489,7 +2490,7 @@ fn build_replay_summary(
     } else {
         0.0
     };
-    CurrentSchemaFixtureReplaySummary {
+    CanonicalStoreRangeReplaySummary {
         block_prepare_concurrency: measurements.block_prepare_concurrency,
         max_response_bytes: measurements.max_response_bytes,
         source_segment_max_blocks: measurements.source_segment_max_blocks,
@@ -2499,8 +2500,8 @@ fn build_replay_summary(
         block_prepare_memory_watermark_bytes: measurements.block_prepare_memory_watermark_bytes,
         source_segment_delay_millis: measurements.source_segment_delay_millis,
         canonical_writer: measurements.canonical_writer,
-        projection_preset: measurements.projection_preset,
-        projection_replay_scope: measurements.projection_replay_scope,
+        materialized_view_preset: measurements.materialized_view_preset,
+        materialized_view_replay_scope: measurements.materialized_view_replay_scope,
         wall_clock_seconds: measurements.wall_clock_seconds,
         starting_canonical_state: measurements.starting_canonical_state.clone(),
         tip_height_after: measurements.tip_height_after,
@@ -2513,13 +2514,14 @@ fn build_replay_summary(
             samples,
             measurements.wall_clock_seconds,
         ),
-        projection_build_wall_clock_seconds: measurements.projection_build_wall_clock_seconds,
-        projection_row_count: measurements.projection_row_count,
-        projection_event_cursor_at_tip: measurements.projection_event_cursor_at_tip,
-        projection_store_bytes: measurements.projection_store_bytes,
-        projection_logical_write_bytes: measurements.projection_logical_write_bytes,
-        projection_compaction_bytes,
-        projection_store_reopen_seconds: measurements.projection_store_reopen_seconds,
+        materialized_view_build_wall_clock_seconds: measurements
+            .materialized_view_build_wall_clock_seconds,
+        materialized_view_row_count: measurements.materialized_view_row_count,
+        materialized_view_event_cursor_at_tip: measurements.materialized_view_event_cursor_at_tip,
+        materialized_view_store_bytes: measurements.materialized_view_store_bytes,
+        materialized_view_logical_write_bytes: measurements.materialized_view_logical_write_bytes,
+        materialized_view_compaction_bytes,
+        materialized_view_store_reopen_seconds: measurements.materialized_view_store_reopen_seconds,
         peak_rss: measurements.peak_rss,
     }
 }
@@ -3019,18 +3021,17 @@ mod tests {
     use crate::{fixture::WorkloadDensity, rss::PEAK_RSS_SOURCE_UNAVAILABLE};
 
     use super::{
-        AcceptanceThresholds, CanonicalBlockFactsRoundTripMeasurements,
-        CanonicalBlockFactsStorageEvidence, CanonicalFactSequenceDigestSummary,
-        CanonicalPublicationFamilyScanStat, CurrentSchemaFixtureReplayMeasurements,
-        CurrentSchemaReplayWriterSettings, FixtureCachePolicy, FixtureSummary,
+        AcceptanceThresholds, CanonicalBlockFactsSequenceDigestSummary,
+        CanonicalPublicationFamilyScanStat, CanonicalReplayStorageEvidence,
+        CanonicalReplayStorageMeasurements, CanonicalStoreRangeReplayMeasurements,
+        CanonicalStoreRangeReplayWriterSettings, FixtureCachePolicy, FixtureSummary,
         RocksDbCanonicalFixtureEventFenceSummary, RocksDbCanonicalFixtureReadySummary,
         RocksDbCanonicalFixtureReplayMeasurements, RocksDbCanonicalFixtureReplayResourceLimits,
         RocksDbCanonicalFixtureSourceLoadSummary, RocksDbResourceBudgetSummary,
         StartingCanonicalState, StartingCanonicalStateKind, StorageCandidateIdentity,
-        StorageLifecycleBlockId, aggregate_stage_durations,
-        build_canonical_block_facts_round_trip_report, build_current_schema_fixture_replay_report,
-        build_rocksdb_canonical_fixture_replay_report, is_valid_benchmark_trial_id,
-        parse_prometheus_samples,
+        StorageLifecycleBlockId, aggregate_stage_durations, build_canonical_replay_storage_report,
+        build_canonical_store_range_replay_report, build_rocksdb_canonical_fixture_replay_report,
+        is_valid_benchmark_trial_id, parse_prometheus_samples,
     };
 
     #[test]
@@ -3044,7 +3045,11 @@ mod tests {
     }
 
     #[test]
-    fn canonical_replay_reports_acceptance_provenance_and_current_schema_oracle() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the report contract test validates one complete serialized evidence shape"
+    )]
+    fn canonical_store_range_replay_reports_acceptance_provenance() {
         let mut measurements = canonical_measurements();
         measurements.software_revision = Some("0123456789abcdef".to_owned());
         measurements.runner_id = Some("linux-amd64-runner-01".to_owned());
@@ -3055,9 +3060,9 @@ mod tests {
         measurements.trial_id = Some("trial-01".to_owned());
         measurements.fixture_cache_policy = Some(FixtureCachePolicy::Warm);
         let report =
-            build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
+            build_canonical_store_range_replay_report(fixture_summary(), &measurements, None);
 
-        assert_eq!(report.report_format_version, 2);
+        assert_eq!(report.report_format_version, 3);
         assert_eq!(report.contract_identity, super::REPORT_CONTRACT_IDENTITY);
         assert_provenance_and_writer(&report);
         assert_eq!(report.provenance.run.trial_id.as_deref(), Some("trial-01"));
@@ -3067,15 +3072,12 @@ mod tests {
         ));
         assert_eq!(report.provenance.run.started_at_unix_millis, 1_000);
         assert_eq!(report.provenance.run.completed_at_unix_millis, 14_000);
-        assert_eq!(report.fixture.fixture_format_version, 1);
+        assert_eq!(report.fixture.fixture_format_version, 2);
         assert_eq!(
             report.fixture.contract_identity,
             crate::fixture::FIXTURE_CONTRACT_IDENTITY
         );
-        assert_eq!(
-            report.fixture.current_schema_oracle_artifact_schema_version,
-            18
-        );
+        assert_eq!(report.fixture.canonical_artifact_schema_version, 18);
         assert_eq!(report.fixture.tip_hash_hex, "abcd");
         assert_eq!(report.fixture.digest_sha256, "b".repeat(64));
         assert_eq!(
@@ -3144,7 +3146,7 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
 zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{reason=\"response_too_large\"} 10000000
 ";
 
-        let report = build_current_schema_fixture_replay_report(
+        let report = build_canonical_store_range_replay_report(
             fixture_summary(),
             &canonical_measurements(),
             Some(exposition),
@@ -3174,16 +3176,16 @@ zinder_ingest_source_segment_prefetch_discarded_completed_response_bytes_total{r
     }
 
     #[test]
-    fn current_schema_report_wrapper_serializes_the_measurement_kind()
+    fn canonical_store_range_replay_wrapper_serializes_the_measurement_kind()
     -> Result<(), serde_json::Error> {
-        let report = build_current_schema_fixture_replay_report(
+        let report = build_canonical_store_range_replay_report(
             fixture_summary(),
             &canonical_measurements(),
             None,
         );
         let encoded = serde_json::to_value(super::BenchmarkReport::from(report))?;
 
-        assert_eq!(encoded["measurement_kind"], "current-schema-fixture-replay");
+        assert_eq!(encoded["measurement_kind"], "canonical-store-range-replay");
         assert_eq!(encoded["contract_identity"], "benchmark-report");
         assert_eq!(encoded["fixture"]["contract_identity"], "canonical-fixture");
         Ok(())
@@ -3373,14 +3375,17 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         Ok(())
     }
 
-    fn assert_provenance_and_writer(report: &super::CurrentSchemaFixtureReplayReport) {
-        assert_eq!(report.storage_candidate.id, "rocksdb-current-schema-oracle");
-        assert_eq!(report.storage_candidate.canonical_engine, "rocksdb");
+    fn assert_provenance_and_writer(report: &super::CanonicalStoreRangeReplayReport) {
         assert_eq!(
-            report.storage_candidate.canonical_model,
-            "projection-coupled-current-schema"
+            report.storage_candidate.id,
+            "rocksdb-canonical-store-range-replay"
         );
-        assert_eq!(report.storage_candidate.diagnostic_projection_engine, None);
+        assert_eq!(report.storage_candidate.canonical_engine, "rocksdb");
+        assert_eq!(report.storage_candidate.canonical_model, "canonical-store");
+        assert_eq!(
+            report.storage_candidate.diagnostic_materialized_view_engine,
+            None
+        );
         assert_eq!(report.storage_candidate.topology, "rocksdb-single-host");
         assert_eq!(
             report.provenance.software_revision.as_deref(),
@@ -3417,7 +3422,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
             Some(AcceptanceThresholds::try_from_seconds(10.0, 15.0)?);
         let exposition = "zinder_ingest_commit_duration_seconds_count 1\n\
             zinder_bench_telemetry_coverage_total{family=\"store_reads\"} 0\n";
-        let report = build_current_schema_fixture_replay_report(
+        let report = build_canonical_store_range_replay_report(
             fixture_summary(),
             &measurements,
             Some(exposition),
@@ -3443,7 +3448,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         measurements.canonical_fixture_replay_thresholds =
             Some(AcceptanceThresholds::try_from_seconds(10.0, 15.0)?);
         let report =
-            build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
+            build_canonical_store_range_replay_report(fixture_summary(), &measurements, None);
 
         let Some(error) = report.validate_acceptance().err() else {
             return Err(crate::BenchError::invalid_argument(
@@ -3464,7 +3469,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         measurements.tip_hash_after_hex = Some("wrong-tip".to_owned());
         let exposition = "zinder_ingest_commit_duration_seconds_count 1\n\
             zinder_bench_telemetry_coverage_total{family=\"store_reads\"} 0\n";
-        let report = build_current_schema_fixture_replay_report(
+        let report = build_canonical_store_range_replay_report(
             fixture_summary(),
             &measurements,
             Some(exposition),
@@ -3488,18 +3493,18 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
     }
 
     #[test]
-    fn diagnostic_projection_presets_do_not_create_target_plane_acceptance_contracts()
+    fn diagnostic_materialized_view_presets_do_not_claim_wallet_build_acceptance()
     -> Result<(), Box<dyn std::error::Error>> {
-        for projection_preset in ["wallet", "explorer"] {
+        for materialized_view_preset in ["wallet", "explorer"] {
             let mut measurements = canonical_measurements();
-            measurements.projection_preset = Some(projection_preset);
-            measurements.projection_replay_scope = Some("retained-history");
-            measurements.projection_build_wall_clock_seconds = Some(5.0);
+            measurements.materialized_view_preset = Some(materialized_view_preset);
+            measurements.materialized_view_replay_scope = Some("retained-history");
+            measurements.materialized_view_build_wall_clock_seconds = Some(5.0);
             measurements.storage_candidate =
-                StorageCandidateIdentity::rocksdb_current_schema_with_diagnostic_projections();
+                StorageCandidateIdentity::rocksdb_canonical_store_range_replay_with_diagnostic_materialized_view();
 
             let report =
-                build_current_schema_fixture_replay_report(fixture_summary(), &measurements, None);
+                build_canonical_store_range_replay_report(fixture_summary(), &measurements, None);
             let report_json = serde_json::to_value(&report)?;
 
             assert!(report_json.get("lifecycle").is_none());
@@ -3510,7 +3515,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                     .is_none()
             );
             assert_eq!(
-                report.storage_candidate.diagnostic_projection_engine,
+                report.storage_candidate.diagnostic_materialized_view_engine,
                 Some("rocksdb")
             );
         }
@@ -3518,16 +3523,16 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
     }
 
     #[test]
-    fn fact_round_trip_reports_semantic_replay_and_omits_unmeasured_contracts()
+    fn canonical_replay_storage_reports_semantic_replay_and_omits_unmeasured_contracts()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut report = build_canonical_block_facts_round_trip_report(
+        let mut report = build_canonical_replay_storage_report(
             fixture_summary(),
-            CanonicalBlockFactsRoundTripMeasurements {
+            CanonicalReplayStorageMeasurements {
                 block_prepare_concurrency: 8,
                 wall_clock_seconds: 2.3,
                 storage_initialization_wall_clock_seconds: 0.1,
-                fact_preparation_wall_clock_seconds: 0.8,
-                fact_persistence_wall_clock_seconds: 0.7,
+                replay_preparation_wall_clock_seconds: 0.8,
+                replay_persistence_wall_clock_seconds: 0.7,
                 index_construction_wall_clock_seconds: 0.0,
                 storage_optimization_wall_clock_seconds: 0.0,
                 validation_wall_clock_seconds: 0.4,
@@ -3538,9 +3543,9 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 first_hash_hex: "first-hash".to_owned(),
                 tip_height: 20,
                 tip_hash_hex: "abcd".to_owned(),
-                logical_fact_bytes: 4_096,
+                logical_replay_bytes: 4_096,
                 physical_storage_bytes: 8_192,
-                persisted_sequence_digest: CanonicalFactSequenceDigestSummary {
+                persisted_sequence_digest: CanonicalBlockFactsSequenceDigestSummary {
                     block_digest_version: 1,
                     sequence_digest_version: 1,
                     block_count: 10,
@@ -3548,7 +3553,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 },
                 replay_format_version: 1,
                 semantic_replay_validated: true,
-                storage: CanonicalBlockFactsStorageEvidence::RocksDb {
+                storage: CanonicalReplayStorageEvidence::RocksDb {
                     storage_schema_version: 1,
                     ingestion_mode: "external-sst",
                     durability_mode: "external-sst-ingest-with-synchronous-completion-marker",
@@ -3564,7 +3569,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                     bytes: None,
                     source: PEAK_RSS_SOURCE_UNAVAILABLE,
                 },
-                storage_candidate: StorageCandidateIdentity::rocksdb_fact_first(),
+                storage_candidate: StorageCandidateIdentity::rocksdb_canonical_replay_storage(),
                 software_revision: None,
                 trial_id: Some("trial-01".to_owned()),
                 fixture_cache_policy: Some(FixtureCachePolicy::Warm),
@@ -3580,10 +3585,13 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         report.validate()?;
         let json = serde_json::to_value(&report)?;
 
-        assert_eq!(json["measurement_kind"], "canonical-block-facts-round-trip");
+        assert_eq!(json["measurement_kind"], "canonical-replay-storage");
         assert_eq!(json["contract_identity"], "benchmark-report");
         assert_eq!(json["fixture"]["contract_identity"], "canonical-fixture");
-        assert_eq!(json["storage_candidate"]["id"], "rocksdb-fact-first");
+        assert_eq!(
+            json["storage_candidate"]["id"],
+            "rocksdb-canonical-replay-storage"
+        );
         assert_eq!(json["round_trip"]["replay_format_version"], 1);
         assert_eq!(json["round_trip"]["semantic_replay_validated"], true);
         assert_eq!(json["provenance"]["run"]["trial_id"], "trial-01");
@@ -3591,31 +3599,31 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         for omitted_field in ["acceptance", "replay", "lifecycle", "store_reads"] {
             assert!(json.get(omitted_field).is_none(), "{omitted_field}");
         }
-        if let super::BenchmarkReport::CanonicalBlockFactsRoundTrip(fact_report) = &mut report {
-            fact_report.round_trip.replay_format_version = 99;
+        if let super::BenchmarkReport::CanonicalReplayStorage(replay_storage_report) = &mut report {
+            replay_storage_report.round_trip.replay_format_version = 99;
         }
         assert!(report.validate().is_err());
         Ok(())
     }
 
     #[test]
-    fn report_v1_rejects_old_contract_identities() {
-        let mut report = super::BenchmarkReport::from(build_current_schema_fixture_replay_report(
+    fn report_v3_rejects_unrecognized_contract_identities() {
+        let mut report = super::BenchmarkReport::from(build_canonical_store_range_replay_report(
             fixture_summary(),
             &canonical_measurements(),
             None,
         ));
-        if let super::BenchmarkReport::CurrentSchemaFixtureReplay(report) = &mut report {
+        if let super::BenchmarkReport::CanonicalStoreRangeReplay(report) = &mut report {
             report.contract_identity = "zinder-benchmark-report".to_owned();
         }
         assert!(report.validate().is_err());
 
-        let mut report = super::BenchmarkReport::from(build_current_schema_fixture_replay_report(
+        let mut report = super::BenchmarkReport::from(build_canonical_store_range_replay_report(
             fixture_summary(),
             &canonical_measurements(),
             None,
         ));
-        if let super::BenchmarkReport::CurrentSchemaFixtureReplay(report) = &mut report {
+        if let super::BenchmarkReport::CanonicalStoreRangeReplay(report) = &mut report {
             report.fixture.contract_identity = "zinder-bench-fixture-manifest".to_owned();
         }
         assert!(report.validate().is_err());
@@ -3643,7 +3651,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         reason = "one report fixture keeps all cross-field evidence visibly consistent"
     )]
     fn rocksdb_canonical_fixture_measurements() -> RocksDbCanonicalFixtureReplayMeasurements {
-        let sequence_digest = CanonicalFactSequenceDigestSummary {
+        let sequence_digest = CanonicalBlockFactsSequenceDigestSummary {
             block_digest_version: 1,
             sequence_digest_version: 1,
             block_count: 10,
@@ -3705,7 +3713,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 sequence_digest: sequence_digest.clone(),
             },
             canonical_ready: RocksDbCanonicalFixtureReadySummary {
-                scope: "canonical-v1-fixture-ready",
+                scope: "canonical-fixture-ready",
                 workload: "wallet",
                 first_retained_block: first_block,
                 visible_tip: visible_tip.clone(),
@@ -3769,8 +3777,8 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
     fn fixture_summary() -> FixtureSummary {
         FixtureSummary {
             contract_identity: crate::fixture::FIXTURE_CONTRACT_IDENTITY.to_owned(),
-            fixture_format_version: 1,
-            current_schema_oracle_artifact_schema_version: 18,
+            fixture_format_version: 2,
+            canonical_artifact_schema_version: 18,
             canonical_block_facts_digest_evidence:
                 crate::fixture::CanonicalBlockFactsDigestEvidence {
                     block_digest_version: 1,
@@ -3793,8 +3801,8 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
         }
     }
 
-    fn canonical_measurements() -> CurrentSchemaFixtureReplayMeasurements {
-        CurrentSchemaFixtureReplayMeasurements {
+    fn canonical_measurements() -> CanonicalStoreRangeReplayMeasurements {
+        CanonicalStoreRangeReplayMeasurements {
             block_prepare_concurrency: 8,
             max_response_bytes: 384 * 1024 * 1024,
             source_segment_max_blocks: 16,
@@ -3803,7 +3811,7 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
             source_fetch_max_in_flight_bytes: 384 * 1024 * 1024,
             block_prepare_memory_watermark_bytes: 512 * 1024 * 1024,
             source_segment_delay_millis: 0,
-            canonical_writer: CurrentSchemaReplayWriterSettings {
+            canonical_writer: CanonicalStoreRangeReplayWriterSettings {
                 store_schema_version: 13,
                 artifact_schema_version: 18,
                 sync_writes: true,
@@ -3819,8 +3827,8 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                     statistics_level: "tickers",
                 },
             },
-            projection_preset: None,
-            projection_replay_scope: None,
+            materialized_view_preset: None,
+            materialized_view_replay_scope: None,
             wall_clock_seconds: 12.5,
             starting_canonical_state: StartingCanonicalState {
                 kind: StartingCanonicalStateKind::Checkpoint,
@@ -3832,17 +3840,17 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
             },
             tip_height_after: Some(20),
             tip_hash_after_hex: Some("abcd".to_owned()),
-            projection_build_wall_clock_seconds: None,
-            projection_row_count: None,
-            projection_event_cursor_at_tip: None,
-            projection_store_bytes: None,
-            projection_store_reopen_seconds: None,
-            projection_logical_write_bytes: None,
+            materialized_view_build_wall_clock_seconds: None,
+            materialized_view_row_count: None,
+            materialized_view_event_cursor_at_tip: None,
+            materialized_view_store_bytes: None,
+            materialized_view_store_reopen_seconds: None,
+            materialized_view_logical_write_bytes: None,
             peak_rss: crate::rss::PeakRss {
                 bytes: None,
                 source: PEAK_RSS_SOURCE_UNAVAILABLE,
             },
-            storage_candidate: StorageCandidateIdentity::rocksdb_current_schema_oracle(),
+            storage_candidate: StorageCandidateIdentity::rocksdb_canonical_store_range_replay(),
             software_revision: None,
             trial_id: None,
             fixture_cache_policy: None,

@@ -9,7 +9,6 @@
 use std::{
     collections::HashMap,
     num::{NonZeroU32, NonZeroU64},
-    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -36,8 +35,8 @@ use zinder_store::{
 use crate::{
     CanonicalBlockConstructionError,
     artifact_builder::{
-        CurrentSchemaBlockArtifacts, PositionedCanonicalBlock, RawBlobPolicy,
-        expand_current_schema_block_artifacts,
+        CanonicalStoreBlockArtifacts, PositionedCanonicalBlock, RawBlobPolicy,
+        expand_canonical_store_block_artifacts,
     },
 };
 
@@ -134,55 +133,13 @@ pub enum IngestError {
         protocol: ShieldedProtocol,
     },
 
-    /// Derive-plane dispatch (consumer apply or store write) failed.
-    #[error("derive dispatch failed: {0}")]
-    DeriveDispatch(String),
+    /// Materialized-view plane dispatch (consumer apply or store write) failed.
+    #[error("materialized-view dispatch failed: {0}")]
+    MaterializedViewDispatch(String),
 
-    /// Derive-store open or operation failed.
+    /// Materialized-view store open or operation failed.
     #[error(transparent)]
-    DeriveStore(#[from] zinder_derive::DeriveStoreError),
-
-    /// Canonical history exists without the projection store that previously
-    /// consumed it, so a derive-only rebuild cannot be proven safe.
-    #[error(
-        "canonical history exists but its projection store is missing at {path:?}; configure a new empty canonical storage path and perform a full re-ingest because derive-only rebuilds are unsupported"
-    )]
-    ProjectionStoreMissingForCanonical {
-        /// Expected projection store path.
-        path: PathBuf,
-    },
-
-    /// Projection rows or cursors exist beside an empty canonical store, so
-    /// the two stores cannot be proven to describe one chain history.
-    #[error(
-        "projection data exists at {path:?} without matching canonical history; configure a new empty canonical storage path and perform a full re-ingest because mixed storage pairs are unsupported"
-    )]
-    ProjectionStoreWithoutCanonicalHistory {
-        /// Projection store whose data has no matching canonical epoch.
-        path: PathBuf,
-    },
-
-    /// Canonical retention already deleted transparent spender facts that the
-    /// durable projection cannot prove it covers or safely reconstruct.
-    #[error(
-        "retention-authoritative projection at {path:?} cannot cover canonical transparent deletions {required_from}..={deleted_through}: materialized through {materialized_through:?}, verified coverage {coverage_from:?}..={coverage_through:?}, destructive rebuild required: {destructive_rebuild}; configure a new empty canonical storage path and perform a full re-ingest"
-    )]
-    ProjectionRetentionCoverageInsufficient {
-        /// Projection store whose coverage is incomplete.
-        path: PathBuf,
-        /// First canonical height the projection must cover.
-        required_from: u32,
-        /// Highest canonical height whose spender facts were deleted.
-        deleted_through: u32,
-        /// Highest materialized projection index height.
-        materialized_through: Option<u32>,
-        /// First height in verified contiguous projection coverage.
-        coverage_from: Option<u32>,
-        /// Last height in verified contiguous projection coverage.
-        coverage_through: Option<u32>,
-        /// Whether writer open would clear the existing projection.
-        destructive_rebuild: bool,
-    },
+    MaterializedViewStore(#[from] zinder_materialized_views::MaterializedViewStoreError),
 
     /// Internal batching produced an empty commit.
     #[error("internal error: attempted to commit an empty canonical batch")]
@@ -192,18 +149,18 @@ pub enum IngestError {
     #[error("internal error: bulk catchup loop produced no commit")]
     BulkCatchupProducedNoCommit,
 
-    /// Historical bulk catchup was asked to finalize blocks inside the live reorg window.
+    /// Historical bulk catchup was asked to advance the settled tip inside the live reorg window.
     #[error(
-        "bulk catchup to height {to_height:?} is inside the node-reported reorg window: tip {tip_height:?}, reorg window {reorg_window_blocks} blocks, maximum historical height {maximum_historical_height:?}; pass --allow-near-tip-finalize only for local or explicitly disposable stores"
+        "bulk catchup to height {to_height:?} is inside the node-reported reorg window: tip {tip_height:?}, reorg window {reorg_window_blocks} blocks, maximum historical height {maximum_historical_height:?}; pass --allow-reorg-window-settlement only for local or explicitly disposable stores"
     )]
-    NearTipBulkCatchupRequiresExplicitFinalize {
+    BulkCatchupInsideReorgWindowRequiresOverride {
         /// Last requested bulk catchup height.
         to_height: BlockHeight,
         /// Current node tip height.
         tip_height: BlockHeight,
         /// Configured store reorg window in blocks.
         reorg_window_blocks: u32,
-        /// Highest height that can be advanced past the safe tip without explicit override.
+        /// Highest height that can be advanced past the settled tip without explicit override.
         maximum_historical_height: BlockHeight,
     },
 
@@ -468,7 +425,7 @@ impl CanonicalBatch {
             compact_block,
             tip_metadata,
         } = block;
-        let CurrentSchemaBlockArtifacts {
+        let CanonicalStoreBlockArtifacts {
             block_header,
             block_blob,
             block_transaction_index,
@@ -477,7 +434,7 @@ impl CanonicalBatch {
             transaction_intrinsic_value_balances,
             transaction_blobs,
             transparent_outputs_by_outpoint,
-        } = expand_current_schema_block_artifacts(facts, retained_raw_blobs)?;
+        } = expand_canonical_store_block_artifacts(facts, retained_raw_blobs)?;
         self.block_replay_envelopes.push(replay_envelope);
         self.block_headers.push(block_header);
         if let Some(block_blob) = block_blob {
@@ -1065,11 +1022,8 @@ fn per_call_retry_permitted(error: &SourceError) -> bool {
 
 /// Classifies an already-built candidate chain segment.
 ///
-/// Parent-hash continuity is the reachable rule for the current polling source:
-/// Zebra JSON-RPC exposes one upstream-node-selected best chain at a time. If a
-/// future `non_finalized_blocks` capability exposes competing branches, this
-/// function is the place to add cumulative-chainwork tie-breaking before it
-/// returns a replacement transition.
+/// Parent-hash continuity is the rule for the polling source: Zebra JSON-RPC
+/// exposes one upstream-node-selected best chain at a time.
 pub(crate) fn select_best_chain(
     current_chain_epoch: ChainEpoch,
     candidate_blocks: &[SourceBlock],
@@ -1225,9 +1179,9 @@ fn append_subtree_root_artifacts(
 /// commit outcome.
 ///
 /// Each caller decides what `chain_epoch` and `reorg_window_change` mean for
-/// its mode: bulk catchup always advances finalization to the new tip; the
+/// its mode: bulk catchup always advances settlement to the new tip; the
 /// tip-follower issues `Extend` for tip advancement and `Replace` for
-/// reorgs, then advances finalization separately once the new tip is at
+/// reorgs, then advances settlement separately once the new tip is at
 /// least `reorg_window_blocks` deep.
 pub(crate) async fn commit_ingest_batch(
     store: &PrimaryChainStore,
@@ -1688,8 +1642,8 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::UnsupportedShieldedProtocol { .. }) => "unsupported_shielded_protocol",
         Some(IngestError::EmptyCanonicalBatch) => "empty_canonical_batch",
         Some(IngestError::BulkCatchupProducedNoCommit) => "bulk_catchup_produced_no_commit",
-        Some(IngestError::NearTipBulkCatchupRequiresExplicitFinalize { .. }) => {
-            "near_tip_bulk_catchup_requires_explicit_finalize"
+        Some(IngestError::BulkCatchupInsideReorgWindowRequiresOverride { .. }) => {
+            "bulk_catchup_inside_reorg_window_requires_override"
         }
         Some(IngestError::BulkCatchupRequiresContiguousTipMetadata { .. }) => {
             "bulk_catchup_requires_contiguous_tip_metadata"
@@ -1718,17 +1672,8 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::CanonicalBlockConstruction(_)) => "canonical_block_construction",
         Some(IngestError::Store(_)) => "store",
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
-        Some(IngestError::DeriveDispatch(_)) => "derive_dispatch",
-        Some(IngestError::DeriveStore(_)) => "derive_store",
-        Some(IngestError::ProjectionStoreMissingForCanonical { .. }) => {
-            "projection_store_missing_for_canonical"
-        }
-        Some(IngestError::ProjectionStoreWithoutCanonicalHistory { .. }) => {
-            "projection_store_without_canonical_history"
-        }
-        Some(IngestError::ProjectionRetentionCoverageInsufficient { .. }) => {
-            "projection_retention_coverage_insufficient"
-        }
+        Some(IngestError::MaterializedViewDispatch(_)) => "materialized_view_dispatch",
+        Some(IngestError::MaterializedViewStore(_)) => "materialized_view_store",
     }
 }
 
@@ -1741,7 +1686,7 @@ fn usize_to_u32_saturating(amount: usize) -> u32 {
 /// Operators consume two event names from this surface, matching the
 /// `ChainEvent` vocabulary used in `docs/architecture/chain-events.md`:
 ///
-/// * `chain_committed` for pure appends, finalization advances, and any other
+/// * `chain_committed` for pure appends, settlement advances, and any other
 ///   transition that does not invalidate previously visible blocks.
 /// * `chain_reorged` for transitions that replace a previously visible
 ///   range within the reorg window. Emitted at `WARN` because reorgs warrant operator
@@ -1764,7 +1709,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 network = encode_zinder_native_chain_name(chain_epoch.network),
                 tip_height = chain_epoch.visible_tip_height.value(),
                 tip_hash = %display_block_hash(chain_epoch.visible_tip_hash),
-                safe_tip_height = chain_epoch.settled_tip_height.value(),
+                settled_tip_height = chain_epoch.settled_tip_height.value(),
                 block_range_start = committed.block_range.start.value(),
                 block_range_end = committed.block_range.end.value(),
                 event_sequence,
@@ -1782,7 +1727,7 @@ pub(crate) fn record_commit_outcome(commit_outcome: &ChainEpochCommitOutcome) {
                 network = encode_zinder_native_chain_name(chain_epoch.network),
                 tip_height = chain_epoch.visible_tip_height.value(),
                 tip_hash = %display_block_hash(chain_epoch.visible_tip_hash),
-                safe_tip_height = chain_epoch.settled_tip_height.value(),
+                settled_tip_height = chain_epoch.settled_tip_height.value(),
                 committed_block_range_start = committed.block_range.start.value(),
                 committed_block_range_end = committed.block_range.end.value(),
                 reverted_block_range_start = reverted.block_range.start.value(),
@@ -1815,7 +1760,7 @@ fn record_writer_progress(chain_epoch: ChainEpoch) {
     )
     .set(u32_to_f64(chain_epoch.visible_tip_height.value()));
     metrics::gauge!(
-        "zinder_ingest_writer_safe_tip_height",
+        "zinder_ingest_writer_settled_tip_height",
         "network" => encode_zinder_native_chain_name(chain_epoch.network)
     )
     .set(u32_to_f64(chain_epoch.settled_tip_height.value()));

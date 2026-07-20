@@ -17,8 +17,8 @@ use zinder_core::{
 use zinder_proto::v1::wallet;
 use zinder_query::{
     ArtifactKey, QueryError, WalletQuery, WalletQueryApi, WalletQueryOptions,
-    latest_block_response, latest_tree_state_checkpoint_response, subtree_roots_response,
-    tree_state_at_response,
+    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
+    visible_tip_block_response,
 };
 use zinder_store::{ArtifactFamily, ChainEpochArtifacts};
 use zinder_testkit::{
@@ -160,7 +160,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
 }
 
 #[tokio::test]
-async fn latest_block_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
+async fn visible_tip_block_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
@@ -174,23 +174,26 @@ async fn latest_block_response_uses_native_wallet_proto_shape() -> eyre::Result<
     ))?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let response = latest_block_response(&wallet_query, None).await?;
+    let response = visible_tip_block_response(&wallet_query, None).await?;
     let encoded_response = response.encode_to_vec();
-    let decoded_response = wallet::LatestBlockResponse::decode(encoded_response.as_slice())?;
+    let decoded_response = wallet::VisibleTipBlockResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
         .chain_view
         .as_ref()
         .and_then(|chain_view| chain_view.chain_epoch.as_ref())
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
-    let latest_block = decoded_response
-        .latest_block
+    let visible_tip_block = decoded_response
+        .visible_tip_block
         .as_ref()
-        .ok_or_else(|| eyre!("missing latest block metadata"))?;
+        .ok_or_else(|| eyre!("missing visible-tip block identity"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
-    assert_eq!(latest_block.height, chain_epoch.visible_tip_height.value());
     assert_eq!(
-        latest_block.block_hash,
+        visible_tip_block.height,
+        chain_epoch.visible_tip_height.value()
+    );
+    assert_eq!(
+        visible_tip_block.block_hash,
         encode_rpc_block_hash_hex(chain_epoch.visible_tip_hash)
     );
 
@@ -623,7 +626,7 @@ fn compact_block_range_chunk(
             }),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         compact_block: Some(wallet::CompactBlock {
             height: compact_block.height.value(),

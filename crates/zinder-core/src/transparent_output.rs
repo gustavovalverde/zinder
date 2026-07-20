@@ -222,7 +222,7 @@ impl TransparentUnspentOutput {
 /// transparent output it consumes.
 ///
 /// The ingest writer persists this fact once with the chain epoch that mined
-/// the spending transaction. Derive consumers read it directly instead of
+/// the spending transaction. Materialized-view consumers read it directly instead of
 /// rehydrating spend context from transparent-output rows during replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentSpendFact {

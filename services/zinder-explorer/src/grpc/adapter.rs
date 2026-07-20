@@ -1,7 +1,7 @@
 //! `ExplorerQuery` gRPC adapter.
 //!
 //! Serves [`ExplorerQuery::ServerInfo`] (advertising [`EXPLORER_SERVER_INFO_V1`])
-//! and the derive-backed explorer surfaces. Handlers that need canonical
+//! and the materialized-view-backed explorer surfaces. Handlers that need canonical
 //! wallet-plane reads (transaction detail, block views, search, mempool
 //! activity, value pools) compose them through a `WalletQuery` channel.
 //!
@@ -57,7 +57,7 @@ use zinder_proto::v1::{
         ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse,
         ValuePoolFlowRoundedAmountSummaryRequest, ValuePoolFlowRoundedAmountSummaryResponse,
         ValuePoolFlowSummaryRequest, ValuePoolFlowSummaryResponse, ValuePoolSummaryRequest,
-        ValuePoolSummaryResponse, VerifyPaymentDisclosureRequest, VerifyPaymentDisclosureResponse,
+        ValuePoolSummaryResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -77,52 +77,52 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
 
 /// First canonical artifact schema that contains transaction-intrinsic balances.
 const MINIMUM_INTRINSIC_VALUE_BALANCE_HISTORY_SCHEMA_VERSION: u16 = 15;
-use super::block_activity::handle_block_activity_distribution;
+use super::block_activity::query_block_activity_distribution;
 use super::block_view::{
-    handle_block_detail, handle_block_production_in_time_range, handle_block_production_series,
-    handle_block_summaries_in_range, handle_block_transactions,
+    query_block_detail, query_block_production_in_time_range, query_block_production_series,
+    query_block_summaries_in_range, query_block_transactions,
 };
-use super::chain_reorg_history::handle_chain_reorg_history;
-use super::commitment_root_search::handle_commitment_root_search;
-use super::conventional_fee_distribution::handle_conventional_fee_distribution;
-use super::displaced_block::{handle_displaced_block_detail, handle_displaced_block_history};
+use super::chain_reorg_history::query_chain_reorg_history;
+use super::commitment_root_search::query_commitment_root_search;
+use super::conventional_fee_distribution::query_conventional_fee_distribution;
+use super::displaced_block::{query_displaced_block_detail, query_displaced_block_history};
 use super::error::ExplorerError;
-use super::fee_summary::handle_fee_summary;
+use super::fee_summary::query_fee_summary;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
-    read_derive_status, spawn_upstream_observation_probe_task,
+    read_materialized_view_status, spawn_upstream_observation_probe_task,
 };
-use super::mempool::{handle_mempool_activity, handle_mempool_snapshot, handle_mempool_summary};
-use super::mempool_event_counts::handle_mempool_event_counts;
+use super::mempool::{query_mempool_activity, query_mempool_snapshot, query_mempool_summary};
+use super::mempool_event_counts::query_mempool_event_counts;
 use super::migration::{
-    handle_migration_cohorts, handle_migration_denominations, handle_migration_overview,
+    query_migration_cohorts, query_migration_denominations, query_migration_overview,
 };
-use super::network_upgrade_status::handle_network_upgrade_status;
-use super::overview_snapshot::handle_overview_snapshot;
-use super::paid_fee_distribution::handle_paid_fee_distribution;
-use super::recent_transactions::{RecentTransactionsStream, handle_recent_transactions};
-use super::search::handle_search;
-use super::transaction_component_summary::handle_transaction_component_summary;
-use super::transaction_detail::{TransactionDetailContext, handle_transaction_detail};
+use super::network_upgrade_status::query_network_upgrade_status;
+use super::overview_snapshot::query_overview_snapshot;
+use super::paid_fee_distribution::query_paid_fee_distribution;
+use super::recent_transactions::{RecentTransactionsStream, query_recent_transactions};
+use super::search::query_search;
+use super::transaction_component_summary::query_transaction_component_summary;
+use super::transaction_detail::{TransactionDetailContext, query_transaction_detail};
 use super::transaction_history::{
-    DeriveStoreTransactionHistoryProjectionReader, TransactionHistoryContext,
-    TransactionHistoryProjectionReadApi, TransactionHistoryProjectionReadError,
-    TransactionHistoryProjectionReadiness, transaction_history,
+    TransactionHistoryContext, TransactionHistoryMaterializedViewReadApi,
+    TransactionHistoryMaterializedViewReadError, TransactionHistoryMaterializedViewReader,
+    TransactionHistoryMaterializedViewReadiness, transaction_history,
 };
 use super::transparent_address_activity::{
-    TransparentAddressActivityContext, handle_transparent_address_activity,
+    TransparentAddressActivityContext, query_transparent_address_activity,
 };
-use super::transparent_address_deltas::handle_transparent_address_deltas;
-use super::transparent_address_ranking::handle_transparent_address_ranking;
-use super::utxo_set_summary::handle_utxo_set_summary;
-use super::value_pool_balance_history::handle_value_pool_balance_history;
+use super::transparent_address_deltas::query_transparent_address_deltas;
+use super::transparent_address_ranking::query_transparent_address_ranking;
+use super::utxo_set_summary::query_utxo_set_summary;
+use super::value_pool_balance_history::query_value_pool_balance_history;
 use super::value_pool_flow::{
-    handle_value_pool_flow_amount_threshold_summary, handle_value_pool_flow_events_in_range,
-    handle_value_pool_flow_history, handle_value_pool_flow_rounded_amount_summary,
-    handle_value_pool_flow_summary,
+    query_value_pool_flow_amount_threshold_summary, query_value_pool_flow_events_in_range,
+    query_value_pool_flow_history, query_value_pool_flow_rounded_amount_summary,
+    query_value_pool_flow_summary,
 };
-use super::value_pool_summary::handle_value_pool_summary;
-use zinder_derive::{DeriveStore, ProjectionPreset};
+use super::value_pool_summary::query_value_pool_summary;
+use zinder_materialized_views::{MaterializedViewPreset, MaterializedViewStore};
 use zinder_store::SecondaryChainStore;
 
 /// Settings the binary populates before constructing the adapter.
@@ -153,13 +153,13 @@ pub struct ExplorerQueryGrpcAdapter {
     wallet_query_bearer_token: Option<BearerToken>,
     bearer_token: Option<BearerToken>,
     canonical_store: Option<SecondaryChainStore>,
-    derive_store: Option<DeriveStore>,
-    projection_preset: Option<ProjectionPreset>,
-    transaction_history_projection_reader: Option<Arc<dyn TransactionHistoryProjectionReadApi>>,
+    materialized_view_store: Option<MaterializedViewStore>,
+    materialized_view_preset: Option<MaterializedViewPreset>,
+    transaction_history_materialized_view_reader:
+        Option<Arc<dyn TransactionHistoryMaterializedViewReadApi>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
     prevout_resolution_online: bool,
-    payment_disclosure_verifier_online: bool,
     upstream_observation_cache: UpstreamObservationCache,
 }
 
@@ -173,28 +173,27 @@ impl ExplorerQueryGrpcAdapter {
             wallet_query_bearer_token: None,
             bearer_token: None,
             canonical_store: None,
-            derive_store: None,
-            projection_preset: None,
-            transaction_history_projection_reader: None,
+            materialized_view_store: None,
+            materialized_view_preset: None,
+            transaction_history_materialized_view_reader: None,
             network_upgrade_activations: Arc::new(NetworkUpgradeActivations::empty(
                 settings.network,
             )),
             wallet_channel: Arc::new(OnceCell::new()),
             prevout_resolution_online: false,
-            payment_disclosure_verifier_online: false,
             upstream_observation_cache: UpstreamObservationCache::empty(),
         }
     }
 
-    /// Wires the consumer-side derive store so block-view RPCs can read the
+    /// Wires the consumer-side materialized-view store so block-view RPCs can read the
     /// materialized `BlockSummary` records.
     #[must_use]
-    pub fn with_derive_store(mut self, store: DeriveStore) -> Self {
-        self.projection_preset = Some(store.effective_projection_preset());
-        self.transaction_history_projection_reader = Some(Arc::new(
-            DeriveStoreTransactionHistoryProjectionReader::new(store.clone()),
+    pub fn with_materialized_view_store(mut self, store: MaterializedViewStore) -> Self {
+        self.materialized_view_preset = Some(store.effective_materialized_view_preset());
+        self.transaction_history_materialized_view_reader = Some(Arc::new(
+            TransactionHistoryMaterializedViewReader::new(store.clone()),
         ));
-        self.derive_store = Some(store);
+        self.materialized_view_store = Some(store);
         self
     }
 
@@ -249,7 +248,7 @@ impl ExplorerQueryGrpcAdapter {
     /// Marks transparent-output resolution as online so the adapter
     /// advertises the per-tx paid-fee capability.
     ///
-    /// The binary sets this flag once it opens a derive store with the bundled
+    /// The binary sets this flag once it opens a materialized-view store with the bundled
     /// `TransactionFeesConsumer` column families. The flag is the single
     /// source of truth for whether paid-fee fields appear in
     /// `TransactionDetail` and `MempoolActivity` responses; downstream
@@ -258,18 +257,6 @@ impl ExplorerQueryGrpcAdapter {
     #[must_use]
     pub const fn with_prevout_resolution_online(mut self, online: bool) -> Self {
         self.prevout_resolution_online = online;
-        self
-    }
-
-    /// Marks the hosted payment-disclosure verifier as online so the adapter
-    /// advertises `EXPLORER_PAYMENT_DISCLOSURE_VERIFY_V1`.
-    ///
-    /// Operator-opt-in (default off): the consumer sees no capability and
-    /// falls back to local verification. Wiring the verifier is the binary's
-    /// responsibility; the flag only controls advertisement.
-    #[must_use]
-    pub const fn with_payment_disclosure_verifier_online(mut self, online: bool) -> Self {
-        self.payment_disclosure_verifier_online = online;
         self
     }
 
@@ -315,7 +302,7 @@ impl ExplorerQueryGrpcAdapter {
     fn advertised_capability_readiness(&self) -> ExplorerReadiness {
         let wallet_query_online = self.wallet_query_endpoint.is_some();
         let transaction_history_readiness = self
-            .transaction_history_projection_reader
+            .transaction_history_materialized_view_reader
             .as_ref()
             .and_then(|reader| reader.readiness().ok());
         let canonical_transaction_history_position =
@@ -332,13 +319,13 @@ impl ExplorerQueryGrpcAdapter {
         ExplorerReadiness {
             wallet_query_online,
             canonical_store_online: self.canonical_store.is_some(),
-            derive_store_online: self.projection_preset == Some(ProjectionPreset::Explorer),
+            materialized_view_store_online: self.materialized_view_preset
+                == Some(MaterializedViewPreset::Explorer),
             prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
-            payment_disclosure_verifier_online: self.payment_disclosure_verifier_online,
             transaction_history_available: transaction_history_readiness
-                .is_some_and(TransactionHistoryProjectionReadiness::is_available),
-            transaction_history_complete: transaction_history_readiness.is_some_and(|projection| {
-                projection.is_complete_at(canonical_transaction_history_position)
+                .is_some_and(TransactionHistoryMaterializedViewReadiness::is_available),
+            transaction_history_complete: transaction_history_readiness.is_some_and(|readiness| {
+                readiness.is_complete_at(canonical_transaction_history_position)
             }),
         }
     }
@@ -354,27 +341,29 @@ impl ExplorerQueryGrpcAdapter {
     #[must_use]
     pub fn advertised_capabilities(&self) -> Vec<&'static str> {
         let readiness = self.advertised_capability_readiness();
-        let ranking_active = self.derive_store.as_ref().is_some_and(|store| {
-            zinder_derive::TransparentAddressRankingConsumer::active_metadata(store)
+        let ranking_active = self.materialized_view_store.as_ref().is_some_and(|store| {
+            zinder_materialized_views::TransparentAddressRankingConsumer::active_metadata(store)
                 .ok()
                 .flatten()
                 .is_some()
         });
         let conventional_fee_distribution_covered =
-            self.derive_store.as_ref().is_some_and(|store| {
-                zinder_derive::ConventionalFeeDistributionConsumer::coverage(store)
+            self.materialized_view_store.as_ref().is_some_and(|store| {
+                zinder_materialized_views::ConventionalFeeDistributionConsumer::coverage(store)
                     .ok()
                     .flatten()
                     .is_some()
             });
-        let paid_fee_distribution_covered = self.derive_store.as_ref().is_some_and(|store| {
-            zinder_derive::PaidFeeDistributionConsumer::coverage(store)
-                .ok()
-                .flatten()
-                .is_some()
-        });
-        let block_production_time_covered =
-            block_production_time_projection_available(self.derive_store.as_ref());
+        let paid_fee_distribution_covered =
+            self.materialized_view_store.as_ref().is_some_and(|store| {
+                zinder_materialized_views::PaidFeeDistributionConsumer::coverage(store)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+        let block_production_time_covered = block_production_time_materialized_view_available(
+            self.materialized_view_store.as_ref(),
+        );
         let transaction_intrinsic_value_balances_available =
             self.canonical_store.as_ref().is_some_and(|store| {
                 store.try_catch_up().is_ok()
@@ -412,24 +401,27 @@ impl ExplorerQueryGrpcAdapter {
     }
 }
 
-fn block_production_time_projection_available(derive_store: Option<&DeriveStore>) -> bool {
-    let Some(store) = derive_store else {
+fn block_production_time_materialized_view_available(
+    materialized_view_store: Option<&MaterializedViewStore>,
+) -> bool {
+    let Some(store) = materialized_view_store else {
         return false;
     };
     let snapshot = store.read_snapshot();
-    let coverage = zinder_derive::BlockProductionTimeConsumer::coverage_snapshot(&snapshot)
-        .ok()
-        .flatten();
-    let projection_state = snapshot
-        .consumer_projection_state(zinder_derive::BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
+    let coverage =
+        zinder_materialized_views::BlockProductionTimeConsumer::coverage_snapshot(&snapshot)
+            .ok()
+            .flatten();
+    let materialized_view_state = snapshot
+        .consumer_state(zinder_materialized_views::BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
         .ok()
         .flatten();
     drop(snapshot);
     coverage
-        .zip(projection_state)
-        .is_some_and(|(coverage, projection_state)| {
+        .zip(materialized_view_state)
+        .is_some_and(|(coverage, materialized_view_state)| {
             coverage.complete_from_height.value() <= 1
-                && coverage.complete_through_height >= projection_state.projection_tip_height
+                && coverage.complete_through_height >= materialized_view_state.tip_height
         })
 }
 
@@ -458,19 +450,25 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
     ) -> Result<Response<ServerInfoResponse>, Status> {
         // ServerInfo carries the standard ExplorerFreshness envelope per
         // ADR-0011 so consumers can read `chain_view.upstream_tip` from the
-        // bootstrap call, before any derive-backed capability is up.
+        // bootstrap call, before any materialized-view-backed capability is up.
         // During `bulk_catchup` this is the only explorer response that
         // is guaranteed to succeed; sync-progress UIs depend on it for
         // an honest denominator. `chain_epoch` is left unset here because
         // ServerInfo resolves no canonical follower tip and so makes no
-        // snapshot-consistency claim; the derive-plane indexed tip and the
+        // snapshot-consistency claim; the materialized-view indexed tip and the
         // upstream observation carry the rest of the freshness signal.
         let freshness = attach_upstream_observation(
             &self.upstream_observation_cache,
-            build_explorer_freshness(self.derive_store.as_ref(), EXPLORER_SERVER_INFO_V1, None, 0)?,
+            build_explorer_freshness(
+                self.materialized_view_store.as_ref(),
+                EXPLORER_SERVER_INFO_V1,
+                None,
+                0,
+            )?,
         )
         .await;
-        let derive_status = read_derive_status(self.derive_store.as_ref())?;
+        let materialized_view_status =
+            read_materialized_view_status(self.materialized_view_store.as_ref())?;
         Ok(Response::new(ServerInfoResponse {
             freshness: Some(freshness),
             info: Some(ExplorerServerInfo {
@@ -484,19 +482,22 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                         .map(str::to_owned)
                         .collect(),
                     contract_revision: zinder_proto::CONTRACT_REVISION,
-                    projection_preset: self
-                        .projection_preset
+                    materialized_view_preset: self
+                        .materialized_view_preset
                         .map_or_else(String::new, |preset| preset.as_str().to_owned()),
-                    projection_identities: self.projection_preset.map_or_else(Vec::new, |preset| {
-                        preset
-                            .consumer_schemas()
-                            .iter()
-                            .map(|schema| schema.name.as_str().to_owned())
-                            .collect()
-                    }),
+                    materialized_view_identities: self.materialized_view_preset.map_or_else(
+                        Vec::new,
+                        |preset| {
+                            preset
+                                .consumer_schemas()
+                                .iter()
+                                .map(|schema| schema.name.as_str().to_owned())
+                                .collect()
+                        },
+                    ),
                 }),
                 vendor: "Zinder".to_owned(),
-                derive_status,
+                materialized_view_status,
             }),
         }))
     }
@@ -512,11 +513,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_transaction_detail(
+            query_transaction_detail(
                 &mut client,
                 TransactionDetailContext {
                     chain_store: self.canonical_store.as_ref(),
-                    derive_store: self.derive_store.as_ref(),
+                    materialized_view_store: self.materialized_view_store.as_ref(),
                     network: self.settings.network,
                     upstream_observation_cache: &self.upstream_observation_cache,
                 },
@@ -539,10 +540,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_block_summaries_in_range(
-                derive_store,
+            query_block_summaries_in_range(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -564,10 +565,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
-            handle_block_production_series(
-                derive_store,
+            query_block_production_series(
+                materialized_view_store,
                 canonical_store,
                 &self.upstream_observation_cache,
                 request,
@@ -589,10 +590,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
-            handle_block_production_in_time_range(
-                derive_store,
+            query_block_production_in_time_range(
+                materialized_view_store,
                 canonical_store,
                 &self.upstream_observation_cache,
                 request,
@@ -614,10 +615,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_block_activity_distribution(
-                derive_store,
+            query_block_activity_distribution(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -639,10 +640,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_transaction_component_summary(
-                derive_store,
+            query_transaction_component_summary(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -664,10 +665,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_transparent_address_ranking(
-                derive_store,
+            query_transparent_address_ranking(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -689,10 +690,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_block_detail(
-                derive_store,
+            query_block_detail(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -714,12 +715,12 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_block_transactions(
+            query_block_transactions(
                 canonical_store,
-                derive_store,
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -742,8 +743,8 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_search(
-                self.derive_store.as_ref(),
+            query_search(
+                self.materialized_view_store.as_ref(),
                 &mut client,
                 self.settings.network,
                 &self.upstream_observation_cache,
@@ -766,10 +767,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
-            handle_commitment_root_search(
-                derive_store,
+            query_commitment_root_search(
+                materialized_view_store,
                 canonical_store,
                 &self.network_upgrade_activations,
                 &self.upstream_observation_cache,
@@ -793,8 +794,8 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_mempool_summary(
-                self.derive_store.as_ref(),
+            query_mempool_summary(
+                self.materialized_view_store.as_ref(),
                 &mut client,
                 self.settings.network,
                 &self.upstream_observation_cache,
@@ -818,8 +819,8 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_mempool_snapshot(
-                self.derive_store.as_ref(),
+            query_mempool_snapshot(
+                self.materialized_view_store.as_ref(),
                 &mut client,
                 self.settings.network,
                 &self.upstream_observation_cache,
@@ -843,8 +844,8 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_mempool_activity(
-                self.derive_store.as_ref(),
+            query_mempool_activity(
+                self.materialized_view_store.as_ref(),
                 &mut client,
                 self.settings.network,
                 &self.upstream_observation_cache,
@@ -867,15 +868,16 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
-                ExplorerError::dependency_not_configured(
-                    "TransparentAddressActivity requires a derive store",
-                )
-            })?;
+            let materialized_view_store =
+                self.materialized_view_store.as_ref().ok_or_else(|| {
+                    ExplorerError::dependency_not_configured(
+                        "TransparentAddressActivity requires a materialized-view store",
+                    )
+                })?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_transparent_address_activity(
+            query_transparent_address_activity(
                 TransparentAddressActivityContext {
-                    derive_store,
+                    materialized_view_store,
                     canonical_store: self.canonical_store.as_ref(),
                     network: self.settings.network,
                     upstream_observation_cache: &self.upstream_observation_cache,
@@ -900,14 +902,15 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
-                ExplorerError::dependency_not_configured(
-                    "TransparentAddressDeltas requires a derive store",
-                )
-            })?;
+            let materialized_view_store =
+                self.materialized_view_store.as_ref().ok_or_else(|| {
+                    ExplorerError::dependency_not_configured(
+                        "TransparentAddressDeltas requires a materialized-view store",
+                    )
+                })?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_transparent_address_deltas(
-                derive_store,
+            query_transparent_address_deltas(
+                materialized_view_store,
                 &mut client,
                 self.settings.network,
                 &self.upstream_observation_cache,
@@ -930,10 +933,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_fee_summary(
-                derive_store,
+            query_fee_summary(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -955,10 +958,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_conventional_fee_distribution(
-                derive_store,
+            query_conventional_fee_distribution(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -980,11 +983,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_paid_fee_distribution(
-                derive_store,
+            query_paid_fee_distribution(
+                materialized_view_store,
                 canonical_store,
                 &mut client,
                 &self.upstream_observation_cache,
@@ -1008,8 +1011,8 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_summary(
-                self.derive_store.as_ref(),
+            query_value_pool_summary(
+                self.materialized_view_store.as_ref(),
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1032,8 +1035,8 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_network_upgrade_status(
-                self.derive_store.as_ref(),
+            query_network_upgrade_status(
+                self.materialized_view_store.as_ref(),
                 &self.network_upgrade_activations,
                 &mut client,
                 &self.upstream_observation_cache,
@@ -1056,10 +1059,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_flow_history(
-                derive_store,
+            query_value_pool_flow_history(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1081,10 +1084,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_flow_events_in_range(
-                derive_store,
+            query_value_pool_flow_events_in_range(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1106,10 +1109,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_flow_summary(
-                derive_store,
+            query_value_pool_flow_summary(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1131,10 +1134,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_flow_amount_threshold_summary(
-                derive_store,
+            query_value_pool_flow_amount_threshold_summary(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1156,10 +1159,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_flow_rounded_amount_summary(
-                derive_store,
+            query_value_pool_flow_rounded_amount_summary(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1181,10 +1184,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_value_pool_balance_history(
-                derive_store,
+            query_value_pool_balance_history(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1207,8 +1210,8 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
-            handle_utxo_set_summary(
-                self.derive_store.as_ref(),
+            query_utxo_set_summary(
+                self.materialized_view_store.as_ref(),
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1230,13 +1233,18 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
-                ExplorerError::dependency_not_configured(
-                    "ChainReorgHistory requires a derive store",
-                )
-            })?;
-            handle_chain_reorg_history(derive_store, &self.upstream_observation_cache, request)
-                .await
+            let materialized_view_store =
+                self.materialized_view_store.as_ref().ok_or_else(|| {
+                    ExplorerError::dependency_not_configured(
+                        "ChainReorgHistory requires a materialized-view store",
+                    )
+                })?;
+            query_chain_reorg_history(
+                materialized_view_store,
+                &self.upstream_observation_cache,
+                request,
+            )
+            .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -1254,7 +1262,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let canonical_store = self.require_canonical_store(OP.method)?;
-            handle_displaced_block_history(
+            query_displaced_block_history(
                 canonical_store,
                 &self.upstream_observation_cache,
                 request,
@@ -1277,12 +1285,8 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let canonical_store = self.require_canonical_store(OP.method)?;
-            handle_displaced_block_detail(
-                canonical_store,
-                &self.upstream_observation_cache,
-                request,
-            )
-            .await
+            query_displaced_block_detail(canonical_store, &self.upstream_observation_cache, request)
+                .await
         }
         .await;
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
@@ -1299,14 +1303,15 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.derive_store.as_ref().ok_or_else(|| {
-                ExplorerError::dependency_not_configured(
-                    "MempoolEventCounts requires a derive store",
-                )
-            })?;
+            let materialized_view_store =
+                self.materialized_view_store.as_ref().ok_or_else(|| {
+                    ExplorerError::dependency_not_configured(
+                        "MempoolEventCounts requires a materialized-view store",
+                    )
+                })?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_mempool_event_counts(
-                derive_store,
+            query_mempool_event_counts(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1328,16 +1333,17 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let projection_reader = self.require_transaction_history_projection_reader()?;
-            projection_reader
+            let materialized_view_reader =
+                self.require_transaction_history_materialized_view_reader()?;
+            materialized_view_reader
                 .readiness()
-                .and_then(TransactionHistoryProjectionReadiness::require_available)
-                .map_err(TransactionHistoryProjectionReadError::into_status)?;
+                .and_then(TransactionHistoryMaterializedViewReadiness::require_available)
+                .map_err(TransactionHistoryMaterializedViewReadError::into_status)?;
             let mut client = self.wallet_client(OP.method).await?;
             transaction_history(
                 TransactionHistoryContext {
-                    projection_reader: Arc::clone(projection_reader),
-                    derive_store: self.derive_store.as_ref(),
+                    materialized_view_reader: Arc::clone(materialized_view_reader),
+                    materialized_view_store: self.materialized_view_store.as_ref(),
                     chain_store: self.canonical_store.as_ref(),
                     upstream_observation_cache: &self.upstream_observation_cache,
                 },
@@ -1363,10 +1369,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_recent_transactions(
-                derive_store,
+            query_recent_transactions(
+                materialized_view_store,
                 self.canonical_store.as_ref(),
                 &mut client,
                 &self.upstream_observation_cache,
@@ -1389,10 +1395,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_overview_snapshot(
-                derive_store,
+            query_overview_snapshot(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1414,10 +1420,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_migration_overview(
-                derive_store,
+            query_migration_overview(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1439,10 +1445,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_migration_cohorts(
-                derive_store,
+            query_migration_cohorts(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1464,10 +1470,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let derive_store = self.require_derive_store(OP.method)?;
+            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method).await?;
-            handle_migration_denominations(
-                derive_store,
+            query_migration_denominations(
+                materialized_view_store,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1478,68 +1484,40 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
-
-    async fn verify_payment_disclosure(
-        &self,
-        _request: Request<VerifyPaymentDisclosureRequest>,
-    ) -> Result<Response<VerifyPaymentDisclosureResponse>, Status> {
-        const OP: OperationNames = OperationNames {
-            method: "VerifyPaymentDisclosure",
-            metric: "verify_payment_disclosure",
-        };
-        let started = Instant::now();
-        // ZIP-311 verifier opt-in (off by default). Operator-flagged because
-        // verification work would otherwise execute on bytes the operator
-        // never approved. The handler never logs or spans
-        // `request.payment_disclosure_bytes`; that is the redaction
-        // contract documented alongside the RPC.
-        let outcome: Result<Response<VerifyPaymentDisclosureResponse>, Status> = if self
-            .payment_disclosure_verifier_online
-        {
-            Err(ExplorerError::unsatisfied_precondition(
-                "VerifyPaymentDisclosure is wired but no ZIP-311 verifier is bundled in this build",
-            )
-            .into())
-        } else {
-            Err(ExplorerError::unsupported(
-                "VerifyPaymentDisclosure is disabled on this server; consumer must fall back to local verification",
-            )
-            .into())
-        };
-        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
-        outcome
-    }
 }
 
 impl ExplorerQueryGrpcAdapter {
-    fn require_transaction_history_projection_reader(
+    fn require_transaction_history_materialized_view_reader(
         &self,
-    ) -> Result<&Arc<dyn TransactionHistoryProjectionReadApi>, Status> {
-        self.transaction_history_projection_reader
+    ) -> Result<&Arc<dyn TransactionHistoryMaterializedViewReadApi>, Status> {
+        self.transaction_history_materialized_view_reader
             .as_ref()
             .ok_or_else(|| {
                 ExplorerError::dependency_not_configured(
-                    "TransactionHistory requires a projection reader",
+                    "TransactionHistory requires a materialized-view reader",
                 )
                 .into()
             })
     }
 
-    fn require_derive_store(&self, method: &'static str) -> Result<&DeriveStore, Status> {
-        let derive_store = self.derive_store.as_ref().ok_or_else(|| {
+    fn require_materialized_view_store(
+        &self,
+        method: &'static str,
+    ) -> Result<&MaterializedViewStore, Status> {
+        let materialized_view_store = self.materialized_view_store.as_ref().ok_or_else(|| {
             Status::from(ExplorerError::dependency_not_configured(format!(
-                "{method} requires the BlockSummary derive view; configure \
+                "{method} requires the BlockSummary materialized view; configure \
                  --storage-path and start the explorer with the consumer wired"
             )))
         })?;
-        if self.projection_preset != Some(ProjectionPreset::Explorer) {
+        if self.materialized_view_preset != Some(MaterializedViewPreset::Explorer) {
             return Err(ExplorerError::unsupported(format!(
-                "{method} is unavailable because the stored projection workload omits \
+                "{method} is unavailable because the stored materialized-view workload omits \
                  explorer product views"
             ))
             .into());
         }
-        Ok(derive_store)
+        Ok(materialized_view_store)
     }
 
     fn require_canonical_store(
@@ -1548,7 +1526,7 @@ impl ExplorerQueryGrpcAdapter {
     ) -> Result<&SecondaryChainStore, Status> {
         self.canonical_store.as_ref().ok_or_else(|| {
             ExplorerError::dependency_not_configured(format!(
-                "{method} requires the canonical fact store; configure --storage-path"
+                "{method} requires the canonical store; configure --storage-path"
             ))
             .into()
         })
@@ -1620,9 +1598,9 @@ fn record_explorer_request(operation: &'static str, elapsed: Duration, error: Op
     record_rpc_request(EXPLORER_RPC_METRICS, operation, elapsed, outcome);
 }
 
-/// Maps a `tonic::Status::code()` to the short string label the BFF and
+/// Maps a `tonic::Status::code()` to the short string label operational
 /// dashboards filter on. Mirrors `zinder-query`'s `query_error_class` so the
-/// two services share the same vocabulary.
+/// query boundaries share one vocabulary.
 fn status_error_class(status: &Status) -> &'static str {
     match status.code() {
         Code::Ok => "none",
@@ -1654,9 +1632,9 @@ mod tests {
 
     use tempfile::{TempDir, tempdir};
     use zinder_core::{ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpochId, Network};
-    use zinder_derive::{
-        CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA, ConsumerProjectionCoverage, ConsumerProjectionState,
-        DeriveStoreOptions, PAID_FEE_DISTRIBUTION_SCHEMA, ProjectionPreset,
+    use zinder_materialized_views::{
+        CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA, MaterializedViewCoverage, MaterializedViewPreset,
+        MaterializedViewState, MaterializedViewStoreOptions, PAID_FEE_DISTRIBUTION_SCHEMA,
         TRANSACTION_HISTORY_CONSUMER_NAME,
     };
     use zinder_proto::capabilities::{
@@ -1668,23 +1646,23 @@ mod tests {
     use super::*;
 
     fn adapter_with_transaction_history_state(
-        state: Option<ConsumerProjectionState>,
+        state: Option<MaterializedViewState>,
         wallet_query_online: bool,
     ) -> Result<(TempDir, ExplorerQueryGrpcAdapter), Box<dyn std::error::Error>> {
         let tempdir = tempdir()?;
-        let derive_store = DeriveStore::open(
+        let materialized_view_store = MaterializedViewStore::open(
             tempdir.path(),
-            DeriveStoreOptions {
-                consumers: DeriveStore::bundled_consumers(),
+            MaterializedViewStoreOptions {
+                consumers: MaterializedViewStore::bundled_consumers(),
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
             },
         )?;
         if let Some(state) = state {
-            derive_store.put_consumer_projection_state(TRANSACTION_HISTORY_CONSUMER_NAME, state)?;
+            materialized_view_store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, state)?;
         }
         let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
-            .with_derive_store(derive_store);
+            .with_materialized_view_store(materialized_view_store);
         let adapter = if wallet_query_online {
             adapter.with_wallet_query_endpoint(String::from("http://127.0.0.1:1"))
         } else {
@@ -1710,15 +1688,15 @@ mod tests {
     }
 
     #[test]
-    fn transaction_history_capabilities_follow_projection_state_and_dependencies()
+    fn transaction_history_capabilities_follow_materialized_view_state_and_dependencies()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_tempdir, adapter) = adapter_with_transaction_history_state(None, true)?;
         assert_transaction_history_capabilities(&adapter, false, false);
 
-        let partial_state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(7),
-            projection_tip_height: BlockHeight::new(20),
-            projection_tip_hash: BlockHash::from_bytes([0x20; 32]),
+        let partial_state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(7),
+            tip_height: BlockHeight::new(20),
+            tip_hash: BlockHash::from_bytes([0x20; 32]),
             revision: 1,
             coverage: None,
         };
@@ -1740,12 +1718,12 @@ mod tests {
             ChainStoreOptions::for_local_tests(),
         )?;
         canonical_store.try_catch_up()?;
-        let complete_state = ConsumerProjectionState {
-            projection_epoch_id: chain_epoch.id,
-            projection_tip_height: chain_epoch.visible_tip_height,
-            projection_tip_hash: chain_epoch.visible_tip_hash,
+        let complete_state = MaterializedViewState {
+            chain_epoch_id: chain_epoch.id,
+            tip_height: chain_epoch.visible_tip_height,
+            tip_hash: chain_epoch.visible_tip_hash,
             revision: 2,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(1),
                 complete_through_height: chain_epoch.visible_tip_height,
                 complete_through_hash: chain_epoch.visible_tip_hash,
@@ -1756,9 +1734,9 @@ mod tests {
         let adapter = adapter.with_canonical_store(canonical_store.clone());
         assert_transaction_history_capabilities(&adapter, true, true);
 
-        let checkpoint_state = ConsumerProjectionState {
+        let checkpoint_state = MaterializedViewState {
             revision: 3,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(8),
                 complete_through_height: chain_epoch.visible_tip_height,
                 complete_through_hash: chain_epoch.visible_tip_hash,
@@ -1770,8 +1748,8 @@ mod tests {
         let adapter = adapter.with_canonical_store(canonical_store.clone());
         assert_transaction_history_capabilities(&adapter, true, false);
 
-        let mismatched_state = ConsumerProjectionState {
-            projection_tip_hash: BlockHash::from_bytes([0x21; 32]),
+        let mismatched_state = MaterializedViewState {
+            tip_hash: BlockHash::from_bytes([0x21; 32]),
             ..complete_state
         };
         let (_tempdir, adapter) =
@@ -1779,12 +1757,12 @@ mod tests {
         let adapter = adapter.with_canonical_store(canonical_store.clone());
         assert_transaction_history_capabilities(&adapter, true, false);
 
-        let stale_state = ConsumerProjectionState {
-            projection_epoch_id: ChainEpochId::new(6),
-            projection_tip_height: BlockHeight::new(19),
-            projection_tip_hash: BlockHash::from_bytes([0x19; 32]),
+        let stale_state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(6),
+            tip_height: BlockHeight::new(19),
+            tip_hash: BlockHash::from_bytes([0x19; 32]),
             revision: 3,
-            coverage: Some(ConsumerProjectionCoverage {
+            coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(1),
                 complete_through_height: BlockHeight::new(19),
                 complete_through_hash: BlockHash::from_bytes([0x19; 32]),
@@ -1804,16 +1782,16 @@ mod tests {
     async fn omitted_transaction_history_disables_capabilities_and_fails_before_wallet_connect()
     -> Result<(), Box<dyn std::error::Error>> {
         let tempdir = tempdir()?;
-        let derive_store = DeriveStore::open_with_projection_preset(
+        let materialized_view_store = MaterializedViewStore::open_with_materialized_view_preset(
             tempdir.path(),
-            ProjectionPreset::Wallet,
-            DeriveStoreOptions {
+            MaterializedViewPreset::Wallet,
+            MaterializedViewStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-                ..DeriveStoreOptions::default()
+                ..MaterializedViewStoreOptions::default()
             },
         )?;
         let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
-            .with_derive_store(derive_store)
+            .with_materialized_view_store(materialized_view_store)
             .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
 
         let capabilities = adapter.advertised_capabilities();
@@ -1828,13 +1806,15 @@ mod tests {
             .info
             .and_then(|info| info.common)
             .ok_or("explorer server info missing common descriptor")?;
-        assert_eq!(common.projection_preset, "wallet");
-        assert_eq!(common.projection_identities.len(), 2);
+        assert_eq!(common.materialized_view_preset, "wallet");
+        assert_eq!(common.materialized_view_identities.len(), 2);
         let outcome = adapter
             .transaction_history(Request::new(TransactionHistoryRequest::default()))
             .await;
         let Err(error) = outcome else {
-            return Err("omitted projection unexpectedly reached the wallet connection".into());
+            return Err(
+                "omitted materialized view unexpectedly reached the wallet connection".into(),
+            );
         };
         assert_eq!(error.code(), Code::Unimplemented);
         Ok(())
@@ -1844,37 +1824,35 @@ mod tests {
     async fn materializing_transaction_history_fails_before_wallet_connect()
     -> Result<(), Box<dyn std::error::Error>> {
         let tempdir = tempdir()?;
-        let derive_store = DeriveStore::open_with_projection_preset(
+        let materialized_view_store = MaterializedViewStore::open_with_materialized_view_preset(
             tempdir.path(),
-            ProjectionPreset::Explorer,
-            DeriveStoreOptions {
+            MaterializedViewPreset::Explorer,
+            MaterializedViewStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-                ..DeriveStoreOptions::default()
+                ..MaterializedViewStoreOptions::default()
             },
         )?;
         let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
-            .with_derive_store(derive_store)
+            .with_materialized_view_store(materialized_view_store)
             .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
 
         let outcome = adapter
             .transaction_history(Request::new(TransactionHistoryRequest::default()))
             .await;
         let Err(error) = outcome else {
-            return Err(
-                "materializing projection unexpectedly reached the wallet connection".into(),
-            );
+            return Err("materializing view unexpectedly reached the wallet connection".into());
         };
         assert_eq!(error.code(), Code::FailedPrecondition);
         Ok(())
     }
 
     #[test]
-    fn fee_distribution_capabilities_are_hidden_without_projection_coverage()
+    fn fee_distribution_capabilities_are_hidden_without_materialized_view_coverage()
     -> Result<(), Box<dyn std::error::Error>> {
         let tempdir = tempdir()?;
-        let derive_store = DeriveStore::open(
+        let materialized_view_store = MaterializedViewStore::open(
             tempdir.path(),
-            DeriveStoreOptions {
+            MaterializedViewStoreOptions {
                 consumers: &[
                     CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA,
                     PAID_FEE_DISTRIBUTION_SCHEMA,
@@ -1884,7 +1862,7 @@ mod tests {
             },
         )?;
         let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
-            .with_derive_store(derive_store)
+            .with_materialized_view_store(materialized_view_store)
             .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
 
         assert!(
@@ -1915,16 +1893,16 @@ mod tests {
         )?;
         canonical_store.try_catch_up()?;
         let tempdir = tempdir()?;
-        let derive_store = DeriveStore::open(
+        let materialized_view_store = MaterializedViewStore::open(
             tempdir.path(),
-            DeriveStoreOptions {
-                consumers: DeriveStore::bundled_consumers(),
+            MaterializedViewStoreOptions {
+                consumers: MaterializedViewStore::bundled_consumers(),
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
             },
         )?;
         let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
-            .with_derive_store(derive_store)
+            .with_materialized_view_store(materialized_view_store)
             .with_canonical_store(canonical_store);
 
         assert!(

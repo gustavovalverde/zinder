@@ -167,13 +167,13 @@ expect_rejected \
   "a release workflow omitting zinder-projector" \
   --release-images-workflow "$projectorless_release_workflow"
 
-legacy_reader_release_workflow="$temporary_directory/legacy-reader-release-images.yml"
-cp "$repository_root/.github/workflows/release-images.yml" "$legacy_reader_release_workflow"
+query_reader_release_workflow="$temporary_directory/query-reader-release-images.yml"
+cp "$repository_root/.github/workflows/release-images.yml" "$query_reader_release_workflow"
 printf '\n# forbidden release image\n# "zinder-query:zinder-query"\n' \
-  >> "$legacy_reader_release_workflow"
+  >> "$query_reader_release_workflow"
 expect_rejected \
-  "a release workflow publishing the superseded query owner" \
-  --release-images-workflow "$legacy_reader_release_workflow"
+  "a release workflow publishing zinder-query" \
+  --release-images-workflow "$query_reader_release_workflow"
 
 bash "$validator" --verify-railway-default
 

@@ -1,6 +1,6 @@
 //! Transparent address script-hash wire codec.
 //!
-//! Derive-store column families that key on a transparent address (for
+//! Materialized-view store column families that key on a transparent address (for
 //! example the address-activity projection) use the canonical 32-byte
 //! [`TransparentAddressScriptHash`] form as their per-address discriminator.
 //! Inline `.as_bytes()` calls outside this module are forbidden so that the
@@ -10,7 +10,7 @@ use crate::TransparentAddressScriptHash;
 use crate::wire::WireDecodeError;
 
 /// Number of bytes a transparent address script-hash occupies on the wire
-/// and in derive-store keys.
+/// and in materialized-view keys.
 pub const ADDRESS_SCRIPT_HASH_LEN: usize = 32;
 
 /// Encodes a transparent address script-hash into its canonical bytes.

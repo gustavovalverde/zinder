@@ -45,8 +45,7 @@ pub(crate) fn write_regtest_fixture() -> Result<(TempDir, SourceBlock)> {
         to_height: height,
         block_count: 1,
         workload_density: measurements.workload_density,
-        current_schema_oracle_artifact_schema_version:
-            zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        canonical_artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         canonical_block_facts_digest_evidence: measurements
             .canonical_block_facts_digest_evidence()?,
         tip_hash_hex: hex::encode(block.hash.as_bytes()),

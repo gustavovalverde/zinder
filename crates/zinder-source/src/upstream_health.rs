@@ -6,7 +6,7 @@
 //! [ADR-0015 §Upstream sync detection].
 //!
 //! [ADR-0015 §Upstream sync detection]:
-//!     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#upstream-sync-detection
+//!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
 
 use std::borrow::Cow;
 

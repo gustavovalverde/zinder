@@ -1,4 +1,4 @@
-//! Single-scan external construction of version-1 wallet projection SSTs.
+//! Single-scan external construction of wallet projection SSTs.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -14,7 +14,7 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion, Network,
     TransactionId, TransparentUtxoSetCommitment, ValidatedCanonicalBlockReplay,
 };
-use zinder_rocksdb::{
+use zinder_rocksdb_bulk_load::{
     OrderedSstWriter, SortedVariableValues, SstFileSet, VariableValueSortEvidence,
     VariableValueSorter,
 };
@@ -46,7 +46,7 @@ const SPEND_EVENT_TAG: u8 = 1;
 
 /// Resource limits for one external projection construction.
 #[derive(Clone, Copy)]
-pub(crate) struct ProjectionLoadConfig<'options> {
+pub(crate) struct WalletProjectionLoadConfig<'options> {
     pub(crate) staging_path: &'options Path,
     pub(crate) options: &'options Options,
     pub(crate) network: Network,
@@ -116,11 +116,11 @@ struct StagedSpend {
 }
 
 #[derive(Default)]
-struct ProjectionSstEvidence {
+struct WalletProjectionSstEvidence {
     logical_row_bytes: u64,
 }
 
-impl ProjectionSstEvidence {
+impl WalletProjectionSstEvidence {
     fn add_row(&mut self, key: &[u8], encoded_value: &[u8]) -> Result<(), RocksDbWalletError> {
         let row_bytes = u64::try_from(key.len())
             .ok()
@@ -129,11 +129,11 @@ impl ProjectionSstEvidence {
                     .ok()
                     .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
             })
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         self.logical_row_bytes = self
             .logical_row_bytes
             .checked_add(row_bytes)
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         Ok(())
     }
 }
@@ -181,13 +181,13 @@ impl RetainedUndo {
             return Ok(());
         }
         if self.supported_depth == 0 || self.records.len() >= self.supported_depth {
-            return Err(RocksDbWalletError::ProjectionRebuildRequired {
+            return Err(RocksDbWalletError::WalletProjectionRebuildRequired {
                 reason: "canonical unsettled suffix exceeds the wallet's configured undo capacity",
             });
         }
         self.reserve(
             u64::try_from(size_of::<WalletReorgUndo>())
-                .map_err(|_| RocksDbWalletError::ProjectionLoadAccountingOverflow)?,
+                .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
         )?;
         self.records.push_back(WalletReorgUndo {
             block,
@@ -208,11 +208,11 @@ impl RetainedUndo {
         }
         self.reserve(
             u64::try_from(size_of::<WalletOutpointKey>())
-                .map_err(|_| RocksDbWalletError::ProjectionLoadAccountingOverflow)?,
+                .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
         )?;
         self.records
             .back_mut()
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?
             .created_outpoints
             .push(key);
         Ok(())
@@ -224,11 +224,11 @@ impl RetainedUndo {
         }
         self.reserve(
             u64::try_from(size_of::<WalletOutpointKey>())
-                .map_err(|_| RocksDbWalletError::ProjectionLoadAccountingOverflow)?,
+                .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
         )?;
         self.records
             .back_mut()
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?
             .spent_outpoints
             .push(key);
         Ok(())
@@ -241,7 +241,7 @@ impl RetainedUndo {
         let undo = self
             .records
             .back_mut()
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         undo.created_outpoints.sort_unstable();
         undo.spent_outpoints.sort_unstable();
         Ok(())
@@ -261,7 +261,7 @@ impl RetainedUndo {
         self.accounted_bytes = self
             .accounted_bytes
             .checked_sub(bytes)
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         Ok(())
     }
 
@@ -278,7 +278,7 @@ impl RetainedUndo {
         };
         self.reserve(
             u64::try_from(size_of::<WalletAddressTransactionKey>())
-                .map_err(|_| RocksDbWalletError::ProjectionLoadAccountingOverflow)?,
+                .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
         )?;
         self.records[undo_index].address_transaction_keys.push(key);
         Ok(())
@@ -288,7 +288,7 @@ impl RetainedUndo {
         let required_bytes = self
             .accounted_bytes
             .checked_add(additional_bytes)
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         if required_bytes > self.max_accounted_bytes {
             return Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
                 limit_bytes: self.max_accounted_bytes,
@@ -307,7 +307,7 @@ impl RetainedUndo {
     reason = "the loader keeps the source scan, external drains, and evidence fence in visible order"
 )]
 pub(crate) fn write_projection_ssts(
-    config: ProjectionLoadConfig<'_>,
+    config: WalletProjectionLoadConfig<'_>,
     blocks: impl IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
 ) -> Result<PreparedWalletProjectionLoad, RocksDbWalletError> {
     let scan_started = Instant::now();
@@ -408,8 +408,9 @@ pub(crate) fn write_projection_ssts(
                     && !block_created_outpoints.contains(&outpoint_key)
                 {
                     retained_undo.reserve_transient(
-                        u64::try_from(size_of::<WalletOutpointKey>())
-                            .map_err(|_| RocksDbWalletError::ProjectionLoadAccountingOverflow)?,
+                        u64::try_from(size_of::<WalletOutpointKey>()).map_err(|_| {
+                            RocksDbWalletError::WalletProjectionLoadAccountingOverflow
+                        })?,
                     )?;
                     block_created_outpoints.insert(outpoint_key);
                 }
@@ -424,7 +425,7 @@ pub(crate) fn write_projection_ssts(
                         .ok()
                         .and_then(|bytes| count.checked_mul(bytes))
                 })
-                .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?,
+                .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
         )?;
         retained_undo.finish_block()?;
         previous_block = Some(block);
@@ -454,7 +455,7 @@ pub(crate) fn write_projection_ssts(
     let mut unspent_writer = ordered_writer(config, "wallet-unspent-output")?;
     let mut spent_writer = ordered_writer(config, "wallet-spent-output")?;
     let mut digest = WalletProjectionDigestBuilder::new();
-    let mut sst_evidence = ProjectionSstEvidence::default();
+    let mut sst_evidence = WalletProjectionSstEvidence::default();
     let mut utxo_count = 0_u64;
     let mut total_value_zat = 0_u64;
     let mut commitment = TransparentUtxoSetCommitment::empty();
@@ -594,7 +595,7 @@ fn drain_outpoint_events(
     address_index_sorter: &mut VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
     address_transaction_sorter: &mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
     digest: &mut WalletProjectionDigestBuilder,
-    sst_evidence: &mut ProjectionSstEvidence,
+    sst_evidence: &mut WalletProjectionSstEvidence,
     utxo_count: &mut u64,
     total_value_zat: &mut u64,
     commitment: &mut TransparentUtxoSetCommitment,
@@ -708,7 +709,7 @@ fn drain_address_index(
     index_writer: &mut OrderedSstWriter<'_>,
     balance_writer: &mut OrderedSstWriter<'_>,
     digest: &mut WalletProjectionDigestBuilder,
-    evidence: &mut ProjectionSstEvidence,
+    evidence: &mut WalletProjectionSstEvidence,
 ) -> Result<(), RocksDbWalletError> {
     let mut current_address = None;
     let mut current_balance = 0_u64;
@@ -759,7 +760,7 @@ fn write_balance(
     balance_zat: u64,
     writer: &mut OrderedSstWriter<'_>,
     digest: &mut WalletProjectionDigestBuilder,
-    evidence: &mut ProjectionSstEvidence,
+    evidence: &mut WalletProjectionSstEvidence,
 ) -> Result<(), RocksDbWalletError> {
     if balance_zat == 0 {
         return Ok(());
@@ -783,7 +784,7 @@ fn drain_address_transactions(
     writer: &mut OrderedSstWriter<'_>,
     retained_undo: &mut RetainedUndo,
     digest: &mut WalletProjectionDigestBuilder,
-    evidence: &mut ProjectionSstEvidence,
+    evidence: &mut WalletProjectionSstEvidence,
 ) -> Result<(), RocksDbWalletError> {
     let mut pending = sorted.next_record()?;
     while let Some(first) = pending.take() {
@@ -846,7 +847,7 @@ fn stage_address_transaction(
 fn append_row(
     writer: &mut OrderedSstWriter<'_>,
     digest: &mut WalletProjectionDigestBuilder,
-    evidence: &mut ProjectionSstEvidence,
+    evidence: &mut WalletProjectionSstEvidence,
     family: WalletProjectionRowFamily,
     key: &[u8],
     encoded_value: &[u8],
@@ -857,7 +858,7 @@ fn append_row(
 }
 
 fn ordered_writer<'options>(
-    config: ProjectionLoadConfig<'options>,
+    config: WalletProjectionLoadConfig<'options>,
     artifact_label: &'static str,
 ) -> Result<OrderedSstWriter<'options>, RocksDbWalletError> {
     Ok(OrderedSstWriter::new(
@@ -877,13 +878,13 @@ fn prepare_families(
     for (name, files) in artifacts {
         sst_file_bytes = sst_file_bytes
             .checked_add(files.file_bytes)
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         sst_file_count = sst_file_count
             .checked_add(
                 u64::try_from(files.paths.len())
-                    .map_err(|_| RocksDbWalletError::ProjectionLoadAccountingOverflow)?,
+                    .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
             )
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         families.push(PreparedWalletColumnFamily {
             name,
             paths: files.paths,
@@ -983,7 +984,7 @@ mod tests {
         TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
         decode_canonical_block_replay, encode_canonical_block_replay,
     };
-    use zinder_rocksdb::BulkLoadError;
+    use zinder_rocksdb_bulk_load::BulkLoadError;
     use zinder_wallet_projection::WalletProjectionSerialOracle;
 
     use super::*;
@@ -1315,7 +1316,7 @@ mod tests {
         staging_path: &'options Path,
         options: &'options Options,
         limits: TestByteLimits,
-    ) -> ProjectionLoadConfig<'options> {
+    ) -> WalletProjectionLoadConfig<'options> {
         test_config_with_settled_tip(
             staging_path,
             options,
@@ -1329,8 +1330,8 @@ mod tests {
         options: &'options Options,
         limits: TestByteLimits,
         settled_tip: BlockId,
-    ) -> ProjectionLoadConfig<'options> {
-        ProjectionLoadConfig {
+    ) -> WalletProjectionLoadConfig<'options> {
+        WalletProjectionLoadConfig {
             staging_path,
             options,
             network: Network::ZcashRegtest,

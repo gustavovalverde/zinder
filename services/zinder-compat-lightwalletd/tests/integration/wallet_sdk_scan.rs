@@ -80,7 +80,7 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
     });
 
     let mut client = CompactTxStreamerClient::connect(format!("http://{server_addr}")).await?;
-    let latest_block = client
+    let visible_tip_block = client
         .get_latest_block(lightwalletd::ChainSpec {})
         .await?
         .into_inner();
@@ -106,7 +106,7 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
         received_blocks.push(compact_block);
     }
 
-    assert_eq!(latest_block.height, u64::from(SDK_SCAN_BLOCK_COUNT));
+    assert_eq!(visible_tip_block.height, u64::from(SDK_SCAN_BLOCK_COUNT));
     assert_eq!(
         received_blocks.len(),
         usize::try_from(SDK_SCAN_BLOCK_COUNT)?

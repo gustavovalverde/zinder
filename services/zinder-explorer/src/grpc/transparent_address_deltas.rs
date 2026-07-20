@@ -1,7 +1,7 @@
 //! `ExplorerQuery.TransparentAddressDeltas` handler.
 //!
 //! Reads the per-event signed value series materialized by
-//! [`zinder_derive::TransparentAddressDeltasConsumer`] out of the
+//! [`zinder_materialized_views::TransparentAddressDeltasConsumer`] out of the
 //! consumer-owned `transparent_address_deltas` column family. The storage
 //! layout sorts ascending by height under each address prefix, so the handler
 //! serves pages oldest-first and clients consume the zcashd
@@ -18,7 +18,7 @@ use zinder_proto::v1::explorer::{
     TransparentAddressDeltasEntry, TransparentAddressDeltasRecord, TransparentAddressDeltasRequest,
     TransparentAddressDeltasResponse,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_transparent_delta_kind;
 use zinder_runtime::AuthenticatedChannel;
 
@@ -28,7 +28,7 @@ use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
 use super::transparent_address_activity::address_lookup_to_script_hash;
-use zinder_derive::{DeriveStore, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY};
+use zinder_materialized_views::{MaterializedViewStore, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY};
 
 /// Hard cap on the delta rows one page returns.
 const MAX_TRANSPARENT_ADDRESS_DELTAS_ENTRIES_PER_REQUEST: u32 = 256;
@@ -43,11 +43,11 @@ const KIND_OFFSET: usize = HEIGHT_KEY_END + 4;
 
 /// Length of one primary storage key:
 /// 32 address + 4 ascending-height + 4 position + 1 kind + 4 event-index.
-const DELTAS_KEY_LEN: usize = zinder_derive::TRANSPARENT_ADDRESS_DELTAS_KEY_LEN;
+const DELTAS_KEY_LEN: usize = zinder_materialized_views::TRANSPARENT_ADDRESS_DELTAS_KEY_LEN;
 
 /// Executes one `ExplorerQuery.TransparentAddressDeltas` request.
-pub(crate) async fn handle_transparent_address_deltas(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_transparent_address_deltas(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     network: Network,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -64,7 +64,7 @@ pub(crate) async fn handle_transparent_address_deltas(
         MAX_TRANSPARENT_ADDRESS_DELTAS_ENTRIES_PER_REQUEST,
     );
     let (entries, next_cursor) = scan_address_deltas(
-        derive_store,
+        materialized_view_store,
         &DeltaScanParameters {
             script_hash,
             start_height: inner.start_height,
@@ -74,19 +74,19 @@ pub(crate) async fn handle_transparent_address_deltas(
         },
     )?;
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
             Some(chain_epoch),
             0,
@@ -110,7 +110,7 @@ struct DeltaScanParameters<'a> {
 }
 
 fn scan_address_deltas(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     parameters: &DeltaScanParameters<'_>,
 ) -> Result<(Vec<TransparentAddressDeltasEntry>, Vec<u8>), Status> {
     let prefix = encode_address_script_hash(parameters.script_hash);
@@ -122,7 +122,7 @@ fn scan_address_deltas(
 
     let scan_cap =
         (parameters.max_entries as usize).saturating_add(usize::from(resume_cursor.is_some()));
-    let rows = derive_store
+    let rows = materialized_view_store
         .range_iterate_consumer(
             TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
             &start_key,

@@ -2,7 +2,7 @@
 //!
 //! Aggregates per-transaction ZIP-317 conventional fee floors over an
 //! inclusive block range from the typed `BlockSummaryRecord` rows
-//! materialized by the derive plane. Coinbase transactions are excluded
+//! materialized by the materialized-view plane. Coinbase transactions are excluded
 //! because they have no fee.
 //!
 //! The fee fields are ZIP-317 conventional fee floors, not
@@ -15,10 +15,12 @@ use prost::Message as _;
 use tonic::{Request, Response, Status};
 use zinder_core::BlockHeight;
 use zinder_core::wire::encode_height_key_ascending;
-use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
+use zinder_materialized_views::{BLOCK_SUMMARY_COLUMN_FAMILY, MaterializedViewStore};
 use zinder_proto::capabilities::EXPLORER_FEE_SUMMARY_V1;
 use zinder_proto::v1::explorer::{BlockSummaryRecord, FeeSummaryRequest, FeeSummaryResponse};
-use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{
+    self, VisibleTipBlockRequest, wallet_query_client::WalletQueryClient,
+};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
@@ -29,21 +31,25 @@ use super::freshness::{
 /// Hard cap on the blocks one `FeeSummary` request aggregates.
 ///
 /// The wire response is a single aggregate over a contiguous window; the cap
-/// bounds one request's derive-store scan.
+/// bounds one request's materialized-view scan.
 const MAX_FEE_SUMMARY_BLOCKS_PER_REQUEST: u32 = 256;
 
 /// Executes one `ExplorerQuery.FeeSummary` request.
-pub(crate) async fn handle_fee_summary(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_fee_summary(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<FeeSummaryRequest>,
 ) -> Result<Response<FeeSummaryResponse>, Status> {
     let inner = request.into_inner();
     validate_range(inner.start_height, inner.end_height)?;
-    let aggregate = aggregate_block_summaries(derive_store, inner.start_height, inner.end_height)?;
+    let aggregate = aggregate_block_summaries(
+        materialized_view_store,
+        inner.start_height,
+        inner.end_height,
+    )?;
     let chain_epoch = fetch_latest_chain_epoch(wallet_client).await?;
-    let mut response = build_response(derive_store, aggregate, chain_epoch)?;
+    let mut response = build_response(materialized_view_store, aggregate, chain_epoch)?;
     if let Some(freshness) = response.freshness.take() {
         response.freshness =
             Some(attach_upstream_observation(upstream_observation_cache, freshness).await);
@@ -76,13 +82,13 @@ struct FeeAggregate {
 }
 
 fn aggregate_block_summaries(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_height: u32,
     end_height: u32,
 ) -> Result<FeeAggregate, Status> {
     let start_key = encode_height_key_ascending(BlockHeight::new(start_height));
     let end_key = encode_height_key_ascending(BlockHeight::new(end_height));
-    let entries = derive_store
+    let entries = materialized_view_store
         .range_iterate_consumer(
             BLOCK_SUMMARY_COLUMN_FAMILY,
             &start_key,
@@ -127,12 +133,12 @@ fn aggregate_block_summaries(
 }
 
 fn build_response(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     aggregate: FeeAggregate,
     chain_epoch: wallet::ChainEpoch,
 ) -> Result<FeeSummaryResponse, Status> {
     let freshness = build_explorer_freshness(
-        Some(derive_store),
+        Some(materialized_view_store),
         EXPLORER_FEE_SUMMARY_V1,
         Some(chain_epoch),
         0,
@@ -151,12 +157,12 @@ async fn fetch_latest_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<wallet::ChainEpoch, Status> {
     wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing").into()
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing").into()
         })
 }

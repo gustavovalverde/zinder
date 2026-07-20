@@ -1,4 +1,4 @@
-# Clean version-1 RocksDB storage construction against an existing Zebra.
+# Clean RocksDB storage construction against an existing Zebra.
 #
 # The topology reuses only Zebra's external network and authentication cookie.
 # Canonical and wallet state are project-scoped, disposable volumes. Zebra's

@@ -40,7 +40,7 @@ pub use node_target::{
     NodeAuthSection, NodeConfigError, NodeHealthConfig, NodeHealthSection, NodeSection, NodeTarget,
 };
 pub use source_block::{
-    SourceBlock, SourceBlockHeader, block_header_info_from_raw_block_bytes, decode_rpc_block_hash,
+    SourceBlock, SourceBlockHeader, block_header_from_raw_block_bytes, decode_rpc_block_hash,
     encode_rpc_block_hash,
 };
 pub use source_chain_update::{

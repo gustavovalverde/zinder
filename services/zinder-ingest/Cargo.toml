@@ -31,7 +31,7 @@ tonic = { workspace = true, features = ["server", "transport"] }
 tracing.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
-zinder-derive.workspace = true
+zinder-materialized-views.workspace = true
 zinder-proto.workspace = true
 zinder-runtime.workspace = true
 zinder-source.workspace = true

@@ -1,12 +1,14 @@
-//! Phase classifier for the unified ingest loop.
+//! Phase classifier for the phase-driven ingest loop.
 //!
-//! Per [ADR-0015](../../../docs/adrs/0015-unified-phase-driven-ingest.md),
+//! Per [ADR-0015](../../../docs/adrs/0015-phase-driven-ingest.md),
 //! the writer dispatches its work into one of three phases on every
 //! iteration: [`IngestPhase::AwaitingUpstream`],
 //! [`IngestPhase::BulkCatchup`], and [`IngestPhase::FollowingTip`]. This
 //! module owns the pure-function classifier ([`classify_phase`]) plus the
 //! shared [`current_chain_height`] helper consumed by every phase handler.
-//! The handlers and the spawn-once orchestration live in `ingest_loop.rs`.
+//! Construction and follow phases are dispatched directly by `writer/mod.rs`
+//! and `writer/follow.rs`; [`classify_phase`] also backs the CLI `probe`
+//! diagnostic in `main.rs`.
 
 use zinder_runtime::IngestPhase;
 use zinder_store::PrimaryChainStore;
@@ -40,10 +42,10 @@ pub fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
 /// - [`IngestPhase::BulkCatchup`] when the gap from the store tip to
 ///   the upstream tip exceeds `catchup_threshold_blocks`. The bulk
 ///   driver runs the pipelined fetch shape and commits with
-///   `AdvanceSafeTipTo`.
+///   `AdvanceSettledTipTo`.
 /// - [`IngestPhase::FollowingTip`] otherwise. The serial driver
-///   commits one block per poll cycle and advances the safe-tip
-///   boundary through `finalize_tip_if_ready`.
+///   commits one block per poll cycle and advances the settled-tip
+///   boundary through `advance_settled_tip_if_ready`.
 ///
 /// An empty store (`store_tip = None`) is treated as height `0` so the
 /// gap is the upstream tip itself. A store ahead of the upstream tip
@@ -53,7 +55,7 @@ pub fn current_chain_height(store: &PrimaryChainStore) -> Option<u32> {
 /// replacement chain re-emerges.
 ///
 /// [ADR-0015 §Decision]:
-///     ../../../docs/adrs/0015-unified-phase-driven-ingest.md#decision
+///     ../../../docs/adrs/0015-phase-driven-ingest.md#decision
 #[must_use]
 pub fn classify_phase(
     store_tip: Option<u32>,

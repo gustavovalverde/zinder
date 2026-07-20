@@ -1,31 +1,34 @@
 //! Local secondary-reader implementation of the chain-index contract.
 
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
 use tokio_stream as stream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockBlobArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
-    ChainEpochId, CompactBlockArtifact, MinedDetails, MinedTransaction, Network,
+    BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch,
+    ChainEpochId, CompactBlockArtifact, MinedTransaction, MinedTransactionChainContext, Network,
     NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TreeStateArtifact, TxStatus,
 };
-use zinder_derive::{
-    DeriveStore, DeriveStoreOptions, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-    TransparentAddressTransactionHistoryConsumer, TransparentAddressTransactionHistoryPageRequest,
+use zinder_materialized_views::{
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreOptions,
+    MaterializedViewStoreReadSnapshot, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TransparentAddressTransactionHistoryConsumer,
+    TransparentAddressTransactionHistoryPageRequest, TransparentOutpointSpendConsumer,
 };
 use zinder_store::{
-    AddressOutputIndexPageRequest, BlockHashLookup, ChainStoreOptions, RocksDbResourceBudget,
-    SecondaryChainStore, StoreError,
+    AddressOutputIndexPageRequest, BlockHashLookup, ChainEventStreamFamily, ChainStoreOptions,
+    EventStreamStartPosition, RocksDbResourceBudget, SecondaryChainStore, StoreError,
 };
 
 use crate::{
     BlockId, ChainIndex, IndexStream, IndexerError, RemoteChainIndex, RemoteOpenOptions,
-    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream, TransparentAddressTxIdsStreamItem,
-    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
-    TransparentUnspentOutputStreamItem, TransparentUtxoSetSummaryView,
+    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
+    TransparentAddressUnspentOutputsStream, TransparentUnspentOutputChunk,
+    TransparentUtxoSetSummaryView,
 };
 
 /// Default maximum time spent on initial secondary catchup during local open.
@@ -43,9 +46,9 @@ pub struct LocalOpenOptions {
     /// Bounded `RocksDB` resource budget applied when opening the canonical
     /// secondary store.
     pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
-    /// Bounded `RocksDB` resource budget applied when opening the derive
+    /// Bounded `RocksDB` resource budget applied when opening the materialized-view
     /// secondary store.
-    pub derive_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional service endpoint used for subscriptions and command RPCs.
     pub subscription_endpoint: Option<String>,
     /// Periodic secondary catchup interval.
@@ -54,7 +57,8 @@ pub struct LocalOpenOptions {
     /// secondary view.
     pub initial_catchup_timeout: Duration,
     /// Node-discovered upgrade activations used to fill
-    /// `MinedDetails.consensus_branch_id` on `transaction_by_id` responses.
+    /// `MinedTransactionChainContext.consensus_branch_id` on
+    /// `transaction_by_id` responses.
     /// The production binary discovers this via
     /// `ZebraJsonRpcSource::discover_network_upgrade_activations`.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
@@ -67,7 +71,7 @@ pub struct LocalOpenOptions {
 /// Local chain index backed by a `RocksDB` secondary reader.
 pub struct LocalChainIndex {
     store: SecondaryChainStore,
-    derive_store: Option<DeriveStore>,
+    materialized_view_store: Option<MaterializedViewStore>,
     remote_index: Option<RemoteChainIndex>,
     catchup_interval: Duration,
     catchup_cancel: CancellationToken,
@@ -112,10 +116,10 @@ impl LocalChainIndex {
             "canonical",
         )
         .await?;
-        let derive_store = open_derive_secondary_with_timeout(
+        let materialized_view_store = open_materialized_view_secondary_with_timeout(
             options.storage_path.clone(),
             options.secondary_path.clone(),
-            options.derive_rocksdb_budget,
+            options.materialized_view_rocksdb_budget,
             options.initial_catchup_timeout,
         )
         .await?;
@@ -136,7 +140,7 @@ impl LocalChainIndex {
 
         Ok(Self {
             store,
-            derive_store,
+            materialized_view_store,
             remote_index,
             catchup_interval: options.catchup_interval,
             catchup_cancel,
@@ -174,6 +178,61 @@ impl LocalChainIndex {
     }
 }
 
+/// Resolves the authenticated visible-chain event fence for `expected_chain_epoch`.
+///
+/// A canonical secondary can catch up between the epoch read and `LiveTail`
+/// resolution. Re-reading the epoch makes that race fail closed instead of
+/// returning materialized history from another branch under the requested epoch.
+fn current_visible_chain_event_cursor_for_epoch(
+    store: &SecondaryChainStore,
+    expected_chain_epoch: ChainEpoch,
+) -> Result<Option<zinder_store::StreamCursorTokenV1>, IndexerError> {
+    let fence = store
+        .resolve_chain_event_stream_start(
+            &EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Visible,
+        )
+        .map_err(IndexerError::from_store_error)?
+        .cursor;
+    let current_chain_epoch = store
+        .current_chain_epoch_reader()
+        .map_err(IndexerError::from_store_error)?
+        .chain_epoch();
+    if current_chain_epoch != expected_chain_epoch {
+        return Err(IndexerError::FailedPrecondition {
+            reason:
+                "canonical chain advanced while binding transparent-address transaction history"
+                    .to_owned(),
+        });
+    }
+    Ok(fence)
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Unknown materialized-view failures retain the client storage-error mapping."
+)]
+fn map_transparent_history_page_error(
+    error: zinder_materialized_views::MaterializedViewStoreError,
+) -> IndexerError {
+    match error {
+        zinder_materialized_views::MaterializedViewStoreError::ConsumerCursorInvalid {
+            reason: "cursor is bound to a different visible chain fence",
+            ..
+        } => IndexerError::FailedPrecondition {
+            reason: "transparent-address transaction history cursor is bound to a replaced visible chain"
+                .to_owned(),
+        },
+        zinder_materialized_views::MaterializedViewStoreError::ConsumerCursorInvalid {
+            reason,
+            ..
+        } => IndexerError::InvalidRequest {
+            reason: reason.to_owned(),
+        },
+        error => IndexerError::from_materialized_view_store_error(error),
+    }
+}
+
 impl Drop for LocalChainIndex {
     fn drop(&mut self) {
         self.catchup_cancel.cancel();
@@ -191,7 +250,7 @@ impl ChainIndex for LocalChainIndex {
             .await
     }
 
-    async fn latest_block(
+    async fn visible_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
@@ -205,7 +264,7 @@ impl ChainIndex for LocalChainIndex {
         .await
     }
 
-    async fn latest_safe_block(
+    async fn settled_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
@@ -234,14 +293,14 @@ impl ChainIndex for LocalChainIndex {
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockHeaderInfo, IndexerError> {
+    ) -> Result<BlockHeader, IndexerError> {
         self.read_at_epoch(at_epoch_id, move |reader| {
             let block_id = resolve_block_id(reader, selector)?;
             let block = reader
                 .block_header_at(block_id.height)
                 .map_err(IndexerError::from_store_error)?
                 .ok_or(IndexerError::NotFound { resource: "block" })?;
-            Ok(block.into_header_info())
+            Ok(block.into_header())
         })
         .await
     }
@@ -424,7 +483,7 @@ impl ChainIndex for LocalChainIndex {
                     .unwrap_or_default();
                 let consensus_branch_id =
                     activations.consensus_branch_id_at(artifact.location.block_height);
-                let details = MinedDetails::from_response_epoch(
+                let chain_context = MinedTransactionChainContext::from_response_epoch(
                     &chain_epoch,
                     artifact.location.block_height,
                     consensus_branch_id,
@@ -436,7 +495,7 @@ impl ChainIndex for LocalChainIndex {
                     .map(|blob| blob.raw_transaction_bytes);
                 Ok(TxStatus::Mined(MinedTransaction::new(
                     artifact.location,
-                    details,
+                    chain_context,
                     raw_transaction_bytes,
                 )))
             })
@@ -476,7 +535,7 @@ impl ChainIndex for LocalChainIndex {
             })
             .await?;
         let items = outputs.into_iter().map(move |output| {
-            Ok(TransparentUnspentOutputStreamItem {
+            Ok(TransparentUnspentOutputChunk {
                 chain_epoch,
                 output,
             })
@@ -491,9 +550,9 @@ impl ChainIndex for LocalChainIndex {
         let max_entries = query
             .max_entries
             .unwrap_or(DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES);
-        let Some(derive_store) = self.derive_store.clone() else {
+        let Some(materialized_view_store) = self.materialized_view_store.clone() else {
             return Err(IndexerError::FailedPrecondition {
-                reason: "transparent-address transaction history derive projection is unavailable"
+                reason: "transparent-address transaction history materialized view is unavailable"
                     .to_owned(),
             });
         };
@@ -506,28 +565,30 @@ impl ChainIndex for LocalChainIndex {
                 .current_chain_epoch_reader()
                 .map_err(IndexerError::from_store_error)?
                 .chain_epoch();
-            derive_store
+            let canonical_fence =
+                current_visible_chain_event_cursor_for_epoch(&store, chain_epoch)?;
+            materialized_view_store
                 .try_catch_up()
-                .map_err(IndexerError::from_derive_store_error)?;
-            let derive_height = derive_store
-                .last_materialized_height_ascending(
-                    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-                )
-                .map_err(IndexerError::from_derive_store_error)?;
-            if derive_height.is_none_or(|height| height < chain_epoch.visible_tip_height) {
+                .map_err(IndexerError::from_materialized_view_store_error)?;
+            let snapshot = materialized_view_store.read_snapshot();
+            let materialized_fence = snapshot
+                .get_chain_event_cursor(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)
+                .map_err(IndexerError::from_materialized_view_store_error)?;
+            if materialized_fence.as_deref()
+                != canonical_fence
+                    .as_ref()
+                    .map(zinder_store::StreamCursorTokenV1::as_bytes)
+            {
                 return Err(IndexerError::FailedPrecondition {
-                    reason: format!(
-                        "transparent-address transaction history is behind canonical height {}: derive height {:?}",
-                        chain_epoch.visible_tip_height.value(),
-                        derive_height.map(BlockHeight::value)
-                    ),
+                    reason: "transparent-address transaction history does not cover the current visible chain fence"
+                        .to_owned(),
                 });
             }
             let cursor_token = query.from_cursor.map(|cursor| {
                 zinder_store::StreamCursorTokenV1::from_bytes(cursor.as_bytes().to_vec())
             });
-            let page = TransparentAddressTransactionHistoryConsumer::read_page(
-                &derive_store,
+            let page = TransparentAddressTransactionHistoryConsumer::read_page_snapshot(
+                &snapshot,
                 TransparentAddressTransactionHistoryPageRequest {
                     address_script_hash: query.address_script_hash,
                     start_height: query.start_height,
@@ -535,9 +596,11 @@ impl ChainIndex for LocalChainIndex {
                     max_entries,
                     descending: query.descending,
                     from_cursor: cursor_token.as_ref(),
+                    chain_event_fence: canonical_fence.as_ref(),
                 },
             )
-            .map_err(IndexerError::from_derive_store_error)?;
+            .map_err(map_transparent_history_page_error)?;
+            drop(snapshot);
             Ok((chain_epoch, page.artifacts, page.next_cursor))
         }))
         .await?;
@@ -549,7 +612,7 @@ impl ChainIndex for LocalChainIndex {
             .into_iter()
             .enumerate()
             .map(move |(index, artifact)| {
-                Ok(TransparentAddressTxIdsStreamItem {
+                Ok(TransparentAddressTransactionChunk {
                     chain_epoch,
                     artifact,
                     cursor: if index == last_index {
@@ -646,25 +709,63 @@ impl ChainIndex for LocalChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentSpendsByOutpointResponse, IndexerError> {
         let outpoints = normalize_transparent_outpoints(outpoints)?;
-        self.read_at_epoch(at_epoch_id, move |reader| {
+        let canonical_store = self.store.clone();
+        let materialized_view_store = self.materialized_view_store.clone();
+        join_blocking(tokio::task::spawn_blocking(move || {
+            canonical_store
+                .try_catch_up()
+                .map_err(IndexerError::from_store_error)?;
+            let reader = match at_epoch_id {
+                Some(at_epoch_id) => canonical_store
+                    .chain_epoch_reader_at(at_epoch_id)
+                    .map_err(|error| map_epoch_pin_store_error(error, at_epoch_id))?,
+                None => canonical_store
+                    .current_chain_epoch_reader()
+                    .map_err(IndexerError::from_store_error)?,
+            };
             let chain_epoch = reader.chain_epoch();
-            let spends_by_outpoint = reader
+            let canonical_spends = reader
                 .transparent_spend_facts_by_outpoints(&outpoints)
                 .map_err(IndexerError::from_store_error)?;
-            let mut spends = Vec::with_capacity(spends_by_outpoint.len());
-            let mut seen = std::collections::HashSet::with_capacity(spends_by_outpoint.len());
-            for outpoint in outpoints {
-                if let Some(fact) = spends_by_outpoint.get(&outpoint)
-                    && seen.insert(outpoint)
-                {
-                    spends.push(zinder_core::TransparentSpendEntry::from_spend_fact(fact));
+            let mut spends = Vec::with_capacity(outpoints.len());
+            let mut seen_outpoints = HashSet::with_capacity(outpoints.len());
+            let mut unresolved_outpoints = Vec::new();
+            for outpoint in &outpoints {
+                if let Some(spend) = canonical_spends.get(outpoint) {
+                    if seen_outpoints.insert(*outpoint) {
+                        spends.push(zinder_core::TransparentSpendEntry::from_spend_fact(spend));
+                    }
+                } else {
+                    unresolved_outpoints.push(*outpoint);
+                }
+            }
+            if !unresolved_outpoints.is_empty()
+                && let Some(deleted_through_height) = reader
+                    .transparent_retention_deleted_through_height()
+                    .map_err(IndexerError::from_store_error)?
+            {
+                let materialized_view_store =
+                    materialized_view_store.ok_or_else(transparent_spend_projection_unavailable)?;
+                materialized_view_store
+                    .try_catch_up()
+                    .map_err(IndexerError::from_materialized_view_store_error)?;
+                let snapshot = materialized_view_store.read_snapshot();
+                for spend in resolve_materialized_transparent_spends(
+                    &snapshot,
+                    &reader,
+                    deleted_through_height,
+                    &unresolved_outpoints,
+                )? {
+                    if seen_outpoints.insert(spend.spent_outpoint) {
+                        spends.push(spend);
+                    }
                 }
             }
             Ok(zinder_core::TransparentSpendsByOutpointResponse {
                 chain_epoch,
                 spends,
             })
-        })
+        }))
         .await
     }
 
@@ -760,6 +861,98 @@ const DEFAULT_MAX_TRANSPARENT_HISTORY_ENTRIES: NonZeroU32 = NonZeroU32::MIN.satu
 /// balance read, matching the wallet plane's `WalletQuery` bound.
 const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
 
+fn resolve_materialized_transparent_spends(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    reader: &zinder_store::ChainEpochReader<'_>,
+    deleted_through_height: BlockHeight,
+    unresolved_outpoints: &[zinder_core::TransparentOutPoint],
+) -> Result<Vec<zinder_core::TransparentSpendEntry>, IndexerError> {
+    let materialized_view_state = snapshot
+        .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
+        .map_err(IndexerError::from_materialized_view_store_error)?
+        .ok_or_else(transparent_spend_projection_unavailable)?;
+    validate_transparent_spend_materialized_view_coverage(
+        reader,
+        materialized_view_state,
+        deleted_through_height,
+    )?;
+    let projected_spends = TransparentOutpointSpendConsumer::read_spends_by_outpoints_snapshot(
+        snapshot,
+        unresolved_outpoints,
+    )
+    .map_err(IndexerError::from_materialized_view_store_error)?;
+    let settled_tip_height = reader.chain_epoch().settled_tip_height;
+    let mut resolved_spends = Vec::with_capacity(projected_spends.len());
+    for outpoint in unresolved_outpoints {
+        let Some(spend) = projected_spends.get(outpoint) else {
+            continue;
+        };
+        if spend.spending_block_height <= settled_tip_height
+            && transparent_spend_matches_canonical_header(reader, spend)?
+        {
+            resolved_spends.push(spend.clone());
+        }
+    }
+    Ok(resolved_spends)
+}
+
+fn validate_transparent_spend_materialized_view_coverage(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    materialized_view_state: MaterializedViewState,
+    deleted_through_height: BlockHeight,
+) -> Result<(), IndexerError> {
+    let coverage = materialized_view_state
+        .coverage
+        .ok_or_else(transparent_spend_projection_unavailable)?;
+    let first_available_height = reader.canonical_history_bounds().first_available_height();
+    let covers_deleted_facts = coverage.complete_from_height <= first_available_height
+        && coverage.complete_through_height >= deleted_through_height;
+    let materialized_view_tip_is_canonical = canonical_block_hash_matches(
+        reader,
+        materialized_view_state.tip_height,
+        materialized_view_state.tip_hash,
+    )?;
+    let coverage_tip_is_canonical = canonical_block_hash_matches(
+        reader,
+        coverage.complete_through_height,
+        coverage.complete_through_hash,
+    )?;
+    if !covers_deleted_facts || !materialized_view_tip_is_canonical || !coverage_tip_is_canonical {
+        return Err(transparent_spend_projection_unavailable());
+    }
+    Ok(())
+}
+
+fn transparent_spend_matches_canonical_header(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    spend: &zinder_core::TransparentSpendEntry,
+) -> Result<bool, IndexerError> {
+    canonical_block_hash_matches(
+        reader,
+        spend.spending_block_height,
+        spend.spending_block_hash,
+    )
+}
+
+fn canonical_block_hash_matches(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    height: BlockHeight,
+    expected_hash: zinder_core::BlockHash,
+) -> Result<bool, IndexerError> {
+    Ok(reader
+        .block_header_at(height)
+        .map_err(IndexerError::from_store_error)?
+        .is_some_and(|header| header.block_hash == expected_hash))
+}
+
+fn transparent_spend_projection_unavailable() -> IndexerError {
+    IndexerError::FailedPrecondition {
+        reason:
+            "transparent-outpoint-spend materialized view does not cover every canonical deletion"
+                .to_owned(),
+    }
+}
+
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "Only a missing pinned epoch becomes a client precondition error; all other storage failures keep the shared storage mapping."
@@ -784,35 +977,38 @@ async fn join_blocking<Output>(
     }
 }
 
-async fn open_derive_secondary_with_timeout(
+async fn open_materialized_view_secondary_with_timeout(
     storage_path: PathBuf,
     secondary_path: PathBuf,
-    derive_rocksdb_budget: RocksDbResourceBudget,
+    materialized_view_rocksdb_budget: RocksDbResourceBudget,
     timeout: Duration,
-) -> Result<Option<DeriveStore>, IndexerError> {
-    let derive_storage_path = DeriveStore::path_for_canonical(&storage_path);
-    let derive_secondary_path = secondary_path.join("derive");
-    let derive_store =
-        join_blocking(tokio::task::spawn_blocking(
-            move || match DeriveStore::open_secondary(
-                derive_storage_path,
-                derive_secondary_path,
-                DeriveStoreOptions {
-                    sync_writes: false,
-                    consumers: DeriveStore::bundled_consumers(),
-                    rocksdb_resource_budget: derive_rocksdb_budget,
-                },
-            ) {
-                Ok(derive_store) => Ok(Some(derive_store)),
-                Err(zinder_derive::DeriveStoreError::Open { .. }) => Ok(None),
-                Err(error) => Err(IndexerError::from_derive_store_error(error)),
+) -> Result<Option<MaterializedViewStore>, IndexerError> {
+    let materialized_view_storage_path = MaterializedViewStore::path_for_canonical(&storage_path);
+    let materialized_view_secondary_path = secondary_path.join("materialized-views");
+    let materialized_view_store = join_blocking(tokio::task::spawn_blocking(move || {
+        match MaterializedViewStore::open_secondary(
+            materialized_view_storage_path,
+            materialized_view_secondary_path,
+            MaterializedViewStoreOptions {
+                sync_writes: false,
+                consumers: MaterializedViewStore::bundled_consumers(),
+                rocksdb_resource_budget: materialized_view_rocksdb_budget,
             },
-        ))
+        ) {
+            Ok(materialized_view_store) => Ok(Some(materialized_view_store)),
+            Err(zinder_materialized_views::MaterializedViewStoreError::Open { .. }) => Ok(None),
+            Err(error) => Err(IndexerError::from_materialized_view_store_error(error)),
+        }
+    }))
+    .await?;
+    if let Some(materialized_view_store_for_initial_catchup) = materialized_view_store.clone() {
+        try_catch_up_materialized_view_store_with_timeout(
+            materialized_view_store_for_initial_catchup,
+            timeout,
+        )
         .await?;
-    if let Some(derive_store_for_initial_catchup) = derive_store.clone() {
-        try_catch_up_derive_store_with_timeout(derive_store_for_initial_catchup, timeout).await?;
     }
-    Ok(derive_store)
+    Ok(materialized_view_store)
 }
 
 async fn try_catch_up_store_with_timeout(
@@ -844,14 +1040,14 @@ async fn try_catch_up_store_with_timeout(
     }
 }
 
-async fn try_catch_up_derive_store_with_timeout(
-    derive_store: DeriveStore,
+async fn try_catch_up_materialized_view_store_with_timeout(
+    materialized_view_store: MaterializedViewStore,
     timeout: Duration,
 ) -> Result<(), IndexerError> {
     let handle = tokio::task::spawn_blocking(move || {
-        derive_store
+        materialized_view_store
             .try_catch_up()
-            .map_err(IndexerError::from_derive_store_error)
+            .map_err(IndexerError::from_materialized_view_store_error)
     });
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(catchup_outcome)) => catchup_outcome,
@@ -862,9 +1058,9 @@ async fn try_catch_up_derive_store_with_timeout(
             tracing::warn!(
                 target: "zinder::client",
                 event = "initial_secondary_catchup_timed_out",
-                role = "derive",
+                role = "materialized-views",
                 timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                "initial derive secondary catchup timed out; opening with the current secondary view"
+                "initial materialized-view secondary catchup timed out; opening with the current secondary view"
             );
             Ok(())
         }

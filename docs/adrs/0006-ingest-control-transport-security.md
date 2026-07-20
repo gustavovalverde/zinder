@@ -13,7 +13,7 @@
 exposes a private `IngestControl` gRPC endpoint and that
 `zinder-query`, `zinder-compat-lightwalletd`, and embedded
 `zinder-client::LocalChainIndex` consumers reach the writer's live state
-through it. The endpoint serves `WriterStatus`, `ChainEvents`,
+through it. The endpoint serves `WriterStatus`, `VisibleChainEvents`,
 `MempoolSnapshot`, and `MempoolEvents`. Anyone who can route a TCP
 connection to the listen address can subscribe to chain events, read the
 mempool, and observe the writer's progress.
@@ -213,7 +213,7 @@ separate decision that names the deployment shape it serves.
   `BearerTokenClientInterceptor`, `constant_time_eq`, and
   `BearerTokenError`.
 - The interceptors plug into `tonic::service::interceptor::InterceptedService`
-  on the server (`IngestControlGrpcAdapter::into_server`) and into
+  on the server (`CanonicalIngestControlGrpcAdapter::into_server`) and into
   `IngestControlClient::with_interceptor` on every consumer.
 - Consumers thread an `Option<BearerToken>` through their public
   builders: `WriterStatusConfig.bearer_token`,
@@ -223,9 +223,9 @@ separate decision that names the deployment shape it serves.
 
 ## Out of Scope
 
-- Native gRPC TLS in `zinder-ingest`, `zinder-query`,
-  `zinder-compat-lightwalletd`. Reverse-proxy termination is the
-  documented production answer.
+- Native gRPC TLS in `zinder-ingest`, `zinder-compat-lightwalletd`, or a
+  custom native adapter that embeds `zinder-query`. Reverse-proxy termination
+  is the documented production answer.
 - mTLS or per-reader client identity.
 - Hot-reload of the token file.
 - Audit logging of authentication failures beyond the existing

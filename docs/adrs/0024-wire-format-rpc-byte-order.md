@@ -39,20 +39,30 @@ RocksDB keys and stored artifacts keep internal byte order. The newtypes `Transa
 - `encode_internal_<thing>(value) -> [u8; 32]` and `decode_internal_<thing>(bytes) -> <Thing>`: identity-shaped wrappers used by storage paths.
 - `encode_rpc_<thing>_hex(value) -> String` and `decode_rpc_<thing>_hex(input: &str) -> <Thing>`: the wire-facing pair. `encode_rpc_*_hex` reverses then hex-encodes. `decode_rpc_*_hex` hex-decodes then reverses; bad inputs surface as `WireDecodeError`.
 
-The renamed helpers (previously `encode_display_*_hex` / `decode_display_*_hex`) adopt the spec's vocabulary so the function name documents the form it produces or accepts. New modules `wire/auth_digest.rs`, `wire/wtxid.rs`, and `wire/merkle_root.rs` provide the same pair for the three hash kinds that previously lacked dedicated wire helpers.
+The helper names state the form they produce or accept. Dedicated helpers cover
+transaction ids, block hashes, authentication digests, wtxids, and merkle
+roots, so adapters do not implement byte reversal locally.
 
 ### Search input
 
-`crates/zinder-core/src/explorer_search.rs` accepts user-supplied hex search input in RPC byte order. The classifier calls `decode_rpc_transaction_id_hex` and `decode_rpc_block_hash_hex` and hands the resulting internal-form `TransactionId` / `BlockHash` to the storage probe. Before this change, the classifier decoded hex literally without reversal, so users typing the canonical form missed the storage key.
+`crates/zinder-core/src/explorer_search.rs` accepts user-supplied hex search
+input in RPC byte order. The classifier calls `decode_rpc_transaction_id_hex`
+and `decode_rpc_block_hash_hex` and hands the resulting internal-form
+`TransactionId` / `BlockHash` to the storage probe.
 
 ### lightwalletd-compat exemption
 
-The proto under `crates/zinder-proto/proto/compat/lightwalletd/` is frozen by lightwalletd's upstream contract: every hash field there is `bytes` in protocol (internal) order with an explicit `// MUST NOT be reversed` comment. Those fields are unchanged. The `services/zinder-compat-lightwalletd` adapter still consumes the renamed wire helpers (`encode_rpc_*_hex` is the right call where lightwalletd asks for display-form strings, such as `lightwalletd::TreeState.hash` and `lightwalletd::SendResponse.error_message`).
+The proto under `crates/zinder-proto/proto/compat/lightwalletd/` is frozen by
+lightwalletd's upstream contract: every hash field there is `bytes` in protocol
+(internal) order with an explicit `// MUST NOT be reversed` comment. The
+`services/zinder-compat-lightwalletd` adapter uses the shared wire helpers when
+lightwalletd requests RPC-form strings, such as `lightwalletd::TreeState.hash`
+and `lightwalletd::SendResponse.error_message`.
 
 ## Consequences
 
 - **Breaking proto change.** Every consumer regenerates from the new proto and drops its own byte-reversal logic. Field numbers are unchanged; only the wire type flips from `bytes` to `string`. With all consumers in alpha, the change ships in one cut without a parallel-fields deprecation cycle.
-- **Stored proto messages flip with the wire.** Several stored artifacts in the chain store (`BlockHeaderInfo`, `TransactionLocation`, `OutPoint`, mempool/transparent-address entries) and every derive payload (`BlockSummaryRecord`, `TransactionHistoryEntry`, etc.) contain the same hash-shaped fields. Their on-disk encoding changes with the proto. `CURRENT_ARTIFACT_SCHEMA_VERSION` bumps from 9 to 10 and refuses to open a store written under the older version; each affected derive consumer bumps its own schema version and rebuilds its projection per [ADR-0028](0028-per-consumer-derive-schema-versioning.md). Existing deployments must wipe and re-sync the canonical store directory before starting the new binary.
+- **Stored proto messages flip with the wire.** Several stored artifacts in the chain store (`BlockHeader`, `TransactionLocation`, `OutPoint`, mempool/transparent-address entries) and every materialized-view payload (`BlockSummaryRecord`, `TransactionHistoryEntry`, etc.) contain the same hash-shaped fields. Their on-disk encoding changes with the proto. The owning canonical and consumer schemas reject incompatible layouts; materialized views require a fresh store per [ADR-0028](0028-materialized-view-schema-versioning.md). Deployments construct fresh compatible canonical storage before starting a binary with a changed wire-backed layout.
 - **One vocabulary.** "RPC byte order" and "internal byte order" are the only terms used in proto comments, code comments, ADRs, and the public-interfaces glossary. Both are direct references to the protocol specification. Folk terms ("display form", "big-endian hash", "user-facing hex") do not appear in the codebase.
 - **Wire size grows ~2x for hash fields.** A `BlockDetail` response with 4,000 txids goes from ~128 KB to ~256 KB of payload. This is negligible over HTTP/2 with gzip and irrelevant for the explorer plane. The lightwalletd-compat plane streams compact blocks at scale and keeps the `bytes` form precisely because its consumer mix differs.
 - **One translation site.** The `wire/` module owns the byte-reversal. Adapters call `encode_rpc_*_hex` on outbound and `decode_rpc_*_hex` on inbound; the existing `wire_invariants` integration test forbids inline `.as_bytes()` or `hex::encode` on hash material outside this module.

@@ -34,11 +34,9 @@ pub(crate) use canonical_history_bounds::{
 };
 pub(crate) use store_key::StoreKey;
 pub use stream_cursor::{
-    AddressOutputCursorPayload, AddressOutputStreamFamily, ChainEventStreamFamily,
-    MempoolEventCursorPayload, MempoolEventStreamFamily, STREAM_CURSOR_TOKEN_V1_LEN,
-    SnapshotPageCursorAnchor, SnapshotPageCursorPayload, SnapshotPageStreamFamily,
-    StreamCursorError, StreamCursorTokenV1, TransparentHistoryCursorAnchor,
-    TransparentHistoryCursorPayload, TransparentHistoryStreamFamily,
+    AddressOutputCursorPayload, ChainEventStreamFamily, MempoolEventCursorPayload,
+    STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorAnchor, SnapshotPageCursorPayload,
+    StreamCursorError, StreamCursorTokenV1,
 };
 pub(crate) use stream_cursor::{
     CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator,

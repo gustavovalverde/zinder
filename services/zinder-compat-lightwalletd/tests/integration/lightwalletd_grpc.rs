@@ -8,7 +8,6 @@ use eyre::eyre;
 use parking_lot::Mutex;
 use prost::Message;
 use std::sync::Arc;
-use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, transport::Server};
@@ -22,18 +21,11 @@ use zinder_core::{
     BroadcastUnknown, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network,
     NetworkUpgradeActivations, RawTransactionBytes, SUBTREE_LEAF_COUNT, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentSpendFact,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputsByOutpointResponse,
+    TransparentSpendFact, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, UnixTimestampMillis,
-    wire::{encode_height_key_ascending, encode_internal_block_hash},
-};
-use zinder_derive::{
-    DeriveStore, DeriveStoreOptions, ProjectionPreset,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+    wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -41,22 +33,21 @@ use zinder_proto::compat::lightwalletd::{
 };
 
 use zinder_query::{
-    BlockHeaderResponseValue, BlockIdResponseValue, ChainEvents, CompactBlock, CompactBlockRange,
-    FullBlock, FullBlockStream, LatestBlock, LatestSafeBlock, QueryError, RawTransaction,
-    SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQuery, WalletQueryApi,
-    derive_store_wallet_projection_reader,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange, FullBlock,
+    FullBlockStream, QueryError, RawTransaction, SettledTipBlock, SubtreeRoots, Transaction,
+    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
+    VisibleTipBlock, WalletQuery, WalletQueryApi,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEventStreamFamily,
     ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention, ReorgWindowChange,
-    RocksDbResourceBudget, StreamCursorTokenV1,
+    StreamCursorTokenV1,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
     encode_fixture_block_replay, sample_regtest_upgrade_activations,
-    seed_transparent_address_transaction_history, synthetic_transaction_public_facts,
+    synthetic_transaction_public_facts,
 };
 
 const ACCEPTANCE_BLOCK_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -80,7 +71,7 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         Arc::new(sample_regtest_upgrade_activations()),
     );
 
-    let latest_block = adapter
+    let visible_tip_block = adapter
         .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
         .await?
         .into_inner();
@@ -131,7 +122,7 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         .await?
         .into_inner();
 
-    assert_eq!(latest_block.height, 1);
+    assert_eq!(visible_tip_block.height, 1);
     assert_eq!(block.height, 1);
     assert_eq!(block.vtx.len(), 1);
     assert!(
@@ -200,60 +191,6 @@ async fn lightd_info_refuses_transparent_support_without_projection_readiness() 
         .into_inner();
 
     assert!(!lightd_info.taddr_support);
-    Ok(())
-}
-
-#[tokio::test]
-async fn lightd_info_advertises_transparent_support_only_when_wallet_projections_cover_tip()
--> eyre::Result<()> {
-    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let derive_tempdir = tempdir()?;
-    let derive_store = DeriveStore::open_with_projection_preset(
-        derive_tempdir.path(),
-        ProjectionPreset::Wallet,
-        DeriveStoreOptions {
-            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-            ..DeriveStoreOptions::default()
-        },
-    )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    )
-    .with_transparent_address_support()
-    .with_wallet_projection_reader(derive_store_wallet_projection_reader(derive_store.clone()));
-
-    let before_materialization = adapter
-        .get_lightd_info(Request::new(lightwalletd::Empty {}))
-        .await?
-        .into_inner();
-    assert!(!before_materialization.taddr_support);
-
-    let tip_key = encode_height_key_ascending(ACCEPTANCE_BLOCK_HEIGHT);
-    for (projection, index_column_family) in [
-        (
-            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-        ),
-        (
-            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
-            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
-        ),
-    ] {
-        set_projection_at_canonical_tip(store_fixture.chain_store(), &derive_store, projection)?;
-        derive_store.put_consumer(index_column_family, &tip_key, &[])?;
-    }
-
-    let after_materialization = adapter
-        .get_lightd_info(Request::new(lightwalletd::Empty {}))
-        .await?
-        .into_inner();
-    assert!(after_materialization.taddr_support);
-
     Ok(())
 }
 
@@ -763,26 +700,26 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         self.inner.network_upgrade_activations().await
     }
 
-    async fn latest_block(
+    async fn visible_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestBlock, QueryError> {
-        self.inner.latest_block(at_epoch_id).await
+    ) -> Result<VisibleTipBlock, QueryError> {
+        self.inner.visible_tip_block(at_epoch_id).await
     }
 
-    async fn latest_safe_block(
+    async fn settled_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestSafeBlock, QueryError> {
+    ) -> Result<SettledTipBlock, QueryError> {
         self.record(at_epoch_id);
-        self.inner.latest_safe_block(at_epoch_id).await
+        self.inner.settled_tip_block(at_epoch_id).await
     }
 
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockIdResponseValue, QueryError> {
+    ) -> Result<BlockIdAtEpoch, QueryError> {
         self.record(at_epoch_id);
         self.inner.block_id_by_selector(selector, at_epoch_id).await
     }
@@ -791,7 +728,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockHeaderResponseValue, QueryError> {
+    ) -> Result<BlockHeaderAtEpoch, QueryError> {
         self.record(at_epoch_id);
         self.inner
             .block_header_by_selector(selector, at_epoch_id)
@@ -997,7 +934,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, QueryError> {
+    ) -> Result<TransactionBroadcastOutcome, QueryError> {
         self.inner.broadcast_transaction(raw_transaction).await
     }
 }
@@ -1381,29 +1318,6 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
             )
         },
     )?;
-    let derive_tempdir = tempdir()?;
-    let derive_store = DeriveStore::open_with_projection_preset(
-        derive_tempdir.path(),
-        ProjectionPreset::Wallet,
-        DeriveStoreOptions {
-            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-            ..DeriveStoreOptions::default()
-        },
-    )?;
-    let tip_key = encode_height_key_ascending(ACCEPTANCE_BLOCK_HEIGHT);
-    for (projection, index_column_family) in [
-        (
-            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-            TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-        ),
-        (
-            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
-            TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
-        ),
-    ] {
-        set_projection_at_canonical_tip(store_fixture.chain_store(), &derive_store, projection)?;
-        derive_store.put_consumer(index_column_family, &tip_key, &[])?;
-    }
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
             store_fixture.chain_store().clone(),
@@ -1412,10 +1326,6 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
         ),
         Arc::new(sample_regtest_upgrade_activations()),
     );
-
-    let adapter = adapter
-        .with_transparent_address_support()
-        .with_wallet_projection_reader(derive_store_wallet_projection_reader(derive_store));
 
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address.clone()],
@@ -1431,10 +1341,6 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
         .await?
         .into_inner();
     let streamed_utxos = collect_stream(stream_response).await?;
-    let lightd_info = adapter
-        .get_lightd_info(Request::new(lightwalletd::Empty {}))
-        .await?
-        .into_inner();
 
     assert_eq!(list_response.address_utxos, streamed_utxos);
     assert_eq!(streamed_utxos.len(), 1);
@@ -1444,7 +1350,6 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
     assert_eq!(streamed_utxos[0].script, script_pub_key);
     assert_eq!(streamed_utxos[0].value_zat, 12);
     assert_eq!(streamed_utxos[0].height, 1);
-    assert!(lightd_info.taddr_support);
 
     Ok(())
 }
@@ -1520,9 +1425,8 @@ async fn get_address_utxos_honors_start_height_floor() -> eyre::Result<()> {
 /// Regression: txid bytes emitted by `GetAddressUtxos` must be accepted verbatim
 /// by `GetTransaction(TxFilter { hash, ... })`.
 ///
-/// The 2026-05-12 parity run surfaced a `NotFound` when wallets rebound the
-/// bytes round-trip; the cause was an unnecessary byte reversal at the input
-/// handler. Lightwalletd-go documents the wire contract at
+/// The output and input use the same little-endian txid bytes; reversing the
+/// input breaks this round trip. Lightwalletd-go documents the wire contract at
 /// `frontend/service.go:792`: txid `bytes` fields are Zcash internal
 /// little-endian, the same byte order [`TransactionId::as_bytes`] returns.
 #[tokio::test]
@@ -1689,79 +1593,6 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
 }
 
 #[tokio::test]
-async fn get_taddress_history_drains_native_pages() -> eyre::Result<()> {
-    let transparent_address =
-        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x31; 20]);
-    let address = transparent_address.to_string();
-    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
-    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
-    let (store_fixture, derive_store) =
-        acceptance_store_fixture_with_transaction_rows_and_tx_history(
-            DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
-            RawBlobRetention::Transactions,
-            |block| {
-                (0..1001)
-                    .map(|index| {
-                        FixtureTransactionRows::from_raw_transaction(
-                            tx_id_for_index(index),
-                            block.height,
-                            block.hash,
-                            index,
-                            tx_payload_for_index(index),
-                        )
-                    })
-                    .collect()
-            },
-            |block| {
-                (0..1001)
-                    .map(|index| {
-                        TransparentAddressTxIndexArtifact::new(
-                            address_script_hash,
-                            block.height,
-                            index,
-                            tx_id_for_index(index),
-                            block.hash,
-                        )
-                    })
-                    .collect()
-            },
-        )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        )
-        .with_derive_store(derive_store),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let request = transparent_address_block_filter(address);
-
-    let deprecated_transactions = adapter
-        .get_taddress_txids(Request::new(request.clone()))
-        .await?
-        .into_inner();
-    let deprecated_transactions = collect_stream(deprecated_transactions).await?;
-    let transactions = adapter
-        .get_taddress_transactions(Request::new(request))
-        .await?
-        .into_inner();
-    let transactions = collect_stream(transactions).await?;
-
-    assert_eq!(deprecated_transactions.len(), 1001);
-    assert_eq!(transactions.len(), 1001);
-    assert_eq!(deprecated_transactions[0].data, tx_payload_for_index(0));
-    assert_eq!(
-        deprecated_transactions[1000].data,
-        tx_payload_for_index(1000)
-    );
-    assert_eq!(transactions[0].data, tx_payload_for_index(0));
-    assert_eq!(transactions[1000].data, tx_payload_for_index(1000));
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn get_transaction_returns_not_found_when_blob_is_unretained() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([0x32; 32]);
     let store_fixture = acceptance_store_fixture_with_transaction_rows(
@@ -1801,9 +1632,9 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
     let transaction_id = TransactionId::from_bytes([0x33; 32]);
     let reorged_height = BlockHeight::new(2);
     let mut chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let safe_tip_block = chain_fixture
+    let settled_tip_block = chain_fixture
         .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("reorg fixture must include safe-tip block"))?
+        .ok_or_else(|| eyre!("reorg fixture must include settled-tip block"))?
         .clone();
     let reorged_block = chain_fixture
         .block_at(reorged_height)
@@ -1820,18 +1651,17 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
     let mut initial_artifacts = chain_fixture
         .chain_epoch_artifacts(ChainEpochId::new(1))
         .ok_or_else(|| eyre!("reorg fixture must build an initial chain epoch"))?;
-    initial_artifacts.chain_epoch.settled_tip_height = safe_tip_block.height;
-    initial_artifacts.chain_epoch.settled_tip_hash = safe_tip_block.hash;
+    initial_artifacts.chain_epoch.settled_tip_height = settled_tip_block.height;
+    initial_artifacts.chain_epoch.settled_tip_hash = settled_tip_block.hash;
     store_fixture
         .chain_store()
         .commit_chain_epoch(initial_artifacts)?;
 
     store_fixture.chain_store().commit_chain_epoch(
-        reorg_replacement_artifacts(safe_tip_block.hash, reorged_height).with_reorg_window_change(
-            ReorgWindowChange::Replace {
+        reorg_replacement_artifacts(settled_tip_block.hash, reorged_height)
+            .with_reorg_window_change(ReorgWindowChange::Replace {
                 from_height: reorged_height,
-            },
-        ),
+            }),
     )?;
 
     let adapter = LightwalletdGrpcAdapter::new(
@@ -1859,171 +1689,6 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
         Err(status) => status,
     };
     assert_eq!(by_hash_status.code(), Code::NotFound);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn taddress_history_returns_not_found_when_blob_is_unretained() -> eyre::Result<()> {
-    let transparent_address =
-        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x32; 20]);
-    let address = transparent_address.to_string();
-    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
-    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
-    let transaction_id = TransactionId::from_bytes([0x32; 32]);
-    let (store_fixture, derive_store) =
-        acceptance_store_fixture_with_transaction_rows_and_tx_history(
-            DEFAULT_TREE_STATE_PAYLOAD.to_vec(),
-            RawBlobRetention::None,
-            |block| vec![transaction_rows_without_blob(transaction_id, block)],
-            |block| {
-                vec![TransparentAddressTxIndexArtifact::new(
-                    address_script_hash,
-                    block.height,
-                    0,
-                    transaction_id,
-                    block.hash,
-                )]
-            },
-        )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        )
-        .with_derive_store(derive_store),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-
-    let deprecated_history_status = raw_transaction_stream_status(
-        adapter
-            .get_taddress_txids(Request::new(transparent_address_block_filter(
-                address.clone(),
-            )))
-            .await?
-            .into_inner(),
-    )
-    .await?;
-    let history_status = raw_transaction_stream_status(
-        adapter
-            .get_taddress_transactions(Request::new(transparent_address_block_filter(address)))
-            .await?
-            .into_inner(),
-    )
-    .await?;
-
-    assert_eq!(deprecated_history_status.code(), Code::NotFound);
-    assert_eq!(history_status.code(), Code::NotFound);
-
-    Ok(())
-}
-
-#[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the two-block fixture keeps raw transaction rows and derive rows together"
-)]
-async fn taddress_history_honors_requested_block_range_floor() -> eyre::Result<()> {
-    let transparent_address =
-        ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x34; 20]);
-    let address = transparent_address.to_string();
-    let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
-    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
-    let before_floor_transaction_id = TransactionId::from_bytes([0x34; 32]);
-    let at_floor_transaction_id = TransactionId::from_bytes([0x35; 32]);
-    let before_floor_payload = b"before-floor-transparent-history".to_vec();
-    let at_floor_payload = b"at-floor-transparent-history".to_vec();
-    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
-        .extend_blocks(2);
-    let before_floor_block = chain_fixture
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("transparent-history fixture must include height 1"))?
-        .clone();
-    let at_floor_block = chain_fixture
-        .block_at(BlockHeight::new(2))
-        .ok_or_else(|| eyre!("transparent-history fixture must include height 2"))?
-        .clone();
-    let chain_fixture = chain_fixture
-        .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
-            before_floor_transaction_id,
-            before_floor_block.height,
-            before_floor_block.hash,
-            0,
-            before_floor_payload,
-        ))
-        .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
-            at_floor_transaction_id,
-            at_floor_block.height,
-            at_floor_block.hash,
-            0,
-            at_floor_payload.clone(),
-        ));
-    let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let derive_store = DeriveStore::open_with_projection_preset(
-        DeriveStore::path_for_canonical(store_fixture.tempdir_path()),
-        ProjectionPreset::Wallet,
-        DeriveStoreOptions {
-            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-            ..DeriveStoreOptions::default()
-        },
-    )?;
-    seed_transparent_address_transaction_history(
-        &derive_store,
-        &[
-            TransparentAddressTxIndexArtifact::new(
-                address_script_hash,
-                before_floor_block.height,
-                0,
-                before_floor_transaction_id,
-                before_floor_block.hash,
-            ),
-            TransparentAddressTxIndexArtifact::new(
-                address_script_hash,
-                at_floor_block.height,
-                0,
-                at_floor_transaction_id,
-                at_floor_block.hash,
-            ),
-        ],
-    )?;
-    set_projection_at_canonical_tip(
-        store_fixture.chain_store(),
-        &derive_store,
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-    )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        )
-        .with_derive_store(derive_store),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let request = transparent_address_block_filter_for_range(address, 2, 2);
-
-    let deprecated_transactions = adapter
-        .get_taddress_txids(Request::new(request.clone()))
-        .await?
-        .into_inner();
-    let deprecated_transactions = collect_stream(deprecated_transactions).await?;
-    let transactions = adapter
-        .get_taddress_transactions(Request::new(request))
-        .await?
-        .into_inner();
-    let transactions = collect_stream(transactions).await?;
-
-    assert_eq!(deprecated_transactions.len(), 1);
-    assert_eq!(transactions.len(), 1);
-    assert_eq!(deprecated_transactions[0].height, 2);
-    assert_eq!(transactions[0].height, 2);
-    assert_eq!(
-        deprecated_transactions[0].data.as_slice(),
-        at_floor_payload.as_slice()
-    );
-    assert_eq!(transactions[0].data.as_slice(), at_floor_payload.as_slice());
 
     Ok(())
 }
@@ -2062,7 +1727,7 @@ async fn send_transaction_forwards_accepted_to_zero_error_code() -> eyre::Result
 async fn send_transaction_maps_invalid_encoding_to_minus_22() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let broadcaster = MockTransactionBroadcaster::returning(
-        TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {
+        TransactionBroadcastOutcome::InvalidEncoding(BroadcastInvalidEncoding {
             error_code: None,
             message: "TX decode failed".to_owned(),
         }),
@@ -2094,7 +1759,7 @@ async fn send_transaction_maps_invalid_encoding_to_minus_22() -> eyre::Result<()
 async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()> {
     let cases = [
         (
-            TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
+            TransactionBroadcastOutcome::Duplicate(BroadcastDuplicate {
                 error_code: None,
                 message: "transaction already in mempool".to_owned(),
             }),
@@ -2102,7 +1767,7 @@ async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()
             "transaction already in mempool",
         ),
         (
-            TransactionBroadcastResult::Rejected(BroadcastRejected {
+            TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                 kind: BroadcastRejectionReason::Unknown,
                 error_code: None,
                 message: "bad-txns-invalid".to_owned(),
@@ -2111,7 +1776,7 @@ async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()
             "bad-txns-invalid",
         ),
         (
-            TransactionBroadcastResult::Unknown(BroadcastUnknown {
+            TransactionBroadcastOutcome::Unknown(BroadcastUnknown {
                 error_code: None,
                 message: "node returned unclassified".to_owned(),
             }),
@@ -2120,9 +1785,9 @@ async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()
         ),
     ];
 
-    for (broadcast_result, expected_code, expected_message) in cases {
+    for (broadcast_outcome, expected_code, expected_message) in cases {
         let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-        let broadcaster = MockTransactionBroadcaster::returning(broadcast_result);
+        let broadcaster = MockTransactionBroadcaster::returning(broadcast_outcome);
         let adapter = LightwalletdGrpcAdapter::new(
             WalletQuery::new(
                 store_fixture.chain_store().clone(),
@@ -2150,7 +1815,7 @@ async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()
 #[tokio::test]
 async fn send_transaction_forwards_node_error_code_when_present() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let broadcaster = MockTransactionBroadcaster::returning(TransactionBroadcastResult::Rejected(
+    let broadcaster = MockTransactionBroadcaster::returning(TransactionBroadcastOutcome::Rejected(
         BroadcastRejected {
             kind: BroadcastRejectionReason::Unknown,
             error_code: Some(-25),
@@ -2217,13 +1882,13 @@ async fn taddress_balance_projects_native_delta_for_generated_lightwalletd_clien
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let wallet_query =
         WalletQuery::new(store_fixture.chain_store().clone(), (), activations.clone());
-    let latest_block = wallet_query.latest_block(None).await?;
+    let visible_tip_block = wallet_query.visible_tip_block(None).await?;
     let query_api = EpochPinRecorder::new(wallet_query).with_transparent_address_balance(
         TransparentAddressBalance {
             confirmed_zat: 1_000,
             unconfirmed_delta_zat: -375,
             address_count: 1,
-            chain_epoch: latest_block.chain_epoch,
+            chain_epoch: visible_tip_block.chain_epoch,
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2292,18 +1957,18 @@ async fn generated_lightwalletd_client_streams_over_grpc_transport() -> eyre::Re
 
     {
         let mut client = CompactTxStreamerClient::connect(format!("http://{server_addr}")).await?;
-        let latest_block = client
+        let visible_tip_block = client
             .get_latest_block(lightwalletd::ChainSpec {})
             .await?
             .into_inner();
         let mut compact_blocks = client
             .get_block_range(lightwalletd::BlockRange {
                 start: Some(lightwalletd::BlockId {
-                    height: latest_block.height,
+                    height: visible_tip_block.height,
                     hash: Vec::new(),
                 }),
                 end: Some(lightwalletd::BlockId {
-                    height: latest_block.height,
+                    height: visible_tip_block.height,
                     hash: Vec::new(),
                 }),
                 pool_types: Vec::new(),
@@ -2321,9 +1986,9 @@ async fn generated_lightwalletd_client_streams_over_grpc_transport() -> eyre::Re
             .ok_or_else(|| eyre!("missing compact block from compatibility stream"))?;
 
         assert!(compact_blocks.message().await?.is_none());
-        assert_eq!(latest_block.height, 1);
-        assert_eq!(compact_block.height, latest_block.height);
-        assert_eq!(tree_state.height, latest_block.height);
+        assert_eq!(visible_tip_block.height, 1);
+        assert_eq!(compact_block.height, visible_tip_block.height);
+        assert_eq!(tree_state.height, visible_tip_block.height);
     }
 
     let _ = shutdown_tx.send(());
@@ -2687,21 +2352,6 @@ where
     Ok(values)
 }
 
-async fn raw_transaction_stream_status<Stream>(stream: Stream) -> eyre::Result<tonic::Status>
-where
-    Stream: tonic::codegen::tokio_stream::Stream<
-            Item = Result<lightwalletd::RawTransaction, tonic::Status>,
-        > + Unpin,
-{
-    match collect_stream(stream).await {
-        Ok(transactions) => Err(eyre!(
-            "expected missing raw blob stream error, got {} transactions",
-            transactions.len()
-        )),
-        Err(status) => Ok(status),
-    }
-}
-
 fn transaction_rows_without_blob(
     transaction_id: TransactionId,
     block: &zinder_testkit::FixtureBlock,
@@ -3024,82 +2674,6 @@ where
     )?)
 }
 
-fn acceptance_store_fixture_with_transaction_rows_and_tx_history<TransactionsFn, TxHistoryFn>(
-    tree_state_payload: Vec<u8>,
-    raw_blob_retention: RawBlobRetention,
-    build_transaction_rows: TransactionsFn,
-    build_tx_history: TxHistoryFn,
-) -> eyre::Result<(StoreFixture, zinder_derive::DeriveStore)>
-where
-    TransactionsFn: FnOnce(&zinder_testkit::FixtureBlock) -> Vec<FixtureTransactionRows>,
-    TxHistoryFn: FnOnce(&zinder_testkit::FixtureBlock) -> Vec<TransparentAddressTxIndexArtifact>,
-{
-    let base_fixture = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(raw_blob_retention)
-        .extend_blocks(1)
-        .with_tip_metadata_override(ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0))
-        .with_tree_state_checkpoint_payload_at(ACCEPTANCE_BLOCK_HEIGHT, tree_state_payload);
-    let acceptance_block = base_fixture
-        .block_at(ACCEPTANCE_BLOCK_HEIGHT)
-        .ok_or_else(|| eyre!("acceptance fixture must include the height 1 block"))?
-        .clone();
-    let block_hash = acceptance_block.hash;
-    let parent_hash = acceptance_block.parent_hash;
-    let block_time_seconds = acceptance_block.block_time_seconds;
-    let transaction_rows = build_transaction_rows(&acceptance_block);
-    let tx_history = build_tx_history(&acceptance_block);
-
-    let mut chain_fixture = base_fixture
-        .with_compact_block_payload_at(
-            ACCEPTANCE_BLOCK_HEIGHT,
-            acceptance_compact_block_payload(block_hash, parent_hash, block_time_seconds),
-        )
-        .with_sapling_subtree_root(SubtreeRootArtifact::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            SubtreeRootHash::from_bytes(SAPLING_SUBTREE_ROOT_HASH),
-            ACCEPTANCE_BLOCK_HEIGHT,
-            block_hash,
-        ));
-    for transaction_rows in transaction_rows {
-        chain_fixture = chain_fixture.with_transaction_rows(transaction_rows);
-    }
-
-    let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let derive_store = DeriveStore::open_with_projection_preset(
-        DeriveStore::path_for_canonical(store_fixture.tempdir_path()),
-        ProjectionPreset::Wallet,
-        DeriveStoreOptions {
-            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-            ..DeriveStoreOptions::default()
-        },
-    )?;
-    seed_transparent_address_transaction_history(&derive_store, &tx_history)?;
-    set_projection_at_canonical_tip(
-        store_fixture.chain_store(),
-        &derive_store,
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-    )?;
-
-    Ok((store_fixture, derive_store))
-}
-
-fn set_projection_at_canonical_tip(
-    chain_store: &zinder_store::PrimaryChainStore,
-    derive_store: &DeriveStore,
-    projection: zinder_derive::DeriveConsumerName,
-) -> eyre::Result<()> {
-    let cursor = chain_store
-        .resolve_chain_event_stream_start(
-            &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Tip,
-        )?
-        .cursor
-        .ok_or_else(|| eyre!("committed fixture must expose a live-tail cursor"))?;
-    derive_store.put_chain_event_cursor(projection, cursor.as_bytes())?;
-    Ok(())
-}
-
 fn acceptance_compact_block_payload(
     block_hash: BlockHash,
     parent_hash: BlockHash,
@@ -3163,41 +2737,4 @@ fn acceptance_compact_block_payload_at(
         }),
     }
     .encode_to_vec()
-}
-
-fn transparent_address_block_filter(
-    address: String,
-) -> lightwalletd::TransparentAddressBlockFilter {
-    transparent_address_block_filter_for_range(address, 1, 1)
-}
-
-fn transparent_address_block_filter_for_range(
-    address: String,
-    start_height: u64,
-    end_height: u64,
-) -> lightwalletd::TransparentAddressBlockFilter {
-    lightwalletd::TransparentAddressBlockFilter {
-        address,
-        range: Some(lightwalletd::BlockRange {
-            start: Some(lightwalletd::BlockId {
-                height: start_height,
-                hash: Vec::new(),
-            }),
-            end: Some(lightwalletd::BlockId {
-                height: end_height,
-                hash: Vec::new(),
-            }),
-            pool_types: Vec::new(),
-        }),
-    }
-}
-
-fn tx_id_for_index(index: u32) -> TransactionId {
-    let mut bytes = [0; 32];
-    bytes[..4].copy_from_slice(&index.to_be_bytes());
-    TransactionId::from_bytes(bytes)
-}
-
-fn tx_payload_for_index(index: u32) -> Vec<u8> {
-    format!("tx-payload-{index}").into_bytes()
 }

@@ -1,4 +1,4 @@
-//! Typed serving reads for an admitted version-1 canonical store.
+//! Typed serving reads for an admitted canonical store.
 
 use crate::BoundedRocksDbOpen;
 use rust_rocksdb::{Direction, IteratorMode};

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_cipherscan::CipherscanRestAdapter;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_runtime::{
-    Readiness, ReadinessState, ServiceIdentifier, StartupPhase, cancel_on_terminating_signal,
+    Readiness, ReadinessState, RuntimeService, StartupPhase, cancel_on_terminating_signal,
     connect_zinder_grpc, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 
@@ -107,7 +107,7 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
     readiness.set(ReadinessState::starting());
     let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::CompatCipherscan,
+        RuntimeService::CompatCipherscan,
         cipherscan_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(cipherscan_config.network),

@@ -30,8 +30,8 @@ use eyre::{Result, eyre};
 use serde::Deserialize;
 use tokio_stream::StreamExt as _;
 use zinder_core::{
-    BroadcastAccepted, BroadcastRejected, Network, RawTransactionBytes, TransactionBroadcastResult,
-    TransactionId, UnixTimestampMillis,
+    BroadcastAccepted, BroadcastRejected, Network, RawTransactionBytes,
+    TransactionBroadcastOutcome, TransactionId, UnixTimestampMillis,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceEvent,
@@ -56,7 +56,7 @@ const MEMPOOL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "TransactionBroadcastResult is #[non_exhaustive]; the broadcast match collapses every non-Accepted variant into a single test failure"
+    reason = "TransactionBroadcastOutcome is #[non_exhaustive]; the broadcast match collapses every non-Accepted variant into a single test failure"
 )]
 #[allow(
     clippy::too_many_lines,
@@ -117,7 +117,7 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
             .broadcast_transaction(RawTransactionBytes::new(raw_tx))
             .await?;
         let broadcast_txid = match &broadcast_outcome {
-            TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }) => {
+            TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id }) => {
                 *transaction_id
             }
             _ if is_known_transaction_rejection(&broadcast_outcome) => {
@@ -335,10 +335,10 @@ fn display_txid_to_wire_bytes(txid: &str) -> Result<[u8; 32]> {
     Ok(bytes)
 }
 
-fn is_known_transaction_rejection(outcome: &TransactionBroadcastResult) -> bool {
+fn is_known_transaction_rejection(outcome: &TransactionBroadcastOutcome) -> bool {
     matches!(
         outcome,
-        TransactionBroadcastResult::Rejected(BroadcastRejected { message, .. })
+        TransactionBroadcastOutcome::Rejected(BroadcastRejected { message, .. })
             if message.contains("already queued for download")
                 || message.contains("transaction is already in state")
     )
@@ -417,7 +417,7 @@ async fn wait_for_mined(
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "TransactionBroadcastResult is #[non_exhaustive]; collapse every non-Accepted variant into a single failure"
+    reason = "TransactionBroadcastOutcome is #[non_exhaustive]; collapse every non-Accepted variant into a single failure"
 )]
 #[allow(
     clippy::too_many_lines,
@@ -475,7 +475,7 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
         .broadcast_transaction(RawTransactionBytes::new(raw_tx))
         .await?;
     let broadcast_txid = match &broadcast_outcome {
-        TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }) => {
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id }) => {
             *transaction_id
         }
         _ => {
@@ -513,11 +513,8 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
     // Reorg out the block that contains the broadcast tx. Zebra's
     // `invalidateblock` does **not** automatically return the tx to the
     // mempool (unlike Bitcoin Core); the tx simply disappears from the
-    // canonical chain. The reorg gate's purpose is to verify Zinder
-    // follows that observed semantic (no synthesized re-add); the strict
-    // "orchestrator does not synthesize Added from reverted blocks"
-    // property is covered separately by the synthetic integration test
-    // `reorg_returns_mined_tx_to_mempool_through_orchestrator`.
+    // canonical chain. The test therefore rebroadcasts explicitly after the
+    // invalidation instead of expecting a synthesized `Added` event.
     rpc_invalidate_block(&env, &mined_block_hash).await?;
 
     // Confirm the tip rolled back. The chain at this point should be at
@@ -547,7 +544,7 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
         .broadcast_transaction(RawTransactionBytes::new(rebroadcast_raw_tx))
         .await?;
     let rebroadcast_txid = match &rebroadcast_outcome {
-        TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }) => {
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id }) => {
             *transaction_id
         }
         _ => {

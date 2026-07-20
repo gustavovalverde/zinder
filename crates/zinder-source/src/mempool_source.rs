@@ -174,7 +174,7 @@ pub enum MempoolHydrationFailureReason {
     CompactTransactionBuildFailed,
     /// A transparent output index did not fit in `u32`.
     TransparentOutputIndexOverflow,
-    /// The orchestrator received a [`MempoolSourceEvent`] variant it does
+    /// The live mempool owner received a [`MempoolSourceEvent`] variant it does
     /// not yet know how to handle.
     UnknownSourceEventVariant,
 }

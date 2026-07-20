@@ -5,10 +5,10 @@ use std::{num::NonZeroU32, pin::Pin, time::Duration};
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId,
+    BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight, BlockHeightRange, BlockId,
     BlockSelector, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
     MempoolEntry, MempoolEvictionReason, RawTransactionBytes, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionBroadcastResult, TransactionId, TransparentAddressBalance,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
     TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
     TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
@@ -72,8 +72,8 @@ pub struct ChainEventEnvelope {
     pub event_sequence: u64,
     /// Chain epoch visible after this event.
     pub chain_epoch: ChainEpoch,
-    /// Safe tip height reported with this event.
-    pub safe_tip_height: BlockHeight,
+    /// Settled tip height reported with this event.
+    pub settled_tip_height: BlockHeight,
     /// Canonical chain transition.
     pub event: ChainEvent,
 }
@@ -83,12 +83,12 @@ pub struct ChainEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChainEvent {
-    /// A non-reorg commit advanced the canonical tip or safe-tip prefix.
+    /// A non-reorg commit advanced the canonical tip or settled-tip prefix.
     ChainCommitted {
         /// Committed epoch payload.
         committed: ChainEpochCommitted,
     },
-    /// A range that had not yet reached the safe tip was replaced.
+    /// A range that had not yet reached the settled tip was replaced.
     ChainReorged {
         /// Previously visible range invalidated by this transition.
         reverted: ChainRangeReverted,
@@ -239,14 +239,6 @@ pub enum MempoolEvent {
         /// without a follow-up tip read.
         block_hash: BlockHash,
     },
-    /// Upstream node refused admission of the transaction. Reserved for
-    /// ZIP-401 `RecentlyEvicted`; source-side emission is pending node-side
-    /// visibility as documented by the mempool topology. Wallet integrators may subscribe
-    /// today but should not block on receiving this variant.
-    Suppressed {
-        /// Identifier of the suppressed transaction.
-        transaction_id: TransactionId,
-    },
 }
 
 /// Mempool-event stream returned by [`EndpointBackedIndex::mempool_events`].
@@ -267,9 +259,9 @@ pub struct TransparentAddressUnspentOutputsQuery {
 /// Stream of unspent transparent outputs returned by
 /// [`ChainIndex::transparent_address_unspent_outputs`]. The stream always
 /// carries the complete unspent set at one pinned chain epoch.
-pub type TransparentAddressUnspentOutputsStream = IndexStream<TransparentUnspentOutputStreamItem>;
+pub type TransparentAddressUnspentOutputsStream = IndexStream<TransparentUnspentOutputChunk>;
 
-/// Opaque transparent-address tx-history cursor.
+/// Opaque transparent-address tx-history cursor bound to one visible-chain fence.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TransparentHistoryCursor(StreamCursorTokenV1);
 
@@ -298,7 +290,8 @@ pub struct TransparentAddressTxIdsQuery {
     pub end_height: BlockHeight,
     /// Server-bounded entry cap. `None` defers to the server default.
     pub max_entries: Option<NonZeroU32>,
-    /// Optional cursor returned by a previous read.
+    /// Optional cursor returned by a previous read. The cursor is valid only
+    /// while the visible-chain event fence is unchanged.
     pub from_cursor: Option<TransparentHistoryCursor>,
     /// Iterate newest-first when true.
     pub descending: bool,
@@ -306,7 +299,7 @@ pub struct TransparentAddressTxIdsQuery {
 
 /// One streamed tx-history chunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentAddressTxIdsStreamItem {
+pub struct TransparentAddressTransactionChunk {
     /// Chain epoch used to answer this chunk.
     pub chain_epoch: ChainEpoch,
     /// Indexed tx-history artifact.
@@ -317,11 +310,11 @@ pub struct TransparentAddressTxIdsStreamItem {
 
 /// Stream of tx-history chunks returned by
 /// [`ChainIndex::transparent_address_tx_ids_in_range`].
-pub type TransparentAddressTxIdsStream = IndexStream<TransparentAddressTxIdsStreamItem>;
+pub type TransparentAddressTxIdsStream = IndexStream<TransparentAddressTransactionChunk>;
 
 /// One streamed unspent transparent output.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentUnspentOutputStreamItem {
+pub struct TransparentUnspentOutputChunk {
     /// Chain epoch pinned for the entire stream.
     pub chain_epoch: ChainEpoch,
     /// Single unspent output.
@@ -365,13 +358,13 @@ impl TransparentUtxoSetSummaryView {
     }
 }
 
-/// Canonical and derive-store reads served identically by every chain-index
+/// Canonical and materialized-view reads served identically by every chain-index
 /// handle.
 ///
 /// Both [`crate::LocalChainIndex`] (a colocated `RocksDB`-secondary reader) and
 /// [`crate::RemoteChainIndex`] (a `WalletQuery` gRPC client) implement this
 /// trait with identical semantics. Every method here answers from the
-/// canonical chain store or the derive projection, so a handle that cannot
+/// canonical chain store or the materialized view, so a handle that cannot
 /// reach a live ingest-control endpoint still honors the full contract.
 ///
 /// Methods that require a live ingest-control/broadcast endpoint (broadcast,
@@ -384,7 +377,7 @@ impl TransparentUtxoSetSummaryView {
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves
 /// to the visible chain epoch at call time; `Some(id)` pins the read to that
-/// epoch. Current-projection derive reads expose their chain epoch in stream
+/// epoch. Current materialized-view reads expose their chain epoch in stream
 /// items instead of accepting a pin.
 ///
 /// All trait methods take and return `zinder-core` types; generated
@@ -404,22 +397,22 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// ```
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError>;
 
-    /// Returns the latest visible block identity.
+    /// Returns the visible-tip block identity.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # use zinder_client::{ChainIndex, IndexerError};
     /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let block = client.latest_block(None).await?;
+    /// let block = client.visible_tip_block(None).await?;
     /// # let _ = block; Ok(()) }
     /// ```
-    async fn latest_block(
+    async fn visible_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError>;
 
-    /// Resolves the block at the chain epoch's safe tip (the height a
+    /// Resolves the block at the chain epoch's settled tip (the height a
     /// wallet may safely use as its scan ceiling: both a compact block and
     /// a coherent tree-state checkpoint are guaranteed available within the
     /// wallet's rewind cap of that height).
@@ -429,10 +422,10 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// ```no_run
     /// # use zinder_client::{ChainIndex, IndexerError};
     /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let block = client.latest_safe_block(None).await?;
+    /// let block = client.settled_tip_block(None).await?;
     /// # let _ = block; Ok(()) }
     /// ```
-    async fn latest_safe_block(
+    async fn settled_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError>;
@@ -478,7 +471,7 @@ pub trait ChainIndex: Send + Sync + 'static {
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockHeaderInfo, IndexerError>;
+    ) -> Result<BlockHeader, IndexerError>;
 
     /// Reads one compact block artifact.
     ///
@@ -668,6 +661,10 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Streams current transparent-address tx-history index entries.
     ///
+    /// The returned rows and any resume cursor are bound to the response's
+    /// visible chain epoch. A reorg invalidates a prior resume cursor rather
+    /// than resuming it against a different branch.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -833,11 +830,11 @@ pub trait ChainIndex: Send + Sync + 'static {
 /// Live ingest-control reads layered on top of [`ChainIndex`].
 ///
 /// Only [`crate::RemoteChainIndex`] implements this trait: every method needs a
-/// reachable ingest-control/broadcast endpoint that the canonical and derive
+/// reachable ingest-control/broadcast endpoint that the canonical and materialized-view
 /// stores cannot stand in for. Broadcast forwards bytes to the upstream node;
 /// the mempool reads observe the writer's in-process mempool index; the
 /// chain-event stream and chain value-pools are produced by the writer at the
-/// safe tip; the wallet-plane server descriptor is the endpoint's own
+/// settled tip; the wallet-plane server descriptor is the endpoint's own
 /// advertisement.
 ///
 /// A consumer that needs any of these methods bounds its handle as
@@ -890,9 +887,9 @@ pub trait EndpointBackedIndex: ChainIndex {
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, IndexerError>;
+    ) -> Result<TransactionBroadcastOutcome, IndexerError>;
 
-    /// Streams tip-family chain events.
+    /// Streams visible-family chain events.
     ///
     /// # Examples
     ///
@@ -906,7 +903,7 @@ pub trait EndpointBackedIndex: ChainIndex {
         &self,
         start: EventStreamStart<ChainEventCursor>,
     ) -> Result<ChainEventStream, IndexerError> {
-        self.chain_events_for_family(start, ChainEventStreamFamily::Tip)
+        self.chain_events_for_family(start, ChainEventStreamFamily::Visible)
             .await
     }
 
@@ -920,7 +917,7 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// # };
     /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
     /// let stream = client
-    ///     .chain_events_for_family(EventStreamStart::LiveTail, ChainEventStreamFamily::Tip)
+    ///     .chain_events_for_family(EventStreamStart::LiveTail, ChainEventStreamFamily::Visible)
     ///     .await?;
     /// # let _ = stream; Ok(()) }
     /// ```
@@ -955,7 +952,7 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// let stream = client
     ///     .chain_events_with_filter(
     ///         EventStreamStart::EarliestRetained,
-    ///         ChainEventStreamFamily::Tip,
+    ///         ChainEventStreamFamily::Visible,
     ///         Vec::new(),
     ///     )
     ///     .await?;

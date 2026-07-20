@@ -1,17 +1,17 @@
-# Deploying the fact-first wallet service on one VM
+# Deploying the wallet service on one VM
 
 This runbook operates the supported `rocksdb-single-host` wallet-serving
 topology. Three independent processes share one host filesystem:
-`zinder-ingest` owns canonical facts, `zinder-projector` owns the wallet
+`zinder-ingest` owns canonical storage, `zinder-projector` owns the wallet
 projection, and `zinder-compat-lightwalletd` serves immutable canonical and
-wallet secondary pairs. The legacy query, explorer, and mixed
-single-container deployments are not release paths.
+wallet secondary pairs. Query, explorer, and mixed single-container images are
+not release paths.
 
 A successful deployment is a canary until the release's mainnet construction,
 wallet-build, coherent-restore, capacity, replacement, and independent-client
 gates have current evidence. See
-[ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md) and the
-[fact-first cutover plan](../plans/fact-first-wallet-serving-cutover.md).
+[ADR-0035](../adrs/0035-canonical-storage-topologies.md) and the
+[testing runbook](testing.md).
 
 ## Prerequisites
 
@@ -132,7 +132,7 @@ Interpret the probes in order:
 
 1. Ingest is ready only when canonical following is within the configured lag
    boundary and the current mempool generation has completed hydration.
-2. Projector is ready only when its schema-v1 wallet store has reached an
+2. Projector is ready only when its admitted wallet store has reached an
    authenticated canonical event fence.
 3. Compatibility is ready only when its inactive canonical and wallet
    secondaries converge to one exact network, epoch, event sequence, visible
@@ -198,7 +198,7 @@ sudo journalctl -u zinder.service -f
 Never rebuild a wallet store in place while readers serve it. Provision lane B
 with all of the following distinct from lane A:
 
-- `storage.wallet_path`;
+- `wallet.path`;
 - projector `storage.canonical_secondary_path`;
 - compatibility canonical and wallet secondary roots;
 - projector build-owner identity;
@@ -231,8 +231,8 @@ docker compose --env-file /etc/zinder/env \
 
 After each restart, require the complete readiness chain again. For a release
 rollback, route traffic to a previously certified side-by-side lane. Do not
-start an older binary on canonical schema-v4 or wallet schema-v1 paths unless
-that release explicitly declares the physical schemas compatible.
+start a binary on existing canonical or wallet paths unless that release
+explicitly declares their physical layouts compatible.
 
 ## Production admission checklist
 
@@ -252,15 +252,13 @@ Before routing mainnet traffic, attach evidence for every item:
   mempool, confirmation, restart, projection lag, and reorg on the pinned
   independent client.
 
-The last measured mainnet canonical lifecycle exceeded its hard gate and the
-500 GB canary did not prove full-topology headroom. Until newer evidence closes
-those results, this topology is suitable for local validation and controlled
-canaries, not a production certification claim.
+A local deployment is suitable for validation and controlled canaries. It is
+not a production certification claim without release-specific evidence for
+every gate above.
 
 ## References
 
 - [Public environment-variable contract](../architecture/public-interfaces.md#environment-variable-mapping)
 - [Initial sync](initial-sync.md)
 - [Testing](testing.md)
-- [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-- [Fact-first wallet-serving cutover](../plans/fact-first-wallet-serving-cutover.md)
+- [ADR-0035](../adrs/0035-canonical-storage-topologies.md)

@@ -91,17 +91,13 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::ChainEventCursorExpired
         | ErrorReason::MempoolEventCursorExpired
         | ErrorReason::SnapshotPageCursorExpired
-        | ErrorReason::ChainEpochPinUnsupported
         | ErrorReason::ChainEpochPinUnavailable
-        // CHAIN_EPOCH_PIN_MISMATCH is wire-reserved and unproduced: requests pin
-        // by bare epoch id, so there is no echoed body to mismatch.
-        | ErrorReason::ChainEpochPinMismatch
         | ErrorReason::SchemaMismatch
         | ErrorReason::SchemaTooNew
         | ErrorReason::ReorgWindowExceeded
         | ErrorReason::ChainEpochConflict
         | ErrorReason::ChainEpochNetworkMismatch
-        | ErrorReason::DeriveProjectionUnavailable
+        | ErrorReason::MaterializedViewUnavailable
         | ErrorReason::DependencyNotConfigured
         | ErrorReason::NodeCapabilityMissing
         | ErrorReason::ExplorerPreconditionUnsatisfied => {
@@ -122,7 +118,6 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
         | ErrorReason::StorageUnavailable
-        | ErrorReason::DeriveProjectionLagging
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::NoVisibleChainEpoch => {
             ReasonPolicy::new(Code::Unavailable, RetryAfterBackoff)

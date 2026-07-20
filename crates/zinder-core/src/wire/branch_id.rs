@@ -55,8 +55,7 @@ mod tests {
     /// table and in lightwalletd's `LightdInfo.consensusBranchId` field.
     const NU5_BRANCH_ID: u32 = 0xc2d6_d0b4;
 
-    /// Branch ID observed on the z3 regtest sidecar during the 2026-05-12
-    /// parity validation; used as a parity fixture.
+    /// Regtest branch ID used as a lightwalletd parity fixture.
     const REGTEST_BRANCH_ID: u32 = 0xc8e7_1055;
 
     #[test]

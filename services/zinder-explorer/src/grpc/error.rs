@@ -37,7 +37,7 @@ pub(crate) enum ExplorerError {
     #[error("{0}")]
     UpstreamUnreachable(String),
 
-    /// The requested resource is not materialized in the explorer's derive view.
+    /// The requested resource is not materialized in the explorer's materialized view.
     #[error("{0}")]
     NotMaterialized(String),
 

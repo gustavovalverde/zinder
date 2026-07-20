@@ -290,7 +290,7 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
 }
 
 #[tokio::test]
-async fn canonical_follower_cancellation_after_reorg_preparation_preserves_old_fence()
+async fn canonical_follower_cancellation_after_reorg_preparation_preserves_original_fence()
 -> Result<(), Box<dyn std::error::Error>> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let original = parseable_multi_block_chain()?;

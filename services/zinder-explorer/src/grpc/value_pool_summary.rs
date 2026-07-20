@@ -16,11 +16,11 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
-use zinder_derive::DeriveStore;
+use zinder_materialized_views::MaterializedViewStore;
 
 /// Executes one `ExplorerQuery.ValuePoolSummary` request.
-pub(crate) async fn handle_value_pool_summary(
-    derive_store: Option<&DeriveStore>,
+pub(crate) async fn query_value_pool_summary(
+    materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     _request: Request<ValuePoolSummaryRequest>,
@@ -42,7 +42,7 @@ pub(crate) async fn handle_value_pool_summary(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            derive_store,
+            materialized_view_store,
             EXPLORER_VALUE_POOL_SUMMARY_V1,
             Some(chain_epoch),
             0,

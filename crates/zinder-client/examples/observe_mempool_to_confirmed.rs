@@ -7,7 +7,7 @@
 //!    [`EndpointBackedIndex::transparent_mempool_outputs_by_address`].
 //! 2. Subscribe to the mempool event log via
 //!    [`EndpointBackedIndex::mempool_events`] to receive
-//!    `Added`/`Mined`/`Invalidated`/`Suppressed` transitions.
+//!    `Added`/`Mined`/`Invalidated` transitions.
 //! 3. Track each unconfirmed transaction id observed for the address until
 //!    one of those transitions resolves it; emit one line per state change.
 //!
@@ -189,11 +189,6 @@ async fn subscribe_mempool_events(
             } => {
                 if watched.remove(&transaction_id) {
                     println!("mempool invalidated: tx={transaction_id:?} reason={reason:?}");
-                }
-            }
-            MempoolEvent::Suppressed { transaction_id } => {
-                if watched.remove(&transaction_id) {
-                    println!("mempool suppressed: tx={transaction_id:?}");
                 }
             }
             _ => {

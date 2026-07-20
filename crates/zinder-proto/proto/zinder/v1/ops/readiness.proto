@@ -57,9 +57,6 @@ enum ReadinessCause {
   // See ADR-0015.
   READINESS_CAUSE_UPSTREAM_NOT_READY = 16;
 
-  // Reserved slots for additive growth. Removing a reserved range is a
-  // breaking change.
-  reserved 17 to 31;
 }
 
 // Snapshot of the current readiness state surfaced to operators and orchestrators.
@@ -73,10 +70,10 @@ message ReadinessReport {
   // Operator-actionable detail tied to the active cause. Unset when the
   // cause carries no auxiliary detail.
   optional ReadinessCauseDetail detail = 4;
-  // Selected closed projection workload, or empty when no projection store is open.
-  string projection_preset = 5;
-  // Stable identities selected by projection_preset.
-  repeated string projection_identities = 6;
+  // Selected closed materialized-view workload, or empty when no materialized-view store is open.
+  string materialized_view_preset = 5;
+  // Stable identities selected by materialized_view_preset.
+  repeated string materialized_view_identities = 6;
 }
 
 // Operator-actionable detail tied to a parametric readiness cause. The

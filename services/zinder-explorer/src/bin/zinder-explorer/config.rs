@@ -7,8 +7,8 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
-    OpsSection, OpsToml, ResolvedSecondaryStorage, SecondaryStorageSection, SecondaryStorageToml,
-    SecuritySection, SecurityToml, ServiceIdentifier, guard_optional_serving_bind,
+    OpsSection, OpsToml, ResolvedSecondaryStorage, RuntimeService, SecondaryStorageSection,
+    SecondaryStorageToml, SecuritySection, SecurityToml, guard_optional_serving_bind,
     guard_serving_bind, load_bearer_token, parse_socket_addr, require_field,
     resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
 };
@@ -56,13 +56,13 @@ pub(crate) enum ExplorerConfigError {
     Config(#[from] ConfigError),
 
     #[error(transparent)]
-    Store(#[from] zinder_explorer::DeriveStoreError),
+    Store(#[from] zinder_explorer::MaterializedViewStoreError),
 
     #[error(transparent)]
     CanonicalStore(#[from] zinder_store::StoreError),
 
     #[error("explorer runtime failed: {0}")]
-    Runtime(#[from] zinder_explorer::DeriveError),
+    Runtime(#[from] zinder_explorer::MaterializedViewError),
 
     #[error("gRPC transport failed: {0}")]
     Transport(#[from] tonic::transport::Error),
@@ -97,7 +97,7 @@ pub(crate) fn load_explorer_config(
             "/var/lib/zinder/explorer-secondary",
         )?
         .with_default("explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
-        .with_ops_section(ServiceIdentifier::Explorer)?
+        .with_ops_section(RuntimeService::Explorer)?
         .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?

@@ -89,7 +89,8 @@ async fn transparent_address_unspent_outputs_streams_complete_set() -> eyre::Res
 }
 
 #[tokio::test]
-async fn transparent_address_unspent_outputs_streams_past_the_old_page_cap() -> eyre::Result<()> {
+async fn transparent_address_unspent_outputs_streams_across_multiple_internal_pages()
+-> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let stored_utxos = commit_unspent_outputs(&store, ChainEpochId::new(1), 1, 1001)?;

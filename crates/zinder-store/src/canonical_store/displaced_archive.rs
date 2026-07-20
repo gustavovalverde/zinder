@@ -246,7 +246,7 @@ fn validate_displaced_write_block(
         || facts.block_header.block_hash != displaced.block_id.hash
     {
         return Err(CanonicalStoreError::displaced_archive(
-            "displaced replay is not the exact canonical version-1 block identity",
+            "displaced replay is not the exact canonical block identity",
         ));
     }
     let Some(coinbase) = facts.transactions.first() else {
@@ -977,7 +977,7 @@ fn decode_and_validate_record_with_context(
     );
     if canonical.as_bytes() != record.replay_bytes {
         return Err(CanonicalStoreError::displaced_archive(
-            "archive replay is not the exact canonical version-1 encoding",
+            "archive replay is not the exact canonical encoding",
         ));
     }
     if facts.block_header.height != position.height
@@ -1208,7 +1208,7 @@ fn decode_archive_record(encoded: &[u8]) -> Result<ArchiveRecord, CanonicalStore
     decoder.require_end()?;
     if encode_archive_record(&record)? != encoded {
         return Err(CanonicalStoreError::displaced_archive(
-            "archive order value is not canonical version-1 bytes",
+            "archive order value is not canonical bytes",
         ));
     }
     Ok(record)

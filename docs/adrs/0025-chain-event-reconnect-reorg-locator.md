@@ -42,9 +42,9 @@ The synthesized `ChainReorged` reverts `(fork_point, reverted_tip]` and re-commi
 
 A consumer therefore only ever handles `ChainCommitted` and `ChainReorged` and never reconciles hashes itself.
 
-### The Safe family never receives a synthesized reorg
+### The Settled family never receives a synthesized reorg
 
-A `Safe` cursor delivers only commits whose range is past the settled tip. A `Safe` cursor cannot be reorged out below the settled tip by definition, so a locator miss on a `Safe` cursor is an expiry, never a synthesized reorg. The `Safe` family never carries `ChainReorged`.
+A `Settled` cursor delivers only non-reorg commits entirely at or below the settled tip. A `Settled` cursor cannot be reorged out below the settled tip by definition, so a locator miss is an expiry, never a synthesized reorg. The `Settled` family never carries `ChainReorged`.
 
 ## Consequences
 
@@ -68,7 +68,3 @@ A `Safe` cursor delivers only commits whose range is past the settled tip. A `Sa
 - `CHAIN_EVENT_CURSOR_INVALID` (reserved for corruption or forgery only).
 
 See [Chain events §Resume Semantics](../architecture/chain-events.md#resume-semantics) and [Public interfaces §Cursor Conventions](../architecture/public-interfaces.md#cursor-conventions).
-
-## Revision history
-
-- 2026-07-03: The resume and self-heal semantics here compose with the explicit `EventStreamStart` start positions of [ADR-0027](0027-event-stream-start-positions.md). The `after_cursor` position feeds the resume algorithm exactly as a resumed cursor does, and the `live_tail` head cursor is minted with a locator anchored at the current visible tip, so a later reconnect from it recovers through the same algorithm. Cursor bytes, the locator layout, and the `CHAIN_EVENT_CURSOR_EXPIRED`/`CHAIN_EVENT_CURSOR_INVALID` classification are unchanged.

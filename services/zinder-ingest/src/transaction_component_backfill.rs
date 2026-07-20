@@ -6,17 +6,17 @@ use std::{collections::HashSet, num::NonZeroU32, time::Duration};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeaderArtifact, BlockHeight, CanonicalHistoryBounds, TransactionId};
-use zinder_derive::{
-    BlockCommitContext, BlockCommitPayload, DeriveStore, TransactionComponentBackfillCoverage,
-    TransactionComponentSummaryConsumer, TransactionIntrinsicValueBalanceFacts,
-    TransparentSpendFacts,
+use zinder_materialized_views::{
+    BlockCommitContext, BlockCommitInput, MaterializedViewStore,
+    TransactionComponentBackfillCoverage, TransactionComponentSummaryConsumer,
+    TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
 };
 use zinder_store::PrimaryChainStore;
 
 use crate::{
     IngestError,
-    derive_consumers::derive_projection_write_guard,
-    ingest_loop::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
+    materialized_view_consumers::materialized_view_write_guard,
+    runtime_config::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
 };
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -30,14 +30,14 @@ const BACKFILL_CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// events once ingest starts.
 pub(crate) fn seed_transaction_component_visible_tail(
     chain_store: &PrimaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     through_height: BlockHeight,
     batch_blocks: NonZeroU32,
 ) -> Result<(), IngestError> {
     loop {
-        let tail =
-            TransactionComponentSummaryConsumer::tail_coverage(derive_store)?.ok_or_else(|| {
-                IngestError::DeriveDispatch(
+        let tail = TransactionComponentSummaryConsumer::tail_coverage(materialized_view_store)?
+            .ok_or_else(|| {
+                IngestError::MaterializedViewDispatch(
                     "transaction-component tail boundary is missing during startup seeding"
                         .to_owned(),
                 )
@@ -46,7 +46,7 @@ pub(crate) fn seed_transaction_component_visible_tail(
             .complete_through_height
             .map_or(Some(tail.boundary_height), BlockHeight::next)
             .ok_or_else(|| {
-                IngestError::DeriveDispatch(
+                IngestError::MaterializedViewDispatch(
                     "transaction-component startup tail height overflow".to_owned(),
                 )
             })?;
@@ -60,10 +60,10 @@ pub(crate) fn seed_transaction_component_visible_tail(
                 .min(through_height.value()),
         );
         let contexts = read_canonical_context_batch(chain_store, next_height, batch_end)?;
-        let _write_guard = derive_projection_write_guard();
+        let _write_guard = materialized_view_write_guard();
         TransactionComponentSummaryConsumer::new()
-            .write_tail_seed_batch(derive_store, &contexts)
-            .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+            .write_tail_seed_batch(materialized_view_store, &contexts)
+            .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
     }
 }
 
@@ -80,16 +80,19 @@ pub struct TransactionComponentBackfillConfig {
 #[derive(Clone)]
 pub struct TransactionComponentBackfillContext {
     chain_store: PrimaryChainStore,
-    derive_store: DeriveStore,
+    materialized_view_store: MaterializedViewStore,
 }
 
 impl TransactionComponentBackfillContext {
-    /// Groups the canonical and derive stores for task startup.
+    /// Groups the canonical and materialized-view stores for task startup.
     #[must_use]
-    pub fn new(chain_store: PrimaryChainStore, derive_store: DeriveStore) -> Self {
+    pub fn new(
+        chain_store: PrimaryChainStore,
+        materialized_view_store: MaterializedViewStore,
+    ) -> Self {
         Self {
             chain_store,
-            derive_store,
+            materialized_view_store,
         }
     }
 }
@@ -218,7 +221,8 @@ fn backfill_next_batch_blocking(
     config: TransactionComponentBackfillConfig,
     context: &TransactionComponentBackfillContext,
 ) -> Result<BackfillProgress, IngestError> {
-    let coverage = TransactionComponentSummaryConsumer::backfill_coverage(&context.derive_store)?;
+    let coverage =
+        TransactionComponentSummaryConsumer::backfill_coverage(&context.materialized_view_store)?;
     let Some(chain_epoch) = context.chain_store.current_chain_epoch()? else {
         return Ok(BackfillProgress::CaughtUp {
             through_height: coverage.map(|coverage| coverage.complete_through_height),
@@ -229,7 +233,7 @@ fn backfill_next_batch_blocking(
     let next_height = next_backfill_height(coverage, first_available_height)?;
     let Some(target_height) = historical_backfill_target(
         chain_epoch.settled_tip_height,
-        TransactionComponentSummaryConsumer::tail_coverage(&context.derive_store)?,
+        TransactionComponentSummaryConsumer::tail_coverage(&context.materialized_view_store)?,
     ) else {
         return Ok(BackfillProgress::CaughtUp {
             through_height: coverage.map(|coverage| coverage.complete_through_height),
@@ -252,7 +256,7 @@ fn backfill_next_batch_blocking(
     let first_block_time = contexts
         .first()
         .ok_or_else(|| {
-            IngestError::DeriveDispatch(
+            IngestError::MaterializedViewDispatch(
                 "transaction-component backfill hydrated an empty batch".to_owned(),
             )
         })?
@@ -260,7 +264,7 @@ fn backfill_next_batch_blocking(
     let last_block_time = contexts
         .last()
         .ok_or_else(|| {
-            IngestError::DeriveDispatch(
+            IngestError::MaterializedViewDispatch(
                 "transaction-component backfill hydrated an empty batch".to_owned(),
             )
         })?
@@ -275,10 +279,10 @@ fn backfill_next_batch_blocking(
         }),
         last_block_time,
     );
-    let _write_guard = derive_projection_write_guard();
+    let _write_guard = materialized_view_write_guard();
     TransactionComponentSummaryConsumer::new()
-        .write_backfill_batch(&context.derive_store, &contexts, next_coverage)
-        .map_err(|error| IngestError::DeriveDispatch(error.to_string()))?;
+        .write_backfill_batch(&context.materialized_view_store, &contexts, next_coverage)
+        .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
 
     Ok(BackfillProgress::Advanced {
         from_height: next_height,
@@ -289,7 +293,7 @@ fn backfill_next_batch_blocking(
 
 fn historical_backfill_target(
     settled_tip_height: BlockHeight,
-    tail: Option<zinder_derive::TransactionComponentTailCoverage>,
+    tail: Option<zinder_materialized_views::TransactionComponentTailCoverage>,
 ) -> Option<BlockHeight> {
     let Some(tail) = tail else {
         return Some(settled_tip_height);
@@ -308,14 +312,16 @@ fn next_backfill_height(
         return Ok(first_available_height);
     };
     if coverage.complete_from_height != first_available_height {
-        return Err(IngestError::DeriveDispatch(format!(
+        return Err(IngestError::MaterializedViewDispatch(format!(
             "transaction-component backfill coverage starts at {}, expected {}",
             coverage.complete_from_height.value(),
             first_available_height.value()
         )));
     }
     coverage.complete_through_height.next().ok_or_else(|| {
-        IngestError::DeriveDispatch("transaction-component backfill height overflow".to_owned())
+        IngestError::MaterializedViewDispatch(
+            "transaction-component backfill height overflow".to_owned(),
+        )
     })
 }
 
@@ -341,7 +347,7 @@ pub(crate) fn canonical_history_bounds(
     chain_store: &PrimaryChainStore,
 ) -> Result<CanonicalHistoryBounds, IngestError> {
     chain_store.canonical_history_bounds()?.ok_or_else(|| {
-        IngestError::DeriveDispatch("canonical history bounds are unavailable".to_owned())
+        IngestError::MaterializedViewDispatch("canonical history bounds are unavailable".to_owned())
     })
 }
 
@@ -358,20 +364,20 @@ fn stage_canonical_blocks(
     let mut expected_parent_hash = read_predecessor_hash(reader, history_bounds, from_height)?;
     for height in inclusive_heights(from_height, through_height) {
         let header = reader.block_header_at(height)?.ok_or_else(|| {
-            IngestError::DeriveDispatch(format!(
+            IngestError::MaterializedViewDispatch(format!(
                 "canonical block header {} is unavailable",
                 height.value()
             ))
         })?;
         if header.height != height {
-            return Err(IngestError::DeriveDispatch(format!(
+            return Err(IngestError::MaterializedViewDispatch(format!(
                 "canonical block header {} reports height {}",
                 height.value(),
                 header.height.value()
             )));
         }
         if expected_parent_hash.is_some_and(|expected| header.parent_hash != expected) {
-            return Err(IngestError::DeriveDispatch(format!(
+            return Err(IngestError::MaterializedViewDispatch(format!(
                 "settled canonical block header {} does not connect to its predecessor",
                 height.value()
             )));
@@ -379,7 +385,7 @@ fn stage_canonical_blocks(
         if height == chain_epoch.settled_tip_height
             && header.block_hash != chain_epoch.settled_tip_hash
         {
-            return Err(IngestError::DeriveDispatch(format!(
+            return Err(IngestError::MaterializedViewDispatch(format!(
                 "settled canonical block header {} does not match the settled-tip hash",
                 height.value()
             )));
@@ -387,7 +393,7 @@ fn stage_canonical_blocks(
         if height == chain_epoch.visible_tip_height
             && header.block_hash != chain_epoch.visible_tip_hash
         {
-            return Err(IngestError::DeriveDispatch(format!(
+            return Err(IngestError::MaterializedViewDispatch(format!(
                 "canonical block header {} does not match the visible-tip hash",
                 height.value()
             )));
@@ -395,14 +401,14 @@ fn stage_canonical_blocks(
 
         let transaction_ids = reader.transaction_ids_at_height(height)?;
         if transaction_ids.is_empty() {
-            return Err(IngestError::DeriveDispatch(format!(
+            return Err(IngestError::MaterializedViewDispatch(format!(
                 "canonical transaction index {} is empty",
                 height.value()
             )));
         }
         for transaction_id in &transaction_ids {
             if !unique_transaction_ids.insert(*transaction_id) {
-                return Err(IngestError::DeriveDispatch(format!(
+                return Err(IngestError::MaterializedViewDispatch(format!(
                     "canonical transaction index repeats transaction {}",
                     hex::encode(transaction_id.as_bytes())
                 )));
@@ -430,7 +436,7 @@ fn read_predecessor_hash(
             .map(|checkpoint| checkpoint.hash));
     }
     if from_height < first_available_height {
-        return Err(IngestError::DeriveDispatch(format!(
+        return Err(IngestError::MaterializedViewDispatch(format!(
             "canonical batch starts at {}, before the first available height {}",
             from_height.value(),
             first_available_height.value()
@@ -438,18 +444,18 @@ fn read_predecessor_hash(
     }
     let predecessor_height =
         BlockHeight::new(from_height.value().checked_sub(1).ok_or_else(|| {
-            IngestError::DeriveDispatch(
+            IngestError::MaterializedViewDispatch(
                 "transaction-component backfill cannot validate a height-zero batch".to_owned(),
             )
         })?);
     let predecessor = reader.block_header_at(predecessor_height)?.ok_or_else(|| {
-        IngestError::DeriveDispatch(format!(
+        IngestError::MaterializedViewDispatch(format!(
             "canonical predecessor header {} is unavailable",
             predecessor_height.value()
         ))
     })?;
     if predecessor.height != predecessor_height {
-        return Err(IngestError::DeriveDispatch(format!(
+        return Err(IngestError::MaterializedViewDispatch(format!(
             "canonical predecessor header {} reports height {}",
             predecessor_height.value(),
             predecessor.height.value()
@@ -482,7 +488,7 @@ fn hydrate_staged_blocks(
                 .remove(&transaction_id)
                 .flatten()
                 .ok_or_else(|| {
-                    IngestError::DeriveDispatch(format!(
+                    IngestError::MaterializedViewDispatch(format!(
                         "canonical transaction facts {} are unavailable",
                         hex::encode(transaction_id.as_bytes())
                     ))
@@ -497,7 +503,7 @@ fn hydrate_staged_blocks(
         }
         contexts.push(
             BlockCommitContext::new(
-                BlockCommitPayload {
+                BlockCommitInput {
                     height: staged_block.header.height,
                     block_hash: staged_block.header.block_hash,
                     previous_block_hash: staged_block.header.parent_hash,
@@ -525,7 +531,7 @@ fn validate_transaction_fact(
     transaction: &zinder_core::TransactionFactsArtifact,
 ) -> Result<(), IngestError> {
     let expected_index = u32::try_from(transaction_index).map_err(|_| {
-        IngestError::DeriveDispatch(format!(
+        IngestError::MaterializedViewDispatch(format!(
             "transaction index overflows u32 at canonical height {}",
             header.height.value()
         ))
@@ -536,7 +542,7 @@ fn validate_transaction_fact(
         || transaction.location.block_hash != header.block_hash
         || transaction.location.tx_index_in_block != expected_index
     {
-        return Err(IngestError::DeriveDispatch(format!(
+        return Err(IngestError::MaterializedViewDispatch(format!(
             "canonical transaction facts {} do not match block {} index {}",
             hex::encode(expected_transaction_id.as_bytes()),
             header.height.value(),
@@ -553,7 +559,7 @@ fn validate_visible_boundary(
     if through_height <= visible_tip_height {
         return Ok(());
     }
-    Err(IngestError::DeriveDispatch(
+    Err(IngestError::MaterializedViewDispatch(
         "transaction-component batch crossed the visible canonical boundary".to_owned(),
     ))
 }
@@ -623,7 +629,10 @@ mod tests {
             )),
             BlockHeight::new(101),
         );
-        assert!(matches!(result, Err(IngestError::DeriveDispatch(_))));
+        assert!(matches!(
+            result,
+            Err(IngestError::MaterializedViewDispatch(_))
+        ));
     }
 
     #[test]
@@ -703,7 +712,7 @@ mod tests {
 
     #[test]
     fn historical_backfill_stops_before_the_live_tail() {
-        let tail = zinder_derive::TransactionComponentTailCoverage {
+        let tail = zinder_materialized_views::TransactionComponentTailCoverage {
             boundary_height: BlockHeight::new(101),
             complete_through_height: Some(BlockHeight::new(110)),
             complete_through_time_unix_seconds: Some(1_700_000_000),

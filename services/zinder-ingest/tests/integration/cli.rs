@@ -10,10 +10,6 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     ChainEpochId, Network, decode_canonical_block_replay,
 };
-use zinder_derive::{
-    BLOCK_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
-};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::ChainFixture;
 
@@ -82,25 +78,10 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[ingest]"));
-    assert!(stdout.contains("projection_preset = \"wallet\""));
-    assert!(stdout.contains("# effective_projection_identities = ["));
     assert!(stdout.contains("reorg_window_blocks = 100"));
-    assert!(stdout.contains("[ingest.phases]"));
+    assert!(stdout.contains("[ingest.phase_classification]"));
     assert!(stdout.contains("catchup_threshold_blocks ="));
-    assert!(stdout.contains("[ingest.derive]"));
-    assert!(stdout.contains("replay_batch_blocks = 100"));
-    assert!(stdout.contains("replay_policy = \"canonical-first\""));
-    assert!(stdout.contains("memory_degrade_ratio = 0.9"));
-    assert!(stdout.contains("memory_pause_ratio = 0.99"));
-    assert!(stdout.contains("memory_resume_ratio = 0.8"));
-    assert!(stdout.contains("min_replay_batch_blocks = 10"));
-    assert!(stdout.contains("[ingest.commitment_root_backfill]"));
-    assert!(stdout.contains("enabled = true"));
-    assert!(stdout.contains("batch_blocks = 256"));
-    assert!(stdout.contains("fetch_concurrency = 8"));
-    assert!(stdout.contains("[ingest.conventional_fee_distribution_backfill]"));
-    assert!(stdout.contains("[ingest.transaction_component_backfill]"));
-    assert!(stdout.contains("[ingest.bulk_catchup]"));
+    assert!(stdout.contains("[ingest.construction]"));
     assert!(stdout.contains("canonical_batch_max_blocks = 1000"));
     assert!(stdout.contains("canonical_batch_max_artifact_bytes = 536870912"));
     assert!(stdout.contains("canonical_batch_max_estimated_write_bytes = 536870912"));
@@ -112,67 +93,28 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("block_prepare_concurrency ="));
     assert!(stdout.contains("block_prepare_memory_watermark_bytes = 536870912"));
     assert!(stdout.contains("commit_reassembly_max_queued_artifact_bytes = 536870912"));
-    assert!(stdout.contains("[ingest.tip_follow]"));
+    assert!(stdout.contains("[ingest.follow]"));
     assert!(stdout.contains("poll_interval_ms = 1000"));
     assert!(stdout.contains("lag_threshold_blocks ="));
-    assert!(stdout.contains("[ingest.modifiers]"));
-    assert!(stdout.contains("allow_near_tip_finalize = false"));
+    assert!(stdout.contains("[ingest.run_overrides]"));
+    assert!(stdout.contains("allow_reorg_window_settlement = false"));
     assert!(stdout.contains("coverage = \"explicit\""));
 
     Ok(())
 }
 
 #[test]
-fn wallet_projection_preset_loads_from_toml_env_and_cli() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("wallet-preset-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    let base_config = ingest_config_toml(&storage_path)?;
-
-    let toml_config =
-        base_config.replace("[ingest]\n", "[ingest]\nprojection_preset = \"wallet\"\n");
-    fs::write(&config_path, toml_config)?;
-    let toml_output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-    assert_wallet_projection_config(&toml_output)?;
-
-    fs::write(&config_path, &base_config)?;
-    let env_output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_INGEST__PROJECTION_PRESET", "wallet")
-        .output()?;
-    assert_wallet_projection_config(&env_output)?;
-
-    let cli_output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--projection-preset",
-            "wallet",
-        ])
-        .output()?;
-    assert_wallet_projection_config(&cli_output)?;
-
-    Ok(())
-}
-
-#[test]
-fn print_config_output_round_trips_with_projection_identity_comment() -> Result<(), Box<dyn Error>>
-{
+fn print_config_output_round_trips() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("round-trip-store");
     let source_config_path = tempdir.path().join("source.toml");
     let rendered_config_path = tempdir.path().join("rendered.toml");
-    let config = ingest_config_toml(&storage_path)?
-        .replace("[ingest]\n", "[ingest]\nprojection_preset = \"wallet\"\n");
-    fs::write(&source_config_path, config)?;
+    fs::write(&source_config_path, ingest_config_toml(&storage_path)?)?;
 
     let first_output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&source_config_path)?])
         .output()?;
-    assert_wallet_projection_config(&first_output)?;
+    assert!(first_output.status.success(), "{first_output:?}");
     fs::write(&rendered_config_path, &first_output.stdout)?;
 
     let second_output = zinder_ingest_command()
@@ -182,149 +124,8 @@ fn print_config_output_round_trips_with_projection_identity_comment() -> Result<
             path_str(&rendered_config_path)?,
         ])
         .output()?;
-    assert_wallet_projection_config(&second_output)?;
+    assert!(second_output.status.success(), "{second_output:?}");
 
-    Ok(())
-}
-
-#[test]
-fn unsupported_projection_preset_fails_before_storage_open() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("unsupported-preset-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    let config = ingest_config_toml(&storage_path)?
-        .replace("[ingest]\n", "[ingest]\nprojection_preset = \"custom\"\n");
-    fs::write(&config_path, config)?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ingest.projection_preset must be one of: wallet, explorer"),
-        "{stderr}"
-    );
-    assert!(!storage_path.exists());
-
-    Ok(())
-}
-
-#[test]
-fn removed_complete_projection_preset_is_rejected() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("removed-complete-preset-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    let config = ingest_config_toml(&storage_path)?
-        .replace("[ingest]\n", "[ingest]\nprojection_preset = \"complete\"\n");
-    fs::write(&config_path, config)?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ingest.projection_preset must be one of: wallet, explorer"),
-        "{stderr}"
-    );
-    assert!(!storage_path.exists());
-
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-    let cli_output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--projection-preset",
-            "complete",
-        ])
-        .output()?;
-    assert!(!cli_output.status.success());
-    let cli_stderr = String::from_utf8(cli_output.stderr)?;
-    assert!(
-        cli_stderr.contains("invalid value 'complete'"),
-        "{cli_stderr}"
-    );
-    assert!(!storage_path.exists());
-
-    Ok(())
-}
-
-fn assert_wallet_projection_config(output: &std::process::Output) -> Result<(), Box<dyn Error>> {
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout.clone())?;
-    assert!(stdout.contains("projection_preset = \"wallet\""));
-    assert!(stdout.contains(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME.as_str()));
-    assert!(stdout.contains(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str()));
-    assert!(!stdout.contains(BLOCK_SUMMARY_CONSUMER_NAME.as_str()));
-    Ok(())
-}
-
-#[test]
-fn commitment_root_backfill_env_overrides_print_config() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("root-backfill-env-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_INGEST__COMMITMENT_ROOT_BACKFILL__ENABLED", "false")
-        .env(
-            "ZINDER_INGEST__COMMITMENT_ROOT_BACKFILL__BATCH_BLOCKS",
-            "64",
-        )
-        .env(
-            "ZINDER_INGEST__COMMITMENT_ROOT_BACKFILL__FETCH_CONCURRENCY",
-            "2",
-        )
-        .output()?;
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout)?;
-    let section = stdout
-        .split("[ingest.commitment_root_backfill]")
-        .nth(1)
-        .and_then(|tail| tail.split("\n[").next())
-        .ok_or("commitment-root backfill section missing")?;
-    assert!(section.contains("enabled = false"));
-    assert!(section.contains("batch_blocks = 64"));
-    assert!(section.contains("fetch_concurrency = 2"));
-    Ok(())
-}
-
-#[test]
-fn conventional_fee_distribution_backfill_env_overrides_print_config() -> Result<(), Box<dyn Error>>
-{
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("fee-distribution-backfill-env-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env(
-            "ZINDER_INGEST__CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL__ENABLED",
-            "false",
-        )
-        .env(
-            "ZINDER_INGEST__CONVENTIONAL_FEE_DISTRIBUTION_BACKFILL__BATCH_BLOCKS",
-            "64",
-        )
-        .output()?;
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout)?;
-    let section = stdout
-        .split("[ingest.conventional_fee_distribution_backfill]")
-        .nth(1)
-        .and_then(|tail| tail.split("\n[").next())
-        .ok_or("conventional-fee distribution backfill section missing")?;
-    assert!(section.contains("enabled = false"));
-    assert!(section.contains("batch_blocks = 64"));
     Ok(())
 }
 
@@ -440,9 +241,9 @@ fn canonical_replay_verification_scans_multiple_bounded_batches() -> Result<(), 
 }
 
 #[test]
-fn print_config_shows_explicit_near_tip_finalize_override() -> Result<(), Box<dyn Error>> {
+fn print_config_shows_explicit_reorg_window_settlement_override() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("allow-near-tip-store");
+    let storage_path = tempdir.path().join("allow-reorg-window-settlement-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
@@ -451,13 +252,13 @@ fn print_config_shows_explicit_near_tip_finalize_override() -> Result<(), Box<dy
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "--allow-near-tip-finalize",
+            "--allow-reorg-window-settlement",
         ])
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("allow_near_tip_finalize = true"));
+    assert!(stdout.contains("allow_reorg_window_settlement = true"));
 
     Ok(())
 }
@@ -477,7 +278,7 @@ fn cli_overrides_environment_and_environment_overrides_config_file() -> Result<(
             "--target-height",
             "300",
         ])
-        .env("ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT", "200")
+        .env("ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT", "200")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
@@ -497,7 +298,7 @@ fn target_height_uses_standard_config_precedence() -> Result<(), Box<dyn Error>>
 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_INGEST__MODIFIERS__TARGET_HEIGHT", "777")
+        .env("ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT", "777")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
@@ -552,7 +353,7 @@ fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn 
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.modifiers.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\""
+            "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\""
         ),
         "{stderr}"
     );
@@ -601,7 +402,7 @@ fn wallet_serving_rejects_explicit_checkpoint_height() -> Result<(), Box<dyn Err
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.modifiers.coverage = \"wallet-serving\" derives checkpoint_height from the node"
+            "ingest.run_overrides.coverage = \"wallet-serving\" derives checkpoint_height from the node"
         ),
         "{stderr}"
     );
@@ -610,9 +411,11 @@ fn wallet_serving_rejects_explicit_checkpoint_height() -> Result<(), Box<dyn Err
 }
 
 #[test]
-fn wallet_serving_rejects_near_tip_finalize_override() -> Result<(), Box<dyn Error>> {
+fn wallet_serving_rejects_reorg_window_settlement_override() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("wallet-serving-near-tip-store");
+    let storage_path = tempdir
+        .path()
+        .join("wallet-serving-reorg-window-settlement-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(
         &config_path,
@@ -624,14 +427,15 @@ fn wallet_serving_rejects_near_tip_finalize_override() -> Result<(), Box<dyn Err
             "--print-config",
             "--config",
             path_str(&config_path)?,
-            "--allow-near-tip-finalize",
+            "--allow-reorg-window-settlement",
         ])
         .output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.modifiers.coverage = \"wallet-serving\" cannot be combined with"),
+        stderr
+            .contains("ingest.run_overrides.coverage = \"wallet-serving\" cannot be combined with"),
         "{stderr}"
     );
 
@@ -737,7 +541,7 @@ fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.bulk_catchup.canonical_batch_max_blocks must be greater than zero"),
+        stderr.contains("ingest.construction.canonical_batch_max_blocks must be greater than zero"),
         "{stderr}"
     );
 
@@ -765,7 +569,7 @@ fn zero_estimated_write_batch_budget_fails_before_storage_creation() -> Result<(
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.bulk_catchup.canonical_batch_max_estimated_write_bytes must be greater than zero"
+            "ingest.construction.canonical_batch_max_estimated_write_bytes must be greater than zero"
         ),
         "{stderr}"
     );
@@ -799,7 +603,7 @@ fn estimated_write_close_floor_above_block_cap_fails_before_storage_creation()
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.bulk_catchup.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.bulk_catchup.canonical_batch_max_blocks"
+            "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.construction.canonical_batch_max_blocks"
         ),
         "{stderr}"
     );
@@ -817,7 +621,7 @@ fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
         .env(
-            "ZINDER_INGEST__BULK_CATCHUP__SOURCE_SEGMENT_MAX_BLOCKS",
+            "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS",
             "0",
         )
         .output()?;
@@ -825,7 +629,7 @@ fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.bulk_catchup.source_segment_max_blocks must be greater than zero"),
+        stderr.contains("ingest.construction.source_segment_max_blocks must be greater than zero"),
         "{stderr}"
     );
 
@@ -835,7 +639,7 @@ fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), 
 #[test]
 fn zero_block_prepare_concurrency_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-derive-store");
+    let storage_path = tempdir.path().join("zero-block-prepare");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
 
@@ -852,51 +656,7 @@ fn zero_block_prepare_concurrency_fails_before_storage_creation() -> Result<(), 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.bulk_catchup.block_prepare_concurrency must be greater than zero"),
-        "{stderr}"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn zero_derive_replay_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-derive-replay-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_INGEST__DERIVE__REPLAY_BATCH_BLOCKS", "0")
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ingest.derive.replay_batch_blocks must be greater than zero"),
-        "{stderr}"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn invalid_derive_replay_policy_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("invalid-derive-replay-policy-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_INGEST__DERIVE__REPLAY_POLICY", "best-effort")
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ingest.derive.replay_policy must be one of: canonical-first, continuous"),
+        stderr.contains("ingest.construction.block_prepare_concurrency must be greater than zero"),
         "{stderr}"
     );
 
@@ -954,7 +714,7 @@ fn source_fetch_byte_budget_below_max_response_fails_before_storage_creation()
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "invalid ingest.bulk_catchup pipeline limits: source fetch watermark 33554432 is below maximum response 67108864"
+            "invalid ingest.construction pipeline limits: source fetch watermark 33554432 is below maximum response 67108864"
         ),
         "{stderr}"
     );
@@ -982,7 +742,7 @@ fn zero_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Erro
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("ingest.tip_follow.poll_interval_ms must be greater than zero"),
+        stderr.contains("ingest.follow.poll_interval_ms must be greater than zero"),
         "{stderr}"
     );
 
@@ -1162,7 +922,7 @@ path = "{}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.modifiers]
+[ingest.run_overrides]
 coverage = "wallet-serving"
 
 [ingest_control]
@@ -1195,7 +955,7 @@ path = "{}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.modifiers]
+[ingest.run_overrides]
 coverage = "wallet-serving"
 checkpoint_height = 1
 

@@ -51,7 +51,7 @@ use crate::common::{
 ///
 /// Mirrors the transparent-address live test's depth: small enough to keep
 /// the test under a minute against mainnet; large enough that the sampled
-/// coinbase has been finalized by the time the wallet API reads it back.
+/// coinbase is settled by the time the wallet API reads it back.
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 
 #[tokio::test(flavor = "multi_thread")]

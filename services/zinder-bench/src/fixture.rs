@@ -23,13 +23,13 @@ use zinder_core::{
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceBlockHeader,
     SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
-    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, block_header_info_from_raw_block_bytes,
+    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, block_header_from_raw_block_bytes,
 };
 
 use crate::error::BenchError;
 
 /// Version stamped into every manifest this crate writes.
-pub const FIXTURE_FORMAT_VERSION: u32 = 1;
+pub const FIXTURE_FORMAT_VERSION: u32 = 2;
 /// Stable identity stamped into every canonical fixture manifest.
 pub const FIXTURE_CONTRACT_IDENTITY: &str = "canonical-fixture";
 
@@ -194,11 +194,11 @@ pub struct FixtureManifest {
     pub block_count: u32,
     /// Consensus-byte workload density for the complete captured range.
     pub workload_density: WorkloadDensity,
-    /// Current-schema oracle artifact version at capture time.
+    /// Canonical artifact schema version at capture time.
     ///
     /// This is provenance for comparisons with the temporary `RocksDB` oracle;
     /// it is not part of the backend-neutral canonical-fact contract.
-    pub current_schema_oracle_artifact_schema_version: u16,
+    pub canonical_artifact_schema_version: u16,
     /// Backend-neutral block-digest contract and ordered-sequence oracle.
     pub canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence,
     /// Hash of the block at `to_height`, hex-encoded in internal byte order,
@@ -247,7 +247,7 @@ impl FixtureManifest {
         self.validate_structure()?;
         let normalized_manifest = serde_json::to_vec(self)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"zinder-bench-fixture-manifest-v1\0");
+        hasher.update(b"zinder-bench-fixture-manifest-v2\0");
         hasher.update(normalized_manifest);
         Ok(hex::encode(hasher.finalize()))
     }
@@ -864,15 +864,15 @@ fn read_and_decode_block(
             height,
             reason: format!("fixture read failed: {source}"),
         })?;
-    let header_info = block_header_info_from_raw_block_bytes(height, &raw_block_bytes)?;
+    let header = block_header_from_raw_block_bytes(height, &raw_block_bytes)?;
     let block_time_seconds =
-        u32::try_from(header_info.block_time).map_err(|_| SourceError::RawBlockTimeOutOfRange)?;
+        u32::try_from(header.block_time).map_err(|_| SourceError::RawBlockTimeOutOfRange)?;
     Ok(SourceBlock::new(
         SourceBlockHeader {
             network,
             height,
-            hash: header_info.block_id.hash,
-            parent_hash: header_info.previous_block_hash,
+            hash: header.block_id.hash,
+            parent_hash: header.previous_block_hash,
             block_time_seconds,
         },
         raw_block_bytes,

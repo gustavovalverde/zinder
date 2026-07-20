@@ -14,7 +14,7 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpochId,
     CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastResult,
+    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
     TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
@@ -27,12 +27,12 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    FactFirstReadPair, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
+    LightwalletdQueryApi, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi, address_lookup_to_script_hash, status_from_query_error,
+    WalletServingReadPair, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
-use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition, MempoolEvent};
+use zinder_store::MempoolEvent;
 
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher,
@@ -61,7 +61,7 @@ pub struct LightwalletdCompatibilityOptions {
     /// Whether `GetLightdInfo` advertises `taddrSupport`.
     ///
     /// Keep this false until the serving process has wired the canonical
-    /// transparent-output index and the derive-backed transparent-history
+    /// transparent-output index and the materialized-view-backed transparent-history
     /// projection that the lightwalletd transparent RPCs depend on.
     pub transparent_address_support: bool,
     /// Bound used when `GetSubtreeRoots.maxEntries` is zero.
@@ -84,15 +84,14 @@ impl Default for LightwalletdCompatibilityOptions {
     }
 }
 
-/// gRPC adapter from [`WalletQueryApi`] to lightwalletd `CompactTxStreamer`.
+/// gRPC adapter from [`LightwalletdQueryApi`] to lightwalletd `CompactTxStreamer`.
 #[derive(Clone)]
 pub struct LightwalletdGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     options: LightwalletdCompatibilityOptions,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
-    wallet_projection_reader: Option<Arc<dyn zinder_query::WalletProjectionReadApi>>,
-    fact_first_read_pairs: Option<Arc<ArcSwap<FactFirstReadPair>>>,
+    serving_pair_slot: Option<Arc<ArcSwap<WalletServingReadPair>>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
@@ -104,14 +103,7 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("options", &self.options)
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
-            .field(
-                "wallet_projection_reader",
-                &self.wallet_projection_reader.is_some(),
-            )
-            .field(
-                "fact_first_read_pairs",
-                &self.fact_first_read_pairs.is_some(),
-            )
+            .field("serving_pair_slot", &self.serving_pair_slot.is_some())
             .field(
                 "network_upgrade_activations",
                 &self.network_upgrade_activations.network(),
@@ -158,8 +150,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             options,
             mempool_surface: None,
             tip_change_watcher: None,
-            wallet_projection_reader: None,
-            fact_first_read_pairs: None,
+            serving_pair_slot: None,
             network_upgrade_activations,
         }
     }
@@ -180,28 +171,17 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
-    /// Supplies typed wallet-projection readiness for `GetLightdInfo`'s
-    /// transparent-address support claim.
-    #[must_use]
-    pub fn with_wallet_projection_reader(
-        mut self,
-        wallet_projection_reader: Arc<dyn zinder_query::WalletProjectionReadApi>,
-    ) -> Self {
-        self.wallet_projection_reader = Some(wallet_projection_reader);
-        self
-    }
-
-    /// Supplies the atomically swappable, immutable fact-first read pairs.
+    /// Supplies the atomically swappable, immutable wallet-serving pair.
     ///
     /// `GetLightdInfo` captures this slot at call time rather than retaining a
     /// startup snapshot, so its transparent-address claim cannot outlive a
     /// canonical/wallet pair generation.
     #[must_use]
-    pub fn with_fact_first_read_pair_slot(
+    pub fn with_serving_pair_slot(
         mut self,
-        read_pairs: Arc<ArcSwap<FactFirstReadPair>>,
+        serving_pair_slot: Arc<ArcSwap<WalletServingReadPair>>,
     ) -> Self {
-        self.fact_first_read_pairs = Some(read_pairs);
+        self.serving_pair_slot = Some(serving_pair_slot);
         self
     }
 
@@ -232,7 +212,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
 
 impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: LightwalletdQueryApi + Send + Sync + 'static,
 {
     /// Resolves the visible chain epoch id at call time.
     ///
@@ -240,14 +220,14 @@ where
     /// to one epoch so a single logical response cannot straddle a reorg.
     /// This resolves that epoch from the visible tip once at handler entry.
     async fn entry_chain_view(&self) -> Result<EntryChainView, Status> {
-        let latest_block = self
+        let visible_tip_block = self
             .query_api
-            .latest_block(None)
+            .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         Ok(EntryChainView {
-            epoch_id: latest_block.chain_epoch.id,
-            visible_tip_height: latest_block.height,
+            epoch_id: visible_tip_block.chain_epoch.id,
+            visible_tip_height: visible_tip_block.height,
         })
     }
 
@@ -332,9 +312,9 @@ where
             .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?;
         let max_entries =
             NonZeroU32::new(request.max_entries).unwrap_or(self.options.max_address_utxos);
-        let latest_block = self
+        let visible_tip_block = self
             .query_api
-            .latest_block(None)
+            .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let mut replies = Vec::new();
@@ -342,14 +322,14 @@ where
         for address in request.addresses {
             let query_request = transparent_address_unspent_outputs_request(
                 &address,
-                latest_block.chain_epoch.network,
+                visible_tip_block.chain_epoch.network,
                 BlockHeight::new(start_height),
             )?;
             let address_utxos = self
                 .query_api
                 .transparent_address_unspent_outputs(
                     query_request,
-                    Some(latest_block.chain_epoch.id),
+                    Some(visible_tip_block.chain_epoch.id),
                 )
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
@@ -371,14 +351,14 @@ where
         &self,
         filter: &lightwalletd::TransparentAddressBlockFilter,
     ) -> Result<Vec<Result<lightwalletd::RawTransaction, Status>>, Status> {
-        let latest_block = self
+        let visible_tip_block = self
             .query_api
-            .latest_block(None)
+            .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let at_epoch_id = latest_block.chain_epoch.id;
+        let at_epoch_id = visible_tip_block.chain_epoch.id;
         let typed_request =
-            transparent_address_tx_history_request(filter, latest_block.chain_epoch.network)?;
+            transparent_address_tx_history_request(filter, visible_tip_block.chain_epoch.network)?;
         let history = transparent_address_tx_history(&self.query_api, typed_request).await?;
         let mut raw_transactions = Vec::with_capacity(history.len());
 
@@ -411,9 +391,9 @@ where
         if addresses.is_empty() {
             return Err(Status::invalid_argument("addresses list must not be empty"));
         }
-        let latest_block = self
+        let visible_tip_block = self
             .query_api
-            .latest_block(None)
+            .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let mut script_hashes = Vec::with_capacity(addresses.len());
@@ -422,14 +402,14 @@ where
                 Some(wallet_proto::AddressLookup {
                     selector: Some(address_lookup::Selector::Address(address)),
                 }),
-                latest_block.chain_epoch.network,
+                visible_tip_block.chain_epoch.network,
             )
             .map_err(|error| status_from_query_error(&error))?;
             script_hashes.push(address_script_hash);
         }
         let balance = self
             .query_api
-            .transparent_address_balance(script_hashes, Some(latest_block.chain_epoch.id))
+            .transparent_address_balance(script_hashes, Some(visible_tip_block.chain_epoch.id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let value_zat = lightwalletd_balance_value_zat(balance)?;
@@ -458,21 +438,21 @@ fn lightwalletd_balance_value_zat(
 #[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: LightwalletdQueryApi + Send + Sync + 'static,
 {
     async fn get_latest_block(
         &self,
         _request: Request<lightwalletd::ChainSpec>,
     ) -> Result<Response<lightwalletd::BlockId>, Status> {
-        let latest_block = self
+        let visible_tip_block = self
             .query_api
-            .latest_block(None)
+            .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
         Ok(Response::new(lightwalletd::BlockId {
-            height: u64::from(latest_block.height.value()),
-            hash: encode_internal_block_hash(latest_block.block_hash).to_vec(),
+            height: u64::from(visible_tip_block.height.value()),
+            hash: encode_internal_block_hash(visible_tip_block.block_hash).to_vec(),
         }))
     }
 
@@ -577,13 +557,13 @@ where
         request: Request<lightwalletd::RawTransaction>,
     ) -> Result<Response<lightwalletd::SendResponse>, Status> {
         let raw_transaction = RawTransactionBytes::new(request.into_inner().data);
-        let broadcast_result = self
+        let broadcast_outcome = self
             .query_api
             .broadcast_transaction(raw_transaction)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        Ok(Response::new(send_response_from_broadcast_result(
-            broadcast_result,
+        Ok(Response::new(send_response_from_broadcast_outcome(
+            broadcast_outcome,
         )))
     }
 
@@ -806,12 +786,12 @@ where
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
         let activations = self.network_upgrade_activations.as_ref();
-        let latest_block = self
+        let visible_tip_block = self
             .query_api
-            .latest_block(None)
+            .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        if latest_block.chain_epoch.network != activations.network() {
+        if visible_tip_block.chain_epoch.network != activations.network() {
             return Err(Status::failed_precondition(
                 "network upgrade activations do not match the chain epoch network",
             ));
@@ -819,48 +799,21 @@ where
 
         let transparent_address_support = if !self.options.transparent_address_support {
             false
-        } else if let Some(read_pairs) = &self.fact_first_read_pairs {
-            let source_position = read_pairs.load_full().wallet_source().source_position();
-            source_position.chain_epoch_id == latest_block.chain_epoch.id
-                && source_position.tip.height == latest_block.height
-                && source_position.tip.hash == latest_block.block_hash
-        } else if let Some(wallet_projection_reader) = &self.wallet_projection_reader {
-            let required_cursor = self
-                .query_api
-                .resolve_chain_events_start(
-                    EventStreamStartPosition::LiveTail,
-                    ChainEventStreamFamily::Tip,
-                )
-                .await
-                .map_err(|error| status_from_query_error(&error))?
-                .cursor;
-            let wallet_projection_reader = Arc::clone(wallet_projection_reader);
-            let readiness =
-                tokio::task::spawn_blocking(move || wallet_projection_reader.readiness())
-                    .await
-                    .map_err(|error| {
-                        Status::internal(format!(
-                            "wallet projection readiness task failed: {error}"
-                        ))
-                    })?
-                    .map_err(|error| {
-                        Status::internal(format!(
-                            "wallet projection readiness read failed: {error}"
-                        ))
-                    })?;
-            readiness
-                .transparent_address_history
-                .covers(latest_block.height, required_cursor.as_ref())
-                && readiness
-                    .transparent_outpoint_spend
-                    .covers(latest_block.height, required_cursor.as_ref())
+        } else if let Some(serving_pair_slot) = &self.serving_pair_slot {
+            let source_position = serving_pair_slot
+                .load_full()
+                .wallet_source()
+                .source_position();
+            source_position.chain_epoch_id == visible_tip_block.chain_epoch.id
+                && source_position.tip.height == visible_tip_block.height
+                && source_position.tip.hash == visible_tip_block.block_hash
         } else {
             false
         };
 
         Ok(Response::new(lightd_info(
             activations,
-            latest_block.height,
+            visible_tip_block.height,
             transparent_address_support,
         )))
     }
@@ -881,7 +834,7 @@ async fn transparent_address_tx_history<QueryApi>(
     mut request: TransparentAddressTxIdsInRangeRequest,
 ) -> Result<Vec<TransparentAddressTxIndexArtifact>, Status>
 where
-    QueryApi: WalletQueryApi + ?Sized,
+    QueryApi: LightwalletdQueryApi + ?Sized,
 {
     let mut artifacts = Vec::new();
     loop {
@@ -1089,16 +1042,16 @@ fn block_range_from_request(
 fn mined_location_from_status(status: TxStatus) -> Result<TransactionLocation, Status> {
     match status {
         TxStatus::Mined(mined) => Ok(mined.location),
-        TxStatus::NotFound | TxStatus::InMempool(_) | TxStatus::ConflictingChain => Err(
-            Status::not_found("transaction is not mined in the canonical chain"),
-        ),
+        TxStatus::NotFound | TxStatus::InMempool(_) => Err(Status::not_found(
+            "transaction is not mined in the canonical chain",
+        )),
         _ => Err(Status::not_found(
             "transaction status is not representable on the lightwalletd wire",
         )),
     }
 }
 
-async fn raw_transaction_from_location<Q: WalletQueryApi + ?Sized>(
+async fn raw_transaction_from_location<Q: LightwalletdQueryApi + ?Sized>(
     query_api: &Q,
     chain_epoch_id: ChainEpochId,
     location: TransactionLocation,
@@ -1423,26 +1376,26 @@ fn lightd_info(
 /// need a Zinder-specific table.
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "non-exhaustive broadcast results from zinder-core must degrade conservatively"
+    reason = "non-exhaustive broadcast outcomes from zinder-core must degrade conservatively"
 )]
-fn send_response_from_broadcast_result(
-    broadcast_result: TransactionBroadcastResult,
+fn send_response_from_broadcast_outcome(
+    broadcast_outcome: TransactionBroadcastOutcome,
 ) -> lightwalletd::SendResponse {
-    match broadcast_result {
-        TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }) => {
+    match broadcast_outcome {
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id }) => {
             lightwalletd::SendResponse {
                 error_code: 0,
                 error_message: encode_rpc_transaction_id_hex(transaction_id),
             }
         }
-        TransactionBroadcastResult::InvalidEncoding(BroadcastInvalidEncoding {
+        TransactionBroadcastOutcome::InvalidEncoding(BroadcastInvalidEncoding {
             error_code,
             message,
         }) => lightwalletd::SendResponse {
             error_code: classified_send_error_code(error_code, -22),
             error_message: message,
         },
-        TransactionBroadcastResult::Rejected(BroadcastRejected {
+        TransactionBroadcastOutcome::Rejected(BroadcastRejected {
             error_code,
             message,
             kind: _,
@@ -1450,14 +1403,14 @@ fn send_response_from_broadcast_result(
             error_code: classified_send_error_code(error_code, -26),
             error_message: message,
         },
-        TransactionBroadcastResult::Duplicate(BroadcastDuplicate {
+        TransactionBroadcastOutcome::Duplicate(BroadcastDuplicate {
             error_code,
             message,
         }) => lightwalletd::SendResponse {
             error_code: classified_send_error_code(error_code, -27),
             error_message: message,
         },
-        TransactionBroadcastResult::Queued(BroadcastQueued { message }) => {
+        TransactionBroadcastOutcome::Queued(BroadcastQueued { message }) => {
             // lightwalletd's SendResponse has no queued concept; surface
             // Zebra's underlying -25 Verify code so legacy wallets see the
             // same error code they would have received from zcashd while the
@@ -1467,7 +1420,7 @@ fn send_response_from_broadcast_result(
                 error_message: message,
             }
         }
-        TransactionBroadcastResult::Unknown(BroadcastUnknown {
+        TransactionBroadcastOutcome::Unknown(BroadcastUnknown {
             error_code,
             message,
         }) => lightwalletd::SendResponse {
@@ -1617,7 +1570,7 @@ fn txid_matches_excluded_suffix(transaction_id: &[u8; 32], exclude_suffixes: &[V
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "MempoolEvent is #[non_exhaustive]; the lightwalletd compat shim only projects Added events into RawTransaction, so all current and future non-Added variants are filtered out of the GetMempoolStream projection."
+    reason = "MempoolEvent is #[non_exhaustive]; the lightwalletd compat shim only projects Added events into RawTransaction, so every non-Added variant is filtered out of the GetMempoolStream projection."
 )]
 fn project_added_to_raw_transaction(
     event_outcome: Result<zinder_store::MempoolEventEnvelope, MempoolSurfaceError>,

@@ -1,8 +1,8 @@
 name: release-images
 
-# Build and push only the fact-first wallet-serving service images to ghcr.io
-# when a release tag lands. The legacy query/explorer owners and mixed
-# single-container bundle are intentionally not release artifacts. Use
+# Build and push the wallet-serving service images to ghcr.io
+# when a release tag lands. The native query library, optional explorer runtime,
+# and mixed single-container bundle are intentionally not release artifacts. Use
 # workflow_dispatch to dry-run.
 #
 # Tag convention:

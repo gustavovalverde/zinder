@@ -554,7 +554,7 @@ fn replacement_rejects_a_stale_fence_without_archive_writes()
 }
 
 #[test]
-fn replacement_batch_is_all_old_or_all_new_across_process_abort()
+fn replacement_batch_is_either_pre_update_or_post_update_across_process_abort()
 -> Result<(), Box<dyn std::error::Error>> {
     for failpoint in ["before_atomic_write", "after_atomic_write"] {
         let temporary = TempDir::new()?;

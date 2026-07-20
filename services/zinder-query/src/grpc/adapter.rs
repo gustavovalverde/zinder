@@ -23,15 +23,13 @@ use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
-    ChainEventStreamFamily, EventStreamStartPosition, StoreError, StreamCursorTokenV1,
-    chain_event_stream_family_from_request, event_stream_start_from_request,
+    StreamCursorTokenV1, chain_event_stream_family_from_request, event_stream_start_from_request,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
 use crate::{
-    QueryError, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
-    WalletProjectionReadApi, WalletQueryApi,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, WalletQueryApi,
 };
 
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
@@ -41,12 +39,12 @@ use super::native::{
     build_compact_block_message, build_full_block_message, build_transparent_address_tx_ids_chunk,
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
     build_transparent_unspent_outputs_header, build_wallet_server_info, compact_block_response,
-    full_block_response, latest_block_response, latest_safe_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    subtree_roots_response, transaction_response, transparent_address_unspent_outputs_response,
+    full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, settled_tip_block_response, subtree_roots_response,
+    transaction_response, transparent_address_unspent_outputs_response,
     transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
     transparent_unspent_outputs_by_outpoint_response, transparent_utxo_set_summary_response,
-    tree_state_at_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 use super::status_from_query_error;
 
@@ -63,9 +61,8 @@ const TRANSACTION_NOT_FOUND_REASON: &str =
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
 ///
-/// Wallet queries that touch in-process state owned by the ingest writer
-/// (`ChainEvents` retained replay, the live mempool index, and the mempool
-/// event log) are proxied through the colocated `IngestControl` private
+/// Wallet queries that touch live in-process mempool state owned by the ingest
+/// writer are proxied through the colocated `IngestControl` private
 /// gRPC endpoint when one is wired. Direct (in-process) handling remains
 /// available for development/test deployments that compose ingest and
 /// query in one binary.
@@ -73,7 +70,6 @@ const TRANSACTION_NOT_FOUND_REASON: &str =
 pub struct WalletQueryGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     server_info: ServerInfoSettings,
-    wallet_projection_reader: Option<Arc<dyn WalletProjectionReadApi>>,
     ingest_control_proxy_endpoint: Option<String>,
     ingest_control_bearer_token: Option<BearerToken>,
     /// One cached HTTP/2 channel to the ingest-control writer, dialed lazily
@@ -91,7 +87,6 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         Self {
             query_api,
             server_info,
-            wallet_projection_reader: None,
             ingest_control_proxy_endpoint: None,
             ingest_control_bearer_token: None,
             ingest_control_channel: Arc::new(OnceCell::new()),
@@ -101,8 +96,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     /// Creates a gRPC adapter that proxies in-process ingest-owned reads
     /// through `IngestControl`.
     ///
-    /// The same endpoint serves `ChainEvents`, `MempoolSnapshot`,
-    /// `MempoolEvents`, and the live mempool overlay on
+    /// The same endpoint serves `MempoolSnapshot`, `MempoolEvents`, and the live mempool overlay on
     /// `TransparentAddressBalance`; secondary readers cannot observe the
     /// live writer state otherwise.
     #[must_use]
@@ -114,7 +108,6 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         Self {
             query_api,
             server_info,
-            wallet_projection_reader: None,
             ingest_control_proxy_endpoint: Some(ingest_control_proxy_endpoint),
             ingest_control_bearer_token: None,
             ingest_control_channel: Arc::new(OnceCell::new()),
@@ -127,16 +120,6 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_ingest_control_bearer_token(mut self, bearer_token: BearerToken) -> Self {
         self.ingest_control_bearer_token = Some(bearer_token);
-        self
-    }
-
-    /// Supplies the typed projection-readiness source used by `ServerInfo`.
-    #[must_use]
-    pub fn with_wallet_projection_reader(
-        mut self,
-        wallet_projection_reader: Arc<dyn WalletProjectionReadApi>,
-    ) -> Self {
-        self.wallet_projection_reader = Some(wallet_projection_reader);
         self
     }
 
@@ -163,11 +146,11 @@ where
     type TransparentAddressUnspentOutputsStream = TransparentUnspentOutputsStream;
     type TransparentAddressTxIdsInRangeStream = TransparentAddressTxIdsStream;
 
-    async fn latest_block(
+    async fn visible_tip_block(
         &self,
-        request: Request<wallet::LatestBlockRequest>,
-    ) -> Result<Response<wallet::LatestBlockResponse>, Status> {
-        latest_block_response(
+        request: Request<wallet::VisibleTipBlockRequest>,
+    ) -> Result<Response<wallet::VisibleTipBlockResponse>, Status> {
+        visible_tip_block_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
         )
@@ -176,11 +159,11 @@ where
         .map_err(|error| status_from_query_error(&error))
     }
 
-    async fn latest_safe_block(
+    async fn settled_tip_block(
         &self,
-        request: Request<wallet::LatestSafeBlockRequest>,
-    ) -> Result<Response<wallet::LatestSafeBlockResponse>, Status> {
-        latest_safe_block_response(
+        request: Request<wallet::SettledTipBlockRequest>,
+    ) -> Result<Response<wallet::SettledTipBlockResponse>, Status> {
+        settled_tip_block_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
         )
@@ -413,18 +396,6 @@ where
     ) -> Result<Response<Self::ChainEventsStream>, Status> {
         let started_at = Instant::now();
         let outcome: Result<Response<ChainEventsStream>, Status> = async {
-            if self.ingest_control_proxy_endpoint.is_some() {
-                let mut client = self
-                    .ingest_control_client(
-                        "ChainEvents requires the ingest-control proxy; \
-                         configure the writer endpoint",
-                    )
-                    .await?;
-                let response = client.chain_events(request).await?;
-                let stream: ChainEventsStream = Box::pin(response.into_inner());
-                return Ok(Response::new(stream));
-            }
-
             let request = request.into_inner();
             let start = event_stream_start_from_request(request.start)?;
             let requested_family = chain_event_stream_family_from_request(request.family)?;
@@ -744,48 +715,7 @@ where
         &self,
         _request: Request<wallet::ServerInfoRequest>,
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
-        let mut server_info = self.server_info.clone();
-        if let Some(wallet_projection_reader) = self.wallet_projection_reader.clone() {
-            let latest_block = match self.query_api.latest_block(None).await {
-                Ok(latest_block) => Some(latest_block),
-                Err(QueryError::Store(StoreError::NoVisibleChainEpoch)) => None,
-                Err(error) => return Err(status_from_query_error(&error)),
-            };
-            if let Some(latest_block) = latest_block {
-                let required_cursor = self
-                    .query_api
-                    .resolve_chain_events_start(
-                        EventStreamStartPosition::LiveTail,
-                        ChainEventStreamFamily::Tip,
-                    )
-                    .await
-                    .map_err(|error| status_from_query_error(&error))?
-                    .cursor;
-                let readiness =
-                    tokio::task::spawn_blocking(move || wallet_projection_reader.readiness())
-                        .await
-                        .map_err(|error| {
-                            Status::internal(format!(
-                                "wallet projection readiness task failed: {error}"
-                            ))
-                        })?
-                        .map_err(|error| {
-                            Status::internal(format!(
-                                "wallet projection readiness read failed: {error}"
-                            ))
-                        })?;
-                let visible_tip_height = latest_block.chain_epoch.visible_tip_height;
-                server_info.transparent_address_history_available = readiness
-                    .transparent_address_history
-                    .covers(visible_tip_height, required_cursor.as_ref());
-                server_info.transparent_outpoint_spend_available = readiness
-                    .transparent_outpoint_spend
-                    .covers(visible_tip_height, required_cursor.as_ref());
-            } else {
-                server_info.transparent_address_history_available = false;
-                server_info.transparent_outpoint_spend_available = false;
-            }
-        }
+        let server_info = self.server_info.clone();
         let mut wallet_info = build_wallet_server_info(&server_info);
         let Some(common) = wallet_info.common.as_mut() else {
             return Err(Status::internal(

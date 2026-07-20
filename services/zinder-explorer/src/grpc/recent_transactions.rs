@@ -1,7 +1,7 @@
 //! `ExplorerQuery.RecentTransactions` handler.
 //!
-//! Streams the newest-first projection materialized by
-//! [`zinder_derive::RecentTransactionsConsumer`]
+//! Streams the newest-first view materialized by
+//! [`zinder_materialized_views::RecentTransactionsConsumer`]
 //! out of the consumer-owned `recent_transactions` column family. Joins
 //! the per-tx `transaction_fees` rows in a single `multi_get` so the page
 //! cost is one prefix scan plus one batched lookup.
@@ -18,7 +18,7 @@ use zinder_proto::v1::explorer::{
     RecentTransactionEntry, RecentTransactionsChunk, RecentTransactionsRequest,
     TransactionFeesRecord,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
 use zinder_store::{SecondaryChainStore, chain_epoch_from_message, status_from_store_error};
@@ -28,7 +28,9 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
-use zinder_derive::{DeriveStore, RECENT_TRANSACTIONS_COLUMN_FAMILY, TransactionFeesConsumer};
+use zinder_materialized_views::{
+    MaterializedViewStore, RECENT_TRANSACTIONS_COLUMN_FAMILY, TransactionFeesConsumer,
+};
 
 /// Server-side maximum entries the handler ever returns in one stream.
 const MAX_RECENT_TRANSACTIONS_PER_REQUEST: u32 = 1024;
@@ -36,7 +38,7 @@ const MAX_RECENT_TRANSACTIONS_PER_REQUEST: u32 = 1024;
 /// Default `max_entries` when the caller passes zero.
 const DEFAULT_RECENT_TRANSACTIONS: u32 = 64;
 
-/// Length of one row key in the projection (`reverse_height` + position).
+/// Length of one row key in the materialized view (`reverse_height` + position).
 const ROW_KEY_LEN: usize = 8;
 
 /// Stream type returned by the RPC.
@@ -44,8 +46,12 @@ pub(crate) type RecentTransactionsStream =
     Pin<Box<dyn Stream<Item = Result<RecentTransactionsChunk, Status>> + Send + 'static>>;
 
 /// Executes one `ExplorerQuery.RecentTransactions` request.
-pub(crate) async fn handle_recent_transactions(
-    derive_store: &DeriveStore,
+#[allow(
+    clippy::too_many_lines,
+    reason = "the streaming handler keeps admission, hydration, and response construction together"
+)]
+pub(crate) async fn query_recent_transactions(
+    materialized_view_store: &MaterializedViewStore,
     chain_store: Option<&SecondaryChainStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
@@ -73,7 +79,7 @@ pub(crate) async fn handle_recent_transactions(
     // Cursor rows are exclusive, so request one extra row to skip the
     // resume row without short-changing the page.
     let scan_cap = (max_entries as usize).saturating_add(usize::from(cursor_start.is_some()));
-    let rows = derive_store
+    let rows = materialized_view_store
         .range_iterate_consumer(
             RECENT_TRANSACTIONS_COLUMN_FAMILY,
             &start_key,
@@ -102,21 +108,26 @@ pub(crate) async fn handle_recent_transactions(
     }
 
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
-    join_paid_fees(derive_store, chain_store, &chain_epoch, &mut entries)?;
+    join_paid_fees(
+        materialized_view_store,
+        chain_store,
+        &chain_epoch,
+        &mut entries,
+    )?;
     let cursor = last_key.map_or_else(Vec::new, |key| key.to_vec());
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_TRANSACTION_RECENT_V1,
             Some(chain_epoch),
             0,
@@ -132,14 +143,14 @@ pub(crate) async fn handle_recent_transactions(
     Ok(Response::new(Box::pin(stream)))
 }
 
-/// Hydrates `entries[*].paid_fee_zat` from the `transaction_fees` projection
+/// Hydrates `entries[*].paid_fee_zat` from the `transaction_fees` materialized view
 /// in a single batched read.
 ///
 /// Coinbase rows are skipped (no fee record exists). Missing fee records
 /// leave `paid_fee_zat` unset; that's the explicit "not available" signal
 /// per ADR-0018.
 fn join_paid_fees(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     chain_store: Option<&SecondaryChainStore>,
     chain_epoch: &zinder_proto::v1::wallet::ChainEpoch,
     entries: &mut [RecentTransactionEntry],
@@ -158,8 +169,9 @@ fn join_paid_fees(
     if lookup_targets.is_empty() {
         return Ok(());
     }
-    let records = TransactionFeesConsumer::read_fees_records_many(derive_store, &lookup_targets)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let records =
+        TransactionFeesConsumer::read_fees_records_many(materialized_view_store, &lookup_targets)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
     for entry in entries.iter_mut() {
         if entry.is_coinbase {
             continue;

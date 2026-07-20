@@ -4,12 +4,12 @@ Status: Accepted
 Date: 2026-05-20
 Related: [ADR-0001](0001-rocksdb-canonical-store.md),
 [ADR-0003](0003-canonical-storage-access-boundary.md),
-[ADR-0015](0015-unified-phase-driven-ingest.md),
+[ADR-0015](0015-phase-driven-ingest.md),
 [ADR-0022](0022-resource-budgeted-bulk-catchup.md)
 
 ## Context
 
-Zinder's canonical and derive stores are allowed to grow with chain history, but
+Zinder's canonical and materialized-view stores are allowed to grow with chain history, but
 their resident memory must not grow with on-disk store size. The storage layer
 serves long sequential reads during startup catchup, secondary replay, and
 wallet-facing scans. With buffered filesystem I/O, those reads can populate the
@@ -36,8 +36,8 @@ write buffers. Those controls are still required, but they are incomplete:
 ## Decision
 
 Both RocksDB users in the workspace route through one bounded open path in
-`zinder-store`: the canonical store (`RocksChainStore`) and the derive store
-(`DeriveStore`). The helper owns the block cache, write-buffer manager, direct
+`zinder-store`: the canonical store (`RocksChainStore`) and the materialized-view store
+(`MaterializedViewStore`). The helper owns the block cache, write-buffer manager, direct
 I/O resolution, and open retry policy.
 
 ### Direct I/O With Buffered Fallback
@@ -60,10 +60,10 @@ beside the RocksDB handle for observability.
 
 ### Resource Budget
 
-`RocksDbResourceBudget` is the single typed budget for canonical and derive
+`RocksDbResourceBudget` is the single typed budget for canonical and materialized-view
 stores. It carries:
 
-| Knob | Writer canonical | Writer derive | Reader canonical | Reader derive | Effect |
+| Knob | Canonical writer | Materialized-view writer | Canonical reader | Materialized-view reader | Effect |
 | --- | --- | --- | --- | --- | --- |
 | `block_cache_bytes` | 512 MiB | 256 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data, index, and bloom blocks. |
 | `max_wal_bytes` | 256 MiB | 256 MiB | 32 MiB | 16 MiB | Live WAL ceiling. Writer stores flush once the WAL crosses this limit. |
@@ -73,7 +73,7 @@ stores. It carries:
 | `max_background_jobs` | 2 | 2 | 2 (not applied) | 2 (not applied) | Primary-writer aggregate flush and compaction job cap owned by RocksDB. |
 | `memtable_budget_bytes` | 256 MiB | 512 MiB | 16 MiB | 16 MiB | Total memtable memory budget across column families via `WriteBufferManager`. |
 
-The derive writer deliberately reserves more aggregate memtable headroom than
+The materialized-view writer deliberately reserves more aggregate memtable headroom than
 canonical because one ordered replay dispatch writes many consumer column
 families. The shared manager still enforces the 512 MiB hard bound; the larger
 envelope prevents hot families from stalling behind constant flush and
@@ -122,13 +122,13 @@ These options are storage-layer contracts and are not operator-configurable:
 ### Memory Pressure
 
 Ingest memory-pressure backpressure uses non-reclaimable memory, not working
-set. The derive replay budget computes its pressure ratio from cgroup `anon`
+set. The materialized-view replay budget computes its pressure ratio from cgroup `anon`
 memory divided by `memory.high` when set, otherwise `memory.max`. If cgroup
 `anon` is unavailable, it falls back to process `RssAnon` from
 `/proc/self/status`.
 
 `working_set_bytes` remains exported as a diagnostic metric, but it does not
-drive derive replay throttling because active file cache is reclaimable.
+drive materialized-view replay throttling because active file cache is reclaimable.
 
 ### Startup Catchup
 
@@ -145,10 +145,10 @@ time.
   filesystems, direct I/O prevents store reads from filling the cgroup through
   page cache. On unsupported platforms, the same bounded RocksDB-owned caches
   are used with buffered I/O.
-- The canonical and derive stores share the same open path, so direct-I/O
+- The canonical and materialized-view stores share the same open path, so direct-I/O
   resolution, block-cache setup, WBM setup, and fallback behavior cannot drift.
 - Operators tune a curated budget surface instead of raw RocksDB options.
-- Rebuildable derive replay backs off only on non-reclaimable memory pressure.
+- Rebuildable materialized-view replay backs off only on non-reclaimable memory pressure.
   Reclaimable file cache does not pause indexing.
 - Reader processes can start and expose `/readyz` while a secondary catches up.
 
@@ -163,15 +163,14 @@ time.
 - **Use per-column-family write buffers only.** Rejected. The total grows with
   the number of column families. `WriteBufferManager` is the cross-CF bound.
 - **Keep using working-set pressure.** Rejected. `memory.current -
-  inactive_file` still includes active file cache and can pause derive replay
+  inactive_file` still includes active file cache and can pause materialized-view replay
   while the kernel could reclaim the memory.
 - **Fail startup when initial catchup is slow.** Rejected. Replica lag is a
   readiness condition, not a liveness failure.
 
-## Revision: store-size-independent memory invariant (2026-06-06)
+## Store-size-independent memory invariant
 
-This revision replaces the earlier WAL-replay-centered wording with the current
-invariant: RocksDB-owned memory is bounded by `RocksDbResourceBudget`, store
+RocksDB-owned memory is bounded by `RocksDbResourceBudget`, store
 reads prefer direct I/O with buffered fallback, total memtable memory is bounded
 by `WriteBufferManager`, and memory pressure is based on non-reclaimable
 anonymous memory.

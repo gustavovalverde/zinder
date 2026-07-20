@@ -6,7 +6,7 @@ use zebra_chain::{
     block::{Header as ZebraBlockHeader, merkle::Root as ZebraMerkleRoot},
     serialization::ZcashDeserialize,
 };
-use zinder_core::{BlockHash, BlockHeaderInfo, BlockHeight, BlockId, Network};
+use zinder_core::{BlockHash, BlockHeader, BlockHeight, BlockId, Network};
 
 use crate::SourceError;
 
@@ -38,25 +38,25 @@ impl SourceBlockHeader {
         height: BlockHeight,
         raw_block_bytes: &[u8],
     ) -> Result<Self, SourceError> {
-        let header_info = block_header_info_from_raw_block_bytes(height, raw_block_bytes)?;
-        let block_time_seconds = u32::try_from(header_info.block_time)
-            .map_err(|_| SourceError::RawBlockTimeOutOfRange)?;
+        let header = block_header_from_raw_block_bytes(height, raw_block_bytes)?;
+        let block_time_seconds =
+            u32::try_from(header.block_time).map_err(|_| SourceError::RawBlockTimeOutOfRange)?;
 
         Ok(Self {
             network,
             height,
-            hash: header_info.block_id.hash,
-            parent_hash: header_info.previous_block_hash,
+            hash: header.block_id.hash,
+            parent_hash: header.previous_block_hash,
             block_time_seconds,
         })
     }
 }
 
-/// Parses a typed [`BlockHeaderInfo`] from raw serialized Zcash block
+/// Parses a typed [`BlockHeader`] from raw serialized Zcash block
 /// bytes.
 ///
 /// Returns the block-header read-model shape consumed by the wallet data
-/// plane. The typed `BlockHeaderInfo` is the public boundary; this
+/// plane. The typed `BlockHeader` is the public boundary; this
 /// function is the one place where Zebra's block-header structure is
 /// translated into Zinder vocabulary.
 ///
@@ -64,10 +64,10 @@ impl SourceBlockHeader {
 /// the header is not deserialized. Hot-path callers (`transaction()`
 /// status lookups) therefore avoid the per-call cost of decoding every
 /// transaction in the containing block.
-pub fn block_header_info_from_raw_block_bytes(
+pub fn block_header_from_raw_block_bytes(
     height: BlockHeight,
     raw_block_bytes: &[u8],
-) -> Result<BlockHeaderInfo, SourceError> {
+) -> Result<BlockHeader, SourceError> {
     let mut cursor = Cursor::new(raw_block_bytes);
     let header = ZebraBlockHeader::zcash_deserialize(&mut cursor).map_err(|source| {
         SourceError::RawBlockParseFailed {
@@ -83,7 +83,7 @@ pub fn block_header_info_from_raw_block_bytes(
     let nonce = *header.nonce;
     let version = header.version;
 
-    Ok(BlockHeaderInfo::new(
+    Ok(BlockHeader::new(
         block_id,
         previous_block_hash,
         merkle_root_hash,

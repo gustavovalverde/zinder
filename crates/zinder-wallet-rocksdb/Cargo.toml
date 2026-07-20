@@ -1,7 +1,7 @@
 [package]
 name = "zinder-wallet-rocksdb"
 version = "0.1.0"
-description = "Version-1 RocksDB wallet projection storage and construction"
+description = "RocksDB wallet projection storage and construction"
 edition.workspace = true
 readme = "../../README.md"
 keywords = ["zcash", "indexer", "wallet"]
@@ -14,7 +14,7 @@ rust-version.workspace = true
 rust-rocksdb.workspace = true
 thiserror.workspace = true
 zinder-core.workspace = true
-zinder-rocksdb.workspace = true
+zinder-rocksdb-bulk-load.workspace = true
 zinder-store.workspace = true
 zinder-wallet-projection.workspace = true
 

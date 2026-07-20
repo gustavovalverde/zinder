@@ -49,8 +49,8 @@ fn chain_view_round_trips_through_prost() -> eyre::Result<()> {
             committed_height: Some(42),
             estimated_height: Some(44),
         }),
-        derive: Some(wallet::DeriveStatus {
-            health: wallet::DeriveHealth::CatchingUp as i32,
+        materialized_views: Some(wallet::MaterializedViewStatus {
+            health: wallet::MaterializedViewHealth::CatchingUp as i32,
             indexed_height: 41,
             lag_blocks: 1,
             observed_at_millis: 1_774_670_400_000,
@@ -76,8 +76,8 @@ fn chain_view_round_trips_through_prost() -> eyre::Result<()> {
     assert_eq!(upstream_tip.estimated_height, Some(44));
     assert_eq!(
         decoded
-            .derive
-            .ok_or_else(|| eyre!("derive missing"))?
+            .materialized_views
+            .ok_or_else(|| eyre!("materialized-view status missing"))?
             .indexed_height,
         41
     );
@@ -138,21 +138,21 @@ fn subtree_root_round_trips_through_prost() -> eyre::Result<()> {
 }
 
 #[test]
-fn latest_block_response_round_trips_through_prost() -> eyre::Result<()> {
-    let response = wallet::LatestBlockResponse {
+fn visible_tip_block_response_round_trips_through_prost() -> eyre::Result<()> {
+    let response = wallet::VisibleTipBlockResponse {
         chain_view: Some(synthetic_chain_view()),
-        latest_block: Some(wallet::BlockMetadata {
+        visible_tip_block: Some(wallet::BlockId {
             height: 42,
             block_hash: "55".repeat(32),
         }),
     };
     let decoded_response = round_trip(&response)?;
-    let latest_block = decoded_response
-        .latest_block
-        .ok_or_else(|| eyre!("decoded latest block response is missing block metadata"))?;
+    let visible_tip_block = decoded_response
+        .visible_tip_block
+        .ok_or_else(|| eyre!("decoded visible-tip block response is missing block identity"))?;
 
-    assert_eq!(latest_block.height, 42);
-    assert_eq!(latest_block.block_hash, "55".repeat(32));
+    assert_eq!(visible_tip_block.height, 42);
+    assert_eq!(visible_tip_block.block_hash, "55".repeat(32));
     assert!(decoded_response.chain_view.is_some());
 
     Ok(())
@@ -215,7 +215,7 @@ fn transaction_status_response_carries_mined_location() -> eyre::Result<()> {
                         block_hash: "cd".repeat(32),
                         tx_index_in_block: 3,
                     }),
-                    details: Some(wallet::MinedDetails {
+                    chain_context: Some(wallet::MinedTransactionChainContext {
                         consensus_branch_id: 0xc2d6_d0b4,
                         block_time: 1_774_670_000,
                         confirmations: 6,
@@ -243,8 +243,8 @@ fn transaction_status_response_carries_mined_location() -> eyre::Result<()> {
     assert_eq!(block_location.tx_index_in_block, 3);
     assert_eq!(
         mined
-            .details
-            .ok_or_else(|| eyre!("details missing"))?
+            .chain_context
+            .ok_or_else(|| eyre!("chain context missing"))?
             .confirmations,
         6
     );
@@ -266,7 +266,7 @@ fn mined_transaction_round_trips_absent_raw_transaction_bytes() -> eyre::Result<
             block_hash: "cd".repeat(32),
             tx_index_in_block: 3,
         }),
-        details: Some(wallet::MinedDetails {
+        chain_context: Some(wallet::MinedTransactionChainContext {
             consensus_branch_id: 0xc2d6_d0b4,
             block_time: 1_774_670_000,
             confirmations: 6,
@@ -311,30 +311,6 @@ fn transaction_status_response_carries_in_mempool_location() -> eyre::Result<()>
 }
 
 #[test]
-fn transaction_status_response_carries_conflicting_location() -> eyre::Result<()> {
-    let response = wallet::TransactionStatusResponse {
-        chain_view: Some(synthetic_chain_view()),
-        location: Some(wallet::TransactionLocation {
-            location: Some(wallet::transaction_location::Location::Conflicting(
-                wallet::ConflictingChainTransaction {},
-            )),
-        }),
-    };
-    let decoded = round_trip(&response)?;
-
-    let location = decoded
-        .location
-        .and_then(|location| location.location)
-        .ok_or_else(|| eyre!("location oneof missing"))?;
-    assert!(matches!(
-        location,
-        wallet::transaction_location::Location::Conflicting(_)
-    ));
-
-    Ok(())
-}
-
-#[test]
 fn network_upgrade_activations_round_trip_through_prost() -> eyre::Result<()> {
     let response = wallet::NetworkUpgradeActivationsResponse {
         activations: vec![wallet::NetworkUpgradeActivation {
@@ -369,8 +345,8 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
 
     assert_eq!(decoded_response.cursor, vec![0x99; 82]);
     assert_eq!(decoded_response.event_sequence, 11);
-    // The safe tip height is folded onto chain_view.chain_epoch.settled_tip;
-    // the envelope no longer carries a separate safe_tip_height field.
+    // The settled tip height is folded onto chain_view.chain_epoch.settled_tip;
+    // the envelope no longer carries a separate settled_tip_height field.
     let settled_tip = decoded_response
         .chain_view
         .as_ref()
@@ -609,7 +585,7 @@ fn transaction_id_wire_field_carries_rpc_form_hex() -> eyre::Result<()> {
 /// Locks the wallet-plane block-hash wire-shape contract.
 ///
 /// Two responses carry block hashes on different wire shapes
-/// (`ChainEpoch.visible_tip.hash` and `BlockMetadata.block_hash`); both must
+/// (`ChainEpoch.visible_tip.hash` and `BlockId.block_hash`); both must
 /// encode the canonical RPC form so the consumer can compare strings
 /// byte-for-byte without knowing which response produced the field.
 #[test]
@@ -621,14 +597,14 @@ fn block_hash_wire_field_carries_rpc_form_hex() -> eyre::Result<()> {
     ]);
     let canonical_rpc_form = "0033f1bac622eb8f3dcc0c3a5e1a3f17dbf3a6a3af406f30e49fa0f422fcceee";
 
-    let metadata = wallet::BlockMetadata {
+    let block_id = wallet::BlockId {
         height: 4_031_230,
         block_hash: encode_rpc_block_hash_hex(internal_block_hash),
     };
-    let decoded_metadata = round_trip(&metadata)?;
-    assert_eq!(decoded_metadata.block_hash, canonical_rpc_form);
+    let decoded_block_id = round_trip(&block_id)?;
+    assert_eq!(decoded_block_id.block_hash, canonical_rpc_form);
     assert_eq!(
-        decode_rpc_block_hash_hex(&decoded_metadata.block_hash)?,
+        decode_rpc_block_hash_hex(&decoded_block_id.block_hash)?,
         internal_block_hash,
     );
 
@@ -660,7 +636,7 @@ fn synthetic_chain_view() -> wallet::ChainView {
         chain_epoch: Some(synthetic_chain_epoch()),
         indexed_tip: None,
         upstream_tip: None,
-        derive: None,
+        materialized_views: None,
     }
 }
 
@@ -863,7 +839,7 @@ fn chain_events_request_round_trips_start_and_family() -> eyre::Result<()> {
                 wallet::LiveTail {},
             )),
         }),
-        family: wallet::ChainEventStreamFamily::Safe as i32,
+        family: wallet::ChainEventStreamFamily::Settled as i32,
         address_filter: vec!["t1deadbeef".to_owned()],
     };
     let decoded = round_trip(&request)?;
@@ -872,13 +848,16 @@ fn chain_events_request_round_trips_start_and_family() -> eyre::Result<()> {
         decoded.start.and_then(|start| start.position),
         Some(wallet::event_stream_start::Position::LiveTail(_))
     ));
-    assert_eq!(decoded.family, wallet::ChainEventStreamFamily::Safe as i32);
+    assert_eq!(
+        decoded.family,
+        wallet::ChainEventStreamFamily::Settled as i32
+    );
     assert_eq!(decoded.address_filter, vec!["t1deadbeef".to_owned()]);
     Ok(())
 }
 
 #[test]
-fn mempool_events_request_round_trips_start_and_family() -> eyre::Result<()> {
+fn mempool_events_request_round_trips_start() -> eyre::Result<()> {
     let request = wallet::MempoolEventsRequest {
         start: Some(wallet::EventStreamStart {
             position: Some(wallet::event_stream_start::Position::AfterCursor(vec![
@@ -886,7 +865,6 @@ fn mempool_events_request_round_trips_start_and_family() -> eyre::Result<()> {
                 82
             ])),
         }),
-        family: wallet::MempoolEventStreamFamily::Mempool as i32,
     };
     let decoded = round_trip(&request)?;
 
@@ -896,10 +874,6 @@ fn mempool_events_request_round_trips_start_and_family() -> eyre::Result<()> {
             0x0F;
             82
         ]))
-    );
-    assert_eq!(
-        decoded.family,
-        wallet::MempoolEventStreamFamily::Mempool as i32
     );
     Ok(())
 }
@@ -911,7 +885,7 @@ fn mempool_snapshot_response_round_trips_events_resume_cursor() -> eyre::Result<
             chain_epoch: Some(synthetic_chain_epoch()),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         events_resume_cursor: vec![0xC4; 82],
         snapshot_age_millis: 250,
@@ -968,16 +942,16 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
         service_version: "0.1.0".to_owned(),
         capabilities: vec![zinder_proto::capabilities::WALLET_EVENTS_CHAIN_V1.to_owned()],
         contract_revision: zinder_proto::CONTRACT_REVISION,
-        projection_preset: "wallet".to_owned(),
-        projection_identities: vec!["transparent_outpoint_spend".to_owned()],
+        materialized_view_preset: "wallet".to_owned(),
+        materialized_view_identities: vec!["transparent_outpoint_spend".to_owned()],
     };
     let decoded = round_trip(&server_info)?;
 
     assert_eq!(decoded.contract_revision, zinder_proto::CONTRACT_REVISION);
     assert_eq!(decoded.contract_revision, 1);
-    assert_eq!(decoded.projection_preset, "wallet");
+    assert_eq!(decoded.materialized_view_preset, "wallet");
     assert_eq!(
-        decoded.projection_identities,
+        decoded.materialized_view_identities,
         vec!["transparent_outpoint_spend"]
     );
     Ok(())

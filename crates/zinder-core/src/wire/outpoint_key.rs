@@ -1,11 +1,11 @@
-//! Transparent outpoint encoder for derive-store primary keys.
+//! Transparent outpoint encoder for materialized-view primary keys.
 //!
 //! The transparent-outpoint-spend projection keys its rows on the spent
 //! outpoint: the creating transaction id followed by the big-endian output
 //! index. Lexicographic order groups every output of one transaction together,
 //! which is irrelevant to point lookups but keeps the layout self-describing.
 //!
-//! Derive-store boundaries build outpoint keys through this encoder rather than
+//! Materialized-view store boundaries build outpoint keys through this encoder rather than
 //! inlining `outpoint.transaction_id.as_bytes()` with
 //! `outpoint.output_index.to_be_bytes()`, keeping the 36-byte layout in one
 //! place per the key-codec convention in ADR-0017.
@@ -15,12 +15,12 @@ use crate::wire::{
     WireDecodeError, decode_internal_transaction_id, encode_internal_transaction_id,
 };
 
-/// Number of bytes a transparent outpoint occupies in a derive-store key.
+/// Number of bytes a transparent outpoint occupies in a materialized-view key.
 pub const OUTPOINT_KEY_LEN: usize = 36;
 
 const TRANSACTION_ID_LEN: usize = 32;
 
-/// Encodes a transparent outpoint into its derive-store key bytes.
+/// Encodes a transparent outpoint into its materialized-view key bytes.
 #[must_use]
 pub fn encode_outpoint_key(outpoint: TransparentOutPoint) -> [u8; OUTPOINT_KEY_LEN] {
     let mut key = [0u8; OUTPOINT_KEY_LEN];
@@ -30,7 +30,7 @@ pub fn encode_outpoint_key(outpoint: TransparentOutPoint) -> [u8; OUTPOINT_KEY_L
     key
 }
 
-/// Decodes derive-store key bytes back into a transparent outpoint.
+/// Decodes materialized-view key bytes back into a transparent outpoint.
 ///
 /// Returns [`WireDecodeError::InvalidLength`] when `bytes` is not exactly
 /// [`OUTPOINT_KEY_LEN`] bytes long.

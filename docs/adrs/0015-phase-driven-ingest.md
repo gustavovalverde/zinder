@@ -1,0 +1,92 @@
+# ADR-0015: Phase-Driven Ingest
+
+## Status
+
+Accepted.
+
+## Context
+
+Canonical ingest has two distinct workloads. A store far behind the upstream
+tip needs bounded, pipelined construction, while a near-tip store needs serial
+append and replacement handling with low observation latency. Requiring an
+operator or deployment system to select one workload creates two startup
+contracts and permits a cold store to run the near-tip path indefinitely.
+
+The writer already owns the information needed to choose correctly: the local
+canonical tip, the upstream tip, the reorg window, and upstream health. The
+choice therefore belongs inside `zinder-ingest`, not in service wrappers or
+deployment scripts.
+
+## Decision
+
+`zinder-ingest` runs one long-lived canonical writer and classifies work on each
+iteration with `classify_phase`:
+
+- `AwaitingUpstream` when the upstream tip is height zero.
+- `BulkCatchup` when the upstream-to-store gap is greater than
+  `ingest.phase_classification.catchup_threshold_blocks`.
+- `FollowingTip` otherwise.
+
+An empty store is treated as height zero. A store ahead of the observed upstream
+tip saturates the gap to zero and enters `FollowingTip`, where the writer waits
+for a coherent replacement observation. Phase changes are bidirectional, so a
+writer can return to `BulkCatchup` after downtime without a process restart or
+operator action.
+
+Bulk catch-up fetches bounded source segments, prepares blocks concurrently,
+and publishes authenticated canonical batches without crossing the configured
+reorg window unless `ingest.run_overrides.allow_reorg_window_settlement` explicitly
+permits it. Following-tip mode observes one coherent source update at a time and
+publishes either an append or a replacement. Both paths use the same canonical
+store, error classification, readiness state, and recovery policy.
+
+The writer exposes the phase independently from readiness cause. A process can,
+for example, be in `following_tip` while reporting `node_unavailable`; clients
+must not infer one dimension from the other. `IngestControl.WriterStatus`
+reports phase, source position, gap, and upstream-health observations.
+
+The configuration is grouped by responsibility:
+
+- `[ingest.phase_classification]` owns the gap boundary.
+- `[ingest.construction]` owns historical construction limits.
+- `[ingest.follow]` owns near-tip polling and lag limits.
+- `[ingest.run_overrides]` owns bounded one-run overrides.
+- `[node.health]` owns the upstream readiness probe because health is a source
+  property, not an ingest-phase property.
+
+The writer opens the primary canonical store once. The mempool owner, retention
+worker, and control service share the same process lifetime and do not restart
+when the ingest phase changes.
+
+### Upstream sync detection
+
+When `[node.health].addr` is configured, the writer polls Zebra's readiness
+endpoint and treats a non-ready upstream as `upstream_not_ready`. The resolved
+`NodeHealthConfig` owns the poll interval, verification-progress floor, and
+estimated-gap threshold. The source adapter returns a typed
+`UpstreamHealthSnapshot`; the writer owns how that observation affects
+readiness and recovery. Missing, malformed, or unreachable health responses do
+not become successful observations.
+
+Without an explicit readiness endpoint, the writer relies on the source
+observations available through Zebra JSON-RPC. Upstream health remains
+independent from the local ingest phase in both cases.
+
+## Consequences
+
+- Operators run one ingest command for empty, recovering, and near-tip stores.
+- Deployment configuration does not encode the writer's current phase.
+- Historical throughput limits and near-tip latency limits remain separate and
+  can be tuned without creating separate execution modes.
+- Readiness and control-plane clients receive explicit phase and upstream-health
+  data.
+- Phase handlers must preserve one canonical publication and recovery contract.
+
+## References
+
+- [Chain ingestion](../architecture/chain-ingestion.md)
+- [Service operations](../architecture/service-operations.md)
+- [ADR-0013: Source failure recovery topology](0013-source-failure-recovery-topology.md)
+- [ADR-0014: Shared configuration sections](0014-shared-configuration-sections.md)
+- [ADR-0022: Resource-budgeted bulk catch-up](0022-resource-budgeted-bulk-catchup.md)
+- [ADR-0035: Canonical storage topologies](0035-canonical-storage-topologies.md)

@@ -15,7 +15,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier, ShieldedProtocol};
-use zinder_rocksdb::{
+use zinder_rocksdb_bulk_load::{
     OrderedKeyValueEvidence, OrderedKeyValueEvidenceAccumulator, SstFileEvidence,
 };
 
@@ -788,7 +788,7 @@ struct PersistedReadyEvidence {
     visible_event_sequence: u64,
     visible_block_count: u64,
     visible_sequence_digest: [u8; 32],
-    visible_logical_fact_bytes: u64,
+    visible_logical_replay_bytes: u64,
     settled_checkpoint: PersistedBlockId,
     settled_checkpoint_count: u64,
     settled_checkpoint_digest: [u8; 32],
@@ -805,7 +805,7 @@ impl PersistedReadyEvidence {
             visible_event_sequence: ready.visible_event_sequence,
             visible_block_count: ready.visible_block_count,
             visible_sequence_digest: ready.visible_sequence_digest,
-            visible_logical_fact_bytes: ready.visible_logical_fact_bytes,
+            visible_logical_replay_bytes: ready.visible_logical_replay_bytes,
             settled_checkpoint: PersistedBlockId::from_block_id(checkpoint.through()),
             settled_checkpoint_count: checkpoint.retained_block_count(),
             settled_checkpoint_digest: checkpoint.sequence_digest().as_bytes(),
@@ -824,7 +824,7 @@ impl PersistedReadyEvidence {
             || self.visible_event_sequence != 1
             || self.visible_block_count != block_evidence.block_count
             || self.visible_sequence_digest != block_evidence.sequence_digest
-            || self.visible_logical_fact_bytes == 0
+            || self.visible_logical_replay_bytes == 0
             || self.settled_checkpoint.height > self.visible_tip.height
             || self.settled_checkpoint_count == 0
             || self.settled_checkpoint_logical_replay_bytes == 0

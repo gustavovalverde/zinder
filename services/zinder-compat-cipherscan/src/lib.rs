@@ -101,10 +101,10 @@ use zinder_proto::v1::{
         explorer_query_client::ExplorerQueryClient, lock_time, transaction_history_request,
     },
     wallet::{
-        self, AddressLookup, BlockSelectorRequest, BroadcastTransactionRequest, LatestBlockRequest,
-        LatestSafeBlockRequest, TransactionRequest, address_lookup, broadcast_transaction_response,
-        chain_event_envelope, event_stream_start, mempool_event_envelope, transaction_location,
-        wallet_query_client::WalletQueryClient,
+        self, AddressLookup, BlockSelectorRequest, BroadcastTransactionRequest,
+        SettledTipBlockRequest, TransactionRequest, VisibleTipBlockRequest, address_lookup,
+        broadcast_transaction_response, chain_event_envelope, event_stream_start,
+        mempool_event_envelope, transaction_location, wallet_query_client::WalletQueryClient,
     },
 };
 use zinder_runtime::AuthenticatedChannel;
@@ -113,7 +113,7 @@ use crate::blend_check::{
     NearbyCandidateCount, SplitCandidateCount, blend_label, build_split_plans, compute_blend_score,
     nearby_popular_amounts, split_remainder_amounts,
 };
-use crate::market_price::{HistoricalMarketPriceResult, MarketPriceClient, MarketPriceError};
+use crate::market_price::{HistoricalMarketPriceLookup, MarketPriceClient, MarketPriceError};
 use crate::mining_pools::get_pool_name;
 
 const DEFAULT_LIMIT: u32 = 10;
@@ -502,18 +502,18 @@ impl TransactionHistoryCountCacheKey {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TransactionHistoryReadFenceCacheKey {
     chain_epoch_id: u64,
-    projection_revision: u64,
-    projection_tip_height: u32,
-    projection_tip_hash: String,
+    materialized_view_revision: u64,
+    materialized_view_tip_height: u32,
+    materialized_view_tip_hash: String,
 }
 
 impl From<&TransactionHistoryReadFence> for TransactionHistoryReadFenceCacheKey {
     fn from(read_fence: &TransactionHistoryReadFence) -> Self {
         Self {
             chain_epoch_id: read_fence.chain_epoch_id,
-            projection_revision: read_fence.projection_revision,
-            projection_tip_height: read_fence.projection_tip_height,
-            projection_tip_hash: read_fence.projection_tip_hash.clone(),
+            materialized_view_revision: read_fence.materialized_view_revision,
+            materialized_view_tip_height: read_fence.materialized_view_tip_height,
+            materialized_view_tip_hash: read_fence.materialized_view_tip_hash.clone(),
         }
     }
 }
@@ -650,10 +650,10 @@ fn validate_orchard_candidate_scan_coverage(
     }
     let coverage_range_is_valid = coverage.complete_from_height <= coverage.complete_through_height;
     let coverage_is_within_fence =
-        coverage.complete_through_height <= read_fence.projection_tip_height;
+        coverage.complete_through_height <= read_fence.materialized_view_tip_height;
     let coverage_tip_matches_fence = coverage.complete_through_height
-        != read_fence.projection_tip_height
-        || coverage.complete_through_hash == read_fence.projection_tip_hash;
+        != read_fence.materialized_view_tip_height
+        || coverage.complete_through_hash == read_fence.materialized_view_tip_hash;
     if !coverage_range_is_valid || !coverage_is_within_fence || !coverage_tip_matches_fence {
         return Err(CipherscanRestError::InvalidUpstreamField(
             "transaction_history.coverage",
@@ -914,7 +914,7 @@ impl CipherscanRestAdapter {
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<CipherscanBlockListEntry>, u64), CipherscanRestError> {
-        let (tip, at_epoch_id) = self.fetch_latest_block_context().await?;
+        let (tip, at_epoch_id) = self.fetch_visible_tip_block_context().await?;
         let total = u64::from(tip.height);
         if offset > tip.height {
             return Ok((Vec::new(), total));
@@ -936,7 +936,7 @@ impl CipherscanRestAdapter {
         cursor: Option<u32>,
         direction: Option<&str>,
     ) -> Result<(Vec<CipherscanBlockListEntry>, u64), CipherscanRestError> {
-        let (tip, at_epoch_id) = self.fetch_latest_block_context().await?;
+        let (tip, at_epoch_id) = self.fetch_visible_tip_block_context().await?;
         let total = u64::from(tip.height);
         let Some(cursor) = cursor else {
             let offset = page.saturating_sub(1).saturating_mul(limit);
@@ -1083,9 +1083,9 @@ impl CipherscanRestAdapter {
         let requested_cutoff_unix_seconds =
             period.cutoff_unix_seconds(generated_at.unix_timestamp());
         let requested_end_time_unix_seconds = generated_at.unix_timestamp().saturating_add(1);
-        let (tip, at_epoch_id) = self.fetch_latest_block_context().await?;
+        let (tip, at_epoch_id) = self.fetch_visible_tip_block_context().await?;
         let chain_epoch_id = at_epoch_id.ok_or(CipherscanRestError::MissingUpstreamField(
-            "latest_block.chain_view.chain_epoch",
+            "visible_tip_block.chain_view.chain_epoch",
         ))?;
         let minimum_height = tip
             .height
@@ -1612,7 +1612,7 @@ impl CipherscanRestAdapter {
         &self,
         block_limit: u32,
     ) -> Result<explorer::BlockActivityDistributionResponse, CipherscanRestError> {
-        let tip = self.fetch_latest_block().await?;
+        let tip = self.fetch_visible_tip_block().await?;
         let start_height = tip.height.saturating_sub(block_limit.saturating_sub(1));
         Ok(self
             .explorer_client()
@@ -2065,46 +2065,46 @@ impl CipherscanRestAdapter {
     }
 
     async fn fetch_tip_height(&self) -> Result<u32, CipherscanRestError> {
-        Ok(self.fetch_latest_block().await?.height)
+        Ok(self.fetch_visible_tip_block().await?.height)
     }
 
-    async fn fetch_latest_block(&self) -> Result<wallet::BlockMetadata, CipherscanRestError> {
-        self.fetch_latest_block_context()
+    async fn fetch_visible_tip_block(&self) -> Result<wallet::BlockId, CipherscanRestError> {
+        self.fetch_visible_tip_block_context()
             .await
             .map(|(tip, _at_epoch_id)| tip)
     }
 
-    async fn fetch_latest_block_context(
+    async fn fetch_visible_tip_block_context(
         &self,
-    ) -> Result<(wallet::BlockMetadata, Option<u64>), CipherscanRestError> {
-        let latest_block_response = self
+    ) -> Result<(wallet::BlockId, Option<u64>), CipherscanRestError> {
+        let visible_tip_block_response = self
             .wallet_client()
-            .latest_block(LatestBlockRequest { at_epoch_id: None })
+            .visible_tip_block(VisibleTipBlockRequest { at_epoch_id: None })
             .await?
             .into_inner();
-        let at_epoch_id = latest_block_response
+        let at_epoch_id = visible_tip_block_response
             .chain_view
             .as_ref()
             .and_then(|chain_view| chain_view.chain_epoch.as_ref())
             .map(|epoch| epoch.chain_epoch_id);
-        let tip = latest_block_response
-            .latest_block
-            .ok_or(CipherscanRestError::MissingUpstreamField("latest_block"))?;
+        let tip = visible_tip_block_response.visible_tip_block.ok_or(
+            CipherscanRestError::MissingUpstreamField("visible_tip_block"),
+        )?;
         Ok((tip, at_epoch_id))
     }
 
     async fn fetch_visible_tip_commitment_tree_sizes(
         &self,
     ) -> Result<VisibleTipCommitmentTreeSizes, CipherscanRestError> {
-        let latest_block_response = self
+        let visible_tip_block_response = self
             .wallet_client()
-            .latest_block(LatestBlockRequest { at_epoch_id: None })
+            .visible_tip_block(VisibleTipBlockRequest { at_epoch_id: None })
             .await?
             .into_inner();
-        let tip = latest_block_response
-            .latest_block
-            .ok_or(CipherscanRestError::MissingUpstreamField("latest_block"))?;
-        let chain_epoch = latest_block_response
+        let tip = visible_tip_block_response.visible_tip_block.ok_or(
+            CipherscanRestError::MissingUpstreamField("visible_tip_block"),
+        )?;
+        let chain_epoch = visible_tip_block_response
             .chain_view
             .and_then(|chain_view| chain_view.chain_epoch)
             .ok_or(CipherscanRestError::MissingUpstreamField("chain_epoch"))?;
@@ -2665,7 +2665,7 @@ async fn chain_info(
 async fn blockchain_info(
     State(adapter): State<CipherscanRestAdapter>,
 ) -> Result<Response, CipherscanRestError> {
-    let tip = adapter.fetch_latest_block().await?;
+    let tip = adapter.fetch_visible_tip_block().await?;
     Ok(json_response(
         StatusCode::OK,
         blockchain_info_json(adapter.network, &tip),
@@ -2875,7 +2875,7 @@ async fn cipherscan_block_detail_json(
             Some(chain_epoch_id),
         )
         .await?;
-    let coinbase_data = match response.transactions.iter().find(|transaction| {
+    let coinbase_miner_fields = match response.transactions.iter().find(|transaction| {
         transaction
             .public_facts
             .as_ref()
@@ -2883,7 +2883,7 @@ async fn cipherscan_block_detail_json(
     }) {
         Some(transaction) => {
             adapter
-                .fetch_coinbase_data(&transaction.transaction_id, chain_epoch_id)
+                .fetch_coinbase_miner_fields(&transaction.transaction_id, chain_epoch_id)
                 .await?
         }
         None => None,
@@ -2907,23 +2907,23 @@ async fn cipherscan_block_detail_json(
             transaction_rows: &transaction_rows,
             miner_address: production_entry.miner_address.as_deref(),
             final_note_commitment_roots: final_note_commitment_roots.as_ref(),
-            coinbase_data: coinbase_data.as_ref(),
+            coinbase_miner_fields: coinbase_miner_fields.as_ref(),
         },
     ))
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct CipherscanCoinbaseData {
+struct CipherscanCoinbaseMinerFields {
     miner_data_hex: String,
     miner_data_text: String,
 }
 
 impl CipherscanRestAdapter {
-    async fn fetch_coinbase_data(
+    async fn fetch_coinbase_miner_fields(
         &self,
         transaction_id: &str,
         at_epoch_id: u64,
-    ) -> Result<Option<CipherscanCoinbaseData>, CipherscanRestError> {
+    ) -> Result<Option<CipherscanCoinbaseMinerFields>, CipherscanRestError> {
         let response = self
             .wallet_client()
             .transaction(TransactionRequest {
@@ -2936,13 +2936,13 @@ impl CipherscanRestAdapter {
             return Ok(None);
         };
 
-        cipherscan_coinbase_data(raw_transaction_bytes).map(Some)
+        decode_cipherscan_coinbase_miner_fields(raw_transaction_bytes).map(Some)
     }
 }
 
-fn cipherscan_coinbase_data(
+fn decode_cipherscan_coinbase_miner_fields(
     raw_transaction_bytes: &[u8],
-) -> Result<CipherscanCoinbaseData, CipherscanRestError> {
+) -> Result<CipherscanCoinbaseMinerFields, CipherscanRestError> {
     let transaction = raw_transaction_bytes
         .zcash_deserialize_into::<ZebraTransaction>()
         .map_err(|_| {
@@ -2966,7 +2966,7 @@ fn cipherscan_coinbase_data(
         })
         .collect();
 
-    Ok(CipherscanCoinbaseData {
+    Ok(CipherscanCoinbaseMinerFields {
         miner_data_hex: hex::encode(miner_data),
         miner_data_text,
     })
@@ -3069,12 +3069,12 @@ fn cipherscan_block_transaction_rows(
 #[derive(Clone, Copy)]
 struct CipherscanBlockDetailResponseInput<'a> {
     summary: &'a explorer::BlockSummary,
-    header: &'a wallet::BlockHeaderInfo,
+    header: &'a wallet::BlockHeader,
     header_fields: &'a CipherscanBlockHeaderFields,
     transaction_rows: &'a CipherscanBlockTransactionRows,
     miner_address: Option<&'a str>,
     final_note_commitment_roots: Option<&'a CipherscanFinalNoteCommitmentRoots>,
-    coinbase_data: Option<&'a CipherscanCoinbaseData>,
+    coinbase_miner_fields: Option<&'a CipherscanCoinbaseMinerFields>,
 }
 
 fn cipherscan_block_detail_response_json(input: CipherscanBlockDetailResponseInput<'_>) -> Value {
@@ -3085,7 +3085,7 @@ fn cipherscan_block_detail_response_json(input: CipherscanBlockDetailResponseInp
         transaction_rows,
         miner_address,
         final_note_commitment_roots,
-        coinbase_data,
+        coinbase_miner_fields,
     } = input;
     json!({
         "height": summary.block_height.to_string(),
@@ -3117,8 +3117,8 @@ fn cipherscan_block_detail_response_json(input: CipherscanBlockDetailResponseInp
             .and_then(|roots| roots.orchard.as_deref()),
         "final_ironwood_root": final_note_commitment_roots
             .and_then(|roots| roots.ironwood.as_deref()),
-        "coinbase_hex": coinbase_data.map(|coinbase| coinbase.miner_data_hex.as_str()),
-        "coinbase_text": coinbase_data.map(|coinbase| coinbase.miner_data_text.as_str()),
+        "coinbase_hex": coinbase_miner_fields.map(|coinbase| coinbase.miner_data_hex.as_str()),
+        "coinbase_text": coinbase_miner_fields.map(|coinbase| coinbase.miner_data_text.as_str()),
         "finality_status": Value::Null,
         "isOrphaned": !summary.is_canonical,
         "transactions": transaction_rows.rows,
@@ -3241,9 +3241,9 @@ async fn transaction_detail(
     } else {
         None
     };
-    let coinbase_data = if facts.is_coinbase {
+    let coinbase_miner_fields = if facts.is_coinbase {
         raw_transaction_bytes(response.location.as_ref())
-            .map(cipherscan_coinbase_data)
+            .map(decode_cipherscan_coinbase_miner_fields)
             .transpose()?
     } else {
         None
@@ -3256,7 +3256,7 @@ async fn transaction_detail(
             location: response.location.as_ref(),
             response: &response,
             coinbase_total_output_zat,
-            coinbase_data: coinbase_data.as_ref(),
+            coinbase_miner_fields: coinbase_miner_fields.as_ref(),
         }),
     ))
 }
@@ -3979,7 +3979,7 @@ async fn price_at(
         .historical_price(&lookup_date)
         .await
     {
-        Ok(HistoricalMarketPriceResult::Price(mut historical_price)) => {
+        Ok(HistoricalMarketPriceLookup::Price(mut historical_price)) => {
             if lookup_date != date {
                 historical_price.date = date;
                 historical_price.actual_date = Some(lookup_date);
@@ -3990,7 +3990,7 @@ async fn price_at(
                 historical_market_price_json(historical_price),
             )
         }
-        Ok(HistoricalMarketPriceResult::NoPrice) => {
+        Ok(HistoricalMarketPriceLookup::NoPrice) => {
             json_response(StatusCode::OK, historical_price_json(&date))
         }
         Err(error) => {
@@ -4230,22 +4230,24 @@ async fn fork_monitor(
     State(adapter): State<CipherscanRestAdapter>,
 ) -> Result<Response, CipherscanRestError> {
     let mut wallet_client = adapter.wallet_client();
-    let latest_block = wallet_client
-        .latest_block(LatestBlockRequest { at_epoch_id: None })
+    let visible_tip_block = wallet_client
+        .visible_tip_block(VisibleTipBlockRequest { at_epoch_id: None })
         .await?
         .into_inner()
-        .latest_block
-        .ok_or(CipherscanRestError::MissingUpstreamField("latest_block"))?;
-    let safe_tip_height = wallet_client
-        .latest_safe_block(LatestSafeBlockRequest { at_epoch_id: None })
+        .visible_tip_block
+        .ok_or(CipherscanRestError::MissingUpstreamField(
+            "visible_tip_block",
+        ))?;
+    let settled_tip_height = wallet_client
+        .settled_tip_block(SettledTipBlockRequest { at_epoch_id: None })
         .await?
         .into_inner()
-        .safe_tip_block
+        .settled_tip_block
         .map_or(0, |block| block.height);
 
     let mut anchors = Vec::new();
     for &(height, label) in FORK_MONITOR_ANCHORS {
-        if height > latest_block.height {
+        if height > visible_tip_block.height {
             continue;
         }
         let cipherscan_hash = canonical_block_hash_at_height(&adapter, height).await?;
@@ -4263,11 +4265,11 @@ async fn fork_monitor(
         json!({
             "generated_at": current_rfc3339_timestamp(),
             "cipherscan": {
-                "tip": latest_block.height,
-                "tip_hash": latest_block.block_hash,
+                "tip": visible_tip_block.height,
+                "tip_hash": visible_tip_block.block_hash,
                 "peers": 0,
-                "finalized": safe_tip_height,
-                "finality_gap": latest_block.height.saturating_sub(safe_tip_height),
+                "finalized": settled_tip_height,
+                "finality_gap": visible_tip_block.height.saturating_sub(settled_tip_height),
             },
             "ctaz": Value::Null,
             "status": "ctaz_unavailable",
@@ -6033,7 +6035,7 @@ async fn mining_metrics(
 ) -> Result<Response, CipherscanRestError> {
     let window = mining_metrics_window(query.window.as_deref());
     let limit = mining_metrics_limit(query.limit.as_deref());
-    let (tip, at_epoch_id) = adapter.fetch_latest_block_context().await?;
+    let (tip, at_epoch_id) = adapter.fetch_visible_tip_block_context().await?;
     let start_height = tip.height.saturating_sub(limit.saturating_sub(1));
     let response = adapter
         .explorer_client()
@@ -6446,7 +6448,7 @@ async fn relay_chain_events(adapter: CipherscanRestAdapter) {
             () = adapter.realtime_cancel.cancelled() => return,
             response = wallet_client.chain_events(wallet::ChainEventsRequest {
                 start: Some(realtime_event_stream_start(resume_cursor.as_deref())),
-                family: wallet::ChainEventStreamFamily::Tip as i32,
+                family: wallet::ChainEventStreamFamily::Visible as i32,
                 address_filter: Vec::new(),
             }) => response,
         };
@@ -6528,7 +6530,6 @@ async fn relay_mempool_events(adapter: CipherscanRestAdapter) {
             () = adapter.realtime_cancel.cancelled() => return,
             response = wallet_client.mempool_events(wallet::MempoolEventsRequest {
                 start: Some(realtime_event_stream_start(resume_cursor.as_deref())),
-                family: wallet::MempoolEventStreamFamily::Mempool as i32,
             }) => response,
         };
         let mut event_stream = match response {
@@ -6676,9 +6677,9 @@ async fn hydrate_realtime_committed_blocks(
     expected_tip_hash: &str,
 ) -> Result<Option<Vec<explorer::BlockSummary>>, CipherscanRestError> {
     for attempt in 0..REALTIME_HYDRATION_ATTEMPTS {
-        let (current_tip, current_epoch_id) = adapter.fetch_latest_block_context().await?;
+        let (current_tip, current_epoch_id) = adapter.fetch_visible_tip_block_context().await?;
         let current_epoch_id = current_epoch_id.ok_or(
-            CipherscanRestError::MissingUpstreamField("latest_block.chain_view.chain_epoch"),
+            CipherscanRestError::MissingUpstreamField("visible_tip_block.chain_view.chain_epoch"),
         )?;
         match realtime_commit_status(
             committed_epoch_id,
@@ -6855,7 +6856,6 @@ fn publish_mempool_event(
             });
             broadcast_realtime_payload(realtime_sender, "mempool_removed", &removal_data);
         }
-        Some(mempool_event_envelope::Event::Suppressed(_)) => {}
         None => {
             return Err(CipherscanRestError::MissingUpstreamField(
                 "mempool_event.event",
@@ -7036,7 +7036,7 @@ struct CipherscanTransactionDetailJsonInput<'a> {
     location: Option<&'a wallet::TransactionLocation>,
     response: &'a explorer::TransactionDetailResponse,
     coinbase_total_output_zat: Option<u64>,
-    coinbase_data: Option<&'a CipherscanCoinbaseData>,
+    coinbase_miner_fields: Option<&'a CipherscanCoinbaseMinerFields>,
 }
 
 struct CipherscanTransactionDetailZatoshiTotals {
@@ -7082,14 +7082,15 @@ fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> V
         location,
         response,
         coinbase_total_output_zat,
-        coinbase_data,
+        coinbase_miner_fields,
     } = input;
     let counts = facts.counts.as_ref();
     let fee = cipherscan_transaction_detail_fee(facts, response.paid_fee_zat);
     let mined = mined_location(location);
     let mempool = mempool_location(location);
     let block_location = mined.and_then(|mined_transaction| mined_transaction.location.as_ref());
-    let mined_details = mined.and_then(|mined_transaction| mined_transaction.details.as_ref());
+    let mined_chain_context =
+        mined.and_then(|mined_transaction| mined_transaction.chain_context.as_ref());
     let transaction_rows = cipherscan_transaction_detail_rows(network, facts, response);
     let intrinsic_value_balances = response.intrinsic_value_balances.as_ref();
     let totals = cipherscan_transaction_detail_totals(response, coinbase_total_output_zat);
@@ -7102,8 +7103,8 @@ fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> V
         "txid": facts.transaction_id,
         "blockHeight": block_location.map(|location| location.block_height.to_string()),
         "blockHash": block_location.map(|location| location.block_hash.as_str()),
-        "blockTime": mined_details.map(|details| details.block_time.to_string()),
-        "confirmations": mined_details.map(|details| details.confirmations),
+        "blockTime": mined_chain_context.map(|chain_context| chain_context.block_time.to_string()),
+        "confirmations": mined_chain_context.map(|chain_context| chain_context.confirmations),
         "mempoolTime": mempool.map(|entry| entry.first_seen_unix_seconds),
         "status": transaction_status(location),
         "size": facts.size_bytes,
@@ -7144,11 +7145,11 @@ fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> V
         fields.insert("outputCount".to_owned(), json!(output_count));
         fields.insert(
             "coinbaseHex".to_owned(),
-            json!(coinbase_data.map(|coinbase| coinbase.miner_data_hex.as_str())),
+            json!(coinbase_miner_fields.map(|coinbase| coinbase.miner_data_hex.as_str())),
         );
         fields.insert(
             "coinbaseText".to_owned(),
-            json!(coinbase_data.map(|coinbase| coinbase.miner_data_text.as_str())),
+            json!(coinbase_miner_fields.map(|coinbase| coinbase.miner_data_text.as_str())),
         );
         fields.insert("bridge".to_owned(), Value::Null);
         fields.insert("stakingAction".to_owned(), Value::Null);
@@ -8210,8 +8211,8 @@ fn shielded_count_json(
     queried_at: OffsetDateTime,
 ) -> Value {
     let totals = summary.totals.as_ref().copied().unwrap_or_default();
-    let total_shielded = totals.legacy_shielded_transaction_count;
-    let fully_shielded = totals.legacy_fully_shielded_transaction_count;
+    let total_shielded = totals.sapling_or_orchard_transaction_count;
+    let fully_shielded = totals.sapling_or_orchard_fully_shielded_transaction_count;
     let coverage_complete = transaction_component_coverage_complete(summary);
     let unavailable = (!coverage_complete)
         .then_some("The requested range extends beyond contiguous transaction-component history.");
@@ -8222,19 +8223,19 @@ fn shielded_count_json(
             "queriedAt": rfc3339_timestamp(queried_at),
             "totalShielded": total_shielded,
             "breakdown": {
-                "saplingOnly": totals.legacy_sapling_only_transaction_count,
-                "orchardOnly": totals.legacy_orchard_only_transaction_count,
-                "bothPools": totals.legacy_sapling_and_orchard_transaction_count,
+                "saplingOnly": totals.sapling_without_orchard_transaction_count,
+                "orchardOnly": totals.orchard_without_sapling_transaction_count,
+                "bothPools": totals.sapling_and_orchard_transaction_count,
             },
             "fullyShielded": fully_shielded,
             "partiallyShielded": total_shielded.saturating_sub(fully_shielded),
             "timeRange": {
                 "firstTx": summary.days.iter()
-                    .filter_map(|day| day.first_legacy_shielded_transaction_time_unix_seconds)
+                    .filter_map(|day| day.first_sapling_or_orchard_transaction_time_unix_seconds)
                     .min()
                     .map(cipherscan_timestamp_from_unix_seconds),
                 "lastTx": summary.days.iter()
-                    .filter_map(|day| day.last_legacy_shielded_transaction_time_unix_seconds)
+                    .filter_map(|day| day.last_sapling_or_orchard_transaction_time_unix_seconds)
                     .max()
                     .map(cipherscan_timestamp_from_unix_seconds),
             },
@@ -8266,7 +8267,7 @@ fn shielded_daily_json(
             let count = day
                 .totals
                 .as_ref()
-                .map_or(0, |totals| totals.legacy_shielded_transaction_count);
+                .map_or(0, |totals| totals.sapling_or_orchard_transaction_count);
             (count > 0).then(|| {
                 json!({
                     "date": calendar_date_from_unix_seconds(day.day_start_unix_seconds),
@@ -8278,7 +8279,7 @@ fn shielded_daily_json(
     let total_shielded = summary
         .totals
         .as_ref()
-        .map_or(0, |totals| totals.legacy_shielded_transaction_count);
+        .map_or(0, |totals| totals.sapling_or_orchard_transaction_count);
     let coverage_complete = transaction_component_coverage_complete(summary);
     json!({
         "success": true,
@@ -8669,12 +8670,13 @@ fn cipherscan_linkability_source(
             .ok_or(CipherscanRestError::MissingUpstreamField(
                 "transaction_detail.location.mined.location",
             ))?;
-    let mined_details = mined
-        .details
-        .as_ref()
-        .ok_or(CipherscanRestError::MissingUpstreamField(
-            "transaction_detail.location.mined.details",
-        ))?;
+    let mined_chain_context =
+        mined
+            .chain_context
+            .as_ref()
+            .ok_or(CipherscanRestError::MissingUpstreamField(
+                "transaction_detail.location.mined.chain_context",
+            ))?;
     validate_transaction_detail_outputs(facts, detail)?;
     let direction = if net_zat < 0 {
         ValuePoolFlowDirection::Shield
@@ -8688,7 +8690,7 @@ fn cipherscan_linkability_source(
             direction,
             amount_zat: net_zat.unsigned_abs(),
             block_height: block_location.block_height,
-            block_time_unix_seconds: mined_details.block_time,
+            block_time_unix_seconds: mined_chain_context.block_time,
             pool,
             transparent_addresses: cipherscan_linkability_addresses(network, direction, detail),
         },
@@ -9482,11 +9484,11 @@ fn add_transaction_component_totals(
         orchard_transaction_count,
         ironwood_transaction_count,
         sprout_transaction_count,
-        legacy_shielded_transaction_count,
-        legacy_sapling_only_transaction_count,
-        legacy_orchard_only_transaction_count,
-        legacy_sapling_and_orchard_transaction_count,
-        legacy_fully_shielded_transaction_count,
+        sapling_or_orchard_transaction_count,
+        sapling_without_orchard_transaction_count,
+        orchard_without_sapling_transaction_count,
+        sapling_and_orchard_transaction_count,
+        sapling_or_orchard_fully_shielded_transaction_count,
     );
 }
 
@@ -9556,7 +9558,7 @@ fn usage_clock_json(
         .saturating_sub(distribution.start_height)
         .saturating_add(1);
     let mut unavailable = vec![String::from(
-        "The adapter aggregates the requested Zinder block-summary window; complete usage-clock history needs a durable block activity history projection.",
+        "The adapter aggregates the requested Zinder block-summary window; complete usage-clock history needs a durable block-activity materialized view.",
     )];
     if distribution.missing_block_count > 0 {
         unavailable.push(format!(
@@ -10137,7 +10139,7 @@ fn reorg_snapshot_unavailable_reasons(snapshot: &ChainReorgHistorySnapshot) -> V
         reasons.push("ChainReorgHistory is not available from this Zinder explorer deployment.");
     }
     if snapshot.is_truncated {
-        reasons.push("This response is based on the first retained reorg-history page; totals may be lower than the full projection.");
+        reasons.push("This response is based on the first retained reorg-history page; totals may be lower than the full materialized view.");
     }
     reasons
 }
@@ -10769,7 +10771,7 @@ fn validate_mining_pool_distribution_page(
         ));
     }
     if expected_fence.is_some_and(|expected| expected != read_fence)
-        || read_fence.projection_tip.as_ref().is_none_or(|tip| {
+        || read_fence.materialized_view_tip.as_ref().is_none_or(|tip| {
             !is_rpc_hash(&tip.hash)
                 || coverage.complete_through_height != Some(tip.height)
                 || coverage
@@ -10926,7 +10928,7 @@ fn pool_flows_json(
     let degraded = !coverage.requested_range_complete;
     let unavailable = if degraded {
         vec![
-            "The requested wall-clock range is not covered by one contiguous value-pool flow projection.",
+            "The requested wall-clock range is not covered by one contiguous value-pool flow materialized view.",
         ]
     } else {
         Vec::new()
@@ -11535,7 +11537,7 @@ fn fee_distribution_range(days: i64, now_unix_seconds: i64) -> (i64, i64) {
         now_unix_seconds.saturating_sub(days.saturating_mul(UNIX_SECONDS_PER_DAY));
     // Public Cipherscan has no upper timestamp predicate. Canonical block times
     // can lead wall-clock time, so include the same bounded future-time window
-    // used by the adapter's other timestamp projections. Native ranges are
+    // used by the adapter's other timestamp-indexed materialized views. Native ranges are
     // half-open; the final second preserves inclusive integer timestamps.
     let end_time_unix_seconds = now_unix_seconds
         .saturating_add(COMPONENT_SUMMARY_FUTURE_TIME_MARGIN_SECONDS)
@@ -11866,7 +11868,7 @@ fn verified_value_pool_source_tip(
 }
 
 fn validate_block_header_tip(
-    block_header: &wallet::BlockHeaderInfo,
+    block_header: &wallet::BlockHeader,
     expected_tip: &wallet::BlockTip,
 ) -> Result<(), CipherscanRestError> {
     let block_id =
@@ -13239,8 +13241,9 @@ fn address_activity_unavailable(
             visible_tip.height == indexed_tip.height && visible_tip.hash == indexed_tip.hash
         });
     if !indexed_tip_matches_epoch {
-        unavailable
-            .push("Transparent-address projections do not match the pinned canonical tip yet.");
+        unavailable.push(
+            "Transparent-address materialized views do not match the pinned canonical tip yet.",
+        );
     }
     if !is_zero_history
         && (summary.total_received_zat.is_none()
@@ -13648,7 +13651,7 @@ fn explorer_supports_capability(
         })
 }
 
-fn blockchain_info_json(network: Network, tip: &wallet::BlockMetadata) -> Value {
+fn blockchain_info_json(network: Network, tip: &wallet::BlockId) -> Value {
     json!({
         "chain": encode_bip70_chain_name(network),
         "blocks": tip.height,
@@ -13683,7 +13686,7 @@ fn raw_transaction_bytes(location: Option<&wallet::TransactionLocation>) -> Opti
         Some(transaction_location::Location::InMempool(mempool)) => {
             Some(mempool.payload_bytes.as_slice())
         }
-        Some(transaction_location::Location::Conflicting(_)) | None => None,
+        None => None,
     }
 }
 
@@ -13692,11 +13695,7 @@ fn mined_location(
 ) -> Option<&wallet::MinedTransaction> {
     match location.and_then(|location| location.location.as_ref()) {
         Some(transaction_location::Location::Mined(mined)) => Some(mined),
-        Some(
-            transaction_location::Location::InMempool(_)
-            | transaction_location::Location::Conflicting(_),
-        )
-        | None => None,
+        Some(transaction_location::Location::InMempool(_)) | None => None,
     }
 }
 
@@ -13705,11 +13704,7 @@ fn mempool_location(
 ) -> Option<&wallet::MempoolTransaction> {
     match location.and_then(|location| location.location.as_ref()) {
         Some(transaction_location::Location::InMempool(mempool)) => Some(mempool),
-        Some(
-            transaction_location::Location::Mined(_)
-            | transaction_location::Location::Conflicting(_),
-        )
-        | None => None,
+        Some(transaction_location::Location::Mined(_)) | None => None,
     }
 }
 
@@ -13717,7 +13712,6 @@ fn transaction_status(location: Option<&wallet::TransactionLocation>) -> &'stati
     match location.and_then(|location| location.location.as_ref()) {
         Some(transaction_location::Location::Mined(_)) => "mined",
         Some(transaction_location::Location::InMempool(_)) => "mempool",
-        Some(transaction_location::Location::Conflicting(_)) => "conflicting",
         None => "unknown",
     }
 }
@@ -14008,7 +14002,7 @@ struct CipherscanBlockHeaderFields {
 
 fn cipherscan_block_header_fields(
     network: Network,
-    header: &wallet::BlockHeaderInfo,
+    header: &wallet::BlockHeader,
 ) -> Result<CipherscanBlockHeaderFields, CipherscanRestError> {
     let mut rpc_nonce = header.nonce.clone();
     rpc_nonce.reverse();
@@ -15411,7 +15405,7 @@ mod tests {
             ..Default::default()
         };
         let response = explorer::TransactionDetailResponse::default();
-        let coinbase_data = CipherscanCoinbaseData {
+        let coinbase_miner_fields = CipherscanCoinbaseMinerFields {
             miner_data_hex: "04f09f8c".to_owned(),
             miner_data_text: "....".to_owned(),
         };
@@ -15422,7 +15416,7 @@ mod tests {
             location: None,
             response: &response,
             coinbase_total_output_zat: Some(137_500_000),
-            coinbase_data: Some(&coinbase_data),
+            coinbase_miner_fields: Some(&coinbase_miner_fields),
         });
 
         assert_eq!(transaction["totalOutput"], json!(1.375));
@@ -15463,7 +15457,7 @@ mod tests {
             location: None,
             response: &response,
             coinbase_total_output_zat: None,
-            coinbase_data: None,
+            coinbase_miner_fields: None,
         });
 
         assert_eq!(
@@ -15610,7 +15604,7 @@ mod tests {
             location: None,
             response: &response,
             coinbase_total_output_zat: None,
-            coinbase_data: None,
+            coinbase_miner_fields: None,
         });
         assert_eq!(transaction["outputs"][0]["spent"], json!(false));
     }
@@ -15644,7 +15638,7 @@ mod tests {
             location: None,
             response: &response,
             coinbase_total_output_zat: None,
-            coinbase_data: None,
+            coinbase_miner_fields: None,
         });
 
         assert_eq!(
@@ -15688,7 +15682,7 @@ mod tests {
             location: None,
             response: &response,
             coinbase_total_output_zat: None,
-            coinbase_data: None,
+            coinbase_miner_fields: None,
         });
 
         assert_eq!(transaction["fee"], json!(0.00035));
@@ -15731,7 +15725,7 @@ mod tests {
             location: None,
             response: &response,
             coinbase_total_output_zat: None,
-            coinbase_data: None,
+            coinbase_miner_fields: None,
         });
 
         assert_eq!(transaction["valueBalanceSapling"], json!(-1.25));
@@ -15832,9 +15826,9 @@ mod tests {
     fn transaction_history_read_fence(revision: u64) -> TransactionHistoryReadFence {
         TransactionHistoryReadFence {
             chain_epoch_id: 11,
-            projection_revision: revision,
-            projection_tip_height: 42,
-            projection_tip_hash: "00".repeat(32),
+            materialized_view_revision: revision,
+            materialized_view_tip_height: 42,
+            materialized_view_tip_hash: "00".repeat(32),
         }
     }
 
@@ -16209,7 +16203,7 @@ mod tests {
             block_hash: SAMPLE_BLOCK_HASH.to_owned(),
             ..Default::default()
         };
-        let header = wallet::BlockHeaderInfo::default();
+        let header = wallet::BlockHeader::default();
         let header_fields = CipherscanBlockHeaderFields {
             difficulty: 1.0,
             bits: "1f07ffff".to_owned(),
@@ -16227,7 +16221,7 @@ mod tests {
             transaction_rows: &transaction_rows,
             miner_address: Some("tmUcufCrN94ZXNuffjzWPdB3PSAYpc2KmSw"),
             final_note_commitment_roots: None,
-            coinbase_data: None,
+            coinbase_miner_fields: None,
         });
 
         assert_eq!(
@@ -16252,7 +16246,7 @@ mod tests {
             block_hash: SAMPLE_BLOCK_HASH.to_owned(),
             ..Default::default()
         };
-        let header = wallet::BlockHeaderInfo::default();
+        let header = wallet::BlockHeader::default();
         let header_fields = CipherscanBlockHeaderFields {
             difficulty: 1.0,
             bits: "1f07ffff".to_owned(),
@@ -16277,7 +16271,7 @@ mod tests {
             transaction_rows: &transaction_rows,
             miner_address: None,
             final_note_commitment_roots: Some(&roots),
-            coinbase_data: None,
+            coinbase_miner_fields: None,
         });
 
         assert_eq!(response["final_sapling_root"], json!("11".repeat(32)));
@@ -16287,16 +16281,16 @@ mod tests {
     }
 
     #[test]
-    fn block_detail_decodes_cipherscan_coinbase_miner_data() -> Result<(), CipherscanRestError> {
+    fn block_detail_decodes_coinbase_miner_fields() -> Result<(), CipherscanRestError> {
         let raw_transaction = hex::decode(
             "0600008098b684d85b16a5370000000050743f00010000000000000000000000000000000000000000000000000000000000000000ffffffff160350743f04f09f8cb87a6b636c61756465636f646572ffffffff0240597307000000001976a9143f1d707eae9297983695aa5dbf983e03b638530c88ac20bcbe000000000017a9147a86d6c7eb12ce0aa309d7391a6f338eba3c242b8700000000",
         )?;
 
-        let coinbase_data = cipherscan_coinbase_data(&raw_transaction)?;
+        let coinbase_miner_fields = decode_cipherscan_coinbase_miner_fields(&raw_transaction)?;
 
         assert_eq!(
-            coinbase_data,
-            CipherscanCoinbaseData {
+            coinbase_miner_fields,
+            CipherscanCoinbaseMinerFields {
                 miner_data_hex: "04f09f8cb87a6b636c61756465636f646572".to_owned(),
                 miner_data_text: ".....zkclaudecoder".to_owned(),
             }
@@ -17346,7 +17340,7 @@ mod tests {
 
     #[test]
     fn blockchain_info_json_preserves_getblockchaininfo_shape() {
-        let tip = wallet::BlockMetadata {
+        let tip = wallet::BlockId {
             height: 42,
             block_hash: SAMPLE_BLOCK_HASH.to_owned(),
         };
@@ -17513,7 +17507,7 @@ mod tests {
 
     #[test]
     fn block_header_fields_preserve_cipherscan_difficulty_encoding() {
-        let header = wallet::BlockHeaderInfo {
+        let header = wallet::BlockHeader {
             bits: 0x1f34_bb90,
             nonce: vec![0x67, 0x00, 0x01],
             ..Default::default()
@@ -17797,7 +17791,7 @@ mod tests {
         assert!(response["unavailable"].as_array().is_some_and(|reasons| {
             reasons.iter().any(|reason| {
                 reason
-                    == "Transparent-address projections do not match the pinned canonical tip yet."
+                    == "Transparent-address materialized views do not match the pinned canonical tip yet."
             })
         }));
         Ok(())
@@ -18498,8 +18492,8 @@ mod tests {
     #[test]
     fn block_header_tip_validation_rejects_same_height_reorg_hash() {
         let expected_tip = value_pool_test_source_tip(200);
-        let matching_header = wallet::BlockHeaderInfo {
-            block_id: Some(wallet::BlockMetadata {
+        let matching_header = wallet::BlockHeader {
+            block_id: Some(wallet::BlockId {
                 height: 200,
                 block_hash: expected_tip.hash.clone(),
             }),
@@ -18507,8 +18501,8 @@ mod tests {
         };
         assert!(validate_block_header_tip(&matching_header, &expected_tip).is_ok());
 
-        let reorged_header = wallet::BlockHeaderInfo {
-            block_id: Some(wallet::BlockMetadata {
+        let reorged_header = wallet::BlockHeader {
+            block_id: Some(wallet::BlockId {
                 height: 200,
                 block_hash: "ff".repeat(32),
             }),
@@ -19934,18 +19928,18 @@ mod tests {
     fn shielded_count_json_preserves_simple_and_detailed_shapes() {
         let summary = explorer::TransactionComponentSummaryResponse {
             totals: Some(explorer::TransactionComponentTotals {
-                legacy_shielded_transaction_count: 12,
-                legacy_sapling_only_transaction_count: 7,
-                legacy_orchard_only_transaction_count: 3,
-                legacy_sapling_and_orchard_transaction_count: 2,
-                legacy_fully_shielded_transaction_count: 5,
+                sapling_or_orchard_transaction_count: 12,
+                sapling_without_orchard_transaction_count: 7,
+                orchard_without_sapling_transaction_count: 3,
+                sapling_and_orchard_transaction_count: 2,
+                sapling_or_orchard_fully_shielded_transaction_count: 5,
                 ..Default::default()
             }),
             days: vec![explorer::TransactionComponentDay {
                 day_start_unix_seconds: 1_751_328_000,
                 totals: None,
-                first_legacy_shielded_transaction_time_unix_seconds: Some(1_751_328_016),
-                last_legacy_shielded_transaction_time_unix_seconds: Some(1_751_331_600),
+                first_sapling_or_orchard_transaction_time_unix_seconds: Some(1_751_328_016),
+                last_sapling_or_orchard_transaction_time_unix_seconds: Some(1_751_331_600),
             }],
             coverage: Some(explorer::TransactionComponentCoverage {
                 complete_from_height: 1,
@@ -19985,14 +19979,14 @@ mod tests {
     fn shielded_daily_json_preserves_cipherscan_daily_shape() {
         let summary = explorer::TransactionComponentSummaryResponse {
             totals: Some(explorer::TransactionComponentTotals {
-                legacy_shielded_transaction_count: 9,
+                sapling_or_orchard_transaction_count: 9,
                 ..Default::default()
             }),
             days: vec![
                 explorer::TransactionComponentDay {
                     day_start_unix_seconds: 1_751_328_000,
                     totals: Some(explorer::TransactionComponentTotals {
-                        legacy_shielded_transaction_count: 4,
+                        sapling_or_orchard_transaction_count: 4,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -20000,7 +19994,7 @@ mod tests {
                 explorer::TransactionComponentDay {
                     day_start_unix_seconds: 1_751_414_400,
                     totals: Some(explorer::TransactionComponentTotals {
-                        legacy_shielded_transaction_count: 5,
+                        sapling_or_orchard_transaction_count: 5,
                         ..Default::default()
                     }),
                     ..Default::default()

@@ -13,7 +13,7 @@ use tonic::transport::Server;
 use zinder_client::{
     BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
     EndpointBackedIndex, EventStreamStart, Network, RawTransactionBytes, RemoteChainIndex,
-    RemoteOpenOptions, TransactionBroadcastResult, TransactionId,
+    RemoteOpenOptions, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
@@ -62,7 +62,7 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         compact_block_result?;
         compact_block_count += 1;
     }
-    let broadcast_result = chain_index
+    let broadcast_outcome = chain_index
         .broadcast_transaction(RawTransactionBytes::new([0x01, 0x02]))
         .await?;
     let mut events = chain_index
@@ -85,8 +85,8 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     assert_eq!(compact_block.height, BlockHeight::new(1));
     assert_eq!(compact_block_count, 2);
     assert_eq!(
-        broadcast_result,
-        TransactionBroadcastResult::Accepted(zinder_client::BroadcastAccepted { transaction_id })
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Accepted(zinder_client::BroadcastAccepted { transaction_id })
     );
     assert!(matches!(
         first_event.event,

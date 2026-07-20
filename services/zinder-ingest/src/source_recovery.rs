@@ -1,7 +1,7 @@
 //! Loop-recovery decisions for long-running writer subsystems.
 //!
-//! Every Zinder writer subsystem (tip-follow, bulk catchup, mempool orchestrator,
-//! chain-tip notification re-subscriber) runs an indefinite loop that
+//! Every Zinder writer subsystem (tip-follow, bulk catchup, live mempool owner,
+//! chain-tip notification subscriber) runs an indefinite loop that
 //! observes upstream node state. When an iteration fails, the loop must
 //! decide whether to drain readiness and continue, or exit so the operator
 //! can intervene. This module owns that decision.
@@ -10,8 +10,7 @@
 //!
 //! - **Source-shaped errors** (every variant of [`SourceError`]) are
 //!   recoverable. The loop drains readiness with operator-actionable
-//!   detail, backs off according to the failure class, and continues.
-//!   This is the lesson from the 2026-05-15 production incident: any
+//!   detail, backs off according to the failure class, and continues. A
 //!   classification scheme that puts unknown upstream failures into a
 //!   process-exit path is fragile by construction.
 //! - **Source-retry-budget exhaustion** and **per-call deadline
@@ -21,7 +20,7 @@
 //! - **Storage failures**, **reorg-window violations**, and **internal
 //!   logic errors** (`EmptyCanonicalBatch`, etc.) are fatal: data integrity
 //!   is at stake, or the failure indicates a Zinder bug. The loop exits
-//!   so the orchestrator can decide whether to restart, replay, or
+//!   so the supervising runtime can decide whether to restart, replay, or
 //!   require manual reset.
 //!
 //! See [`docs/architecture/chain-ingestion.md`](../../../docs/architecture/chain-ingestion.md)
@@ -186,7 +185,7 @@ pub(crate) fn decide_recovery(
         | IngestError::UnsupportedShieldedProtocol { .. }
         | IngestError::EmptyCanonicalBatch
         | IngestError::BulkCatchupProducedNoCommit
-        | IngestError::NearTipBulkCatchupRequiresExplicitFinalize { .. }
+        | IngestError::BulkCatchupInsideReorgWindowRequiresOverride { .. }
         | IngestError::BulkCatchupRequiresContiguousTipMetadata { .. }
         | IngestError::BulkCatchupCheckpointMisaligned { .. }
         | IngestError::TipFollowObservedTipBehindStore { .. }
@@ -197,13 +196,8 @@ pub(crate) fn decide_recovery(
         | IngestError::CanonicalBlockConstruction(_)
         | IngestError::BlockingTaskFailed { .. }
         | IngestError::SourceSegmentFetchTaskStopped { .. }
-        | IngestError::DeriveDispatch(_)
-        | IngestError::DeriveStore(_)
-        | IngestError::ProjectionStoreMissingForCanonical { .. }
-        | IngestError::ProjectionStoreWithoutCanonicalHistory { .. }
-        | IngestError::ProjectionRetentionCoverageInsufficient { .. } => {
-            SourceRecoveryDecision::Exit
-        }
+        | IngestError::MaterializedViewDispatch(_)
+        | IngestError::MaterializedViewStore(_) => SourceRecoveryDecision::Exit,
     }
 }
 
@@ -277,10 +271,8 @@ mod tests {
 
     #[test]
     fn view_stale_block_unavailable_is_recoverable() {
-        // The 2026-05-15 production scenario: Zebra returned the exact
-        // string "block height not in best chain" with a non-`-28` code,
-        // and the loop exited. After the fix this stays recoverable and
-        // the writer keeps running.
+        // Zebra can report a best-chain view change with a non-`-28` code.
+        // The typed failure remains recoverable regardless of the raw code.
         let error = IngestError::Source(SourceError::BlockUnavailable {
             height: BlockHeight::new(4_013_801),
             reason: "block height not in best chain".to_owned(),

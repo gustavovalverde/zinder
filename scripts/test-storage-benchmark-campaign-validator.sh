@@ -60,7 +60,7 @@ write_report() {
       ingestion_mode: "binary-copy-single-load-transaction-with-deferred-index",
       tables_logged: true,
       replay_envelope_compression: "lz4",
-      fact_table_bytes: 6000,
+      replay_table_bytes: 6000,
       index_bytes: 1000,
       wal_bytes: 9000,
       server_settings: {
@@ -96,11 +96,11 @@ write_report() {
         database_memory_limit_bytes: 8589934592
       }
     };
-    ($candidate == "rocksdb-fact-first") as $is_rocksdb
+    ($candidate == "rocksdb-canonical-replay-storage") as $is_rocksdb
     | {
         contract_identity: "benchmark-report",
-        report_format_version: 2,
-        measurement_kind: "canonical-block-facts-round-trip",
+        report_format_version: 3,
+        measurement_kind: "canonical-replay-storage",
         provenance: {
           benchmark_version: "0.1.0",
           software_revision: "0123456789abcdef",
@@ -122,8 +122,8 @@ write_report() {
         },
         fixture: {
           contract_identity: "canonical-fixture",
-          fixture_format_version: 1,
-          current_schema_oracle_artifact_schema_version: 18,
+          fixture_format_version: 2,
+          canonical_artifact_schema_version: 18,
           canonical_block_facts_digest_evidence: {
             block_digest_version: 1,
             sequence_digest_version: 1,
@@ -142,17 +142,17 @@ write_report() {
         storage_candidate: {
           id: $candidate,
           canonical_engine: (if $is_rocksdb then "rocksdb" else "postgres" end),
-          canonical_model: "block-granular-canonical-facts",
+          canonical_model: "block-granular-canonical-replays",
           diagnostic_projection_engine: null,
           topology: (if $is_rocksdb then "rocksdb-single-host" else "postgres-scale-out" end)
         },
         round_trip: {
-          scope: "canonical-block-facts-fixture-round-trip",
+          scope: "block-local-canonical-replay",
           block_prepare_concurrency: 16,
           wall_clock_seconds: (if $is_rocksdb then 10 else 8 end),
           storage_initialization_wall_clock_seconds: 0.5,
-          fact_preparation_wall_clock_seconds: 1,
-          fact_persistence_wall_clock_seconds: 2,
+          replay_preparation_wall_clock_seconds: 1,
+          replay_persistence_wall_clock_seconds: 2,
           index_construction_wall_clock_seconds: 1,
           storage_optimization_wall_clock_seconds: 0.5,
           validation_wall_clock_seconds: 1,
@@ -166,7 +166,7 @@ write_report() {
           tip_hash_hex: ("d" * 64),
           block_count: 10,
           blocks_per_second: (if $is_rocksdb then 1 else 1.25 end),
-          logical_fact_bytes: 4096,
+          logical_replay_bytes: 4096,
           physical_storage_bytes: 8192,
           persisted_sequence_digest: {
             block_digest_version: 1,
@@ -266,9 +266,9 @@ write_resource_evidence() {
             support: (if $storage_required then "sampled" else "unsupported" end),
             kind: "du-allocated-kibibytes",
             path: (
-              if $component_id == "rocksdb-fact-first-client" then
+              if $component_id == "rocksdb-canonical-replay-storage-client" then
                 "/var/lib/zinder"
-              elif $component_id == "postgres-fact-first-database" then
+              elif $component_id == "postgres-canonical-replay-storage-database" then
                 "/var/lib/postgresql"
               else
                 null
@@ -311,22 +311,22 @@ create_valid_campaign() {
       rocksdb_completed=$((base_timestamp + 3000))
     fi
     write_report \
-      "rocksdb-fact-first" \
+      "rocksdb-canonical-replay-storage" \
       "$trial_id" \
       "$rocksdb_started" \
       "$rocksdb_completed" \
-      "$campaign_directory/rocksdb-fact-first-$trial_id.json"
+      "$campaign_directory/rocksdb-canonical-replay-storage-$trial_id.json"
     write_report \
-      "postgres-fact-first" \
+      "postgres-canonical-replay-storage" \
       "$trial_id" \
       "$postgres_started" \
       "$postgres_completed" \
-      "$campaign_directory/postgres-fact-first-$trial_id.json"
-    rocksdb_resources="rocksdb-fact-first-client-$trial_id.resources.json"
-    postgres_client_resources="postgres-fact-first-client-$trial_id.resources.json"
-    postgres_database_resources="postgres-fact-first-database-$trial_id.resources.json"
+      "$campaign_directory/postgres-canonical-replay-storage-$trial_id.json"
+    rocksdb_resources="rocksdb-canonical-replay-storage-client-$trial_id.resources.json"
+    postgres_client_resources="postgres-canonical-replay-storage-client-$trial_id.resources.json"
+    postgres_database_resources="postgres-canonical-replay-storage-database-$trial_id.resources.json"
     write_resource_evidence \
-      "rocksdb-fact-first-client" \
+      "rocksdb-canonical-replay-storage-client" \
       "$trial_id" \
       "$rocksdb_started" \
       "$rocksdb_completed" \
@@ -337,7 +337,7 @@ create_valid_campaign() {
       true \
       "$campaign_directory/$rocksdb_resources"
     write_resource_evidence \
-      "postgres-fact-first-client" \
+      "postgres-canonical-replay-storage-client" \
       "$trial_id" \
       "$postgres_started" \
       "$postgres_completed" \
@@ -348,7 +348,7 @@ create_valid_campaign() {
       false \
       "$campaign_directory/$postgres_client_resources"
     write_resource_evidence \
-      "postgres-fact-first-database" \
+      "postgres-canonical-replay-storage-database" \
       "$trial_id" \
       "$postgres_started" \
       "$postgres_completed" \
@@ -358,7 +358,7 @@ create_valid_campaign() {
       2000 \
       true \
       "$campaign_directory/$postgres_database_resources"
-    printf 'rocksdb-fact-first-%s.json\t%s\tpostgres-fact-first-%s.json\t%s\t%s\n' \
+    printf 'rocksdb-canonical-replay-storage-%s.json\t%s\tpostgres-canonical-replay-storage-%s.json\t%s\t%s\n' \
       "$trial_id" \
       "$rocksdb_resources" \
       "$trial_id" \
@@ -402,11 +402,11 @@ expect_failure() {
 valid_campaign="$scratch_directory/valid"
 create_valid_campaign "$valid_campaign"
 mutate_report \
-  "$valid_campaign/rocksdb-fact-first-trial-02.json" \
+  "$valid_campaign/rocksdb-canonical-replay-storage-trial-02.json" \
   '.round_trip.storage.external_sst_bytes = 7100'
 mutate_report \
-  "$valid_campaign/postgres-fact-first-trial-02.json" \
-  '.round_trip.storage.fact_table_bytes = 6100
+  "$valid_campaign/postgres-canonical-replay-storage-trial-02.json" \
+  '.round_trip.storage.replay_table_bytes = 6100
    | .round_trip.storage.index_bytes = 1100
    | .round_trip.storage.wal_bytes = 9100'
 valid_summary="$($validator "$valid_campaign/campaign.tsv")"
@@ -416,11 +416,11 @@ valid_summary="$($validator "$valid_campaign/campaign.tsv")"
   || fail "valid campaign did not preserve derived alternating order"
 [[ "$(jq -r '.campaign.trials[0].arms.rocksdb.report_sha256 | test("^[0-9a-f]{64}$")' <<<"$valid_summary")" == "true" ]] \
   || fail "valid campaign did not identify the RocksDB report hash"
-[[ "$(jq -r '.campaign.trials[0].arms.postgres.report_path | endswith("postgres-fact-first-trial-01.json")' <<<"$valid_summary")" == "true" ]] \
+[[ "$(jq -r '.campaign.trials[0].arms.postgres.report_path | endswith("postgres-canonical-replay-storage-trial-01.json")' <<<"$valid_summary")" == "true" ]] \
   || fail "valid campaign did not identify the PostgreSQL report path"
 [[ "$(jq -r '.campaign.trials[0].arms.rocksdb.resource_evidence.artifact_sha256 | test("^[0-9a-f]{64}$")' <<<"$valid_summary")" == "true" ]] \
   || fail "valid campaign did not identify the RocksDB resource evidence hash"
-[[ "$(jq -r '.campaign.trials[0].arms.postgres.resource_evidence.database.artifact_path | endswith("postgres-fact-first-database-trial-01.resources.json")' <<<"$valid_summary")" == "true" ]] \
+[[ "$(jq -r '.campaign.trials[0].arms.postgres.resource_evidence.database.artifact_path | endswith("postgres-canonical-replay-storage-database-trial-01.resources.json")' <<<"$valid_summary")" == "true" ]] \
   || fail "valid campaign did not identify the PostgreSQL database resource evidence path"
 [[ "$(jq -r '[
     .campaign.trials[0].arms.rocksdb.resource_evidence.maximum_observed_report_window_sample_gap_millis,
@@ -440,15 +440,15 @@ valid_summary="$($validator "$valid_campaign/campaign.tsv")"
   || fail "PostgreSQL normalized memory did not align every client sample exactly once"
 [[ "$(jq -r '.campaign.trials[0].arms.postgres.memory_alignment.maximum_timestamp_delta_millis' <<<"$valid_summary")" == "60" ]] \
   || fail "PostgreSQL normalized memory reported the wrong alignment delta"
-[[ "$(jq -r '.candidates[] | select(.candidate == "rocksdb-fact-first") | .sampled_whole_arm_memory_peak_bytes.median' <<<"$valid_summary")" == "1110" ]] \
+[[ "$(jq -r '.candidates[] | select(.candidate == "rocksdb-canonical-replay-storage") | .sampled_whole_arm_memory_peak_bytes.median' <<<"$valid_summary")" == "1110" ]] \
   || fail "RocksDB candidate summary omitted normalized memory statistics"
-[[ "$(jq -r '.candidates[] | select(.candidate == "postgres-fact-first") | .sampled_whole_arm_storage_peak_bytes.maximum' <<<"$valid_summary")" == "3000" ]] \
+[[ "$(jq -r '.candidates[] | select(.candidate == "postgres-canonical-replay-storage") | .sampled_whole_arm_storage_peak_bytes.maximum' <<<"$valid_summary")" == "3000" ]] \
   || fail "PostgreSQL candidate summary omitted normalized storage statistics"
 
 nearest_alignment_campaign="$scratch_directory/nearest-alignment"
 cp -R "$valid_campaign" "$nearest_alignment_campaign"
 mutate_json_artifact \
-  "$nearest_alignment_campaign/postgres-fact-first-database-trial-01.resources.json" \
+  "$nearest_alignment_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
   '.samples += [
       {
         observed_at_unix_millis: 112470,
@@ -468,10 +468,10 @@ nearest_alignment_summary="$($validator "$nearest_alignment_campaign/campaign.ts
 
 fractional_cpu_campaign="$scratch_directory/fractional-cpu"
 cp -R "$valid_campaign" "$fractional_cpu_campaign"
-for report_path in "$fractional_cpu_campaign"/*-fact-first-trial-*.json; do
+for report_path in "$fractional_cpu_campaign"/*-canonical-replay-storage-trial-*.json; do
   mutate_report "$report_path" '.provenance.runner.cpu_limit_cores = 0.3'
 done
-for report_path in "$fractional_cpu_campaign"/postgres-fact-first-trial-*.json; do
+for report_path in "$fractional_cpu_campaign"/postgres-canonical-replay-storage-trial-*.json; do
   mutate_report \
     "$report_path" \
     '.round_trip.storage.benchmark_runtime.client_cpu_limit_cores = 0.1
@@ -482,182 +482,182 @@ done
 
 copied_campaign="$scratch_directory/copied"
 cp -R "$valid_campaign" "$copied_campaign"
-cp "$copied_campaign/rocksdb-fact-first-trial-01.json" \
-  "$copied_campaign/rocksdb-fact-first-trial-05.json"
+cp "$copied_campaign/rocksdb-canonical-replay-storage-trial-01.json" \
+  "$copied_campaign/rocksdb-canonical-replay-storage-trial-05.json"
 expect_failure "copied report" "$copied_campaign"
 
 trial_mismatch_campaign="$scratch_directory/trial-mismatch"
 cp -R "$valid_campaign" "$trial_mismatch_campaign"
 mutate_report \
-  "$trial_mismatch_campaign/postgres-fact-first-trial-03.json" \
+  "$trial_mismatch_campaign/postgres-canonical-replay-storage-trial-03.json" \
   '.provenance.run.trial_id = "different-trial"'
 expect_failure "paired trial mismatch" "$trial_mismatch_campaign"
 
 wrong_version_campaign="$scratch_directory/wrong-version"
 cp -R "$valid_campaign" "$wrong_version_campaign"
-mutate_report "$wrong_version_campaign/rocksdb-fact-first-trial-02.json" '.report_format_version = 4'
+mutate_report "$wrong_version_campaign/rocksdb-canonical-replay-storage-trial-02.json" '.report_format_version = 4'
 expect_failure "wrong report version" "$wrong_version_campaign"
 
 missing_report_identity_campaign="$scratch_directory/missing-report-identity"
 cp -R "$valid_campaign" "$missing_report_identity_campaign"
 mutate_report \
-  "$missing_report_identity_campaign/rocksdb-fact-first-trial-02.json" \
+  "$missing_report_identity_campaign/rocksdb-canonical-replay-storage-trial-02.json" \
   'del(.contract_identity)'
 expect_failure "missing report contract identity" "$missing_report_identity_campaign"
 
-old_report_identity_campaign="$scratch_directory/old-report-identity"
-cp -R "$valid_campaign" "$old_report_identity_campaign"
+unrecognized_report_identity_campaign="$scratch_directory/unrecognized-report-identity"
+cp -R "$valid_campaign" "$unrecognized_report_identity_campaign"
 mutate_report \
-  "$old_report_identity_campaign/postgres-fact-first-trial-02.json" \
+  "$unrecognized_report_identity_campaign/postgres-canonical-replay-storage-trial-02.json" \
   '.contract_identity = "zinder-benchmark-report"'
-expect_failure "old report contract identity" "$old_report_identity_campaign"
+expect_failure "unrecognized report contract identity" "$unrecognized_report_identity_campaign"
 
 missing_fixture_identity_campaign="$scratch_directory/missing-fixture-identity"
 cp -R "$valid_campaign" "$missing_fixture_identity_campaign"
 mutate_report \
-  "$missing_fixture_identity_campaign/rocksdb-fact-first-trial-03.json" \
+  "$missing_fixture_identity_campaign/rocksdb-canonical-replay-storage-trial-03.json" \
   'del(.fixture.contract_identity)'
 expect_failure "missing fixture contract identity" "$missing_fixture_identity_campaign"
 
-old_fixture_identity_campaign="$scratch_directory/old-fixture-identity"
-cp -R "$valid_campaign" "$old_fixture_identity_campaign"
+unrecognized_fixture_identity_campaign="$scratch_directory/unrecognized-fixture-identity"
+cp -R "$valid_campaign" "$unrecognized_fixture_identity_campaign"
 mutate_report \
-  "$old_fixture_identity_campaign/postgres-fact-first-trial-03.json" \
+  "$unrecognized_fixture_identity_campaign/postgres-canonical-replay-storage-trial-03.json" \
   '.fixture.contract_identity = "zinder-bench-fixture-manifest"'
-expect_failure "old fixture contract identity" "$old_fixture_identity_campaign"
+expect_failure "unrecognized fixture contract identity" "$unrecognized_fixture_identity_campaign"
 
 wrong_rocksdb_schema_campaign="$scratch_directory/wrong-rocksdb-schema"
 cp -R "$valid_campaign" "$wrong_rocksdb_schema_campaign"
 mutate_report \
-  "$wrong_rocksdb_schema_campaign/rocksdb-fact-first-trial-01.json" \
+  "$wrong_rocksdb_schema_campaign/rocksdb-canonical-replay-storage-trial-01.json" \
   '.round_trip.storage.storage_schema_version = 2'
 expect_failure "wrong RocksDB storage schema" "$wrong_rocksdb_schema_campaign"
 
 wrong_postgres_schema_campaign="$scratch_directory/wrong-postgres-schema"
 cp -R "$valid_campaign" "$wrong_postgres_schema_campaign"
 mutate_report \
-  "$wrong_postgres_schema_campaign/postgres-fact-first-trial-01.json" \
+  "$wrong_postgres_schema_campaign/postgres-canonical-replay-storage-trial-01.json" \
   '.round_trip.storage.storage_schema_version = 2'
 expect_failure "wrong PostgreSQL storage schema" "$wrong_postgres_schema_campaign"
 
 missing_replay_evidence_campaign="$scratch_directory/missing-replay-evidence"
 cp -R "$valid_campaign" "$missing_replay_evidence_campaign"
 mutate_report \
-  "$missing_replay_evidence_campaign/postgres-fact-first-trial-02.json" \
+  "$missing_replay_evidence_campaign/postgres-canonical-replay-storage-trial-02.json" \
   'del(.round_trip.replay_format_version)'
 expect_failure "missing replay format evidence" "$missing_replay_evidence_campaign"
 
 wrong_replay_format_campaign="$scratch_directory/wrong-replay-format"
 cp -R "$valid_campaign" "$wrong_replay_format_campaign"
 mutate_report \
-  "$wrong_replay_format_campaign/rocksdb-fact-first-trial-03.json" \
+  "$wrong_replay_format_campaign/rocksdb-canonical-replay-storage-trial-03.json" \
   '.round_trip.replay_format_version = 99'
 expect_failure "unsupported replay format" "$wrong_replay_format_campaign"
 
 unvalidated_semantic_replay_campaign="$scratch_directory/unvalidated-semantic-replay"
 cp -R "$valid_campaign" "$unvalidated_semantic_replay_campaign"
 mutate_report \
-  "$unvalidated_semantic_replay_campaign/rocksdb-fact-first-trial-04.json" \
+  "$unvalidated_semantic_replay_campaign/rocksdb-canonical-replay-storage-trial-04.json" \
   '.round_trip.semantic_replay_validated = false'
 expect_failure "unvalidated semantic replay" "$unvalidated_semantic_replay_campaign"
 
 wrong_topology_campaign="$scratch_directory/wrong-topology"
 cp -R "$valid_campaign" "$wrong_topology_campaign"
 mutate_report \
-  "$wrong_topology_campaign/postgres-fact-first-trial-04.json" \
+  "$wrong_topology_campaign/postgres-canonical-replay-storage-trial-04.json" \
   '.storage_candidate.topology = "rocksdb-single-host"'
 expect_failure "wrong topology" "$wrong_topology_campaign"
 
 null_configuration_campaign="$scratch_directory/null-configuration"
 cp -R "$valid_campaign" "$null_configuration_campaign"
 mutate_report \
-  "$null_configuration_campaign/rocksdb-fact-first-trial-01.json" \
+  "$null_configuration_campaign/rocksdb-canonical-replay-storage-trial-01.json" \
   '.round_trip.storage.rocksdb_resource_budget = null'
 expect_failure "null RocksDB configuration" "$null_configuration_campaign"
 
 zero_storage_campaign="$scratch_directory/zero-storage"
 cp -R "$valid_campaign" "$zero_storage_campaign"
 mutate_report \
-  "$zero_storage_campaign/postgres-fact-first-trial-02.json" \
+  "$zero_storage_campaign/postgres-canonical-replay-storage-trial-02.json" \
   '.round_trip.physical_storage_bytes = 0'
 expect_failure "zero physical storage" "$zero_storage_campaign"
 
 missing_database_image_campaign="$scratch_directory/missing-database-image"
 cp -R "$valid_campaign" "$missing_database_image_campaign"
 mutate_report \
-  "$missing_database_image_campaign/postgres-fact-first-trial-05.json" \
+  "$missing_database_image_campaign/postgres-canonical-replay-storage-trial-05.json" \
   '.round_trip.storage.benchmark_runtime.database_image_reference = null'
 expect_failure "missing PostgreSQL database image" "$missing_database_image_campaign"
 
 overlapping_campaign="$scratch_directory/overlapping"
 cp -R "$valid_campaign" "$overlapping_campaign"
 mutate_report \
-  "$overlapping_campaign/postgres-fact-first-trial-01.json" \
+  "$overlapping_campaign/postgres-canonical-replay-storage-trial-01.json" \
   '.provenance.run.started_at_unix_millis = 110500
    | .provenance.run.completed_at_unix_millis = 111500'
 shift_resource_evidence \
-  "$overlapping_campaign/postgres-fact-first-client-trial-01.resources.json" \
+  "$overlapping_campaign/postgres-canonical-replay-storage-client-trial-01.resources.json" \
   -1500
 shift_resource_evidence \
-  "$overlapping_campaign/postgres-fact-first-database-trial-01.resources.json" \
+  "$overlapping_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
   -1500
 expect_failure "overlapping paired arms" "$overlapping_campaign"
 
 cross_trial_overlap_campaign="$scratch_directory/cross-trial-overlap"
 cp -R "$valid_campaign" "$cross_trial_overlap_campaign"
 mutate_report \
-  "$cross_trial_overlap_campaign/postgres-fact-first-trial-02.json" \
+  "$cross_trial_overlap_campaign/postgres-canonical-replay-storage-trial-02.json" \
   '.provenance.run.started_at_unix_millis = 112500
    | .provenance.run.completed_at_unix_millis = 113500'
 shift_resource_evidence \
-  "$cross_trial_overlap_campaign/postgres-fact-first-client-trial-02.resources.json" \
+  "$cross_trial_overlap_campaign/postgres-canonical-replay-storage-client-trial-02.resources.json" \
   -7500
 shift_resource_evidence \
-  "$cross_trial_overlap_campaign/postgres-fact-first-database-trial-02.resources.json" \
+  "$cross_trial_overlap_campaign/postgres-canonical-replay-storage-database-trial-02.resources.json" \
   -7500
 expect_failure "overlapping chronological trials" "$cross_trial_overlap_campaign"
 
 chronological_order_campaign="$scratch_directory/chronological-order"
 cp -R "$valid_campaign" "$chronological_order_campaign"
 mutate_report \
-  "$chronological_order_campaign/rocksdb-fact-first-trial-02.json" \
+  "$chronological_order_campaign/rocksdb-canonical-replay-storage-trial-02.json" \
   '.provenance.run.started_at_unix_millis = 120000
    | .provenance.run.completed_at_unix_millis = 121000'
 mutate_report \
-  "$chronological_order_campaign/postgres-fact-first-trial-02.json" \
+  "$chronological_order_campaign/postgres-canonical-replay-storage-trial-02.json" \
   '.provenance.run.started_at_unix_millis = 122000
    | .provenance.run.completed_at_unix_millis = 123000'
 mutate_report \
-  "$chronological_order_campaign/postgres-fact-first-trial-03.json" \
+  "$chronological_order_campaign/postgres-canonical-replay-storage-trial-03.json" \
   '.provenance.run.started_at_unix_millis = 130000
    | .provenance.run.completed_at_unix_millis = 131000'
 mutate_report \
-  "$chronological_order_campaign/rocksdb-fact-first-trial-03.json" \
+  "$chronological_order_campaign/rocksdb-canonical-replay-storage-trial-03.json" \
   '.provenance.run.started_at_unix_millis = 132000
    | .provenance.run.completed_at_unix_millis = 133000'
 shift_resource_evidence \
-  "$chronological_order_campaign/rocksdb-fact-first-client-trial-02.resources.json" \
+  "$chronological_order_campaign/rocksdb-canonical-replay-storage-client-trial-02.resources.json" \
   -2000
 shift_resource_evidence \
-  "$chronological_order_campaign/postgres-fact-first-client-trial-02.resources.json" \
+  "$chronological_order_campaign/postgres-canonical-replay-storage-client-trial-02.resources.json" \
   2000
 shift_resource_evidence \
-  "$chronological_order_campaign/postgres-fact-first-database-trial-02.resources.json" \
+  "$chronological_order_campaign/postgres-canonical-replay-storage-database-trial-02.resources.json" \
   2000
 shift_resource_evidence \
-  "$chronological_order_campaign/rocksdb-fact-first-client-trial-03.resources.json" \
+  "$chronological_order_campaign/rocksdb-canonical-replay-storage-client-trial-03.resources.json" \
   2000
 shift_resource_evidence \
-  "$chronological_order_campaign/postgres-fact-first-client-trial-03.resources.json" \
+  "$chronological_order_campaign/postgres-canonical-replay-storage-client-trial-03.resources.json" \
   -2000
 shift_resource_evidence \
-  "$chronological_order_campaign/postgres-fact-first-database-trial-03.resources.json" \
+  "$chronological_order_campaign/postgres-canonical-replay-storage-database-trial-03.resources.json" \
   -2000
 {
   printf 'rocksdb_report\trocksdb_resources\tpostgres_report\tpostgres_client_resources\tpostgres_database_resources\n'
   for trial_number in 1 3 2 4 5; do
     trial_id="$(printf 'trial-%02d' "$trial_number")"
-    printf 'rocksdb-fact-first-%s.json\trocksdb-fact-first-client-%s.resources.json\tpostgres-fact-first-%s.json\tpostgres-fact-first-client-%s.resources.json\tpostgres-fact-first-database-%s.resources.json\n' \
+    printf 'rocksdb-canonical-replay-storage-%s.json\trocksdb-canonical-replay-storage-client-%s.resources.json\tpostgres-canonical-replay-storage-%s.json\tpostgres-canonical-replay-storage-client-%s.resources.json\tpostgres-canonical-replay-storage-database-%s.resources.json\n' \
       "$trial_id" \
       "$trial_id" \
       "$trial_id" \
@@ -670,39 +670,39 @@ expect_failure "nonalternating chronological arm order" "$chronological_order_ca
 missing_phase_campaign="$scratch_directory/missing-phase"
 cp -R "$valid_campaign" "$missing_phase_campaign"
 mutate_report \
-  "$missing_phase_campaign/rocksdb-fact-first-trial-03.json" \
+  "$missing_phase_campaign/rocksdb-canonical-replay-storage-trial-03.json" \
   'del(.round_trip.validation_wall_clock_seconds)'
 expect_failure "missing phase timing" "$missing_phase_campaign"
 
 wrong_range_campaign="$scratch_directory/wrong-range"
 cp -R "$valid_campaign" "$wrong_range_campaign"
 mutate_report \
-  "$wrong_range_campaign/postgres-fact-first-trial-04.json" \
+  "$wrong_range_campaign/postgres-canonical-replay-storage-trial-04.json" \
   '.round_trip.first_height = 2'
 expect_failure "inconsistent persisted range" "$wrong_range_campaign"
 
 wrong_digest_version_campaign="$scratch_directory/wrong-digest-version"
 cp -R "$valid_campaign" "$wrong_digest_version_campaign"
 mutate_report \
-  "$wrong_digest_version_campaign/rocksdb-fact-first-trial-05.json" \
+  "$wrong_digest_version_campaign/rocksdb-canonical-replay-storage-trial-05.json" \
   '.round_trip.persisted_sequence_digest.sequence_digest_version = 2'
 expect_failure "inconsistent digest version" "$wrong_digest_version_campaign"
 
 wrong_throughput_campaign="$scratch_directory/wrong-throughput"
 cp -R "$valid_campaign" "$wrong_throughput_campaign"
 mutate_report \
-  "$wrong_throughput_campaign/postgres-fact-first-trial-01.json" \
+  "$wrong_throughput_campaign/postgres-canonical-replay-storage-trial-01.json" \
   '.round_trip.blocks_per_second = 99'
 expect_failure "inconsistent throughput" "$wrong_throughput_campaign"
 
-legacy_ledger_campaign="$scratch_directory/legacy-ledger"
-cp -R "$valid_campaign" "$legacy_ledger_campaign"
-printf 'rocksdb_report\tpostgres_report\n' >"$legacy_ledger_campaign/campaign.tsv"
-expect_failure "ledger without resource evidence columns" "$legacy_ledger_campaign"
+missing_resource_evidence_campaign="$scratch_directory/missing-resource-evidence"
+cp -R "$valid_campaign" "$missing_resource_evidence_campaign"
+printf 'rocksdb_report\tpostgres_report\n' >"$missing_resource_evidence_campaign/campaign.tsv"
+expect_failure "ledger without resource evidence columns" "$missing_resource_evidence_campaign"
 
 missing_resource_campaign="$scratch_directory/missing-resource"
 cp -R "$valid_campaign" "$missing_resource_campaign"
-rm "$missing_resource_campaign/postgres-fact-first-database-trial-01.resources.json"
+rm "$missing_resource_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json"
 expect_failure "missing resource artifact" "$missing_resource_campaign"
 
 duplicate_artifact_campaign="$scratch_directory/duplicate-artifact"
@@ -714,61 +714,61 @@ expect_failure "duplicate ledger artifacts" "$duplicate_artifact_campaign"
 malformed_resource_campaign="$scratch_directory/malformed-resource"
 cp -R "$valid_campaign" "$malformed_resource_campaign"
 printf '{\n' \
-  >"$malformed_resource_campaign/rocksdb-fact-first-client-trial-01.resources.json"
+  >"$malformed_resource_campaign/rocksdb-canonical-replay-storage-client-trial-01.resources.json"
 expect_failure "malformed resource artifact" "$malformed_resource_campaign"
 
 multiple_resource_values_campaign="$scratch_directory/multiple-resource-values"
 cp -R "$valid_campaign" "$multiple_resource_values_campaign"
 printf '\n{}\n' \
-  >>"$multiple_resource_values_campaign/postgres-fact-first-client-trial-01.resources.json"
+  >>"$multiple_resource_values_campaign/postgres-canonical-replay-storage-client-trial-01.resources.json"
 expect_failure "multiple resource evidence values" "$multiple_resource_values_campaign"
 
 wrong_resource_version_campaign="$scratch_directory/wrong-resource-version"
 cp -R "$valid_campaign" "$wrong_resource_version_campaign"
 mutate_json_artifact \
-  "$wrong_resource_version_campaign/rocksdb-fact-first-client-trial-01.resources.json" \
+  "$wrong_resource_version_campaign/rocksdb-canonical-replay-storage-client-trial-01.resources.json" \
   '.evidence_format_version = 2'
 expect_failure "wrong resource evidence version" "$wrong_resource_version_campaign"
 
 wrong_resource_component_campaign="$scratch_directory/wrong-resource-component"
 cp -R "$valid_campaign" "$wrong_resource_component_campaign"
 mutate_json_artifact \
-  "$wrong_resource_component_campaign/postgres-fact-first-database-trial-01.resources.json" \
-  '.component_id = "postgres-fact-first-client"'
+  "$wrong_resource_component_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
+  '.component_id = "postgres-canonical-replay-storage-client"'
 expect_failure "wrong resource component" "$wrong_resource_component_campaign"
 
 wrong_resource_trial_campaign="$scratch_directory/wrong-resource-trial"
 cp -R "$valid_campaign" "$wrong_resource_trial_campaign"
 mutate_json_artifact \
-  "$wrong_resource_trial_campaign/rocksdb-fact-first-client-trial-01.resources.json" \
+  "$wrong_resource_trial_campaign/rocksdb-canonical-replay-storage-client-trial-01.resources.json" \
   '.trial_id = "different-trial"'
 expect_failure "wrong resource trial" "$wrong_resource_trial_campaign"
 
 failed_child_campaign="$scratch_directory/failed-child"
 cp -R "$valid_campaign" "$failed_child_campaign"
 mutate_json_artifact \
-  "$failed_child_campaign/postgres-fact-first-client-trial-01.resources.json" \
+  "$failed_child_campaign/postgres-canonical-replay-storage-client-trial-01.resources.json" \
   '.child_exit_status = 7'
 expect_failure "failed benchmark child" "$failed_child_campaign"
 
 unsupported_memory_campaign="$scratch_directory/unsupported-memory"
 cp -R "$valid_campaign" "$unsupported_memory_campaign"
 mutate_json_artifact \
-  "$unsupported_memory_campaign/postgres-fact-first-database-trial-01.resources.json" \
+  "$unsupported_memory_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
   '.sources.memory_current.support = "unsupported"'
 expect_failure "unsupported cgroup memory source" "$unsupported_memory_campaign"
 
 unverified_cgroup_namespace_campaign="$scratch_directory/unverified-cgroup-namespace"
 cp -R "$valid_campaign" "$unverified_cgroup_namespace_campaign"
 mutate_json_artifact \
-  "$unverified_cgroup_namespace_campaign/rocksdb-fact-first-client-trial-01.resources.json" \
+  "$unverified_cgroup_namespace_campaign/rocksdb-canonical-replay-storage-client-trial-01.resources.json" \
   '.sources.cgroup_namespace.support = "unverified"'
 expect_failure "unverified component cgroup namespace" "$unverified_cgroup_namespace_campaign"
 
 missing_rocksdb_storage_campaign="$scratch_directory/missing-rocksdb-storage"
 cp -R "$valid_campaign" "$missing_rocksdb_storage_campaign"
 mutate_json_artifact \
-  "$missing_rocksdb_storage_campaign/rocksdb-fact-first-client-trial-01.resources.json" \
+  "$missing_rocksdb_storage_campaign/rocksdb-canonical-replay-storage-client-trial-01.resources.json" \
   '.sources.storage.support = "unsupported"
    | .sources.storage.path = null
    | .sampled_storage_peak_bytes = null
@@ -778,14 +778,14 @@ expect_failure "missing RocksDB sampled storage" "$missing_rocksdb_storage_campa
 narrow_rocksdb_storage_campaign="$scratch_directory/narrow-rocksdb-storage"
 cp -R "$valid_campaign" "$narrow_rocksdb_storage_campaign"
 mutate_json_artifact \
-  "$narrow_rocksdb_storage_campaign/rocksdb-fact-first-client-trial-01.resources.json" \
+  "$narrow_rocksdb_storage_campaign/rocksdb-canonical-replay-storage-client-trial-01.resources.json" \
   '.sources.storage.path = "/var/lib/zinder/benchmark-store"'
 expect_failure "narrow RocksDB storage root" "$narrow_rocksdb_storage_campaign"
 
 missing_postgres_storage_campaign="$scratch_directory/missing-postgres-storage"
 cp -R "$valid_campaign" "$missing_postgres_storage_campaign"
 mutate_json_artifact \
-  "$missing_postgres_storage_campaign/postgres-fact-first-database-trial-01.resources.json" \
+  "$missing_postgres_storage_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
   '.sources.storage.support = "unsupported"
    | .sources.storage.path = null
    | .sampled_storage_peak_bytes = null
@@ -795,14 +795,14 @@ expect_failure "missing PostgreSQL sampled storage" "$missing_postgres_storage_c
 narrow_postgres_storage_campaign="$scratch_directory/narrow-postgres-storage"
 cp -R "$valid_campaign" "$narrow_postgres_storage_campaign"
 mutate_json_artifact \
-  "$narrow_postgres_storage_campaign/postgres-fact-first-database-trial-01.resources.json" \
+  "$narrow_postgres_storage_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
   '.sources.storage.path = "/var/lib/postgresql/18/docker"'
 expect_failure "narrow PostgreSQL storage root" "$narrow_postgres_storage_campaign"
 
 uncovered_window_campaign="$scratch_directory/uncovered-window"
 cp -R "$valid_campaign" "$uncovered_window_campaign"
 mutate_json_artifact \
-  "$uncovered_window_campaign/rocksdb-fact-first-client-trial-01.resources.json" \
+  "$uncovered_window_campaign/rocksdb-canonical-replay-storage-client-trial-01.resources.json" \
   '.samples |= map(select(.observed_at_unix_millis < 111000))
    | .sampled_memory_current_peak_bytes = ([.samples[].memory_current_bytes] | max)
    | .sampled_storage_peak_bytes = ([.samples[].storage_bytes] | max)'
@@ -811,7 +811,7 @@ expect_failure "resource samples without report-window coverage" "$uncovered_win
 sample_gap_campaign="$scratch_directory/sample-gap"
 cp -R "$valid_campaign" "$sample_gap_campaign"
 mutate_json_artifact \
-  "$sample_gap_campaign/rocksdb-fact-first-client-trial-01.resources.json" \
+  "$sample_gap_campaign/rocksdb-canonical-replay-storage-client-trial-01.resources.json" \
   '.samples |= map(select(
       .observed_at_unix_millis < 110300
       or .observed_at_unix_millis > 110800
@@ -823,23 +823,23 @@ expect_failure "resource report-window sample gap" "$sample_gap_campaign"
 malformed_sample_campaign="$scratch_directory/malformed-sample"
 cp -R "$valid_campaign" "$malformed_sample_campaign"
 mutate_json_artifact \
-  "$malformed_sample_campaign/postgres-fact-first-client-trial-01.resources.json" \
+  "$malformed_sample_campaign/postgres-canonical-replay-storage-client-trial-01.resources.json" \
   '.samples[2].memory_current_bytes = null'
 expect_failure "malformed resource sample" "$malformed_sample_campaign"
 
 within_trial_interval_campaign="$scratch_directory/within-trial-interval"
 cp -R "$valid_campaign" "$within_trial_interval_campaign"
 mutate_json_artifact \
-  "$within_trial_interval_campaign/postgres-fact-first-database-trial-01.resources.json" \
+  "$within_trial_interval_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
   '.sample_interval_seconds = 0.2'
 expect_failure "within-trial resource interval mismatch" "$within_trial_interval_campaign"
 
 across_campaign_interval_campaign="$scratch_directory/across-campaign-interval"
 cp -R "$valid_campaign" "$across_campaign_interval_campaign"
 for evidence_path in \
-  "$across_campaign_interval_campaign/rocksdb-fact-first-client-trial-05.resources.json" \
-  "$across_campaign_interval_campaign/postgres-fact-first-client-trial-05.resources.json" \
-  "$across_campaign_interval_campaign/postgres-fact-first-database-trial-05.resources.json"; do
+  "$across_campaign_interval_campaign/rocksdb-canonical-replay-storage-client-trial-05.resources.json" \
+  "$across_campaign_interval_campaign/postgres-canonical-replay-storage-client-trial-05.resources.json" \
+  "$across_campaign_interval_campaign/postgres-canonical-replay-storage-database-trial-05.resources.json"; do
   mutate_json_artifact "$evidence_path" '.sample_interval_seconds = 0.2'
 done
 expect_failure "campaign resource interval mismatch" "$across_campaign_interval_campaign"
@@ -847,10 +847,10 @@ expect_failure "campaign resource interval mismatch" "$across_campaign_interval_
 unalignable_campaign="$scratch_directory/unalignable"
 cp -R "$valid_campaign" "$unalignable_campaign"
 mutate_report \
-  "$unalignable_campaign/postgres-fact-first-trial-01.json" \
+  "$unalignable_campaign/postgres-canonical-replay-storage-trial-01.json" \
   '.provenance.run.completed_at_unix_millis = 112100'
 mutate_json_artifact \
-  "$unalignable_campaign/postgres-fact-first-database-trial-01.resources.json" \
+  "$unalignable_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
   '.samples |= map(select(.observed_at_unix_millis != 112040))'
 expect_failure "unalignable PostgreSQL resource samples" "$unalignable_campaign"
 

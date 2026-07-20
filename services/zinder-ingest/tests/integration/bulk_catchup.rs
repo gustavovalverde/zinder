@@ -19,14 +19,14 @@ use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
     CommitmentTreeFrontiers, Network, ShieldedProtocol, SubtreeRootIndex,
 };
-use zinder_derive::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, DeriveStoreError, ProjectionPreset,
-    decode_stored_record,
-};
 use zinder_ingest::{
-    BulkCatchupRunConfig, CanonicalPipelineLimits, DeriveReplayPolicy, IngestDeriveConfig,
-    NodeSourceKind, catch_up_derive_store_to_canonical, run_bulk_catchup,
-    run_bulk_catchup_until_complete,
+    BulkCatchupRunConfig, CanonicalPipelineLimits, MaterializedViewReplayConfig,
+    MaterializedViewReplayPolicy, NodeSourceKind, catch_up_materialized_view_store_to_canonical,
+    run_bulk_catchup, run_bulk_catchup_until_complete,
+};
+use zinder_materialized_views::{
+    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewPreset,
+    MaterializedViewStoreError, decode_stored_record,
 };
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
@@ -56,12 +56,14 @@ fn test_pipeline_limits() -> CanonicalPipelineLimits {
     }
 }
 
-fn bundled_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
-    Ok(zinder_derive::DeriveStore::open(
-        zinder_derive::DeriveStore::path_for_canonical(storage_path),
-        zinder_derive::DeriveStoreOptions {
+fn bundled_materialized_view_store(
+    storage_path: &Path,
+) -> Result<zinder_materialized_views::MaterializedViewStore> {
+    Ok(zinder_materialized_views::MaterializedViewStore::open(
+        zinder_materialized_views::MaterializedViewStore::path_for_canonical(storage_path),
+        zinder_materialized_views::MaterializedViewStoreOptions {
             sync_writes: false,
-            consumers: zinder_derive::DeriveStore::bundled_consumers(),
+            consumers: zinder_materialized_views::MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         },
     )?)
@@ -130,7 +132,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
-        allow_near_tip_finalize: false,
+        allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
 
@@ -194,9 +196,9 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "scenario covers checkpoint bootstrap, run_bulk_catchup, derive replay, and materialized projection assertions end to end"
+    reason = "scenario covers checkpoint bootstrap, run_bulk_catchup, materialized-view replay, and materialized-view assertions end to end"
 )]
-async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
+async fn materialized_view_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
     let source_block = fixture_source_block()?;
     let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
     let checkpoint = empty_checkpoint(BlockId::new(checkpoint_height, source_block.parent_hash));
@@ -208,7 +210,9 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
     };
 
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("derive-replay-catchup-store");
+    let storage_path = tempdir
+        .path()
+        .join("materialized-view replay-catchup-store");
     let bulk_catchup_config = BulkCatchupRunConfig {
         node: NodeTarget::new(
             Network::ZcashTestnet,
@@ -242,7 +246,7 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
-        allow_near_tip_finalize: false,
+        allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
     let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;
@@ -263,11 +267,11 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         "parents older than the checkpoint must remain explicitly unresolved"
     );
 
-    let derive_store = bundled_derive_store(&storage_path)?;
-    let derive_config = IngestDeriveConfig {
+    let materialized_view_store = bundled_materialized_view_store(&storage_path)?;
+    let materialized_view_config = MaterializedViewReplayConfig {
         replay_batch_blocks: NonZeroU32::new(1)
             .ok_or_else(|| eyre!("invalid replay batch blocks"))?,
-        replay_policy: DeriveReplayPolicy::DEFAULT,
+        replay_policy: MaterializedViewReplayPolicy::DEFAULT,
         memory_budget_bytes: None,
         memory_degrade_ratio: 0.85,
         memory_pause_ratio: 0.95,
@@ -276,24 +280,35 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
             .ok_or_else(|| eyre!("invalid minimum replay batch blocks"))?,
         startup_handoff_lag_blocks: 1_000,
     };
-    catch_up_derive_store_to_canonical(&store, &derive_store, derive_config).await?;
+    catch_up_materialized_view_store_to_canonical(
+        &store,
+        &materialized_view_store,
+        materialized_view_config,
+    )
+    .await?;
 
-    assert_chain_event_cursors_advanced(&derive_store)?;
-    assert_block_summary_materialized(&derive_store, source_block.height)?;
-    assert_paid_fee_live_tail_seeded(&derive_store, source_block.height)?;
+    assert_chain_event_cursors_advanced(&materialized_view_store)?;
+    assert_block_summary_materialized(&materialized_view_store, source_block.height)?;
+    assert_paid_fee_live_tail_seeded(&materialized_view_store, source_block.height)?;
 
-    let wallet_derive_store = zinder_derive::DeriveStore::open_with_projection_preset(
-        storage_path.join("wallet-derive"),
-        ProjectionPreset::Wallet,
-        zinder_derive::DeriveStoreOptions {
-            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-            ..zinder_derive::DeriveStoreOptions::default()
-        },
-    )?;
-    catch_up_derive_store_to_canonical(&store, &wallet_derive_store, derive_config).await?;
-    for schema in ProjectionPreset::Wallet.consumer_schemas() {
+    let wallet_materialized_view_store =
+        zinder_materialized_views::MaterializedViewStore::open_with_materialized_view_preset(
+            storage_path.join("wallet-materialized-views"),
+            MaterializedViewPreset::Wallet,
+            zinder_materialized_views::MaterializedViewStoreOptions {
+                rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+                ..zinder_materialized_views::MaterializedViewStoreOptions::default()
+            },
+        )?;
+    catch_up_materialized_view_store_to_canonical(
+        &store,
+        &wallet_materialized_view_store,
+        materialized_view_config,
+    )
+    .await?;
+    for schema in MaterializedViewPreset::Wallet.consumer_schemas() {
         assert!(
-            wallet_derive_store
+            wallet_materialized_view_store
                 .get_chain_event_cursor(schema.name)?
                 .is_some(),
             "wallet projection {} must advance through retained canonical events",
@@ -301,8 +316,8 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
         );
     }
     assert!(matches!(
-        wallet_derive_store.consumer_column_family(BLOCK_SUMMARY_COLUMN_FAMILY),
-        Err(DeriveStoreError::ConsumerColumnFamilyMissing { name })
+        wallet_materialized_view_store.consumer_column_family(BLOCK_SUMMARY_COLUMN_FAMILY),
+        Err(MaterializedViewStoreError::ConsumerColumnFamilyMissing { name })
             if name == BLOCK_SUMMARY_COLUMN_FAMILY
     ));
 
@@ -310,21 +325,27 @@ async fn derive_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Res
 }
 
 fn assert_paid_fee_live_tail_seeded(
-    derive_store: &zinder_derive::DeriveStore,
+    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
     block_height: BlockHeight,
 ) -> Result<()> {
-    let tail = zinder_derive::PaidFeeDistributionConsumer::tail_coverage(derive_store)?
-        .ok_or_else(|| eyre!("derive replay did not seed the paid-fee live tail"))?;
+    let tail = zinder_materialized_views::PaidFeeDistributionConsumer::tail_coverage(
+        materialized_view_store,
+    )?
+    .ok_or_else(|| eyre!("materialized-view replay did not seed the paid-fee live tail"))?;
     assert_eq!(tail.boundary_height, block_height);
     assert_eq!(tail.complete_through_height, Some(block_height));
     Ok(())
 }
 
-fn assert_chain_event_cursors_advanced(derive_store: &zinder_derive::DeriveStore) -> Result<()> {
-    for consumer_name in zinder_derive::DeriveStore::bundled_chain_event_consumer_names() {
-        if *consumer_name == zinder_derive::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME {
+fn assert_chain_event_cursors_advanced(
+    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
+) -> Result<()> {
+    for consumer_name in
+        zinder_materialized_views::MaterializedViewStore::bundled_chain_event_consumer_names()
+    {
+        if *consumer_name == zinder_materialized_views::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME {
             assert!(
-                derive_store
+                materialized_view_store
                     .get_chain_event_cursor(*consumer_name)?
                     .is_none(),
                 "snapshot-owned ranking must not adopt a cursor before bootstrap activation"
@@ -332,25 +353,25 @@ fn assert_chain_event_cursors_advanced(derive_store: &zinder_derive::DeriveStore
             continue;
         }
         assert!(
-            derive_store
+            materialized_view_store
                 .get_chain_event_cursor(*consumer_name)?
                 .is_some(),
-            "derive replay must advance {consumer_name:?} through the retained canonical events"
+            "materialized-view replay must advance {consumer_name:?} through the retained canonical events"
         );
     }
     Ok(())
 }
 
 fn assert_block_summary_materialized(
-    derive_store: &zinder_derive::DeriveStore,
+    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
     block_height: BlockHeight,
 ) -> Result<()> {
-    let record_bytes = derive_store
+    let record_bytes = materialized_view_store
         .get_consumer(
             BLOCK_SUMMARY_COLUMN_FAMILY,
             &BlockSummaryConsumer::key_for_height(block_height),
         )?
-        .ok_or_else(|| eyre!("derive replay did not materialize the block summary"))?;
+        .ok_or_else(|| eyre!("materialized-view replay did not materialize the block summary"))?;
     let block_summary_record = decode_stored_record(&record_bytes)?;
     let summary = block_summary_record
         .summary
@@ -413,7 +434,7 @@ async fn bulk_catchup_seeds_compact_metadata_from_valid_nonzero_checkpoint() -> 
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
-        allow_near_tip_finalize: false,
+        allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
 
@@ -480,7 +501,7 @@ async fn run_bulk_catchup_until_complete_resumes_after_retry_deadline() -> Resul
             .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
         flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
         upstream_tip_hint: None,
-        allow_near_tip_finalize: false,
+        allow_reorg_window_settlement: false,
         checkpoint: Some(checkpoint),
     };
     let store = PrimaryChainStore::open(&storage_path, test_all_blob_store_options())?;

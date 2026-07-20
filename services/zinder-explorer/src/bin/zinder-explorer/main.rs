@@ -8,11 +8,11 @@ use clap::Parser;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
-    DeriveStore, DeriveStoreError, DeriveStoreOptions, ExplorerQueryGrpcAdapter,
-    ExplorerServerInfoSettings, describe_request_metrics,
+    ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, MaterializedViewStore,
+    MaterializedViewStoreError, MaterializedViewStoreOptions, describe_request_metrics,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, Readiness, ReadinessState, ServiceIdentifier, StartupPhase,
+    OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
     spawn_ops_endpoint_for,
 };
@@ -25,7 +25,7 @@ use config::{ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides};
 
 /// Cadence the background task uses to advance the secondary's view to the
 /// primary's latest durable state.
-const DERIVE_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
+const MATERIALIZED_VIEW_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Default cadence for the upstream-observation probe.
 ///
@@ -112,6 +112,10 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "startup keeps configuration, secondary admission, and server wiring in one path"
+)]
 async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
@@ -137,31 +141,35 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         }
     };
 
-    let derive_store = match open_derive_store(&explorer_config) {
-        Ok(derive_store) => derive_store,
+    let materialized_view_store = match open_materialized_view_store(&explorer_config) {
+        Ok(materialized_view_store) => materialized_view_store,
         Err(error) => {
             start_api_phase.fail(&error);
             return Err(error);
         }
     };
-    report_projection_workload(&readiness, derive_store.as_ref());
+    report_materialized_view_workload(&readiness, materialized_view_store.as_ref());
 
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
-    let derive_catchup_handle = derive_store
-        .clone()
-        .map(|derive_store| spawn_derive_catchup_task(derive_store, cancel.clone()));
+    let materialized_view_catchup_handle =
+        materialized_view_store
+            .clone()
+            .map(|materialized_view_store| {
+                spawn_materialized_view_catchup_task(materialized_view_store, cancel.clone())
+            });
     let canonical_catchup_handle =
         spawn_canonical_catchup_task(canonical_store.clone(), cancel.clone());
 
-    let grpc_adapter = build_grpc_adapter(&explorer_config, canonical_store, derive_store).await;
+    let grpc_adapter =
+        build_grpc_adapter(&explorer_config, canonical_store, materialized_view_store).await;
     let upstream_observation_handle =
         spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
 
     let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::Explorer,
+        RuntimeService::Explorer,
         explorer_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(explorer_config.network),
@@ -198,20 +206,25 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         ops_handle,
         upstream_observation_handle,
         canonical_catchup_handle,
-        derive_catchup_handle,
+        materialized_view_catchup_handle,
     )
     .await;
 
     server_result.map_err(ExplorerConfigError::Transport)
 }
 
-fn report_projection_workload(readiness: &Readiness, derive_store: Option<&DeriveStore>) {
-    let Some(projection_preset) = derive_store.map(DeriveStore::effective_projection_preset) else {
+fn report_materialized_view_workload(
+    readiness: &Readiness,
+    materialized_view_store: Option<&MaterializedViewStore>,
+) {
+    let Some(materialized_view_preset) =
+        materialized_view_store.map(MaterializedViewStore::effective_materialized_view_preset)
+    else {
         return;
     };
-    readiness.set_projection_workload(
-        projection_preset.as_str(),
-        projection_preset
+    readiness.set_materialized_view_workload(
+        materialized_view_preset.as_str(),
+        materialized_view_preset
             .consumer_schemas()
             .iter()
             .map(|schema| schema.name.as_str().to_owned())
@@ -223,7 +236,7 @@ async fn shutdown_background_tasks(
     ops_handle: Option<OpsEndpointHandle>,
     upstream_observation_handle: Option<JoinHandle<()>>,
     canonical_catchup_handle: JoinHandle<()>,
-    derive_catchup_handle: Option<JoinHandle<()>>,
+    materialized_view_catchup_handle: Option<JoinHandle<()>>,
 ) {
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
@@ -232,7 +245,7 @@ async fn shutdown_background_tasks(
         let _ = handle.await;
     }
     let _ = canonical_catchup_handle.await;
-    if let Some(handle) = derive_catchup_handle {
+    if let Some(handle) = materialized_view_catchup_handle {
         let _ = handle.await;
     }
 }
@@ -312,59 +325,66 @@ fn open_canonical_store(
     }
 }
 
-fn open_derive_store(
+fn open_materialized_view_store(
     explorer_config: &ExplorerConfig,
-) -> Result<Option<DeriveStore>, ExplorerConfigError> {
-    let derive_path = DeriveStore::path_for_canonical(&explorer_config.storage.path);
-    let secondary_path = explorer_config.storage.secondary_path.join("derive");
+) -> Result<Option<MaterializedViewStore>, ExplorerConfigError> {
+    let materialized_view_path =
+        MaterializedViewStore::path_for_canonical(&explorer_config.storage.path);
+    let secondary_path = explorer_config
+        .storage
+        .secondary_path
+        .join("materialized-views");
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let projection_preset = match DeriveStore::detect_projection_preset_at_path(&derive_path) {
-        Ok(Some(projection_preset)) => projection_preset,
-        Ok(None) => {
-            tracing::info!(
-                target: "zinder::explorer",
-                event = "derive_store_unavailable",
-                "derive store unavailable; derive-backed explorer capabilities disabled"
-            );
-            open_storage_phase.complete();
-            return Ok(None);
-        }
-        Err(error @ DeriveStoreError::Open { .. }) => {
-            tracing::info!(
-                target: "zinder::explorer",
-                event = "derive_store_unavailable",
-                error = %error,
-                "derive store unavailable; derive-backed explorer capabilities disabled"
-            );
-            open_storage_phase.complete();
-            return Ok(None);
-        }
-        Err(error) => {
-            let wrapped = ExplorerConfigError::Store(error);
-            open_storage_phase.fail(&wrapped);
-            return Err(wrapped);
-        }
-    };
-    match DeriveStore::open_secondary_with_projection_preset(
-        &derive_path,
+    let materialized_view_preset =
+        match MaterializedViewStore::detect_materialized_view_preset_at_path(
+            &materialized_view_path,
+        ) {
+            Ok(Some(materialized_view_preset)) => materialized_view_preset,
+            Ok(None) => {
+                tracing::info!(
+                    target: "zinder::explorer",
+                    event = "materialized_view_store_unavailable",
+                    "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
+                );
+                open_storage_phase.complete();
+                return Ok(None);
+            }
+            Err(error @ MaterializedViewStoreError::Open { .. }) => {
+                tracing::info!(
+                    target: "zinder::explorer",
+                    event = "materialized_view_store_unavailable",
+                    error = %error,
+                    "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
+                );
+                open_storage_phase.complete();
+                return Ok(None);
+            }
+            Err(error) => {
+                let wrapped = ExplorerConfigError::Store(error);
+                open_storage_phase.fail(&wrapped);
+                return Err(wrapped);
+            }
+        };
+    match MaterializedViewStore::open_secondary_with_materialized_view_preset(
+        &materialized_view_path,
         &secondary_path,
-        projection_preset,
-        DeriveStoreOptions {
+        materialized_view_preset,
+        MaterializedViewStoreOptions {
             sync_writes: false,
-            rocksdb_resource_budget: explorer_config.storage.derive_rocksdb_budget,
-            ..DeriveStoreOptions::default()
+            rocksdb_resource_budget: explorer_config.storage.materialized_view_rocksdb_budget,
+            ..MaterializedViewStoreOptions::default()
         },
     ) {
         Ok(handle) => {
             open_storage_phase.complete();
             Ok(Some(handle))
         }
-        Err(error @ DeriveStoreError::Open { .. }) => {
+        Err(error @ MaterializedViewStoreError::Open { .. }) => {
             tracing::info!(
                 target: "zinder::explorer",
-                event = "derive_store_unavailable",
+                event = "materialized_view_store_unavailable",
                 error = %error,
-                "derive store unavailable; derive-backed explorer capabilities disabled"
+                "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
             );
             open_storage_phase.complete();
             Ok(None)
@@ -382,7 +402,7 @@ fn spawn_canonical_catchup_task(
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(DERIVE_CATCHUP_INTERVAL);
+        let mut interval = tokio::time::interval(MATERIALIZED_VIEW_CATCHUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -401,21 +421,21 @@ fn spawn_canonical_catchup_task(
     })
 }
 
-fn spawn_derive_catchup_task(
-    store: DeriveStore,
+fn spawn_materialized_view_catchup_task(
+    store: MaterializedViewStore,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(DERIVE_CATCHUP_INTERVAL);
+        let mut interval = tokio::time::interval(MATERIALIZED_VIEW_CATCHUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(error) = store.try_catch_up() {
                         tracing::warn!(
                             target: "zinder::explorer",
-                            event = "derive_secondary_catchup_failed",
+                            event = "materialized_view_secondary_catchup_failed",
                             error = %error,
-                            "derive store secondary catchup failed"
+                            "materialized-view store secondary catchup failed"
                         );
                     }
                 }
@@ -465,17 +485,17 @@ async fn fetch_network_upgrade_activations(
 async fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
     canonical_store: SecondaryChainStore,
-    derive_store: Option<DeriveStore>,
+    materialized_view_store: Option<MaterializedViewStore>,
 ) -> ExplorerQueryGrpcAdapter {
     let server_info = ExplorerServerInfoSettings {
         network: explorer_config.network,
     };
-    let has_derive_store = derive_store.is_some();
+    let has_materialized_view_store = materialized_view_store.is_some();
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
         .with_canonical_store(canonical_store)
-        .with_prevout_resolution_online(has_derive_store);
-    if let Some(derive_store) = derive_store {
-        grpc_adapter = grpc_adapter.with_derive_store(derive_store);
+        .with_prevout_resolution_online(has_materialized_view_store);
+    if let Some(materialized_view_store) = materialized_view_store {
+        grpc_adapter = grpc_adapter.with_materialized_view_store(materialized_view_store);
     }
     if let Some(activations) = fetch_network_upgrade_activations(explorer_config).await {
         grpc_adapter = grpc_adapter.with_network_upgrade_activations(activations);

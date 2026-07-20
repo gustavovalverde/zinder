@@ -8,8 +8,8 @@ use zinder_compat_cipherscan::CipherscanMarketPriceEndpoints;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenConnectError, BearerTokenError, ConfigError, ConfigLoader,
-    InvalidZinderGrpcEndpoint, NetworkSection, NetworkToml, OpsSection, OpsToml, SecuritySection,
-    SecurityToml, ServiceIdentifier, guard_optional_serving_bind, guard_serving_bind,
+    InvalidZinderGrpcEndpoint, NetworkSection, NetworkToml, OpsSection, OpsToml, RuntimeService,
+    SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
     load_bearer_token, parse_socket_addr, require_field, resolve_allow_public_bind,
     resolve_ops_listen_addr, validate_zinder_grpc_endpoint,
 };
@@ -98,7 +98,7 @@ pub(crate) fn load_cipherscan_config(
             "cipherscan.historical_price_endpoint_template",
             DEFAULT_HISTORICAL_PRICE_ENDPOINT_TEMPLATE,
         )?
-        .with_ops_section(ServiceIdentifier::CompatCipherscan)?
+        .with_ops_section(RuntimeService::CompatCipherscan)?
         .with_security_section()?
         .with_file(config_path)
         .with_zinder_env()?

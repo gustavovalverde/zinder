@@ -1,9 +1,9 @@
-//! Durable fact-first mempool event lifecycle.
+//! Durable live mempool event lifecycle.
 //!
 //! The canonical primary retains the resumable event log but never stores the
 //! mutable mempool index. The ingest owner appends an event here before it
 //! publishes the matching in-memory index transition, so a writer restart can
-//! always recover the event cursor history without reopening a legacy primary.
+//! always recover the event cursor history without reopening the canonical primary.
 
 use std::collections::HashMap;
 
@@ -13,8 +13,7 @@ use zinder_core::{Network, TransactionId, UnixTimestampMillis};
 use crate::{
     EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
     MempoolEventPosition, MempoolEventRetentionConfig, MempoolEventRetentionReport,
-    MempoolEventStreamFamily, SnapshotPageCursorAnchor, SnapshotPageStreamFamily,
-    StreamCursorTokenV1,
+    SnapshotPageCursorAnchor, StreamCursorTokenV1,
     format::{StoreKey, decode_mempool_event_envelope, encode_mempool_event_envelope},
 };
 
@@ -338,7 +337,6 @@ impl RocksDbCanonicalStore {
         StreamCursorTokenV1::snapshot_page(
             SnapshotPageCursorAnchor {
                 network: self.network(),
-                family: SnapshotPageStreamFamily::SnapshotPage,
                 events_resume_anchor,
                 after_transaction_id,
             },
@@ -380,7 +378,6 @@ impl RocksDbCanonicalStore {
         let mut pruned_added_count = 0_u64;
         let mut pruned_mined_count = 0_u64;
         let mut pruned_invalidated_count = 0_u64;
-        let mut pruned_suppressed_count = 0_u64;
         let mut batch = WriteBatch::default();
         let event_family = column_family(&self.bounded_open.db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
         for event_sequence in oldest_retained_sequence..current_event_sequence {
@@ -401,7 +398,6 @@ impl RocksDbCanonicalStore {
                 &mut pruned_added_count,
                 &mut pruned_mined_count,
                 &mut pruned_invalidated_count,
-                &mut pruned_suppressed_count,
             )?;
         }
         if new_floor != oldest_retained_sequence {
@@ -412,7 +408,6 @@ impl RocksDbCanonicalStore {
         report.pruned_added_count = pruned_added_count;
         report.pruned_mined_count = pruned_mined_count;
         report.pruned_invalidated_count = pruned_invalidated_count;
-        report.pruned_suppressed_count = pruned_suppressed_count;
         Ok(report)
     }
 }
@@ -426,7 +421,7 @@ impl RocksDbCanonicalStore {
 /// snapshot unable to publish the terminal transition that removes it.
 #[allow(
     unreachable_patterns,
-    reason = "MempoolEvent is non-exhaustive; future variants must not silently change replay retention."
+    reason = "MempoolEvent is non-exhaustive; unrecognized variants must not silently change replay retention."
 )]
 fn earliest_active_mempool_add_sequence(
     store: &RocksDbCanonicalStore,
@@ -444,7 +439,6 @@ fn earliest_active_mempool_add_sequence(
             | MempoolEvent::Mined { transaction_id, .. } => {
                 active_add_sequences.remove(&transaction_id);
             }
-            MempoolEvent::Suppressed { .. } => {}
             _ => {
                 return Err(CanonicalStoreError::MempoolEventLogInvalid {
                     reason: "mempool event variant is unsupported for replay retention".to_owned(),
@@ -457,14 +451,13 @@ fn earliest_active_mempool_add_sequence(
 
 #[allow(
     unreachable_patterns,
-    reason = "MempoolEvent is non-exhaustive outside zinder-store; future variants must fail closed before durable append."
+    reason = "MempoolEvent is non-exhaustive outside zinder-store; unrecognized variants fail closed before durable append."
 )]
 fn validate_append_event(event: &MempoolEvent) -> Result<(), CanonicalStoreError> {
     match event {
         MempoolEvent::Added { .. }
         | MempoolEvent::Invalidated { .. }
-        | MempoolEvent::Mined { .. }
-        | MempoolEvent::Suppressed { .. } => Ok(()),
+        | MempoolEvent::Mined { .. } => Ok(()),
         _ => Err(CanonicalStoreError::MempoolEventLogInvalid {
             reason: "mempool event variant is unsupported".to_owned(),
         }),
@@ -530,11 +523,6 @@ fn validate_mempool_resume_cursor(
         .map_err(|_| CanonicalStoreError::MempoolEventCursorInvalid {
             reason: "cursor token failed validation",
         })?;
-    if payload.family != MempoolEventStreamFamily::Mempool {
-        return Err(CanonicalStoreError::MempoolEventCursorInvalid {
-            reason: "cursor stream family is unsupported",
-        });
-    }
     if payload.event_sequence > current_event_sequence {
         return Err(CanonicalStoreError::MempoolEventCursorInvalid {
             reason: "cursor sequence is ahead of retained history",
@@ -565,7 +553,6 @@ fn mempool_event_cursor(
 ) -> Result<StreamCursorTokenV1, CanonicalStoreError> {
     StreamCursorTokenV1::mempool_event(
         store.network(),
-        MempoolEventStreamFamily::Mempool,
         event_sequence,
         transaction_id,
         store.cursor_auth_key,
@@ -704,13 +691,12 @@ fn mempool_event_retention_report_locked(
         pruned_added_count: 0,
         pruned_mined_count: 0,
         pruned_invalidated_count: 0,
-        pruned_suppressed_count: 0,
     })
 }
 
 #[allow(
     unreachable_patterns,
-    reason = "MempoolEvent is non-exhaustive outside zinder-store; future variants must not receive an invented retention policy."
+    reason = "MempoolEvent is non-exhaustive outside zinder-store; unrecognized variants do not receive an invented retention policy."
 )]
 fn retention_window_for(
     event: &MempoolEvent,
@@ -719,9 +705,7 @@ fn retention_window_for(
     match event {
         MempoolEvent::Added { .. } => Ok(retention.added_retention),
         MempoolEvent::Mined { .. } => Ok(retention.mined_retention),
-        MempoolEvent::Invalidated { .. } | MempoolEvent::Suppressed { .. } => {
-            Ok(retention.invalidated_retention)
-        }
+        MempoolEvent::Invalidated { .. } => Ok(retention.invalidated_retention),
         _ => Err(CanonicalStoreError::MempoolEventLogInvalid {
             reason: "mempool event variant is unsupported".to_owned(),
         }),
@@ -740,20 +724,18 @@ fn age_exceeds_window(
 
 #[allow(
     unreachable_patterns,
-    reason = "MempoolEvent is non-exhaustive outside zinder-store; future variants must fail closed during retention."
+    reason = "MempoolEvent is non-exhaustive outside zinder-store; unrecognized variants fail closed during retention."
 )]
 fn increment_pruned_count(
     event: &MempoolEvent,
     added: &mut u64,
     mined: &mut u64,
     invalidated: &mut u64,
-    suppressed: &mut u64,
 ) -> Result<(), CanonicalStoreError> {
     match event {
         MempoolEvent::Added { .. } => *added = added.saturating_add(1),
         MempoolEvent::Mined { .. } => *mined = mined.saturating_add(1),
         MempoolEvent::Invalidated { .. } => *invalidated = invalidated.saturating_add(1),
-        MempoolEvent::Suppressed { .. } => *suppressed = suppressed.saturating_add(1),
         _ => {
             return Err(CanonicalStoreError::MempoolEventLogInvalid {
                 reason: "mempool event variant is unsupported".to_owned(),

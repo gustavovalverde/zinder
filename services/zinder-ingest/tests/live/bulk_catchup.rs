@@ -249,8 +249,8 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
     let wallet_query = WalletQuery::new(store, (), Arc::clone(&activations));
 
     let measurement_start = std::time::Instant::now();
-    let _latest = wallet_query.latest_block(None).await?;
-    let latest_block_micros = measurement_start.elapsed().as_micros();
+    let _latest = wallet_query.visible_tip_block(None).await?;
+    let visible_tip_block_micros = measurement_start.elapsed().as_micros();
 
     let measurement_start = std::time::Instant::now();
     let _block = wallet_query.compact_block_at(from_height, None).await?;
@@ -320,7 +320,7 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
         eprintln!(
             "live_mainnet_calibration tip={} checkpoint_height={} \
              checkpoint_sapling_size={} checkpoint_orchard_size={} \
-             bulk_catchup_seconds={} latest_block={}us compact_block_at_first={}us \
+             bulk_catchup_seconds={} visible_tip_block={}us compact_block_at_first={}us \
              compact_block_at_tip={}us compact_block_range_1={}us \
              compact_block_range_10={}us compact_block_range_50={}us \
              compact_block_range_1000={}us tree_state_at={}us subtree_roots_8={}us",
@@ -329,7 +329,7 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
             checkpoint_sapling_size,
             checkpoint_orchard_size,
             bulk_catchup_seconds,
-            latest_block_micros,
+            visible_tip_block_micros,
             compact_block_at_first_micros,
             compact_block_at_tip_micros,
             compact_block_range_1_micros,

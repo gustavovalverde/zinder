@@ -1,4 +1,4 @@
-//! Production ownership boundary for version-1 wallet projection construction.
+//! Production ownership boundary for wallet projection construction.
 //!
 //! The release binary is the only component that opens the wallet store as a
 //! primary. Canonical facts are consumed through a process-local `RocksDB`

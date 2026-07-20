@@ -61,7 +61,7 @@ async fn cli_runs_bounded_ingest_loop_from_config() -> Result<()> {
             storage_path: &storage_path,
             target_height: target_height.value(),
             request_timeout_secs: env.target.request_timeout.as_secs(),
-            allow_near_tip_finalize: true,
+            allow_reorg_window_settlement: true,
         })?,
     )?;
 
@@ -233,8 +233,8 @@ async fn cli_runs_bounded_wallet_serving_loop_from_config() -> Result<()> {
     .await?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::clone(&activations));
-    let latest_block = wallet_query.latest_block(None).await?;
-    assert_eq!(latest_block.height, to_height);
+    let visible_tip_block = wallet_query.visible_tip_block(None).await?;
+    assert_eq!(visible_tip_block.height, to_height);
     let compact_blocks = wallet_query
         .compact_blocks_in_range(
             BlockHeightRange::inclusive(wallet_serving_floor, to_height),

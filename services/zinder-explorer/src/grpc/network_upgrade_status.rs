@@ -2,17 +2,17 @@
 //!
 //! Projects the node-advertised [`NetworkUpgradeActivations`] table onto the
 //! wire, anchoring the `active` flags to the canonical tip height read from
-//! `WalletQuery.LatestBlock`.
+//! `WalletQuery.VisibleTipBlock`.
 
 use tonic::{Request, Response, Status};
 use zinder_core::wire::encode_branch_id_hex;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
-use zinder_derive::DeriveStore;
+use zinder_materialized_views::MaterializedViewStore;
 use zinder_proto::capabilities::EXPLORER_NETWORK_UPGRADE_STATUS_V1;
 use zinder_proto::v1::explorer::{
     NetworkUpgradeEntry, NetworkUpgradeStatusRequest, NetworkUpgradeStatusResponse,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
@@ -21,26 +21,28 @@ use super::freshness::{
 };
 
 /// Executes one `ExplorerQuery.NetworkUpgradeStatus` request.
-pub(crate) async fn handle_network_upgrade_status(
-    derive_store: Option<&DeriveStore>,
+pub(crate) async fn query_network_upgrade_status(
+    materialized_view_store: Option<&MaterializedViewStore>,
     activations: &NetworkUpgradeActivations,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     _request: Request<NetworkUpgradeStatusRequest>,
 ) -> Result<Response<NetworkUpgradeStatusResponse>, Status> {
     let response = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = response
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let tip_height = response
-        .latest_block
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.latest_block missing"))?
+        .visible_tip_block
+        .ok_or_else(|| {
+            ExplorerError::internal("VisibleTipBlockResponse.visible_tip_block missing")
+        })?
         .height;
 
     let upgrades = activations
@@ -72,7 +74,7 @@ pub(crate) async fn handle_network_upgrade_status(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            derive_store,
+            materialized_view_store,
             EXPLORER_NETWORK_UPGRADE_STATUS_V1,
             Some(chain_epoch),
             0,

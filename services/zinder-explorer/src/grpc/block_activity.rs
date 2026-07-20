@@ -1,21 +1,23 @@
 //! Bounded request-time block-activity aggregation.
 //!
-//! The handler reads existing `BlockSummary` projection rows and groups their
+//! The handler reads existing `BlockSummary` materialized-view rows and groups their
 //! block and transaction counts into a complete weekday/hour grid. It owns no
-//! projection and reports coverage explicitly when the requested range has
+//! materialized view and reports coverage explicitly when the requested range has
 //! missing materialized rows.
 
 use prost::Message as _;
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 use zinder_core::{BlockHeight, wire::encode_height_key_ascending};
-use zinder_derive::{BLOCK_SUMMARY_COLUMN_FAMILY, DeriveStore};
+use zinder_materialized_views::{BLOCK_SUMMARY_COLUMN_FAMILY, MaterializedViewStore};
 use zinder_proto::capabilities::EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1;
 use zinder_proto::v1::explorer::{
     BlockActivityBucket, BlockActivityDistributionRequest, BlockActivityDistributionResponse,
     BlockSummary, BlockSummaryRecord,
 };
-use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{
+    self, VisibleTipBlockRequest, wallet_query_client::WalletQueryClient,
+};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
@@ -25,7 +27,7 @@ use super::freshness::{
 
 /// Server-side ceiling for one request-time activity aggregate.
 ///
-/// A larger history needs a dedicated durable projection with explicit reorg
+/// A larger history needs a dedicated durable materialized view with explicit reorg
 /// and retention semantics rather than an unbounded read-time scan.
 const MAX_BLOCK_ACTIVITY_DISTRIBUTION_BLOCKS: u32 = 20_000;
 const WEEKDAYS_PER_WEEK: usize = 7;
@@ -33,8 +35,8 @@ const HOURS_PER_DAY: usize = 24;
 const ACTIVITY_BUCKET_COUNT: usize = WEEKDAYS_PER_WEEK * HOURS_PER_DAY;
 
 /// Executes one `ExplorerQuery.BlockActivityDistribution` request.
-pub(crate) async fn handle_block_activity_distribution(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_block_activity_distribution(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockActivityDistributionRequest>,
@@ -44,7 +46,7 @@ pub(crate) async fn handle_block_activity_distribution(
     let (chain_epoch, _) = read_canonical_tip(wallet_client).await?;
     let start_key = encode_height_key_ascending(BlockHeight::new(request.start_height));
     let end_key = encode_height_key_ascending(BlockHeight::new(request.end_height));
-    let entries = derive_store
+    let entries = materialized_view_store
         .range_iterate_consumer(
             BLOCK_SUMMARY_COLUMN_FAMILY,
             &start_key,
@@ -68,7 +70,7 @@ pub(crate) async fn handle_block_activity_distribution(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
             Some(chain_epoch),
             0,
@@ -108,18 +110,20 @@ async fn read_canonical_tip(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<(wallet::ChainEpoch, u32), Status> {
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let canonical_tip = latest
-        .latest_block
-        .ok_or_else(|| ExplorerError::internal("LatestBlockResponse.latest_block missing"))?
+        .visible_tip_block
+        .ok_or_else(|| {
+            ExplorerError::internal("VisibleTipBlockResponse.visible_tip_block missing")
+        })?
         .height;
     Ok((chain_epoch, canonical_tip))
 }

@@ -2,7 +2,7 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Accepted; revised 2026-06-03 (tree-state-at-height upstream fill) |
+| Status | Accepted |
 | Product | Zinder |
 | Domain | Wallet data plane, external wallet compatibility, typed client boundary |
 | Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Chain ingestion](../architecture/chain-ingestion.md), [Public interfaces](../architecture/public-interfaces.md), [Service operations](../architecture/service-operations.md) |
@@ -13,7 +13,7 @@ A Zinder store bootstrapped near the upstream-node tip can satisfy basic lightwa
 
 - `lightwalletd` exposes `GetTreeState`, `GetSubtreeRoots`, `GetAddressUtxos`, and `GetAddressUtxosStream` as first-class `CompactTxStreamer` methods.
 - Zallet's `wallet` code fetches birthday tree state at `birthday - 1`, loads Sapling and Orchard subtree roots from index `0`, and polls transparent UTXOs for wallet-owned transparent receivers.
-- Full-node wallets and native Rust applications need snapshot semantics for atomic reads above the safe tip, whether they consume the `WalletQuery` wire protocol or the typed `ChainIndex` client.
+- Full-node wallets and native Rust applications need snapshot semantics for atomic reads above the settled tip, whether they consume the `WalletQuery` wire protocol or the typed `ChainIndex` client.
 
 The architectural risk is treating one wallet as the design center. App-specific
 patches would leave Zinder without a durable consumer contract. The opposite
@@ -47,7 +47,7 @@ The core contract is:
 Serving coverage fails closed:
 
 - `wallet-serving` rejects explicit `from_height` and `checkpoint_height` overrides.
-- `wallet-serving` rejects `allow_near_tip_finalize`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
+- `wallet-serving` rejects `allow_reorg_window_settlement`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
 - Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes, with one bounded exception: `tree_state_at(height)` fills from the configured upstream node on a cache-miss (see the tree-state-at-height carve-out under Tradeoffs).
 - Readiness does not claim production traffic is safe before secondary catchup and writer-status validation have established the reader's state.
 
@@ -84,7 +84,7 @@ Positive:
 Negative:
 
 - Initial serving stores are larger and slower to build than recent-checkpoint fixtures.
-- Local test workflows use explicit disposable stores or tip-follow rather than near-tip safe-tip bulk catchup.
+- Local test workflows use explicit disposable stores or tip-follow rather than near-tip settled-tip bulk catchup.
 - Full prevention of excessive transparent-UTXO materialization across many addresses requires a deeper multi-address store API; the aggregate response budget bounds the read until that lands.
 
 Tradeoffs:

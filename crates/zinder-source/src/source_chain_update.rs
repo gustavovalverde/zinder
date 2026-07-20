@@ -121,9 +121,9 @@ pub enum SourceChainUpdate {
         /// Block identity that should no longer be treated as connected.
         block_id: BlockId,
     },
-    /// Source-observed safe tip advanced (the upstream node reports a new
+    /// Source-observed settled tip advanced (the upstream node reports a new
     /// height past its reorg window).
-    SafeTip {
+    SettledTip {
         /// Cursor after this update is applied.
         cursor: SourceChainCursor,
         /// Highest block the source reports as past its reorg window.
@@ -134,8 +134,8 @@ pub enum SourceChainUpdate {
 /// Bounded ordered source-chain updates fetched in one adapter call.
 ///
 /// Bulk catch-up uses this as an internal source-boundary optimization. The
-/// update vocabulary remains [`SourceChainUpdate`], so JSON-RPC batching and a
-/// future Zebra feed both converge before canonical ingest sees them.
+/// update vocabulary remains [`SourceChainUpdate`], so source-specific batching
+/// converges before canonical ingest sees it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SourceChainSegment {
     updates: Vec<SourceChainUpdate>,
@@ -303,10 +303,10 @@ impl SourceChainUpdate {
         }
     }
 
-    /// Builds a safe-tip source update.
+    /// Builds a settled-tip source update.
     #[must_use]
-    pub const fn safe_tip(cursor: SourceChainCursor, tip_id: BlockId) -> Self {
-        Self::SafeTip { cursor, tip_id }
+    pub const fn settled_tip(cursor: SourceChainCursor, tip_id: BlockId) -> Self {
+        Self::SettledTip { cursor, tip_id }
     }
 
     /// Returns the feed cursor after this update is applied.
@@ -315,7 +315,7 @@ impl SourceChainUpdate {
         match self {
             Self::ConnectedBlock { cursor, .. }
             | Self::RevertedBlock { cursor, .. }
-            | Self::SafeTip { cursor, .. } => *cursor,
+            | Self::SettledTip { cursor, .. } => *cursor,
         }
     }
 }

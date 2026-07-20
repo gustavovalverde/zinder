@@ -36,7 +36,7 @@ const DISPLACED_BLOCK_BY_ORDER_KEY_KIND: u8 = 23;
 const DISPLACED_BLOCK_BY_HASH_KEY_KIND: u8 = 24;
 const DISPLACED_ROOT_INDEX_KEY_KIND: u8 = 25;
 const BLOCK_REPLAY_KEY_KIND: u8 = 26;
-// Key kinds 27..=32 are reserved for future artifact families; visibility keys start at 33.
+// Visibility keys use a distinct range beginning at 33.
 const VISIBLE_BLOCK_EPOCH_KEY_KIND: u8 = 33;
 const VISIBLE_COMPACT_BLOCK_EPOCH_KEY_KIND: u8 = 34;
 const VISIBLE_TREE_STATE_EPOCH_KEY_KIND: u8 = 35;

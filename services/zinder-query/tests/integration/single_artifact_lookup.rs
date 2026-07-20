@@ -159,7 +159,7 @@ async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
         "the mined arm must carry the serialized transaction bytes alongside the location",
     );
     assert!(
-        mined.details.confirmations >= 1,
+        mined.chain_context.confirmations >= 1,
         "a mined transaction at the visible tip has at least one confirmation",
     );
 

@@ -9,17 +9,22 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use zinder_core::{
-    BlockBlobArtifact, BlockHeaderInfo, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    ChainEpoch, ChainEpochId, CompactBlockArtifact, MAX_RAW_TRANSACTION_BYTES, MinedDetails,
-    MinedTransaction, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
+    ChainEpoch, ChainEpochId, CompactBlockArtifact, MAX_RAW_TRANSACTION_BYTES, MinedTransaction,
+    MinedTransactionChainContext, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionBroadcastResult, TransactionId, TransactionLocation, TransparentAddressBalance,
+    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
     TransparentOutputEntry, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
 };
-use zinder_derive::DeriveStore;
+use zinder_materialized_views::{
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreReadSnapshot,
+    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TransparentAddressTransactionHistoryConsumer,
+    TransparentAddressTransactionHistoryPageRequest, TransparentOutpointSpendConsumer,
+};
 use zinder_proto::capabilities::{
     WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
 };
@@ -31,15 +36,10 @@ use zinder_store::{
     StreamCursorTokenV1,
 };
 
-mod fact_first;
-mod fact_first_pair;
 mod grpc;
-mod wallet_projection_read;
+mod lightwalletd_serving_query;
+mod wallet_serving_pair;
 
-pub use fact_first::FactFirstWalletQuery;
-pub use fact_first_pair::{
-    FactFirstCanonicalRead, FactFirstPairAdmissionError, FactFirstReadPair, FactFirstWalletRead,
-};
 pub use grpc::{
     ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
     address_lookup_to_script_hash, block_header_by_selector_response,
@@ -47,24 +47,22 @@ pub use grpc::{
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
     build_wallet_server_info, chain_events_response, compact_block_response, full_block_response,
-    latest_block_response, latest_tree_state_checkpoint_response,
-    network_upgrade_activations_response, status_from_query_error, subtree_roots_response,
-    transaction_response, transparent_address_tx_ids_response,
-    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
-    tree_state_at_response,
+    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
+    status_from_query_error, subtree_roots_response, transaction_response,
+    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
+    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
+    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
+    visible_tip_block_response,
 };
-pub use wallet_projection_read::{
-    ProjectionRead, TransparentAddressHistoryPage, WalletProjectionPosition,
-    WalletProjectionReadApi, WalletProjectionReadError, WalletProjectionReadiness,
-    derive_store_wallet_projection_reader,
+pub use lightwalletd_serving_query::LightwalletdServingQuery;
+pub use wallet_serving_pair::{
+    CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
 };
-
 /// Wallet-facing read API backed by epoch-bound canonical reads.
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves to
 /// the visible chain epoch at call time; `Some(id)` pins the read to that epoch.
-/// Current-projection derive reads expose their chain epoch in the response
+/// Current materialized-view reads expose their chain epoch in the response
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
@@ -72,33 +70,33 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// configured upstream node.
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError>;
 
-    /// Reads latest visible block metadata.
-    async fn latest_block(
+    /// Reads the visible-tip block identity.
+    async fn visible_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestBlock, QueryError>;
+    ) -> Result<VisibleTipBlock, QueryError>;
 
-    /// Reads the block at the chain epoch's safe tip (the wallet's scan
-    /// ceiling). Mirrors `latest_block` but resolves to
-    /// `chain_epoch.safe_tip_height` rather than `chain_epoch.tip_height`.
-    async fn latest_safe_block(
+    /// Reads the block at the chain epoch's settled tip (the wallet's scan
+    /// ceiling). Mirrors `visible_tip_block` but resolves to
+    /// `chain_epoch.settled_tip_height` rather than `chain_epoch.tip_height`.
+    async fn settled_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestSafeBlock, QueryError>;
+    ) -> Result<SettledTipBlock, QueryError>;
 
     /// Resolves a typed block selector against the canonical best chain.
     async fn block_id_by_selector(
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockIdResponseValue, QueryError>;
+    ) -> Result<BlockIdAtEpoch, QueryError>;
 
     /// Reads the typed block-header read model at a typed block selector.
     async fn block_header_by_selector(
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockHeaderResponseValue, QueryError>;
+    ) -> Result<BlockHeaderAtEpoch, QueryError>;
 
     /// Reads one compact block artifact at a given height.
     async fn compact_block_at(
@@ -143,7 +141,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Reads typed transaction status by transaction id.
     ///
     /// Returns [`TxStatus::Mined`] for mined transactions, with epoch-bound
-    /// [`MinedDetails`] enrichment, [`TxStatus::NotFound`] when the
+    /// [`MinedTransactionChainContext`] enrichment, [`TxStatus::NotFound`] when the
     /// transaction is not visible in the canonical chain, and
     /// [`QueryError`] for storage/upstream failures. An `at_epoch_id` pin is
     /// a canonical-chain read and never consults live mempool state;
@@ -256,7 +254,8 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Folds the canonical current-UTXO projection into an unspent count and a
     /// total value (gettxoutsetinfo-equivalent) by a request-time full scan.
     /// The aggregate is taken at the resolved epoch's settled tip, where the
-    /// projection is the irreversible unspent set. When `commitment_enabled`
+    /// projection is the settled-tip unspent set under the configured reorg
+    /// policy; a deeper reorg fails closed. When `commitment_enabled`
     /// is set the same scan also folds the `LtHash16` homomorphic commitment.
     async fn transparent_utxo_set_summary(
         &self,
@@ -307,7 +306,208 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, QueryError>;
+    ) -> Result<TransactionBroadcastOutcome, QueryError>;
+}
+
+/// Read and broadcast operations required by the lightwalletd compatibility adapter.
+///
+/// The native [`WalletQueryApi`] remains the complete wallet boundary. This
+/// narrower trait lets the compatibility server depend only on operations its
+/// `CompactTxStreamer` translation actually uses.
+#[async_trait]
+pub trait LightwalletdQueryApi: Send + Sync + 'static {
+    /// Reads the visible-tip block identity.
+    async fn visible_tip_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<VisibleTipBlock, QueryError>;
+
+    /// Resolves a typed block selector against the canonical best chain.
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockIdAtEpoch, QueryError>;
+
+    /// Reads one compact block artifact at a given height.
+    async fn compact_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlock, QueryError>;
+
+    /// Reads compact block artifacts for an inclusive height range.
+    async fn compact_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockRange, QueryError>;
+
+    /// Reads typed transaction status by transaction id.
+    async fn transaction(
+        &self,
+        transaction_id: TransactionId,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransactionStatus, QueryError>;
+
+    /// Reads an optional raw transaction blob by transaction id.
+    async fn raw_transaction(
+        &self,
+        transaction_id: TransactionId,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<RawTransaction, QueryError>;
+
+    /// Reads the complete unspent transparent output set for one address.
+    async fn transparent_address_unspent_outputs(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError>;
+
+    /// Reads a bounded page of transparent-address transaction history.
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        request: TransparentAddressTxIdsInRangeRequest,
+    ) -> Result<TransparentAddressTxIds, QueryError>;
+
+    /// Sums transparent-address balances at one pinned chain epoch.
+    async fn transparent_address_balance(
+        &self,
+        addresses: Vec<TransparentAddressScriptHash>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, QueryError>;
+
+    /// Reads the tree state at exactly `height`.
+    async fn tree_state_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TreeState, QueryError>;
+
+    /// Reads the latest tree-state checkpoint at the visible chain epoch tip.
+    async fn latest_tree_state_checkpoint(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TreeState, QueryError>;
+
+    /// Reads subtree-root artifacts for a bounded subtree range.
+    async fn subtree_roots(
+        &self,
+        subtree_root_range: SubtreeRootRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<SubtreeRoots, QueryError>;
+
+    /// Broadcasts a raw transaction without mutating canonical storage.
+    async fn broadcast_transaction(
+        &self,
+        raw_transaction: RawTransactionBytes,
+    ) -> Result<TransactionBroadcastOutcome, QueryError>;
+}
+
+#[async_trait]
+impl<T> LightwalletdQueryApi for T
+where
+    T: WalletQueryApi,
+{
+    async fn visible_tip_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<VisibleTipBlock, QueryError> {
+        WalletQueryApi::visible_tip_block(self, at_epoch_id).await
+    }
+
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockIdAtEpoch, QueryError> {
+        WalletQueryApi::block_id_by_selector(self, selector, at_epoch_id).await
+    }
+
+    async fn compact_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlock, QueryError> {
+        WalletQueryApi::compact_block_at(self, height, at_epoch_id).await
+    }
+
+    async fn compact_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockRange, QueryError> {
+        WalletQueryApi::compact_blocks_in_range(self, block_range, at_epoch_id).await
+    }
+
+    async fn transaction(
+        &self,
+        transaction_id: TransactionId,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransactionStatus, QueryError> {
+        WalletQueryApi::transaction(self, transaction_id, at_epoch_id).await
+    }
+
+    async fn raw_transaction(
+        &self,
+        transaction_id: TransactionId,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<RawTransaction, QueryError> {
+        WalletQueryApi::raw_transaction(self, transaction_id, at_epoch_id).await
+    }
+
+    async fn transparent_address_unspent_outputs(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        WalletQueryApi::transparent_address_unspent_outputs(self, request, at_epoch_id).await
+    }
+
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        request: TransparentAddressTxIdsInRangeRequest,
+    ) -> Result<TransparentAddressTxIds, QueryError> {
+        WalletQueryApi::transparent_address_tx_ids_in_range(self, request).await
+    }
+
+    async fn transparent_address_balance(
+        &self,
+        addresses: Vec<TransparentAddressScriptHash>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, QueryError> {
+        WalletQueryApi::transparent_address_balance(self, addresses, at_epoch_id).await
+    }
+
+    async fn tree_state_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TreeState, QueryError> {
+        WalletQueryApi::tree_state_at(self, height, at_epoch_id).await
+    }
+
+    async fn latest_tree_state_checkpoint(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TreeState, QueryError> {
+        WalletQueryApi::latest_tree_state_checkpoint(self, at_epoch_id).await
+    }
+
+    async fn subtree_roots(
+        &self,
+        subtree_root_range: SubtreeRootRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<SubtreeRoots, QueryError> {
+        WalletQueryApi::subtree_roots(self, subtree_root_range, at_epoch_id).await
+    }
+
+    async fn broadcast_transaction(
+        &self,
+        raw_transaction: RawTransactionBytes,
+    ) -> Result<TransactionBroadcastOutcome, QueryError> {
+        WalletQueryApi::broadcast_transaction(self, raw_transaction).await
+    }
 }
 
 /// Query boundary backed by a [`ChainEpochReadApi`] implementation.
@@ -316,7 +516,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct WalletQuery<ReadApi, Broadcaster = ()> {
     read_api: ReadApi,
-    wallet_projection_reader: Option<Arc<dyn WalletProjectionReadApi>>,
+    materialized_view_store: Option<MaterializedViewStore>,
     transaction_broadcaster: Broadcaster,
     options: WalletQueryOptions,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
@@ -329,7 +529,10 @@ impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalletQuery")
             .field("read_api", &self.read_api)
-            .field("wallet_projection_reader", &self.wallet_projection_reader)
+            .field(
+                "materialized_view_store",
+                &self.materialized_view_store.is_some(),
+            )
             .field("transaction_broadcaster", &self.transaction_broadcaster)
             .field("options", &self.options)
             .field(
@@ -393,7 +596,7 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
     /// `transaction_broadcaster`.
     ///
     /// `network_upgrade_activations` is the node-discovered upgrade table
-    /// that populates `MinedDetails.consensus_branch_id` for mined
+    /// that populates `MinedTransactionChainContext.consensus_branch_id` for mined
     /// transactions with the value actually active at the mined height on
     /// the configured network. In production it is shared via
     /// `ZebraJsonRpcSource::discover_network_upgrade_activations`; tests use
@@ -422,7 +625,7 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
     ) -> Self {
         Self {
             read_api,
-            wallet_projection_reader: None,
+            materialized_view_store: None,
             transaction_broadcaster,
             options,
             network_upgrade_activations,
@@ -430,20 +633,13 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
         }
     }
 
-    /// Attaches the derive-store reader used for derive-owned wallet projections.
+    /// Attaches the materialized-view projections used by wallet queries.
     #[must_use]
-    pub fn with_derive_store(mut self, derive_store: DeriveStore) -> Self {
-        self.wallet_projection_reader = Some(derive_store_wallet_projection_reader(derive_store));
-        self
-    }
-
-    /// Attaches a typed wallet-projection reader.
-    #[must_use]
-    pub fn with_wallet_projection_reader(
+    pub fn with_materialized_view_store(
         mut self,
-        wallet_projection_reader: Arc<dyn WalletProjectionReadApi>,
+        materialized_view_store: MaterializedViewStore,
     ) -> Self {
-        self.wallet_projection_reader = Some(wallet_projection_reader);
+        self.materialized_view_store = Some(materialized_view_store);
         self
     }
 
@@ -482,43 +678,43 @@ where
         Ok((*self.network_upgrade_activations).clone())
     }
 
-    async fn latest_block(
+    async fn visible_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestBlock, QueryError> {
+    ) -> Result<VisibleTipBlock, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
-            Ok(LatestBlock {
+            Ok(VisibleTipBlock {
                 chain_epoch,
                 height: chain_epoch.visible_tip_height,
                 block_hash: chain_epoch.visible_tip_hash,
             })
         }))
         .await;
-        record_wallet_query_outcome("latest_block", started_at, &query_outcome, None);
+        record_wallet_query_outcome("visible_tip_block", started_at, &query_outcome, None);
         query_outcome
     }
 
-    async fn latest_safe_block(
+    async fn settled_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<LatestSafeBlock, QueryError> {
+    ) -> Result<SettledTipBlock, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
-            Ok(LatestSafeBlock {
+            Ok(SettledTipBlock {
                 chain_epoch,
                 height: chain_epoch.settled_tip_height,
                 block_hash: chain_epoch.settled_tip_hash,
             })
         }))
         .await;
-        record_wallet_query_outcome("latest_safe_block", started_at, &query_outcome, None);
+        record_wallet_query_outcome("settled_tip_block", started_at, &query_outcome, None);
         query_outcome
     }
 
@@ -526,14 +722,14 @@ where
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockIdResponseValue, QueryError> {
+    ) -> Result<BlockIdAtEpoch, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
             let block_id = resolve_block_selector(&reader, selector)?;
-            Ok(BlockIdResponseValue {
+            Ok(BlockIdAtEpoch {
                 chain_epoch,
                 block_id,
             })
@@ -547,7 +743,7 @@ where
         &self,
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockHeaderResponseValue, QueryError> {
+    ) -> Result<BlockHeaderAtEpoch, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
@@ -557,9 +753,9 @@ where
             let block = reader.block_header_at(block_id.height)?.ok_or_else(|| {
                 block_height_artifact_unavailable(ArtifactFamily::BlockHeader, block_id.height)
             })?;
-            Ok(BlockHeaderResponseValue {
+            Ok(BlockHeaderAtEpoch {
                 chain_epoch,
-                block_header: block.into_header_info(),
+                block_header: block.into_header(),
             })
         }))
         .await;
@@ -628,7 +824,7 @@ where
                 .unwrap_or_default();
             let consensus_branch_id =
                 activations.consensus_branch_id_at(artifact.location.block_height);
-            let details = MinedDetails::from_response_epoch(
+            let chain_context = MinedTransactionChainContext::from_response_epoch(
                 &chain_epoch,
                 artifact.location.block_height,
                 consensus_branch_id,
@@ -641,7 +837,7 @@ where
                 chain_epoch,
                 status: TxStatus::Mined(MinedTransaction::new(
                     artifact.location,
-                    details,
+                    chain_context,
                     raw_transaction_bytes,
                 )),
             })
@@ -776,41 +972,46 @@ where
     ) -> Result<TransparentSpendsByOutpointResponse, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
-        let wallet_projection_reader = self.wallet_projection_reader.clone();
+        let materialized_view_store = self.materialized_view_store.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
 
-            let canonical = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
+            let canonical_spends = reader.transparent_spend_facts_by_outpoints(&outpoints)?;
 
             let mut spends = Vec::with_capacity(outpoints.len());
-            let mut seen = HashSet::with_capacity(outpoints.len());
-            let mut canonical_misses = Vec::new();
+            let mut seen_outpoints = HashSet::with_capacity(outpoints.len());
+            let mut unresolved_outpoints = Vec::new();
             for outpoint in &outpoints {
-                if let Some(fact) = canonical.get(outpoint) {
-                    if seen.insert(*outpoint) {
-                        spends.push(TransparentSpendEntry::from_spend_fact(fact));
+                if let Some(spend) = canonical_spends.get(outpoint) {
+                    if seen_outpoints.insert(*outpoint) {
+                        spends.push(TransparentSpendEntry::from_spend_fact(spend));
                     }
                 } else {
-                    canonical_misses.push(*outpoint);
+                    unresolved_outpoints.push(*outpoint);
                 }
             }
 
-            if !canonical_misses.is_empty() {
-                if let Some(wallet_projection_reader) = wallet_projection_reader.as_deref() {
-                    for entry in resolve_swept_spends_from_derive(
-                        wallet_projection_reader,
-                        &read_api,
-                        &reader,
-                        chain_epoch.settled_tip_height,
-                        &canonical_misses,
-                    )? {
-                        if seen.insert(entry.spent_outpoint) {
-                            spends.push(entry);
-                        }
+            if !unresolved_outpoints.is_empty()
+                && let Some(deleted_through_height) = reader
+                    .transparent_retention_deleted_through_height()
+                    .map_err(QueryError::Store)?
+            {
+                let materialized_view_store =
+                    materialized_view_store.ok_or(QueryError::MaterializedViewUnavailable {
+                        capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
+                    })?;
+                materialized_view_store.try_catch_up()?;
+                let snapshot = materialized_view_store.read_snapshot();
+                for materialized_spend in resolve_materialized_transparent_spends(
+                    &snapshot,
+                    &reader,
+                    deleted_through_height,
+                    &unresolved_outpoints,
+                )? {
+                    if seen_outpoints.insert(materialized_spend.spent_outpoint) {
+                        spends.push(materialized_spend);
                     }
-                } else {
-                    ensure_spend_lookup_complete_without_derive(&reader)?;
                 }
             }
 
@@ -1020,8 +1221,8 @@ where
             return outcome;
         }
 
-        let Some(wallet_projection_reader) = self.wallet_projection_reader.clone() else {
-            let outcome = Err(QueryError::DeriveUnavailable {
+        let Some(materialized_view_store) = self.materialized_view_store.clone() else {
+            let outcome = Err(QueryError::MaterializedViewUnavailable {
                 capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
             });
             record_wallet_query_outcome(
@@ -1034,28 +1235,43 @@ where
         };
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
-            let reader = read_api
+            let chain_epoch = read_api
                 .current_chain_epoch_reader()
-                .map_err(QueryError::Store)?;
-            let chain_epoch = reader.chain_epoch();
-            let required_cursor = current_tip_chain_event_cursor_for_epoch(&read_api, chain_epoch)?;
-            let projection_read = wallet_projection_reader
-                .transparent_address_history_page(&request)
-                .map_err(|error| {
-                    map_wallet_projection_read_error(error, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1)
-                })?;
-            let derive_height = projection_read.materialized_height;
-            if !projection_read.covers(chain_epoch.visible_tip_height, required_cursor.as_ref()) {
-                return Err(QueryError::DeriveLag {
+                .map_err(QueryError::Store)?
+                .chain_epoch();
+            let canonical_fence =
+                current_visible_chain_event_cursor_for_epoch(&read_api, chain_epoch)?;
+            materialized_view_store.try_catch_up()?;
+            let snapshot = materialized_view_store.read_snapshot();
+            let materialized_fence = snapshot
+                .get_chain_event_cursor(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)?;
+            if materialized_fence.as_deref()
+                != canonical_fence
+                    .as_ref()
+                    .map(zinder_store::StreamCursorTokenV1::as_bytes)
+            {
+                return Err(QueryError::MaterializedViewUnavailable {
                     capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
-                    chain_tip_height: chain_epoch.visible_tip_height,
-                    derive_height,
                 });
             }
+            let page = TransparentAddressTransactionHistoryConsumer::read_page_snapshot(
+                &snapshot,
+                TransparentAddressTransactionHistoryPageRequest {
+                    address_script_hash: request.address_script_hash,
+                    start_height: request.start_height,
+                    end_height: request.end_height,
+                    max_entries: request.max_entries,
+                    from_cursor: request.from_cursor.as_ref(),
+                    chain_event_fence: canonical_fence.as_ref(),
+                    descending: request.descending,
+                },
+            )
+            .map_err(map_transparent_history_page_error)?;
+            drop(snapshot);
             Ok(TransparentAddressTxIds {
                 chain_epoch,
-                artifacts: projection_read.value.artifacts,
-                next_cursor: projection_read.value.next_cursor,
+                artifacts: page.artifacts,
+                next_cursor: page.next_cursor,
             })
         }))
         .await;
@@ -1378,7 +1594,7 @@ where
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, QueryError> {
+    ) -> Result<TransactionBroadcastOutcome, QueryError> {
         let started_at = Instant::now();
         let broadcast_outcome = async {
             guard_broadcast_payload_size(&raw_transaction)?;
@@ -1398,125 +1614,144 @@ where
     }
 }
 
-/// Resolves canonical spend-fact misses against the durable
-/// transparent-outpoint-spend projection.
-///
-/// The canonical read is authoritative inside the reorg window and above the
-/// deleted-through marker. Below that marker canonical holds no spend fact, so
-/// the projection is the only source of spender identity. Only spends at or
-/// below the pinned epoch's settled tip are surfaced: an above-settled-tip miss
-/// keeps today's semantics (absent means no fact visible in the window). The
-/// read refuses with the derive-lag vocabulary only when facts were actually
-/// deleted below the projection's durable height, so an empty projection on a
-/// store that never swept still returns the correct absent answer.
-fn resolve_swept_spends_from_derive(
-    wallet_projection_reader: &dyn WalletProjectionReadApi,
-    read_api: &(impl ChainEpochReadApi + ?Sized),
+/// Resolves canonical misses from one verified materialized-view snapshot.
+fn resolve_materialized_transparent_spends(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     reader: &zinder_store::ChainEpochReader<'_>,
-    settled_tip_height: BlockHeight,
-    canonical_misses: &[TransparentOutPoint],
+    deleted_through_height: BlockHeight,
+    unresolved_outpoints: &[TransparentOutPoint],
 ) -> Result<Vec<TransparentSpendEntry>, QueryError> {
-    let deleted_through = reader
-        .transparent_retention_deleted_through_height()
-        .map_err(QueryError::Store)?
-        .map_or(0, BlockHeight::value);
-    let projection_read = wallet_projection_reader
-        .transparent_outpoint_spenders(canonical_misses)
-        .map_err(|error| {
-            map_wallet_projection_read_error(error, WALLET_READ_TRANSPARENT_SPENDS_V1)
-        })?;
-    let derive_height = projection_read.materialized_height;
-    let projection_is_current = if deleted_through == 0 {
-        true
-    } else {
-        let required_cursor = current_tip_chain_event_cursor(read_api)?;
-        projection_read.covers(BlockHeight::new(deleted_through), required_cursor.as_ref())
-    };
-    if !projection_is_current {
-        return Err(QueryError::DeriveLag {
+    let materialized_view_state = snapshot
+        .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?
+        .ok_or(QueryError::MaterializedViewUnavailable {
             capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
-            chain_tip_height: BlockHeight::new(deleted_through),
-            derive_height,
-        });
-    }
-    let derive_hits = projection_read.value;
-    let mut resolved = Vec::with_capacity(canonical_misses.len().min(derive_hits.len()));
-    for outpoint in canonical_misses {
-        let Some(entry) = derive_hits.get(outpoint) else {
+        })?;
+    validate_transparent_spend_materialized_view_coverage(
+        reader,
+        materialized_view_state,
+        deleted_through_height,
+    )?;
+    let projected_spends = TransparentOutpointSpendConsumer::read_spends_by_outpoints_snapshot(
+        snapshot,
+        unresolved_outpoints,
+    )?;
+    let settled_tip_height = reader.chain_epoch().settled_tip_height;
+    let mut resolved_spends = Vec::with_capacity(projected_spends.len());
+    for outpoint in unresolved_outpoints {
+        let Some(spend) = projected_spends.get(outpoint) else {
             continue;
         };
-        if entry.spending_block_height <= settled_tip_height
-            && derive_spend_matches_canonical_header(reader, entry)?
+        if spend.spending_block_height <= settled_tip_height
+            && transparent_spend_matches_canonical_header(reader, spend)?
         {
-            resolved.push(entry.clone());
+            resolved_spends.push(spend.clone());
         }
     }
-    Ok(resolved)
+    Ok(resolved_spends)
 }
 
-fn current_tip_chain_event_cursor(
-    read_api: &(impl ChainEpochReadApi + ?Sized),
-) -> Result<Option<StreamCursorTokenV1>, QueryError> {
-    read_api
-        .resolve_chain_event_stream_start(
-            &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Tip,
-        )
-        .map(|resume| resume.cursor)
-        .map_err(map_chain_event_store_error)
-}
-
-fn current_tip_chain_event_cursor_for_epoch(
-    read_api: &(impl ChainEpochReadApi + ?Sized),
-    expected_chain_epoch: ChainEpoch,
-) -> Result<Option<StreamCursorTokenV1>, QueryError> {
-    let cursor = current_tip_chain_event_cursor(read_api)?;
-    let current_chain_epoch = read_api
-        .current_chain_epoch_reader()
-        .map_err(QueryError::Store)?
-        .chain_epoch();
-    Ok((current_chain_epoch == expected_chain_epoch)
-        .then_some(cursor)
-        .flatten())
-}
-
-/// Refuses an ambiguous canonical miss after retention has deleted spend facts.
-///
-/// Before the first real deletion, a canonical miss proves that no spend fact
-/// exists at the pinned epoch. Afterwards, only the durable derive projection
-/// can distinguish an old spent outpoint from an unspent one.
-fn ensure_spend_lookup_complete_without_derive(
+/// Requires verified spender coverage through every canonical deletion.
+fn validate_transparent_spend_materialized_view_coverage(
     reader: &zinder_store::ChainEpochReader<'_>,
+    materialized_view_state: MaterializedViewState,
+    deleted_through_height: BlockHeight,
 ) -> Result<(), QueryError> {
-    if reader
-        .transparent_retention_deleted_through_height()
-        .map_err(QueryError::Store)?
-        .is_some()
-    {
-        return Err(QueryError::DeriveUnavailable {
+    let Some(coverage) = materialized_view_state.coverage else {
+        return Err(QueryError::MaterializedViewUnavailable {
+            capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
+        });
+    };
+    let first_available_height = reader.canonical_history_bounds().first_available_height();
+    let covers_deleted_facts = coverage.complete_from_height <= first_available_height
+        && coverage.complete_through_height >= deleted_through_height;
+    let materialized_view_tip_is_canonical = canonical_block_hash_matches(
+        reader,
+        materialized_view_state.tip_height,
+        materialized_view_state.tip_hash,
+    )?;
+    let coverage_tip_is_canonical = canonical_block_hash_matches(
+        reader,
+        coverage.complete_through_height,
+        coverage.complete_through_hash,
+    )?;
+    if !covers_deleted_facts || !materialized_view_tip_is_canonical || !coverage_tip_is_canonical {
+        return Err(QueryError::MaterializedViewUnavailable {
             capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
         });
     }
     Ok(())
 }
 
-/// Confirms a projection spend row still names the canonical block at its
-/// spending height.
-///
-/// The projection records rows for in-window blocks a later reorg can remove.
-/// Until the tailer replays that reorg the stale row survives, and once the
-/// safe tip advances past its height the settled-tip filter alone would surface
-/// it as the spender. Cross-checking the row's stored block hash against the
-/// retained canonical header (headers are never swept) makes a reorged-out row
-/// absent instead of a wrong spending transaction id.
-fn derive_spend_matches_canonical_header(
+fn transparent_spend_matches_canonical_header(
     reader: &zinder_store::ChainEpochReader<'_>,
-    entry: &TransparentSpendEntry,
+    spend: &TransparentSpendEntry,
 ) -> Result<bool, QueryError> {
-    let canonical_header = reader
-        .block_header_at(entry.spending_block_height)
-        .map_err(QueryError::Store)?;
-    Ok(canonical_header.is_some_and(|header| header.block_hash == entry.spending_block_hash))
+    canonical_block_hash_matches(
+        reader,
+        spend.spending_block_height,
+        spend.spending_block_hash,
+    )
+}
+
+fn canonical_block_hash_matches(
+    reader: &zinder_store::ChainEpochReader<'_>,
+    height: BlockHeight,
+    expected_hash: zinder_core::BlockHash,
+) -> Result<bool, QueryError> {
+    Ok(reader
+        .block_header_at(height)
+        .map_err(QueryError::Store)?
+        .is_some_and(|header| header.block_hash == expected_hash))
+}
+
+/// Resolves the authenticated visible-chain event fence for `expected_chain_epoch`.
+///
+/// The chain store can advance between the epoch read and `LiveTail` resolution.
+/// Re-reading the epoch makes that race fail closed instead of pairing a history
+/// projection from one chain branch with another branch's response epoch.
+fn current_visible_chain_event_cursor_for_epoch(
+    read_api: &(impl ChainEpochReadApi + ?Sized),
+    expected_chain_epoch: ChainEpoch,
+) -> Result<Option<StreamCursorTokenV1>, QueryError> {
+    let fence = read_api
+        .resolve_chain_event_stream_start(
+            &EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Visible,
+        )
+        .map_err(map_chain_event_store_error)?
+        .cursor;
+    let current_chain_epoch = read_api
+        .current_chain_epoch_reader()
+        .map_err(QueryError::Store)?
+        .chain_epoch();
+    if current_chain_epoch != expected_chain_epoch {
+        return Err(QueryError::MaterializedViewUnavailable {
+            capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+        });
+    }
+    Ok(fence)
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Unknown materialized-view failures retain the query storage-error mapping."
+)]
+fn map_transparent_history_page_error(
+    error: zinder_materialized_views::MaterializedViewStoreError,
+) -> QueryError {
+    match error {
+        zinder_materialized_views::MaterializedViewStoreError::ConsumerCursorInvalid {
+            reason: "cursor is bound to a different visible chain fence",
+            ..
+        } => QueryError::MaterializedViewUnavailable {
+            capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+        },
+        zinder_materialized_views::MaterializedViewStoreError::ConsumerCursorInvalid {
+            reason,
+            ..
+        } => QueryError::TransparentHistoryCursorInvalid { reason },
+        error => QueryError::MaterializedViewStore(error),
+    }
 }
 
 fn open_chain_epoch_reader<ReadApi>(
@@ -1749,25 +1984,6 @@ fn map_chain_event_store_error(error: StoreError) -> QueryError {
     }
 }
 
-fn map_wallet_projection_read_error(
-    error: WalletProjectionReadError,
-    capability: &'static str,
-) -> QueryError {
-    match error {
-        WalletProjectionReadError::ProjectionUnavailable { .. } => {
-            QueryError::DeriveUnavailable { capability }
-        }
-        WalletProjectionReadError::TransparentAddressHistoryCursorInvalid => {
-            QueryError::TransparentHistoryCursorInvalid {
-                reason: "cursor does not match the transparent-address transaction-history stream",
-            }
-        }
-        WalletProjectionReadError::Storage { source } => {
-            QueryError::WalletProjectionRead { source }
-        }
-    }
-}
-
 /// Metric pair the `WalletQuery` adapter emits per request.
 const QUERY_RPC_METRICS: zinder_runtime::RpcMetricNames =
     zinder_runtime::RpcMetricNames::for_service(
@@ -1838,20 +2054,18 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
             "transparent_history_cursor_invalid"
         }
         Some(QueryError::InvalidAddress { .. }) => "invalid_address",
-        Some(QueryError::ChainEpochPinUnsupported) => "chain_epoch_pin_unsupported",
         Some(QueryError::ChainEpochPinUnavailable { .. }) => "chain_epoch_pin_unavailable",
         Some(QueryError::UnsupportedChainEvent { .. }) => "unsupported_chain_event",
         Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
         Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
-        Some(QueryError::DeriveUnavailable { .. }) => "derive_unavailable",
-        Some(QueryError::DeriveLag { .. }) => "derive_lag",
+        Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
         Some(QueryError::Store(_)) => "store",
-        Some(QueryError::DeriveStore(_)) => "derive_store",
+        Some(QueryError::MaterializedViewStore(_)) => "materialized_view_store",
         Some(QueryError::WalletProjectionRead { .. }) => "wallet_projection_read",
         Some(QueryError::CanonicalStore(_)) => "canonical_store",
         Some(QueryError::WalletStore(_)) => "wallet_store",
@@ -1911,33 +2125,33 @@ fn proxy_error_class(error: Option<&tonic::Status>) -> &'static str {
     }
 }
 
-/// Latest visible block metadata bound to one chain epoch.
+/// Visible-tip block identity bound to one chain epoch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LatestBlock {
+pub struct VisibleTipBlock {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
-    /// Latest visible block height.
+    /// Visible-tip block height.
     pub height: BlockHeight,
-    /// Latest visible block hash.
+    /// Visible-tip block hash.
     pub block_hash: zinder_core::BlockHash,
 }
 
-/// Safe-tip block metadata bound to one chain epoch. The block sits at
-/// `chain_epoch.safe_tip_height` and is the highest height the wallet can
+/// Settled-tip block metadata bound to one chain epoch. The block sits at
+/// `chain_epoch.settled_tip_height` and is the highest height the wallet can
 /// safely use as its scan ceiling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LatestSafeBlock {
+pub struct SettledTipBlock {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
-    /// Safe tip height (`chain_epoch.safe_tip_height`).
+    /// Settled tip height (`chain_epoch.settled_tip_height`).
     pub height: BlockHeight,
-    /// Block hash at `safe_tip_height`.
+    /// Block hash at `settled_tip_height`.
     pub block_hash: zinder_core::BlockHash,
 }
 
 /// Block-identity resolver response bound to one chain epoch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockIdResponseValue {
+pub struct BlockIdAtEpoch {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
     /// Resolved block identity in the canonical best chain.
@@ -1946,11 +2160,11 @@ pub struct BlockIdResponseValue {
 
 /// Block-header read response bound to one chain epoch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockHeaderResponseValue {
+pub struct BlockHeaderAtEpoch {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
     /// Block-header read-model value at the resolved selector.
-    pub block_header: BlockHeaderInfo,
+    pub block_header: BlockHeader,
 }
 
 /// Single compact block response bound to one chain epoch.
@@ -2020,7 +2234,7 @@ pub struct RawTransaction {
 /// Typed transaction-status response bound to one chain epoch.
 ///
 /// Returned by [`WalletQueryApi::transaction`]. Carries the typed
-/// [`TxStatus`] (`Mined`/`InMempool`/`ConflictingChain`/`NotFound`) and
+/// [`TxStatus`] (`Mined`/`InMempool`/`NotFound`) and
 /// the epoch used to answer the read; the wire-side adapter maps
 /// `TxStatus::NotFound` to gRPC `NOT_FOUND`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2065,7 +2279,9 @@ pub struct TransparentAddressTxIdsInRangeRequest {
     pub end_height: BlockHeight,
     /// Server-bounded maximum entries per page.
     pub max_entries: NonZeroU32,
-    /// Optional cursor returned by a previous response.
+    /// Optional cursor returned by a previous response. The cursor is bound
+    /// to the response's visible-chain event fence and is rejected after a
+    /// reorg.
     pub from_cursor: Option<StreamCursorTokenV1>,
     /// Iterate newest-first when true.
     pub descending: bool,
@@ -2261,10 +2477,6 @@ pub enum QueryError {
         oldest_retained_sequence: u64,
     },
 
-    /// The query implementation does not support request-side epoch pinning.
-    #[error("chain-epoch pinning is unsupported by this query implementation")]
-    ChainEpochPinUnsupported,
-
     /// Requested chain epoch is no longer available.
     #[error("chain-epoch pin is unavailable: {chain_epoch_id:?}")]
     ChainEpochPinUnavailable {
@@ -2306,24 +2518,11 @@ pub enum QueryError {
         maximum: usize,
     },
 
-    /// Derive-owned wallet projection is not configured for this query handle.
-    #[error("derive projection is unavailable for {capability}")]
-    DeriveUnavailable {
-        /// Capability that requires the derive projection.
+    /// Materialized-view-owned wallet projection is not configured for this query handle.
+    #[error("materialized view is unavailable for {capability}")]
+    MaterializedViewUnavailable {
+        /// Capability that requires the materialized view.
         capability: &'static str,
-    },
-
-    /// Derive-owned wallet projection has not caught up to the requested epoch.
-    #[error(
-        "derive projection {capability} is behind chain tip {chain_tip_height:?}: derive height {derive_height:?}"
-    )]
-    DeriveLag {
-        /// Capability that requires the derive projection.
-        capability: &'static str,
-        /// Canonical chain tip height required by the request.
-        chain_tip_height: BlockHeight,
-        /// Latest materialized derive height, when any block has been processed.
-        derive_height: Option<BlockHeight>,
     },
 
     /// A blocking read task failed unexpectedly (panic or runtime shutdown).
@@ -2337,9 +2536,9 @@ pub enum QueryError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
-    /// Derive store returned a storage error.
+    /// Materialized-view store returned a storage error.
     #[error(transparent)]
-    DeriveStore(#[from] zinder_derive::DeriveStoreError),
+    MaterializedViewStore(#[from] zinder_materialized_views::MaterializedViewStoreError),
 
     /// Typed wallet-projection backend returned a storage failure.
     #[error("wallet projection read failed: {source}")]
@@ -2349,11 +2548,11 @@ pub enum QueryError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// Version-1 canonical store returned a storage or admission failure.
+    /// Canonical store returned a storage or admission failure.
     #[error(transparent)]
     CanonicalStore(#[from] zinder_store::CanonicalStoreError),
 
-    /// Version-1 wallet store returned a storage or admission failure.
+    /// Wallet store returned a storage or admission failure.
     #[error(transparent)]
     WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
 
@@ -2385,10 +2584,8 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
             Self::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
             Self::BroadcastTransactionTooLarge { .. } => ErrorReason::BroadcastTransactionTooLarge,
-            Self::DeriveUnavailable { .. } => ErrorReason::DeriveProjectionUnavailable,
-            Self::DeriveLag { .. } => ErrorReason::DeriveProjectionLagging,
+            Self::MaterializedViewUnavailable { .. } => ErrorReason::MaterializedViewUnavailable,
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
-            Self::ChainEpochPinUnsupported => ErrorReason::ChainEpochPinUnsupported,
             Self::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
             Self::ArtifactUnavailable { .. } => ErrorReason::ArtifactUnavailable,
             Self::CompactBlockPayloadMalformed { .. } => ErrorReason::CompactBlockPayloadMalformed,
@@ -2402,7 +2599,7 @@ impl zinder_proto::BoundaryError for QueryError {
                 ErrorReason::NodeCapabilityMissing
             }
             Self::Node(_) => ErrorReason::NodeUnavailable,
-            Self::DeriveStore(_)
+            Self::MaterializedViewStore(_)
             | Self::Store(_)
             | Self::WalletProjectionRead { .. }
             | Self::CanonicalStore(_)
@@ -2567,7 +2764,6 @@ mod error_reason_tests {
                 event_sequence: 1,
                 oldest_retained_sequence: 2,
             },
-            QueryError::ChainEpochPinUnsupported,
             QueryError::ChainEpochPinUnavailable {
                 chain_epoch_id: ChainEpochId::new(1),
             },
@@ -2579,21 +2775,18 @@ mod error_reason_tests {
                 actual: MAX_RAW_TRANSACTION_BYTES + 1,
                 maximum: MAX_RAW_TRANSACTION_BYTES,
             },
-            QueryError::DeriveUnavailable {
+            QueryError::MaterializedViewUnavailable {
                 capability: "probe",
-            },
-            QueryError::DeriveLag {
-                capability: "probe",
-                chain_tip_height: BlockHeight::new(2),
-                derive_height: Some(BlockHeight::new(1)),
             },
             QueryError::BlockingTaskFailed {
                 reason: "probe".to_owned(),
             },
             QueryError::Store(StoreError::NoVisibleChainEpoch),
-            QueryError::DeriveStore(zinder_derive::DeriveStoreError::InvalidOptions {
-                reason: "probe",
-            }),
+            QueryError::MaterializedViewStore(
+                zinder_materialized_views::MaterializedViewStoreError::InvalidOptions {
+                    reason: "probe",
+                },
+            ),
             QueryError::WalletProjectionRead {
                 source: Box::new(std::io::Error::other("probe")),
             },
@@ -2612,27 +2805,5 @@ mod error_reason_tests {
                 "QueryError variant {error:?} mapped to ERROR_REASON_UNSPECIFIED"
             );
         }
-    }
-
-    #[test]
-    fn typed_projection_errors_preserve_public_wallet_error_vocabulary() {
-        assert!(matches!(
-            map_wallet_projection_read_error(
-                WalletProjectionReadError::ProjectionUnavailable {
-                    projection: "probe",
-                },
-                "wallet.probe.v1",
-            ),
-            QueryError::DeriveUnavailable {
-                capability: "wallet.probe.v1",
-            }
-        ));
-        assert!(matches!(
-            map_wallet_projection_read_error(
-                WalletProjectionReadError::TransparentAddressHistoryCursorInvalid,
-                WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
-            ),
-            QueryError::TransparentHistoryCursorInvalid { .. }
-        ));
     }
 }

@@ -75,7 +75,7 @@ pub(crate) enum MempoolIndexInvariantError {
         /// Repeated spent outpoint.
         outpoint: TransparentOutPoint,
     },
-    /// A future source-event variant has no verified index transition.
+    /// An unrecognized source-event variant has no verified index transition.
     #[error("mempool event variant is unsupported")]
     UnsupportedEvent,
 }
@@ -184,7 +184,6 @@ impl MempoolIndex {
                     MempoolIndexPreflight::NoChange
                 })
             }
-            MempoolEvent::Suppressed { .. } => Ok(MempoolIndexPreflight::Apply),
             _ => Err(MempoolIndexInvariantError::UnsupportedEvent),
         }
     }

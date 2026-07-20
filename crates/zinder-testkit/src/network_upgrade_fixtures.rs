@@ -4,7 +4,7 @@
 //! [`crate::transparent_signer`]: the signer module owns key derivation and
 //! v5 transaction building, while this module owns the
 //! [`zinder_core::NetworkUpgradeActivations`] shapes that tests need to drive
-//! consensus-aware code paths (`MinedDetails.consensus_branch_id`,
+//! consensus-aware code paths (`MinedTransactionChainContext.consensus_branch_id`,
 //! `GetLightdInfo`, transparent-signing branch-id selection).
 //!
 //! Two helpers live here:
@@ -13,7 +13,7 @@
 //!   matches ZFND's `z3` regtest sidecar defaults
 //!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.1 and NU6.2 at 3,
 //!   and NU6.3 at 603). Intended for in-process integration tests that
-//!   exercise `GetLightdInfo` or `MinedDetails.consensus_branch_id` without a
+//!   exercise `GetLightdInfo` or `MinedTransactionChainContext.consensus_branch_id` without a
 //!   live node. Live tests must discover the activations from the running node,
 //!   not hard-code them here.
 //! - [`local_network_from_activations`] converts a node-discovered
@@ -38,7 +38,7 @@ use zinder_core::{
 /// Matches the activation heights of the captured ZFND `z3` regtest fixtures:
 /// Overwinter..Canopy at 1, NU5 and NU6 at 2, NU6.1 and NU6.2 at 3, and
 /// NU6.3 at 603. Intended for integration tests that exercise
-/// `GetLightdInfo` or `MinedDetails.consensus_branch_id` without a live node.
+/// `GetLightdInfo` or `MinedTransactionChainContext.consensus_branch_id` without a live node.
 /// Live tests must discover the activations from the running node, not
 /// hard-code them here.
 #[must_use]

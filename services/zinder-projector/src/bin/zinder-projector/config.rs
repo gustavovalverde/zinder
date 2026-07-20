@@ -13,10 +13,11 @@ use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
     NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml, ProjectorControlSection,
-    ProjectorControlToml, SecuritySection, SecurityToml, StorageRoleSection,
-    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_derive_writer_rocksdb_budget,
+    ProjectorControlToml, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecuritySection,
+    SecurityToml, StorageRoleSection, guard_optional_serving_bind, require_field,
+    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
     resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_projector_control,
+    resolve_wallet_projection_writer_rocksdb_budget,
 };
 use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::RocksDbResourceBudget;
@@ -123,7 +124,7 @@ pub(crate) enum ProjectorError {
     WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
 
     #[error(transparent)]
-    CanonicalControl(#[from] crate::canonical_control::CanonicalControlError),
+    CanonicalControl(#[from] crate::canonical_writer_control::CanonicalWriterControlError),
 
     #[error("projector build task failed: {0}")]
     BuildTask(#[from] tokio::task::JoinError),
@@ -216,7 +217,7 @@ pub(crate) fn load_projector_config(
             "storage.canonical_secondary_path",
             DEFAULT_CANONICAL_SECONDARY_PATH,
         )?
-        .with_default("storage.wallet_path", DEFAULT_WALLET_PATH)?
+        .with_default("wallet.path", DEFAULT_WALLET_PATH)?
         .with_default("projector.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
             "projector.build.max_outpoint_sort_memory_bytes",
@@ -253,7 +254,7 @@ pub(crate) fn load_projector_config(
             "storage.canonical_secondary_path",
             overrides.canonical_secondary_path,
         )?
-        .with_override_path_if("storage.wallet_path", overrides.wallet_path)?
+        .with_override_path_if("wallet.path", overrides.wallet_path)?
         .with_override_if(
             "projector.reorg_window_blocks",
             overrides.reorg_window_blocks,
@@ -304,6 +305,7 @@ pub(crate) fn projector_config_toml(config: &ProjectorConfig) -> Result<String, 
 struct ProjectorRawConfig {
     network: NetworkSection,
     storage: ProjectorStorageSection,
+    wallet: ProjectorWalletSection,
     projector: ProjectorSection,
     node: NodeSection,
     ingest_control: IngestControlSection,
@@ -317,9 +319,14 @@ struct ProjectorRawConfig {
 struct ProjectorStorageSection {
     canonical_path: Option<PathBuf>,
     canonical_secondary_path: Option<PathBuf>,
-    wallet_path: Option<PathBuf>,
     canonical: StorageRoleSection,
-    derive: StorageRoleSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProjectorWalletSection {
+    path: Option<PathBuf>,
+    rocksdb: RocksDbResourceBudgetSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -355,11 +362,12 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         raw.storage.canonical_secondary_path,
         "storage.canonical_secondary_path",
     )?;
-    let wallet_path = require_field(raw.storage.wallet_path, "storage.wallet_path")?;
+    let wallet_path = require_field(raw.wallet.path, "wallet.path")?;
     require_distinct_paths(&canonical_path, &canonical_secondary_path, &wallet_path)?;
     let canonical_rocksdb_budget =
         resolve_canonical_reader_rocksdb_budget(raw.storage.canonical.rocksdb)?;
-    let wallet_rocksdb_budget = resolve_derive_writer_rocksdb_budget(raw.storage.derive.rocksdb)?;
+    let wallet_rocksdb_budget =
+        resolve_wallet_projection_writer_rocksdb_budget(raw.wallet.rocksdb)?;
     let reorg_window_blocks = require_nonzero_u32(
         raw.projector.reorg_window_blocks,
         "projector.reorg_window_blocks",
@@ -466,7 +474,7 @@ fn require_distinct_paths(
             .any(|other| other == path || other.starts_with(path) || path.starts_with(other))
         {
             return Err(ConfigError::invalid(
-                "storage.canonical_path, storage.canonical_secondary_path, and storage.wallet_path must be disjoint roots",
+                "storage.canonical_path, storage.canonical_secondary_path, and wallet.path must be disjoint roots",
             ));
         }
     }
@@ -568,6 +576,7 @@ fn require_minimum_u64(
 struct ProjectorConfigToml {
     network: NetworkToml,
     storage: ProjectorStorageToml,
+    wallet: ProjectorWalletToml,
     projector: ProjectorToml,
     node: NodeToml,
     ingest_control: IngestControlReaderToml,
@@ -583,9 +592,11 @@ impl ProjectorConfigToml {
             storage: ProjectorStorageToml {
                 canonical_path: config.canonical_path.clone(),
                 canonical_secondary_path: config.canonical_secondary_path.clone(),
-                wallet_path: config.wallet_path.clone(),
                 canonical: ProjectorStorageRoleToml::from_budget(config.canonical_rocksdb_budget),
-                derive: ProjectorStorageRoleToml::from_budget(config.wallet_rocksdb_budget),
+            },
+            wallet: ProjectorWalletToml {
+                path: config.wallet_path.clone(),
+                rocksdb: RocksDbResourceBudgetToml::from_resolved(config.wallet_rocksdb_budget),
             },
             projector: ProjectorToml {
                 reorg_window_blocks: config.reorg_window_blocks,
@@ -614,47 +625,24 @@ impl ProjectorConfigToml {
 struct ProjectorStorageToml {
     canonical_path: PathBuf,
     canonical_secondary_path: PathBuf,
-    wallet_path: PathBuf,
     canonical: ProjectorStorageRoleToml,
-    derive: ProjectorStorageRoleToml,
+}
+
+#[derive(Serialize)]
+struct ProjectorWalletToml {
+    path: PathBuf,
+    rocksdb: RocksDbResourceBudgetToml,
 }
 
 #[derive(Serialize)]
 struct ProjectorStorageRoleToml {
-    rocksdb: ProjectorRocksDbToml,
+    rocksdb: RocksDbResourceBudgetToml,
 }
 
 impl ProjectorStorageRoleToml {
     const fn from_budget(budget: RocksDbResourceBudget) -> Self {
         Self {
-            rocksdb: ProjectorRocksDbToml::from_budget(budget),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ProjectorRocksDbToml {
-    block_cache_bytes: u64,
-    max_wal_bytes: u64,
-    max_open_files: i32,
-    write_buffer_bytes: u64,
-    max_write_buffer_count: i32,
-    max_background_jobs: i32,
-    memtable_budget_bytes: u64,
-    statistics_level: &'static str,
-}
-
-impl ProjectorRocksDbToml {
-    const fn from_budget(budget: RocksDbResourceBudget) -> Self {
-        Self {
-            block_cache_bytes: budget.block_cache_bytes,
-            max_wal_bytes: budget.max_wal_bytes,
-            max_open_files: budget.max_open_files,
-            write_buffer_bytes: budget.write_buffer_bytes,
-            max_write_buffer_count: budget.max_write_buffer_count,
-            max_background_jobs: budget.max_background_jobs,
-            memtable_budget_bytes: budget.memtable_budget_bytes,
-            statistics_level: budget.statistics_level.as_str(),
+            rocksdb: RocksDbResourceBudgetToml::from_resolved(budget),
         }
     }
 }

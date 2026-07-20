@@ -29,7 +29,7 @@ tonic-types.workspace = true
 tracing.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
-zinder-rocksdb.workspace = true
+zinder-rocksdb-bulk-load.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true

@@ -1,126 +1,88 @@
-# Service Boundaries
+# Service boundaries
 
-Zinder is one product with three deployable services in the first fact-first
-release. The boundary rule is simple: ingest alone writes canonical facts,
-projector alone writes wallet state, and compatibility serves only a
-request-scoped exact pair of read-only canonical and wallet generations.
+Zinder has three release runtimes. Ingest alone writes canonical state,
+projector alone writes wallet state, and compatibility serves immutable
+canonical and wallet readers admitted at one exact fence.
 
-## Current Boundary Map
+## Boundary map
 
 | Boundary | Owns | Must not own |
 | --- | --- | --- |
-| `zinder-ingest` | Upstream connections, chain selection, canonical construction and following, reorg handling, canonical publication, durable chain and mempool event history | Wallet projection writes, public wallet traffic, or projection promotion |
-| `zinder-projector` | Fixed-fence wallet construction, continuous canonical-event following, settlement and bounded reorg reconciliation, wallet-store primary ownership | Chain selection, canonical writes, public traffic, or source-node RPCs |
-| `zinder-compat-lightwalletd` | Canonical and wallet secondaries, exact-pair admission and atomic generation replacement, vendored lightwalletd behavior, compatibility error mapping | Either primary store, source-node reads, migrations, or mixed-generation responses |
-| `zinder-query` library | `WalletQueryApi`, request types, native adapter code, and shared query error mapping | A standalone production listener, storage ownership, or lifecycle orchestration |
+| `zinder-ingest` | Zebra chain and mempool sources, canonical construction and following, reorg authority, canonical events, canonical leases, checkpoint coordination, live mempool state | Wallet rows, wallet-store promotion, or public wallet traffic |
+| `zinder-projector` | Wallet construction, projection build leases, continuous canonical-event following, wallet reorg reconciliation, wallet-store primary | Canonical writes, chain selection, public wallet traffic, or compatibility translation |
+| `zinder-compat-lightwalletd` | Canonical and wallet secondary generations, wallet-serving admission, `CompactTxStreamer` translation, transaction broadcast, sparse tree-state fill | Either primary store, projection construction, or mixed-generation responses |
+| `zinder-query` | `WalletQueryApi`, `LightwalletdQueryApi`, request and response types, exact-fence reader traits, `WalletServingReadPair`, `LightwalletdServingQuery`, and query errors | A standalone listener, primary storage, or runtime orchestration |
 
-`zinder-explorer` and `zinder-compat-cipherscan` remain post-wallet-cutover
-work. They are workspace code but are not built into, configured by, or started
-by the first production release.
+`zinder-explorer` and `zinder-compat-cipherscan` are optional workspace
+services. They compile, but the release workflow and checked single-host
+composition do not publish or start them.
 
-## Why This Split Exists
+## Ownership rules
 
-Zcash indexing has two distinct jobs that often get coupled: converting upstream node state into durable, queryable chain artifacts, and serving wallets and applications with stable APIs and privacy-aware behavior. The jobs have different failure modes. Ingestion needs deterministic sync, reorg handling, atomic commits, schema migration, recoverability, and source-failure handling. Query serving needs latency, compatibility, privacy boundaries, and independent scale-out.
+The services may share domain types from `zinder-core`, protocol definitions
+from `zinder-proto`, storage contracts from the owning storage crates, runtime
+configuration and operations support from `zinder-runtime`, and fixtures from
+`zinder-testkit`.
 
-Coupling them in one runtime hides operational costs: read load can interfere with chain commits, migrations become user-visible outages, and derived explorer features can drift into the wallet path. One runtime can do both during local development. Neither supported deployment topology may let read traffic share the same ownership boundary as chain commits.
+They do not share mutable in-memory chain state or a writable RocksDB handle.
+No reader repairs missing canonical or wallet rows on demand. No compatibility
+adapter bypasses `LightwalletdQueryApi` for indexed reads. Store schema changes are
+executed by the process that owns that primary.
 
-The same shape appears across the indexer ecosystem: Blockscout separates indexer, web, and API modes; Sui separates checkpoint processing from ingestion sources; Reth Execution Extensions model committed and reverted chains explicitly; Substreams treats indexing as deterministic transformations with replayable sinks.
+Source-node access is capability-specific:
 
-## Allowed Coupling
+- `zinder-ingest` owns chain selection, block acquisition, and mempool
+  ingestion.
+- `zinder-projector` may discover network activation parameters needed to
+  validate canonical identity; it does not fetch projection rows from the node.
+- `zinder-compat-lightwalletd` may broadcast transactions, discover consensus
+  activations, and fill tree state that the query contract explicitly delegates
+  upstream. It does not use the node as a fallback for indexed chain history.
 
-The services may share:
+## Storage ownership
 
-- Domain types from `zinder-core`.
-- Storage contracts from `zinder-store`.
-- Protocol definitions from `zinder-proto`.
-- Deterministic test fixtures from `zinder-testkit`.
+`zinder-ingest` opens canonical RocksDB as primary. `zinder-projector` opens a
+canonical secondary and wallet RocksDB as primary.
+`zinder-compat-lightwalletd` opens generation-specific secondaries for both
+stores. Canonical and wallet paths are siblings, and every secondary generation
+has its own metadata path.
 
-The services must not share:
+The compatibility publisher catches both secondaries up, validates network,
+reorg policy, canonical source identity, event fence, and wallet digest, then
+atomically publishes a `WalletServingReadPair`. Each query operation retains
+that pair for its full lifetime. Multi-page compatibility reads bind their
+resume cursor to the admitted source and fail closed if publication advances
+between pages.
 
-- Mutable in-memory chain state.
-- Migration ownership.
-- Node client loops.
-- Derived-index write access to canonical tables.
-- Compatibility adapters that bypass `WalletQueryApi`.
+The supported topology is `rocksdb-single-host`. Primaries and secondaries
+share one host filesystem but remain separate processes and ownership domains.
+RocksDB secondary mode is not a cross-host replication protocol.
+[ADR-0035](../adrs/0035-canonical-storage-topologies.md) owns the topology
+decision.
 
-## Storage Ownership
+PostgreSQL modules under `zinder-bench` persist canonical replay records as a
+benchmark corpus for diagnostics. They do not establish a runtime service,
+wallet-store implementation, replication contract, or supported deployment.
 
-The current implementation and only release target is the
-`rocksdb-single-host` topology. `postgres-scale-out` remains diagnostic-only;
-its benchmarks preserve these ownership rules but do not create a production
-migration commitment. [ADR-0035](../adrs/0035-fact-first-storage-selection-and-lifecycle.md)
-owns that boundary.
+## Optional explorer boundary
 
-`zinder-ingest` opens the canonical schema-v4 RocksDB store as its only primary.
-`zinder-projector` opens a canonical secondary and the wallet schema-v1 store
-as its only primary. `zinder-compat-lightwalletd` opens both stores as
-generation-specific secondaries, catches them up, validates their authenticated
-fence and wallet digest, and atomically publishes the pair. Requests retain one
-pair generation for their full lifetime, so refresh cannot mix stores beneath
-an in-flight response.
+`zinder-explorer` owns `ExplorerQuery` translation and reads the
+artifact-oriented canonical store plus the materialized-view store as
+secondaries. `zinder-materialized-views` owns explorer projection consumers and
+their schemas. Explorer state is never a prerequisite for canonical writes or
+wallet projection correctness.
 
-Canonical and wallet paths are siblings, not nested aliases. Each secondary
-path is process- and generation-specific. No release process opens the legacy
-derive store, and no compatibility fallback may reconstruct wallet rows or
-serve directly from a primary.
+`zinder-compat-cipherscan` translates external REST and WebSocket contracts
+onto separately composed `ExplorerQuery` and `WalletQuery` endpoints. It owns
+product shapes and bounded caches, not chain data. The release topology does
+not provide those native endpoints.
 
-## Development Profile
+## Anti-patterns
 
-Local composition starts the same ingest, projector, and compatibility
-binaries with regtest paths. It must preserve distinct store ownership,
-secondaries, exact-pair admission, readiness, and reorg behavior. Do not
-introduce a generic `zinder-serve` process or a local primary-read shortcut.
-
-## Deployment Topologies
-
-### `rocksdb-single-host`
-
-The production service set is:
-
-```text
-zinder-ingest              -> canonical RocksDB (primary)
-                           -> IngestControl.WriterStatus / ChainEvents -> [ingest_control] gRPC
-zinder-projector           -> canonical RocksDB (secondary)
-                           -> wallet RocksDB (primary)
-                           -> IngestControl.WriterStatus / ChainEvents
-zinder-compat-lightwalletd -> canonical RocksDB (generation secondary)
-                           -> wallet RocksDB (generation secondary)
-                           -> exact pair -> WalletQueryApi -> CompactTxStreamer
-```
-
-Read replicas are colocated with the writer on one shared-filesystem host.
-Cross-host RocksDB replicas are out of scope; see
-[ADR-0003 §Out of Scope](../adrs/0003-canonical-storage-access-boundary.md#out-of-scope).
-This topology is production-supported and has no Postgres dependency.
-
-### `postgres-scale-out` diagnostic candidate
-
-PostgreSQL is not an accepted production target until `rocksdb-single-host`
-passes its lifecycle and performance certification. Benchmarking may continue
-against the same fact-first schema, but it must not add runtime abstraction,
-compatibility branches, or deployment claims to this release.
-
-```text
-zinder-ingest       -> Postgres canonical schema (one fenced active writer)
-zinder-projector    -> Postgres wallet or explorer schema (fenced per projection)
-compatibility edge  -> epoch-bound canonical + wallet read session -> WalletQueryApi
-```
-
-Role-scoped credentials, writer-generation fencing, replica-lag reporting,
-request-scoped epoch reads, failover, and stale-writer rejection are part of
-this topology's certification boundary. It becomes production-supported only
-after those gates and the shared lifecycle targets pass.
-
-## Anti-Patterns
-
-- A single production daemon where query handlers call upstream node RPC directly.
-- A query service that writes missing blocks on demand.
-- A query service that opens the live canonical RocksDB database as **primary** in production. Secondary access is the production contract per ADR-0003.
-- A compatibility adapter that opens either primary, mixes secondary
-  generations, reconstructs missing wallet state, or calls upstream nodes.
-- A generic `zinder-serve` boundary that hides which service owns ingestion,
-  query, or compatibility behavior.
-- A derived explorer index that is required for wallet sync.
-- A migration that runs because a query process booted.
-- A `common` crate that silently becomes the real application.
-- A `wallet service` that does not actually implement a wallet.
+- A runtime that owns both public query load and a primary chain store.
+- A query handler that fetches missing indexed history from the node.
+- A second canonical or wallet writer for the same store.
+- A reader that opens a live primary or mutates storage during admission.
+- A compatibility adapter that mixes canonical and wallet generations.
+- An explorer aggregate required for wallet sync.
+- A generic database or service abstraction that hides the owning domain.

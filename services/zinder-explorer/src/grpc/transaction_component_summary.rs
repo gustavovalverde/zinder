@@ -1,24 +1,26 @@
 //! `ExplorerQuery.TransactionComponentSummary` handler.
 //!
-//! Reads exact half-open block-time aggregates from the derive projection and
+//! Reads exact half-open block-time aggregates from the materialized view and
 //! reports whether its joined historical and live-tail coverage spans the
 //! current canonical visible tip.
 
 use tonic::{Request, Response, Status};
 use zinder_core::BlockHeight;
-use zinder_derive::{
-    DeriveStore, TransactionComponentBackfillCoverage,
-    TransactionComponentDay as DerivedTransactionComponentDay,
-    TransactionComponentSummary as DerivedTransactionComponentSummary,
+use zinder_materialized_views::{
+    MaterializedViewStore, TransactionComponentBackfillCoverage,
+    TransactionComponentDay as ProjectedTransactionComponentDay,
+    TransactionComponentSummary as ProjectedTransactionComponentSummary,
     TransactionComponentSummaryConsumer,
-    TransactionComponentTotals as DerivedTransactionComponentTotals,
+    TransactionComponentTotals as ProjectedTransactionComponentTotals,
 };
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2;
 use zinder_proto::v1::explorer::{
     TransactionComponentCoverage, TransactionComponentDay, TransactionComponentSummaryRequest,
     TransactionComponentSummaryResponse, TransactionComponentTotals,
 };
-use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{
+    self, VisibleTipBlockRequest, wallet_query_client::WalletQueryClient,
+};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
@@ -27,8 +29,8 @@ use super::freshness::{
 };
 
 /// Executes one `ExplorerQuery.TransactionComponentSummary` request.
-pub(crate) async fn handle_transaction_component_summary(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_transaction_component_summary(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<TransactionComponentSummaryRequest>,
@@ -40,18 +42,18 @@ pub(crate) async fn handle_transaction_component_summary(
     )?;
 
     let summary = TransactionComponentSummaryConsumer::summary_in_time_range(
-        derive_store,
+        materialized_view_store,
         request.start_time_unix_seconds,
         request.end_time_unix_seconds,
     )
     .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let coverage = TransactionComponentSummaryConsumer::coverage(derive_store)
+    let coverage = TransactionComponentSummaryConsumer::coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let (chain_epoch, visible_tip_height) = fetch_current_chain_epoch(wallet_client).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,
             Some(chain_epoch),
             0,
@@ -82,13 +84,13 @@ async fn fetch_current_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<(wallet::ChainEpoch, u32), Status> {
     let chain_epoch = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
     let visible_tip_height = chain_epoch
         .visible_tip
@@ -99,7 +101,7 @@ async fn fetch_current_chain_epoch(
 }
 
 fn map_summary(
-    summary: DerivedTransactionComponentSummary,
+    summary: ProjectedTransactionComponentSummary,
     totals_only: bool,
 ) -> (TransactionComponentTotals, Vec<TransactionComponentDay>) {
     let days = if totals_only {
@@ -110,7 +112,7 @@ fn map_summary(
     (map_totals(summary.totals), days)
 }
 
-fn map_totals(totals: DerivedTransactionComponentTotals) -> TransactionComponentTotals {
+fn map_totals(totals: ProjectedTransactionComponentTotals) -> TransactionComponentTotals {
     TransactionComponentTotals {
         transaction_count: totals.transaction_count,
         transparent_input_count: totals.transparent_input_count,
@@ -124,12 +126,12 @@ fn map_totals(totals: DerivedTransactionComponentTotals) -> TransactionComponent
         orchard_transaction_count: totals.orchard_transaction_count,
         ironwood_transaction_count: totals.ironwood_transaction_count,
         sprout_transaction_count: totals.sprout_transaction_count,
-        legacy_shielded_transaction_count: totals.legacy_shielded_transaction_count,
-        legacy_sapling_only_transaction_count: totals.legacy_sapling_only_transaction_count,
-        legacy_orchard_only_transaction_count: totals.legacy_orchard_only_transaction_count,
-        legacy_sapling_and_orchard_transaction_count: totals
-            .legacy_sapling_and_orchard_transaction_count,
-        legacy_fully_shielded_transaction_count: totals.legacy_fully_shielded_transaction_count,
+        sapling_or_orchard_transaction_count: totals.sapling_or_orchard_transaction_count,
+        sapling_without_orchard_transaction_count: totals.sapling_without_orchard_transaction_count,
+        orchard_without_sapling_transaction_count: totals.orchard_without_sapling_transaction_count,
+        sapling_and_orchard_transaction_count: totals
+            .sapling_and_orchard_transaction_count,
+        sapling_or_orchard_fully_shielded_transaction_count: totals.sapling_or_orchard_fully_shielded_transaction_count,
         sapling_orchard_or_ironwood_transaction_count: totals
             .sapling_orchard_or_ironwood_transaction_count,
         non_coinbase_without_sapling_orchard_or_ironwood_transaction_count: totals
@@ -143,14 +145,14 @@ fn map_totals(totals: DerivedTransactionComponentTotals) -> TransactionComponent
     }
 }
 
-fn map_day(day: DerivedTransactionComponentDay) -> TransactionComponentDay {
+fn map_day(day: ProjectedTransactionComponentDay) -> TransactionComponentDay {
     TransactionComponentDay {
         day_start_unix_seconds: day.day_start_unix_seconds,
         totals: Some(map_totals(day.totals)),
-        first_legacy_shielded_transaction_time_unix_seconds: day
-            .first_legacy_shielded_transaction_time_unix_seconds,
-        last_legacy_shielded_transaction_time_unix_seconds: day
-            .last_legacy_shielded_transaction_time_unix_seconds,
+        first_sapling_or_orchard_transaction_time_unix_seconds: day
+            .first_sapling_or_orchard_transaction_time_unix_seconds,
+        last_sapling_or_orchard_transaction_time_unix_seconds: day
+            .last_sapling_or_orchard_transaction_time_unix_seconds,
     }
 }
 
@@ -188,8 +190,8 @@ mod tests {
     use super::*;
     use tonic::Code;
 
-    fn derived_totals() -> DerivedTransactionComponentTotals {
-        DerivedTransactionComponentTotals {
+    fn derived_totals() -> ProjectedTransactionComponentTotals {
+        ProjectedTransactionComponentTotals {
             transaction_count: 1,
             transparent_input_count: 2,
             transparent_output_count: 3,
@@ -202,11 +204,11 @@ mod tests {
             orchard_transaction_count: 10,
             ironwood_transaction_count: 11,
             sprout_transaction_count: 12,
-            legacy_shielded_transaction_count: 13,
-            legacy_sapling_only_transaction_count: 14,
-            legacy_orchard_only_transaction_count: 15,
-            legacy_sapling_and_orchard_transaction_count: 16,
-            legacy_fully_shielded_transaction_count: 17,
+            sapling_or_orchard_transaction_count: 13,
+            sapling_without_orchard_transaction_count: 14,
+            orchard_without_sapling_transaction_count: 15,
+            sapling_and_orchard_transaction_count: 16,
+            sapling_or_orchard_fully_shielded_transaction_count: 17,
             sapling_orchard_or_ironwood_transaction_count: 18,
             non_coinbase_without_sapling_orchard_or_ironwood_transaction_count: 19,
             non_coinbase_sapling_orchard_or_ironwood_with_transparent_inputs_and_outputs_transaction_count: 20,
@@ -228,13 +230,13 @@ mod tests {
     #[test]
     fn summary_mapping_preserves_totals_days_and_extrema() {
         let (totals, days) = map_summary(
-            DerivedTransactionComponentSummary {
+            ProjectedTransactionComponentSummary {
                 totals: derived_totals(),
-                days: vec![DerivedTransactionComponentDay {
+                days: vec![ProjectedTransactionComponentDay {
                     day_start_unix_seconds: 1_700_006_400,
                     totals: derived_totals(),
-                    first_legacy_shielded_transaction_time_unix_seconds: Some(1_700_006_401),
-                    last_legacy_shielded_transaction_time_unix_seconds: Some(1_700_092_799),
+                    first_sapling_or_orchard_transaction_time_unix_seconds: Some(1_700_006_401),
+                    last_sapling_or_orchard_transaction_time_unix_seconds: Some(1_700_092_799),
                 }],
             },
             false,
@@ -242,7 +244,10 @@ mod tests {
 
         assert_eq!(totals.transaction_count, 1);
         assert_eq!(totals.ironwood_action_count, 7);
-        assert_eq!(totals.legacy_fully_shielded_transaction_count, 17);
+        assert_eq!(
+            totals.sapling_or_orchard_fully_shielded_transaction_count,
+            17
+        );
         assert_eq!(totals.sapling_orchard_or_ironwood_transaction_count, 18);
         assert_eq!(
             totals.non_coinbase_without_sapling_orchard_or_ironwood_transaction_count,
@@ -263,11 +268,11 @@ mod tests {
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].totals, Some(totals));
         assert_eq!(
-            days[0].first_legacy_shielded_transaction_time_unix_seconds,
+            days[0].first_sapling_or_orchard_transaction_time_unix_seconds,
             Some(1_700_006_401)
         );
         assert_eq!(
-            days[0].last_legacy_shielded_transaction_time_unix_seconds,
+            days[0].last_sapling_or_orchard_transaction_time_unix_seconds,
             Some(1_700_092_799)
         );
     }
@@ -275,13 +280,13 @@ mod tests {
     #[test]
     fn summary_mapping_omits_day_buckets_for_totals_only_request() {
         let (totals, days) = map_summary(
-            DerivedTransactionComponentSummary {
+            ProjectedTransactionComponentSummary {
                 totals: derived_totals(),
-                days: vec![DerivedTransactionComponentDay {
+                days: vec![ProjectedTransactionComponentDay {
                     day_start_unix_seconds: 1_700_006_400,
                     totals: derived_totals(),
-                    first_legacy_shielded_transaction_time_unix_seconds: None,
-                    last_legacy_shielded_transaction_time_unix_seconds: None,
+                    first_sapling_or_orchard_transaction_time_unix_seconds: None,
+                    last_sapling_or_orchard_transaction_time_unix_seconds: None,
                 }],
             },
             true,

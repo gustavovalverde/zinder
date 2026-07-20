@@ -1,4 +1,4 @@
-//! Exact version-1 `RocksDB` wallet layout, admission, and reads.
+//! Exact `RocksDB` wallet layout, admission, and reads.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,7 +8,9 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use zinder_rocksdb::{SortedVariableValues, VariableValueSortEvidence, VariableValueSorter};
+use zinder_rocksdb_bulk_load::{
+    SortedVariableValues, VariableValueSortEvidence, VariableValueSorter,
+};
 
 use rust_rocksdb::{
     BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
@@ -26,12 +28,12 @@ use zinder_store::{
     open_bounded_rocksdb,
 };
 use zinder_wallet_projection::{
-    ProjectionBuildLease, ProjectionBuildLeaseRequest, WALLET_PROJECTION_SCHEMA_VERSION,
-    WALLET_PROJECTION_STORE_IDENTITY, WALLET_STORE_CONTROL_KEY, WalletAddressBalance,
-    WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
-    WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildPlan,
+    WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_STORE_IDENTITY, WALLET_STORE_CONTROL_KEY,
+    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
+    WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity, WalletOutpointKey,
+    WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest, WalletProjectionBuildPlan,
     WalletProjectionBuildState, WalletProjectionDigestBuilder, WalletProjectionReadyEvidence,
-    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletStoreControl,
+    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletStoreControlRecord,
     WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
@@ -149,22 +151,22 @@ pub(crate) struct RocksDbWalletBuilder {
     bounded_open: BoundedRocksDbOpen,
     store_path: std::path::PathBuf,
     resource_budget: RocksDbResourceBudget,
-    control: WalletStoreControl,
-    lease: ProjectionBuildLease,
+    control: WalletStoreControlRecord,
+    lease: WalletProjectionBuildLease,
 }
 
 /// A cold-reopened BUILDING store whose rows have not yet been validated.
 pub(crate) struct ColdRocksDbWalletBuild {
     bounded_open: BoundedRocksDbOpen,
-    control: WalletStoreControl,
-    lease: ProjectionBuildLease,
+    control: WalletStoreControlRecord,
+    lease: WalletProjectionBuildLease,
 }
 
 /// A cold-validated BUILDING store carrying the evidence it may publish.
 pub(crate) struct ValidatedRocksDbWalletBuild {
     bounded_open: BoundedRocksDbOpen,
-    control: WalletStoreControl,
-    lease: ProjectionBuildLease,
+    control: WalletStoreControlRecord,
+    lease: WalletProjectionBuildLease,
     ready_evidence: WalletProjectionReadyEvidence,
     validation_evidence: WalletColdValidationEvidence,
 }
@@ -188,13 +190,13 @@ pub(crate) struct WalletColdValidationEvidence {
     pub(crate) random_read_count: u64,
 }
 
-/// One admitted READY version-1 wallet `RocksDB` store.
+/// One admitted READY wallet `RocksDB` store.
 ///
 /// The private database handle prevents consumers from bypassing the wallet
 /// row codecs or mutating a store after admission.
 pub struct RocksDbWalletStore {
     pub(crate) bounded_open: BoundedRocksDbOpen,
-    pub(crate) control: WalletStoreControl,
+    pub(crate) control: WalletStoreControlRecord,
     pub(crate) ready_evidence: WalletProjectionReadyEvidence,
 }
 
@@ -235,7 +237,7 @@ impl RocksDbWalletBuildStore {
             wallet_column_family_descriptors,
         )
         .map_err(|source| RocksDbWalletError::rocksdb("fresh build-store open", source))?;
-        let control = WalletStoreControl {
+        let control = WalletStoreControlRecord {
             network,
             supported_reorg_depth,
             writer_generation: 0,
@@ -289,24 +291,24 @@ impl RocksDbWalletBuildStore {
     /// generation. An unexpired lease is never silently shared or stolen.
     pub fn try_acquire_lease(
         &self,
-        request: ProjectionBuildLeaseRequest,
+        request: WalletProjectionBuildLeaseRequest,
         now: UnixTimestampMillis,
-    ) -> Result<ProjectionBuildLease, RocksDbWalletError> {
+    ) -> Result<WalletProjectionBuildLease, RocksDbWalletError> {
         let (bounded_open, control) = self.open_building_control()?;
         validate_lease_request(&control, request, now)?;
         if let Some(lease) = control.build_lease
             && lease.expires_at() > now
         {
-            return Err(RocksDbWalletError::ProjectionBuildLeaseHeld {
+            return Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld {
                 expires_at: lease.expires_at(),
             });
         }
         let generation = control
             .writer_generation
             .checked_add(1)
-            .ok_or(RocksDbWalletError::ProjectionBuildLeaseGenerationOverflow)?;
-        let lease = ProjectionBuildLease::from_request(request, generation, self.network);
-        let next_control = WalletStoreControl {
+            .ok_or(RocksDbWalletError::WalletProjectionBuildLeaseGenerationOverflow)?;
+        let lease = WalletProjectionBuildLease::from_request(request, generation, self.network);
+        let next_control = WalletStoreControlRecord {
             writer_generation: generation,
             build_lease: Some(lease),
             ..control
@@ -324,20 +326,20 @@ impl RocksDbWalletBuildStore {
     /// Extends an active lease owned by the supplied durable capability.
     pub fn renew_lease(
         &self,
-        lease: ProjectionBuildLease,
+        lease: WalletProjectionBuildLease,
         expires_at: UnixTimestampMillis,
         now: UnixTimestampMillis,
-    ) -> Result<ProjectionBuildLease, RocksDbWalletError> {
+    ) -> Result<WalletProjectionBuildLease, RocksDbWalletError> {
         let (bounded_open, control) = self.open_building_control()?;
         let persisted = authorize_active_lease(&control, lease, now)?;
         if expires_at <= now {
-            return Err(RocksDbWalletError::ProjectionBuildLeaseExpiryNotFuture);
+            return Err(RocksDbWalletError::WalletProjectionBuildLeaseExpiryNotFuture);
         }
         if expires_at <= persisted.expires_at() {
-            return Err(RocksDbWalletError::ProjectionBuildLeaseRenewalNotExtended);
+            return Err(RocksDbWalletError::WalletProjectionBuildLeaseRenewalNotExtended);
         }
         let renewed = persisted.renewed(expires_at);
-        let next_control = WalletStoreControl {
+        let next_control = WalletStoreControlRecord {
             build_lease: Some(renewed),
             ..control
         };
@@ -354,12 +356,12 @@ impl RocksDbWalletBuildStore {
     /// Releases an active lease without changing the BUILDING plan or generation.
     pub fn release_lease(
         &self,
-        lease: ProjectionBuildLease,
+        lease: WalletProjectionBuildLease,
         now: UnixTimestampMillis,
     ) -> Result<(), RocksDbWalletError> {
         let (bounded_open, control) = self.open_building_control()?;
         let _persisted = authorize_active_lease(&control, lease, now)?;
-        let next_control = WalletStoreControl {
+        let next_control = WalletStoreControlRecord {
             build_lease: None,
             ..control
         };
@@ -384,7 +386,7 @@ impl RocksDbWalletBuildStore {
         if let Some(lease) = control.build_lease
             && lease.expires_at() > now
         {
-            return Err(RocksDbWalletError::ProjectionBuildLeaseHeld {
+            return Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld {
                 expires_at: lease.expires_at(),
             });
         }
@@ -407,7 +409,7 @@ impl RocksDbWalletBuildStore {
 
     fn open_building_control(
         &self,
-    ) -> Result<(BoundedRocksDbOpen, WalletStoreControl), RocksDbWalletError> {
+    ) -> Result<(BoundedRocksDbOpen, WalletStoreControlRecord), RocksDbWalletError> {
         require_exact_column_families(&self.store_path)?;
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::ExistingPrimary {
@@ -431,7 +433,7 @@ impl RocksDbWalletBuilder {
     )]
     pub(crate) fn create_fresh(
         build_store: RocksDbWalletBuildStore,
-        lease_request: ProjectionBuildLeaseRequest,
+        lease_request: WalletProjectionBuildLeaseRequest,
         now: UnixTimestampMillis,
     ) -> Result<Self, RocksDbWalletError> {
         let lease = build_store.try_acquire_lease(lease_request, now)?;
@@ -450,11 +452,13 @@ impl RocksDbWalletBuilder {
                 return match release_result {
                     Ok(())
                     | Err(
-                        RocksDbWalletError::ProjectionBuildLeaseExpired { .. }
-                        | RocksDbWalletError::ProjectionBuildLeaseMissing
-                        | RocksDbWalletError::ProjectionBuildLeaseOwnerMismatch { .. }
-                        | RocksDbWalletError::ProjectionBuildLeaseGenerationMismatch { .. }
-                        | RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch { .. },
+                        RocksDbWalletError::WalletProjectionBuildLeaseExpired { .. }
+                        | RocksDbWalletError::WalletProjectionBuildLeaseMissing
+                        | RocksDbWalletError::WalletProjectionBuildLeaseOwnerMismatch { .. }
+                        | RocksDbWalletError::WalletProjectionBuildLeaseGenerationMismatch { .. }
+                        | RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch {
+                            ..
+                        },
                     ) => Err(open_error),
                     Err(cleanup_error) => Err(RocksDbWalletError::BuildLeaseCleanup {
                         build_error: Box::new(open_error),
@@ -478,7 +482,7 @@ impl RocksDbWalletBuilder {
         wallet_data_options(&self.bounded_open.block_cache, self.resource_budget)
     }
 
-    pub(crate) const fn lease(&self) -> ProjectionBuildLease {
+    pub(crate) const fn lease(&self) -> WalletProjectionBuildLease {
         self.lease
     }
 
@@ -616,7 +620,7 @@ impl ValidatedRocksDbWalletBuild {
         self.validation_evidence
     }
 
-    pub(crate) const fn lease(&self) -> ProjectionBuildLease {
+    pub(crate) const fn lease(&self) -> WalletProjectionBuildLease {
         self.lease
     }
 
@@ -643,13 +647,13 @@ impl ValidatedRocksDbWalletBuild {
             != WalletCanonicalSourceIdentity::from_ready_evidence(&self.ready_evidence)
         {
             return Err(
-                RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+                RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch {
                     reason: "READY evidence differs from the pinned canonical anchor",
                 },
             );
         }
         let ready_evidence = self.ready_evidence;
-        let ready_control = WalletStoreControl {
+        let ready_control = WalletStoreControlRecord {
             network: self.control.network,
             supported_reorg_depth: self.control.supported_reorg_depth,
             writer_generation: self.control.writer_generation,
@@ -821,6 +825,23 @@ impl RocksDbWalletStore {
         after: Option<WalletAddressUnspentOutputKey>,
         page_size: NonZeroU16,
     ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
+        self.address_unspent_outputs_page_from_height(
+            address_script_hash,
+            BlockHeight::new(0),
+            after,
+            page_size,
+        )
+    }
+
+    /// Returns one bounded page of current outputs for an address at or above
+    /// `start_height`.
+    pub fn address_unspent_outputs_page_from_height(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+        after: Option<WalletAddressUnspentOutputKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
         if after.is_some_and(|key| key.address_script_hash() != address_script_hash) {
             return Err(RocksDbWalletError::ContinuationAddressMismatch {
                 index: TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
@@ -831,9 +852,13 @@ impl RocksDbWalletStore {
             TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
         )?;
         let address_prefix = address_script_hash.as_bytes();
+        let lower_bound =
+            WalletAddressUnspentOutputKey::first_at_or_after(address_script_hash, start_height);
         let start = after
             .as_ref()
-            .map_or(address_prefix.as_slice(), |key| key.as_bytes().as_slice());
+            .map_or(lower_bound.as_bytes().as_slice(), |key| {
+                key.as_bytes().as_slice()
+            });
         let mut outputs = Vec::with_capacity(usize::from(page_size.get()));
         let mut last_key = None;
         for row in self
@@ -907,6 +932,23 @@ impl RocksDbWalletStore {
         after: Option<WalletAddressTransactionKey>,
         page_size: NonZeroU16,
     ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
+        self.address_transaction_history_range_page(
+            address_script_hash,
+            BlockHeightRange::inclusive(BlockHeight::new(0), BlockHeight::new(u32::MAX)),
+            after,
+            page_size,
+        )
+    }
+
+    /// Returns one bounded page of address-touching transactions within an
+    /// inclusive height range.
+    pub fn address_transaction_history_range_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        height_range: BlockHeightRange,
+        after: Option<WalletAddressTransactionKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
         if after.is_some_and(|key| key.address_script_hash() != address_script_hash) {
             return Err(RocksDbWalletError::ContinuationAddressMismatch {
                 index: TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
@@ -917,9 +959,15 @@ impl RocksDbWalletStore {
             TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
         )?;
         let address_prefix = address_script_hash.as_bytes();
+        let lower_bound =
+            WalletAddressTransactionKey::first_at_or_after(address_script_hash, height_range.start);
+        let upper_bound =
+            WalletAddressTransactionKey::new(address_script_hash, height_range.end, u32::MAX);
         let start = after
             .as_ref()
-            .map_or(address_prefix.as_slice(), |key| key.as_bytes().as_slice());
+            .map_or(lower_bound.as_bytes().as_slice(), |key| {
+                key.as_bytes().as_slice()
+            });
         let mut transactions = Vec::with_capacity(usize::from(page_size.get()));
         let mut last_key = None;
         for row in self
@@ -931,6 +979,9 @@ impl RocksDbWalletStore {
                 RocksDbWalletError::rocksdb("address transaction history page scan", source)
             })?;
             if !key_bytes.starts_with(&address_prefix) {
+                break;
+            }
+            if key_bytes.as_ref() > upper_bound.as_bytes().as_slice() {
                 break;
             }
             if after.is_some_and(|key| key_bytes.as_ref() <= key.as_bytes().as_slice()) {
@@ -1433,7 +1484,7 @@ fn require_exact_column_families(path: &Path) -> Result<(), RocksDbWalletError> 
 }
 
 fn require_building_control(
-    control: &WalletStoreControl,
+    control: &WalletStoreControlRecord,
     store_path: &Path,
     expected_network: Network,
 ) -> Result<(), RocksDbWalletError> {
@@ -1452,12 +1503,12 @@ fn require_building_control(
 }
 
 fn validate_lease_request(
-    control: &WalletStoreControl,
-    request: ProjectionBuildLeaseRequest,
+    control: &WalletStoreControlRecord,
+    request: WalletProjectionBuildLeaseRequest,
     now: UnixTimestampMillis,
 ) -> Result<(), RocksDbWalletError> {
     if request.expires_at() <= now {
-        return Err(RocksDbWalletError::ProjectionBuildLeaseExpiryNotFuture);
+        return Err(RocksDbWalletError::WalletProjectionBuildLeaseExpiryNotFuture);
     }
     let WalletProjectionBuildState::Building(plan) = &control.build_state else {
         return Err(RocksDbWalletError::AdmissionChanged {
@@ -1467,7 +1518,7 @@ fn validate_lease_request(
     let canonical_anchor = request.pinned_canonical_anchor();
     if canonical_anchor.source_position() != plan.target_source_position {
         return Err(
-            RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+            RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch {
                 reason: "requested source position differs from the BUILDING target",
             },
         );
@@ -1478,7 +1529,7 @@ fn validate_lease_request(
         > canonical_anchor.source_position().event_sequence
     {
         return Err(
-            RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+            RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch {
                 reason: "retained event anchor follows the pinned canonical event",
             },
         );
@@ -1487,24 +1538,28 @@ fn validate_lease_request(
 }
 
 fn authorize_active_lease(
-    control: &WalletStoreControl,
-    lease: ProjectionBuildLease,
+    control: &WalletStoreControlRecord,
+    lease: WalletProjectionBuildLease,
     now: UnixTimestampMillis,
-) -> Result<ProjectionBuildLease, RocksDbWalletError> {
+) -> Result<WalletProjectionBuildLease, RocksDbWalletError> {
     let persisted = control
         .build_lease
-        .ok_or(RocksDbWalletError::ProjectionBuildLeaseMissing)?;
+        .ok_or(RocksDbWalletError::WalletProjectionBuildLeaseMissing)?;
     if persisted.owner() != lease.owner() {
-        return Err(RocksDbWalletError::ProjectionBuildLeaseOwnerMismatch {
-            expected: persisted.owner(),
-            observed: lease.owner(),
-        });
+        return Err(
+            RocksDbWalletError::WalletProjectionBuildLeaseOwnerMismatch {
+                expected: persisted.owner(),
+                observed: lease.owner(),
+            },
+        );
     }
     if persisted.generation() != lease.generation() {
-        return Err(RocksDbWalletError::ProjectionBuildLeaseGenerationMismatch {
-            expected: persisted.generation(),
-            observed: lease.generation(),
-        });
+        return Err(
+            RocksDbWalletError::WalletProjectionBuildLeaseGenerationMismatch {
+                expected: persisted.generation(),
+                observed: lease.generation(),
+            },
+        );
     }
     if persisted.pinned_canonical_anchor() != lease.pinned_canonical_anchor()
         || persisted.retained_event_anchor() != lease.retained_event_anchor()
@@ -1514,13 +1569,13 @@ fn authorize_active_lease(
         || persisted.version() != lease.version()
     {
         return Err(
-            RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+            RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch {
                 reason: "supplied capability differs from durable lease identity",
             },
         );
     }
     if persisted.expires_at() <= now {
-        return Err(RocksDbWalletError::ProjectionBuildLeaseExpired {
+        return Err(RocksDbWalletError::WalletProjectionBuildLeaseExpired {
             expires_at: persisted.expires_at(),
         });
     }
@@ -1529,8 +1584,8 @@ fn authorize_active_lease(
 
 fn apply_build_lease_heartbeat(
     bounded_open: &BoundedRocksDbOpen,
-    control: &mut WalletStoreControl,
-    lease: &mut ProjectionBuildLease,
+    control: &mut WalletStoreControlRecord,
+    lease: &mut WalletProjectionBuildLease,
     heartbeat: WalletBuildLeaseHeartbeat,
 ) -> Result<(), RocksDbWalletError> {
     let persisted_control = decode_only_control(bounded_open)?;
@@ -1541,13 +1596,13 @@ fn apply_build_lease_heartbeat(
         return Ok(());
     };
     if renew_until <= heartbeat.now() {
-        return Err(RocksDbWalletError::ProjectionBuildLeaseExpiryNotFuture);
+        return Err(RocksDbWalletError::WalletProjectionBuildLeaseExpiryNotFuture);
     }
     if renew_until <= persisted_lease.expires_at() {
-        return Err(RocksDbWalletError::ProjectionBuildLeaseRenewalNotExtended);
+        return Err(RocksDbWalletError::WalletProjectionBuildLeaseRenewalNotExtended);
     }
     let renewed = persisted_lease.renewed(renew_until);
-    let next_control = WalletStoreControl {
+    let next_control = WalletStoreControlRecord {
         build_lease: Some(renewed),
         ..persisted_control
     };
@@ -1569,7 +1624,7 @@ fn apply_build_lease_heartbeat(
 
 pub(crate) fn decode_only_control(
     bounded_open: &BoundedRocksDbOpen,
-) -> Result<WalletStoreControl, RocksDbWalletError> {
+) -> Result<WalletStoreControlRecord, RocksDbWalletError> {
     let mut iterator = bounded_open.db.iterator(IteratorMode::Start);
     let Some(first) = iterator.next() else {
         return Err(RocksDbWalletError::StoreControlMissing);
@@ -1579,12 +1634,12 @@ pub(crate) fn decode_only_control(
     if key.as_ref() != WALLET_STORE_CONTROL_KEY || iterator.next().is_some() {
         return Err(RocksDbWalletError::StoreControlCardinalityMismatch);
     }
-    WalletStoreControl::decode(&encoded).map_err(RocksDbWalletError::from)
+    WalletStoreControlRecord::decode(&encoded).map_err(RocksDbWalletError::from)
 }
 
 fn write_control_sync(
     bounded_open: &BoundedRocksDbOpen,
-    control: &WalletStoreControl,
+    control: &WalletStoreControlRecord,
 ) -> Result<(), RocksDbWalletError> {
     let encoded = control.encode()?;
     let mut batch = WriteBatch::default();
@@ -1643,11 +1698,11 @@ impl AccountedValidationReorgUndoMemory {
 
     fn reserve(&mut self, bytes: usize) -> Result<(), RocksDbWalletError> {
         let bytes = u64::try_from(bytes)
-            .map_err(|_| RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         let required_bytes = self
             .current
             .checked_add(bytes)
-            .ok_or(RocksDbWalletError::ProjectionLoadAccountingOverflow)?;
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
         if required_bytes > self.limit {
             return Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
                 limit_bytes: self.limit,
@@ -2229,7 +2284,7 @@ fn validate_address_transaction_rows(
 fn validate_expected_address_transaction<I, Key, Value>(
     rows: &mut I,
     digest: &mut WalletProjectionDigestBuilder,
-    expected: &zinder_rocksdb::VariableValueRecord<ADDRESS_TRANSACTION_KEY_BYTES>,
+    expected: &zinder_rocksdb_bulk_load::VariableValueRecord<ADDRESS_TRANSACTION_KEY_BYTES>,
     count: &mut u64,
 ) -> Result<(), RocksDbWalletError>
 where
@@ -2425,7 +2480,7 @@ mod tests {
         TransparentUtxoSetCommitment, UnixTimestampMillis,
     };
     use zinder_wallet_projection::{
-        ProjectionBuildLeaseRequest, ProjectionBuildOwner, WalletProjectionDigest,
+        WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner, WalletProjectionDigest,
         WalletProjectionFamilyRowCounts, WalletProjectionRetainedEventAnchor,
         WalletProjectionSourcePosition, WalletTransactionPosition,
     };
@@ -2559,9 +2614,9 @@ mod tests {
         }
     }
 
-    fn test_lease_request() -> ProjectionBuildLeaseRequest {
-        ProjectionBuildLeaseRequest::new(
-            ProjectionBuildOwner::from_bytes([0x55; 16]),
+    fn test_lease_request() -> WalletProjectionBuildLeaseRequest {
+        WalletProjectionBuildLeaseRequest::new(
+            WalletProjectionBuildOwner::from_bytes([0x55; 16]),
             source_identity(),
             WalletProjectionRetainedEventAnchor::new(
                 source_identity().source_position().event_sequence,

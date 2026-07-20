@@ -256,52 +256,6 @@ fn network_to_wire_string_match_lives_only_in_wire_module() -> Result<()> {
 }
 
 #[test]
-fn deleted_chain_name_helpers_have_no_lingering_references() -> Result<()> {
-    // These helpers were private aliases that drifted from the canonical wire
-    // encoders. Assert no caller resurrects them.
-    //
-    // Each banned identifier was a private alias that drifted from
-    // `zinder_core::wire::encode_bip70_chain_name` or `encode_zinder_native_chain_name`.
-    const BANNED_IDENTIFIERS: &[&str] = &[
-        "lightwalletd_chain_name",
-        "transaction_id_from_lightwalletd_hash",
-    ];
-    let root = workspace_root()?;
-    let plan_path = root.join(".tmp/wire-conventions-refactor-plan.md");
-    let invariant_test_path = root.join("crates/zinder-core/tests/integration/wire_invariants.rs");
-
-    let mut offenders: Vec<(PathBuf, &'static str)> = Vec::new();
-    for directory in SCANNED_DIRECTORIES {
-        for source_path in rust_source_files(&root.join(directory))? {
-            if source_path == invariant_test_path {
-                continue;
-            }
-            let contents = fs::read_to_string(&source_path)?;
-            for identifier in BANNED_IDENTIFIERS {
-                if contents.contains(identifier) {
-                    offenders.push((source_path.clone(), identifier));
-                }
-            }
-        }
-    }
-
-    assert!(
-        offenders.is_empty(),
-        "deleted chain-name helpers must not be referenced; replace any remaining \
-         call sites with \
-         `zinder_core::wire::*`:\n  {}\n\
-         (Tracking doc: {})",
-        offenders
-            .iter()
-            .map(|(path, identifier)| format!("{identifier} in {}", path.display()))
-            .collect::<Vec<_>>()
-            .join("\n  "),
-        plan_path.display(),
-    );
-    Ok(())
-}
-
-#[test]
 fn utxo_set_commitment_personal_lives_only_in_wire_module() -> Result<()> {
     const PERSONAL_TAG_LITERAL: &str = "ZinderUtxoSet___";
     const PERSONAL_ALLOWLIST: &[&str] = &["crates/zinder-core/src/wire/utxo_set_commitment.rs"];

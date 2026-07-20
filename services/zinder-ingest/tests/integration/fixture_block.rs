@@ -17,11 +17,11 @@ use zinder_core::{
     CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
     TransactionFactsArtifact, TransactionLocation, TransparentInputFact, UnixTimestampMillis,
 };
-use zinder_derive::project_block_summary_record;
 use zinder_ingest::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
     PositionedCanonicalBlock, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
 };
+use zinder_materialized_views::project_block_summary_record;
 use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_source::{SourceBlock, decode_rpc_block_hash};
 use zinder_store::{
@@ -240,7 +240,7 @@ fn fixture_block_builds_canonical_facts() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         project_block_summary_record(persisted_replay.facts()),
         expected_block_summary,
-        "persisted replay must reproduce the block-summary projection without hydration"
+        "persisted replay must reproduce the BlockSummary materialized view without hydration"
     );
 
     Ok(())

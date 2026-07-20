@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use zinder_core::{
-    BroadcastAccepted, RawTransactionBytes, TransactionBroadcastResult, TransactionId,
+    BroadcastAccepted, RawTransactionBytes, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{SourceError, TransactionBroadcaster};
 
@@ -25,7 +25,7 @@ pub struct MockTransactionBroadcaster {
 
 #[derive(Clone, Debug)]
 enum BroadcastOutcome {
-    Result(TransactionBroadcastResult),
+    Returned(TransactionBroadcastOutcome),
     SourceError(MockSourceError),
 }
 
@@ -55,16 +55,16 @@ impl MockTransactionBroadcaster {
     /// `transaction_id` as the node's accepted id.
     #[must_use]
     pub fn accepted(transaction_id: TransactionId) -> Self {
-        Self::with_outcome(BroadcastOutcome::Result(
-            TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id }),
+        Self::with_outcome(BroadcastOutcome::Returned(
+            TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id }),
         ))
     }
 
     /// Returns a broadcaster that returns the given
-    /// [`TransactionBroadcastResult`] verbatim for every call.
+    /// [`TransactionBroadcastOutcome`] verbatim for every call.
     #[must_use]
-    pub fn returning(broadcast_result: TransactionBroadcastResult) -> Self {
-        Self::with_outcome(BroadcastOutcome::Result(broadcast_result))
+    pub fn returning(broadcast_outcome: TransactionBroadcastOutcome) -> Self {
+        Self::with_outcome(BroadcastOutcome::Returned(broadcast_outcome))
     }
 
     /// Returns a broadcaster that fails every call with
@@ -113,10 +113,10 @@ impl TransactionBroadcaster for MockTransactionBroadcaster {
     async fn broadcast_transaction(
         &self,
         raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastResult, SourceError> {
+    ) -> Result<TransactionBroadcastOutcome, SourceError> {
         self.captured_calls.lock().push(raw_transaction);
         match &self.outcome {
-            BroadcastOutcome::Result(broadcast_result) => Ok(broadcast_result.clone()),
+            BroadcastOutcome::Returned(broadcast_outcome) => Ok(broadcast_outcome.clone()),
             BroadcastOutcome::SourceError(mock_source_error) => {
                 Err(mock_source_error.as_source_error())
             }
@@ -130,7 +130,7 @@ mod tests {
 
     use super::MockTransactionBroadcaster;
     use zinder_core::{
-        BroadcastAccepted, RawTransactionBytes, TransactionBroadcastResult, TransactionId,
+        BroadcastAccepted, RawTransactionBytes, TransactionBroadcastOutcome, TransactionId,
     };
     use zinder_source::{SourceError, TransactionBroadcaster};
 
@@ -143,7 +143,7 @@ mod tests {
             .await?;
         assert!(matches!(
             outcome,
-            TransactionBroadcastResult::Accepted(BroadcastAccepted { transaction_id })
+            TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id })
                 if transaction_id == TransactionId::from_bytes([0x42; 32])
         ));
         Ok(())

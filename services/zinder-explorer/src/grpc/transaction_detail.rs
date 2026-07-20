@@ -23,7 +23,7 @@ use zinder_core::{
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V3;
 use zinder_proto::wire::encode_privacy_shape;
 
-use zinder_derive::{DeriveStore, TransactionFeesConsumer};
+use zinder_materialized_views::{MaterializedViewStore, TransactionFeesConsumer};
 use zinder_proto::v1::{
     explorer::{
         LockTime as WireLockTime, LockTimeUnlocked, TransactionComponentCounts,
@@ -59,20 +59,20 @@ use super::transparent_input::{
 /// shared dependency does not ripple through every call site.
 pub(crate) struct TransactionDetailContext<'context> {
     pub(crate) chain_store: Option<&'context SecondaryChainStore>,
-    pub(crate) derive_store: Option<&'context DeriveStore>,
+    pub(crate) materialized_view_store: Option<&'context MaterializedViewStore>,
     pub(crate) network: zinder_core::Network,
     pub(crate) upstream_observation_cache: &'context UpstreamObservationCache,
 }
 
 /// Executes one `ExplorerQuery.TransactionDetail` request.
-pub(crate) async fn handle_transaction_detail(
+pub(crate) async fn query_transaction_detail(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     context: TransactionDetailContext<'_>,
     request: Request<TransactionDetailRequest>,
 ) -> Result<Response<TransactionDetailResponse>, Status> {
     let TransactionDetailContext {
         chain_store,
-        derive_store,
+        materialized_view_store,
         network,
         upstream_observation_cache,
     } = context;
@@ -105,7 +105,7 @@ pub(crate) async fn handle_transaction_detail(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            derive_store,
+            materialized_view_store,
             EXPLORER_TRANSACTION_DETAIL_V3,
             Some(chain_epoch.clone()),
             0,
@@ -118,7 +118,7 @@ pub(crate) async fn handle_transaction_detail(
         transaction.canonical_artifact.as_ref(),
     )?;
     let fees = resolve_fee_record(
-        derive_store,
+        materialized_view_store,
         transaction.canonical_artifact.as_ref(),
         &parent_transactions,
     )?;
@@ -224,10 +224,9 @@ async fn resolve_transparent_rows(
 /// Resolves the parsed public facts and the wire location for one transaction.
 ///
 /// The `location` oneof is carried through verbatim so the explorer detail
-/// returns the same `{ mined, in_mempool, conflicting }` shape the wallet
-/// plane answered with. Facts come from the canonical store for mined,
-/// from the raw bytes for mempool, and from the minimal txid-only shape for
-/// conflicting (which carries no transaction bytes).
+/// returns the same `{ mined, in_mempool }` shape the wallet plane answered
+/// with. Facts come from the canonical store for mined transactions and from
+/// raw bytes for mempool transactions.
 fn resolve_facts_and_location(
     canonical_reader: Option<&ChainEpochReader<'_>>,
     network: zinder_core::Network,
@@ -268,12 +267,6 @@ fn resolve_facts_and_location(
                 Some(fact_set),
             )
         }
-        wire_location::Location::Conflicting(conflicting) => (
-            conflicting_public_facts(transaction_id),
-            wire_location::Location::Conflicting(conflicting),
-            None,
-            None,
-        ),
     };
     Ok(ResolvedTransactionDetail {
         facts,
@@ -286,7 +279,7 @@ fn resolve_facts_and_location(
 }
 
 fn resolve_fee_record(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     transaction: Option<&TransactionFactsArtifact>,
     parent_transactions: &HashMap<TransactionId, Option<TransactionFactsArtifact>>,
 ) -> Result<Option<TransactionFeesRecord>, Status> {
@@ -296,12 +289,12 @@ fn resolve_fee_record(
     if transaction.public_facts.is_coinbase {
         return Ok(None);
     }
-    let Some(derive_store) = derive_store else {
+    let Some(materialized_view_store) = materialized_view_store else {
         return Ok(None);
     };
 
     let projected = TransactionFeesConsumer::read_fees_record(
-        derive_store,
+        materialized_view_store,
         transaction.location.transaction_id,
         transaction.public_facts.privacy_shape,
     )
@@ -328,7 +321,7 @@ fn canonical_reader_for_location<'store>(
     }
     let store = chain_store.ok_or_else(|| {
         ExplorerError::dependency_not_configured(
-            "TransactionDetail requires the canonical fact store; configure --storage-path",
+            "TransactionDetail requires the canonical store; configure --storage-path",
         )
     })?;
     store
@@ -356,7 +349,7 @@ fn read_parent_transaction_facts(
     }
     let reader = canonical_reader.ok_or_else(|| {
         ExplorerError::dependency_not_configured(
-            "TransactionDetail prevout resolution requires the canonical fact store",
+            "TransactionDetail prevout resolution requires the canonical store",
         )
     })?;
     reader
@@ -386,7 +379,7 @@ async fn resolve_transparent_output_spends(
         requested_outpoints.iter().copied().collect();
     if requested_outpoint_set.len() != requested_outpoints.len() {
         return Err(ExplorerError::internal(
-            "TransactionDetail canonical facts contain duplicate transparent output indexes",
+            "TransactionDetail transaction artifact contains duplicate transparent output indexes",
         )
         .into());
     }
@@ -510,7 +503,7 @@ fn read_mined_transaction_facts(
 ) -> Result<TransactionFactsArtifact, Status> {
     let reader = canonical_reader.ok_or_else(|| {
         ExplorerError::dependency_not_configured(
-            "TransactionDetail requires the canonical fact store; configure --storage-path",
+            "TransactionDetail requires the canonical store; configure --storage-path",
         )
     })?;
     let artifact = reader
@@ -527,40 +520,11 @@ fn read_mined_transaction_facts(
 fn mined_consensus_branch_id(
     mined: &wallet::MinedTransaction,
 ) -> Result<ConsensusBranchId, Status> {
-    let details = mined
-        .details
+    let chain_context = mined
+        .chain_context
         .as_ref()
-        .ok_or_else(|| ExplorerError::internal("MinedTransaction missing details"))?;
-    Ok(ConsensusBranchId::new(details.consensus_branch_id))
-}
-
-/// Builds the minimal public facts for a conflicting-chain transaction.
-///
-/// A conflicting-chain status carries no transaction bytes and is not in the
-/// canonical fact store, so the only fact the explorer can assert is the
-/// requested transaction id. The remaining fields surface the
-/// not-decodable shape: `Unsupported` version, `Unclassified` privacy.
-fn conflicting_public_facts(transaction_id: zinder_core::TransactionId) -> CoreFacts {
-    CoreFacts {
-        transaction_id,
-        auth_digest: None,
-        wtxid: None,
-        version: CoreTransactionVersion::Unsupported {
-            effective_version: 0,
-            version_group_id: None,
-        },
-        consensus_branch_id: None,
-        lock_time: CoreLockTime::Unlocked,
-        expiry_height: None,
-        size_bytes: 0,
-        counts: zinder_core::TransactionComponentCounts::EMPTY,
-        orchard_value_balance_zat: None,
-        orchard_anchor: None,
-        ironwood_value_balance_zat: None,
-        privacy_shape: zinder_core::PrivacyShape::Unclassified,
-        is_coinbase: false,
-        unsupported_sections: Vec::new(),
-    }
+        .ok_or_else(|| ExplorerError::internal("MinedTransaction missing chain context"))?;
+    Ok(ConsensusBranchId::new(chain_context.consensus_branch_id))
 }
 
 pub(crate) fn encode_public_facts(facts: &CoreFacts) -> WireFacts {
@@ -700,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_fee_fallback_stays_behind_derive_capability() {
+    fn canonical_fee_fallback_stays_behind_materialized_view_capability() {
         let transaction_id = TransactionId::from_bytes([9; 32]);
         let transaction = TransactionFactsArtifact::new(
             TransactionLocation::new(

@@ -17,12 +17,12 @@ message ExplorerServerInfo {
   // Service vendor, always "Zinder".
   string vendor = 2;
 
-  // Derive-plane health: whether the queryable projections are live with the
+  // Materialized-view plane health: whether the queryable views are live with the
   // canonical tip, catching up, or paused. Lets an operator distinguish a
-  // transient catch-up from a stalled derive plane without scraping metrics.
+  // transient catch-up from a stalled materialized-view plane without scraping metrics.
   // Absent until the ingest plane writes its first status record. See
-  // `zinder.v1.wallet.DeriveStatus`.
-  optional zinder.v1.wallet.DeriveStatus derive_status = 3;
+  // `zinder.v1.wallet.MaterializedViewStatus`.
+  optional zinder.v1.wallet.MaterializedViewStatus materialized_view_status = 3;
 }
 
 // Server descriptor request.
@@ -35,7 +35,7 @@ message ServerInfoRequest {}
 // so consumers can read the upstream tip and capability versions from any
 // explorer response, including the bootstrap call. Without this, the upstream
 // tip (which rides on `ExplorerFreshness.chain_view.upstream_tip`) would only
-// be reachable through derive-backed endpoints that are capability-gated and
+// be reachable through materialized-view-backed endpoints that are capability-gated and
 // unavailable during `bulk_catchup`, leaving sync-progress UIs unable to
 // compute an honest denominator at exactly the moment they most need it.
 message ServerInfoResponse {
@@ -88,7 +88,7 @@ enum UnavailableReason {
 // Explorer response metadata that varies per call, carried at field tag 1 on
 // every `ExplorerQuery` response.
 //
-// The chain-state axes (epoch, tips, upstream, derive) live on
+// The chain-state axes (epoch, tips, upstream, materialized views) live on
 // `chain_view`; this message keeps only the metadata that genuinely varies
 // per call. Defined in
 // [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md);
@@ -102,9 +102,6 @@ message ExplorerFreshness {
   // do not touch mempool state.
   uint64 snapshot_age_millis = 2;
 
-  reserved 3, 4;
-  reserved "derive_cursor_lag_blocks", "derive_cursor_lag_millis";
-
   // The capability string that produced this response. Lets clients branch
   // on which `_vN` was used to construct the response shape.
   string capability_version = 5;
@@ -112,8 +109,6 @@ message ExplorerFreshness {
   // Field-path-keyed unavailability entries.
   repeated UnavailableField unavailable = 6;
 
-  reserved 7, 8;
-  reserved "upstream", "indexed_head";
 }
 
 // Coarse transaction-format identifier.
@@ -263,7 +258,7 @@ enum TransparentDeltaKind {
 // Storage-only per-input transparent prevout value materialized by
 // `TransactionFeesConsumer`.
 //
-// This record deliberately excludes the prevout script: fee projection rows
+// This record deliberately excludes the prevout script: fee materialized-view rows
 // need only the value, while `TransactionDetail` resolves the complete prevout
 // from retained canonical parent facts at request time.
 message TransparentInputValueRecord {
@@ -275,7 +270,7 @@ message TransparentInputValueRecord {
 //
 // `spent_outpoint` identifies the output consumed by this input. `value_zat`
 // and `script_pub_key` are independently optional: retained parent facts can
-// recover both, while a compatible historical fee row may preserve the value
+// recover both, while a persisted fee row may preserve the value
 // after the parent script is unavailable. Absence must not be interpreted as a
 // zero value or an empty script. Shielded spends are not represented because
 // their values and receivers are encrypted by protocol.
@@ -320,13 +315,13 @@ message TransactionDetailRequest {
 //
 // `location` is the same `zinder.v1.wallet.TransactionLocation` oneof
 // `WalletQuery.Transaction` returns, so a consumer writes one match shape
-// for both surfaces and TransactionDetail carries the `conflicting` arm.
+// for both surfaces.
 //
 // `transparent_inputs` is populated for mined transactions from their
 // canonical transaction fact and retained parent facts. Each entry combines
 // input identity and optional prevout resolution so callers do not have to
 // correlate parallel arrays. `prevout_resolution_status` and `paid_fee_zat`
-// remain fee-projection fields advertised by `EXPLORER_TRANSACTION_FEES_V1`.
+// remain fee materialized-view fields advertised by `EXPLORER_TRANSACTION_FEES_V1`.
 // The handler merges a projected fee row with values recovered from the same
 // parent facts used by `transparent_inputs`.
 // `paid_fee_zat` additionally requires `facts.privacy_shape ==
@@ -340,10 +335,8 @@ message TransactionDetailRequest {
 // and scripts; mempool inputs carry their transaction-local index and outpoint
 // without implying prevout resolution. Outputs always carry their intrinsic
 // value and script. Only mined outputs may carry a canonical `spent_by` relation;
-// mempool-spend state remains a separate wallet-plane relation. Conflicting
-// transactions have no payload and therefore return empty lists. Addresses
-// remain an edge concern derived from standard scripts; Zinder returns
-// scriptPubKey bytes.
+// mempool-spend state remains a separate wallet-plane relation. Addresses remain
+// an edge concern derived from standard scripts; Zinder returns scriptPubKey bytes.
 //
 // `intrinsic_value_balances` is populated only for mined transactions when
 // the canonical artifact or retained transaction blob is available at the
@@ -355,16 +348,14 @@ message TransactionDetailResponse {
   optional uint64 paid_fee_zat = 5;
   PrevoutResolutionStatus prevout_resolution_status = 6;
   repeated TransparentInput transparent_inputs = 7;
-  reserved 8;
-  reserved "transparent_input_outpoints";
   repeated TransparentOutput transparent_outputs = 9;
   TransactionIntrinsicValueBalances intrinsic_value_balances = 10;
 }
 
 // Compact summary of one canonical block.
 //
-// Materialized once at derive time and read back by both
-// `ExplorerQuery.BlockSummariesInRange` (projection) and
+// Materialized once at materialization time and read back by both
+// `ExplorerQuery.BlockSummariesInRange` (materialized view) and
 // `ExplorerQuery.BlockDetail` (full record). See
 // [Explorer plane §Block view shape](../../../../../docs/architecture/explorer-plane.md#block-view-shape).
 message BlockSummary {
@@ -418,8 +409,8 @@ message BlockSummary {
   // Distance from this block to the canonical tip at response time.
   // `1` when this block IS the tip, `2` for the block before, and so on.
   // Computed at request time from
-  // `WalletQuery.LatestBlock.latest_block.height - block_height + 1`; not
-  // stored in the derive column family.
+  // `WalletQuery.VisibleTipBlock.visible_tip_block.height - block_height + 1`; not
+  // stored in the materialized-view column family.
   uint32 confirmations = 12;
 
   // True when this block is part of the canonical best chain at response
@@ -432,9 +423,9 @@ message BlockSummary {
   uint32 ironwood_action_count = 14;
 }
 
-// Materialized storage record for the `BlockSummary` derive view.
+// Materialized storage record for the `BlockSummary` materialized view.
 //
-// Not exposed by any RPC. Encoded once at derive time and read back by
+// Not exposed by any RPC. Encoded once at materialization time and read back by
 // both `ExplorerQuery.BlockSummariesInRange` (projecting `summary`) and
 // `ExplorerQuery.BlockDetail` (emitting `summary` plus `transaction_ids`).
 // One record per canonical block, keyed by big-endian block height inside
@@ -488,7 +479,7 @@ message BlockProductionPoint {
 
   // Compact difficulty target (`nBits`) from the canonical block header.
   // This is the same unsigned integer exposed as
-  // `zinder.v1.wallet.BlockHeaderInfo.bits`.
+  // `zinder.v1.wallet.BlockHeader.bits`.
   uint32 bits = 2;
 
   // Canonical coinbase facts when the transaction fact artifact is retained.
@@ -516,7 +507,7 @@ message CoinbaseTransactionSummary {
 //
 // Returns points over the inclusive height range `[start_height, end_height]`.
 // The range is bounded server-side. `at_epoch_id` optionally pins canonical
-// header visibility to one chain epoch; derive rows are joined only when their
+// header visibility to one chain epoch; materialized-view rows are joined only when their
 // block hash and time agree with that canonical header.
 message BlockProductionSeriesRequest {
   uint32 start_height = 1;
@@ -528,7 +519,7 @@ message BlockProductionSeriesRequest {
 //
 // Points are ordered by ascending block height. `covered_block_count` counts
 // heights where both the block-summary row and canonical header were present
-// and agreed. `missing_block_count` makes partial local retention, derive lag,
+// and agreed. `missing_block_count` makes partial local retention, view lag,
 // and concurrent reorg mismatches explicit instead of emitting fabricated
 // zero-valued observations.
 message BlockProductionSeriesResponse {
@@ -546,8 +537,8 @@ message BlockProductionSeriesResponse {
 // header timestamps are in `[start_time_unix_seconds, end_time_unix_seconds)`.
 // Points are ordered by `(block_time, block_height, block_hash)`, so equal and
 // non-monotonic timestamps remain deterministic. The cursor binds the time
-// bounds, resolved chain epoch, and projection revision so every page reads one
-// canonical projection fence.
+// bounds, resolved chain epoch, and materialized-view revision so every page
+// reads one canonical/materialized-view fence.
 message BlockProductionInTimeRangeRequest {
   // Inclusive Unix timestamp lower bound.
   int64 start_time_unix_seconds = 1;
@@ -598,11 +589,11 @@ message BlockProductionTimeRangeCoverage {
   bool requested_range_complete = 5;
 }
 
-// Projection identity bound into every continuation cursor.
+// Materialized-view identity bound into every continuation cursor.
 message BlockProductionTimeRangeReadFence {
   uint64 chain_epoch_id = 1;
-  uint64 projection_revision = 2;
-  zinder.v1.wallet.BlockTip projection_tip = 3;
+  uint64 materialized_view_revision = 2;
+  zinder.v1.wallet.BlockTip materialized_view_tip = 3;
 }
 
 // `ExplorerQuery.BlockActivityDistribution` request.
@@ -610,7 +601,7 @@ message BlockProductionTimeRangeReadFence {
 // Aggregates the existing materialized block-summary rows over the inclusive
 // height range `[start_height, end_height]`. The range is bounded server-side;
 // consumers that need longer-lived history must request an explicit durable
-// projection rather than treating this request-time aggregate as unbounded.
+// materialized view rather than treating this request-time aggregate as unbounded.
 message BlockActivityDistributionRequest {
   uint32 start_height = 1;
   uint32 end_height = 2;
@@ -632,7 +623,7 @@ message BlockActivityBucket {
 // `ExplorerQuery.BlockActivityDistribution` response.
 //
 // The response reports the requested height range separately from the number
-// of materialized rows read. A nonzero `missing_block_count` means the derive
+// of materialized rows read. A nonzero `missing_block_count` means the materialized view
 // store does not cover the entire requested range, so a caller must present
 // the returned window as partial rather than a complete history.
 message BlockActivityDistributionResponse {
@@ -651,7 +642,7 @@ message BlockActivityDistributionResponse {
 //
 // Either `block_height` or `block_hash` resolves the target block. Hash
 // lookups consult the upstream wallet plane's
-// `WalletQuery.BlockIdBySelector` indirection so the derive store keeps a
+// `WalletQuery.BlockIdBySelector` indirection so the materialized-view store keeps a
 // single height-keyed schema.
 message BlockDetailRequest {
   oneof selector {
@@ -707,8 +698,6 @@ message BlockTransaction {
   // scriptPubKey but no inferred address label.
   repeated zinder.v1.wallet.TransparentOutput transparent_outputs = 4;
 
-  reserved 5;
-  reserved "transparent_input_outpoints";
 
   // Transparent inputs in ascending input-index order. Each entry identifies
   // the spent outpoint and independently carries its retained value and
@@ -937,13 +926,6 @@ message ViewingKeyMatch {
   NotPubliclyIndexable not_publicly_indexable = 1;
 }
 
-// Payment-disclosure payload candidate. Reserved for the future
-// payment-disclosure verifier; classified but not implemented in v1.
-message PaymentDisclosureMatch {
-  // Hint string a UI may render explaining the reserved state.
-  string hint = 1;
-}
-
 // Catch-all candidate when no other arm classifies the input.
 message UnclassifiedMatch {
   // Operator-readable hint explaining what the classifier expected.
@@ -960,7 +942,6 @@ message SearchCandidate {
     UnifiedAddressMatch unified_address = 5;
     ShieldedAddressMatch shielded_address = 6;
     ViewingKeyMatch viewing_key = 7;
-    PaymentDisclosureMatch payment_disclosure = 8;
     UnclassifiedMatch unclassified = 9;
   }
 
@@ -975,8 +956,7 @@ message SearchCandidate {
 // `ExplorerQuery.Search` request.
 message SearchRequest {
   // Raw user input. Capped at 4 KiB on the server side; longer payloads
-  // (e.g. ZIP-321 URIs, payment disclosures) are routed to dedicated
-  // RPCs once those surfaces ship.
+  // (for example, ZIP-321 URIs) are not search targets.
   string query = 1;
 }
 
@@ -1014,10 +994,10 @@ message CommitmentRootMatch {
   ShieldedProtocol protocol = 4;
 }
 
-// Historical coverage of the commitment-root projection.
+// Historical coverage of the commitment-root materialized view.
 //
-// The projection can serve newly committed blocks while an older range is
-// still backfilling. Consumers must not interpret an empty `matches` list as a
+// The materialized view can serve tip-adjacent blocks while a preceding range
+// is still backfilling. Consumers must not interpret an empty `matches` list as a
 // definitive absence unless `canonical_history_complete` is true.
 message CommitmentRootSearchCoverage {
   // First height in the contiguous historical backfill range. Absent until the
@@ -1219,7 +1199,7 @@ message MempoolActivityEntry {
 
   // Parsed transaction component counts. These are derived from the live
   // entry's raw transaction bytes at request time; no durable mempool
-  // projection is involved.
+  // materialized view is involved.
   TransactionComponentCounts component_counts = 9;
 
   // Sum of every transparent output created by this transaction, in
@@ -1237,8 +1217,8 @@ message MempoolActivityResponse {
 
 // `ExplorerQuery.TransparentAddressActivity` request.
 //
-// Returns confirmed transparent-address activity from the derive
-// projection. Mempool activity for a transparent address is served
+// Returns confirmed transparent-address activity from the materialized view.
+// Mempool activity for a transparent address is served
 // separately through `MempoolActivity` so each surface has one source
 // of truth.
 message TransparentAddressActivityRequest {
@@ -1266,11 +1246,6 @@ message TransparentAddressActivityRequest {
 
   // Reserved tag for the deleted `descending` field. The handler always
   // serves newest-first; the previous bool led to an ordering bug when
-  // requested as ascending, so the field was removed instead of fixed
-  // (clients reverse client-side when they need ascending order).
-  reserved 6;
-  reserved "descending";
-
   // Optional chain-epoch id pin.
   optional uint64 at_epoch_id = 7;
 
@@ -1467,7 +1442,7 @@ message TransparentAddressDeltasRecord {
 //
 // Aggregates per-transaction ZIP-317 conventional fee floors over the
 // inclusive block range `[start_height, end_height]` from the typed
-// `BlockSummaryRecord` facts materialized by the derive plane.
+// `BlockSummaryRecord` facts materialized by the materialized-view plane.
 message FeeSummaryRequest {
   uint32 start_height = 1;
   uint32 end_height = 2;
@@ -1504,7 +1479,7 @@ message FeeSummaryResponse {
 
 // `ExplorerQuery.MigrationOverview` request.
 //
-// Aggregates the Orchard-to-Ironwood migration facts the derive plane
+// Aggregates the Orchard-to-Ironwood migration facts the materialized-view plane
 // materializes. Both bounds absent aggregates the full indexed history;
 // present bounds restrict the aggregate to the inclusive block range
 // `[start_height, end_height]`.
@@ -1561,7 +1536,7 @@ message MigrationCohortsRequest {
 
   // Last block height to group (inclusive). The span
   // `end_height - start_height + 1` may not exceed 4096 blocks; the handler
-  // rejects wider ranges so one request bounds the derive-store scan, matching
+  // rejects wider ranges so one request bounds the materialized-view scan, matching
   // the `MAX_BLOCK_SUMMARIES_PER_REQUEST`-style caps elsewhere on this surface.
   uint32 end_height = 2;
 
@@ -1622,7 +1597,7 @@ message MigrationDenominationsRequest {
 
   // Last block height to bin (inclusive). The span
   // `end_height - start_height + 1` may not exceed 4096 blocks; the handler
-  // rejects wider ranges so one request bounds the derive-store scan, matching
+  // rejects wider ranges so one request bounds the materialized-view scan, matching
   // the `MAX_BLOCK_SUMMARIES_PER_REQUEST`-style caps elsewhere on this surface.
   uint32 end_height = 2;
 
@@ -1683,14 +1658,14 @@ message ConventionalFeeDistributionDay {
   uint64 unavailable_transaction_count = 3;
 }
 
-// Contiguous projection coverage for a conventional-fee distribution query.
+// Contiguous materialized-view coverage for a conventional-fee distribution query.
 message ConventionalFeeDistributionCoverage {
   optional uint32 complete_from_height = 1;
   optional uint32 complete_through_height = 2;
   optional int64 complete_from_time_unix_seconds = 3;
   optional int64 complete_through_time_unix_seconds = 4;
 
-  // True only when contiguous projection coverage starts at height 1 and
+  // True only when contiguous materialized-view coverage starts at height 1 and
   // includes the full requested range. The genesis floor is required because
   // canonical block times are non-monotonic.
   bool requested_range_complete = 5;
@@ -1733,14 +1708,14 @@ message PaidFeeDistributionDay {
   uint64 unavailable_transaction_count = 3;
 }
 
-// Contiguous projection coverage for a paid-fee distribution query.
+// Contiguous materialized-view coverage for a paid-fee distribution query.
 message PaidFeeDistributionCoverage {
   optional uint32 complete_from_height = 1;
   optional uint32 complete_through_height = 2;
   optional int64 complete_from_time_unix_seconds = 3;
   optional int64 complete_through_time_unix_seconds = 4;
 
-  // True only when projection coverage includes the full requested range.
+  // True only when materialized-view coverage includes the full requested range.
   bool requested_range_complete = 5;
 }
 
@@ -1769,11 +1744,11 @@ message TransactionComponentTotals {
   uint64 orchard_transaction_count = 10;
   uint64 ironwood_transaction_count = 11;
   uint64 sprout_transaction_count = 12;
-  uint64 legacy_shielded_transaction_count = 13;
-  uint64 legacy_sapling_only_transaction_count = 14;
-  uint64 legacy_orchard_only_transaction_count = 15;
-  uint64 legacy_sapling_and_orchard_transaction_count = 16;
-  uint64 legacy_fully_shielded_transaction_count = 17;
+  uint64 sapling_or_orchard_transaction_count = 13;
+  uint64 sapling_without_orchard_transaction_count = 14;
+  uint64 orchard_without_sapling_transaction_count = 15;
+  uint64 sapling_and_orchard_transaction_count = 16;
+  uint64 sapling_or_orchard_fully_shielded_transaction_count = 17;
   // Includes coinbase transactions with at least one Sapling, Orchard, or
   // Ironwood component. Sprout-only transactions do not count.
   uint64 sapling_orchard_or_ironwood_transaction_count = 18;
@@ -1799,11 +1774,11 @@ message TransactionComponentDay {
   // UTC midnight as Unix seconds.
   int64 day_start_unix_seconds = 1;
   TransactionComponentTotals totals = 2;
-  optional int64 first_legacy_shielded_transaction_time_unix_seconds = 3;
-  optional int64 last_legacy_shielded_transaction_time_unix_seconds = 4;
+  optional int64 first_sapling_or_orchard_transaction_time_unix_seconds = 3;
+  optional int64 last_sapling_or_orchard_transaction_time_unix_seconds = 4;
 }
 
-// Historical range whose transaction-component projection is contiguous.
+// Historical range whose transaction-component materialized view is contiguous.
 message TransactionComponentCoverage {
   uint32 complete_from_height = 1;
   uint32 complete_through_height = 2;
@@ -2080,14 +2055,14 @@ service ExplorerQuery {
   rpc DisplacedBlockDetail(DisplacedBlockDetailRequest)
       returns (DisplacedBlockDetailResponse);
 
-  // Returns rolling counts of mempool events from the per-second counter
-  // column family. Replaces consumer-side in-memory ring buffers.
+  // Returns rolling counts of mempool events from the durable per-second
+  // counter column family.
   // Capability: `explorer.mempool.event_counts_v1`.
   rpc MempoolEventCounts(MempoolEventCountsRequest)
       returns (MempoolEventCountsResponse);
 
-  // Streams the newest-first projection of canonical transactions from
-  // the `recent_transactions` derive column family. Capability:
+  // Streams the newest-first materialized view of canonical transactions from
+  // the `recent_transactions` materialized-view column family. Capability:
   // `explorer.transaction.recent_v1`.
   rpc RecentTransactions(RecentTransactionsRequest)
       returns (stream RecentTransactionsChunk);
@@ -2097,23 +2072,14 @@ service ExplorerQuery {
   rpc TransactionHistory(TransactionHistoryRequest)
       returns (TransactionHistoryResponse);
 
-  // Verifies a [ZIP-311](https://zips.z.cash/zip-0311) payment disclosure
-  // in-process. Operator opt-in. When the capability
-  // `explorer.payment_disclosure.verify_v1` is absent the consumer falls
-  // back to its own local verifier. The handler applies strict redaction
-  // so the request bytes never reach span attributes.
-  rpc VerifyPaymentDisclosure(VerifyPaymentDisclosureRequest)
-      returns (VerifyPaymentDisclosureResponse);
-
   // Returns one coherent point-in-time bundle of every field a consumer
   // needs to render an overview dashboard. The handler anchors the bundle
-  // on a single `WalletQuery.LatestBlock` tip and reads every other field
-  // from the derive store in one pass, so all fields share one
-  // `ExplorerFreshness` and one snapshot identity. Replaces the per-card
+  // on a single `WalletQuery.VisibleTipBlock` tip and reads every other field
+  // from the materialized-view store in one pass, so all fields share one
+  // `ExplorerFreshness` and one snapshot identity. This avoids a per-card
   // fan-out (`MempoolSummary` + `FeeSummary` + `ValuePoolSummary` +
-  // `BlockSummariesInRange` + `RecentTransactions` + `MempoolEventCounts`)
-  // that consumers would otherwise stitch together client-side and that
-  // cannot guarantee tip-coherence across calls. Capability:
+  // `BlockSummariesInRange` + `RecentTransactions` + `MempoolEventCounts`),
+  // which cannot guarantee tip coherence across calls. Capability:
   // `explorer.overview.snapshot_v1`.
   rpc OverviewSnapshot(OverviewSnapshotRequest)
       returns (OverviewSnapshotResponse);
@@ -2147,9 +2113,6 @@ message ValuePoolSummaryRequest {}
 // the cumulative chain totals reported by the upstream node, not
 // per-block deltas.
 message ValuePoolSummaryResponse {
-  reserved 3;
-  reserved "tip_height";
-
   ExplorerFreshness freshness = 1;
 
   // Upstream value-pool entries, preserved in upstream order so unknown
@@ -2204,7 +2167,7 @@ message ValuePoolFlowEvent {
   TransactionIntrinsicValueBalances pool_balances = 8;
 }
 
-// Historical and live-tail coverage of the value-pool flow event projection.
+// Historical and live-tail coverage of the value-pool flow event materialized view.
 //
 // The historical segment is populated by an explicit backfill. The live-tail
 // segment begins at `live_tail_from_height` and advances from canonical ingest.
@@ -2235,7 +2198,7 @@ message ValuePoolFlowHistoryRequest {
   // canonical event anchor. Native clients should not construct or inspect it.
   bytes cursor = 2;
   ValuePoolFlowFilter filter = 3;
-  // Exact counts are returned only when projection coverage is contiguous from
+  // Exact counts are returned only when materialized-view coverage is contiguous from
   // height 1 through the response's current visible tip. Otherwise the field
   // remains absent even when requested.
   bool include_total_count = 4;
@@ -2494,7 +2457,7 @@ message UtxoSetSummaryRequest {
 // `ExplorerQuery.UtxoSetSummary` response.
 //
 // The chain-wide transparent UTXO-set aggregate, computed by a request-time
-// full scan of the current-UTXO projection at the settled tip
+// full scan of the current UTXO materialized view at the settled tip
 // (gettxoutsetinfo-equivalent). `hash_serialized` and `bytes_serialized` are
 // intentionally omitted: both depend on a defined UTXO-set serialization
 // ordering that Zinder does not commit to, so only the order-independent
@@ -2509,7 +2472,8 @@ message UtxoSetSummaryResponse {
   uint64 total_value_zat = 3;
 
   // Settled tip height the aggregate was taken at. Below this height the
-  // projection is the irreversible unspent set.
+  // materialized view is the settled-tip unspent set under the configured reorg policy;
+  // a deeper reorg fails closed.
   uint32 summarized_height = 4;
 
   // Homomorphic commitment to the full unspent set. Mirrors the wallet-plane
@@ -2578,7 +2542,7 @@ message TransactionFeesRecord {
 
 // `ExplorerQuery.RecentTransactions` request.
 //
-// Streams the newest-first projection of canonical transactions materialized
+// Streams the newest-first view of canonical transactions materialized
 // by `RecentTransactionsConsumer`.
 message RecentTransactionsRequest {
   // Hard cap on entries returned across all stream chunks. Server clamps
@@ -2597,7 +2561,7 @@ message RecentTransactionsChunk {
   repeated RecentTransactionEntry entries = 3;
 }
 
-// One row in the `recent_transactions` projection.
+// One row in the `recent_transactions` materialized view.
 //
 // Denormalized to keep a recent-transactions panel renderable from one
 // streaming RPC. `zip317_conventional_fee_zat` is unset for coinbase rows;
@@ -2627,16 +2591,16 @@ enum TransactionHistoryDirection {
   TRANSACTION_HISTORY_DIRECTION_NEWER = 2;
 }
 
-// Read fence for the transaction-history projection and the canonical chain
+// Read fence for the transaction-history materialized view and the canonical chain
 // snapshot used to produce a response.
 message TransactionHistoryReadFence {
   uint64 chain_epoch_id = 1;
-  uint64 projection_revision = 2;
-  uint32 projection_tip_height = 3;
-  string projection_tip_hash = 4;
+  uint64 materialized_view_revision = 2;
+  uint32 materialized_view_tip_height = 3;
+  string materialized_view_tip_hash = 4;
 }
 
-// Verified contiguous coverage of the transaction-history projection.
+// Verified contiguous coverage of the transaction-history materialized view.
 message TransactionHistoryCoverage {
   uint32 complete_from_height = 1;
   uint32 complete_through_height = 2;
@@ -2673,7 +2637,7 @@ message TransactionHistoryFilter {
 // Canonical transaction coordinate accepted as a stateless starting point.
 //
 // Native clients should resume with an opaque cursor; compatibility adapters
-// can map a legacy height/index pair through this shape.
+// can map a height/index pair through this shape.
 message TransactionHistoryAnchor {
   uint32 block_height = 1;
   uint32 transaction_index = 2;
@@ -2757,8 +2721,8 @@ message TransactionHistoryEntry {
 
 // `ExplorerQuery.MempoolEventCounts` request.
 //
-// Returns rolling counts of `Added`, `Mined`, `Invalidated`, and
-// `Suppressed` mempool events from the per-second counter column family
+// Returns rolling counts of `Added`, `Mined`, and `Invalidated` mempool
+// events from the per-second counter column family
 // `MempoolEventCountsConsumer` writes. The server clamps `window_seconds`
 // to `[60, 3600]`; passing zero asks for the server default (300).
 message MempoolEventCountsRequest {
@@ -2781,19 +2745,15 @@ message MempoolEventCountsResponse {
   // Number of `Invalidated` events the source emitted during the window.
   uint32 invalidated_count = 5;
 
-  // Number of `Suppressed` events the source emitted during the window.
-  // Stays zero for sources that do not surface ZIP-401
-  // `RecentlyEvicted`-style admission refusals.
-  uint32 suppressed_count = 6;
 }
 
 // `ExplorerQuery.ChainReorgHistory` request.
 //
-// Reads the durable reorg-incident projection as a bounded stateless page.
-// The projection backfills from the earliest retained chain event when the
-// derive consumer first runs, then keeps future incidents independently of
+// Reads the durable reorg-incident materialized view as a bounded stateless page.
+// The materialized view backfills from the earliest retained chain event when the
+// materialized-view consumer first runs, then keeps future incidents independently of
 // chain-event retention. It cannot reconstruct incidents that were pruned
-// before the projection existed.
+// before the materialized view existed.
 message ChainReorgHistoryRequest {
   // Maximum incident rows to return. Zero selects the server default; values
   // above the server cap are clamped.
@@ -2873,7 +2833,7 @@ message DisplacedBlockSummary {
 // height.
 //
 // This deliberately stays narrower than `BlockSummary`: every field is
-// read directly from the pinned canonical store and no derive-only aggregate
+// read directly from the pinned canonical store and no materialized-view-only aggregate
 // is silently emitted as zero.
 message DisplacedBlockCanonicalCounterpart {
   uint32 block_height = 1;
@@ -2944,53 +2904,7 @@ message DisplacedBlockDetailResponse {
   DisplacedBlockArchiveCoverage coverage = 5;
 }
 
-// `ExplorerQuery.VerifyPaymentDisclosure` request.
-//
-// Carries the opaque [ZIP-311](https://zips.z.cash/zip-0311) payment-
-// disclosure bytes. The server applies strict redaction: the request
-// bytes never reach span attributes or logs; only the verdict and the
-// optional `public_facts` on a `VALID` response are observable.
-message VerifyPaymentDisclosureRequest {
-  bytes payment_disclosure_bytes = 1;
-}
-
-// `ExplorerQuery.VerifyPaymentDisclosure` response.
-message VerifyPaymentDisclosureResponse {
-  ExplorerFreshness freshness = 1;
-  PaymentDisclosureVerdict verdict = 2;
-
-  // Echoed only when `verdict` is `VALID`. The redaction rules above
-  // apply to anything echoed back through this field.
-  optional PaymentDisclosurePublicFacts public_facts = 3;
-}
-
-// Discrete verdict the payment-disclosure verifier returns.
-enum PaymentDisclosureVerdict {
-  PAYMENT_DISCLOSURE_VERDICT_UNSPECIFIED = 0;
-  PAYMENT_DISCLOSURE_VERDICT_VALID = 1;
-  PAYMENT_DISCLOSURE_VERDICT_INVALID_SIGNATURE = 2;
-  PAYMENT_DISCLOSURE_VERDICT_TRANSACTION_NOT_FOUND = 3;
-  PAYMENT_DISCLOSURE_VERDICT_MALFORMED = 4;
-}
-
-// Public facts the verifier echoes back on a `VALID` verdict.
-//
-// Field set is intentionally minimal so the verifier's output cannot be
-// used to bypass ZIP-311's redaction contract. The transaction id is
-// already public; the payment id binds the disclosure to a specific
-// payment subject; the disclosed amount is what the disclosure asserts
-// the payment moved.
-message PaymentDisclosurePublicFacts {
-  // Canonical transaction id in RPC byte order (64 lowercase hex
-  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string transaction_id = 1;
-  // Opaque ZIP-311 payment identifier carried verbatim from the disclosure
-  // payload. Not a Zcash hash; kept as raw bytes.
-  bytes payment_id = 2;
-  uint64 disclosed_value_zat = 3;
-}
-
-// Typed error returned when a derive-RPC cursor has expired.
+// Typed error returned when a materialized-view RPC cursor has expired.
 //
 // Per the explorer-plane cursor contract (see
 // `docs/architecture/explorer-plane.md`): cursors are valid for the
@@ -3000,9 +2914,9 @@ message PaymentDisclosurePublicFacts {
 // to the gRPC status's `details`. Consumers re-issue from the start of
 // the range or jump to `recommended_resume_height`.
 message CursorExpiredError {
-  // Height the server now considers the safe starting point for a fresh
+  // Recommended restart height for a fresh
   // cursor. Set to the canonical tip when the consumer should restart at
-  // the head of the projection; set to the lowest still-indexed height
+  // the head of the materialized view; set to the lowest still-indexed height
   // when the consumer should restart earlier.
   uint32 recommended_resume_height = 1;
 
@@ -3044,7 +2958,7 @@ message OverviewSnapshotRequest {
 //
 // All sub-fields are read against the snapshot identified by
 // `freshness.chain_epoch`; the bundle never spans two tips. The handler
-// reads the wallet tip once and every derive-store field once, in one
+// reads the wallet tip once and every materialized-view field once, in one
 // pass, then assembles the single freshness envelope. Consumers compare
 // `freshness.chain_epoch` (and the higher-level `tip_hash` they derive
 // from it) across responses to detect snapshot boundary crosses.
@@ -3131,10 +3045,6 @@ message OverviewMempoolEvents {
   // Number of `Invalidated` events the source emitted during the window.
   uint32 invalidated_count = 4;
 
-  // Number of `Suppressed` events the source emitted during the window.
-  // Stays zero for sources that do not surface ZIP-401-style admission
-  // refusals.
-  uint32 suppressed_count = 5;
 }
 
 // Fee-summary sub-field of `OverviewSnapshotResponse`.

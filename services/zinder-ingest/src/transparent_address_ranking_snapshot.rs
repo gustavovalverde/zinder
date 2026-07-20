@@ -1,17 +1,17 @@
-//! No-wipe startup construction of the transparent-address ranking projection.
+//! Startup construction of the transparent-address ranking materialized view.
 
 use zinder_core::{BlockHash, BlockHeight, ChainEpoch};
-use zinder_derive::{
-    DeriveStore, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TransparentAddressDeltasConsumer,
-    TransparentAddressRankingConsumer, TransparentAddressRankingCoverage,
-    TransparentAddressRankingSnapshotPlan, TransparentAddressRankingSnapshotRow,
-    TransparentAddressSummary,
+use zinder_materialized_views::{
+    MaterializedViewStore, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
+    TransparentAddressDeltasConsumer, TransparentAddressRankingConsumer,
+    TransparentAddressRankingCoverage, TransparentAddressRankingSnapshotPlan,
+    TransparentAddressRankingSnapshotRow, TransparentAddressSummary,
 };
 use zinder_store::{ChainEventHistoryRequest, PrimaryChainStore, StreamCursorTokenV1};
 
 use crate::{
     IngestError,
-    derive_consumers::{
+    materialized_view_consumers::{
         read_current_block_context_batch, unanimous_existing_block_consumer_cursor,
     },
 };
@@ -19,14 +19,14 @@ use crate::{
 const SNAPSHOT_WRITE_BATCH_ROWS: usize = 2_048;
 const TAIL_SEED_BATCH_BLOCKS: u32 = 64;
 
-/// Result of attempting to construct the optional ranking projection.
+/// Result of attempting to construct the optional ranking materialized view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransparentAddressRankingBootstrapOutcome {
-    /// The projection was already current or became current during this call.
+    /// The materialized view was already current or became current during this call.
     Ready,
     /// Existing historical sources cannot prove complete lifetime statistics.
     SourceCoverageIncomplete,
-    /// No canonical chain or unanimous derive boundary exists yet, or derive
+    /// No canonical chain or unanimous materialized-view boundary exists yet, or materialized-view
     /// replay still trails the canonical event tail.
     ChainNotReady,
 }
@@ -48,25 +48,26 @@ struct SnapshotBuildInputs {
     cursor_bytes: Vec<u8>,
 }
 
-/// Builds the ranking projection without rewriting canonical Zinder data.
+/// Builds the ranking materialized view without rewriting canonical Zinder data.
 pub async fn bootstrap_transparent_address_ranking(
     chain_store: &PrimaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
 ) -> Result<TransparentAddressRankingBootstrapOutcome, IngestError> {
-    let (cursor_bytes, chain_epoch) = match bootstrap_boundary(chain_store, derive_store)? {
-        BootstrapBoundary::Ready => {
-            return Ok(TransparentAddressRankingBootstrapOutcome::Ready);
-        }
-        BootstrapBoundary::NotReady => {
-            return Ok(TransparentAddressRankingBootstrapOutcome::ChainNotReady);
-        }
-        BootstrapBoundary::Build {
-            cursor_bytes,
-            chain_epoch,
-        } => (cursor_bytes, chain_epoch),
-    };
+    let (cursor_bytes, chain_epoch) =
+        match bootstrap_boundary(chain_store, materialized_view_store)? {
+            BootstrapBoundary::Ready => {
+                return Ok(TransparentAddressRankingBootstrapOutcome::Ready);
+            }
+            BootstrapBoundary::NotReady => {
+                return Ok(TransparentAddressRankingBootstrapOutcome::ChainNotReady);
+            }
+            BootstrapBoundary::Build {
+                cursor_bytes,
+                chain_epoch,
+            } => (cursor_bytes, chain_epoch),
+        };
     let (snapshot, base_block_hash, target_block_hash, lifetime) =
-        read_snapshot_sources(chain_store, derive_store).await?;
+        read_snapshot_sources(chain_store, materialized_view_store).await?;
     let base_height = snapshot.summarized_height;
     if !lifetime.source_coverage.contiguous_from_height_1
         || lifetime.source_coverage.first_height != Some(BlockHeight::new(1))
@@ -96,7 +97,7 @@ pub async fn bootstrap_transparent_address_ranking(
     };
     build_and_activate_snapshot(
         chain_store,
-        derive_store,
+        materialized_view_store,
         SnapshotBuildInputs {
             rows,
             base_block_hash,
@@ -111,9 +112,10 @@ pub async fn bootstrap_transparent_address_ranking(
 
 fn bootstrap_boundary(
     chain_store: &PrimaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
 ) -> Result<BootstrapBoundary, IngestError> {
-    let Some(cursor_bytes) = unanimous_existing_block_consumer_cursor(derive_store)? else {
+    let Some(cursor_bytes) = unanimous_existing_block_consumer_cursor(materialized_view_store)?
+    else {
         return Ok(BootstrapBoundary::NotReady);
     };
     let cursor = StreamCursorTokenV1::from_bytes(cursor_bytes.clone());
@@ -121,16 +123,18 @@ fn bootstrap_boundary(
         .chain_event_history(ChainEventHistoryRequest::with_default_limit(Some(&cursor)))?
         .is_empty()
     {
-        // Derive replay trails the canonical event tail: startup hands residual
+        // Materialized-view replay trails the canonical event tail: startup hands residual
         // replay to the always-on tailer, so defer until a boot finds parity.
         return Ok(BootstrapBoundary::NotReady);
     }
     let Some(chain_epoch) = chain_store.current_chain_epoch()? else {
         return Ok(BootstrapBoundary::NotReady);
     };
-    if let Some(active) = TransparentAddressRankingConsumer::active_metadata(derive_store)? {
-        let ranking_cursor =
-            derive_store.get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?;
+    if let Some(active) =
+        TransparentAddressRankingConsumer::active_metadata(materialized_view_store)?
+    {
+        let ranking_cursor = materialized_view_store
+            .get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?;
         if ranking_cursor.as_deref() != Some(cursor_bytes.as_slice())
             || active.coverage.balance_complete_through_height != chain_epoch.visible_tip_height
         {
@@ -140,11 +144,11 @@ fn bootstrap_boundary(
         }
         return Ok(BootstrapBoundary::Ready);
     }
-    if derive_store
+    if materialized_view_store
         .get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
         .is_some()
     {
-        return Err(IngestError::DeriveDispatch(
+        return Err(IngestError::MaterializedViewDispatch(
             "transparent-address ranking cursor exists without an active generation".to_owned(),
         ));
     }
@@ -156,13 +160,13 @@ fn bootstrap_boundary(
 
 async fn read_snapshot_sources(
     chain_store: &PrimaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
 ) -> Result<
     (
         zinder_store::TransparentAddressBalanceSnapshot,
         BlockHash,
         BlockHash,
-        zinder_derive::TransparentAddressDeltasLifetimeBootstrap,
+        zinder_materialized_views::TransparentAddressDeltasLifetimeBootstrap,
     ),
     IngestError,
 > {
@@ -179,11 +183,14 @@ async fn read_snapshot_sources(
     .map_err(|error| IngestError::BlockingTaskFailed {
         reason: error.to_string(),
     })??;
-    let derive = derive_store.clone();
+    let materialized_view_store = materialized_view_store.clone();
     let base_height = snapshot.summarized_height;
     let lifetime = tokio::task::spawn_blocking(move || {
-        TransparentAddressDeltasConsumer::lifetime_summaries_through(&derive, base_height)
-            .map_err(IngestError::from)
+        TransparentAddressDeltasConsumer::lifetime_summaries_through(
+            &materialized_view_store,
+            base_height,
+        )
+        .map_err(IngestError::from)
     })
     .await
     .map_err(|error| IngestError::BlockingTaskFailed {
@@ -194,19 +201,19 @@ async fn read_snapshot_sources(
 
 async fn build_and_activate_snapshot(
     chain_store: &PrimaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     inputs: SnapshotBuildInputs,
 ) -> Result<(), IngestError> {
     let base_height = inputs.chain_epoch.settled_tip_height;
     let expected_summary_count = u64::try_from(inputs.rows.len()).map_err(|_| {
-        IngestError::DeriveDispatch(
+        IngestError::MaterializedViewDispatch(
             "transparent-address ranking snapshot row count exceeds u64".to_owned(),
         )
     })?;
-    let generation = TransparentAddressRankingConsumer::build_metadata(derive_store)?
+    let generation = TransparentAddressRankingConsumer::build_metadata(materialized_view_store)?
         .map_or(1, |metadata| metadata.generation);
     TransparentAddressRankingConsumer::initialize_snapshot_generation(
-        derive_store,
+        materialized_view_store,
         TransparentAddressRankingSnapshotPlan {
             generation,
             base_height,
@@ -224,21 +231,25 @@ async fn build_and_activate_snapshot(
     )
     .map_err(ranking_error)?;
     for batch in inputs.rows.chunks(SNAPSHOT_WRITE_BATCH_ROWS) {
-        TransparentAddressRankingConsumer::write_snapshot_batch(derive_store, generation, batch)
-            .map_err(ranking_error)?;
+        TransparentAddressRankingConsumer::write_snapshot_batch(
+            materialized_view_store,
+            generation,
+            batch,
+        )
+        .map_err(ranking_error)?;
     }
-    TransparentAddressRankingConsumer::finalize_snapshot_base(derive_store, generation)
+    TransparentAddressRankingConsumer::finalize_snapshot_base(materialized_view_store, generation)
         .map_err(ranking_error)?;
     seed_visible_tail(
         chain_store,
-        derive_store,
+        materialized_view_store,
         generation,
         base_height,
         inputs.chain_epoch.visible_tip_height,
     )
     .await?;
     let metadata = TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
-        derive_store,
+        materialized_view_store,
         generation,
         &inputs.cursor_bytes,
     )
@@ -257,13 +268,13 @@ async fn build_and_activate_snapshot(
 
 async fn seed_visible_tail(
     chain_store: &PrimaryChainStore,
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     generation: u64,
     base_height: BlockHeight,
     target_height: BlockHeight,
 ) -> Result<(), IngestError> {
     let Some(mut next_height) = base_height.next() else {
-        return Err(IngestError::DeriveDispatch(
+        return Err(IngestError::MaterializedViewDispatch(
             "transparent-address ranking base height overflowed".to_owned(),
         ));
     };
@@ -278,14 +289,14 @@ async fn seed_visible_tail(
             read_current_block_context_batch(chain_store, next_height, batch_end).await?;
         for context in contexts {
             TransparentAddressRankingConsumer::write_snapshot_tail_block(
-                derive_store,
+                materialized_view_store,
                 generation,
                 context.as_ref(),
             )
             .map_err(ranking_error)?;
         }
         next_height = batch_end.next().ok_or_else(|| {
-            IngestError::DeriveDispatch(
+            IngestError::MaterializedViewDispatch(
                 "transparent-address ranking tail height overflowed".to_owned(),
             )
         })?;
@@ -298,7 +309,7 @@ fn reconcile_snapshot_rows(
         zinder_core::TransparentAddressScriptHash,
         zinder_store::TransparentAddressBalanceSummary,
     >,
-    lifetime_summaries: Vec<zinder_derive::TransparentAddressLifetimeSummary>,
+    lifetime_summaries: Vec<zinder_materialized_views::TransparentAddressLifetimeSummary>,
 ) -> Option<Vec<TransparentAddressRankingSnapshotRow>> {
     let mut rows = Vec::with_capacity(lifetime_summaries.len());
     for lifetime in lifetime_summaries {
@@ -333,7 +344,7 @@ fn required_block_hash(
         .block_header_at(height)?
         .map(|header| header.block_hash)
         .ok_or_else(|| {
-            IngestError::DeriveDispatch(format!(
+            IngestError::MaterializedViewDispatch(format!(
                 "transparent-address ranking boundary block {} is unavailable",
                 height.value()
             ))
@@ -345,13 +356,13 @@ fn required_block_hash(
     reason = "the signature is passed directly to Result::map_err"
 )]
 fn ranking_error(error: impl ToString) -> IngestError {
-    IngestError::DeriveDispatch(error.to_string())
+    IngestError::MaterializedViewDispatch(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use zinder_core::TransparentAddressScriptHash;
-    use zinder_derive::TransparentAddressLifetimeSummary;
+    use zinder_materialized_views::TransparentAddressLifetimeSummary;
     use zinder_store::TransparentAddressBalanceSummary;
 
     use super::*;
@@ -380,7 +391,9 @@ mod tests {
         };
         let rows =
             reconcile_snapshot_rows(balances.clone(), vec![lifetime.clone()]).ok_or_else(|| {
-                IngestError::DeriveDispatch("matching balance did not reconcile".to_owned())
+                IngestError::MaterializedViewDispatch(
+                    "matching balance did not reconcile".to_owned(),
+                )
             })?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary.balance_zat, 7);

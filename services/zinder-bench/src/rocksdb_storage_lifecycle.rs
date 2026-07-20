@@ -1,4 +1,4 @@
-//! Complete-history version-1 canonical and wallet `RocksDB` lifecycle measurement.
+//! Complete-history canonical and wallet `RocksDB` lifecycle measurement.
 
 use std::{
     fs,
@@ -12,7 +12,7 @@ use zinder_bench::{
     BenchError,
     report::{
         AcceptanceThresholds, BenchmarkReport, BenchmarkRunProvenance,
-        CanonicalFactSequenceDigestSummary, CanonicalStorageReadySummary, ReportProvenance,
+        CanonicalBlockFactsSequenceDigestSummary, CanonicalStorageReadySummary, ReportProvenance,
         RocksDbResourceBudgetSummary, RocksDbStorageLifecycleMeasurements, RunnerProvenance,
         StorageLifecycleBlockId, StorageLifecycleContractSummary, StorageLifecyclePhaseDurations,
         StorageLifecycleResourceLimits, StorageLifecycleSourceSummary,
@@ -158,7 +158,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let total_started = Instant::now();
     let validated = args.validate()?;
     let canonical_resource_budget = RocksDbResourceBudget::canonical_writer_defaults();
-    let wallet_resource_budget = RocksDbResourceBudget::derive_writer_defaults();
+    let wallet_resource_budget = RocksDbResourceBudget::materialized_view_writer_defaults();
 
     let source_discovery_started = Instant::now();
     let node_auth = args
@@ -592,11 +592,11 @@ fn canonical_ready_summary(
         transaction_count: block_load.transaction_count,
         subtree_root_count: subtree_load.subtree_root_count,
         replay_format_version: ready.replay_format_version.value(),
-        sequence_digest: CanonicalFactSequenceDigestSummary::from_digest(
+        sequence_digest: CanonicalBlockFactsSequenceDigestSummary::from_digest(
             ready.block_digest_version,
             sequence_digest,
         ),
-        logical_replay_bytes: ready.visible_logical_fact_bytes,
+        logical_replay_bytes: ready.visible_logical_replay_bytes,
         logical_storage_bytes: block_load.logical_bytes,
         sst_file_bytes: block_load.sst_file_bytes,
         sst_file_count: block_load.sst_file_count,
@@ -620,11 +620,11 @@ fn wallet_ready_summary(
         source_epoch_id: report.source_position.chain_epoch_id.value(),
         source_tip: block_id_summary(report.source_position.tip),
         source_event_sequence: report.source_position.event_sequence,
-        source_sequence_digest: CanonicalFactSequenceDigestSummary::from_digest(
+        source_sequence_digest: CanonicalBlockFactsSequenceDigestSummary::from_digest(
             zinder_core::CanonicalBlockFactsDigestVersion::V1,
             report.source_sequence_digest,
         ),
-        projection_digest_hex: hex::encode(report.projection_digest.as_bytes()),
+        wallet_projection_digest_hex: hex::encode(report.projection_digest.as_bytes()),
         row_counts: WalletStorageRowCounts {
             transparent_unspent_output_count: row_counts.transparent_unspent_output_count,
             transparent_unspent_output_by_address_count: row_counts
@@ -694,7 +694,7 @@ fn wallet_phase_durations(report: &RocksDbWalletBuildReport) -> WalletStoragePha
 }
 
 fn variable_value_sort_evidence(
-    evidence: zinder_rocksdb::VariableValueSortEvidence,
+    evidence: zinder_rocksdb_bulk_load::VariableValueSortEvidence,
 ) -> WalletVariableValueSortEvidence {
     WalletVariableValueSortEvidence {
         record_count: evidence.record_count,

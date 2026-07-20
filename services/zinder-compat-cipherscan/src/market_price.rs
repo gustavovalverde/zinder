@@ -54,7 +54,7 @@ pub(crate) struct HistoricalMarketPrice {
 
 /// Typed outcome of a successful historical-price provider request.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum HistoricalMarketPriceResult {
+pub(crate) enum HistoricalMarketPriceLookup {
     Price(HistoricalMarketPrice),
     NoPrice,
 }
@@ -104,16 +104,16 @@ struct UpstreamZcashPrice {
 
 #[derive(Debug, Deserialize)]
 struct HistoricalUpstreamResponse {
-    market_data: Option<HistoricalMarketData>,
+    market_data: Option<UpstreamHistoricalMarket>,
 }
 
 #[derive(Debug, Deserialize)]
-struct HistoricalMarketData {
-    current_price: Option<HistoricalCurrentPrice>,
+struct UpstreamHistoricalMarket {
+    current_price: Option<UpstreamHistoricalUsdPrice>,
 }
 
 #[derive(Debug, Deserialize)]
-struct HistoricalCurrentPrice {
+struct UpstreamHistoricalUsdPrice {
     usd: Option<f64>,
 }
 
@@ -204,14 +204,14 @@ impl MarketPriceClient {
     pub(crate) async fn historical_price(
         &self,
         requested_date: &str,
-    ) -> Result<HistoricalMarketPriceResult, MarketPriceError> {
+    ) -> Result<HistoricalMarketPriceLookup, MarketPriceError> {
         if let Some(price) = self.cached_historical_price(requested_date).await {
-            return Ok(HistoricalMarketPriceResult::Price(price));
+            return Ok(HistoricalMarketPriceLookup::Price(price));
         }
 
         let _refresh_guard = self.historical_refresh.lock().await;
         if let Some(price) = self.cached_historical_price(requested_date).await {
-            return Ok(HistoricalMarketPriceResult::Price(price));
+            return Ok(HistoricalMarketPriceLookup::Price(price));
         }
 
         let endpoint = self
@@ -229,7 +229,7 @@ impl MarketPriceClient {
             .and_then(|market_data| market_data.current_price)
             .and_then(|current_price| current_price.usd)
         else {
-            return Ok(HistoricalMarketPriceResult::NoPrice);
+            return Ok(HistoricalMarketPriceLookup::NoPrice);
         };
         if !price_usd.is_finite() || price_usd <= 0.0 {
             return Err(MarketPriceError::Malformed("market_data.current_price.usd"));
@@ -249,7 +249,7 @@ impl MarketPriceClient {
             .lock()
             .await
             .insert(requested_date.to_owned(), price.clone());
-        Ok(HistoricalMarketPriceResult::Price(price))
+        Ok(HistoricalMarketPriceLookup::Price(price))
     }
 
     async fn cached_historical_price(&self, requested_date: &str) -> Option<HistoricalMarketPrice> {
@@ -639,7 +639,7 @@ mod tests {
             server.historical_endpoint_template(),
         )?;
 
-        let HistoricalMarketPriceResult::Price(body) =
+        let HistoricalMarketPriceLookup::Price(body) =
             client.historical_price("12-07-2026").await?
         else {
             return Err("missing historical price".into());
@@ -715,8 +715,8 @@ mod tests {
         let missing = client.historical_price("10-07-2026").await?;
         let available = client.historical_price("10-07-2026").await?;
 
-        assert_eq!(missing, HistoricalMarketPriceResult::NoPrice);
-        assert!(matches!(available, HistoricalMarketPriceResult::Price(_)));
+        assert_eq!(missing, HistoricalMarketPriceLookup::NoPrice);
+        assert!(matches!(available, HistoricalMarketPriceLookup::Price(_)));
         assert_eq!(server.request_count(), 2);
         Ok(())
     }

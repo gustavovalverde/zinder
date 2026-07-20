@@ -16,7 +16,7 @@ use zinder_core::{
     TransactionBlobArtifact,
 };
 use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
-use zinder_rocksdb::{
+use zinder_rocksdb_bulk_load::{
     FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
 };
 

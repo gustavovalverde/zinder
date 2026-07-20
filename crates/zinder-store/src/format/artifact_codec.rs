@@ -27,7 +27,7 @@ use crate::{
 
 use super::{
     ArtifactEnvelopeError, ArtifactEnvelopeHeaderV1, ChainEventCursorAnchor, ChainEventLocator,
-    ChainEventStreamFamily, MempoolEventStreamFamily, PayloadFormat, StoreKey,
+    ChainEventStreamFamily, PayloadFormat, StoreKey,
 };
 
 pub(crate) fn encode_chain_epoch(chain_epoch: &ChainEpoch) -> Vec<u8> {
@@ -52,7 +52,7 @@ pub(crate) fn encode_chain_event_envelope(event_envelope: &ChainEventEnvelope) -
     ChainEventEnvelopeRecord {
         event_sequence: event_envelope.event_sequence,
         chain_epoch: Some(chain_epoch_record(&event_envelope.chain_epoch)),
-        safe_tip_height: event_envelope.safe_tip_height.value(),
+        settled_tip_height: event_envelope.settled_tip_height.value(),
         event: Some(chain_event_record(&event_envelope.event)),
     }
     .encode_to_vec()
@@ -116,7 +116,7 @@ pub(crate) fn decode_chain_event_envelope(
         cursor,
         record.event_sequence,
         chain_epoch,
-        BlockHeight::new(record.safe_tip_height),
+        BlockHeight::new(record.settled_tip_height),
         event,
     ))
 }
@@ -151,7 +151,6 @@ pub(crate) fn decode_mempool_event_envelope(
     let event = decode_mempool_event_record(key, event_record)?;
     let cursor = StreamCursorTokenV1::mempool_event(
         network,
-        MempoolEventStreamFamily::Mempool,
         record.event_sequence,
         event.transaction_id(),
         cursor_auth_key,
@@ -222,10 +221,6 @@ pub(crate) fn decode_mempool_event_position(
             .mined
             .as_ref()
             .map(|mined| mined.transaction_id.as_slice()),
-        MempoolEventKind::Suppressed => event_record
-            .suppressed
-            .as_ref()
-            .map(|suppressed| suppressed.transaction_id.as_slice()),
     }
     .ok_or(StoreError::ArtifactCorrupt {
         family: ArtifactFamily::MempoolEvent,
@@ -272,7 +267,6 @@ pub(crate) enum MempoolEventKind {
     Added,
     Invalidated,
     Mined,
-    Suppressed,
 }
 
 impl MempoolEventKind {
@@ -281,7 +275,6 @@ impl MempoolEventKind {
             MEMPOOL_EVENT_KIND_ADDED => Some(Self::Added),
             MEMPOOL_EVENT_KIND_INVALIDATED => Some(Self::Invalidated),
             MEMPOOL_EVENT_KIND_MINED => Some(Self::Mined),
-            MEMPOOL_EVENT_KIND_SUPPRESSED => Some(Self::Suppressed),
             _ => None,
         }
     }
@@ -294,7 +287,6 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
             added: Some(mempool_entry_record(entry)),
             invalidated: None,
             mined: None,
-            suppressed: None,
         },
         MempoolEvent::Invalidated {
             transaction_id,
@@ -307,7 +299,6 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
                 reason_id: mempool_eviction_reason_id(*reason),
             }),
             mined: None,
-            suppressed: None,
         },
         MempoolEvent::Mined {
             transaction_id,
@@ -321,16 +312,6 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
                 transaction_id: transaction_id.as_bytes().to_vec(),
                 mined_height: mined_height.value(),
                 block_hash: block_hash.as_bytes().to_vec(),
-            }),
-            suppressed: None,
-        },
-        MempoolEvent::Suppressed { transaction_id } => MempoolEventRecord {
-            event_kind: MEMPOOL_EVENT_KIND_SUPPRESSED,
-            added: None,
-            invalidated: None,
-            mined: None,
-            suppressed: Some(MempoolSuppressedRecord {
-                transaction_id: transaction_id.as_bytes().to_vec(),
             }),
         },
         // The Rust enum is `#[non_exhaustive]`; future variants force a
@@ -395,20 +376,6 @@ fn decode_mempool_event_record(
                     ArtifactFamily::MempoolEvent,
                     key,
                     &mined.block_hash,
-                )?,
-            })
-        }
-        MempoolEventKind::Suppressed => {
-            let suppressed = record.suppressed.ok_or(StoreError::ArtifactCorrupt {
-                family: ArtifactFamily::MempoolEvent,
-                key: key.clone().into(),
-                reason: "suppressed mempool event is missing payload",
-            })?;
-            Ok(MempoolEvent::Suppressed {
-                transaction_id: decode_transaction_id_for_family(
-                    ArtifactFamily::MempoolEvent,
-                    key,
-                    &suppressed.transaction_id,
                 )?,
             })
         }
@@ -2174,8 +2141,8 @@ fn chain_epoch_record(chain_epoch: &ChainEpoch) -> ChainEpochRecord {
         network_id: chain_epoch.network.id(),
         tip_height: chain_epoch.visible_tip_height.value(),
         tip_hash: chain_epoch.visible_tip_hash.as_bytes().to_vec(),
-        safe_tip_height: chain_epoch.settled_tip_height.value(),
-        safe_tip_hash: chain_epoch.settled_tip_hash.as_bytes().to_vec(),
+        settled_tip_height: chain_epoch.settled_tip_height.value(),
+        settled_tip_hash: chain_epoch.settled_tip_hash.as_bytes().to_vec(),
         artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
         sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
         orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
@@ -2200,8 +2167,8 @@ fn decode_chain_epoch_record(
         network,
         visible_tip_height: BlockHeight::new(record.tip_height),
         visible_tip_hash: decode_block_hash(family, key, &record.tip_hash)?,
-        settled_tip_height: BlockHeight::new(record.safe_tip_height),
-        settled_tip_hash: decode_block_hash(family, key, &record.safe_tip_hash)?,
+        settled_tip_height: BlockHeight::new(record.settled_tip_height),
+        settled_tip_hash: decode_block_hash(family, key, &record.settled_tip_hash)?,
         artifact_schema_version: ArtifactSchemaVersion::new(
             u16::try_from(record.artifact_schema_version).map_err(|_| {
                 StoreError::ArtifactCorrupt {
@@ -2540,9 +2507,9 @@ struct ChainEpochRecord {
     #[prost(bytes, tag = "4")]
     tip_hash: Vec<u8>,
     #[prost(uint32, tag = "5")]
-    safe_tip_height: u32,
+    settled_tip_height: u32,
     #[prost(bytes, tag = "6")]
-    safe_tip_hash: Vec<u8>,
+    settled_tip_hash: Vec<u8>,
     #[prost(uint32, tag = "7")]
     artifact_schema_version: u32,
     #[prost(uint64, tag = "8")]
@@ -2565,7 +2532,7 @@ struct ChainEventEnvelopeRecord {
     #[prost(message, optional, tag = "3")]
     chain_epoch: Option<ChainEpochRecord>,
     #[prost(uint32, tag = "4")]
-    safe_tip_height: u32,
+    settled_tip_height: u32,
     #[prost(message, optional, tag = "5")]
     event: Option<ChainEventRecord>,
 }
@@ -3039,7 +3006,6 @@ struct TransparentOutPointRecord {
 const MEMPOOL_EVENT_KIND_ADDED: u32 = 1;
 const MEMPOOL_EVENT_KIND_INVALIDATED: u32 = 2;
 const MEMPOOL_EVENT_KIND_MINED: u32 = 3;
-const MEMPOOL_EVENT_KIND_SUPPRESSED: u32 = 4;
 
 #[derive(Clone, PartialEq, Message)]
 struct MempoolEventEnvelopeRecord {
@@ -3061,14 +3027,6 @@ struct MempoolEventRecord {
     invalidated: Option<MempoolInvalidatedRecord>,
     #[prost(message, optional, tag = "4")]
     mined: Option<MempoolMinedRecord>,
-    #[prost(message, optional, tag = "5")]
-    suppressed: Option<MempoolSuppressedRecord>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct MempoolSuppressedRecord {
-    #[prost(bytes, tag = "1")]
-    transaction_id: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]

@@ -6,7 +6,7 @@
 use eyre::{Result, eyre};
 use zinder_core::{
     BlockHeight, Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    TransactionBroadcastResult, TransactionId,
+    TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceBackend,
@@ -129,17 +129,17 @@ async fn broadcast_classifies_invalid_transaction() -> Result<()> {
             std::num::NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
         )
         .await?;
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x00]))
         .await?;
 
     assert_eq!(subtree_roots.protocol, ShieldedProtocol::Sapling);
     assert_eq!(subtree_roots.start_index, SubtreeRootIndex::new(0));
     assert!(matches!(
-        broadcast_result,
-        TransactionBroadcastResult::InvalidEncoding(_)
-            | TransactionBroadcastResult::Rejected(_)
-            | TransactionBroadcastResult::Unknown(_)
+        broadcast_outcome,
+        TransactionBroadcastOutcome::InvalidEncoding(_)
+            | TransactionBroadcastOutcome::Rejected(_)
+            | TransactionBroadcastOutcome::Unknown(_)
     ));
     Ok(())
 }
@@ -162,7 +162,7 @@ async fn fetches_tip_block_and_rejects_invalid_transaction() -> Result<()> {
             std::num::NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
         )
         .await?;
-    let broadcast_result = source
+    let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x00]))
         .await?;
 
@@ -172,10 +172,10 @@ async fn fetches_tip_block_and_rejects_invalid_transaction() -> Result<()> {
     assert_eq!(subtree_roots.protocol, ShieldedProtocol::Sapling);
     assert_eq!(subtree_roots.start_index, SubtreeRootIndex::new(0));
     assert!(matches!(
-        broadcast_result,
-        TransactionBroadcastResult::InvalidEncoding(_)
-            | TransactionBroadcastResult::Rejected(_)
-            | TransactionBroadcastResult::Unknown(_)
+        broadcast_outcome,
+        TransactionBroadcastOutcome::InvalidEncoding(_)
+            | TransactionBroadcastOutcome::Rejected(_)
+            | TransactionBroadcastOutcome::Unknown(_)
     ));
     Ok(())
 }

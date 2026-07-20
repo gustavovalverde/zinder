@@ -1,4 +1,4 @@
-//! Process-local secondary access to an admitted canonical version-1 store.
+//! Process-local secondary access to an admitted canonical store.
 
 use std::path::{Path, PathBuf};
 
@@ -55,7 +55,7 @@ impl CanonicalSecondaryCatchupOutcome {
     }
 }
 
-/// One admitted read-only `RocksDB` secondary for a canonical version-1 primary.
+/// One admitted read-only `RocksDB` secondary for a canonical primary.
 ///
 /// The reader owns a process-unique secondary metadata path. It cannot publish
 /// canonical transitions because the primary mutation API is not implemented
@@ -349,7 +349,7 @@ fn require_exact_column_family_names(
         return Err(CanonicalStoreError::admission(
             primary_path,
             format!(
-                "column families {observed:?} do not exactly match required canonical version-1 set {expected:?}"
+                "column families {observed:?} do not exactly match required canonical set {expected:?}"
             ),
         ));
     }

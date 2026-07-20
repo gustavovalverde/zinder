@@ -9,16 +9,16 @@ use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
-    Readiness, ServiceIdentifier, StartupPhase, TrafficReadinessInterceptor,
+    Readiness, RuntimeService, StartupPhase, TrafficReadinessInterceptor,
     cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
 mod config;
-mod frozen_pair;
+mod wallet_serving_pair_publisher;
 
 use config::{LightwalletdConfigError, LightwalletdConfigOverrides};
-use frozen_pair::{FrozenPairConfig, FrozenPairManager};
+use wallet_serving_pair_publisher::{WalletServingPairConfig, WalletServingPairPublisher};
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -123,7 +123,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let readiness = Readiness::default();
     let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = spawn_ops_endpoint_for(
-        ServiceIdentifier::CompatLightwalletd,
+        RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(lightwalletd_config.network),
@@ -171,15 +171,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    readiness.set_projection_workload(
-        "wallet",
-        vec![
-            "transparent-address-history-v1".to_owned(),
-            "transparent-utxo-v1".to_owned(),
-        ],
-    );
-    let (frozen_pair_manager, read_pairs) = FrozenPairManager::bootstrap(
-        FrozenPairConfig {
+    let (serving_pair_publisher, serving_pair_slot) = WalletServingPairPublisher::bootstrap(
+        WalletServingPairConfig {
             canonical_primary_path: lightwalletd_config.storage.path.clone(),
             canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
             wallet_primary_path: lightwalletd_config.wallet_primary_path.clone(),
@@ -188,7 +181,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             network_upgrade_activations: Arc::clone(&network_upgrade_activations),
             canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
             canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
-            wallet_resource_budget: lightwalletd_config.storage.derive_rocksdb_budget,
+            wallet_resource_budget: lightwalletd_config.wallet_rocksdb_budget,
             catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
             convergence_timeout: lightwalletd_config.storage.initial_catchup_timeout,
             convergence_attempts: lightwalletd_config.pair_convergence_attempts,
@@ -202,7 +195,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     )
     .await?;
     let visible_height = Some(
-        read_pairs
+        serving_pair_slot
             .load_full()
             .canonical_fence()
             .visible_tip()
@@ -211,8 +204,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
     open_storage_phase.complete();
 
-    let mut wallet_query = zinder_query::FactFirstWalletQuery::from_read_pair_slot(
-        Arc::clone(&read_pairs),
+    let mut wallet_query = zinder_query::LightwalletdServingQuery::from_serving_pair_slot(
+        Arc::clone(&serving_pair_slot),
         broadcaster,
         network_upgrade_activations.clone(),
     );
@@ -221,7 +214,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     }
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-    let frozen_pair_handle = frozen_pair_manager.spawn(cancel.clone());
+    let serving_pair_publisher_handle = serving_pair_publisher.spawn(cancel.clone());
     let mempool_surface = Arc::new({
         let mut surface =
             IngestControlMempoolSurface::new(lightwalletd_config.ingest_control_addr.clone());
@@ -236,7 +229,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         cancel.clone(),
     );
     let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
-        .with_fact_first_read_pair_slot(read_pairs)
+        .with_serving_pair_slot(serving_pair_slot)
         .with_transparent_address_support()
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);
@@ -310,19 +303,19 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         ),
     }
 
-    match frozen_pair_handle.await {
+    match serving_pair_publisher_handle.await {
         Ok(()) => {}
         Err(join_error) if join_error.is_panic() => tracing::warn!(
             target: "zinder::compat_lightwalletd",
-            event = "frozen_pair_manager_panic",
+            event = "serving_pair_publisher_panic",
             error = %join_error,
-            "frozen pair manager task panicked"
+            "wallet-serving pair publisher task panicked"
         ),
         Err(join_error) => tracing::warn!(
             target: "zinder::compat_lightwalletd",
-            event = "frozen_pair_manager_join_failed",
+            event = "serving_pair_publisher_join_failed",
             error = %join_error,
-            "frozen pair manager task did not exit cleanly"
+            "wallet-serving pair publisher task did not exit cleanly"
         ),
     }
 

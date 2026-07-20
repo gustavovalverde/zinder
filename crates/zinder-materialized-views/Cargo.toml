@@ -1,0 +1,29 @@
+[package]
+name = "zinder-materialized-views"
+version = "0.1.0"
+description = "Materialized-view plane SDK: MaterializedViewConsumer trait, BlockKeyedConsumer template, MaterializedViewStore, and the bundled consumer impls"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "materialized-view"]
+categories = ["api-bindings"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+metrics.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+rust-rocksdb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zinder-core.workspace = true
+zinder-proto.workspace = true
+zinder-store.workspace = true
+
+[dev-dependencies]
+eyre.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

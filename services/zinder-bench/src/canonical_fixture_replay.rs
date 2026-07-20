@@ -40,7 +40,7 @@ use crate::{
     fixture::{FixtureManifest, FixtureNodeSource, read_segment_blocks},
 };
 
-/// Digest-bound checkpoint sidecar written beside a version-1 fixture manifest.
+/// Digest-bound checkpoint sidecar written beside a format-2 fixture manifest.
 pub const CANONICAL_FIXTURE_REPLAY_PLAN_FILE_NAME: &str = "canonical-replay-plan.json";
 const CANONICAL_FIXTURE_REPLAY_PLAN_TEMP_FILE_NAME: &str = "canonical-replay-plan.json.tmp";
 const CANONICAL_FIXTURE_REPLAY_PLAN_CONTRACT_IDENTITY: &str = "canonical-fixture-replay-plan";
@@ -56,7 +56,7 @@ pub struct CanonicalFixtureReplayPlan {
     pub contract_identity: String,
     /// Sidecar format version.
     pub format_version: u32,
-    /// SHA-256 identity of the exact version-1 fixture manifest.
+    /// SHA-256 identity of the exact format-2 fixture manifest.
     pub fixture_manifest_sha256: String,
     /// Fingerprint algorithm used for the captured activation table.
     pub network_upgrade_activations_fingerprint_version: u16,
@@ -220,12 +220,12 @@ where
     }
 }
 
-/// Explicit inputs for one authenticated fixture replay into canonical-v1 `RocksDB`.
+/// Explicit inputs for one authenticated fixture replay into canonical `RocksDB`.
 #[derive(Clone, Debug)]
 pub struct CanonicalFixtureRocksDbReplayConfig {
     /// Directory containing the admitted fixture manifest, segments, and replay plan.
     pub fixture_directory: PathBuf,
-    /// Fresh destination for the canonical-v1 store.
+    /// Fresh destination for the canonical store.
     pub canonical_store_path: PathBuf,
     /// Deadline applied to each source operation in canonical construction.
     pub request_timeout: Duration,
@@ -239,16 +239,16 @@ pub struct CanonicalFixtureRocksDbReplayConfig {
     pub source_segment_delay: Duration,
 }
 
-/// Exact load, publication, and cold-reopen evidence from canonical-v1 replay.
+/// Exact load, publication, and cold-reopen evidence from canonical replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalFixtureRocksDbReplayOutcome {
     /// Fixture manifest digest bound into the exact admitted replay plan.
     pub fixture_manifest_digest_sha256: String,
     /// Stable digest of the exact replay plan admitted before source work.
     pub replay_plan_digest_sha256: String,
-    /// Block-family evidence accepted by the real canonical-v1 loader.
+    /// Block-family evidence accepted by the real canonical loader.
     pub block_load_evidence: CanonicalBlockLoadEvidence,
-    /// Exact completed-subtree evidence accepted by the canonical-v1 loader.
+    /// Exact completed-subtree evidence accepted by the canonical loader.
     pub subtree_root_load_evidence: CanonicalSubtreeRootLoadEvidence,
     /// Whether the loaded fixed tip was authenticated against the admitted source checkpoint.
     pub source_tip_checkpoint_authenticated: bool,
@@ -593,7 +593,7 @@ fn certify_reopened_canonical_fixture(
     })
 }
 
-/// Replays one authenticated fixture through the production canonical-v1 build lifecycle.
+/// Replays one authenticated fixture through the production canonical build lifecycle.
 #[must_use = "the canonical fixture replay future must be awaited"]
 pub fn replay_canonical_fixture_into_rocksdb(
     config: CanonicalFixtureRocksDbReplayConfig,
@@ -616,7 +616,7 @@ pub fn replay_canonical_fixture_into_rocksdb(
 /// Replays an authenticated fixture through an explicit block transport.
 ///
 /// This benchmark-only seam byte-compares transport blocks with the admitted
-/// fixture before invoking the production canonical-v1 loader. It does not
+/// fixture before invoking the production canonical loader. It does not
 /// alter the shipped ingest source selection and does not provide fallback.
 #[must_use = "the transport-authenticated canonical fixture replay future must be awaited"]
 pub fn replay_canonical_fixture_transport_into_rocksdb<S: NodeSource + Clone>(

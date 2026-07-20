@@ -2,7 +2,7 @@
 //! `MigrationDenominations` handlers.
 //!
 //! All three read the Orchard-to-Ironwood migration facts materialized by
-//! `zinder_derive::IronwoodMigrationConsumer` and wrap the result in the
+//! `zinder_materialized_views::IronwoodMigrationConsumer` and wrap the result in the
 //! cross-cutting `ExplorerFreshness` envelope. `MigrationOverview` pairs the
 //! per-migration rows with the cumulative pool-totals records to report the
 //! migrated-value total alongside the chain-wide two-sided pool audit;
@@ -16,7 +16,9 @@ use std::collections::BTreeMap;
 
 use tonic::{Request, Response, Status};
 use zinder_core::BlockHeight;
-use zinder_derive::{DeriveStore, IronwoodMigrationConsumer, Migration, MigrationPoolTotals};
+use zinder_materialized_views::{
+    IronwoodMigrationConsumer, MaterializedViewStore, Migration, MigrationPoolTotals,
+};
 use zinder_proto::capabilities::{
     EXPLORER_MIGRATION_COHORTS_V1, EXPLORER_MIGRATION_DENOMINATIONS_V1,
     EXPLORER_MIGRATION_OVERVIEW_V1,
@@ -26,7 +28,9 @@ use zinder_proto::v1::explorer::{
     MigrationDenominationsRequest, MigrationDenominationsResponse, MigrationOverviewRequest,
     MigrationOverviewResponse,
 };
-use zinder_proto::v1::wallet::{self, LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{
+    self, VisibleTipBlockRequest, wallet_query_client::WalletQueryClient,
+};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
@@ -36,7 +40,7 @@ use super::freshness::{
 
 /// Hard cap on the block span one cohort or denomination request may cover.
 ///
-/// Bounds a single request's derive-store scan, mirroring the bounded-page
+/// Bounds a single request's materialized-view scan, mirroring the bounded-page
 /// rule the other explorer range reads apply.
 const MAX_MIGRATION_BLOCK_SPAN: u32 = 4096;
 
@@ -48,8 +52,8 @@ const MAX_MIGRATION_BLOCK_SPAN: u32 = 4096;
 const MAX_MIGRATION_ROWS_PER_REQUEST: usize = 65_536;
 
 /// Executes one `ExplorerQuery.MigrationOverview` request.
-pub(crate) async fn handle_migration_overview(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_migration_overview(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MigrationOverviewRequest>,
@@ -62,13 +66,13 @@ pub(crate) async fn handle_migration_overview(
     }
     let end_height = match inner.end_height {
         Some(end) => Some(end),
-        None => read_latest_pool_totals(derive_store)?.map(|totals| totals.block_height),
+        None => read_latest_pool_totals(materialized_view_store)?.map(|totals| totals.block_height),
     };
     let (aggregate, delta) = match end_height {
         Some(end_height) => {
             let start_height = inner.start_height.unwrap_or(0);
-            let migrations = read_migrations(derive_store, start_height, end_height)?;
-            let delta = read_range_pool_delta(derive_store, start_height, end_height)?;
+            let migrations = read_migrations(materialized_view_store, start_height, end_height)?;
+            let delta = read_range_pool_delta(materialized_view_store, start_height, end_height)?;
             (aggregate_overview(&migrations), delta)
         }
         None => (OverviewAggregate::default(), PoolDelta::default()),
@@ -78,7 +82,7 @@ pub(crate) async fn handle_migration_overview(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_MIGRATION_OVERVIEW_V1,
             Some(chain_epoch),
             0,
@@ -97,22 +101,26 @@ pub(crate) async fn handle_migration_overview(
 }
 
 /// Executes one `ExplorerQuery.MigrationCohorts` request.
-pub(crate) async fn handle_migration_cohorts(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_migration_cohorts(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MigrationCohortsRequest>,
 ) -> Result<Response<MigrationCohortsResponse>, Status> {
     let inner = request.into_inner();
     validate_span(inner.start_height, inner.end_height)?;
-    let migrations = read_migrations(derive_store, inner.start_height, inner.end_height)?;
+    let migrations = read_migrations(
+        materialized_view_store,
+        inner.start_height,
+        inner.end_height,
+    )?;
     let (cohorts, stats) = group_cohorts(&migrations);
 
     let chain_epoch = fetch_latest_chain_epoch(wallet_client, inner.at_epoch_id).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_MIGRATION_COHORTS_V1,
             Some(chain_epoch),
             0,
@@ -130,22 +138,26 @@ pub(crate) async fn handle_migration_cohorts(
 }
 
 /// Executes one `ExplorerQuery.MigrationDenominations` request.
-pub(crate) async fn handle_migration_denominations(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_migration_denominations(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MigrationDenominationsRequest>,
 ) -> Result<Response<MigrationDenominationsResponse>, Status> {
     let inner = request.into_inner();
     validate_span(inner.start_height, inner.end_height)?;
-    let migrations = read_migrations(derive_store, inner.start_height, inner.end_height)?;
+    let migrations = read_migrations(
+        materialized_view_store,
+        inner.start_height,
+        inner.end_height,
+    )?;
     let (bins, total_tx) = bin_denominations(&migrations);
 
     let chain_epoch = fetch_latest_chain_epoch(wallet_client, inner.at_epoch_id).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_MIGRATION_DENOMINATIONS_V1,
             Some(chain_epoch),
             0,
@@ -289,13 +301,13 @@ fn denomination_floor(amount_zat: u64) -> u64 {
 }
 
 fn read_range_pool_delta(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_height: u32,
     end_height: u32,
 ) -> Result<PoolDelta, Status> {
-    let end_totals = read_pool_totals_at_or_before(derive_store, end_height)?;
+    let end_totals = read_pool_totals_at_or_before(materialized_view_store, end_height)?;
     let baseline = match start_height.checked_sub(1) {
-        Some(previous) => read_pool_totals_at_or_before(derive_store, previous)?,
+        Some(previous) => read_pool_totals_at_or_before(materialized_view_store, previous)?,
         None => None,
     };
     let end_orchard = end_totals.map_or(0, |totals| totals.cumulative_orchard_value_balance_zat);
@@ -324,12 +336,12 @@ fn saturating_negative_magnitude(end: i64, base: i64) -> u64 {
 }
 
 fn read_migrations(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_height: u32,
     end_height: u32,
 ) -> Result<Vec<Migration>, Status> {
     IronwoodMigrationConsumer::read_migrations_in_range(
-        derive_store,
+        materialized_view_store,
         BlockHeight::new(start_height),
         BlockHeight::new(end_height),
         MAX_MIGRATION_ROWS_PER_REQUEST,
@@ -338,18 +350,21 @@ fn read_migrations(
 }
 
 fn read_latest_pool_totals(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
 ) -> Result<Option<MigrationPoolTotals>, Status> {
-    IronwoodMigrationConsumer::read_latest_pool_totals(derive_store)
+    IronwoodMigrationConsumer::read_latest_pool_totals(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()).into())
 }
 
 fn read_pool_totals_at_or_before(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     height: u32,
 ) -> Result<Option<MigrationPoolTotals>, Status> {
-    IronwoodMigrationConsumer::read_pool_totals_at_or_before(derive_store, BlockHeight::new(height))
-        .map_err(|error| ExplorerError::internal(error.to_string()).into())
+    IronwoodMigrationConsumer::read_pool_totals_at_or_before(
+        materialized_view_store,
+        BlockHeight::new(height),
+    )
+    .map_err(|error| ExplorerError::internal(error.to_string()).into())
 }
 
 fn validate_span(start_height: u32, end_height: u32) -> Result<(), Status> {
@@ -371,13 +386,13 @@ async fn fetch_latest_chain_epoch(
     at_epoch_id: Option<u64>,
 ) -> Result<wallet::ChainEpoch, Status> {
     wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing").into()
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing").into()
         })
 }
 

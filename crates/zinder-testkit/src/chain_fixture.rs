@@ -163,7 +163,7 @@ pub struct FixtureTransactionRows {
     /// Optional transaction-intrinsic shielded value balances.
     ///
     /// Constructors populate all-zero balances so schema-19 replay and
-    /// current-schema rows remain exact by default. `None` is reserved for
+    /// canonical schema rows remain exact by default. `None` is reserved for
     /// tests that deliberately construct an invalid or incomplete artifact set.
     pub intrinsic_value_balances: Option<TransactionIntrinsicValueBalances>,
 }
@@ -230,7 +230,7 @@ impl FixtureTransactionRows {
         self
     }
 
-    /// Returns the current-schema intrinsic-balance artifact for these rows.
+    /// Returns the canonical intrinsic-balance artifact for these rows.
     #[must_use]
     pub fn intrinsic_value_balances_artifact(
         &self,
@@ -533,6 +533,13 @@ impl ChainFixture {
         self
     }
 
+    pub(crate) fn with_canonical_genesis_parent(mut self) -> Self {
+        if let Some(first_block) = self.blocks.first_mut() {
+            first_block.parent_hash = self.network.genesis_hash();
+        }
+        self
+    }
+
     /// Returns a new fixture that shares blocks `< divergence_height` with
     /// `self` and is empty from `divergence_height` onwards.
     ///
@@ -799,7 +806,13 @@ impl ChainFixture {
             .collect()
     }
 
-    fn canonical_transaction_rows(&self) -> Vec<FixtureTransactionRows> {
+    /// Returns the complete ordered transaction rows used by canonical replay.
+    ///
+    /// Explicit transaction rows are merged with transparent output and spend
+    /// facts so production-store fixtures consume the same semantic source as
+    /// [`Self::chain_epoch_artifacts`].
+    #[must_use]
+    pub(crate) fn canonical_transaction_rows(&self) -> Vec<FixtureTransactionRows> {
         build_fixture_transaction_rows(
             &self.transaction_rows,
             &self.transparent_outputs_by_outpoint,

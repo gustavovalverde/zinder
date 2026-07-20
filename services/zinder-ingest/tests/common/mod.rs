@@ -44,8 +44,9 @@ use zinder_proto::{
     v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
 };
 use zinder_query::{
-    ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter, latest_block_response,
+    ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
     latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
+    visible_tip_block_response,
 };
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::PrimaryChainStore;
@@ -72,12 +73,14 @@ pub(crate) struct WalletReadTestRange {
     pub(crate) subtree_root_start_indices: SubtreeRootStartIndices,
 }
 
-/// Opens a derive store with no consumer column families for tests that
+/// Opens a materialized-view store with no consumer column families for tests that
 /// only need to satisfy writer API wiring.
-pub(crate) fn test_derive_store(storage_path: &Path) -> Result<zinder_derive::DeriveStore> {
-    Ok(zinder_derive::DeriveStore::open(
-        zinder_derive::DeriveStore::path_for_canonical(storage_path),
-        zinder_derive::DeriveStoreOptions {
+pub(crate) fn test_materialized_view_store(
+    storage_path: &Path,
+) -> Result<zinder_materialized_views::MaterializedViewStore> {
+    Ok(zinder_materialized_views::MaterializedViewStore::open(
+        zinder_materialized_views::MaterializedViewStore::path_for_canonical(storage_path),
+        zinder_materialized_views::MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[],
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
@@ -97,7 +100,7 @@ pub(crate) fn live_bulk_catchup_run_config(
     from_height: BlockHeight,
     to_height: BlockHeight,
     canonical_batch_max_blocks: NonZeroU32,
-    allow_near_tip_finalize: bool,
+    allow_reorg_window_settlement: bool,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 ) -> BulkCatchupRunConfig {
     const SOURCE_SEGMENT_MAX_BLOCKS: NonZeroU32 = NonZeroU32::MIN.saturating_add(7);
@@ -138,7 +141,7 @@ pub(crate) fn live_bulk_catchup_run_config(
             .unwrap_or(NonZeroU64::MIN),
         flush_interval_epochs: NonZeroU32::MIN.saturating_add(4),
         upstream_tip_hint: None,
-        allow_near_tip_finalize,
+        allow_reorg_window_settlement,
         checkpoint: None,
     }
 }
@@ -393,8 +396,12 @@ pub(crate) async fn assert_wallet_read_responses(
         read_range.end_height,
     )
     .await?;
-    assert_native_latest_block_response(&wallet_query, read_range.network, read_range.end_height)
-        .await?;
+    assert_native_visible_tip_block_response(
+        &wallet_query,
+        read_range.network,
+        read_range.end_height,
+    )
+    .await?;
     assert_native_tree_state_checkpoint_response(
         &wallet_query,
         read_range.network,
@@ -474,7 +481,7 @@ async fn assert_lightwalletd_trait_responses(
     grpc_adapter: &LightwalletdGrpcAdapter<WalletQuery<PrimaryChainStore>>,
     read_range: WalletReadTestRange,
 ) -> Result<()> {
-    let latest_block = LightwalletdCompactTxStreamer::get_latest_block(
+    let visible_tip_block = LightwalletdCompactTxStreamer::get_latest_block(
         grpc_adapter,
         Request::new(lightwalletd::ChainSpec {}),
     )
@@ -510,7 +517,7 @@ async fn assert_lightwalletd_trait_responses(
     .await?
     .into_inner();
 
-    assert_eq!(latest_block.height, u64::from(read_range.end_height));
+    assert_eq!(visible_tip_block.height, u64::from(read_range.end_height));
     assert_eq!(
         compact_blocks.len(),
         usize::try_from(read_range.end_height - read_range.start_height + 1)?
@@ -605,7 +612,7 @@ async fn assert_generated_lightwalletd_client_responses(
         format!("http://{server_addr}"),
     )
     .await?;
-    let latest_block = client
+    let visible_tip_block = client
         .get_latest_block(lightwalletd::ChainSpec {})
         .await?
         .into_inner();
@@ -633,7 +640,7 @@ async fn assert_generated_lightwalletd_client_responses(
         compact_blocks.push(compact_block);
     }
 
-    assert_eq!(latest_block.height, u64::from(end_height));
+    assert_eq!(visible_tip_block.height, u64::from(end_height));
     assert_eq!(
         compact_blocks.len(),
         usize::try_from(end_height - start_height + 1)?
@@ -668,9 +675,9 @@ async fn assert_native_wallet_grpc_responses(
     let wallet_query = WalletQuery::new(store.clone(), (), Arc::clone(activations));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 
-    let latest_block = WalletQueryService::latest_block(
+    let visible_tip_block = WalletQueryService::visible_tip_block(
         &grpc_adapter,
-        Request::new(wallet::LatestBlockRequest { at_epoch_id: None }),
+        Request::new(wallet::VisibleTipBlockRequest { at_epoch_id: None }),
     )
     .await?
     .into_inner();
@@ -704,7 +711,11 @@ async fn assert_native_wallet_grpc_responses(
     .await?
     .into_inner();
 
-    assert_native_grpc_response_epoch(&latest_block, read_range.network, read_range.end_height)?;
+    assert_native_grpc_response_epoch(
+        &visible_tip_block,
+        read_range.network,
+        read_range.end_height,
+    )?;
     for compact_block_chunk in &compact_block_range {
         assert_native_grpc_response_epoch(
             compact_block_chunk,
@@ -720,8 +731,8 @@ async fn assert_native_wallet_grpc_responses(
     )?;
 
     assert_eq!(
-        latest_block
-            .latest_block
+        visible_tip_block
+            .visible_tip_block
             .ok_or_else(|| eyre!("native gRPC latest block missing metadata"))?
             .height,
         read_range.end_height
@@ -798,7 +809,7 @@ trait HasNativeGrpcChainEpoch {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch>;
 }
 
-impl HasNativeGrpcChainEpoch for wallet::LatestBlockResponse {
+impl HasNativeGrpcChainEpoch for wallet::VisibleTipBlockResponse {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
         self.chain_view
             .as_ref()
@@ -952,21 +963,21 @@ fn assert_lightwalletd_compact_block_payload(
     Ok(())
 }
 
-async fn assert_native_latest_block_response<QueryApi: WalletQueryApi>(
+async fn assert_native_visible_tip_block_response<QueryApi: WalletQueryApi>(
     wallet_query: &QueryApi,
     network: Network,
     end_height: u32,
 ) -> Result<()> {
-    let response = latest_block_response(wallet_query, None).await?;
+    let response = visible_tip_block_response(wallet_query, None).await?;
     let encoded_response = response.encode_to_vec();
-    let decoded_response = wallet::LatestBlockResponse::decode(encoded_response.as_slice())?;
+    let decoded_response = wallet::VisibleTipBlockResponse::decode(encoded_response.as_slice())?;
     let response_chain_epoch = decoded_response
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("native response missing chain epoch"))?;
-    let latest_block = decoded_response
-        .latest_block
-        .ok_or_else(|| eyre!("native response missing latest block"))?;
+    let visible_tip_block = decoded_response
+        .visible_tip_block
+        .ok_or_else(|| eyre!("native response missing visible-tip block"))?;
 
     assert_eq!(
         response_chain_epoch.network_name,
@@ -979,8 +990,8 @@ async fn assert_native_latest_block_response<QueryApi: WalletQueryApi>(
             .height,
         end_height
     );
-    assert_eq!(latest_block.height, end_height);
-    assert!(!latest_block.block_hash.is_empty());
+    assert_eq!(visible_tip_block.height, end_height);
+    assert!(!visible_tip_block.block_hash.is_empty());
     Ok(())
 }
 
@@ -1104,7 +1115,7 @@ pub(crate) fn zinder_ingest_command() -> Command {
     command
 }
 
-/// Builder for a bounded unified-ingest TOML config used by the CLI live tests.
+/// Builder for a bounded phase-driven ingest TOML config used by the CLI live tests.
 pub(crate) struct BoundedIngestConfigToml<'fields> {
     pub(crate) network_name: &'fields str,
     pub(crate) json_rpc_addr: &'fields str,
@@ -1113,10 +1124,10 @@ pub(crate) struct BoundedIngestConfigToml<'fields> {
     pub(crate) storage_path: &'fields Path,
     pub(crate) target_height: u32,
     pub(crate) request_timeout_secs: u64,
-    pub(crate) allow_near_tip_finalize: bool,
+    pub(crate) allow_reorg_window_settlement: bool,
 }
 
-/// Builder for a wallet-serving bounded unified-ingest TOML config used by the
+/// Builder for a wallet-serving bounded phase-driven ingest TOML config used by the
 /// CLI live tests.
 pub(crate) struct WalletServingIngestConfigToml<'fields> {
     pub(crate) network_name: &'fields str,
@@ -1130,7 +1141,7 @@ pub(crate) struct WalletServingIngestConfigToml<'fields> {
 
 /// Renders a `BoundedIngestConfigToml` into the TOML shape `zinder-ingest` accepts.
 ///
-/// The `[ingest.modifiers].target_height` field makes the unified loop exit
+/// The `[ingest.run_overrides].target_height` field makes the ingest loop exit
 /// with status 0 once the canonical store reaches that height.
 pub(crate) fn bounded_ingest_config_toml(
     config_toml: &BoundedIngestConfigToml<'_>,
@@ -1155,12 +1166,12 @@ path = "{}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.bulk_catchup]
+[ingest.construction]
 canonical_batch_max_blocks = 1000
 
-[ingest.modifiers]
+[ingest.run_overrides]
 target_height = {}
-allow_near_tip_finalize = {}
+allow_reorg_window_settlement = {}
 
 [ingest_control]
 listen_addr = "127.0.0.1:0"
@@ -1172,11 +1183,11 @@ listen_addr = "127.0.0.1:0"
         config_toml.node_auth_password,
         path_str(config_toml.storage_path)?,
         config_toml.target_height,
-        config_toml.allow_near_tip_finalize
+        config_toml.allow_reorg_window_settlement
     ))
 }
 
-/// Renders a wallet-serving bounded unified-ingest TOML config.
+/// Renders a wallet-serving bounded phase-driven ingest TOML config.
 ///
 /// The `coverage = "wallet-serving"` modifier instructs the loop to derive
 /// the historical floor from upstream activation heights before committing.
@@ -1203,10 +1214,10 @@ path = "{}"
 source = "zebra-json-rpc"
 reorg_window_blocks = 100
 
-[ingest.bulk_catchup]
+[ingest.construction]
 canonical_batch_max_blocks = 100
 
-[ingest.modifiers]
+[ingest.run_overrides]
 coverage = "wallet-serving"
 target_height = {}
 

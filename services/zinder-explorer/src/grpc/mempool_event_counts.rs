@@ -1,7 +1,7 @@
 //! `ExplorerQuery.MempoolEventCounts` handler.
 //!
 //! Reads the per-second counter rows written by
-//! [`zinder_derive::MempoolEventCountsConsumer`]
+//! [`zinder_materialized_views::MempoolEventCountsConsumer`]
 //! and aggregates them across the requested window.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,14 +9,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 use zinder_proto::capabilities::EXPLORER_MEMPOOL_EVENT_COUNTS_V1;
 use zinder_proto::v1::explorer::{MempoolEventCountsRequest, MempoolEventCountsResponse};
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
-use zinder_derive::{DeriveStore, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MempoolEventCountsConsumer};
+use zinder_materialized_views::{
+    MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MaterializedViewStore, MempoolEventCountsConsumer,
+};
 
 /// Minimum window size accepted by the handler.
 const MIN_WINDOW_SECONDS: u32 = 60;
@@ -32,8 +34,8 @@ const DEFAULT_WINDOW_SECONDS: u32 = 300;
 const MAX_ROWS_PER_REQUEST: usize = MAX_WINDOW_SECONDS as usize;
 
 /// Executes one `MempoolEventCounts` request.
-pub(crate) async fn handle_mempool_event_counts(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_mempool_event_counts(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MempoolEventCountsRequest>,
@@ -44,7 +46,7 @@ pub(crate) async fn handle_mempool_event_counts(
     let window_start = now_seconds.saturating_sub(u64::from(window_seconds));
     let start_key = MempoolEventCountsConsumer::key_for_second(window_start);
     let end_key = MempoolEventCountsConsumer::key_for_second(now_seconds);
-    let entries = derive_store
+    let entries = materialized_view_store
         .range_iterate_consumer(
             MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
             &start_key,
@@ -56,33 +58,30 @@ pub(crate) async fn handle_mempool_event_counts(
     let mut added_count = 0u32;
     let mut mined_count = 0u32;
     let mut invalidated_count = 0u32;
-    let mut suppressed_count = 0u32;
     for (_, payload) in entries {
-        if let Some((added, mined, invalidated, suppressed)) =
-            MempoolEventCountsConsumer::decode_row(&payload)
+        if let Some((added, mined, invalidated)) = MempoolEventCountsConsumer::decode_row(&payload)
         {
             added_count = added_count.saturating_add(added);
             mined_count = mined_count.saturating_add(mined);
             invalidated_count = invalidated_count.saturating_add(invalidated);
-            suppressed_count = suppressed_count.saturating_add(suppressed);
         }
     }
 
     let latest = wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();
     let chain_epoch = latest
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing")
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
             Some(chain_epoch),
             0,
@@ -95,7 +94,6 @@ pub(crate) async fn handle_mempool_event_counts(
         added_count,
         mined_count,
         invalidated_count,
-        suppressed_count,
     }))
 }
 

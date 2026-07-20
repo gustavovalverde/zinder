@@ -7,7 +7,7 @@ Zinder is a service-oriented Zcash indexer. Architecture, vocabulary, and bounda
 ## Where to read first
 
 - [docs/README.md](docs/README.md): full doc index with lifecycle rules.
-- [docs/architecture/service-boundaries.md](docs/architecture/service-boundaries.md): who owns what across the four runtimes (`zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`, `zinder-explorer`).
+- [docs/architecture/service-boundaries.md](docs/architecture/service-boundaries.md): who owns what across the three release services (`zinder-ingest`, `zinder-projector`, `zinder-compat-lightwalletd`) plus the `zinder-query` library and optional explorer services.
 - [docs/architecture/public-interfaces.md](docs/architecture/public-interfaces.md): the vocabulary spine (types, errors, config fields, capability strings).
 - [docs/architecture/chain-ingestion.md](docs/architecture/chain-ingestion.md): the canonical commit pipeline.
 - [docs/adrs/0003-canonical-storage-access-boundary.md](docs/adrs/0003-canonical-storage-access-boundary.md): the epoch-bound storage API, writer/reader topology, secondary catchup, and writer-status RPC.
@@ -41,7 +41,7 @@ cargo mutants --workspace --all-features \
   --file crates/zinder-store/src/chain_store.rs \
   --file crates/zinder-store/src/chain_store/validation.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'chain_event_history|finalized_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
+  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
 ```
 
 Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<test_name>)'`. Tier filter: `-E 'test(/^integration::cli::/)'`. Integration tests live in each crate's `tests/{integration,live,perf}/` submodules; the per-crate binary is `tests/acceptance.rs`.
@@ -63,9 +63,7 @@ ZINDER_TEST_LIVE=1 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, three tests skip:
-`zebra_indexer_mempool_*` and
-`mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state`.
+Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, the `zebra_indexer_mempool_*` tests skip.
 
 Testnet (Z3 stack with cookie auth):
 

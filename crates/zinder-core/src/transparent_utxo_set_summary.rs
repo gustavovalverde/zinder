@@ -3,8 +3,9 @@
 //! Aggregates the current-UTXO projection into two unambiguous totals: the
 //! number of unspent transparent outputs and the sum of their values. The
 //! aggregate is taken at the chain epoch's settled tip, where the projection
-//! holds exactly the irreversible unspent set: reorged-away creations and
-//! finalized spends are already removed below that height.
+//! holds the settled-tip unspent set under the configured reorg policy:
+//! reorged-away creations and settled spends are already removed below that height.
+//! A deeper reorg is rejected rather than treated as impossible.
 //!
 //! An optional [`TransparentUtxoSetCommitment`] binds the full unspent set to a
 //! single order-independent value under the `LtHash16` scheme: each output is
@@ -34,8 +35,8 @@ pub struct TransparentUtxoSetSummary {
     /// operator opted into the request-time fold.
     pub commitment: Option<TransparentUtxoSetCommitment>,
     /// Settled tip height the aggregate was taken at. Below this height the
-    /// projection is the irreversible unspent set, so no spend re-check or
-    /// producing-block visibility check is required.
+    /// projection is the settled-tip unspent set under the configured reorg
+    /// policy, so no spend re-check or producing-block visibility check is required.
     pub summarized_height: BlockHeight,
     /// Chain epoch visible at lookup time; bounds every field above.
     pub chain_epoch: ChainEpoch,

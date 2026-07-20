@@ -281,7 +281,7 @@ impl CommitmentTreeSizes {
 pub struct PreparedCanonicalBlock {
     /// Immutable facts computed from this source block alone.
     pub facts: CanonicalBlockFacts,
-    /// Versioned projection replay bytes encoded on the parallel prepare lane.
+    /// Versioned materialized-view replay bytes encoded on the parallel prepare lane.
     pub replay_envelope: CanonicalBlockReplayEnvelope,
     /// Retained raw blobs kept outside semantic fact identity.
     pub retained_raw_blobs: RetainedRawBlobs,
@@ -307,7 +307,7 @@ pub struct RetainedRawBlobs {
 /// Prepared canonical facts placed at an ordered commitment-tree position.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PositionedCanonicalBlock {
-    /// Immutable block-local projection facts.
+    /// Immutable block-local materialized-view facts.
     pub facts: CanonicalBlockFacts,
     /// Versioned replay envelope for `facts`.
     pub replay_envelope: CanonicalBlockReplayEnvelope,
@@ -482,9 +482,9 @@ pub fn position_canonical_block(
 
 /// Physical rows required by the current `RocksDB` writer.
 ///
-/// These redundant index shapes are deliberately private to the current-schema
+/// These redundant index shapes are deliberately private to the canonical
 /// writer boundary and are not part of the backend-neutral fact contract.
-pub(crate) struct CurrentSchemaBlockArtifacts {
+pub(crate) struct CanonicalStoreBlockArtifacts {
     pub(crate) block_header: BlockHeaderArtifact,
     pub(crate) block_blob: Option<BlockBlobArtifact>,
     pub(crate) block_transaction_index: Vec<BlockTransactionIndexArtifact>,
@@ -497,11 +497,11 @@ pub(crate) struct CurrentSchemaBlockArtifacts {
 
 /// Expands the minimal fact envelope into the redundant rows the current
 /// `RocksDB` schema still commits.
-pub(crate) fn expand_current_schema_block_artifacts(
+pub(crate) fn expand_canonical_store_block_artifacts(
     facts: CanonicalBlockFacts,
     retained_raw_blobs: RetainedRawBlobs,
-) -> Result<CurrentSchemaBlockArtifacts, CanonicalBlockConstructionError> {
-    let transparent_outputs_by_outpoint = current_schema_transparent_outputs(&facts);
+) -> Result<CanonicalStoreBlockArtifacts, CanonicalBlockConstructionError> {
+    let transparent_outputs_by_outpoint = canonical_transparent_outputs_by_outpoint(&facts);
     let CanonicalBlockFacts {
         block_header,
         transactions,
@@ -548,7 +548,7 @@ pub(crate) fn expand_current_schema_block_artifacts(
         ));
     }
 
-    Ok(CurrentSchemaBlockArtifacts {
+    Ok(CanonicalStoreBlockArtifacts {
         block_header,
         block_blob,
         block_transaction_index,
@@ -565,8 +565,8 @@ struct PreparedCanonicalTransactions {
     transaction_blobs: Vec<TransactionBlobArtifact>,
 }
 
-/// Expands block-local transparent outputs into current-schema outpoint rows.
-pub(crate) fn current_schema_transparent_outputs(
+/// Expands block-local transparent outputs into canonical outpoint rows.
+pub(crate) fn canonical_transparent_outputs_by_outpoint(
     facts: &CanonicalBlockFacts,
 ) -> Vec<TransparentOutputArtifact> {
     let block_height = facts.block_header.height;
@@ -1035,7 +1035,7 @@ mod tests {
         COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CanonicalBlockConstructionError, CommitmentTreeSizes,
         CompactOrchardAction, CompactTx, RawBlobPolicy, ShieldedProtocol,
         compact_note_ciphertext_prefix, compact_transaction_has_payload,
-        expand_current_schema_block_artifacts, position_canonical_block, prepare_canonical_block,
+        expand_canonical_store_block_artifacts, position_canonical_block, prepare_canonical_block,
     };
 
     #[test]
@@ -1043,7 +1043,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the boundary test keeps real-fixture expansion, commit, and row reads together"
     )]
-    fn current_schema_expansion_round_trips_real_fixture_rows() -> Result<(), Box<dyn Error>> {
+    fn canonical_store_expansion_round_trips_real_fixture_rows() -> Result<(), Box<dyn Error>> {
         let source_block = regtest_fixture_block()?;
         let prepared = prepare_canonical_block(
             &source_block,
@@ -1055,23 +1055,25 @@ mod tests {
         let compact_block = positioned.compact_block;
         let replay_envelope = positioned.replay_envelope;
         let tip_metadata = positioned.tip_metadata;
-        let current_schema =
-            expand_current_schema_block_artifacts(positioned.facts, positioned.retained_raw_blobs)?;
-        let location = *current_schema
+        let canonical_store_artifacts = expand_canonical_store_block_artifacts(
+            positioned.facts,
+            positioned.retained_raw_blobs,
+        )?;
+        let location = *canonical_store_artifacts
             .transaction_locations
             .first()
             .ok_or("fixture transaction location is missing")?;
-        let transaction_facts = current_schema
+        let transaction_facts = canonical_store_artifacts
             .transaction_facts
             .first()
             .cloned()
             .ok_or("fixture transaction facts are missing")?;
-        let transaction_blob = current_schema
+        let transaction_blob = canonical_store_artifacts
             .transaction_blobs
             .first()
             .cloned()
             .ok_or("fixture transaction blob is missing")?;
-        let transparent_output = current_schema
+        let transparent_output = canonical_store_artifacts
             .transparent_outputs_by_outpoint
             .first()
             .cloned()
@@ -1091,23 +1093,25 @@ mod tests {
             tip_metadata,
             created_at: UnixTimestampMillis::new(1_774_669_000_000),
         };
-        let block_blobs = current_schema.block_blob.into_iter().collect();
+        let block_blobs = canonical_store_artifacts.block_blob.into_iter().collect();
         fixture.chain_store().commit_chain_epoch(
             ChainEpochArtifacts::new(
                 chain_epoch,
-                vec![current_schema.block_header],
+                vec![canonical_store_artifacts.block_header],
                 vec![replay_envelope],
                 vec![compact_block],
             )
             .with_block_blobs(block_blobs)
-            .with_block_transaction_index(current_schema.block_transaction_index)
-            .with_transaction_locations(current_schema.transaction_locations)
-            .with_transaction_facts(current_schema.transaction_facts)
+            .with_block_transaction_index(canonical_store_artifacts.block_transaction_index)
+            .with_transaction_locations(canonical_store_artifacts.transaction_locations)
+            .with_transaction_facts(canonical_store_artifacts.transaction_facts)
             .with_transaction_intrinsic_value_balances(
-                current_schema.transaction_intrinsic_value_balances,
+                canonical_store_artifacts.transaction_intrinsic_value_balances,
             )
-            .with_transaction_blobs(current_schema.transaction_blobs)
-            .with_transparent_outputs_by_outpoint(current_schema.transparent_outputs_by_outpoint),
+            .with_transaction_blobs(canonical_store_artifacts.transaction_blobs)
+            .with_transparent_outputs_by_outpoint(
+                canonical_store_artifacts.transparent_outputs_by_outpoint,
+            ),
         )?;
 
         let reader = fixture.chain_store().current_chain_epoch_reader()?;

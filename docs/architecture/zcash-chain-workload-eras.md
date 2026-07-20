@@ -17,11 +17,6 @@ workload bands are measurement context. They can seed perf fixtures, initial
 budget expectations, and runbook interpretation, but they must not change
 consensus parsing, canonical commit semantics, or public API contracts.
 
-As of 2026-05-25, Zcash mainnet is in NU6.1. NU6.1 activated at height
-`3146400` on 2025-11-24 at 19:56 UTC. NU7 is listed as planned by the public
-Zcash upgrade page, but no NU7 activation height is part of this document's
-current evidence model.
-
 ## Design Rule
 
 Do not add "sandblasting mode", "May 2017 mode", or similar incident names to
@@ -153,64 +148,27 @@ Perf tests should capture at least these output metrics per corpus range:
 - RocksDB WAL, memtable, and compaction pressure
 - head-of-line wait time in source, block-prepare, and commit reassembly
 
-## Measured Parser Cost
+## Benchmark Method
 
-The current local validation source is the mainnet Zebra container
-`z3-mainnet-zebra-1`. Its `getblockchaininfo.upgrades` table advertises
-Overwinter `347500`, Sapling `419200`, Blossom `653600`, Heartwood `903000`,
-Canopy `1046400`, NU5 `1687104`, NU6 `2726400`, and NU6.1 `3146400`.
+Use `zinder-bench` fixed-range replay over captured ranges from the benchmark
+corpus. The current path prepares canonical records through
+`prepare_canonical_block`, persists them under the selected raw-blob policy,
+and reports source, preparation, commit, storage, and resource measurements.
+Historical one-off timings do not belong in this architecture contract because
+they bind the result to an obsolete implementation and one machine.
 
-The parser benchmark used local raw blocks from that node and ran
-`SourceBlock::from_raw_block_bytes` followed by the function then named
-`derive_block_with_raw_blob_policy(..., RawBlobPolicy::None)`. That function is
-now named `prepare_canonical_block`; the historical
-measurement still describes its pre-optimization implementation. Those values
-are the baseline because that implementation parsed the complete block twice
-and serialized plus parsed each transaction again. The current bulk source
-parses only the header before canonical preparation, which parses the complete
-block once and builds facts directly from the parsed transactions. JSON-RPC
-fetch time is excluded. The timings below are local-machine measurements, so
-they are useful for relative cost shape, not as an absolute SLA.
+Compare the same fixture digest, store state, retention policy, resource
+limits, and preparation concurrency. Use `stage_durations`,
+`replay.blocks_per_second`, `commit_fallback_reads`, logical and physical byte
+counts, and peak resident memory to locate a regression. Include the heavy
+Orchard, heavy Sapling, transparent-input, activation-boundary, and end-side
+ranges so one workload shape cannot hide a regression in another.
 
-Use `zinder-bench` fixed-range replay for comparisons after the parse-once
-change. Its `stage_durations` report makes the acceptance boundary explicit:
-compare the same captured range, store state, retention policy, and prepare
-concurrency, then require higher `replay.blocks_per_second` without increased
-`commit_fallback_reads` or peak resident memory. Keep the heavy Orchard, heavy
-Sapling, and end-side ranges in the comparison so one workload shape cannot
-hide a regression in another.
-
-| Window | Range | Component evidence | canonical block preparation timing |
-| --- | ---: | --- | --- |
-| May 2017 peak | `108089..108109` | `43,201` transparent spend references, `2,063` transparent outputs, `6.5 MB` raw block bytes | avg `3.8 ms`, p95 `15.9 ms`, max `21.0 ms` at `108106` |
-| Heavy Orchard anchor | `1708038..1708058` | `3,754` Orchard actions, `13.3 MB` raw block bytes | avg `78.4 ms`, p95 `154.1 ms`, max `235.1 ms` at `1708048` |
-| Heavy Sapling anchor | `1723234..1723254` | `7,591` Sapling outputs, `1,074` Sapling spends, `7.8 MB` raw block bytes | avg `294.4 ms`, p95 `1445.0 ms`, max `2090.3 ms` at `1723244` |
-| Sandblasting end-side sample | `2175682..2175702` | `469` Sapling outputs, `268` Orchard actions | avg `14.2 ms`, p95 `25.0 ms`, max `25.1 ms` at `2175684` |
-| NU5 boundary | `1687094..1687114` | Only `6` Orchard actions across the 21-block window | avg `2.9 ms`, p95 `8.4 ms`, max `16.3 ms` at `1687109` |
-| NU6 boundary | `2726390..2726410` | `44` Orchard actions, small raw blocks | avg `0.9 ms`, p95 `3.2 ms`, max `4.0 ms` at `2726404` |
-| NU6.1 boundary | `3146390..3146410` | `69` Orchard actions, small raw blocks | avg `1.1 ms`, p95 `3.9 ms`, max `6.3 ms` at `3146394` |
-
-Single-block anchors show the same shape:
-
-| Anchor | Raw bytes | Transactions | Dominant counts | canonical block preparation time |
-| ---: | ---: | ---: | --- | ---: |
-| `108099` | `99,149` | `11` | `551` transparent spend references | `0.8 ms` |
-| `1708048` | `1,999,370` | `96` | `552` Orchard actions | `129.7 ms` |
-| `1723244` | `1,991,912` | `469` | `1,862` Sapling outputs and `452` Sapling spends | `1742.7 ms` |
-| `2175692` | `33,424` | `16` | mixed Sapling and Orchard, much lower density | `12.6 ms` |
-| `3146400` | `1,945` | `1` | small NU6.1 activation block | `0.1 ms` |
-
-The current performance model is:
-
-- The worst sampled parser cost is not at a network-upgrade boundary. It is at
-  dense historical shielded-load blocks, especially the Sapling-heavy
-  `1723244` anchor.
-- The May 2017 range is a different workload class: transparent
-  spend-reference pressure. It is real, but it is not the dominant parser cost
-  in this sample.
-- NU5 introduces the parser and artifact shape that makes Orchard possible, but
-  the activation boundary itself is not enough to size budgets. Budgets must
-  respond to observed component density.
+Network-upgrade boundaries define parser and artifact shapes, but they do not
+size runtime budgets by themselves. The controller must respond to observed
+component density and resource pressure, especially shielded action counts,
+transparent spend references, artifact bytes, estimated writes, and commit
+queue pressure.
 
 ## Architecture Implications
 
@@ -228,7 +186,7 @@ The performance architecture should stay measurement-driven:
 4. RocksDB tuning belongs to bounded resource budgets: memtable size, WAL size,
    write batch size, flush behavior, and compaction pressure. Do not fork
    storage semantics by historical incident.
-5. Derive replay should use the same canonical facts and chain events as normal
+5. Materialized-view replay should use the same canonical facts and chain events as normal
    ingest. A historical band may explain why replay is slower, but it should
    not create a second replay contract.
 

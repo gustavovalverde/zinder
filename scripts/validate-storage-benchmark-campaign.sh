@@ -82,8 +82,8 @@ validate_report() {
       <= ([($actual | absolute), ($expected | absolute), 1] | max) * 0.000000001;
     def attributed_seconds:
       .round_trip.storage_initialization_wall_clock_seconds
-      + .round_trip.fact_preparation_wall_clock_seconds
-      + .round_trip.fact_persistence_wall_clock_seconds
+      + .round_trip.replay_preparation_wall_clock_seconds
+      + .round_trip.replay_persistence_wall_clock_seconds
       + .round_trip.index_construction_wall_clock_seconds
       + .round_trip.storage_optimization_wall_clock_seconds
       + .round_trip.validation_wall_clock_seconds
@@ -95,20 +95,20 @@ validate_report() {
       and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
       and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
     .contract_identity == "benchmark-report"
-    and .report_format_version == 2
-    and .measurement_kind == "canonical-block-facts-round-trip"
+    and .report_format_version == 3
+    and .measurement_kind == "canonical-replay-storage"
     and .storage_candidate.id == $candidate
     and .storage_candidate.canonical_engine == $engine
-    and .storage_candidate.canonical_model == "block-granular-canonical-facts"
+    and .storage_candidate.canonical_model == "block-granular-canonical-replays"
     and .storage_candidate.diagnostic_projection_engine == null
     and .storage_candidate.topology == $topology
-    and .round_trip.scope == "canonical-block-facts-fixture-round-trip"
+    and .round_trip.scope == "block-local-canonical-replay"
     and .round_trip.fixture_sequence_digest_match == true
     and .round_trip.replay_format_version == 1
     and .round_trip.semantic_replay_validated == true
     and .fixture.contract_identity == "canonical-fixture"
-    and .fixture.fixture_format_version == 1
-    and (.fixture.current_schema_oracle_artifact_schema_version > 0)
+    and .fixture.fixture_format_version == 2
+    and (.fixture.canonical_artifact_schema_version > 0)
     and (.fixture.digest_sha256 | lowercase_sha256)
     and .fixture.canonical_block_facts_digest_evidence.block_digest_version == 1
     and .fixture.canonical_block_facts_digest_evidence.sequence_digest_version == 1
@@ -142,8 +142,8 @@ validate_report() {
       (.round_trip.block_count / .round_trip.wall_clock_seconds)
     )
     and (.round_trip.storage_initialization_wall_clock_seconds | nonnegative_number)
-    and (.round_trip.fact_preparation_wall_clock_seconds | nonnegative_number)
-    and (.round_trip.fact_persistence_wall_clock_seconds | nonnegative_number)
+    and (.round_trip.replay_preparation_wall_clock_seconds | nonnegative_number)
+    and (.round_trip.replay_persistence_wall_clock_seconds | nonnegative_number)
     and (.round_trip.index_construction_wall_clock_seconds | nonnegative_number)
     and (.round_trip.storage_optimization_wall_clock_seconds | nonnegative_number)
     and (.round_trip.validation_wall_clock_seconds | nonnegative_number)
@@ -155,7 +155,7 @@ validate_report() {
       (attributed_seconds + .round_trip.unattributed_wall_clock_seconds);
       .round_trip.wall_clock_seconds
     )
-    and (.round_trip.logical_fact_bytes | positive_number)
+    and (.round_trip.logical_replay_bytes | positive_number)
     and (.round_trip.physical_storage_bytes | positive_number)
     and (.round_trip.block_prepare_concurrency > 0)
     and (.round_trip.benchmark_client_peak_rss.source | nonblank)
@@ -180,7 +180,7 @@ validate_report() {
     and (.provenance.target_arch | nonblank)
   ' "$report_path" >/dev/null || fail "$report_path is not a complete $expected_candidate report"
 
-  if [[ "$expected_candidate" == "rocksdb-fact-first" ]]; then
+  if [[ "$expected_candidate" == "rocksdb-canonical-replay-storage" ]]; then
     jq -e '
       def nonblank: type == "string" and (length > 0);
       .round_trip.storage.engine == "rocksdb"
@@ -218,12 +218,12 @@ validate_report() {
       and .round_trip.storage.ingestion_mode == "binary-copy-single-load-transaction-with-deferred-index"
       and .round_trip.storage.tables_logged == true
       and .round_trip.storage.replay_envelope_compression == "lz4"
-      and (.round_trip.storage.fact_table_bytes | positive_number)
+      and (.round_trip.storage.replay_table_bytes | positive_number)
       and (.round_trip.storage.index_bytes | positive_number)
       and (.round_trip.storage.wal_bytes | positive_number)
       and (
         .round_trip.physical_storage_bytes
-        >= (.round_trip.storage.fact_table_bytes + .round_trip.storage.index_bytes)
+        >= (.round_trip.storage.replay_table_bytes + .round_trip.storage.index_bytes)
       )
       and (.round_trip.storage.server_settings.server_version | nonblank)
       and (.round_trip.storage.server_settings.server_version_number > 0)
@@ -289,7 +289,7 @@ report_configuration() {
     if .round_trip.storage.engine == "rocksdb" then
       (.round_trip.storage | del(.external_sst_bytes))
     elif .round_trip.storage.engine == "postgres" then
-      (.round_trip.storage | del(.fact_table_bytes, .index_bytes, .wal_bytes))
+      (.round_trip.storage | del(.replay_table_bytes, .index_bytes, .wal_bytes))
     else
       error("unsupported storage engine")
     end
@@ -315,8 +315,8 @@ while IFS=$'\t' read -r rocksdb_report rocksdb_resources postgres_report postgre
   postgres_path="$(resolve_artifact_path "$postgres_report")"
   postgres_client_resources_path="$(resolve_artifact_path "$postgres_client_resources")"
   postgres_database_resources_path="$(resolve_artifact_path "$postgres_database_resources")"
-  validate_report "$rocksdb_path" "rocksdb-fact-first" "rocksdb" "rocksdb-single-host"
-  validate_report "$postgres_path" "postgres-fact-first" "postgres" "postgres-scale-out"
+  validate_report "$rocksdb_path" "rocksdb-canonical-replay-storage" "rocksdb" "rocksdb-single-host"
+  validate_report "$postgres_path" "postgres-canonical-replay-storage" "postgres" "postgres-scale-out"
 
   rocksdb_trial_id="$(jq -er '.provenance.run.trial_id' "$rocksdb_path")"
   postgres_trial_id="$(jq -er '.provenance.run.trial_id' "$postgres_path")"
@@ -537,7 +537,7 @@ while IFS=$'\t' read -r rocksdb_report rocksdb_resources postgres_report postgre
     | ($postgres[0].provenance.run) as $p
     | validated_resource_evidence(
         $rocksdb_resources[0];
-        "rocksdb-fact-first-client";
+        "rocksdb-canonical-replay-storage-client";
         $r.trial_id;
         $rocksdb[0];
         true;
@@ -547,7 +547,7 @@ while IFS=$'\t' read -r rocksdb_report rocksdb_resources postgres_report postgre
       ) as $rocksdb_resource
     | validated_resource_evidence(
         $postgres_client_resources[0];
-        "postgres-fact-first-client";
+        "postgres-canonical-replay-storage-client";
         $p.trial_id;
         $postgres[0];
         false;
@@ -557,7 +557,7 @@ while IFS=$'\t' read -r rocksdb_report rocksdb_resources postgres_report postgre
       ) as $postgres_client_resource
     | validated_resource_evidence(
         $postgres_database_resources[0];
-        "postgres-fact-first-database";
+        "postgres-canonical-replay-storage-database";
         $p.trial_id;
         $postgres[0];
         true;
@@ -619,7 +619,7 @@ while IFS=$'\t' read -r rocksdb_report rocksdb_resources postgres_report postgre
           resource_evidence: ($rocksdb_resource | del(.samples)),
           wall_clock_seconds: $rocksdb[0].round_trip.wall_clock_seconds,
           blocks_per_second: $rocksdb[0].round_trip.blocks_per_second,
-          logical_fact_bytes: $rocksdb[0].round_trip.logical_fact_bytes,
+          logical_replay_bytes: $rocksdb[0].round_trip.logical_replay_bytes,
           physical_storage_bytes: $rocksdb[0].round_trip.physical_storage_bytes,
           sampled_whole_arm_memory_peak_bytes: (
             [$rocksdb_window[].memory_current_bytes] | max
@@ -638,7 +638,7 @@ while IFS=$'\t' read -r rocksdb_report rocksdb_resources postgres_report postgre
           },
           wall_clock_seconds: $postgres[0].round_trip.wall_clock_seconds,
           blocks_per_second: $postgres[0].round_trip.blocks_per_second,
-          logical_fact_bytes: $postgres[0].round_trip.logical_fact_bytes,
+          logical_replay_bytes: $postgres[0].round_trip.logical_replay_bytes,
           physical_storage_bytes: $postgres[0].round_trip.physical_storage_bytes,
           sampled_whole_arm_memory_peak_bytes: (
             [$postgres_aligned_memory_samples[].memory_bytes] | max
@@ -820,7 +820,7 @@ jq -s \
               blocks_per_second: ([.[].round_trip.blocks_per_second] | statistics),
               physical_storage_bytes: ([.[].round_trip.physical_storage_bytes] | statistics),
               sampled_whole_arm_memory_peak_bytes: (
-                if $candidate == "rocksdb-fact-first" then
+                if $candidate == "rocksdb-canonical-replay-storage" then
                   [$chronological_trials[0][].arms.rocksdb.sampled_whole_arm_memory_peak_bytes]
                 else
                   [$chronological_trials[0][].arms.postgres.sampled_whole_arm_memory_peak_bytes]
@@ -828,7 +828,7 @@ jq -s \
                 | statistics
               ),
               sampled_whole_arm_storage_peak_bytes: (
-                if $candidate == "rocksdb-fact-first" then
+                if $candidate == "rocksdb-canonical-replay-storage" then
                   [$chronological_trials[0][].arms.rocksdb.sampled_whole_arm_storage_peak_bytes]
                 else
                   [$chronological_trials[0][].arms.postgres.sampled_whole_arm_storage_peak_bytes]

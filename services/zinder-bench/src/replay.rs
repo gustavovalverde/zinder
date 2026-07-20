@@ -12,15 +12,18 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use zinder_core::{ChainEpoch, UnixTimestampMillis, wire::encode_rpc_block_hash_hex};
-use zinder_derive::{DeriveStore, ProjectionPreset, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME};
 use zinder_ingest::{
     BulkCatchupRunConfig, CanonicalPipelineLimits, RawBlobPolicy,
     bench_support::{
         BENCH_MAX_RESPONSE_BYTES, BenchBulkCatchupParams, bench_bulk_catchup_run_config,
-        bench_derive_config,
+        bench_materialized_view_config,
     },
-    bootstrap_transparent_address_ranking, catch_up_derive_store_to_canonical,
-    open_primary_derive_store_for_canonical_with_projection_preset, run_bulk_catchup_with_store,
+    bootstrap_transparent_address_ranking, catch_up_materialized_view_store_to_canonical,
+    open_primary_materialized_view_store_for_canonical_with_materialized_view_preset,
+    run_bulk_catchup_with_store,
+};
+use zinder_materialized_views::{
+    MaterializedViewPreset, MaterializedViewStore, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION, ChainEventStreamFamily,
@@ -32,12 +35,12 @@ use crate::{
     error::BenchError,
     fixture::{FixtureManifest, FixtureNodeSource},
     report::{
-        AcceptanceThresholds, CurrentSchemaFixtureReplayMeasurements,
-        CurrentSchemaFixtureReplayReport, CurrentSchemaReplayWriterSettings, FixtureCachePolicy,
-        FixtureSummary, RocksDbResourceBudgetSummary, STORE_READ_TELEMETRY_FAMILY,
-        StartingCanonicalState, StartingCanonicalStateKind, StorageCandidateIdentity,
-        TELEMETRY_COVERAGE_TOTAL, build_current_schema_fixture_replay_report,
-        is_valid_benchmark_trial_id,
+        AcceptanceThresholds, CanonicalStoreRangeReplayMeasurements,
+        CanonicalStoreRangeReplayReport, CanonicalStoreRangeReplayWriterSettings,
+        FixtureCachePolicy, FixtureSummary, RocksDbResourceBudgetSummary,
+        STORE_READ_TELEMETRY_FAMILY, StartingCanonicalState, StartingCanonicalStateKind,
+        StorageCandidateIdentity, TELEMETRY_COVERAGE_TOTAL,
+        build_canonical_store_range_replay_report, is_valid_benchmark_trial_id,
     },
     rss::peak_rss,
 };
@@ -67,12 +70,12 @@ pub struct ReplayConfig {
     pub source_segment_delay_millis: u64,
     /// Optional canonical block-cache override in bytes (the cache-size knob).
     pub canonical_block_cache_bytes: Option<u64>,
-    /// Projection preset to replay after canonical ingest, or `None` for a
+    /// Materialized-view preset to replay after canonical ingest, or `None` for a
     /// canonical-only run.
-    pub projection_preset: Option<ProjectionPreset>,
+    pub materialized_view_preset: Option<MaterializedViewPreset>,
     /// Portion of canonical event history presented to the selected
-    /// projections.
-    pub projection_replay_scope: ProjectionReplayScope,
+    /// materialized views.
+    pub materialized_view_replay_scope: MaterializedViewReplayScope,
     /// Source revision of the measured binary, when known.
     pub software_revision: Option<String>,
     /// Campaign trial identity, paired with `fixture_cache_policy` when supplied.
@@ -138,9 +141,9 @@ impl ReplayConfig {
         let Some(_thresholds) = self.canonical_fixture_replay_thresholds else {
             return Ok(());
         };
-        if self.projection_preset.is_some() {
+        if self.materialized_view_preset.is_some() {
             return Err(BenchError::invalid_argument(
-                "canonical fixture replay thresholds require a canonical-only run without --projection-preset",
+                "canonical fixture replay thresholds require a canonical-only run without --materialized-view-preset",
             ));
         }
         require_nonblank_provenance(self.software_revision.as_deref(), "--software-revision")?;
@@ -175,19 +178,19 @@ fn require_nonblank_provenance(candidate: Option<&str>, flag: &str) -> Result<()
     Ok(())
 }
 
-/// Canonical event-history scope used for a projection benchmark arm.
+/// Canonical event-history scope used for a materialized-view benchmark arm.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ProjectionReplayScope {
-    /// Seed fresh projection cursors at the cloned store tip, then measure only
+pub enum MaterializedViewReplayScope {
+    /// Seed fresh materialized-view cursors at the cloned store tip, then measure only
     /// events produced by the captured range.
     #[default]
     FixedRange,
-    /// Start fresh projections without cursors and rebuild all retained
+    /// Start fresh materialized views without cursors and rebuild all retained
     /// canonical event history.
     RetainedHistory,
 }
 
-impl ProjectionReplayScope {
+impl MaterializedViewReplayScope {
     /// Stable report spelling for this benchmark scope.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -199,7 +202,7 @@ impl ProjectionReplayScope {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct ProjectionMeasurements {
+struct MaterializedViewMeasurements {
     wall_clock_seconds: Option<f64>,
     row_count: Option<u64>,
     event_cursor_at_tip: Option<bool>,
@@ -217,7 +220,7 @@ struct CanonicalReplayMeasurements {
 
 struct ReplayRunMeasurements {
     canonical: CanonicalReplayMeasurements,
-    projection: ProjectionMeasurements,
+    materialized_view: MaterializedViewMeasurements,
     pipeline_limits: CanonicalPipelineLimits,
     completed_at_unix_millis: u64,
 }
@@ -254,7 +257,7 @@ struct StartingCheckpointManifestEvidence {
 pub async fn replay_fixture(
     config: ReplayConfig,
     metrics_handle: Option<PrometheusHandle>,
-) -> Result<CurrentSchemaFixtureReplayReport, BenchError> {
+) -> Result<CanonicalStoreRangeReplayReport, BenchError> {
     config.validate(metrics_handle.is_some())?;
     if metrics_handle.is_some() {
         metrics::counter!(
@@ -285,7 +288,7 @@ pub async fn replay_fixture(
         manifest.from_height,
         &starting_canonical_state,
     )?;
-    let projection_replay_start_cursor = prepare_projection_replay(&config, &store)?;
+    let materialized_view_replay_start_cursor = prepare_materialized_view_replay(&config, &store)?;
 
     let run_config = benchmark_run_config(
         &config,
@@ -308,13 +311,14 @@ pub async fn replay_fixture(
             .as_ref()
             .map(|chain_epoch| hex::encode(chain_epoch.visible_tip_hash.as_bytes())),
     };
-    let projection_store = open_projection_store(&config, projection_replay_start_cursor.as_ref())?;
+    let materialized_view_store =
+        open_materialized_view_store(&config, materialized_view_replay_start_cursor.as_ref())?;
 
-    let projection_measurements = measure_projection_replay(
+    let materialized_view_measurements = measure_materialized_view_replay(
         &config.store_path,
         &store,
-        config.projection_preset,
-        projection_store,
+        config.materialized_view_preset,
+        materialized_view_store,
     )
     .await?;
     let run_completed_at_unix_millis = UnixTimestampMillis::now().value();
@@ -322,13 +326,13 @@ pub async fn replay_fixture(
     let fixture = FixtureSummary::try_from(&manifest)?;
     let run = ReplayRunMeasurements {
         canonical: canonical_measurements,
-        projection: projection_measurements,
+        materialized_view: materialized_view_measurements,
         pipeline_limits: run_config.pipeline_limits,
         completed_at_unix_millis: run_completed_at_unix_millis,
     };
     let measurements =
         assemble_replay_measurements(&config, canonical_options, starting_canonical_state, run)?;
-    Ok(build_current_schema_fixture_replay_report(
+    Ok(build_canonical_store_range_replay_report(
         fixture,
         &measurements,
         exposition.as_deref(),
@@ -432,14 +436,14 @@ fn assemble_replay_measurements(
     canonical_options: ChainStoreOptions,
     starting_canonical_state: StartingCanonicalState,
     run: ReplayRunMeasurements,
-) -> Result<CurrentSchemaFixtureReplayMeasurements, BenchError> {
+) -> Result<CanonicalStoreRangeReplayMeasurements, BenchError> {
     let ReplayRunMeasurements {
         canonical,
-        projection,
+        materialized_view,
         pipeline_limits,
         completed_at_unix_millis,
     } = run;
-    Ok(CurrentSchemaFixtureReplayMeasurements {
+    Ok(CanonicalStoreRangeReplayMeasurements {
         block_prepare_concurrency: pipeline_limits.block_prepare_concurrency.get(),
         max_response_bytes: pipeline_limits.max_response_bytes.get(),
         source_segment_max_blocks: pipeline_limits.source_segment_max_blocks.get(),
@@ -455,22 +459,24 @@ fn assemble_replay_measurements(
             .get(),
         source_segment_delay_millis: config.source_segment_delay_millis,
         canonical_writer: canonical_writer_settings(canonical_options),
-        projection_preset: config.projection_preset.map(ProjectionPreset::as_str),
-        projection_replay_scope: config
-            .projection_preset
-            .map(|_| config.projection_replay_scope.as_str()),
+        materialized_view_preset: config
+            .materialized_view_preset
+            .map(MaterializedViewPreset::as_str),
+        materialized_view_replay_scope: config
+            .materialized_view_preset
+            .map(|_| config.materialized_view_replay_scope.as_str()),
         wall_clock_seconds: canonical.wall_clock_seconds,
         starting_canonical_state,
         tip_height_after: canonical.tip_height_after,
         tip_hash_after_hex: canonical.tip_hash_after_hex,
-        projection_build_wall_clock_seconds: projection.wall_clock_seconds,
-        projection_row_count: projection.row_count,
-        projection_event_cursor_at_tip: projection.event_cursor_at_tip,
-        projection_store_bytes: projection.store_bytes,
-        projection_store_reopen_seconds: projection.reopen_seconds,
-        projection_logical_write_bytes: projection.logical_write_bytes,
+        materialized_view_build_wall_clock_seconds: materialized_view.wall_clock_seconds,
+        materialized_view_row_count: materialized_view.row_count,
+        materialized_view_event_cursor_at_tip: materialized_view.event_cursor_at_tip,
+        materialized_view_store_bytes: materialized_view.store_bytes,
+        materialized_view_store_reopen_seconds: materialized_view.reopen_seconds,
+        materialized_view_logical_write_bytes: materialized_view.logical_write_bytes,
         peak_rss: peak_rss(),
-        storage_candidate: storage_candidate_identity(config.projection_preset)?,
+        storage_candidate: storage_candidate_identity(config.materialized_view_preset)?,
         software_revision: config.software_revision.clone(),
         trial_id: config.trial_id.clone(),
         fixture_cache_policy: config.fixture_cache_policy,
@@ -509,15 +515,15 @@ fn validate_acceptance_starting_state(
 }
 
 fn storage_candidate_identity(
-    projection_preset: Option<ProjectionPreset>,
+    materialized_view_preset: Option<MaterializedViewPreset>,
 ) -> Result<StorageCandidateIdentity, BenchError> {
-    match projection_preset {
-        None => Ok(StorageCandidateIdentity::rocksdb_current_schema_oracle()),
-        Some(ProjectionPreset::Wallet | ProjectionPreset::Explorer) => {
-            Ok(StorageCandidateIdentity::rocksdb_current_schema_with_diagnostic_projections())
+    match materialized_view_preset {
+        None => Ok(StorageCandidateIdentity::rocksdb_canonical_store_range_replay()),
+        Some(MaterializedViewPreset::Wallet | MaterializedViewPreset::Explorer) => {
+            Ok(StorageCandidateIdentity::rocksdb_canonical_store_range_replay_with_diagnostic_materialized_view())
         }
         Some(_) => Err(BenchError::invalid_argument(
-            "unsupported projection preset for benchmark candidate identity",
+            "unsupported materialized-view preset for benchmark candidate identity",
         )),
     }
 }
@@ -656,8 +662,10 @@ fn open_canonical_store(
     Ok((store, options))
 }
 
-fn canonical_writer_settings(options: ChainStoreOptions) -> CurrentSchemaReplayWriterSettings {
-    CurrentSchemaReplayWriterSettings {
+fn canonical_writer_settings(
+    options: ChainStoreOptions,
+) -> CanonicalStoreRangeReplayWriterSettings {
+    CanonicalStoreRangeReplayWriterSettings {
         store_schema_version: CURRENT_STORE_SCHEMA_VERSION,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
         sync_writes: options.sync_writes,
@@ -672,88 +680,98 @@ fn canonical_writer_settings(options: ChainStoreOptions) -> CurrentSchemaReplayW
     }
 }
 
-fn prepare_projection_replay(
+fn prepare_materialized_view_replay(
     config: &ReplayConfig,
     canonical_store: &PrimaryChainStore,
 ) -> Result<Option<StreamCursorTokenV1>, BenchError> {
-    if config.projection_preset.is_none() {
+    if config.materialized_view_preset.is_none() {
         return Ok(None);
     }
-    let projection_path = DeriveStore::path_for_canonical(&config.store_path);
-    if projection_path.exists() {
+    let materialized_view_store_path =
+        MaterializedViewStore::path_for_canonical(&config.store_path);
+    if materialized_view_store_path.exists() {
         return Err(BenchError::invalid_argument(format!(
-            "projection replay requires a fresh projection store, but {} already exists; create the throwaway canonical clone without its projection subdirectory",
-            projection_path.display()
+            "materialized-view replay requires a fresh materialized-view store, but {} already exists; create the throwaway canonical clone without its materialized-views subdirectory",
+            materialized_view_store_path.display()
         )));
     }
-    if config.projection_replay_scope == ProjectionReplayScope::RetainedHistory {
+    if config.materialized_view_replay_scope == MaterializedViewReplayScope::RetainedHistory {
         return Ok(None);
     }
     canonical_store
         .resolve_chain_event_stream_start(
             &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Tip,
+            ChainEventStreamFamily::Visible,
         )
         .map(|position| position.cursor)
         .map_err(BenchError::from)
 }
 
-fn open_projection_store(
+fn open_materialized_view_store(
     config: &ReplayConfig,
     fixed_range_start_cursor: Option<&StreamCursorTokenV1>,
-) -> Result<Option<DeriveStore>, BenchError> {
-    let Some(projection_preset) = config.projection_preset else {
+) -> Result<Option<MaterializedViewStore>, BenchError> {
+    let Some(materialized_view_preset) = config.materialized_view_preset else {
         return Ok(None);
     };
-    let projection_store = open_primary_derive_store_for_canonical_with_projection_preset(
-        &config.store_path,
-        RocksDbResourceBudget::derive_writer_defaults(),
-        projection_preset,
-    )?;
-    if config.projection_replay_scope == ProjectionReplayScope::FixedRange {
-        seed_projection_consumers(&projection_store, fixed_range_start_cursor)?;
+    let materialized_view_store =
+        open_primary_materialized_view_store_for_canonical_with_materialized_view_preset(
+            &config.store_path,
+            RocksDbResourceBudget::materialized_view_writer_defaults(),
+            materialized_view_preset,
+        )?;
+    if config.materialized_view_replay_scope == MaterializedViewReplayScope::FixedRange {
+        seed_materialized_view_consumers(&materialized_view_store, fixed_range_start_cursor)?;
     }
-    Ok(Some(projection_store))
+    Ok(Some(materialized_view_store))
 }
 
-async fn measure_projection_replay(
+async fn measure_materialized_view_replay(
     store_path: &Path,
     canonical_store: &PrimaryChainStore,
-    projection_preset: Option<ProjectionPreset>,
-    projection_store: Option<DeriveStore>,
-) -> Result<ProjectionMeasurements, BenchError> {
-    let (Some(projection_preset), Some(projection_store)) = (projection_preset, projection_store)
+    materialized_view_preset: Option<MaterializedViewPreset>,
+    materialized_view_store: Option<MaterializedViewStore>,
+) -> Result<MaterializedViewMeasurements, BenchError> {
+    let (Some(materialized_view_preset), Some(materialized_view_store)) =
+        (materialized_view_preset, materialized_view_store)
     else {
-        return Ok(ProjectionMeasurements::default());
+        return Ok(MaterializedViewMeasurements::default());
     };
-    let projection_build_started_at = Instant::now();
-    let logical_write_bytes_before = projection_store.logical_write_bytes();
-    catch_up_derive_store_to_canonical(canonical_store, &projection_store, bench_derive_config())
-        .await?;
-    if projection_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME) {
-        let _ = bootstrap_transparent_address_ranking(canonical_store, &projection_store).await?;
+    let materialized_view_build_started_at = Instant::now();
+    let logical_write_bytes_before = materialized_view_store.logical_write_bytes();
+    catch_up_materialized_view_store_to_canonical(
+        canonical_store,
+        &materialized_view_store,
+        bench_materialized_view_config(),
+    )
+    .await?;
+    if materialized_view_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME) {
+        let _ = bootstrap_transparent_address_ranking(canonical_store, &materialized_view_store)
+            .await?;
     }
-    let wall_clock_seconds = projection_build_started_at.elapsed().as_secs_f64();
-    let logical_write_bytes = projection_store
+    let wall_clock_seconds = materialized_view_build_started_at.elapsed().as_secs_f64();
+    let logical_write_bytes = materialized_view_store
         .logical_write_bytes()
         .saturating_sub(logical_write_bytes_before);
-    projection_store.refresh_rocksdb_resource_metrics();
-    let row_count = projection_row_count(&projection_store, projection_preset)?;
-    let projection_path = DeriveStore::path_for_canonical(store_path);
-    let store_bytes = directory_bytes(&projection_path)?;
-    drop(projection_store);
+    materialized_view_store.refresh_rocksdb_resource_metrics();
+    let row_count =
+        materialized_view_row_count(&materialized_view_store, materialized_view_preset)?;
+    let materialized_view_store_path = MaterializedViewStore::path_for_canonical(store_path);
+    let store_bytes = directory_bytes(&materialized_view_store_path)?;
+    drop(materialized_view_store);
 
     let reopen_started_at = Instant::now();
-    let reopened = open_primary_derive_store_for_canonical_with_projection_preset(
-        store_path,
-        RocksDbResourceBudget::derive_writer_defaults(),
-        projection_preset,
-    )?;
+    let reopened =
+        open_primary_materialized_view_store_for_canonical_with_materialized_view_preset(
+            store_path,
+            RocksDbResourceBudget::materialized_view_writer_defaults(),
+            materialized_view_preset,
+        )?;
     let reopen_seconds = reopen_started_at.elapsed().as_secs_f64();
-    validate_projection_reached_canonical_tip(canonical_store, &reopened)?;
+    validate_materialized_view_reached_canonical_tip(canonical_store, &reopened)?;
     drop(reopened);
 
-    Ok(ProjectionMeasurements {
+    Ok(MaterializedViewMeasurements {
         wall_clock_seconds: Some(wall_clock_seconds),
         row_count: Some(row_count),
         event_cursor_at_tip: Some(true),
@@ -763,29 +781,29 @@ async fn measure_projection_replay(
     })
 }
 
-fn validate_projection_reached_canonical_tip(
+fn validate_materialized_view_reached_canonical_tip(
     canonical_store: &PrimaryChainStore,
-    projection_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
 ) -> Result<(), BenchError> {
     let expected_cursor = canonical_store
         .resolve_chain_event_stream_start(
             &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Tip,
+            ChainEventStreamFamily::Visible,
         )?
         .cursor;
-    let consumer_names = projection_store
+    let consumer_names = materialized_view_store
         .chain_event_consumer_names()
-        .chain(projection_store.event_only_chain_event_consumer_names());
+        .chain(materialized_view_store.event_only_chain_event_consumer_names());
     for consumer_name in consumer_names {
-        let consumer_cursor = projection_store.get_chain_event_cursor(consumer_name)?;
+        let consumer_cursor = materialized_view_store.get_chain_event_cursor(consumer_name)?;
         let cursor_matches = match (&expected_cursor, &consumer_cursor) {
             (None, None) => true,
             (Some(expected), Some(actual)) => expected.as_bytes() == actual,
             _ => false,
         };
         if !cursor_matches {
-            return Err(BenchError::projection_build_incomplete(format!(
-                "projection {} did not reach the canonical event tip",
+            return Err(BenchError::materialized_view_build_incomplete(format!(
+                "materialized view {} did not reach the canonical event tip",
                 consumer_name.as_str()
             )));
         }
@@ -793,48 +811,48 @@ fn validate_projection_reached_canonical_tip(
     Ok(())
 }
 
-/// Seeds every selected projection consumer at the canonical store's current
+/// Seeds every selected materialized-view consumer at the canonical store's current
 /// event cursor so a fixed-range benchmark excludes earlier retained history.
 ///
-/// The projection store must be fresh. Production recovery must never call this
+/// The materialized-view store must be fresh. Production recovery must never call this
 /// helper because it intentionally declares earlier history out of scope.
-pub fn seed_projection_replay_at_canonical_tip(
+pub fn seed_materialized_view_replay_at_canonical_tip(
     canonical_store: &PrimaryChainStore,
-    projection_store: &zinder_derive::DeriveStore,
+    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
 ) -> Result<Option<StreamCursorTokenV1>, BenchError> {
     let cursor = canonical_store
         .resolve_chain_event_stream_start(
             &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Tip,
+            ChainEventStreamFamily::Visible,
         )?
         .cursor;
-    seed_projection_consumers(projection_store, cursor.as_ref())?;
+    seed_materialized_view_consumers(materialized_view_store, cursor.as_ref())?;
     Ok(cursor)
 }
 
-fn seed_projection_consumers(
-    projection_store: &zinder_derive::DeriveStore,
+fn seed_materialized_view_consumers(
+    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
     cursor: Option<&StreamCursorTokenV1>,
 ) -> Result<(), BenchError> {
-    let consumer_names = projection_store
+    let consumer_names = materialized_view_store
         .chain_event_consumer_names()
         .filter(|name| *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
-        .chain(projection_store.event_only_chain_event_consumer_names())
+        .chain(materialized_view_store.event_only_chain_event_consumer_names())
         .collect::<Vec<_>>();
     for consumer_name in &consumer_names {
-        if projection_store
+        if materialized_view_store
             .get_chain_event_cursor(*consumer_name)?
             .is_some()
         {
             return Err(BenchError::invalid_argument(
-                "fixed-range projection replay requires a fresh projection store",
+                "fixed-range materialized-view replay requires a fresh materialized-view store",
             ));
         }
     }
 
     if let Some(cursor) = cursor {
         for consumer_name in consumer_names {
-            projection_store.put_chain_event_cursor(consumer_name, cursor.as_bytes())?;
+            materialized_view_store.put_chain_event_cursor(consumer_name, cursor.as_bytes())?;
         }
     }
     Ok(())
@@ -856,15 +874,15 @@ fn validate_starting_tip(
     }
 }
 
-fn projection_row_count(
-    projection_store: &zinder_derive::DeriveStore,
-    projection_preset: ProjectionPreset,
+fn materialized_view_row_count(
+    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
+    materialized_view_preset: MaterializedViewPreset,
 ) -> Result<u64, BenchError> {
     let mut row_count = 0_u64;
-    for schema in projection_preset.consumer_schemas() {
+    for schema in materialized_view_preset.consumer_schemas() {
         for column_family in schema.column_families {
-            row_count =
-                row_count.saturating_add(projection_store.consumer_row_count(column_family)?);
+            row_count = row_count
+                .saturating_add(materialized_view_store.consumer_row_count(column_family)?);
         }
     }
     Ok(row_count)

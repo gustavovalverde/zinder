@@ -47,7 +47,6 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         "{stdout}"
     );
     assert!(stdout.contains("[storage.canonical.rocksdb]"), "{stdout}");
-    assert!(stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
     assert!(stdout.contains("[wallet]"), "{stdout}");
     assert!(
         stdout.contains(&format!("path = \"{}\"", path_str(&wallet_path)?)),
@@ -60,6 +59,7 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         )),
         "{stdout}"
     );
+    assert!(stdout.contains("[wallet.rocksdb]"), "{stdout}");
     assert!(stdout.contains("[ingest_control]"), "{stdout}");
     assert!(
         stdout.contains("addr = \"http://127.0.0.1:9100\""),
@@ -244,26 +244,6 @@ fn nested_or_lexically_aliased_storage_roots_are_rejected_before_binding() -> ey
 }
 
 #[test]
-fn legacy_storage_path_override_is_rejected() -> eyre::Result<()> {
-    let output = zinder_compat_command()
-        .args([
-            "--print-config",
-            "--storage-path",
-            "/tmp/zinder-compat-legacy",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("unexpected argument '--storage-path'"),
-        "{stderr}"
-    );
-
-    Ok(())
-}
-
-#[test]
 fn ingest_only_section_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("compat-node-source-store");
@@ -287,15 +267,15 @@ fn ingest_only_section_is_rejected() -> eyre::Result<()> {
 }
 
 #[test]
-fn derive_storage_section_is_accepted() -> eyre::Result<()> {
+fn wallet_rocksdb_section_is_accepted() -> eyre::Result<()> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-derive-store");
-    let secondary_path = tempdir.path().join("compat-derive-secondary");
-    let wallet_path = tempdir.path().join("compat-derive-wallet");
+    let storage_path = tempdir.path().join("compat-canonical");
+    let secondary_path = tempdir.path().join("compat-canonical-secondary");
+    let wallet_path = tempdir.path().join("compat-wallet-rocksdb");
     let config_path = tempdir.path().join("zinder-compat.toml");
     fs::write(
         &config_path,
-        compat_config_with_derive_storage_toml(&storage_path, &secondary_path, &wallet_path)?,
+        compat_config_with_wallet_rocksdb_toml(&storage_path, &secondary_path, &wallet_path)?,
     )?;
 
     let output = zinder_compat_command()
@@ -305,10 +285,35 @@ fn derive_storage_section_is_accepted() -> eyre::Result<()> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stdout.contains("[storage.derive.rocksdb]"), "{stdout}");
+    assert!(stdout.contains("[wallet.rocksdb]"), "{stdout}");
     assert!(stdout.contains("block_cache_bytes = 134217728"), "{stdout}");
     assert!(!stderr.contains("ERROR"), "{stderr}");
 
+    Ok(())
+}
+
+#[test]
+fn unknown_storage_subsection_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("compat-canonical");
+    let secondary_path = tempdir.path().join("compat-canonical-secondary");
+    let wallet_path = tempdir.path().join("compat-wallet");
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "{}\n[storage.unsupported.rocksdb]\nblock_cache_bytes = 134217728\n",
+            compat_config_toml(&storage_path, &secondary_path, &wallet_path)?
+        ),
+    )?;
+
+    let output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("unknown field `unsupported`"), "{stderr}");
     Ok(())
 }
 
@@ -340,7 +345,7 @@ listen_addr = "127.0.0.1:9067"
     ))
 }
 
-fn compat_config_with_derive_storage_toml(
+fn compat_config_with_wallet_rocksdb_toml(
     storage_path: &Path,
     secondary_path: &Path,
     wallet_path: &Path,
@@ -358,7 +363,7 @@ secondary_path = "{}"
 path = "{}"
 secondary_path = "{}"
 
-[storage.derive.rocksdb]
+[wallet.rocksdb]
 block_cache_bytes = 134217728
 
 [compat]

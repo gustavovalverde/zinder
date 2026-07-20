@@ -11,21 +11,23 @@ use zinder_core::{
     BlockId, CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, Network,
     UnixTimestampMillis,
 };
-use zinder_rocksdb::VariableValueSortEvidence;
+use zinder_rocksdb_bulk_load::VariableValueSortEvidence;
 use zinder_store::{
     CanonicalReplayScan, CanonicalStoreError, CanonicalStoreReadyEvidence,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
-    ProjectionBuildLease, ProjectionBuildLeaseRequest, ProjectionBuildOwner,
-    WalletCanonicalSourceIdentity, WalletProjectionAccumulator, WalletProjectionDigest,
+    WalletCanonicalSourceIdentity, WalletProjectionAccumulator, WalletProjectionBuildLease,
+    WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner, WalletProjectionDigest,
     WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
     WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition, WalletUtxoSetSummary,
 };
 
 use crate::{
     RocksDbWalletBuildStore, RocksDbWalletError, RocksDbWalletStore,
-    projection_load::{PreparedWalletProjectionLoad, ProjectionLoadConfig, write_projection_ssts},
+    projection_load::{
+        PreparedWalletProjectionLoad, WalletProjectionLoadConfig, write_projection_ssts,
+    },
     store::{RocksDbWalletBuilder, WalletColdValidationConfig},
 };
 
@@ -77,7 +79,7 @@ pub struct WalletBuildLeaseHeartbeat {
 /// Explicit lease input for one fixed-tip build invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WalletProjectionBuildLeaseExecution {
-    lease_request: ProjectionBuildLeaseRequest,
+    lease_request: WalletProjectionBuildLeaseRequest,
     initial_now: UnixTimestampMillis,
 }
 
@@ -85,7 +87,7 @@ impl WalletProjectionBuildLeaseExecution {
     /// Binds the lease request and caller-observed initial clock to one build.
     #[must_use]
     pub const fn new(
-        lease_request: ProjectionBuildLeaseRequest,
+        lease_request: WalletProjectionBuildLeaseRequest,
         initial_now: UnixTimestampMillis,
     ) -> Self {
         Self {
@@ -96,7 +98,7 @@ impl WalletProjectionBuildLeaseExecution {
 
     /// Returns the initial durable ownership request.
     #[must_use]
-    pub const fn lease_request(self) -> ProjectionBuildLeaseRequest {
+    pub const fn lease_request(self) -> WalletProjectionBuildLeaseRequest {
         self.lease_request
     }
 
@@ -191,7 +193,7 @@ impl WalletProjectionReplaySource for RocksDbCanonicalSecondary {
 /// rejects publication before the wallet control record can become READY.
 pub fn validate_wallet_projection_pre_promotion_fence<Source>(
     canonical_store: &Source,
-    lease: ProjectionBuildLease,
+    lease: WalletProjectionBuildLease,
 ) -> Result<(), RocksDbWalletError>
 where
     Source: WalletProjectionReplaySource + ?Sized,
@@ -360,7 +362,7 @@ struct FailedWalletBuildLeaseCleanup {
     wallet_path: PathBuf,
     network: Network,
     resource_budget: RocksDbResourceBudget,
-    lease: Option<ProjectionBuildLease>,
+    lease: Option<WalletProjectionBuildLease>,
     now: UnixTimestampMillis,
 }
 
@@ -380,7 +382,7 @@ impl FailedWalletBuildLeaseCleanup {
         }
     }
 
-    fn arm(&mut self, lease: ProjectionBuildLease, now: UnixTimestampMillis) {
+    fn arm(&mut self, lease: WalletProjectionBuildLease, now: UnixTimestampMillis) {
         self.lease = Some(lease);
         self.now = now;
     }
@@ -410,11 +412,11 @@ impl FailedWalletBuildLeaseCleanup {
             // the control record, so this failed build must not clear it.
             Ok(())
             | Err(
-                RocksDbWalletError::ProjectionBuildLeaseExpired { .. }
-                | RocksDbWalletError::ProjectionBuildLeaseMissing
-                | RocksDbWalletError::ProjectionBuildLeaseOwnerMismatch { .. }
-                | RocksDbWalletError::ProjectionBuildLeaseGenerationMismatch { .. }
-                | RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch { .. },
+                RocksDbWalletError::WalletProjectionBuildLeaseExpired { .. }
+                | RocksDbWalletError::WalletProjectionBuildLeaseMissing
+                | RocksDbWalletError::WalletProjectionBuildLeaseOwnerMismatch { .. }
+                | RocksDbWalletError::WalletProjectionBuildLeaseGenerationMismatch { .. }
+                | RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch { .. },
             ) => Ok(()),
             Err(error) => Err(error),
         }
@@ -454,7 +456,7 @@ where
     let canonical_ready = canonical_store.wallet_projection_ready_evidence();
     let source_identity = canonical_source_identity(&canonical_ready);
     let now = UnixTimestampMillis::now();
-    let lease_request = ProjectionBuildLeaseRequest::new(
+    let lease_request = WalletProjectionBuildLeaseRequest::new(
         default_build_owner(now),
         source_identity,
         WalletProjectionRetainedEventAnchor::new(canonical_ready.visible_event_sequence),
@@ -481,13 +483,13 @@ pub fn build_wallet_from_canonical_with_lease<Source>(
     canonical_store: &Source,
     wallet_path: impl AsRef<Path>,
     options: RocksDbWalletBuildOptions,
-    lease_request: ProjectionBuildLeaseRequest,
+    lease_request: WalletProjectionBuildLeaseRequest,
     now: UnixTimestampMillis,
 ) -> Result<RocksDbWalletBuildOutcome, RocksDbWalletError>
 where
     Source: WalletProjectionReplaySource + ?Sized,
 {
-    let mut default_heartbeat = |_: WalletBuildLeasePhase, lease: ProjectionBuildLease| {
+    let mut default_heartbeat = |_: WalletBuildLeasePhase, lease: WalletProjectionBuildLease| {
         let now = UnixTimestampMillis::now();
         Ok(default_build_lease_heartbeat(now, lease.expires_at()))
     };
@@ -520,7 +522,7 @@ where
     Source: WalletProjectionReplaySource + ?Sized,
     Heartbeat: FnMut(
         WalletBuildLeasePhase,
-        zinder_wallet_projection::ProjectionBuildLease,
+        zinder_wallet_projection::WalletProjectionBuildLease,
     ) -> Result<WalletBuildLeaseHeartbeat, RocksDbWalletError>,
 {
     let lease_request = execution.lease_request();
@@ -537,7 +539,7 @@ where
     let source_identity = canonical_source_identity(&canonical_ready);
     if lease_request.pinned_canonical_anchor() != source_identity {
         return Err(
-            RocksDbWalletError::ProjectionBuildLeaseCanonicalAnchorMismatch {
+            RocksDbWalletError::WalletProjectionBuildLeaseCanonicalAnchorMismatch {
                 reason: "requested canonical anchor differs from the source READY fence",
             },
         );
@@ -568,7 +570,7 @@ where
 
         let data_options = builder.data_options();
         let mut prepared = write_projection_ssts(
-            ProjectionLoadConfig {
+            WalletProjectionLoadConfig {
                 staging_path: staging.path(),
                 options: &data_options,
                 network,
@@ -738,11 +740,11 @@ fn canonical_source_identity(
     )
 }
 
-fn default_build_owner(now: UnixTimestampMillis) -> ProjectionBuildOwner {
+fn default_build_owner(now: UnixTimestampMillis) -> WalletProjectionBuildOwner {
     let mut owner = [0_u8; 16];
     owner[..8].copy_from_slice(&now.value().to_be_bytes());
     owner[8..12].copy_from_slice(&std::process::id().to_be_bytes());
-    ProjectionBuildOwner::from_bytes(owner)
+    WalletProjectionBuildOwner::from_bytes(owner)
 }
 
 fn validate_canonical_fence(

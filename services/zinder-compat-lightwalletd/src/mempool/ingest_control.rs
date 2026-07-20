@@ -21,7 +21,7 @@
 //! (Caddy, nginx) bound N at the proxy edge; Zinder does not enforce a
 //! process-wide cap.
 //! [`spawn_ingest_control_tip_change_publisher`] runs a separate session-per-
-//! reconnect loop for `ChainEvents`, with a 500 ms backoff between attempts
+//! reconnect loop for `VisibleChainEvents`, with a 500 ms backoff between attempts
 //! so a writer restart does not drive a tight reconnect loop.
 
 use std::sync::Arc;
@@ -32,10 +32,7 @@ use tokio::sync::{OnceCell, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
-use zinder_proto::v1::{
-    ingest::ingest_control_client::IngestControlClient,
-    wallet::{self, MempoolEventStreamFamily},
-};
+use zinder_proto::v1::{ingest::ingest_control_client::IngestControlClient, wallet};
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
     EventStreamStartPosition, StreamCursorTokenV1, event_stream_start_message,
@@ -50,7 +47,7 @@ use super::surface::{
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
-/// Reconnect delay after a `chain_events` session ends without an explicit shutdown.
+/// Reconnect delay after a visible-chain-events session ends without an explicit shutdown.
 ///
 /// Short enough to recover quickly from a writer restart, long enough that a
 /// tight reconnect loop does not hammer the writer when it actively rejects
@@ -165,7 +162,6 @@ impl MempoolSurface for IngestControlMempoolSurface {
         let response = client
             .mempool_events(wallet::MempoolEventsRequest {
                 start: Some(event_stream_start_message(&start)),
-                family: MempoolEventStreamFamily::Mempool as i32,
             })
             .await
             .map_err(|status| MempoolSurfaceError::Unavailable {
@@ -239,7 +235,7 @@ impl TipChangeWatcher for WatchTipChangeWatcher {
     }
 }
 
-/// Spawns a task that consumes `IngestControl.chain_events` and publishes
+/// Spawns a task that consumes `IngestControl.VisibleChainEvents` and publishes
 /// committed event sequences to a `watch::Sender<u64>`.
 ///
 /// Returns a watcher view over the same channel. Drop the
@@ -284,13 +280,9 @@ async fn run_ingest_control_tip_change_session(
         }
     };
     let response_outcome = client
-        .chain_events(Request::new(wallet::ChainEventsRequest {
-            start: Some(event_stream_start_message(
-                &EventStreamStartPosition::LiveTail,
-            )),
-            family: wallet::ChainEventStreamFamily::Tip as i32,
-            address_filter: Vec::new(),
-        }))
+        .visible_chain_events(Request::new(event_stream_start_message(
+            &EventStreamStartPosition::LiveTail,
+        )))
         .await;
     let response = match response_outcome {
         Ok(response) => response,
@@ -299,7 +291,7 @@ async fn run_ingest_control_tip_change_session(
                 target: "zinder::compat_lightwalletd",
                 event = "tip_change_publisher_subscribe_failed",
                 error = %error,
-                "tip-change publisher chain_events subscribe failed; will retry"
+                "tip-change publisher visible-chain-events subscription failed; will retry"
             );
             return;
         }
@@ -315,7 +307,7 @@ async fn run_ingest_control_tip_change_session(
                     target: "zinder::compat_lightwalletd",
                     event = "tip_change_publisher_stream_error",
                     error = %error,
-                    "tip-change publisher chain_events stream errored; will reconnect"
+                    "tip-change publisher visible-chain-events stream errored; will reconnect"
                 );
                 return;
             }

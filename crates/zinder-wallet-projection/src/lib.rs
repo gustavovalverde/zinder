@@ -1,7 +1,7 @@
 //! Wallet projection contracts independent of storage engines.
 //!
 //! This crate owns the exact durable keys and values needed by wallet-facing
-//! reads. It does not depend on canonical-store readers or the legacy derive
+//! reads. It does not depend on canonical-store readers or the materialized-view
 //! plane.
 
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
@@ -15,11 +15,11 @@ mod serial_oracle;
 
 pub use contract_error::WalletProjectionContractError;
 pub use control::{
-    ProjectionBuildLease, ProjectionBuildLeaseRequest, ProjectionBuildOwner,
-    WalletCanonicalSourceIdentity, WalletProjectionBuildPlan, WalletProjectionBuildState,
+    WalletCanonicalSourceIdentity, WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest,
+    WalletProjectionBuildOwner, WalletProjectionBuildPlan, WalletProjectionBuildState,
     WalletProjectionDigest, WalletProjectionEventCursor, WalletProjectionFamilyRowCounts,
     WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
-    WalletProjectionSourcePosition, WalletStoreControl, WalletUtxoSetSummary,
+    WalletProjectionSourcePosition, WalletStoreControlRecord, WalletUtxoSetSummary,
 };
 pub use digest::{
     WALLET_PROJECTION_ACCUMULATOR_LEN, WALLET_PROJECTION_ACCUMULATOR_VERSION,
@@ -39,7 +39,7 @@ pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 1;
 pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 2;
 
 /// Version of the durable projection-build lease embedded in store control.
-pub const PROJECTION_BUILD_LEASE_VERSION: u16 = 1;
+pub const WALLET_PROJECTION_BUILD_LEASE_VERSION: u16 = 1;
 
 /// Canonical store schema admitted by this projection schema.
 pub const REQUIRED_CANONICAL_STORE_SCHEMA_VERSION: u16 = 4;

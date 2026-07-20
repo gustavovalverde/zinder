@@ -54,8 +54,8 @@ fn explorer_freshness_carries_chain_view_with_every_axis() -> eyre::Result<()> {
                 committed_height: Some(2_530_000),
                 estimated_height: Some(2_544_375),
             }),
-            derive: Some(wallet::DeriveStatus {
-                health: wallet::DeriveHealth::CatchingUp as i32,
+            materialized_views: Some(wallet::MaterializedViewStatus {
+                health: wallet::MaterializedViewHealth::CatchingUp as i32,
                 indexed_height: 2_529_999,
                 lag_blocks: 1,
                 observed_at_millis: 1_774_670_400_000,
@@ -88,7 +88,7 @@ fn explorer_freshness_carries_chain_view_with_every_axis() -> eyre::Result<()> {
     Ok(())
 }
 
-/// An absent `indexed_tip` means "derive head unknown", never "at tip"; the
+/// An absent `indexed_tip` means "materialized-view head unknown", never "at tip"; the
 /// proto3 optional message survives the round trip as `None`.
 #[test]
 fn explorer_freshness_absent_indexed_tip_means_unknown() -> eyre::Result<()> {
@@ -97,7 +97,7 @@ fn explorer_freshness_absent_indexed_tip_means_unknown() -> eyre::Result<()> {
             chain_epoch: Some(wallet::ChainEpoch::default()),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         snapshot_age_millis: 0,
         capability_version: EXPLORER_OVERVIEW_SNAPSHOT_V1.to_owned(),
@@ -219,8 +219,8 @@ fn block_production_time_range_round_trips_request_coverage_and_read_fence() -> 
         }),
         read_fence: Some(explorer::BlockProductionTimeRangeReadFence {
             chain_epoch_id: 47,
-            projection_revision: 9,
-            projection_tip: Some(wallet::BlockTip {
+            materialized_view_revision: 9,
+            materialized_view_tip: Some(wallet::BlockTip {
                 height: 2_530_000,
                 hash: "cd".repeat(32),
             }),
@@ -249,11 +249,13 @@ fn block_production_time_range_round_trips_request_coverage_and_read_fence() -> 
         .read_fence
         .ok_or_else(|| eyre!("block-production read fence missing after round-trip"))?;
     assert_eq!(read_fence.chain_epoch_id, 47);
-    assert_eq!(read_fence.projection_revision, 9);
+    assert_eq!(read_fence.materialized_view_revision, 9);
     assert_eq!(
         read_fence
-            .projection_tip
-            .ok_or_else(|| eyre!("block-production projection tip missing after round-trip"))?
+            .materialized_view_tip
+            .ok_or_else(|| eyre!(
+                "block-production materialized-view tip missing after round-trip"
+            ))?
             .height,
         2_530_000
     );
@@ -333,7 +335,7 @@ fn transaction_detail_response_fixture() -> explorer::TransactionDetailResponse 
                         block_hash: "cd".repeat(32),
                         tx_index_in_block: 1,
                     }),
-                    details: Some(wallet::MinedDetails {
+                    chain_context: Some(wallet::MinedTransactionChainContext {
                         consensus_branch_id: 0xc2d6_d0b4,
                         block_time: 1_774_670_000,
                         confirmations: 12,
@@ -374,36 +376,6 @@ fn transaction_detail_response_fixture() -> explorer::TransactionDetailResponse 
         }],
         intrinsic_value_balances: None,
     }
-}
-
-#[test]
-fn transaction_detail_response_carries_conflicting_location() -> eyre::Result<()> {
-    let response = explorer::TransactionDetailResponse {
-        freshness: None,
-        facts: None,
-        location: Some(wallet::TransactionLocation {
-            location: Some(wallet::transaction_location::Location::Conflicting(
-                wallet::ConflictingChainTransaction {},
-            )),
-        }),
-        paid_fee_zat: None,
-        prevout_resolution_status: 0,
-        transparent_inputs: Vec::new(),
-        transparent_outputs: Vec::new(),
-        intrinsic_value_balances: None,
-    };
-    let decoded = round_trip(&response)?;
-
-    let location = decoded
-        .location
-        .and_then(|location| location.location)
-        .ok_or_else(|| eyre!("location oneof missing"))?;
-    assert!(matches!(
-        location,
-        wallet::transaction_location::Location::Conflicting(_)
-    ));
-
-    Ok(())
 }
 
 /// A missing canonical fact artifact remains absent from a block row.
@@ -716,7 +688,7 @@ fn utxo_set_summary_response_round_trips_through_prost() -> eyre::Result<()> {
                 chain_epoch: Some(wallet::ChainEpoch::default()),
                 indexed_tip: None,
                 upstream_tip: None,
-                derive: None,
+                materialized_views: None,
             }),
             snapshot_age_millis: 0,
             capability_version: EXPLORER_UTXO_SET_SUMMARY_V1.to_owned(),

@@ -28,10 +28,10 @@ use zinder_store::{
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
-    ProjectionBuildLeaseRequest, ProjectionBuildOwner, WALLET_PROJECTION_STORE_IDENTITY,
-    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
-    WalletOutpointKey, WalletProjectionFamilyRowCounts, WalletProjectionRetainedEventAnchor,
-    WalletProjectionSourcePosition,
+    WALLET_PROJECTION_STORE_IDENTITY, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
+    WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLeaseRequest,
+    WalletProjectionBuildOwner, WalletProjectionFamilyRowCounts,
+    WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildStore,
@@ -420,8 +420,8 @@ fn closed_canonical_primary_secondary_build_matches_primary_oracle()
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
-    let lease_request = ProjectionBuildLeaseRequest::new(
-        ProjectionBuildOwner::from_bytes([0x77; 16]),
+    let lease_request = WalletProjectionBuildLeaseRequest::new(
+        WalletProjectionBuildOwner::from_bytes([0x77; 16]),
         primary_report.canonical_source_identity(),
         WalletProjectionRetainedEventAnchor::new(1),
         UnixTimestampMillis::new(u64::MAX),
@@ -1166,8 +1166,8 @@ fn build_lease_execution(
         ),
         ready.sequence_checkpoint.through(),
     );
-    let lease_request = ProjectionBuildLeaseRequest::new(
-        ProjectionBuildOwner::from_bytes([0x91; 16]),
+    let lease_request = WalletProjectionBuildLeaseRequest::new(
+        WalletProjectionBuildOwner::from_bytes([0x91; 16]),
         source,
         WalletProjectionRetainedEventAnchor::new(ready.visible_event_sequence),
         UnixTimestampMillis::new(u64::MAX),

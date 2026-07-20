@@ -451,11 +451,11 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
 
-    // Bootstrap a stub chain epoch at the checkpoint height. `safe_tip_height`
+    // Bootstrap a stub chain epoch at the checkpoint height. `settled_tip_height`
     // is pinned to the checkpoint, which is the load-bearing invariant for the
     // reorg-below-checkpoint defense: any subsequent Replace whose `from_height`
     // would rewind through the checkpoint runs into `minimum_reorg_height =
-    // safe_tip_height + 1` and surfaces `StoreError::ReorgWindowExceeded`.
+    // settled_tip_height + 1` and surfaces `StoreError::ReorgWindowExceeded`.
     let checkpoint_height = BlockHeight::new(1_000);
     let checkpoint_hash = block_hash(1_000);
     let bootstrap_chain_epoch = ChainEpoch {
@@ -472,7 +472,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
     store.commit_artifactless_checkpoint(bootstrap_chain_epoch)?;
 
     // Attempt a reorg whose `from_height` rewinds onto the checkpoint height
-    // itself. `minimum_reorg_height = safe_tip_height + 1 = 1001`, so 1000 is
+    // itself. `minimum_reorg_height = settled_tip_height + 1 = 1001`, so 1000 is
     // already below the floor and must be rejected. Artifacts at 1000 are
     // supplied only to clear `validate_artifact_presence`; the reorg-window
     // check fires before any coverage validation.
@@ -524,12 +524,12 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
             error,
             StoreError::ReorgWindowExceeded {
                 attempted_from_height: attempted,
-                safe_tip_height: safe_tip,
+                settled_tip_height: settled_tip,
                 ..
-            } if attempted == attempted_from_height && safe_tip == checkpoint_height
+            } if attempted == attempted_from_height && settled_tip == checkpoint_height
         ),
         "expected ReorgWindowExceeded with attempted={attempted_from_height:?} \
-         and safe_tip={checkpoint_height:?}; got {error:?}"
+         and settled_tip={checkpoint_height:?}; got {error:?}"
     );
 
     Ok(())

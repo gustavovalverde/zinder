@@ -67,8 +67,8 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     let wallet_query = WalletQuery::new(store, (), Arc::clone(&activations));
 
     let measurement_start = std::time::Instant::now();
-    let _latest = wallet_query.latest_block(None).await?;
-    let latest_block_micros = measurement_start.elapsed().as_micros();
+    let _latest = wallet_query.visible_tip_block(None).await?;
+    let visible_tip_block_micros = measurement_start.elapsed().as_micros();
 
     let measurement_start = std::time::Instant::now();
     let _block = wallet_query
@@ -96,7 +96,7 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     // Pick a real txid from the bulk-caught-up chain by reading the coinbase at
     // height 1 through the indexed compact block. Then call `transaction()`
     // repeatedly so the average covers the artifact-lookup + header-parse
-    // + consensus-branch-id path that powers `MinedDetails` enrichment.
+    // + consensus-branch-id path that powers `MinedTransactionChainContext` enrichment.
     // Header parsing only succeeds against real Zcash block bytes, so this
     // measurement only fires on live nodes (the synthetic test fixtures
     // produce non-parseable raw block bytes).
@@ -119,12 +119,12 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
     )]
     {
         eprintln!(
-            "live_latency_baseline network={} tip={} latest_block={}us compact_block_at={}us \
+            "live_latency_baseline network={} tip={} visible_tip_block={}us compact_block_at={}us \
              compact_block_range_50={}us tree_state_at={}us transaction_avg={}us \
              (n={} total={}us)",
             encode_zinder_native_chain_name(env.network()),
             tip_height.value(),
-            latest_block_micros,
+            visible_tip_block_micros,
             compact_block_at_micros,
             compact_block_range_50_micros,
             tree_state_at_micros,
@@ -191,8 +191,8 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
     let wallet_query = WalletQuery::new(store, (), Arc::clone(&activations));
 
     let measurement_start = std::time::Instant::now();
-    let _latest = wallet_query.latest_block(None).await?;
-    let latest_block_micros = measurement_start.elapsed().as_micros();
+    let _latest = wallet_query.visible_tip_block(None).await?;
+    let visible_tip_block_micros = measurement_start.elapsed().as_micros();
 
     let measurement_start = std::time::Instant::now();
     let _first_block = wallet_query.compact_block_at(from_height, None).await?;
@@ -235,14 +235,14 @@ async fn checkpoint_bounded_read_endpoint_latency_baseline() -> Result<()> {
     {
         eprintln!(
             "live_checkpoint_latency_baseline network={} tip={} checkpoint_height={} \
-             bulk_catchup={}us latest_block={}us compact_block_at_first={}us \
+             bulk_catchup={}us visible_tip_block={}us compact_block_at_first={}us \
              compact_block_at_tip={}us compact_block_range_{}={}us tree_state_at={}us \
              transaction_avg={}us (n={} total={}us)",
             encode_zinder_native_chain_name(env.network()),
             tip_height.value(),
             checkpoint_height.value(),
             bulk_catchup_micros,
-            latest_block_micros,
+            visible_tip_block_micros,
             compact_block_at_first_micros,
             compact_block_at_tip_micros,
             HOSTED_BACKFILL_DEPTH_BLOCKS,

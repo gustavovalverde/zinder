@@ -137,7 +137,7 @@ impl CanonicalStoreAdmissionExpectation {
     }
 }
 
-/// One admitted READY canonical version-1 `RocksDB` store.
+/// One admitted READY canonical `RocksDB` store.
 ///
 /// Construction is owned exclusively by [`super::RocksDbCanonicalBuilder`].
 /// This serving type cannot represent or reopen an unpublished BUILDING store.
@@ -173,7 +173,7 @@ impl RocksDbCanonicalStore {
         }
     }
 
-    /// Opens an existing READY version-1 canonical store after exact admission.
+    /// Opens an existing READY canonical store after exact admission.
     ///
     /// Admission validates the complete column-family set, singleton control
     /// key, identity, schema, exact network-upgrade activation table, workload,
@@ -599,7 +599,7 @@ fn validate_exact_column_families(
         return Err(CanonicalStoreError::admission(
             path,
             format!(
-                "column families {observed:?} do not exactly match required canonical version-1 set {expected:?}"
+                "column families {observed:?} do not exactly match required canonical set {expected:?}"
             ),
         ));
     }
@@ -809,10 +809,10 @@ mod tests {
     }
 
     #[test]
-    fn old_looking_schema_one_path_is_refused_without_adoption()
+    fn unadmitted_schema_marker_is_refused_without_adoption()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
-        let path = temporary.path().join("old-schema-one");
+        let path = temporary.path().join("unadmitted-schema-marker");
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
@@ -831,7 +831,7 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
-        .ok_or("old-looking schema should be rejected")?;
+        .ok_or("unadmitted schema marker should be rejected")?;
         assert!(matches!(
             error,
             CanonicalStoreError::AdmissionRefused { .. }

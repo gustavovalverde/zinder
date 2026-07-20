@@ -7,7 +7,7 @@ The wallet data plane is the part of Zinder that wallets and wallet-like applica
 The `zinder-query` library owns the wallet request, adapter, and error contract.
 `zinder-projector` owns the durable wallet state, and
 `zinder-compat-lightwalletd` is the only deployed wallet-facing runtime in the
-first fact-first release. The standalone native query binary is deleted.
+current release. The standalone native query binary is deleted.
 
 Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
 this plane is consumer-neutral. Mobile SDKs, lightwalletd clients, native
@@ -19,7 +19,7 @@ tree-state anchors, chain epochs, and typed errors.
 It should provide:
 
 - Compact block range APIs.
-- Latest block and chain metadata APIs.
+- Visible-tip block and chain metadata APIs.
 - Transaction lookup APIs where compatible with Zcash wallet expectations.
 - Tree state APIs required for wallet sync.
 - Sapling and Orchard subtree root APIs required for batched wallet scanning.
@@ -65,7 +65,7 @@ This avoids two problems:
 
 If a compact block artifact is missing, `zinder-query` should return a typed unavailable error or readiness failure. It should not fetch the block from the upstream node and build a one-off response.
 
-The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the derive-plane axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlocksInRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
+The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the materialized-view axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlocksInRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
 
 A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resolves to the visible epoch at request time; present resolves the canonical epoch by id. The store keys the epoch by id, so a pinned read either resolves it or returns `CHAIN_EPOCH_PIN_UNAVAILABLE` when the id is no longer retained. `ChainEpoch` is a response-only descriptor nested in `ChainView`; the request never echoes the epoch body.
 
@@ -125,7 +125,7 @@ resolved hash. Both the gRPC adapter and `zinder-client::ChainIndex` expose
 The same resolver backs the typed block-header read model:
 `WalletQuery.BlockHeaderBySelector` (capability
 `wallet.read.block_header_by_selector_v1`) returns `BlockHeaderResponse {
-chain_view, block_header }` where `BlockHeaderInfo` is the Zinder-native
+chain_view, block_header }` where `BlockHeader` is the Zinder-native
 header shape (block identity, previous hash, merkle root, commitment bytes,
 block time, bits, nonce, version). The shape does not re-export Zebra's
 JSON-RPC `getblockheader` object or the lightwalletd compact block header. The
@@ -147,25 +147,23 @@ Native transaction lookup returns typed transaction status. The public Rust shap
 `zinder_core::TxStatus` and the native gRPC surface mirrors it through
 `WalletQuery.Transaction(TransactionRequest) returns (TransactionStatusResponse)`
 under capability `wallet.read.transaction_by_id_v1`. The response carries the
-shared `TransactionLocation` oneof on its `location` field; the oneof has three
+shared `TransactionLocation` oneof on its `location` field; the oneof has two
 arms. `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because typed errors do not consume oneof variants:
 
-- `mined`: `MinedTransaction { MinedBlockLocation location; MinedDetails details; bytes raw_transaction_bytes }`.
+- `mined`: `MinedTransaction { MinedBlockLocation location; MinedTransactionChainContext chain_context; bytes raw_transaction_bytes }`.
 - `in_mempool`: `MempoolTransaction { bytes payload_bytes; int64 first_seen_unix_seconds }`.
-- `conflicting`: `ConflictingChainTransaction {}` (reserved shape; status
-  is the signal, fields are reserved for future non-best-chain lookup).
 
 `TransactionLocation` is one message defined in `wallet.proto` and embedded by
 every read surface that answers "where does this transaction live", including
 `ExplorerQuery.TransactionDetail`, so a consumer writes one match shape for both
-planes and the explorer detail carries the `conflicting` arm rather than dropping it.
+planes.
 
-The mined variant carries epoch-bound `MinedDetails {
+The mined variant carries epoch-bound `MinedTransactionChainContext {
 consensus_branch_id, block_time, confirmations }`. These fields are
 response/read-model values, not persisted transaction-artifact fields.
-`MinedDetails::from_response_epoch(epoch, mined_height, consensus_branch_id,
+`MinedTransactionChainContext::from_response_epoch(epoch, mined_height, consensus_branch_id,
 block_time)` is the **only** public constructor in `zinder-core`. Callers
-cannot construct `MinedDetails` without the response's `ChainEpoch` in scope,
+cannot construct `MinedTransactionChainContext` without the response's `ChainEpoch` in scope,
 so the racy `tip_height - block_height` confirmations computation is
 prevented by construction. `consensus_branch_id` is resolved from the
 process-startup `Arc<NetworkUpgradeActivations>` discovered via
@@ -219,7 +217,7 @@ Wallet sync needs durable chain-state notifications. `WalletQuery.ChainEvents` i
 
 The contract:
 
-- Each `ChainEventEnvelope` carries the cross-plane `ChainView` at field tag 3 (`chain_view`). `chain_view.chain_epoch` is the epoch visible after the event, and `chain_view.chain_epoch.settled_tip.height` is the safe tip height that was true for the event. The envelope carries no separate `safe_tip_height` field.
+- Each `ChainEventEnvelope` carries the cross-plane `ChainView` at field tag 3 (`chain_view`). `chain_view.chain_epoch` is the epoch visible after the event, and `chain_view.chain_epoch.settled_tip.height` is the settled tip height that was true for the event. The envelope carries no separate `settled_tip_height` field.
 - The cursor is the `StreamCursorTokenV1` bytes documented in [Chain events](chain-events.md). Clients persist the exact bytes returned in the previous envelope and resume strictly after that cursor.
 - The request carries a required `EventStreamStart start` oneof per [ADR-0027](../adrs/0027-event-stream-start-positions.md): `after_cursor` resumes strictly after the supplied cursor, `earliest_retained` replays from the retention floor (the bootstrap path for a fresh wallet install), and `live_tail` resolves once at subscribe time to a server-minted head cursor so only events applied after subscription are delivered. An unset start is `INVALID_ARGUMENT`.
 - With `after_cursor`, the cursor's encoded family is authoritative; a non-default request `family` that disagrees is `INVALID_ARGUMENT`. `earliest_retained` and `live_tail` resolve within the request's `family` field.
@@ -229,9 +227,9 @@ The contract:
 
 `ChainCommitted` and `ChainReorged` are the two event variants. `ChainReorged` carries both the reverted range and the replacement range, so a wallet receiving a reorg event truncates its local view at the reverted boundary and resumes from the replacement range without making additional indexer calls. If a client reconnects with a cursor whose branch was reorged out, the server resolves the fork point from the cursor's back-spaced locator against the canonical block index and delivers a `ChainReorged` envelope before resuming, synthesizing it when the real reorg event has aged out of retention. A wallet recovers from a reconnect reorg without a full re-derive and never observes silent branch changes. A divergence deeper than the locator cap degrades to the typed `EventCursorExpired`. See [ADR-0025](../adrs/0025-chain-event-reconnect-reorg-locator.md).
 
-Two cursor varieties are advertised under capability string `wallet.events.chain_v1`: `Tip` and `Safe`. Tip consumers receive every envelope including reorgs. Safe consumers receive only commits past the safe tip and never see `ChainReorged`. The safe cursor family is represented in the cursor body, not by a separate `WalletQuery.ChainEventSafeAnchor` RPC.
+Two cursor varieties are advertised under capability string `wallet.events.chain_v1`: `Visible` and `Settled`. Visible consumers receive every envelope including reorgs. Settled consumers receive only non-reorg commits entirely at or below the settled tip. The settled cursor family is represented in the cursor body, not by a separate RPC.
 
-The lightwalletd compatibility shim does not expose this subscription. The vendored `CompactTxStreamer` proto has no equivalent method, and ADR-0004 forbids inventing parallel surfaces in the compat layer. Wallet clients on the lightwalletd contract continue to use `GetLatestBlock` polling. Native Zinder clients receive the subscription contract from day one.
+The lightwalletd compatibility shim does not expose this subscription. The vendored `CompactTxStreamer` proto has no equivalent method, and ADR-0004 forbids inventing parallel surfaces in the compat layer. Wallet clients on the lightwalletd contract use `GetLatestBlock` polling, while native Zinder clients use the subscription contract.
 
 ## Mempool Snapshot and Subscription
 
@@ -252,7 +250,7 @@ observed wallet-run details.
 
 Three architectural consequences follow from that map:
 
-- The canonical path is `NodeSource -> MempoolSourceEvent -> MempoolIndex + MempoolEventLog -> WalletQuery -> adapters`. Compatibility methods translate over that path; they do not own their own mempool cache.
+- The canonical path is `NodeSource -> MempoolSourceEvent -> MempoolIndex + durable mempool event history -> WalletQuery -> adapters`. Compatibility methods translate over that path; they do not own their own mempool cache.
 - Source observations must become hydrated `MempoolEntry` records before they reach public APIs. Zebra's streaming mempool event carries transaction hash and auth digest, so raw transaction fetching and compact-transaction construction belong in the source/ingest path, not in `zinder-compat-lightwalletd`.
 - The native mempool surface does not inherit lightwalletd's stream-close lifecycle. `MempoolEvents` stream end means disconnect or shutdown. Chain-tip changes are delivered through `ChainEvents`.
 - The public server-observed type is `MempoolEntry`, not `PendingTransaction`. A pending transaction is a wallet-local UX state: it can include a transaction that was created locally but never accepted by the network.
@@ -280,8 +278,7 @@ mirror the `ChainIndex` methods:
 
 - `WalletQuery.Transaction` returns the typed `TransactionStatusResponse`
   carrying the shared `TransactionLocation` oneof
-  (`mined`/`in_mempool`/`conflicting`, with `NotFound` mapped to gRPC
-  `NOT_FOUND`).
+  (`mined`/`in_mempool`, with `NotFound` mapped to gRPC `NOT_FOUND`).
 - `WalletQuery.TransparentMempoolOutputsByAddress` (capability
   `wallet.mempool.transparent_outputs_by_address_v1`) returns unmined
   transparent outputs that fund one transparent address.
@@ -313,7 +310,7 @@ compact-transaction payloads locally for shielded interest.
 Block hash is source-driven enrichment: the source backends extract the mined
 block hash from the upstream node's observation (Zebra streaming
 `MempoolChange::Mined` plus `getrawtransaction`, JSON-RPC polling
-`getrawtransaction`'s `blockhash` field) so the orchestrator passes through
+`getrawtransaction`'s `blockhash` field) so the live mempool owner publishes
 authoritative bytes without a chain-store-not-yet-caught-up race. Consumers
 that track a pending transaction through mining receive the full mined block
 identity in one cursor delivery.
@@ -402,9 +399,8 @@ Operators must only publish a `zinder-compat-lightwalletd` deployment with
 a store with transaction blobs retained and both
 `transparent_address_transaction_history` and `transparent_outpoint_spend`
 covering the canonical tip. The wallet-serving coverage profile
-(`ingest.modifiers.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`) is
-one supported way to select transaction retention; `projection_preset =
-"wallet"` alone is not. A
+(`ingest.run_overrides.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`) is
+the supported way to select transaction retention. A
 recent-checkpoint or tip-bootstrapped store may have the address-output index
 family enabled but still lack the historical rows needed by wallet birthdays and
 resync anchors; that deployment posture is not wallet-serving.
@@ -422,21 +418,32 @@ Transaction-history reads return the txids that touch a given transparent
 address within an inclusive height range. The native surface is
 `WalletQuery.TransparentAddressTxIdsInRange`, a server-streamed page-bounded
 read; the matching Rust API is
-`ChainIndex::transparent_address_tx_ids_in_range`. The derive projection is a
-current read model, so callers use the `chain_view.chain_epoch` returned with
-each chunk as the response binding instead of supplying an `at_epoch_id` pin. The
-compatibility adapter implements `GetTaddressTxids` and
-`GetTaddressTransactions` over the same native method.
-
-Both surfaces are backed by the derive-owned transparent-address transaction
-history projection. Canonical ingest writes typed transaction, transparent
-output, and transparent spend facts; the derive tailer materializes one row per
+`ChainIndex::transparent_address_tx_ids_in_range`. This native path is backed by
+the materialized-view-owned transparent-address transaction-history consumer.
+It is a current read model, so callers use the `chain_view.chain_epoch` returned
+with each chunk as the response binding instead of supplying an `at_epoch_id`
+pin. Canonical ingest writes typed transaction, transparent-output, and
+transparent-spend facts; the materialized-view tailer writes one row per
 `(address, transaction)` pair after the corresponding chain event is durable.
+
 Capability `wallet.address.transparent_history_v1` is advertised only when the
-query service can open a derive store that has caught up to the canonical tip.
-Cursor-based pagination uses the derive projection's opaque cursor; the
-`descending` bit selects newest-first iteration. Cursor cadence: only the
-terminal chunk carries a non-empty resume cursor.
+query service can open a materialized-view store whose history-consumer cursor
+exactly matches the canonical visible-chain event fence. The handler reads that
+cursor and the history rows from one materialized-view snapshot, so a
+same-height reorg or secondary catch-up race fails closed instead of mixing
+branches. Cursor-based pagination binds the opaque cursor to the same visible
+chain fence; resuming after a reorg fails with `FAILED_PRECONDITION`. The
+`descending` bit selects newest-first iteration, and only the terminal chunk
+carries a non-empty resume cursor.
+
+The compatibility adapter implements `GetTaddressTxids` and
+`GetTaddressTransactions` through `LightwalletdServingQuery`. That path reads
+the transparent history already present in the admitted wallet projection,
+alongside the canonical half of the same `WalletServingReadPair`; it does not
+depend on the optional materialized-view store. Its ascending page cursor binds
+the wallet row key to the exact `WalletCanonicalSourceIdentity` that issued the
+page. If the publisher installs another serving pair between pages, resumption
+fails with `FAILED_PRECONDITION` instead of combining rows from two sources.
 
 The full projection path is the canonical worked example in
 [Extending artifacts §A worked example: transparent address transaction history](extending-artifacts.md#a-worked-example-transparent-address-transaction-history).
@@ -462,7 +469,7 @@ The prevout-resolution surface is native-only. `CompactTxStreamer` has no prevou
 
 Reverse-spend resolution is the inverse of prevout resolution: given an `OutPoint`, it returns where that output was spent rather than the output itself. This is the getspentinfo-equivalent surface. Two RPCs cover the canonical and mempool chain views; a full getspentinfo composes both (this RPC for confirmed spends, the mempool RPC for unmined):
 
-- `WalletQuery.TransparentSpendsByOutpoint(TransparentSpendsByOutpointRequest) returns (TransparentSpendsByOutpointResponse)` resolves outpoints to their confirmed spend, arbitrarily far back: the answer is durable, not scoped to the reorg window. Capability `wallet.read.transparent_spends_by_outpoint_v1` is always advertised because the canonical spend-fact index is present on every wallet-plane deployment. The handler reads the `transparent_spend_fact` table through the epoch-bound `transparent_spend_facts_by_outpoints` reader; pinned reads (`at_epoch_id`) verify each spend's producing-block visibility against the requested epoch. Canonical misses are union-routed to the durable `transparent_outpoint_spend` derive projection per [ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md). That projection derives the spent outpoint and spender identity from the child transaction input plus its mined location, so a child retained above a checkpoint still records a spend whose parent output is below it. Parent-output hydration is not required. A projection hit is surfaced only when its spend settled at or below the pinned epoch's settled tip and its stored block hash still matches the retained canonical header at that height, so a row from a reorged-out branch never surfaces as the spender. If canonical retention has deleted spend facts above the projection's durable height, the read refuses with the derive-lag vocabulary instead of answering incompletely. If real deletion has occurred but the query handle has no derive store, the read refuses with `DERIVE_PROJECTION_UNAVAILABLE`; it never converts an ambiguous miss into an absent spender. A store that never deleted a fact keeps the canonical-only absent semantics.
+- `WalletQuery.TransparentSpendsByOutpoint(TransparentSpendsByOutpointRequest) returns (TransparentSpendsByOutpointResponse)` resolves outpoints to their confirmed spend, arbitrarily far back: the answer is durable, not scoped to the reorg window. Capability `wallet.read.transparent_spends_by_outpoint_v1` is always advertised because the canonical spend-fact index is present on every wallet-plane deployment. The handler reads the `transparent_spend_fact` table through the epoch-bound `transparent_spend_facts_by_outpoints` reader; pinned reads (`at_epoch_id`) verify each spend's producing-block visibility against the requested epoch. Canonical misses are union-routed to the durable `transparent_outpoint_spend` materialized view per [ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md). That projection derives the spent outpoint and spender identity from the child transaction input plus its mined location, so a child retained above a checkpoint still records a spend whose parent output is below it. Parent-output hydration is not required. A projection hit is surfaced only when its spend settled at or below the pinned epoch's settled tip and its stored block hash still matches the retained canonical header at that height, so a row from a reorged-out branch never surfaces as the spender. If canonical retention has deleted spend facts above the projection's durable height, the read refuses with `MATERIALIZED_VIEW_UNAVAILABLE` instead of answering incompletely. If real deletion has occurred but the query handle has no materialized-view store, the same error prevents an ambiguous miss from becoming an absent spender. A store that never deleted a fact keeps the canonical-only absent semantics.
 - `WalletQuery.TransparentMempoolSpendsByOutpoint(TransparentMempoolSpendsByOutpointRequest) returns (TransparentMempoolSpendsByOutpointResponse)` resolves outpoints to their unmined spend in the writer's live mempool index. Capability `wallet.mempool.transparent_spends_by_outpoint_v1`.
 
 The canonical response binds to a `ChainEpoch`, then carries `repeated TransparentSpend spends`. Each `TransparentSpend` carries the request's `spent_outpoint`, the `spending_transaction_id` (RPC byte order), the `input_index` of the spend within the spending transaction, and a `BlockTip spending_block` (height plus RPC-form hash of the block that mined the spend). The spent output's value and script are intentionally omitted: a consumer wanting them already has `TransparentOutputsByOutpoint`. Outpoints with no spend visible at the bound epoch and no durably recorded spender produce no entry; consumers key results by `spent_outpoint`. Absence alone never proves that an arbitrary outpoint exists and is unspent: `TransparentUnspentOutputsByOutpoint` is the direct durable spentness authority per [ADR-0026](../adrs/0026-utxo-set-commitment.md). A consumer that already holds the canonical output fact, such as `ExplorerQuery.TransactionDetail`, may interpret a successful complete lookup's absent spender as unspent at that epoch. Duplicate request outpoints collapse to one entry. Coinbase inputs spend no prevout and never appear in the spend-fact index; the coinbase sentinel outpoint is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter. One request is capped at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024`, identical to the prevout surface; callers with larger known output sets must issue epoch-pinned chunks and verify the complete epoch identity across every response.
@@ -485,7 +492,7 @@ The native surface is `WalletQuery.ChainValuePoolsAtTip(ChainValuePoolsAtTipRequ
 
 The response binds to the writer-visible `ChainEpoch`, carries `source_tip: BlockTip`, and preserves `repeated ChainValuePool pools` in upstream order. `source_tip` is the `blocks` plus `bestblockhash` pair returned by the same `getblockchaininfo` response as the pool totals. A caller accepting the snapshot as canonical compares both its height and hash with the intended canonical tip; height equality alone is not sufficient across a reorg. Each pool entry carries `id`, `monitored`, and optional `chain_value_zat`. The list-shaped contract is intentional: consumers can render known pools by id without forcing Zinder to drop or rename future consensus pools.
 
-`zinder-query` does not open an upstream-node connection for this method. It proxies through `IngestControl.ChainValuePoolsAtTip`, because the ingest writer owns the source handle and the source capability snapshot. Storage-only or unproxied query deployments reject the call with `UNAVAILABLE`; writers whose source lacks `chain_value_pools` reject with `FAILED_PRECONDITION`.
+`zinder-query` does not open an upstream-node connection for this method. It proxies through `IngestControl.ChainValuePoolsAtTip`, because the ingest writer owns the source handle and the source capability snapshot. A `WalletQuery` adapter without an ingest-control proxy rejects the call with `UNAVAILABLE`; writers whose source lacks `chain_value_pools` reject with `FAILED_PRECONDITION`.
 
 This live snapshot is a prerequisite fact, not a value-pool history or value-flow projection. Historical pool totals and per-period movements remain separate future consumers with independent coverage and replay semantics.
 
@@ -505,7 +512,7 @@ The `ChainIndex` Rust API exposes `transparent_address_balance(addresses)` retur
 
 ## Capability Discovery
 
-`WalletQuery.ServerInfo` returns a `ServerCapabilities` descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). Capability strings are exact-match; clients gate features on capability strings such as `wallet.events.chain_v1` rather than on Zinder version. New methods land with new capability strings; deprecated capabilities continue to be advertised alongside their replacement until the documented removal version. The descriptor's `node` field is reserved for upstream-node capability snapshots, but storage-only `zinder-query` deployments leave it empty unless a runtime handoff supplies source probe results.
+`WalletQuery.ServerInfo` returns a `ServerCapabilities` descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). Capability strings are exact-match; clients gate features on capability strings such as `wallet.events.chain_v1` rather than on Zinder version. The descriptor's `node` field is reserved for upstream-node capability snapshots; an adapter constructed without source-probe results leaves it empty.
 
 ## Native Rust API
 
@@ -521,7 +528,7 @@ Transaction broadcast is a network operation, not a canonical chain commit.
 
 - Forward the raw transaction to a configured network or upstream node path.
 - Advertise `wallet.broadcast.transaction_v1` only after the configured source probe reports `transaction_broadcast`.
-- Return `TransactionBroadcastResult` with accepted, duplicate, invalid-encoding, rejected, or unknown outcomes.
+- Return `TransactionBroadcastOutcome` with accepted, duplicate, invalid-encoding, queued, rejected, or unknown outcomes.
 - Avoid writing canonical chain state.
 - Rely on ingestion to observe the transaction later in mempool or block data.
 
@@ -538,7 +545,7 @@ Regtest can prove forwarding, typed rejection mapping, and the no-storage-mutati
 
 ## Compatibility
 
-`zinder-compat-lightwalletd` serves the vendored `CompactTxStreamer` proto from `zinder_proto::compat::lightwalletd` by translating `WalletQueryApi`. The full responsibility list, allowed request shapes, error mapping, and test surface are owned by [Protocol boundary §Lightwalletd Compatibility](protocol-boundary.md#lightwalletd-compatibility); native `WalletQueryApi` remains the primary API and new functionality lands there first.
+`zinder-compat-lightwalletd` serves the vendored `CompactTxStreamer` proto from `zinder_proto::compat::lightwalletd` by translating `LightwalletdQueryApi`. The full responsibility list, allowed request shapes, error mapping, and test surface are owned by [Protocol boundary §Lightwalletd Compatibility](protocol-boundary.md#lightwalletd-compatibility); native `WalletQueryApi` remains the primary API and new functionality lands there first.
 
 v1 wallet APIs target self-hosted, single-operator deployments backed by a configured upstream node. The v1 binaries do not implement TLS termination, authentication, rate limiting, or quota accounting; an operator who needs any of those terminates them at a load balancer or reverse proxy in front of Zinder. Public-internet hosting requirements are out of v1 scope.
 
@@ -568,7 +575,7 @@ A deployment may claim Android SDK or Zodl compatibility only when:
 - The serving store contains the subtree-root history required by fresh wallet
   bootstrap and tree-state history for every anchor height a supported wallet
   flow can request, including create, resync, and restore/import flows. Use
-  `zinder-ingest --wallet-serving` (or `ingest.modifiers.coverage = "wallet-serving"`)
+  `zinder-ingest --wallet-serving` (or `ingest.run_overrides.coverage = "wallet-serving"`)
   for this serving profile; recent checkpoints are validation fixtures, not
   wallet-serving stores.
 - The transparent output surface in [§Transparent Address Outputs](#transparent-address-outputs)
@@ -596,7 +603,7 @@ For example, a compact block range response should bind:
 - End height.
 - Tip hash.
 - Tip height.
-- Safe tip height.
+- Settled tip height.
 - Artifact schema version.
 - Subtree-root range or cursor when subtree data is returned.
 
@@ -606,54 +613,21 @@ If the chain tip changes while the request is executing, the response should sti
 
 `lightwalletd` compatibility is the floor for wallet-sync performance, not the target. Zinder publishes P50, P99, and worst-case budgets for hot wallet endpoints and gates `GetBlockRange`-equivalent behavior in CI.
 
-### Published Budgets (calibration target)
+### Enforced Regression Budgets
 
-The first published numbers are calibration targets, not strict limits. They will promote to strict CI gates after two consecutive releases stabilize them.
+The `ci-perf` profile runs deterministic regression checks from
+`services/zinder-query/tests/perf/perf_smoke.rs`. A 1,000-block compact range
+must complete within 2 seconds, a 1,000-block full-block stream within 5
+seconds, and a visible-tip read within 250 milliseconds. The full-block stream
+also caps its channel at 16 chunks, so peak buffering cannot scale with the
+requested range. These are deliberately generous CI ceilings, not percentile
+claims about production hardware.
 
-The "regtest baseline" column records observed times from `services/zinder-ingest/tests/live/latency.rs::read_endpoint_latency_baseline` against a live Zebra regtest with 101 coinbase-only blocks. These are sanity-floor numbers; mainnet blocks carry real shielded payloads.
-
-The endpoint-specific mainnet columns record observed times from
-`services/zinder-ingest/tests/live/bulk_catchup.rs::bulk_catchup_last_1000_blocks_from_checkpoint`
-after bulk catching up the last 1000 mainnet blocks from a checkpoint at
-`tip - 1000`. Each cell aggregates 6 single-shot observations across separate
-test runs (5 warm, 1 with a cold first-call cache effect): "P50" is the median,
-"P99" is approximated by the maximum because n is too small to derive a true
-99th percentile.
-
-| Endpoint | Range / Shape | Regtest baseline (one observation) | Mainnet P50 (n=6) | Mainnet P99 (n=6, max-of-sample) | Mainnet worst-case (n=6) |
-| -------- | ------------- | ---------------------------------- | ----------------- | -------------------------------- | ------------------------ |
-| `latest_block` | single read | ~325 µs | ~48 µs | ~113 µs | ~113 µs |
-| `compact_block_at` | one block | ~133 µs | ~40 µs | ~59 µs | ~59 µs |
-| `compact_block_range` | 1 block | <1 ms | ~27 µs | ~37 µs | ~37 µs |
-| `compact_block_range` | 10 blocks | <1 ms | ~57 µs | ~80 µs | ~80 µs |
-| `compact_block_range` | 50 blocks | ~915 µs | ~179 µs | ~205 µs | ~205 µs |
-| `compact_block_range` | 1000 blocks | <2 s (synthetic) | ~3.07 ms | ~3.26 ms | ~3.26 ms |
-| `tree_state_checkpoint_at_or_before` | one height | ~97 µs | ~58 µs | ~69 µs | ~69 µs |
-| `subtree_roots` | 1..=8 entries from checkpoint | n/a | ~11 µs | ~12 µs | ~12 µs |
-
-The mainnet `subtree_roots` row times the checkpoint-bootstrapped read shape: querying from `start_index = checkpoint_completed_subtree_count` with `max_entries = 8`. Subtree roots completed before the checkpoint are not in the store; operators must seed them out-of-band if a wallet needs them.
-
-The report-based mainnet baseline below comes from
-`scripts/observability-smoke.sh calibrate` against a synced local mainnet Zebra
-on 2026-04-28. It verifies checkpoint bulk catchup, checkpoint backup restore,
-native wallet gRPC, lightwalletd-compatible gRPC, readiness gauges, source
-RPC metrics, store-read metrics, RocksDB property gauges, and Prometheus alert
-rule loading. The current sample count is intentionally small because it proves
-the harness and captures a release-readiness anchor; release signoff should run
-the same command with at least 6 samples.
-
-| Operational metric | Mainnet P50 (n=2) | Mainnet P99 (n=2, max-of-sample) | Mainnet worst-case (n=2) |
-| ------------------ | ----------------- | -------------------------------- | ------------------------ |
-| `bulk_catchup_seconds` | 13.204 s | 13.243 s | 13.243 s |
-| `wallet_query_p95_max_seconds` | 0.742 ms | 1.053 ms | 1.053 ms |
-| `node_rpc_p95_max_seconds` | 4.118 ms | 4.228 ms | 4.228 ms |
-| `store_read_p95_max_seconds` | 0.510 ms | 0.895 ms | 0.895 ms |
-| `secondary_catchup_p95_max_seconds` | 4.309 ms | 4.716 ms | 4.716 ms |
-| `readiness_sync_lag_blocks` | 0 | 0 | 0 |
-| `readiness_replica_lag_chain_epochs` | 0 | 0 | 0 |
-| `rocksdb_pending_compaction_bytes` | 0 | 0 | 0 |
-
-The `services/zinder-query/tests/perf_smoke.rs` regtest test enforces a generous regression-only budget (`compact_block_range(1, 1000)` under 2 s, `latest_block` under 250 ms) so CI catches catastrophic regressions. Tight per-percentile gates ship after the calibration harness collects enough samples for a real 99th percentile; the n=6 endpoint table and n=2 report table above are baseline anchors, not strict release gates.
+Live latency and mainnet catch-up tests measure real Zebra and RocksDB behavior
+without publishing machine-specific observations as durable architecture.
+Operators collect current P50, P99, worst-case, readiness, source-RPC, store,
+and RocksDB evidence through the commands in the testing runbook before making
+a release-performance claim.
 
 Every range or list endpoint defines:
 
@@ -662,7 +636,7 @@ Every range or list endpoint defines:
 - Stable ordering.
 - The epoch or source timestamp that bounds the response.
 
-The native compact-block range API rejects requests above `max_compact_block_range` before opening a reader. Latest block metadata and tree-state reads use the same epoch-bound reader contract without upstream node repair. Batched storage reads are still bounded by the range limit; native gRPC streams one compact block per message instead of packing the whole range into a single response.
+The native compact-block range API rejects requests above `max_compact_block_range` before opening a reader. Visible-tip block and tree-state reads use the same epoch-bound reader contract without upstream node repair. Batched storage reads are still bounded by the range limit; native gRPC streams one compact block per message instead of packing the whole range into a single response.
 
 The lightwalletd compatibility adapter must also keep unbounded upstream
 semantics bounded at Zinder's boundary. For example, `GetSubtreeRoots` treats

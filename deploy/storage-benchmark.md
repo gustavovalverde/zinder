@@ -1,19 +1,19 @@
 # Storage benchmark environment
 
-`docker-compose.storage-benchmark.yml` runs the current-schema RocksDB oracle
-and 2 fact-first storage candidates from one immutable `zinder-bench` image and
-one captured fixture. The RocksDB and PostgreSQL fact-first arms persist the
+`docker-compose.storage-benchmark.yml` runs canonical-store range replay
+and 2 canonical-replay-storage storage candidates from one immutable `zinder-bench` image and
+one captured fixture. The RocksDB and PostgreSQL canonical-replay-storage arms persist the
 same versioned `CanonicalBlockFacts` semantic replay envelope, read every row
 back, reconstruct the full aggregate, recompute the independent ordered
 sequence digest, and publish a completion marker only after that validation
 succeeds.
 
-The fact-first reports prove only this persisted fact round trip. They do not
+The canonical-replay-storage reports prove only this persisted canonical replay storage run. They do not
 certify fresh canonical construction, compact-block or tree-position material,
-`ChainEpoch` or `ChainEvent` publication, reorg and finality behavior, restore
+`ChainEpoch` or `ChainEvent` publication, reorg and settlement behavior, restore
 and following, wallet projection construction, query readiness, or the complete
-production lifecycle. The current-schema oracle remains a separate diagnostic
-baseline, not a third interchangeable fact-first engine.
+production lifecycle. Canonical-store range replay remains a separate diagnostic
+baseline, not a third interchangeable canonical-replay-storage engine.
 
 This Compose file is disposable benchmark infrastructure. The application
 deployment remains in `docker-compose.yml`, and neither deployment topology
@@ -27,9 +27,9 @@ services compete for host resources and cannot produce fair throughput data.
 
 | Profile | Services | Measured boundary | Aggregate budget |
 | --- | --- | --- | --- |
-| `oracle` | `rocksdb-current-schema-oracle` | Current projection-coupled schema replay from a checkpoint | 8 CPUs, 16 GiB |
-| `rocksdb` | `rocksdb-fact-first` | RocksDB fact write, read-back digest, and completion marker | 8 CPUs, 16 GiB |
-| `postgres` | `postgres-fact-first`, `postgres-database` | PostgreSQL fact write, read-back digest, and completion row | 8 CPUs, 16 GiB |
+| `oracle` | `rocksdb-canonical-store-range-replay` | Production canonical-store replay from a checkpoint | 8 CPUs, 16 GiB |
+| `rocksdb` | `rocksdb-canonical-replay-storage` | RocksDB replay-record write, read-back digest, and completion marker | 8 CPUs, 16 GiB |
+| `postgres` | `postgres-canonical-replay-storage`, `postgres-database` | PostgreSQL replay-record write, read-back digest, and completion row | 8 CPUs, 16 GiB |
 | `comparison` | All 4 services | Cross-service integration only | Shared host resources |
 
 The PostgreSQL arm divides its default budget between the benchmark client (2
@@ -41,8 +41,8 @@ sum differs from the reported aggregate.
 The fixture, starting checkpoint, and reports use host bind mounts. Both
 RocksDB candidates and PostgreSQL `PGDATA` use separate named volumes so each
 candidate owns isolated Linux filesystem state. The fixture is the sole
-read-only input for the fact-first services; the starting checkpoint belongs
-exclusively to the current-schema oracle.
+read-only input for the canonical-replay-storage services; the starting checkpoint belongs
+exclusively to canonical-store range replay.
 
 PostgreSQL keeps logged tables, `fsync`, full-page writes, and synchronous
 commit enabled. Only disposable operating-system temporary files use `tmpfs`.
@@ -143,7 +143,7 @@ docker compose \
 
 The expected profiles are `comparison`, `oracle`, `postgres`, and `rocksdb`.
 
-## Run the current-schema oracle
+## Run canonical-store range replay
 
 Every oracle replay mutates its checkpoint clone. Remove prior benchmark
 volumes, copy the read-only checkpoint into the oracle volume, and remove any
@@ -159,22 +159,22 @@ docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
   --profile oracle run --rm --no-deps \
-  --user 0:0 --entrypoint /bin/sh rocksdb-current-schema-oracle -ceu '
+  --user 0:0 --entrypoint /bin/sh rocksdb-canonical-store-range-replay -ceu '
     test -n "$(ls -A /benchmark/start-store)"
     test -z "$(ls -A /var/lib/zinder/benchmark-store)"
     cp -a /benchmark/start-store/. /var/lib/zinder/benchmark-store/
-    rm -rf /var/lib/zinder/benchmark-store/derive
+    rm -rf /var/lib/zinder/benchmark-store/materialized-views
     chown -R 1000:1000 /var/lib/zinder/benchmark-store
   '
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile oracle run --rm --no-deps rocksdb-current-schema-oracle
+  --profile oracle run --rm --no-deps rocksdb-canonical-store-range-replay
 ```
 
 The report is written as
-`rocksdb-current-schema-oracle-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`. The
+`rocksdb-canonical-store-range-replay-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`. The
 command creates reports exclusively, so a repeated path fails instead of
 overwriting evidence. Reseed the volume and select a fresh result directory
 before every replay.
@@ -192,27 +192,27 @@ set +a
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile oracle run --rm --no-deps rocksdb-current-schema-oracle \
-  current-schema-replay \
+  --profile oracle run --rm --no-deps rocksdb-canonical-store-range-replay \
+  canonical-store-range-replay \
   --fixture /benchmark/fixture \
   --store /var/lib/zinder/benchmark-store \
   --block-prepare-concurrency "$ZINDER_BENCH_BLOCK_PREPARE_CONCURRENCY" \
   --software-revision "$ZINDER_BENCH_SOFTWARE_REVISION" \
   --runner-id "$ZINDER_BENCH_RUNNER_ID" \
-  --cpu-limit-cores "$ZINDER_BENCH_ROCKSDB_ORACLE_CPUS" \
-  --memory-limit-bytes "$ZINDER_BENCH_ROCKSDB_ORACLE_MEMORY_LIMIT_BYTES" \
+  --cpu-limit-cores "$ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_CPUS" \
+  --memory-limit-bytes "$ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_MEMORY_LIMIT_BYTES" \
   --storage-class "$ZINDER_BENCH_STORAGE_CLASS" \
   --image-reference "$ZINDER_BENCH_IMAGE" \
   --canonical-fixture-replay-target-secs "$ZINDER_BENCH_FIXTURE_REPLAY_TARGET_SECS" \
   --canonical-fixture-replay-hard-limit-secs "$ZINDER_BENCH_FIXTURE_REPLAY_HARD_LIMIT_SECS" \
-  --report "/benchmark/results/rocksdb-current-schema-oracle-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}-acceptance.json"
+  --report "/benchmark/results/rocksdb-canonical-store-range-replay-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}-acceptance.json"
 ```
 
 These thresholds apply only to captured-range replay from the supplied
 checkpoint. They do not establish the fresh construction, restore, following,
 or wallet-readiness objectives from ADR-0035.
 
-## Run the RocksDB fact-first arm
+## Run the RocksDB canonical-replay-storage arm
 
 Start from empty candidate state and run only the `rocksdb` profile. The
 candidate refuses an existing store, and the report refuses an existing output
@@ -228,7 +228,7 @@ docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
   --profile rocksdb run --rm --no-deps \
-  --user 0:0 --entrypoint /bin/sh rocksdb-fact-first -ceu '
+  --user 0:0 --entrypoint /bin/sh rocksdb-canonical-replay-storage -ceu '
     test -z "$(ls -A /var/lib/zinder)"
     chown 1000:1000 /var/lib/zinder
   '
@@ -236,13 +236,13 @@ docker compose \
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile rocksdb run --rm --no-deps rocksdb-fact-first
+  --profile rocksdb run --rm --no-deps rocksdb-canonical-replay-storage
 ```
 
 The report is written as
-`rocksdb-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`. This arm builds one
+`rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`. This arm builds one
 sorted external SST file, ingests it into its own named volume, validates the
-persisted fact sequence, publishes its completion marker, and reopens the store
+persisted replay sequence, publishes its completion marker, and reopens the store
 for a second complete validation pass. The root-only initialization above
 changes ownership on the fresh disposable volume before timing begins; it does
 not create the candidate path or mutate an existing candidate. The report keeps
@@ -251,7 +251,7 @@ because the current Rust binding does not expose an external-writer I/O-mode
 override.
 
 The same container writes
-`rocksdb-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
+`rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
 after the child process exits. The observer samples cgroup-v2
 `memory.current`, preserves the exact component `memory.peak`, and samples
 allocated bytes across `/var/lib/zinder`, including the sibling external-SST
@@ -264,7 +264,7 @@ against observer-off smoke runs before using storage high-water evidence to
 select a topology. If that overhead is material, replace the sampler with a
 runner-supported quota or filesystem counter before a formal campaign.
 
-## Run the PostgreSQL fact-first arm
+## Run the PostgreSQL canonical-replay-storage arm
 
 Start from an empty PostgreSQL volume, wait for database readiness, and inspect
 the selected server before running the client. The benchmark command receives
@@ -309,7 +309,7 @@ docker compose \
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile postgres run --rm --no-deps postgres-fact-first
+  --profile postgres run --rm --no-deps postgres-canonical-replay-storage
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
@@ -332,7 +332,7 @@ official database image runs only PostgreSQL and the local resource observer,
 and no benchmark input depends on external network access.
 
 The report is written as
-`postgres-fact-first-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`. This arm creates a
+`postgres-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`. This arm creates a
 fresh candidate schema, streams bounded fixture segments through binary `COPY`
 inside one load transaction, builds its deferred primary-key index, validates
 the persisted sequence, and then commits its completion row. The report includes
@@ -340,9 +340,9 @@ the effective database settings, database image identity, and exact client and
 database resource partition.
 
 The client resource artifact is written as
-`postgres-fact-first-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
+`postgres-canonical-replay-storage-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
 when the benchmark client exits. The database artifact is written as
-`postgres-fact-first-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
+`postgres-canonical-replay-storage-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
 only when `postgres-database` stops, because its observer owns the full server
 lifetime. Do not add a campaign row until both files exist. The database
 observer samples allocated bytes across `/var/lib/postgresql`; client storage
@@ -416,11 +416,15 @@ identity, cache policy, runner identity, and start/completion times come from
 the artifacts rather than duplicated operator claims. Record a row only after
 both arms complete successfully and the PostgreSQL database has stopped.
 
+<!-- markdownlint-disable MD010 -->
+
 ```text
 rocksdb_report	rocksdb_resources	postgres_report	postgres_client_resources	postgres_database_resources
-rocksdb-fact-first-REV-trial-01.json	rocksdb-fact-first-REV-trial-01.resources.json	postgres-fact-first-REV-trial-01.json	postgres-fact-first-client-REV-trial-01.resources.json	postgres-fact-first-database-REV-trial-01.resources.json
-rocksdb-fact-first-REV-trial-02.json	rocksdb-fact-first-REV-trial-02.resources.json	postgres-fact-first-REV-trial-02.json	postgres-fact-first-client-REV-trial-02.resources.json	postgres-fact-first-database-REV-trial-02.resources.json
+rocksdb-canonical-replay-storage-REV-trial-01.json	rocksdb-canonical-replay-storage-REV-trial-01.resources.json	postgres-canonical-replay-storage-REV-trial-01.json	postgres-canonical-replay-storage-client-REV-trial-01.resources.json	postgres-canonical-replay-storage-database-REV-trial-01.resources.json
+rocksdb-canonical-replay-storage-REV-trial-02.json	rocksdb-canonical-replay-storage-REV-trial-02.resources.json	postgres-canonical-replay-storage-REV-trial-02.json	postgres-canonical-replay-storage-client-REV-trial-02.resources.json	postgres-canonical-replay-storage-database-REV-trial-02.resources.json
 ```
+
+<!-- markdownlint-enable MD010 -->
 
 After at least five alternating pairs, validate the campaign and create the
 required median/minimum/maximum summary:
@@ -445,9 +449,9 @@ before relying on the aggregate. The summary preserves every artifact path and
 SHA-256 alongside chronological trial evidence and candidate
 minimum/median/maximum statistics.
 
-## Compare fact-first reports
+## Compare canonical-replay-storage reports
 
-Compare only the 2 `canonical-block-facts-round-trip` reports. A valid pair
+Compare only the 2 `canonical-replay-storage` reports. A valid pair
 uses the same fixture digest, source revision, image reference, runner identity,
 aggregate resource budget, storage class, and block preparation concurrency.
 Both reports must show `fixture_sequence_digest_match: true` before throughput
@@ -479,7 +483,7 @@ database volume root. Both metrics are sampled estimates whose resolution is
 determined by their observed timestamps, not only the configured delay. The
 campaign summary records that delay and the PostgreSQL alignment tolerance,
 while each resource summary records the observed report-window sample gap. Use
-those cadence facts, the report's final physical byte count, and the sampled
+those cadence measurements, the report's final physical byte count, and the sampled
 high-water metric together.
 
 ```bash
@@ -498,8 +502,8 @@ jq '{
   benchmark_client_peak_rss: .round_trip.benchmark_client_peak_rss,
   phases: {
     storage_initialization: .round_trip.storage_initialization_wall_clock_seconds,
-    fact_preparation: .round_trip.fact_preparation_wall_clock_seconds,
-    fact_persistence: .round_trip.fact_persistence_wall_clock_seconds,
+    replay_preparation: .round_trip.replay_preparation_wall_clock_seconds,
+    replay_persistence: .round_trip.replay_persistence_wall_clock_seconds,
     index_construction: .round_trip.index_construction_wall_clock_seconds,
     storage_optimization: .round_trip.storage_optimization_wall_clock_seconds,
     validation: .round_trip.validation_wall_clock_seconds,
@@ -511,8 +515,8 @@ jq '{
   physical_storage_bytes: .round_trip.physical_storage_bytes,
   runner: .provenance.runner
 }' \
-  benchmark-results/rocksdb-fact-first-*.json \
-  benchmark-results/postgres-fact-first-*.json
+  benchmark-results/rocksdb-canonical-replay-storage-*.json \
+  benchmark-results/postgres-canonical-replay-storage-*.json
 ```
 
 The physical byte totals are useful within each engine's explicit measurement
@@ -531,7 +535,7 @@ each optimization as a named arm with the same fixture and acceptance gates.
 The `comparison` profile makes all services addressable for integration checks.
 It does not preserve the isolated 8-CPU, 16-GiB budget per active candidate, so
 do not publish throughput from this profile. For example, an integration check
-can keep PostgreSQL available while invoking both fact clients sequentially:
+can keep PostgreSQL available while invoking both replay clients sequentially:
 
 ```bash
 docker compose \
@@ -543,7 +547,7 @@ docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
   --profile comparison run --rm --no-deps \
-  --user 0:0 --entrypoint /bin/sh rocksdb-fact-first -ceu '
+  --user 0:0 --entrypoint /bin/sh rocksdb-canonical-replay-storage -ceu '
     test -z "$(ls -A /var/lib/zinder)"
     chown 1000:1000 /var/lib/zinder
   '
@@ -551,12 +555,12 @@ docker compose \
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile comparison run --rm --no-deps rocksdb-fact-first
+  --profile comparison run --rm --no-deps rocksdb-canonical-replay-storage
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
   -f deploy/docker-compose.storage-benchmark.yml \
-  --profile comparison run --rm --no-deps postgres-fact-first
+  --profile comparison run --rm --no-deps postgres-canonical-replay-storage
 ```
 
 Use clean volumes and fresh report paths before this check. The commands above

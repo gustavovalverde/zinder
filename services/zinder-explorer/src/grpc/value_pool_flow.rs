@@ -8,10 +8,11 @@ use std::collections::BTreeMap;
 
 use tonic::{Request, Response, Status};
 use zinder_core::wire::encode_rpc_transaction_id_hex;
-use zinder_derive::{
-    DeriveStore, ValuePoolFlowBackfillCoverage, ValuePoolFlowDirection as DerivedDirection,
-    ValuePoolFlowEvent as DerivedEvent, ValuePoolFlowHistoryConsumer, ValuePoolFlowHistoryRow,
-    ValuePoolFlowPool as DerivedPool, ValuePoolFlowTailCoverage,
+use zinder_materialized_views::{
+    MaterializedViewStore, ValuePoolFlowBackfillCoverage,
+    ValuePoolFlowDirection as ProjectedDirection, ValuePoolFlowEvent as ProjectedEvent,
+    ValuePoolFlowHistoryConsumer, ValuePoolFlowHistoryRow, ValuePoolFlowPool as ProjectedPool,
+    ValuePoolFlowTailCoverage,
 };
 use zinder_proto::capabilities::{
     EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
@@ -28,7 +29,7 @@ use zinder_proto::v1::explorer::{
     ValuePoolFlowRoundedAmountSummaryRow, ValuePoolFlowSummaryBucket, ValuePoolFlowSummaryRequest,
     ValuePoolFlowSummaryResolution, ValuePoolFlowSummaryResponse,
 };
-use zinder_proto::v1::wallet::{LatestBlockRequest, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_runtime::AuthenticatedChannel;
 
 use super::clamp_max_entries;
@@ -49,12 +50,13 @@ const DEFAULT_ROUNDED_AMOUNT_ROWS: u32 = 50;
 const MAX_ROUNDED_AMOUNT_ROWS: u32 = 100;
 const CURSOR_PREFIX: &[u8; 4] = b"zvf1";
 const CURSOR_FILTER_LEN: usize = 10;
-const CURSOR_LEN: usize =
-    CURSOR_PREFIX.len() + CURSOR_FILTER_LEN + zinder_derive::VALUE_POOL_FLOW_HISTORY_KEY_LEN;
+const CURSOR_LEN: usize = CURSOR_PREFIX.len()
+    + CURSOR_FILTER_LEN
+    + zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_KEY_LEN;
 
 /// Executes one `ExplorerQuery.ValuePoolFlowHistory` request.
-pub(crate) async fn handle_value_pool_flow_history(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_value_pool_flow_history(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ValuePoolFlowHistoryRequest>,
@@ -71,9 +73,10 @@ pub(crate) async fn handle_value_pool_flow_history(
     } else {
         Some(decode_cursor(&request.cursor, &filter)?)
     };
-    let backfill_coverage = ValuePoolFlowHistoryConsumer::backfill_coverage(derive_store)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(derive_store)
+    let backfill_coverage =
+        ValuePoolFlowHistoryConsumer::backfill_coverage(materialized_view_store)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let chain_epoch = fetch_current_chain_epoch(wallet_client).await?;
     let visible_tip_height = visible_tip_height(&chain_epoch)?;
@@ -83,13 +86,14 @@ pub(crate) async fn handle_value_pool_flow_history(
         tail_coverage,
         visible_tip_height,
     );
-    let page = read_history_page_blocking(derive_store, page_size, anchor, filter).await?;
+    let page =
+        read_history_page_blocking(materialized_view_store, page_size, anchor, filter).await?;
     let total_matching_events =
-        history_total_count(derive_store, filter, count_domain_complete).await?;
+        history_total_count(materialized_view_store, filter, count_domain_complete).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
             Some(chain_epoch),
             0,
@@ -121,8 +125,8 @@ pub(crate) async fn handle_value_pool_flow_history(
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowEventsInRange` request.
-pub(crate) async fn handle_value_pool_flow_events_in_range(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_value_pool_flow_events_in_range(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ValuePoolFlowEventsInRangeRequest>,
@@ -144,12 +148,13 @@ pub(crate) async fn handle_value_pool_flow_events_in_range(
     for _ in 0..MAX_EPOCH_STABILIZATION_ATTEMPTS {
         let chain_epoch = fetch_current_chain_epoch(wallet_client).await?;
         let visible_tip_height = visible_tip_height(&chain_epoch)?;
-        let backfill_coverage = ValuePoolFlowHistoryConsumer::backfill_coverage(derive_store)
-            .map_err(|error| ExplorerError::internal(error.to_string()))?;
-        let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(derive_store)
+        let backfill_coverage =
+            ValuePoolFlowHistoryConsumer::backfill_coverage(materialized_view_store)
+                .map_err(|error| ExplorerError::internal(error.to_string()))?;
+        let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(materialized_view_store)
             .map_err(|error| ExplorerError::internal(error.to_string()))?;
         let range = read_flow_events_in_range_blocking(
-            derive_store,
+            materialized_view_store,
             FlowEventsInRangeQuery {
                 start_time_unix_seconds: request.start_time_unix_seconds,
                 end_time_unix_seconds: request.end_time_unix_seconds,
@@ -166,7 +171,7 @@ pub(crate) async fn handle_value_pool_flow_events_in_range(
         let freshness = attach_upstream_observation(
             upstream_observation_cache,
             build_explorer_freshness(
-                Some(derive_store),
+                Some(materialized_view_store),
                 EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1,
                 Some(chain_epoch.clone()),
                 0,
@@ -202,8 +207,8 @@ pub(crate) async fn handle_value_pool_flow_events_in_range(
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowSummary` request.
-pub(crate) async fn handle_value_pool_flow_summary(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_value_pool_flow_summary(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ValuePoolFlowSummaryRequest>,
@@ -217,16 +222,17 @@ pub(crate) async fn handle_value_pool_flow_summary(
     }
     let resolution = SummaryResolution::try_from(request.resolution)?;
     let pools = PoolFilter::try_from(request.pools)?;
-    let backfill_coverage = ValuePoolFlowHistoryConsumer::backfill_coverage(derive_store)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(derive_store)
+    let backfill_coverage =
+        ValuePoolFlowHistoryConsumer::backfill_coverage(materialized_view_store)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let chain_epoch = fetch_current_chain_epoch(wallet_client).await?;
     let visible_tip_height = visible_tip_height(&chain_epoch)?;
     let requested_range_complete =
         coverage_reaches_visible_tip(backfill_coverage, tail_coverage, visible_tip_height);
     let buckets = read_summary_buckets_blocking(
-        derive_store,
+        materialized_view_store,
         request.start_time_unix_seconds,
         request.end_time_unix_seconds,
         pools,
@@ -236,7 +242,7 @@ pub(crate) async fn handle_value_pool_flow_summary(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1,
             Some(chain_epoch),
             0,
@@ -255,8 +261,8 @@ pub(crate) async fn handle_value_pool_flow_summary(
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowAmountThresholdSummary` request.
-pub(crate) async fn handle_value_pool_flow_amount_threshold_summary(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_value_pool_flow_amount_threshold_summary(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ValuePoolFlowAmountThresholdSummaryRequest>,
@@ -270,16 +276,17 @@ pub(crate) async fn handle_value_pool_flow_amount_threshold_summary(
     }
     validate_minimum_amounts(&request.minimum_amounts_zat)?;
     let pools = PoolFilter::try_from(request.pools)?;
-    let backfill_coverage = ValuePoolFlowHistoryConsumer::backfill_coverage(derive_store)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(derive_store)
+    let backfill_coverage =
+        ValuePoolFlowHistoryConsumer::backfill_coverage(materialized_view_store)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let chain_epoch = fetch_current_chain_epoch(wallet_client).await?;
     let visible_tip_height = visible_tip_height(&chain_epoch)?;
     let requested_range_complete =
         coverage_reaches_visible_tip(backfill_coverage, tail_coverage, visible_tip_height);
     let thresholds = read_amount_threshold_summary_blocking(
-        derive_store,
+        materialized_view_store,
         request.start_time_unix_seconds,
         request.end_time_unix_seconds,
         pools,
@@ -289,7 +296,7 @@ pub(crate) async fn handle_value_pool_flow_amount_threshold_summary(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
             Some(chain_epoch),
             0,
@@ -309,8 +316,8 @@ pub(crate) async fn handle_value_pool_flow_amount_threshold_summary(
 }
 
 /// Executes one `ExplorerQuery.ValuePoolFlowRoundedAmountSummary` request.
-pub(crate) async fn handle_value_pool_flow_rounded_amount_summary(
-    derive_store: &DeriveStore,
+pub(crate) async fn query_value_pool_flow_rounded_amount_summary(
+    materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<ValuePoolFlowRoundedAmountSummaryRequest>,
@@ -323,16 +330,17 @@ pub(crate) async fn handle_value_pool_flow_rounded_amount_summary(
         DEFAULT_ROUNDED_AMOUNT_ROWS,
         MAX_ROUNDED_AMOUNT_ROWS,
     );
-    let backfill_coverage = ValuePoolFlowHistoryConsumer::backfill_coverage(derive_store)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(derive_store)
+    let backfill_coverage =
+        ValuePoolFlowHistoryConsumer::backfill_coverage(materialized_view_store)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let tail_coverage = ValuePoolFlowHistoryConsumer::tail_coverage(materialized_view_store)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let chain_epoch = fetch_current_chain_epoch(wallet_client).await?;
     let visible_tip_height = visible_tip_height(&chain_epoch)?;
     let requested_range_complete =
         coverage_reaches_visible_tip(backfill_coverage, tail_coverage, visible_tip_height);
     let rows = read_rounded_amount_summary_blocking(
-        derive_store,
+        materialized_view_store,
         request.start_time_unix_seconds,
         request.end_time_unix_seconds,
         pools,
@@ -346,7 +354,7 @@ pub(crate) async fn handle_value_pool_flow_rounded_amount_summary(
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
-            Some(derive_store),
+            Some(materialized_view_store),
             EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1,
             Some(chain_epoch),
             0,
@@ -369,13 +377,13 @@ async fn fetch_current_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<zinder_proto::v1::wallet::ChainEpoch, Status> {
     wallet_client
-        .latest_block(Request::new(LatestBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner()
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| {
-            ExplorerError::internal("LatestBlockResponse.chain_view.chain_epoch missing").into()
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing").into()
         })
 }
 
@@ -388,18 +396,18 @@ fn visible_tip_height(chain_epoch: &zinder_proto::v1::wallet::ChainEpoch) -> Res
 }
 
 async fn history_total_count(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     filter: FlowFilter,
     count_domain_complete: bool,
 ) -> Result<Option<u64>, Status> {
     if !count_domain_complete {
         return Ok(None);
     }
-    let derive_store = derive_store.clone();
+    let materialized_view_store = materialized_view_store.clone();
     let count = tokio::task::spawn_blocking(move || -> Result<u64, Status> {
-        derive_store
+        materialized_view_store
             .count_consumer_rows_matching(
-                zinder_derive::VALUE_POOL_FLOW_HISTORY_COLUMN_FAMILY,
+                zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_COLUMN_FAMILY,
                 |key, payload| {
                     let event = ValuePoolFlowHistoryConsumer::decode_event(key, payload)
                         .map_err(|error| error.to_string())?;
@@ -414,14 +422,19 @@ async fn history_total_count(
 }
 
 async fn read_history_page_blocking(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     page_size: u32,
-    anchor: Option<[u8; zinder_derive::VALUE_POOL_FLOW_HISTORY_KEY_LEN]>,
+    anchor: Option<[u8; zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_KEY_LEN]>,
     filter: FlowFilter,
 ) -> Result<HistoryPage, Status> {
-    let derive_store = derive_store.clone();
+    let materialized_view_store = materialized_view_store.clone();
     tokio::task::spawn_blocking(move || {
-        read_history_page(&derive_store, page_size, anchor.as_ref(), &filter)
+        read_history_page(
+            &materialized_view_store,
+            page_size,
+            anchor.as_ref(),
+            &filter,
+        )
     })
     .await
     .map_err(|error| {
@@ -430,7 +443,7 @@ async fn read_history_page_blocking(
 }
 
 struct FlowEventsInRange {
-    events: Vec<DerivedEvent>,
+    events: Vec<ProjectedEvent>,
     scanned_event_count: u32,
     scan_limit_reached: bool,
     event_limit_reached: bool,
@@ -446,13 +459,13 @@ struct FlowEventsInRangeQuery {
 }
 
 async fn read_flow_events_in_range_blocking(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     query: FlowEventsInRangeQuery,
 ) -> Result<FlowEventsInRange, Status> {
-    let derive_store = derive_store.clone();
+    let materialized_view_store = materialized_view_store.clone();
     tokio::task::spawn_blocking(move || {
         let range_events = ValuePoolFlowHistoryConsumer::events_in_time_range(
-            &derive_store,
+            &materialized_view_store,
             query.start_time_unix_seconds,
             query.end_time_unix_seconds,
             MAX_HISTORY_SCANNED_EVENTS.saturating_add(1),
@@ -472,7 +485,7 @@ async fn read_flow_events_in_range_blocking(
 }
 
 fn select_flow_events_in_range(
-    mut range_events: Vec<DerivedEvent>,
+    mut range_events: Vec<ProjectedEvent>,
     filter: FlowFilter,
     maximum_amount_zat: Option<u64>,
     max_events: u32,
@@ -511,16 +524,16 @@ fn select_flow_events_in_range(
 }
 
 async fn read_summary_buckets_blocking(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_time_unix_seconds: i64,
     end_time_unix_seconds: i64,
     pools: PoolFilter,
     resolution: SummaryResolution,
 ) -> Result<Vec<ValuePoolFlowSummaryBucket>, Status> {
-    let derive_store = derive_store.clone();
+    let materialized_view_store = materialized_view_store.clone();
     tokio::task::spawn_blocking(move || {
         let events = ValuePoolFlowHistoryConsumer::events_in_time_range(
-            &derive_store,
+            &materialized_view_store,
             start_time_unix_seconds,
             end_time_unix_seconds,
             MAX_SUMMARY_SCANNED_EVENTS.saturating_add(1),
@@ -541,16 +554,16 @@ async fn read_summary_buckets_blocking(
 }
 
 async fn read_amount_threshold_summary_blocking(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_time_unix_seconds: i64,
     end_time_unix_seconds: i64,
     pools: PoolFilter,
     minimum_amounts_zat: Vec<u64>,
 ) -> Result<Vec<ValuePoolFlowAmountThresholdSummaryRow>, Status> {
-    let derive_store = derive_store.clone();
+    let materialized_view_store = materialized_view_store.clone();
     tokio::task::spawn_blocking(move || {
         summarize_amount_thresholds(
-            &derive_store,
+            &materialized_view_store,
             start_time_unix_seconds,
             end_time_unix_seconds,
             pools,
@@ -570,7 +583,7 @@ async fn read_amount_threshold_summary_blocking(
     reason = "Arguments mirror the bounded native request."
 )]
 async fn read_rounded_amount_summary_blocking(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_time_unix_seconds: i64,
     end_time_unix_seconds: i64,
     pools: PoolFilter,
@@ -580,10 +593,10 @@ async fn read_rounded_amount_summary_blocking(
     minimum_event_count: u64,
     max_rows: u32,
 ) -> Result<Vec<ValuePoolFlowRoundedAmountSummaryRow>, Status> {
-    let derive_store = derive_store.clone();
+    let materialized_view_store = materialized_view_store.clone();
     tokio::task::spawn_blocking(move || {
         let events = ValuePoolFlowHistoryConsumer::events_in_time_range(
-            &derive_store,
+            &materialized_view_store,
             start_time_unix_seconds,
             end_time_unix_seconds,
             MAX_SUMMARY_SCANNED_EVENTS.saturating_add(1),
@@ -615,20 +628,20 @@ async fn read_rounded_amount_summary_blocking(
 
 struct HistoryPage {
     rows: Vec<ValuePoolFlowHistoryRow>,
-    cursor_key: Option<[u8; zinder_derive::VALUE_POOL_FLOW_HISTORY_KEY_LEN]>,
+    cursor_key: Option<[u8; zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_KEY_LEN]>,
     has_more: bool,
     scanned_event_count: u32,
     scan_limit_reached: bool,
 }
 
 fn read_history_page(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     page_size: u32,
-    anchor: Option<&[u8; zinder_derive::VALUE_POOL_FLOW_HISTORY_KEY_LEN]>,
+    anchor: Option<&[u8; zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_KEY_LEN]>,
     filter: &FlowFilter,
 ) -> Result<HistoryPage, Status> {
     let rows = ValuePoolFlowHistoryConsumer::read_page_after(
-        derive_store,
+        materialized_view_store,
         anchor,
         MAX_HISTORY_SCANNED_EVENTS,
     )
@@ -693,8 +706,8 @@ impl TryFrom<ValuePoolFlowFilter> for FlowFilter {
 impl FlowFilter {
     fn matches(
         self,
-        event: &DerivedEvent,
-    ) -> Result<bool, zinder_derive::ValuePoolFlowHistoryConsumerError> {
+        event: &ProjectedEvent,
+    ) -> Result<bool, zinder_materialized_views::ValuePoolFlowHistoryConsumerError> {
         if event.is_coinbase() {
             return Ok(false);
         }
@@ -720,7 +733,7 @@ impl TryFrom<Vec<i32>> for PoolFilter {
 }
 
 impl PoolFilter {
-    fn matches(self, event: &DerivedEvent) -> bool {
+    fn matches(self, event: &ProjectedEvent) -> bool {
         self.0 == 0 || self.0 & pool_bit(event.pool()) != 0
     }
 }
@@ -798,9 +811,9 @@ fn direction_mask(directions: Vec<i32>) -> Result<u8, Status> {
                 "unspecified value-pool flow direction cannot be used as a filter",
             )
             .into()),
-            ValuePoolFlowDirection::Shield => Ok(mask | direction_bit(DerivedDirection::Shield)),
+            ValuePoolFlowDirection::Shield => Ok(mask | direction_bit(ProjectedDirection::Shield)),
             ValuePoolFlowDirection::Deshield => {
-                Ok(mask | direction_bit(DerivedDirection::Deshield))
+                Ok(mask | direction_bit(ProjectedDirection::Deshield))
             }
         }
     })
@@ -817,35 +830,35 @@ fn pool_mask(pools: Vec<i32>) -> Result<u8, Status> {
                 )
                 .into());
             }
-            ValuePoolFlowPool::Sprout => DerivedPool::Sprout,
-            ValuePoolFlowPool::Sapling => DerivedPool::Sapling,
-            ValuePoolFlowPool::Orchard => DerivedPool::Orchard,
-            ValuePoolFlowPool::Ironwood => DerivedPool::Ironwood,
-            ValuePoolFlowPool::Mixed => DerivedPool::Mixed,
+            ValuePoolFlowPool::Sprout => ProjectedPool::Sprout,
+            ValuePoolFlowPool::Sapling => ProjectedPool::Sapling,
+            ValuePoolFlowPool::Orchard => ProjectedPool::Orchard,
+            ValuePoolFlowPool::Ironwood => ProjectedPool::Ironwood,
+            ValuePoolFlowPool::Mixed => ProjectedPool::Mixed,
         };
         Ok(mask | pool_bit(pool))
     })
 }
 
-const fn direction_bit(direction: DerivedDirection) -> u8 {
+const fn direction_bit(direction: ProjectedDirection) -> u8 {
     match direction {
-        DerivedDirection::Shield => 1,
-        DerivedDirection::Deshield => 2,
+        ProjectedDirection::Shield => 1,
+        ProjectedDirection::Deshield => 2,
     }
 }
 
-const fn pool_bit(pool: DerivedPool) -> u8 {
+const fn pool_bit(pool: ProjectedPool) -> u8 {
     match pool {
-        DerivedPool::Sprout => 1,
-        DerivedPool::Sapling => 2,
-        DerivedPool::Orchard => 4,
-        DerivedPool::Ironwood => 8,
-        DerivedPool::Mixed => 16,
+        ProjectedPool::Sprout => 1,
+        ProjectedPool::Sapling => 2,
+        ProjectedPool::Orchard => 4,
+        ProjectedPool::Ironwood => 8,
+        ProjectedPool::Mixed => 16,
     }
 }
 
 fn encode_cursor(
-    anchor: &[u8; zinder_derive::VALUE_POOL_FLOW_HISTORY_KEY_LEN],
+    anchor: &[u8; zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_KEY_LEN],
     filter: &FlowFilter,
 ) -> Vec<u8> {
     let mut cursor = Vec::with_capacity(CURSOR_LEN);
@@ -860,7 +873,7 @@ fn encode_cursor(
 fn decode_cursor(
     cursor: &[u8],
     filter: &FlowFilter,
-) -> Result<[u8; zinder_derive::VALUE_POOL_FLOW_HISTORY_KEY_LEN], Status> {
+) -> Result<[u8; zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_KEY_LEN], Status> {
     if cursor.len() != CURSOR_LEN || cursor.get(..CURSOR_PREFIX.len()) != Some(CURSOR_PREFIX) {
         return Err(ExplorerError::invalid_request("invalid value-pool flow cursor").into());
     }
@@ -889,20 +902,20 @@ fn decode_cursor(
         .map_err(|_| ExplorerError::invalid_request("invalid value-pool flow cursor").into())
 }
 
-fn map_event(event: DerivedEvent) -> Result<ValuePoolFlowEvent, Status> {
+fn map_event(event: ProjectedEvent) -> Result<ValuePoolFlowEvent, Status> {
     let direction = match event
         .direction()
         .map_err(|error| ExplorerError::internal(error.to_string()))?
     {
-        DerivedDirection::Shield => ValuePoolFlowDirection::Shield,
-        DerivedDirection::Deshield => ValuePoolFlowDirection::Deshield,
+        ProjectedDirection::Shield => ValuePoolFlowDirection::Shield,
+        ProjectedDirection::Deshield => ValuePoolFlowDirection::Deshield,
     };
     let pool = match event.pool() {
-        DerivedPool::Sprout => ValuePoolFlowPool::Sprout,
-        DerivedPool::Sapling => ValuePoolFlowPool::Sapling,
-        DerivedPool::Orchard => ValuePoolFlowPool::Orchard,
-        DerivedPool::Ironwood => ValuePoolFlowPool::Ironwood,
-        DerivedPool::Mixed => ValuePoolFlowPool::Mixed,
+        ProjectedPool::Sprout => ValuePoolFlowPool::Sprout,
+        ProjectedPool::Sapling => ValuePoolFlowPool::Sapling,
+        ProjectedPool::Orchard => ValuePoolFlowPool::Orchard,
+        ProjectedPool::Ironwood => ValuePoolFlowPool::Ironwood,
+        ProjectedPool::Mixed => ValuePoolFlowPool::Mixed,
     };
     Ok(ValuePoolFlowEvent {
         transaction_id: encode_rpc_transaction_id_hex(event.transaction_id),
@@ -1019,7 +1032,7 @@ struct BucketTotals {
 }
 
 fn summarize_events(
-    events: Vec<DerivedEvent>,
+    events: Vec<ProjectedEvent>,
     pools: PoolFilter,
     resolution: SummaryResolution,
 ) -> Result<Vec<ValuePoolFlowSummaryBucket>, Status> {
@@ -1040,7 +1053,7 @@ fn summarize_events(
             .direction()
             .map_err(|error| ExplorerError::internal(error.to_string()))?
         {
-            DerivedDirection::Shield => {
+            ProjectedDirection::Shield => {
                 bucket.shield_event_count =
                     bucket.shield_event_count.checked_add(1).ok_or_else(|| {
                         ExplorerError::internal("value-pool flow shield event count overflow")
@@ -1052,7 +1065,7 @@ fn summarize_events(
                         ExplorerError::internal("value-pool flow shield amount overflow")
                     })?;
             }
-            DerivedDirection::Deshield => {
+            ProjectedDirection::Deshield => {
                 bucket.deshield_event_count =
                     bucket.deshield_event_count.checked_add(1).ok_or_else(|| {
                         ExplorerError::internal("value-pool flow deshield event count overflow")
@@ -1081,7 +1094,7 @@ fn summarize_events(
 }
 
 fn summarize_amount_thresholds(
-    derive_store: &DeriveStore,
+    materialized_view_store: &MaterializedViewStore,
     start_time_unix_seconds: i64,
     end_time_unix_seconds: i64,
     pools: PoolFilter,
@@ -1103,7 +1116,7 @@ fn summarize_amount_thresholds(
         )
         .collect::<Vec<_>>();
     ValuePoolFlowHistoryConsumer::visit_events_in_time_range(
-        derive_store,
+        materialized_view_store,
         start_time_unix_seconds,
         end_time_unix_seconds,
         |event| {
@@ -1137,7 +1150,7 @@ struct RoundedAmountTotals {
     reason = "Arguments mirror the bounded native request."
 )]
 fn summarize_rounded_amounts(
-    events: Vec<DerivedEvent>,
+    events: Vec<ProjectedEvent>,
     pools: PoolFilter,
     minimum_raw_amount_zat: u64,
     maximum_raw_amount_zat: Option<u64>,
@@ -1164,8 +1177,8 @@ fn summarize_rounded_amounts(
             .direction()
             .map_err(|error| ExplorerError::internal(error.to_string()))?
         {
-            DerivedDirection::Shield => &mut bucket.shield_event_count,
-            DerivedDirection::Deshield => &mut bucket.deshield_event_count,
+            ProjectedDirection::Shield => &mut bucket.shield_event_count,
+            ProjectedDirection::Deshield => &mut bucket.deshield_event_count,
         };
         *count = count.checked_add(1).ok_or_else(|| {
             ExplorerError::internal("value-pool rounded-amount event count overflow")
@@ -1215,11 +1228,11 @@ fn round_amount_to_quantum(amount_zat: u64, quantum_zat: u64) -> Result<u64, Sta
 
 fn add_amount_threshold_event(
     row: &mut ValuePoolFlowAmountThresholdSummaryRow,
-    direction: DerivedDirection,
+    direction: ProjectedDirection,
     amount_zat: u64,
 ) -> Result<(), &'static str> {
     match direction {
-        DerivedDirection::Shield => {
+        ProjectedDirection::Shield => {
             let event_count = row
                 .shield_event_count
                 .checked_add(1)
@@ -1231,7 +1244,7 @@ fn add_amount_threshold_event(
             row.shield_event_count = event_count;
             row.shield_amount_zat = amount_sum;
         }
-        DerivedDirection::Deshield => {
+        ProjectedDirection::Deshield => {
             let event_count = row
                 .deshield_event_count
                 .checked_add(1)
@@ -1257,13 +1270,13 @@ mod tests {
     use tempfile::tempdir;
     use tonic::Code;
     use zinder_core::{BlockHeight, TransactionId, TransactionIntrinsicValueBalances};
-    use zinder_derive::{DeriveStoreOptions, VALUE_POOL_FLOW_HISTORY_SCHEMA};
+    use zinder_materialized_views::{MaterializedViewStoreOptions, VALUE_POOL_FLOW_HISTORY_SCHEMA};
     use zinder_store::RocksDbResourceBudget;
 
     use super::*;
 
-    fn event(time: i64, balances: TransactionIntrinsicValueBalances) -> DerivedEvent {
-        DerivedEvent {
+    fn event(time: i64, balances: TransactionIntrinsicValueBalances) -> ProjectedEvent {
+        ProjectedEvent {
             transaction_id: TransactionId::from_bytes([7; 32]),
             block_height: BlockHeight::new(10),
             block_time_unix_seconds: time,
@@ -1272,8 +1285,8 @@ mod tests {
         }
     }
 
-    fn coinbase_event(time: i64, balances: TransactionIntrinsicValueBalances) -> DerivedEvent {
-        DerivedEvent {
+    fn coinbase_event(time: i64, balances: TransactionIntrinsicValueBalances) -> ProjectedEvent {
+        ProjectedEvent {
             transaction_index_in_block: 0,
             ..event(time, balances)
         }
@@ -1282,12 +1295,12 @@ mod tests {
     #[test]
     fn cursor_rejects_filter_changes() {
         let filter = FlowFilter {
-            direction_mask: direction_bit(DerivedDirection::Shield),
-            pool_mask: pool_bit(DerivedPool::Sapling),
+            direction_mask: direction_bit(ProjectedDirection::Shield),
+            pool_mask: pool_bit(ProjectedPool::Sapling),
             minimum_amount_zat: 12,
         };
         let cursor = encode_cursor(
-            &[3; zinder_derive::VALUE_POOL_FLOW_HISTORY_KEY_LEN],
+            &[3; zinder_materialized_views::VALUE_POOL_FLOW_HISTORY_KEY_LEN],
             &filter,
         );
         assert!(decode_cursor(&cursor, &filter).is_ok());
@@ -1315,7 +1328,7 @@ mod tests {
                 event(7_200, TransactionIntrinsicValueBalances::new(0, 0, 11, 0)),
                 event(7_300, TransactionIntrinsicValueBalances::new(0, -13, 0, 0)),
             ],
-            PoolFilter(pool_bit(DerivedPool::Sapling)),
+            PoolFilter(pool_bit(ProjectedPool::Sapling)),
             SummaryResolution::Hour,
         )?;
         assert_eq!(buckets.len(), 2);
@@ -1328,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn history_filters_exclude_legacy_coinbase_rows() {
+    fn history_filters_exclude_coinbase_flow_rows() {
         let filter = FlowFilter {
             direction_mask: 0,
             pool_mask: 0,
@@ -1418,8 +1431,8 @@ mod tests {
     fn flow_event_range_preserves_inclusive_amount_bounds_and_reports_result_limits()
     -> Result<(), Status> {
         let filter = FlowFilter {
-            direction_mask: direction_bit(DerivedDirection::Deshield),
-            pool_mask: pool_bit(DerivedPool::Sapling),
+            direction_mask: direction_bit(ProjectedDirection::Deshield),
+            pool_mask: pool_bit(ProjectedPool::Sapling),
             minimum_amount_zat: 100,
         };
         let selected = select_flow_events_in_range(
@@ -1462,18 +1475,20 @@ mod tests {
             minimum_amount_zat: 10,
             ..Default::default()
         };
-        assert!(add_amount_threshold_event(&mut threshold, DerivedDirection::Shield, 12).is_ok());
-        assert!(add_amount_threshold_event(&mut threshold, DerivedDirection::Deshield, 20).is_ok());
+        assert!(add_amount_threshold_event(&mut threshold, ProjectedDirection::Shield, 12).is_ok());
+        assert!(
+            add_amount_threshold_event(&mut threshold, ProjectedDirection::Deshield, 20).is_ok()
+        );
         assert_eq!(threshold.shield_event_count, 1);
         assert_eq!(threshold.shield_amount_zat, 12);
         assert_eq!(threshold.deshield_event_count, 1);
         assert_eq!(threshold.deshield_amount_zat, 20);
 
         threshold.shield_event_count = u64::MAX;
-        assert!(add_amount_threshold_event(&mut threshold, DerivedDirection::Shield, 1).is_err());
+        assert!(add_amount_threshold_event(&mut threshold, ProjectedDirection::Shield, 1).is_err());
         threshold.shield_event_count = 0;
         threshold.shield_amount_zat = u64::MAX;
-        assert!(add_amount_threshold_event(&mut threshold, DerivedDirection::Shield, 1).is_err());
+        assert!(add_amount_threshold_event(&mut threshold, ProjectedDirection::Shield, 1).is_err());
     }
 
     #[test]
@@ -1656,9 +1671,9 @@ mod tests {
     async fn blocking_scans_preserve_store_error_mapping_and_skip_inexact_counts()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let directory = tempdir()?;
-        let store = DeriveStore::open(
+        let store = MaterializedViewStore::open(
             directory.path(),
-            DeriveStoreOptions {
+            MaterializedViewStoreOptions {
                 sync_writes: false,
                 consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -1674,9 +1689,9 @@ mod tests {
 
         drop(store);
         let unconfigured_directory = tempdir()?;
-        let unconfigured_store = DeriveStore::open(
+        let unconfigured_store = MaterializedViewStore::open(
             unconfigured_directory.path(),
-            DeriveStoreOptions {
+            MaterializedViewStoreOptions {
                 sync_writes: false,
                 consumers: &[],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),

@@ -1,2 +1,2 @@
 mod fixed_tip_build;
-mod projection_build_lease;
+mod wallet_projection_build_lease;

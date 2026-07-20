@@ -6,7 +6,7 @@
 //! `ConfigLoader::with_*_section` helpers rather than re-declaring
 //! constants.
 
-use crate::sections::ServiceIdentifier;
+use crate::sections::RuntimeService;
 
 /// Default operational endpoint listen address per service.
 ///
@@ -15,26 +15,26 @@ use crate::sections::ServiceIdentifier;
 /// `ZINDER_OPS__LISTEN_ADDR=0.0.0.0:<port>` baked in each service's
 /// Dockerfile.
 #[must_use]
-pub const fn default_ops_listen_addr(service: ServiceIdentifier) -> &'static str {
+pub const fn default_ops_listen_addr(service: RuntimeService) -> &'static str {
     match service {
-        ServiceIdentifier::Ingest => "127.0.0.1:9105",
-        ServiceIdentifier::CompatLightwalletd => "127.0.0.1:9107",
-        ServiceIdentifier::CompatCipherscan => "127.0.0.1:9108",
-        ServiceIdentifier::Explorer => "127.0.0.1:9069",
+        RuntimeService::Ingest => "127.0.0.1:9105",
+        RuntimeService::CompatLightwalletd => "127.0.0.1:9107",
+        RuntimeService::CompatCipherscan => "127.0.0.1:9108",
+        RuntimeService::Explorer => "127.0.0.1:9069",
     }
 }
 
 /// Default gRPC listen address per service, when the service binds one.
 ///
-/// [`ServiceIdentifier::Ingest`] returns `None` because the ingest writer
+/// [`RuntimeService::Ingest`] returns `None` because the ingest writer
 /// does not expose a public gRPC endpoint; its private `IngestControl`
 /// endpoint uses [`DEFAULT_INGEST_CONTROL_LISTEN_ADDR`].
 #[must_use]
-pub const fn default_grpc_listen_addr(service: ServiceIdentifier) -> Option<&'static str> {
+pub const fn default_grpc_listen_addr(service: RuntimeService) -> Option<&'static str> {
     match service {
-        ServiceIdentifier::CompatLightwalletd => Some("127.0.0.1:9067"),
-        ServiceIdentifier::Explorer => Some("127.0.0.1:9068"),
-        ServiceIdentifier::CompatCipherscan | ServiceIdentifier::Ingest => None,
+        RuntimeService::CompatLightwalletd => Some("127.0.0.1:9067"),
+        RuntimeService::Explorer => Some("127.0.0.1:9068"),
+        RuntimeService::CompatCipherscan | RuntimeService::Ingest => None,
     }
 }
 
@@ -61,10 +61,10 @@ mod tests {
     #[test]
     fn ops_default_ports_are_distinct() {
         let ports: HashSet<&'static str> = [
-            default_ops_listen_addr(ServiceIdentifier::Ingest),
-            default_ops_listen_addr(ServiceIdentifier::CompatLightwalletd),
-            default_ops_listen_addr(ServiceIdentifier::CompatCipherscan),
-            default_ops_listen_addr(ServiceIdentifier::Explorer),
+            default_ops_listen_addr(RuntimeService::Ingest),
+            default_ops_listen_addr(RuntimeService::CompatLightwalletd),
+            default_ops_listen_addr(RuntimeService::CompatCipherscan),
+            default_ops_listen_addr(RuntimeService::Explorer),
         ]
         .into_iter()
         .collect();

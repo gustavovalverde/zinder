@@ -11,7 +11,7 @@ Zebra, Zaino, Zinder, and lightwalletd, see
 | Client shape | Integration surface | Constraint |
 | --- | --- | --- |
 | Existing lightwalletd client | `zinder-compat-lightwalletd` | The client already speaks `CompactTxStreamer`; changing the endpoint should not require a protocol rewrite. |
-| Rust wallet or service that needs live events or broadcast | `zinder-client::RemoteChainIndex` | The consumer can link the Zinder Rust crates and reach `zinder-query` over gRPC. |
+| Rust wallet or service that needs live events or broadcast | `zinder-client::RemoteChainIndex` | The consumer can link the Zinder Rust crates and reach a deployment that embeds the native `WalletQuery` adapter over gRPC. |
 | Rust read-only process colocated with canonical storage | `zinder-client::LocalChainIndex` | The process only needs stored reads and can manage a RocksDB secondary path. It cannot subscribe, broadcast, or read live mempool state. |
 | Client that cannot link `zinder-client` | Vendored `WalletQuery` protos | The consumer generates a native gRPC client with its own language and toolchain. |
 | Explorer or analytics application | `ExplorerQuery`, with `WalletQuery` where required | The consumer needs derived views rather than only wallet-sync artifacts. |
@@ -24,17 +24,24 @@ The wallet codebases below demonstrate integration seams and method demand; they
 | --- | --- | --- | --- |
 | [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` | `GetLightdInfo`, `GetLatestBlock`, `GetBlockRange`, `GetTreeState`, `GetSubtreeRoots`, `GetTransaction`, `GetAddressUtxosStream`, `GetTaddressTxids`, `SendTransaction`, `GetMempoolTx`, and `GetMempoolStream` | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; no native Zinder adapter is required. |
 | [Vizor](https://github.com/chainapsis/vizor-wallet) | librustzcash `lightwalletd-tonic` client with a configurable endpoint | `GetLightdInfo`, latest block and block ranges, tree state, subtree roots, transaction lookup, transparent receiver discovery, `SendTransaction`, and mempool methods through librustzcash's sync engine | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; public deployments also need trusted TLS in front of Zinder. |
-| [Zallet](https://github.com/zcash/zallet) | Backend-neutral `Chain` and snapshot-scoped `ChainView` traits | `ServerInfo`, `LatestBlock`, `FullBlocksInRange`, block headers, `SubtreeRootsInRange`, `Transaction`, transparent output and spend lookups, `ChainEvents`, `MempoolSnapshot`, `MempoolEvents`, and `BroadcastTransaction` | Implement a new native `WalletQuery` adapter behind the existing traits. This mapping does not claim that Zallet integration exists on Zinder `main`. |
-| [Zally](https://github.com/gustavovalverde/zally) | `ChainSource` for reads and events, plus `Submitter` for broadcast | `LatestSafeBlock`, `LatestBlock`, `CompactBlocksInRange`, `TreeState`, `SubtreeRootsInRange`, `Transaction`, `TransparentAddressUnspentOutputs`, `ChainEvents`, and `BroadcastTransaction` | Map the traits to `RemoteChainIndex` and `EndpointBackedIndex`; `LocalChainIndex` cannot satisfy events or broadcast. |
+| [Zallet](https://github.com/zcash/zallet) | Backend-neutral `Chain` and snapshot-scoped `ChainView` traits | `ServerInfo`, `VisibleTipBlock`, `FullBlocksInRange`, block headers, `SubtreeRootsInRange`, `Transaction`, transparent output and spend lookups, `ChainEvents`, `MempoolSnapshot`, `MempoolEvents`, and `BroadcastTransaction` | Implement a new native `WalletQuery` adapter behind the existing traits. This mapping does not claim that Zallet integration exists on Zinder `main`. |
+| [Zally](https://github.com/gustavovalverde/zally) | `ChainSource` for reads and events, plus `Submitter` for broadcast | `SettledTipBlock`, `VisibleTipBlock`, `CompactBlocksInRange`, `TreeState`, `SubtreeRootsInRange`, `Transaction`, `TransparentAddressUnspentOutputs`, `ChainEvents`, and `BroadcastTransaction` | Map the traits to `RemoteChainIndex` and `EndpointBackedIndex`; `LocalChainIndex` cannot satisfy events or broadcast. |
 
 Method coverage proves that Zinder has an appropriate public primitive. A support claim additionally requires the wallet's create or import, sync, recovery, send, mempool, and reorg flows against the selected wallet release and network.
 
 ## Lightwalletd compatibility
 
 `zinder-compat-lightwalletd` serves the vendored lightwalletd
-`CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. It
-opens canonical and derive storage only through secondary readers. It does not
-call Zebra, write canonical storage, or build artifacts independently.
+`CompactTxStreamer` protocol by translating requests onto `LightwalletdQueryApi`.
+It serves indexed reads from an admitted exact-fence pair of canonical and
+wallet-projection secondaries. It does not write canonical storage, build
+artifacts independently, or use Zebra as a fallback for indexed history.
+
+The compatibility runtime uses `zinder-source` only for explicit edge
+capabilities: transaction broadcast, network-upgrade activation discovery, and
+sparse tree-state fill where the query contract delegates that read upstream.
+Those calls never substitute for indexed history or change the pinned serving
+pair.
 
 For a compatible wallet, Zinder is an endpoint-level replacement for
 lightwalletd: the wallet keeps the `CompactTxStreamer` contract and changes the
@@ -52,13 +59,13 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 
 The contract is split across two async traits so the compiler expresses which calls a handle can serve:
 
-- `ChainIndex` carries the canonical and derive-store reads. Both adapters implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
+- `ChainIndex` carries canonical and wallet-projection reads. Both adapters implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
 - `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
 
 A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`; passing a `LocalChainIndex` there is a compile error rather than a runtime "endpoint not configured" failure. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
 
 Native clients get typed errors, capability discovery, epoch-pinned reads,
-chain-event cursors, transaction broadcast results, mempool reads, and
+chain-event cursors, transaction broadcast outcomes, mempool reads, and
 transparent-address artifacts without depending on the lightwalletd
 compatibility layer.
 
@@ -122,7 +129,7 @@ Explorer-shaped reads use `WalletQuery` for canonical wallet-plane data and
 `ExplorerQuery` for derived views. A consumer should call `WalletQuery` directly
 for canonical blocks, transactions, tree state, broadcast, and wallet events.
 It should call `ExplorerQuery` for summaries, search, history, distributions,
-rankings, and other derived projections. The derive plane consumes canonical
+rankings, and other derived projections. The materialized-view plane consumes canonical
 artifacts and event streams, owns its own storage, and can be rebuilt without
 touching canonical chain state.
 
@@ -130,6 +137,6 @@ touching canonical chain state.
 
 - [Indexer/wallet boundary](../architecture/indexer-wallet-boundary.md)
 - [Wallet data plane](../architecture/wallet-data-plane.md)
-- [Derive plane](../architecture/derive-plane.md)
+- [Materialized-view plane](../architecture/materialized-view-plane.md)
 - [Protocol boundary](../architecture/protocol-boundary.md)
 - [Server-side wallet pattern](server-side-wallet-pattern.md)

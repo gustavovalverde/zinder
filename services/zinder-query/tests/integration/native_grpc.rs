@@ -15,7 +15,8 @@ use tonic_types::StatusExt;
 use zinder_core::wire::encode_rpc_transaction_id_hex;
 use zinder_core::{
     ChainEpoch, ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootHash, SubtreeRootIndex, TransactionId, TreeStateArtifact, UnixTimestampMillis,
+    SubtreeRootHash, SubtreeRootIndex, TransactionId, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentOutputArtifact, TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_proto::capabilities::{WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1};
 use zinder_proto::v1::{
@@ -28,14 +29,17 @@ use zinder_proto::v1::{
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter, WalletQueryOptions};
 use zinder_store::{
     ChainEpochArtifacts, EventStreamStartPosition, PrimaryChainStore, StreamCursorTokenV1,
-    event_stream_start_message,
+    chain_view_message, event_stream_start_message,
 };
 use zinder_testkit::{
     MockTransactionBroadcaster, StoreFixture, encode_fixture_block_replay,
     sample_regtest_upgrade_activations,
 };
 
-use crate::common::{compact_block_with_tree_sizes, synthetic_chain_epoch};
+use crate::common::{
+    chain_epoch_artifacts_with_transparent_facts, compact_block_with_tree_sizes,
+    synthetic_chain_epoch,
+};
 
 #[tokio::test]
 async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyre::Result<()> {
@@ -50,8 +54,8 @@ async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyr
     assert_wallet_grpc_response_epochs(&grpc_responses, stored_artifacts.chain_epoch.id.value());
     assert_eq!(
         grpc_responses
-            .latest_block
-            .latest_block
+            .visible_tip_block
+            .visible_tip_block
             .ok_or_else(|| eyre!("missing latest block"))?
             .height,
         1
@@ -259,7 +263,7 @@ async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Resu
             start: Some(event_stream_start_message(
                 &EventStreamStartPosition::EarliestRetained,
             )),
-            family: wallet::ChainEventStreamFamily::Tip as i32,
+            family: wallet::ChainEventStreamFamily::Visible as i32,
             address_filter: Vec::new(),
         }),
     )
@@ -304,7 +308,7 @@ async fn native_grpc_service_rejects_unset_event_stream_start() -> eyre::Result<
             &grpc_adapter,
             Request::new(wallet::ChainEventsRequest {
                 start,
-                family: wallet::ChainEventStreamFamily::Tip as i32,
+                family: wallet::ChainEventStreamFamily::Visible as i32,
                 address_filter: Vec::new(),
             }),
         )
@@ -337,7 +341,7 @@ async fn native_grpc_service_live_tail_delivers_only_post_subscribe_events() -> 
             start: Some(event_stream_start_message(
                 &EventStreamStartPosition::LiveTail,
             )),
-            family: wallet::ChainEventStreamFamily::Tip as i32,
+            family: wallet::ChainEventStreamFamily::Visible as i32,
             address_filter: Vec::new(),
         }),
     )
@@ -392,7 +396,7 @@ async fn native_grpc_service_expires_pruned_chain_event_cursors() -> eyre::Resul
                     first_cursor,
                 )),
             )),
-            family: wallet::ChainEventStreamFamily::Tip as i32,
+            family: wallet::ChainEventStreamFamily::Visible as i32,
             address_filter: Vec::new(),
         }),
     )
@@ -448,9 +452,9 @@ async fn native_grpc_service_honors_request_epoch_pin() -> eyre::Result<()> {
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
-    let response = WalletQueryService::latest_block(
+    let response = WalletQueryService::visible_tip_block(
         &grpc_adapter,
-        Request::new(wallet::LatestBlockRequest {
+        Request::new(wallet::VisibleTipBlockRequest {
             at_epoch_id: Some(first_epoch.id.value()),
         }),
     )
@@ -461,73 +465,12 @@ async fn native_grpc_service_honors_request_epoch_pin() -> eyre::Result<()> {
         .clone()
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
-    let latest_block = response
-        .latest_block
+    let visible_tip_block = response
+        .visible_tip_block
         .ok_or_else(|| eyre!("missing latest block"))?;
 
     assert_eq!(response_epoch.chain_epoch_id, first_epoch.id.value());
-    assert_eq!(latest_block.height, 1);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn native_grpc_service_proxies_chain_events_to_ingest_control() -> eyre::Result<()> {
-    let proxied_event = wallet::ChainEventEnvelope {
-        cursor: vec![0x01, 0x02],
-        event_sequence: 77,
-        chain_view: Some(wallet::ChainView {
-            chain_epoch: Some(proxied_event_chain_epoch()),
-            indexed_tip: None,
-            upstream_tip: None,
-            derive: None,
-        }),
-        event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
-            wallet::ChainCommitted {
-                committed: Some(wallet::ChainEpochCommitted {
-                    chain_epoch: Some(proxied_event_chain_epoch()),
-                    start_height: 5,
-                    end_height: 5,
-                }),
-            },
-        )),
-    };
-    let (ingest_control_addr, cancel, server_handle) =
-        spawn_ingest_control_server(StaticIngestControl::new(proxied_event.clone())).await?;
-    let store_fixture = StoreFixture::open()?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let grpc_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
-        wallet_query,
-        ServerInfoSettings::default(),
-        format!("http://{ingest_control_addr}"),
-    );
-
-    let mut event_stream = WalletQueryService::chain_events(
-        &grpc_adapter,
-        Request::new(wallet::ChainEventsRequest {
-            start: Some(event_stream_start_message(
-                &EventStreamStartPosition::EarliestRetained,
-            )),
-            family: wallet::ChainEventStreamFamily::Tip as i32,
-            address_filter: Vec::new(),
-        }),
-    )
-    .await?
-    .into_inner();
-    let first_event = event_stream
-        .next()
-        .await
-        .ok_or_else(|| eyre!("chain-events proxy stream closed before first event"))??;
-
-    assert_eq!(first_event, proxied_event);
-
-    drop(event_stream);
-    cancel.cancel();
-    server_handle.await??;
+    assert_eq!(visible_tip_block.height, 1);
 
     Ok(())
 }
@@ -537,10 +480,10 @@ async fn native_grpc_service_resolves_unpinned_mempool_transactions() -> eyre::R
     let transaction_id = TransactionId::from_bytes([0x89; 32]);
     let mempool_status = wallet::TransactionStatusResponse {
         chain_view: Some(wallet::ChainView {
-            chain_epoch: Some(proxied_event_chain_epoch()),
+            chain_epoch: Some(test_chain_epoch()),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }),
         location: Some(wallet::TransactionLocation {
             location: Some(wallet::transaction_location::Location::InMempool(
@@ -551,8 +494,8 @@ async fn native_grpc_service_resolves_unpinned_mempool_transactions() -> eyre::R
             )),
         }),
     };
-    let ingest_control = StaticIngestControl::new(wallet::ChainEventEnvelope::default())
-        .with_mempool_transaction_response(mempool_status);
+    let ingest_control =
+        StaticIngestControl::new().with_mempool_transaction_response(mempool_status);
     let (ingest_control_addr, cancel, server_handle) =
         spawn_ingest_control_server(ingest_control).await?;
     let store_fixture = StoreFixture::open()?;
@@ -602,6 +545,137 @@ async fn native_grpc_service_resolves_unpinned_mempool_transactions() -> eyre::R
     cancel.cancel();
     server_handle.await??;
     Ok(())
+}
+
+#[tokio::test]
+async fn native_grpc_service_combines_confirmed_balance_with_pending_transparent_activity()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let fixture = commit_confirmed_transparent_balance_fixture(&store)?;
+
+    let pending_inflow_zat = 300;
+    let ingest_control = configured_mempool_balance_ingest_control(&fixture, pending_inflow_zat);
+    let (ingest_control_addr, cancel, server_handle) =
+        spawn_ingest_control_server(ingest_control).await?;
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let grpc_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
+        wallet_query,
+        ServerInfoSettings::default(),
+        format!("http://{ingest_control_addr}"),
+    );
+
+    let response = WalletQueryService::transparent_address_balance(
+        &grpc_adapter,
+        Request::new(wallet::TransparentAddressBalanceRequest {
+            addresses: vec![wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                    fixture.address_script_hash.as_bytes().to_vec(),
+                )),
+            }],
+            at_epoch_id: Some(fixture.chain_epoch.id.value()),
+        }),
+    )
+    .await?
+    .into_inner();
+
+    assert_eq!(response.confirmed_zat, fixture.confirmed_value_zat);
+    assert_eq!(
+        response.unconfirmed_delta_zat,
+        i64::try_from(pending_inflow_zat)? - i64::try_from(fixture.confirmed_value_zat)?,
+        "the live overlay adds pending inflows and subtracts spends of confirmed outputs"
+    );
+    assert_eq!(response.address_count, 1);
+    assert_eq!(
+        response
+            .chain_view
+            .and_then(|chain_view| chain_view.chain_epoch)
+            .ok_or_else(|| eyre!("balance response omitted its chain epoch"))?
+            .chain_epoch_id,
+        fixture.chain_epoch.id.value(),
+        "the public balance response remains pinned to the canonical epoch"
+    );
+
+    cancel.cancel();
+    server_handle.await??;
+    Ok(())
+}
+
+struct ConfirmedTransparentBalanceFixture {
+    chain_epoch: ChainEpoch,
+    address_script_hash: TransparentAddressScriptHash,
+    confirmed_outpoint: TransparentOutPoint,
+    confirmed_value_zat: u64,
+}
+
+fn commit_confirmed_transparent_balance_fixture(
+    store: &PrimaryChainStore,
+) -> eyre::Result<ConfirmedTransparentBalanceFixture> {
+    let address_script_hash = TransparentAddressScriptHash::from_bytes([0x42; 32]);
+    let confirmed_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x51; 32]), 7);
+    let confirmed_value_zat = 10_000;
+    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(41, 1);
+    let confirmed_output = TransparentOutputArtifact::new(
+        confirmed_outpoint,
+        confirmed_value_zat,
+        vec![0x76, 0xa9, 0x14],
+        address_script_hash,
+        block.height,
+        block.block_hash,
+    );
+    store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
+        chain_epoch,
+        vec![block],
+        vec![compact_block],
+        &[confirmed_output],
+        Vec::new(),
+    ))?;
+
+    Ok(ConfirmedTransparentBalanceFixture {
+        chain_epoch,
+        address_script_hash,
+        confirmed_outpoint,
+        confirmed_value_zat,
+    })
+}
+
+fn configured_mempool_balance_ingest_control(
+    fixture: &ConfirmedTransparentBalanceFixture,
+    pending_inflow_zat: u64,
+) -> StaticIngestControl {
+    StaticIngestControl::new()
+        .with_transparent_mempool_outputs_by_address_response(
+            wallet::TransparentMempoolOutputsByAddressResponse {
+                chain_view: Some(chain_view_message(fixture.chain_epoch)),
+                outputs: vec![wallet::TransparentMempoolOutput {
+                    address_script_hash: fixture.address_script_hash.as_bytes().to_vec(),
+                    script_pub_key: vec![0x76, 0xa9, 0x14],
+                    outpoint: Some(wallet::OutPoint {
+                        transaction_id: encode_rpc_transaction_id_hex(TransactionId::from_bytes(
+                            [0x52; 32],
+                        )),
+                        output_index: 0,
+                    }),
+                    value_zat: pending_inflow_zat,
+                }],
+            },
+        )
+        .with_transparent_mempool_spends_by_outpoint_response(
+            wallet::TransparentMempoolSpendsByOutpointResponse {
+                chain_view: Some(chain_view_message(fixture.chain_epoch)),
+                spends: vec![wallet::TransparentMempoolSpend {
+                    spent_outpoint: Some(wallet::OutPoint {
+                        transaction_id: encode_rpc_transaction_id_hex(
+                            fixture.confirmed_outpoint.transaction_id,
+                        ),
+                        output_index: fixture.confirmed_outpoint.output_index,
+                    }),
+                    spending_transaction_id: encode_rpc_transaction_id_hex(
+                        TransactionId::from_bytes([0x53; 32]),
+                    ),
+                }],
+            },
+        )
 }
 
 #[tokio::test]
@@ -667,7 +741,7 @@ struct StoredWalletArtifacts {
 }
 
 struct WalletGrpcResponses {
-    latest_block: wallet::LatestBlockResponse,
+    visible_tip_block: wallet::VisibleTipBlockResponse,
     compact_block_range: Vec<wallet::CompactBlocksInRangeChunk>,
     explicit_tree_state: wallet::TreeStateResponse,
     latest_tree_state_checkpoint: wallet::TreeStateResponse,
@@ -712,9 +786,9 @@ fn commit_wallet_artifacts(store: &PrimaryChainStore) -> eyre::Result<StoredWall
 async fn read_wallet_grpc_responses(
     grpc_adapter: &WalletQueryGrpcAdapter<WalletQuery<PrimaryChainStore>>,
 ) -> Result<WalletGrpcResponses, tonic::Status> {
-    let latest_block = WalletQueryService::latest_block(
+    let visible_tip_block = WalletQueryService::visible_tip_block(
         grpc_adapter,
-        Request::new(wallet::LatestBlockRequest { at_epoch_id: None }),
+        Request::new(wallet::VisibleTipBlockRequest { at_epoch_id: None }),
     )
     .await?
     .into_inner();
@@ -766,7 +840,7 @@ async fn read_wallet_grpc_responses(
     .into_inner();
 
     Ok(WalletGrpcResponses {
-        latest_block,
+        visible_tip_block,
         compact_block_range,
         explicit_tree_state,
         latest_tree_state_checkpoint,
@@ -777,7 +851,7 @@ async fn read_wallet_grpc_responses(
 
 fn assert_wallet_grpc_response_epochs(responses: &WalletGrpcResponses, chain_epoch_id: u64) {
     assert_eq!(
-        response_chain_epoch_id(&responses.latest_block),
+        response_chain_epoch_id(&responses.visible_tip_block),
         chain_epoch_id
     );
     for compact_block_chunk in &responses.compact_block_range {
@@ -801,7 +875,7 @@ trait HasChainEpoch {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch>;
 }
 
-impl HasChainEpoch for wallet::LatestBlockResponse {
+impl HasChainEpoch for wallet::VisibleTipBlockResponse {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
         self.chain_view
             .as_ref()
@@ -848,20 +922,22 @@ fn has_capability(wallet_info: &wallet::WalletServerInfo, capability: &str) -> b
     })
 }
 
-type StaticChainEventsStream =
+type StaticVisibleChainEventsStream =
     Pin<Box<dyn Stream<Item = Result<wallet::ChainEventEnvelope, Status>> + Send>>;
 
 #[derive(Clone)]
 struct StaticIngestControl {
-    event: wallet::ChainEventEnvelope,
-    mempool_transaction_response: Option<wallet::TransactionStatusResponse>,
+    transaction: Option<wallet::TransactionStatusResponse>,
+    outputs_by_address: Option<wallet::TransparentMempoolOutputsByAddressResponse>,
+    spends_by_outpoint: Option<wallet::TransparentMempoolSpendsByOutpointResponse>,
 }
 
 impl StaticIngestControl {
-    fn new(event: wallet::ChainEventEnvelope) -> Self {
+    fn new() -> Self {
         Self {
-            event,
-            mempool_transaction_response: None,
+            transaction: None,
+            outputs_by_address: None,
+            spends_by_outpoint: None,
         }
     }
 
@@ -869,14 +945,30 @@ impl StaticIngestControl {
         mut self,
         response: wallet::TransactionStatusResponse,
     ) -> Self {
-        self.mempool_transaction_response = Some(response);
+        self.transaction = Some(response);
+        self
+    }
+
+    fn with_transparent_mempool_outputs_by_address_response(
+        mut self,
+        response: wallet::TransparentMempoolOutputsByAddressResponse,
+    ) -> Self {
+        self.outputs_by_address = Some(response);
+        self
+    }
+
+    fn with_transparent_mempool_spends_by_outpoint_response(
+        mut self,
+        response: wallet::TransparentMempoolSpendsByOutpointResponse,
+    ) -> Self {
+        self.spends_by_outpoint = Some(response);
         self
     }
 }
 
 #[tonic::async_trait]
 impl IngestControl for StaticIngestControl {
-    type ChainEventsStream = StaticChainEventsStream;
+    type VisibleChainEventsStream = StaticVisibleChainEventsStream;
     type MempoolEventsStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<wallet::MempoolEventEnvelope, Status>> + Send>,
     >;
@@ -915,7 +1007,7 @@ impl IngestControl for StaticIngestControl {
                 }),
                 indexed_tip: None,
                 upstream_tip: None,
-                derive: None,
+                materialized_views: None,
             }),
             network_name: "zcash-regtest".to_owned(),
             phase: WriterPhase::FollowingTip.into(),
@@ -924,13 +1016,13 @@ impl IngestControl for StaticIngestControl {
         }))
     }
 
-    async fn chain_events(
+    async fn visible_chain_events(
         &self,
-        _request: Request<wallet::ChainEventsRequest>,
-    ) -> Result<Response<Self::ChainEventsStream>, Status> {
-        Ok(Response::new(Box::pin(tokio_stream::iter([Ok(self
-            .event
-            .clone())]))))
+        _request: Request<wallet::EventStreamStart>,
+    ) -> Result<Response<Self::VisibleChainEventsStream>, Status> {
+        Err(Status::unimplemented(
+            "test scaffold does not stub VisibleChainEvents",
+        ))
     }
 
     async fn mempool_snapshot(
@@ -946,7 +1038,7 @@ impl IngestControl for StaticIngestControl {
         &self,
         _request: Request<MempoolTransactionRequest>,
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
-        self.mempool_transaction_response
+        self.transaction
             .clone()
             .map(Response::new)
             .ok_or_else(|| Status::not_found("transaction is not in the test mempool"))
@@ -965,18 +1057,28 @@ impl IngestControl for StaticIngestControl {
         &self,
         _request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
     ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
-        Err(Status::unimplemented(
-            "test scaffold does not stub TransparentMempoolOutputsByAddress",
-        ))
+        self.outputs_by_address
+            .clone()
+            .map(Response::new)
+            .ok_or_else(|| {
+                Status::unimplemented(
+                    "test scaffold does not stub TransparentMempoolOutputsByAddress",
+                )
+            })
     }
 
     async fn transparent_mempool_spends_by_outpoint(
         &self,
         _request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
     ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
-        Err(Status::unimplemented(
-            "test scaffold does not stub TransparentMempoolSpendsByOutpoint",
-        ))
+        self.spends_by_outpoint
+            .clone()
+            .map(Response::new)
+            .ok_or_else(|| {
+                Status::unimplemented(
+                    "test scaffold does not stub TransparentMempoolSpendsByOutpoint",
+                )
+            })
     }
 
     async fn transparent_mempool_outputs_by_outpoint(
@@ -998,7 +1100,7 @@ impl IngestControl for StaticIngestControl {
     }
 }
 
-fn proxied_event_chain_epoch() -> wallet::ChainEpoch {
+fn test_chain_epoch() -> wallet::ChainEpoch {
     wallet::ChainEpoch {
         chain_epoch_id: 11,
         network_name: "zcash-regtest".to_owned(),

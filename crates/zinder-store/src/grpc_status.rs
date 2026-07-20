@@ -6,13 +6,8 @@ use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet;
 use zinder_proto::{BoundaryError, status_with_reason};
 
-use crate::proto_codec::{
-    chain_event_stream_family_from_message, event_stream_start_from_message,
-    mempool_event_stream_family_from_message,
-};
-use crate::{
-    ChainEventStreamFamily, EventStreamStartPosition, MempoolEventStreamFamily, StoreError,
-};
+use crate::proto_codec::{chain_event_stream_family_from_message, event_stream_start_from_message};
+use crate::{ChainEventStreamFamily, EventStreamStartPosition, StoreError};
 
 /// Decodes the wire `EventStreamStart` carried by a stream-subscribe request,
 /// mapping an unset or empty start position to `INVALID_ARGUMENT`.
@@ -30,15 +25,6 @@ pub fn chain_event_stream_family_from_request(
 ) -> Result<ChainEventStreamFamily, Status> {
     chain_event_stream_family_from_message(family)
         .ok_or_else(|| Status::invalid_argument("chain-event stream family is unknown"))
-}
-
-/// Decodes the wire mempool-event stream family carried by a stream-subscribe
-/// request, mapping unknown integers to `INVALID_ARGUMENT`.
-pub fn mempool_event_stream_family_from_request(
-    family: i32,
-) -> Result<MempoolEventStreamFamily, Status> {
-    mempool_event_stream_family_from_message(family)
-        .ok_or_else(|| Status::invalid_argument("mempool-event stream family is unknown"))
 }
 
 /// Maps a [`StoreError`] to the canonical gRPC status used by all services.
@@ -64,7 +50,6 @@ fn typed_detail_for(error: &StoreError) -> ErrorDetails {
         StoreError::ChainEventCursorInvalid { reason }
         | StoreError::MempoolEventCursorInvalid { reason }
         | StoreError::AddressOutputCursorInvalid { reason }
-        | StoreError::TransparentHistoryCursorInvalid { reason }
         | StoreError::SnapshotPageCursorInvalid { reason } => {
             ErrorDetails::with_bad_request(vec![FieldViolation::new("from_cursor", *reason)])
         }
@@ -131,14 +116,12 @@ impl BoundaryError for StoreError {
                 ErrorReason::ChainEventCursorInvalid
             }
             Self::AddressOutputCursorInvalid { .. } => ErrorReason::AddressOutputCursorInvalid,
-            Self::TransparentHistoryCursorInvalid { .. } => {
-                ErrorReason::TransparentHistoryCursorInvalid
-            }
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
             Self::MempoolEventCursorExpired { .. } => ErrorReason::MempoolEventCursorExpired,
             Self::SnapshotPageCursorInvalid { .. } => ErrorReason::SnapshotPageCursorInvalid,
             Self::SnapshotPageCursorExpired { .. } => ErrorReason::SnapshotPageCursorExpired,
             Self::SchemaMismatch { .. }
+            | Self::StoreMetadataMissing
             | Self::StoreSchemaIncomplete { .. }
             | Self::SchemaTooOld { .. } => ErrorReason::SchemaMismatch,
             Self::SchemaTooNew { .. } => ErrorReason::SchemaTooNew,
@@ -200,7 +183,6 @@ mod tests {
             },
             StoreError::NoVisibleChainEpoch,
             StoreError::CanonicalHistoryBoundsMissing,
-            StoreError::CanonicalHistoryBoundsReconciliation { reason: "probe" },
             StoreError::CanonicalHistoryUnavailable {
                 requested_height: BlockHeight::new(1),
                 first_available_height: BlockHeight::new(2),
@@ -227,6 +209,7 @@ mod tests {
                 persisted_version: 1,
                 expected_version: 2,
             },
+            StoreError::StoreMetadataMissing,
             StoreError::StoreSchemaIncomplete {
                 missing_column_family: "probe",
             },
@@ -249,7 +232,7 @@ mod tests {
             StoreError::ReorgWindowExceeded {
                 attempted_from_height: BlockHeight::new(1),
                 minimum_reorg_height: BlockHeight::new(2),
-                safe_tip_height: BlockHeight::new(3),
+                settled_tip_height: BlockHeight::new(3),
             },
             StoreError::ChainEventCursorExpired {
                 event_sequence: 1,
@@ -257,7 +240,6 @@ mod tests {
             },
             StoreError::ChainEventCursorInvalid { reason: "probe" },
             StoreError::AddressOutputCursorInvalid { reason: "probe" },
-            StoreError::TransparentHistoryCursorInvalid { reason: "probe" },
             StoreError::MempoolEventCursorExpired {
                 event_sequence: 1,
                 oldest_retained_sequence: 2,

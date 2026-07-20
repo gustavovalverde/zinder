@@ -18,13 +18,14 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
-use zinder_derive::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, DeriveStore, DeriveStoreReadSnapshot,
+use zinder_materialized_views::{
+    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, MaterializedViewStore,
+    MaterializedViewStoreReadSnapshot,
 };
 
 use super::error::ExplorerError;
 use zinder_proto::v1::explorer::{BlockSummaryRecord, ExplorerFreshness};
-use zinder_proto::v1::wallet::{self, ChainView, DeriveStatus, IndexedTip, UpstreamTip};
+use zinder_proto::v1::wallet::{self, ChainView, IndexedTip, MaterializedViewStatus, UpstreamTip};
 use zinder_source::{NodeSource, UpstreamHealthSnapshot};
 
 /// Shared, lock-protected handle to the most recent
@@ -93,7 +94,7 @@ pub(crate) async fn attach_upstream_observation(
                     chain_epoch: None,
                     indexed_tip: None,
                     upstream_tip: Some(upstream_tip),
-                    derive: None,
+                    materialized_views: None,
                 });
             }
         }
@@ -101,17 +102,19 @@ pub(crate) async fn attach_upstream_observation(
     freshness
 }
 
-/// Reads the explorer's indexed tip: the highest block the derive projections
+/// Reads the explorer's indexed tip: the highest block the materialized views
 /// have fully materialized, decoded from the newest `BlockSummaryRecord`.
 /// Returns `None` when no block is materialized yet.
 ///
-/// All chain-event derive consumers advance under one shared cursor, so the
+/// All chain-event materialized-view consumers advance under one shared cursor, so the
 /// block-summary head is an accurate indexed tip for every capability.
-pub(crate) fn read_indexed_tip(derive_store: &DeriveStore) -> Result<Option<IndexedTip>, Status> {
-    if !derive_store.has_consumer(BLOCK_SUMMARY_CONSUMER_NAME) {
+pub(crate) fn read_indexed_tip(
+    materialized_view_store: &MaterializedViewStore,
+) -> Result<Option<IndexedTip>, Status> {
+    if !materialized_view_store.has_consumer(BLOCK_SUMMARY_CONSUMER_NAME) {
         return Ok(None);
     }
-    let Some((_, payload)) = derive_store
+    let Some((_, payload)) = materialized_view_store
         .last_consumer_entry(BLOCK_SUMMARY_COLUMN_FAMILY)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
     else {
@@ -121,7 +124,7 @@ pub(crate) fn read_indexed_tip(derive_store: &DeriveStore) -> Result<Option<Inde
 }
 
 fn read_indexed_tip_snapshot(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
 ) -> Result<Option<IndexedTip>, Status> {
     let Some((_, payload)) = snapshot
         .last_consumer_entry(BLOCK_SUMMARY_COLUMN_FAMILY)
@@ -152,47 +155,50 @@ fn decode_indexed_tip(payload: &[u8]) -> Result<IndexedTip, Status> {
 /// handler.
 ///
 /// Assembles the cross-plane `chain_view` from the canonical follower tip
-/// (`chain_epoch`), the derive plane's indexed tip (the block the response
-/// actually reflects), and the persisted derive status. Consumers read index
+/// (`chain_epoch`), the materialized-view plane's indexed tip (the block the response
+/// actually reflects), and the persisted materialized-view status. Consumers read index
 /// lag as `chain_view.chain_epoch.visible_tip.height -
-/// chain_view.indexed_tip.tip.height`. The derive-plane identity (indexed tip
-/// and derive status) is carried whenever `derive_store` is wired, so the
-/// bootstrap `ServerInfo` call reports how far the projections have
+/// chain_view.indexed_tip.tip.height`. The materialized-view identity (indexed tip
+/// and materialized-view status) is carried whenever `materialized_view_store` is wired, so the
+/// bootstrap `ServerInfo` call reports how far the materialized views have
 /// materialized even though its `chain_epoch` is absent because it makes no
 /// snapshot-consistency claim. `chain_view` stays unset only when the response
-/// resolves no chain epoch and no derive store is wired. The upstream tip is
+/// resolves no chain epoch and no materialized-view store is wired. The upstream tip is
 /// overlaid separately by [`attach_upstream_observation`].
 pub(crate) fn build_explorer_freshness(
-    derive_store: Option<&DeriveStore>,
+    materialized_view_store: Option<&MaterializedViewStore>,
     capability_version: &str,
     chain_epoch: Option<wallet::ChainEpoch>,
     snapshot_age_millis: u64,
 ) -> Result<ExplorerFreshness, Status> {
-    let (indexed_tip, derive) = match derive_store {
-        Some(store) => (read_indexed_tip(store)?, read_derive_status(Some(store))?),
+    let (indexed_tip, materialized_views) = match materialized_view_store {
+        Some(store) => (
+            read_indexed_tip(store)?,
+            read_materialized_view_status(Some(store))?,
+        ),
         None => (None, None),
     };
     Ok(explorer_freshness(
         indexed_tip,
-        derive,
+        materialized_views,
         capability_version,
         chain_epoch,
         snapshot_age_millis,
     ))
 }
 
-/// Builds freshness from the same derive snapshot as a response's rows and coverage.
+/// Builds freshness from the same materialized-view snapshot as the response rows.
 pub(crate) fn build_explorer_freshness_from_snapshot(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     capability_version: &str,
     chain_epoch: Option<wallet::ChainEpoch>,
     snapshot_age_millis: u64,
 ) -> Result<ExplorerFreshness, Status> {
     let indexed_tip = read_indexed_tip_snapshot(snapshot)?;
-    let derive = read_derive_status_snapshot(snapshot)?;
+    let materialized_views = read_materialized_view_status_snapshot(snapshot)?;
     Ok(explorer_freshness(
         indexed_tip,
-        derive,
+        materialized_views,
         capability_version,
         chain_epoch,
         snapshot_age_millis,
@@ -201,21 +207,22 @@ pub(crate) fn build_explorer_freshness_from_snapshot(
 
 fn explorer_freshness(
     indexed_tip: Option<IndexedTip>,
-    derive: Option<DeriveStatus>,
+    materialized_views: Option<MaterializedViewStatus>,
     capability_version: &str,
     chain_epoch: Option<wallet::ChainEpoch>,
     snapshot_age_millis: u64,
 ) -> ExplorerFreshness {
-    let chain_view = if chain_epoch.is_some() || indexed_tip.is_some() || derive.is_some() {
-        Some(ChainView {
-            chain_epoch,
-            indexed_tip,
-            upstream_tip: None,
-            derive,
-        })
-    } else {
-        None
-    };
+    let chain_view =
+        if chain_epoch.is_some() || indexed_tip.is_some() || materialized_views.is_some() {
+            Some(ChainView {
+                chain_epoch,
+                indexed_tip,
+                upstream_tip: None,
+                materialized_views,
+            })
+        } else {
+            None
+        };
     ExplorerFreshness {
         chain_view,
         snapshot_age_millis,
@@ -224,7 +231,7 @@ fn explorer_freshness(
     }
 }
 
-/// Returns true when the derive-plane indexed tip is the visible tip of the
+/// Returns true when the materialized-view indexed tip is the visible tip of the
 /// supplied canonical chain epoch.
 pub(crate) fn indexed_tip_matches_chain_epoch(
     freshness: &ExplorerFreshness,
@@ -239,39 +246,41 @@ pub(crate) fn indexed_tip_matches_chain_epoch(
         .is_some_and(|(indexed_tip, visible_tip)| indexed_tip == visible_tip)
 }
 
-/// Reads the derive-status record the ingest plane persists, decoding it into
-/// the wire [`DeriveStatus`]. Returns `None` when no derive store is wired or
-/// the ingest plane has not written a record yet.
-pub(crate) fn read_derive_status(
-    derive_store: Option<&DeriveStore>,
-) -> Result<Option<DeriveStatus>, Status> {
-    let Some(store) = derive_store else {
+/// Reads the persisted materialized-view status.
+///
+/// Decodes the record into the wire [`MaterializedViewStatus`]. Returns `None`
+/// when no materialized-view store is wired or the ingest plane has not written
+/// a record yet.
+pub(crate) fn read_materialized_view_status(
+    materialized_view_store: Option<&MaterializedViewStore>,
+) -> Result<Option<MaterializedViewStatus>, Status> {
+    let Some(store) = materialized_view_store else {
         return Ok(None);
     };
     let Some(bytes) = store
-        .get_derive_status()
+        .get_materialized_view_status()
         .map_err(|error| ExplorerError::internal(error.to_string()))?
     else {
         return Ok(None);
     };
-    decode_derive_status(&bytes).map(Some)
+    decode_materialized_view_status(&bytes).map(Some)
 }
 
-fn read_derive_status_snapshot(
-    snapshot: &DeriveStoreReadSnapshot<'_>,
-) -> Result<Option<DeriveStatus>, Status> {
+fn read_materialized_view_status_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+) -> Result<Option<MaterializedViewStatus>, Status> {
     let Some(bytes) = snapshot
-        .get_derive_status()
+        .get_materialized_view_status()
         .map_err(|error| ExplorerError::internal(error.to_string()))?
     else {
         return Ok(None);
     };
-    decode_derive_status(&bytes).map(Some)
+    decode_materialized_view_status(&bytes).map(Some)
 }
 
-fn decode_derive_status(bytes: &[u8]) -> Result<DeriveStatus, Status> {
-    DeriveStatus::decode(bytes).map_err(|error| {
-        ExplorerError::internal(format!("DeriveStatus decode failed: {error}")).into()
+fn decode_materialized_view_status(bytes: &[u8]) -> Result<MaterializedViewStatus, Status> {
+    MaterializedViewStatus::decode(bytes).map_err(|error| {
+        ExplorerError::internal(format!("MaterializedViewStatus decode failed: {error}")).into()
     })
 }
 
@@ -350,7 +359,7 @@ mod tests {
             chain_epoch: Some(wallet::ChainEpoch::default()),
             indexed_tip: None,
             upstream_tip: None,
-            derive: None,
+            materialized_views: None,
         }
     }
 

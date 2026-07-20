@@ -150,7 +150,7 @@ fn historical_enrichment_is_idempotent_rejects_stale_hashes_and_survives_commit(
 }
 
 #[test]
-fn only_artifact_schema_19_is_readable_older_and_newer_are_rejected_and_19_commits()
+fn only_artifact_schema_19_is_readable_other_versions_are_rejected_and_19_commits()
 -> eyre::Result<()> {
     assert_schema_reopen(19, true)?;
     assert_schema_reopen(11, false)?;

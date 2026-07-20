@@ -178,25 +178,25 @@ pub enum WalletProjectionContractError {
     ReadyUtxoCommitmentSchemeMismatch,
     /// A persisted build lease uses an unsupported lease encoding version.
     #[error("wallet projection build lease has unsupported version {encoded}")]
-    UnsupportedProjectionBuildLeaseVersion {
+    UnsupportedWalletProjectionBuildLeaseVersion {
         /// Unsupported durable lease version.
         encoded: u64,
     },
     /// A persisted lease does not name the wallet projection schema that contains it.
     #[error("wallet projection build lease schema does not match store schema")]
-    ProjectionBuildLeaseSchemaMismatch,
+    WalletProjectionBuildLeaseSchemaMismatch,
     /// A persisted lease belongs to a different network than its store control.
     #[error("wallet projection build lease network does not match store control")]
-    ProjectionBuildLeaseNetworkMismatch,
+    WalletProjectionBuildLeaseNetworkMismatch,
     /// A persisted lease and singleton control record disagree about writer generation.
     #[error("wallet projection build lease generation does not match store control")]
-    ProjectionBuildLeaseGenerationMismatch,
+    WalletProjectionBuildLeaseGenerationMismatch,
     /// A persisted lease is not anchored at the BUILDING plan's canonical target.
     #[error("wallet projection build lease canonical anchor does not match the BUILDING plan")]
-    ProjectionBuildLeaseCanonicalAnchorMismatch,
+    WalletProjectionBuildLeaseCanonicalAnchorMismatch,
     /// A retained event anchor follows the canonical anchor it is meant to resume from.
     #[error("wallet projection retained event anchor follows its canonical anchor")]
-    ProjectionBuildLeaseRetainedEventAnchorMismatch,
+    WalletProjectionBuildLeaseRetainedEventAnchorMismatch,
     /// READY state must not retain a build lease after atomic promotion.
     #[error("READY wallet projection control must not retain a build lease")]
     ReadyControlRetainsBuildLease,

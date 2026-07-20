@@ -6,16 +6,12 @@
 //!
 //! Cross-references: [Integration surfaces](../../../../docs/reference/integration-surfaces.md).
 
-use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
 use zinder_client::{ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex};
-use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
-use zinder_query::WalletQuery;
-use zinder_testkit::sample_regtest_upgrade_activations;
 
-use super::transparent_address_history_fixture;
+use super::{build_transparent_address_adapter, build_transparent_address_serving_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
@@ -39,18 +35,9 @@ fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
 }
 
 #[tokio::test]
-async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<()> {
-    let fixture = transparent_address_history_fixture()?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            fixture.store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        )
-        .with_derive_store(fixture.derive_store.clone()),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-
+async fn serves_public_transparent_address_shape_from_production_pair() -> eyre::Result<()> {
+    let mut fixture = build_transparent_address_serving_fixture()?;
+    let adapter = build_transparent_address_adapter(&mut fixture)?;
     let utxo_request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![fixture.address.clone()],
         start_height: 1,
@@ -80,16 +67,10 @@ async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<
 
     assert_eq!(utxo_list.address_utxos, vec![first_streamed_utxo.clone()]);
     assert!(utxo_stream.next().await.is_none());
-    assert_eq!(first_streamed_utxo.address, fixture.address.as_str());
-    assert_eq!(
-        first_streamed_utxo.txid,
-        fixture.transaction_id.as_bytes().to_vec()
-    );
+    assert_eq!(first_streamed_utxo.address, fixture.address);
+    assert_eq!(first_streamed_utxo.txid, fixture.transaction_id.as_bytes());
     assert_eq!(first_streamed_utxo.index, 0);
-    assert_eq!(
-        first_streamed_utxo.script,
-        fixture.script_pub_key.as_slice()
-    );
+    assert_eq!(first_streamed_utxo.script, fixture.script_pub_key);
     assert_eq!(first_streamed_utxo.value_zat, fixture.value_zat);
     assert_eq!(
         first_streamed_utxo.height,
@@ -105,18 +86,17 @@ async fn serves_public_transparent_address_shape_from_fixture() -> eyre::Result<
         .await
         .ok_or_else(|| eyre::eyre!("missing transparent transaction response"))??;
     assert_eq!(txid_response.data, fixture.raw_transaction_bytes);
+    assert_eq!(transaction_response.data, fixture.raw_transaction_bytes);
     assert_eq!(
         txid_response.height,
         u64::from(fixture.block_height.value())
     );
-    assert_eq!(transaction_response.data, fixture.raw_transaction_bytes);
     assert_eq!(
         transaction_response.height,
         u64::from(fixture.block_height.value())
     );
     assert!(txids.next().await.is_none());
     assert!(transactions.next().await.is_none());
-
     Ok(())
 }
 

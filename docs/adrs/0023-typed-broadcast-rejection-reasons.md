@@ -4,7 +4,7 @@
 | ----- | ----- |
 | Status | Accepted |
 | Product | Zinder |
-| Domain | Transaction-broadcast result wire contract and submitter classification |
+| Domain | Transaction-broadcast outcome wire contract and submitter classification |
 | Related | [ADR-0004](0004-node-source-and-protocol-boundaries.md), [ADR-0007](0007-mempool-topology-and-retention.md), [Public interfaces](../architecture/public-interfaces.md), [Service boundaries](../architecture/service-boundaries.md) |
 
 ## Context
@@ -105,7 +105,7 @@ ends up because Zebra emits them all under `-25 Verify`.
 `zinder-core` exports the value types every downstream consumer matches
 on:
 
-- `enum TransactionBroadcastResult` gains a `Queued(BroadcastQueued)`
+- `enum TransactionBroadcastOutcome` gains a `Queued(BroadcastQueued)`
   variant.
 - `BroadcastRejected` gains a `kind: BroadcastRejectionReason` field.
 - `BroadcastQueued { message: String }` is a new struct.
@@ -168,7 +168,7 @@ already has queued; nothing about the legacy-wire shape changes.
 
 ## Vocabulary
 
-- `TransactionBroadcastResult::Queued` (the new top-level variant).
+- `TransactionBroadcastOutcome::Queued` (the top-level variant).
 - `BroadcastQueued { message }` (the carrier struct).
 - `BroadcastRejected { kind, error_code, message }` (now typed).
 - `BroadcastRejectionReason` (`InvalidSignature`, `BadExpiryHeight`,

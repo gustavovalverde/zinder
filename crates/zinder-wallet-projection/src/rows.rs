@@ -337,6 +337,22 @@ impl WalletOutpointKey {
 pub struct WalletAddressUnspentOutputKey([u8; ADDRESS_UNSPENT_OUTPUT_KEY_LEN]);
 
 impl WalletAddressUnspentOutputKey {
+    /// Returns the first key at or after `height` for an address.
+    ///
+    /// The all-zero outpoint suffix makes this an inclusive lower bound for
+    /// the address's creation-height ordering; it is not required to name an
+    /// existing output.
+    #[must_use]
+    pub fn first_at_or_after(
+        address_script_hash: TransparentAddressScriptHash,
+        height: BlockHeight,
+    ) -> Self {
+        let mut bytes = [0u8; ADDRESS_UNSPENT_OUTPUT_KEY_LEN];
+        bytes[..32].copy_from_slice(&address_script_hash.as_bytes());
+        bytes[32..36].copy_from_slice(&height.value().to_be_bytes());
+        Self(bytes)
+    }
+
     /// Encodes `address_hash || creation_height_be || txid || output_index_be`.
     #[must_use]
     pub fn new(output: &WalletUnspentOutput) -> Self {
@@ -397,6 +413,19 @@ impl WalletAddressUnspentOutputKey {
 pub struct WalletAddressTransactionKey([u8; ADDRESS_TRANSACTION_KEY_LEN]);
 
 impl WalletAddressTransactionKey {
+    /// Returns the first key at or after `height` for an address.
+    ///
+    /// The zero transaction index makes this an inclusive lower bound for the
+    /// address's block-height ordering; it is not required to name an existing
+    /// transaction.
+    #[must_use]
+    pub fn first_at_or_after(
+        address_script_hash: TransparentAddressScriptHash,
+        height: BlockHeight,
+    ) -> Self {
+        Self::new(address_script_hash, height, 0)
+    }
+
     /// Encodes `address_hash || height_be || transaction_index_be`.
     #[must_use]
     pub fn new(
