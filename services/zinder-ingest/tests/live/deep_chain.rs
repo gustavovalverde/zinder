@@ -18,7 +18,7 @@ use zinder_proto::compat::lightwalletd::{
     self, CompactBlock as LightwalletdCompactBlock, compact_tx_streamer_server::CompactTxStreamer,
 };
 use zinder_query::WalletQuery;
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
@@ -67,7 +67,7 @@ async fn bulk_catchup_deep_chain_with_by_txid_lookups() -> Result<()> {
     assert_eq!(chain_epoch.visible_tip_height, tip_height);
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let lightwalletd_adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(store.clone(), (), Arc::clone(&activations)),
         Arc::clone(&activations),

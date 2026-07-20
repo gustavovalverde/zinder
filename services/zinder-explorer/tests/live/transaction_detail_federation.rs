@@ -177,7 +177,8 @@ struct TransactionDetailFixture {
 impl TransactionDetailFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (tempdir, store, sample) = bulk_catchup_and_sample_tip_coinbase(env).await?;
+        let (tempdir, store, store_options, sample) =
+            bulk_catchup_and_sample_tip_coinbase(env).await?;
         let wallet_query = WalletQuery::new(
             store.clone(),
             (),
@@ -189,7 +190,7 @@ impl TransactionDetailFixture {
         let canonical_secondary = SecondaryChainStore::open(
             tempdir.path().join("zinder-store"),
             tempdir.path().join("zinder-store-secondary-explorer"),
-            ChainStoreOptions::for_network(network),
+            store_options,
         )?;
         canonical_secondary.try_catch_up()?;
         let explorer_adapter =
@@ -266,7 +267,12 @@ struct SampledCoinbase {
 
 async fn bulk_catchup_and_sample_tip_coinbase(
     env: &LiveTestEnv,
-) -> Result<(TempDir, PrimaryChainStore, SampledCoinbase)> {
+) -> Result<(
+    TempDir,
+    PrimaryChainStore,
+    ChainStoreOptions,
+    SampledCoinbase,
+)> {
     let tip_height = fetch_live_tip_height(env).await?;
     if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
         return Err(eyre!(
@@ -311,9 +317,9 @@ async fn bulk_catchup_and_sample_tip_coinbase(
     let tip_source_block = source.fetch_block_at(tip_height).await?;
     let sample = sample_tip_coinbase(&tip_source_block)?;
 
-    let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
-    Ok((tempdir, store, sample))
+    let store_options = bulk_catchup_config.canonical_store_options();
+    let store = PrimaryChainStore::open(&storage_path, store_options)?;
+    Ok((tempdir, store, store_options, sample))
 }
 
 fn sample_tip_coinbase(block: &SourceBlock) -> Result<SampledCoinbase> {

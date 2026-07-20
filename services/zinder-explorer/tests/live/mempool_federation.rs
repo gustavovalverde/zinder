@@ -31,7 +31,7 @@ use zinder_proto::v1::explorer::{
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
@@ -308,7 +308,7 @@ async fn bulk_catchup_store(env: &LiveTestEnv) -> Result<(TempDir, PrimaryChainS
         .await?
         .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     Ok((tempdir, store))
 }
 

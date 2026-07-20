@@ -23,7 +23,7 @@ use zinder_core::TransparentAddressScriptHash;
 use zinder_core::{BlockHeight, Network};
 use zinder_ingest::run_bulk_catchup;
 use zinder_query::{TransparentAddressUnspentOutputsRequest, WalletQuery, WalletQueryApi};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{init, require_live_for};
 use zinder_testkit::{TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey};
 
@@ -75,7 +75,7 @@ async fn transparent_address_unspent_outputs_surface_through_typed_wallet_query(
         .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let wallet_query = WalletQuery::new(store, (), activations);
     let mut hasher = Sha256::new();
     hasher.update(test_key.address_script_bytes());

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::BlockHeight;
 use zinder_ingest::tip_follow;
 use zinder_runtime::Readiness;
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{init, require_live};
 
 use crate::common::{
@@ -36,6 +36,7 @@ async fn tip_follow_advances_to_node_tip() -> Result<()> {
         fetch_live_network_upgrade_activations(&env).await?,
     );
     let source = zebra_source_from_tip_follow(&tip_follow_config)?;
+    let store_options = tip_follow_config.canonical_store_options();
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
     let cancel_handle = cancel.clone();
@@ -48,8 +49,7 @@ async fn tip_follow_advances_to_node_tip() -> Result<()> {
     cancel_handle.cancel();
     tip_follow_handle.await??;
 
-    let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+    let store = PrimaryChainStore::open(&storage_path, store_options)?;
     let chain_epoch = store
         .current_chain_epoch()?
         .ok_or_else(|| eyre!("tip-follow did not commit any chain epoch"))?;

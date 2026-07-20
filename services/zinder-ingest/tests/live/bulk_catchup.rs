@@ -13,7 +13,7 @@ use zinder_core::{
 };
 use zinder_ingest::run_bulk_catchup;
 use zinder_query::{WalletQuery, WalletQueryApi};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore, StoreError};
+use zinder_store::{PrimaryChainStore, StoreError};
 use zinder_testkit::live::{init, require_live, require_live_for};
 
 use crate::common::{
@@ -60,7 +60,7 @@ async fn bulk_catchup_initial_range() -> Result<()> {
     assert_eq!(commit_outcome.chain_epoch.visible_tip_height, to_height);
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let reader = store.current_chain_epoch_reader()?;
     let block = reader
         .block_header_at(to_height)?
@@ -139,24 +139,24 @@ async fn bulk_catchup_from_checkpoint() -> Result<()> {
     assert_eq!(chain_epoch.settled_tip_height, tip_height);
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let reader = store.current_chain_epoch_reader()?;
 
     // Bootstrap commit carried no artifacts, only the chain-epoch envelope, so
-    // reads at and below the checkpoint surface ArtifactMissing instead of
-    // succeeding with stale data or returning Ok(None).
+    // reads at and below the checkpoint surface CanonicalHistoryUnavailable
+    // instead of succeeding with stale data or returning Ok(None).
     assert!(matches!(
         reader.block_header_at(checkpoint_height),
-        Err(StoreError::ArtifactMissing { .. })
+        Err(StoreError::CanonicalHistoryUnavailable { .. })
     ));
     assert!(matches!(
         reader.compact_block_at(checkpoint_height),
-        Err(StoreError::ArtifactMissing { .. })
+        Err(StoreError::CanonicalHistoryUnavailable { .. })
     ));
     let below_checkpoint = BlockHeight::new(checkpoint_height.value() - 1);
     assert!(matches!(
         reader.block_header_at(below_checkpoint),
-        Err(StoreError::ArtifactMissing { .. })
+        Err(StoreError::CanonicalHistoryUnavailable { .. })
     ));
 
     let first_filled = reader.block_header_at(from_height)?.ok_or_else(|| {
@@ -237,7 +237,7 @@ async fn bulk_catchup_last_1000_blocks_from_checkpoint() -> Result<()> {
     assert_eq!(chain_epoch.visible_tip_height, tip_height);
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     {
         let reader = store.current_chain_epoch_reader()?;
         assert!(matches!(

@@ -36,7 +36,7 @@ use zinder_core::{
 };
 use zinder_ingest::run_bulk_catchup;
 use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
@@ -123,7 +123,7 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
         .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
 
     let store =
-        PrimaryChainStore::open(&storage_path, ChainStoreOptions::for_network(env.network()))?;
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
     let wallet_query = WalletQuery::new(store, (), activations.clone());
 
     let pre_activation_branch_id = read_coinbase_consensus_branch_id(&wallet_query, window_start)

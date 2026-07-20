@@ -1150,6 +1150,9 @@ pub(crate) fn bounded_ingest_config_toml(
         r#"[network]
 name = "{}"
 
+[ops]
+listen_addr = "127.0.0.1:0"
+
 [node]
 json_rpc_addr = "{}"
 request_timeout_secs = {}
@@ -1197,6 +1200,9 @@ pub(crate) fn wallet_serving_ingest_config_toml(
     Ok(format!(
         r#"[network]
 name = "{}"
+
+[ops]
+listen_addr = "127.0.0.1:0"
 
 [node]
 json_rpc_addr = "{}"
