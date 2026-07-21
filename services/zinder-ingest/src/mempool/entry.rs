@@ -45,7 +45,9 @@ pub enum MempoolEntryBuildError {
     },
 
     /// The source-reported authorization digest disagrees with the parsed transaction.
-    #[error("mempool authorization digest mismatch")]
+    #[error(
+        "mempool authorization digest mismatch: source {source_digest:?}, parsed {parsed_digest:?}"
+    )]
     AuthDigestMismatch {
         /// Authorization digest reported by the source observation.
         source_digest: Option<AuthDigest>,
@@ -87,18 +89,21 @@ pub fn build_mempool_entry(
     let parsed_auth_digest = parsed_transaction
         .auth_digest()
         .map(|digest| AuthDigest::from_bytes(digest.0));
-    if parsed_auth_digest != source_entry.auth_digest {
+    if let Some(source_digest) = source_entry.auth_digest
+        && parsed_auth_digest != Some(source_digest)
+    {
         return Err(MempoolEntryBuildError::AuthDigestMismatch {
-            source_digest: source_entry.auth_digest,
+            source_digest: Some(source_digest),
             parsed_digest: parsed_auth_digest,
         });
     }
+    let auth_digest = source_entry.auth_digest.or(parsed_auth_digest);
 
     let compact_transaction_data = compact_transaction_data(&parsed_transaction)
         .map_err(|source| MempoolEntryBuildError::CompactTransactionBuildFailed { source })?;
     MempoolEntry::new(
         source_entry.transaction_id,
-        source_entry.auth_digest,
+        auth_digest,
         source_entry.raw_transaction_bytes,
         compact_transaction_data,
         MempoolObservation {
@@ -244,6 +249,75 @@ mod tests {
             Err(MempoolEntryBuildError::AuthDigestMismatch {
                 source_digest: Some(_),
                 parsed_digest: None,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn build_mempool_entry_derives_auth_digest_when_source_omits_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/z3-regtest-ironwood-block-603.json"
+        ))?;
+        let raw_block_hex = fixture
+            .get("raw_block_hex")
+            .and_then(Value::as_str)
+            .ok_or("fixture raw_block_hex is missing")?;
+        let raw_block_bytes = hex::decode(raw_block_hex)?;
+        let parsed_block: ZebraBlock = raw_block_bytes.zcash_deserialize_into()?;
+        let transaction = parsed_block
+            .transactions
+            .iter()
+            .find(|transaction| transaction.auth_digest().is_some())
+            .ok_or("fixture block has no witnessed transaction")?;
+        let parsed_auth_digest = transaction
+            .auth_digest()
+            .map(|digest| AuthDigest::from_bytes(digest.0));
+        let source_entry = MempoolSourceEntry {
+            transaction_id: TransactionId::from_bytes(transaction.hash().0),
+            auth_digest: None,
+            raw_transaction_bytes: RawTransactionBytes::new(transaction.zcash_serialize_to_vec()?),
+            observed_at_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+        };
+
+        let entry = build_mempool_entry(source_entry, synthetic_chain_epoch())?;
+
+        assert_eq!(entry.auth_digest(), parsed_auth_digest);
+        Ok(())
+    }
+
+    #[test]
+    fn build_mempool_entry_strictly_rejects_supplied_witness_digest_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/z3-regtest-ironwood-block-603.json"
+        ))?;
+        let raw_block_hex = fixture
+            .get("raw_block_hex")
+            .and_then(Value::as_str)
+            .ok_or("fixture raw_block_hex is missing")?;
+        let raw_block_bytes = hex::decode(raw_block_hex)?;
+        let parsed_block: ZebraBlock = raw_block_bytes.zcash_deserialize_into()?;
+        let transaction = parsed_block
+            .transactions
+            .iter()
+            .find(|transaction| transaction.auth_digest().is_some())
+            .ok_or("fixture block has no witnessed transaction")?;
+        let source_entry = MempoolSourceEntry {
+            transaction_id: TransactionId::from_bytes(transaction.hash().0),
+            auth_digest: Some(AuthDigest::from_bytes([0xAB; 32])),
+            raw_transaction_bytes: RawTransactionBytes::new(transaction.zcash_serialize_to_vec()?),
+            observed_at_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+        };
+
+        let outcome = build_mempool_entry(source_entry, synthetic_chain_epoch());
+
+        assert!(matches!(
+            outcome,
+            Err(MempoolEntryBuildError::AuthDigestMismatch {
+                source_digest: Some(_),
+                parsed_digest: Some(_),
             })
         ));
         Ok(())
