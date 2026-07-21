@@ -6,6 +6,10 @@ protocol descriptor, generated OpenAPI documents, and one GitHub Release. The
 optional explorer and Cipherscan services, benchmark executable, and internal
 Rust crates are not release artifacts.
 
+`deploy/release-images.json` is the authoritative published image set. The PR
+smoke build and tagged release both consume the exact catalog value validated
+by their admission job.
+
 ## Release identity
 
 The root `[workspace.package]` version is the product version. Every

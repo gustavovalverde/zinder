@@ -6,8 +6,8 @@ usage() {
 Usage:
   validate-deployment-admission.sh --deployment-class CLASS --target TARGET
   validate-deployment-admission.sh --deployment-class CLASS --railway-default
-  validate-deployment-admission.sh --release-workflow PATH
-  validate-deployment-admission.sh --build-images-workflow PATH
+  validate-deployment-admission.sh --release-workflow PATH [--release-images-catalog PATH]
+  validate-deployment-admission.sh --build-images-workflow PATH [--release-images-catalog PATH]
   validate-deployment-admission.sh --prometheus-config PATH
   validate-deployment-admission.sh --verify-railway-default
   validate-deployment-admission.sh --compose-contract RESOLVED_COMPOSE_JSON
@@ -23,6 +23,8 @@ target=""
 railway_default=false
 release_workflow=""
 build_images_workflow=""
+release_images_catalog="$repository_root/deploy/release-images.json"
+release_images_catalog_explicit=false
 prometheus_config=""
 verify_railway_default=false
 compose_contract=""
@@ -53,6 +55,12 @@ while [[ $# -gt 0 ]]; do
       build_images_workflow="$2"
       shift 2
       ;;
+    --release-images-catalog)
+      [[ $# -ge 2 ]] || usage
+      release_images_catalog="$2"
+      release_images_catalog_explicit=true
+      shift 2
+      ;;
     --prometheus-config)
       [[ $# -ge 2 ]] || usage
       prometheus_config="$2"
@@ -73,8 +81,40 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+validate_release_images_catalog() {
+  [[ -r "$release_images_catalog" ]] || {
+    echo "release admission rejected: cannot read release image catalog $release_images_catalog" >&2
+    exit 1
+  }
+
+  jq -e '
+    type == "array"
+    and length == 4
+    and all(.[]; type == "string" and test("^zinder-[a-z0-9-]+$"))
+    and ([.[]] | unique | length) == length
+  ' "$release_images_catalog" >/dev/null || {
+    cat >&2 <<'EOF'
+release admission rejected: the release image catalog must be a JSON array of
+four unique, safely named Zinder runtime images.
+EOF
+    exit 1
+  }
+
+  required_release_images="$({
+    printf '%s\n' zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
+  } | sort)"
+  configured_release_images="$(jq -r '.[]' "$release_images_catalog" | sort)"
+  if [[ "$configured_release_images" != "$required_release_images" ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: the release image catalog must contain exactly
+ingest, projector, native query, and lightwalletd compatibility images.
+EOF
+    exit 1
+  fi
+}
+
 if [[ -n "$compose_contract" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && -z "$prometheus_config" && "$verify_railway_default" = false ]] || usage
   [[ -r "$compose_contract" ]] || {
     echo "release admission rejected: cannot read resolved Compose contract $compose_contract" >&2
     exit 1
@@ -274,7 +314,7 @@ resolve_railway_default_target() {
 }
 
 if [[ "$verify_railway_default" = true ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
 
   target="$(resolve_railway_default_target)"
   [[ "$target" = "zinder-admission-required" ]] || {
@@ -304,17 +344,7 @@ if [[ -n "$build_images_workflow" ]]; then
     exit 1
   }
 
-  required_build_images="$({
-    printf '%s\n' \
-      zinder-ingest:zinder-ingest:zinder-ingest \
-      zinder-projector:zinder-projector:zinder-projector \
-      zinder-query:zinder-query:zinder-query \
-      zinder-compat-lightwalletd:zinder-compat-lightwalletd:zinder-compat-lightwalletd
-  } | sort)"
-  configured_build_images="$(
-    sed -n 's/^[[:space:]]*"\(zinder-[a-z0-9-]*:zinder-[a-z0-9-]*:zinder-[a-z0-9-]*\)"$/\1/p' \
-      "$build_images_workflow" | sort -u
-  )"
+  validate_release_images_catalog
   required_build_platforms="$({
     printf '%s\n' linux/amd64 linux/arm64
   } | sort)"
@@ -322,16 +352,25 @@ if [[ -n "$build_images_workflow" ]]; then
     sed -n 's/^[[:space:]]*ref: \(linux\/[a-z0-9]*\)$/\1/p' \
       "$build_images_workflow" | sort -u
   )"
-  if [[ "$configured_build_images" != "$required_build_images" ]] \
-    || [[ "$configured_build_platforms" != "$required_build_platforms" ]] \
+  # These literals are workflow expressions and shell variables being inspected.
+  # shellcheck disable=SC2016
+  if [[ "$configured_build_platforms" != "$required_build_platforms" ]] \
     || ! grep -Fq 'runner: ubuntu-24.04-arm' "$build_images_workflow" \
+    || ! grep -Fq 'needs: verify' "$build_images_workflow" \
+    || ! grep -Fq 'release_images: ${{ steps.images.outputs.release_images }}' "$build_images_workflow" \
+    || ! grep -Fq 'RELEASE_IMAGES_JSON: ${{ needs.verify.outputs.release_images }}' "$build_images_workflow" \
+    || ! grep -Fq "jq -c '.' deploy/release-images.json" "$build_images_workflow" \
+    || ! grep -Fq "jq -r '.[]' <<< \"\$RELEASE_IMAGES_JSON\"" "$build_images_workflow" \
     || ! grep -Fq -- '--platform "$PLATFORM_REF"' "$build_images_workflow" \
-    || ! grep -Fq 'docker run --rm --entrypoint="$help_entrypoint" "${image_name}:${PR_TAG}" --help' \
+    || ! grep -Eq 'SMOKE_BUILD_GIT_COMMIT: [0-9a-f]{40}$' "$build_images_workflow" \
+    || ! grep -Fq -- '--build-arg "ZINDER_BUILD_GIT_COMMIT=${SMOKE_BUILD_GIT_COMMIT}"' \
+      "$build_images_workflow" \
+    || ! grep -Fq 'docker run --rm --entrypoint="$image_name" "${image_name}:${PR_TAG}" --help' \
       "$build_images_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the pull-request image workflow must build and run
-the --help smoke for exactly ingest, projector, native query, and lightwalletd
-compatibility images on native amd64 and arm64 runners.
+the --help smoke for the validated release image catalog on native amd64 and
+arm64 runners.
 EOF
     exit 1
   fi
@@ -339,7 +378,7 @@ EOF
 fi
 
 if [[ -n "$prometheus_config" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
   [[ -r "$prometheus_config" ]] || {
     echo "release admission rejected: cannot read Prometheus config $prometheus_config" >&2
     exit 1
@@ -371,6 +410,7 @@ if [[ -n "$release_workflow" ]]; then
     echo "release admission rejected: cannot read release workflow $release_workflow" >&2
     exit 1
   }
+  validate_release_images_catalog
 
   if grep -Fq 'workflow_dispatch:' "$release_workflow"; then
     cat >&2 <<'EOF'
@@ -454,55 +494,27 @@ EOF
     exit 1
   fi
 
-  if ! grep -Fq '"zinder-projector:zinder-projector"' "$release_workflow"; then
+  # These literals are workflow expressions and shell variables being inspected.
+  # shellcheck disable=SC2016
+  if ! grep -Fq 'release_images: ${{ steps.images.outputs.release_images }}' \
+    "$release_workflow" \
+    || ! grep -Fq "jq -c '.' \"\$RELEASE_IMAGES_FILE\"" "$release_workflow" \
+    || ! grep -Fq 'RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}' \
+      "$release_workflow" \
+    || ! grep -Fq "jq -r '.[]' <<< \"\$RELEASE_IMAGES_JSON\"" "$release_workflow" \
+    || ! grep -Fq 'image: ${{ fromJSON(needs.validate.outputs.release_images) }}' \
+      "$release_workflow"; then
     cat >&2 <<'EOF'
-release admission rejected: the image workflow omits the independent
-zinder-projector runtime required to construct and continuously follow the
-wallet projection.
-EOF
-    exit 1
-  fi
-
-  if ! grep -Fq '"zinder-query:zinder-query"' "$release_workflow"; then
-    cat >&2 <<'EOF'
-release admission rejected: the image workflow omits the native WalletQuery
-runtime required by the complete topology.
-EOF
-    exit 1
-  fi
-
-  if ! grep -Fq '"zinder-compat-lightwalletd:zinder-compat-lightwalletd"' "$release_workflow"; then
-    cat >&2 <<'EOF'
-release admission rejected: the image workflow omits the lightwalletd
-compatibility runtime required by the complete topology.
-EOF
-    exit 1
-  fi
-
-  required_release_images="$({
-    printf '%s\n' zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
-  } | sort)"
-  build_release_images="$(
-    sed -n 's/^[[:space:]]*"\(zinder-[a-z0-9-]*\):\1"$/\1/p' \
-      "$release_workflow" | sort -u
-  )"
-  merge_release_images="$(
-    sed -n '/^  merge:/,/^    steps:/p' "$release_workflow" \
-      | sed -n 's/^[[:space:]]*- \(zinder-[a-z0-9-]*\)$/\1/p' \
-      | sort -u
-  )"
-  if [[ "$build_release_images" != "$required_release_images" \
-    || "$merge_release_images" != "$required_release_images" ]]; then
-    cat >&2 <<'EOF'
-release admission rejected: both the digest-build list and the manifest merge
-matrix must contain exactly ingest, projector, native query, and lightwalletd
-compatibility images.
+release admission rejected: digest builds, manifest publication, and stable
+promotion must consume the validated release image catalog output.
 EOF
     exit 1
   fi
 
   exit 0
 fi
+
+[[ "$release_images_catalog_explicit" = false ]] || usage
 
 case "$deployment_class" in
   production|canary|diagnostic) ;;

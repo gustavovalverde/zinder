@@ -1,0 +1,6 @@
+[
+  "zinder-ingest",
+  "zinder-projector",
+  "zinder-query",
+  "zinder-compat-lightwalletd"
+]

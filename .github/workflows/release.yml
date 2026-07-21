@@ -19,6 +19,7 @@ concurrency:
 
 env:
   BUF_VERSION: "1.68.2"
+  RELEASE_IMAGES_FILE: deploy/release-images.json
 
 jobs:
   validate:
@@ -26,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.identity.outputs.commit }}
+      release_images: ${{ steps.images.outputs.release_images }}
       stable: ${{ steps.identity.outputs.stable }}
       version: ${{ steps.identity.outputs.version }}
     steps:
@@ -52,6 +54,10 @@ jobs:
       - name: Verify release topology
         run: bash scripts/test-deployment-admission.sh
 
+      - name: Resolve release images
+        id: images
+        run: printf 'release_images=%s\n' "$(jq -c '.' "$RELEASE_IMAGES_FILE")" >> "$GITHUB_OUTPUT"
+
   api-docs:
     name: build API release artifacts
     needs: validate
@@ -74,15 +80,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          buf lint
-          buf generate
-          find dist/openapi -type f -name '*.yaml' -size +0c -print -quit \
-            | grep -q . || {
-              echo "OpenAPI generation produced no non-empty YAML artifact" >&2
-              exit 1
-            }
-          buf build --output dist/zinder.v1.descriptor.bin
-          test -s dist/zinder.v1.descriptor.bin
+          bash scripts/generate-api-artifacts.sh
 
           mkdir -p dist/release
           cp -R dist/openapi dist/release/openapi
@@ -155,29 +153,22 @@ jobs:
           BUILD_GIT_COMMIT: ${{ needs.validate.outputs.commit }}
           CACHE_SCOPE: zinder-rust-${{ matrix.platform.name }}-release
           OWNER_RAW: ${{ github.repository_owner }}
-          PLATFORM_NAME: ${{ matrix.platform.name }}
           PLATFORM_REF: ${{ matrix.platform.ref }}
+          RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
           owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
           mkdir -p /tmp/digests
-          images=(
-            "zinder-ingest:zinder-ingest"
-            "zinder-projector:zinder-projector"
-            "zinder-query:zinder-query"
-            "zinder-compat-lightwalletd:zinder-compat-lightwalletd"
-          )
-
-          for image in "${images[@]}"; do
-            IFS=: read -r image_name target <<< "$image"
+          image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
+          while IFS= read -r image_name; do
             image_ref="ghcr.io/${owner_lc}/${image_name}"
             metadata_file="/tmp/metadata-${image_name}.json"
 
             docker buildx build \
               --file deploy/Dockerfile \
-              --target "$target" \
+              --target "$image_name" \
               --platform "$PLATFORM_REF" \
               --build-arg "ZINDER_BUILD_GIT_COMMIT=${BUILD_GIT_COMMIT}" \
               --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
@@ -197,7 +188,7 @@ jobs:
             fi
             mkdir -p "/tmp/digests/${image_name}"
             touch "/tmp/digests/${image_name}/${digest#sha256:}"
-          done
+          done <<< "$image_names"
 
       - name: Upload image digests
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -219,11 +210,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image:
-          - zinder-ingest
-          - zinder-projector
-          - zinder-query
-          - zinder-compat-lightwalletd
+        image: ${{ fromJSON(needs.validate.outputs.release_images) }}
     steps:
       - name: Download image digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -362,26 +349,22 @@ jobs:
       - name: Verify exact manifests and promote latest
         env:
           OWNER_RAW: ${{ github.repository_owner }}
+          RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
           owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
-          images=(
-            zinder-ingest
-            zinder-projector
-            zinder-query
-            zinder-compat-lightwalletd
-          )
+          image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
 
-          for image_name in "${images[@]}"; do
+          while IFS= read -r image_name; do
             docker buildx imagetools inspect \
               "ghcr.io/${owner_lc}/${image_name}:${RELEASE_TAG}" >/dev/null
-          done
-          for image_name in "${images[@]}"; do
+          done <<< "$image_names"
+          while IFS= read -r image_name; do
             image="ghcr.io/${owner_lc}/${image_name}"
             docker buildx imagetools create \
               -t "${image}:latest" \
               "${image}:${RELEASE_TAG}"
             docker buildx imagetools inspect "${image}:latest"
-          done
+          done <<< "$image_names"

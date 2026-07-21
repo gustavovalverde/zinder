@@ -15,6 +15,7 @@ on:
       - "deploy/Dockerfile"
       - "deploy/Dockerfile.railway-nocache"
       - "deploy/docker-compose.yml"
+      - "deploy/release-images.json"
       - "railway.toml"
       - "scripts/validate-deployment-admission.sh"
       - "scripts/test-deployment-admission.sh"
@@ -30,8 +31,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  verify:
+    name: verify deployment admission
+    runs-on: ubuntu-latest
+    outputs:
+      release_images: ${{ steps.images.outputs.release_images }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Verify deployment admission
+        run: bash scripts/test-deployment-admission.sh
+
+      - name: Resolve release images
+        id: images
+        run: printf 'release_images=%s\n' "$(jq -c '.' deploy/release-images.json)" >> "$GITHUB_OUTPUT"
+
   build:
     name: build runtime images (${{ matrix.platform.name }})
+    needs: verify
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -47,11 +64,10 @@ jobs:
       PR_TAG: pr-${{ github.event.pull_request.number || 'manual' }}-${{ matrix.platform.name }}
       CACHE_SCOPE: zinder-rust-pr-${{ matrix.platform.name }}
       PLATFORM_REF: ${{ matrix.platform.ref }}
+      RELEASE_IMAGES_JSON: ${{ needs.verify.outputs.release_images }}
+      SMOKE_BUILD_GIT_COMMIT: 0123456789abcdef0123456789abcdef01234567
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - name: Verify deployment admission
-        run: bash scripts/test-deployment-admission.sh
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -60,21 +76,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          images=(
-            "zinder-ingest:zinder-ingest:zinder-ingest"
-            "zinder-projector:zinder-projector:zinder-projector"
-            "zinder-query:zinder-query:zinder-query"
-            "zinder-compat-lightwalletd:zinder-compat-lightwalletd:zinder-compat-lightwalletd"
-          )
-
-          for image in "${images[@]}"; do
-            IFS=: read -r image_name target help_entrypoint <<< "$image"
+          image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
+          while IFS= read -r image_name; do
 
             docker buildx build \
               --file deploy/Dockerfile \
-              --target "$target" \
+              --target "$image_name" \
               --platform "$PLATFORM_REF" \
-              --build-arg "ZINDER_BUILD_GIT_COMMIT=${GITHUB_SHA}" \
+              --build-arg "ZINDER_BUILD_GIT_COMMIT=${SMOKE_BUILD_GIT_COMMIT}" \
               --load \
               --tag "${image_name}:${PR_TAG}" \
               --cache-from "type=gha,scope=${CACHE_SCOPE}" \
@@ -83,5 +92,5 @@ jobs:
 
             docker image inspect "${image_name}:${PR_TAG}" \
               --format 'image={{.Id}} size_bytes={{.Size}}'
-            docker run --rm --entrypoint="$help_entrypoint" "${image_name}:${PR_TAG}" --help
-          done
+            docker run --rm --entrypoint="$image_name" "${image_name}:${PR_TAG}" --help
+          done <<< "$image_names"

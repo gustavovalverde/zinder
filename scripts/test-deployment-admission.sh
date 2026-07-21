@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 validator="$repository_root/scripts/validate-deployment-admission.sh"
+release_images_catalog="$repository_root/deploy/release-images.json"
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/zinder-deployment-admission.XXXXXX")"
 trap 'rm -rf -- "$temporary_directory"' EXIT
 
@@ -45,9 +46,11 @@ expect_rejected \
   --target zinder-canonical-runtime
 
 bash "$validator" \
-  --release-workflow "$repository_root/.github/workflows/release.yml"
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --release-images-catalog "$release_images_catalog"
 bash "$validator" \
-  --build-images-workflow "$repository_root/.github/workflows/build-images.yml"
+  --build-images-workflow "$repository_root/.github/workflows/build-images.yml" \
+  --release-images-catalog "$release_images_catalog"
 bash "$validator" \
   --prometheus-config "$repository_root/deploy/observability/prometheus.yml"
 
@@ -255,29 +258,55 @@ expect_rejected \
   "a release workflow containing the mixed single-container target" \
   --release-workflow "$mixed_release_workflow"
 
-projectorless_release_workflow="$temporary_directory/projectorless-release.yml"
-sed '/"zinder-projector:zinder-projector"/d' \
-  "$repository_root/.github/workflows/release.yml" \
-  > "$projectorless_release_workflow"
-expect_rejected \
-  "a release workflow omitting zinder-projector" \
-  --release-workflow "$projectorless_release_workflow"
+while IFS= read -r omitted_image; do
+  omitted_image_catalog="$temporary_directory/catalog-without-${omitted_image}.json"
+  jq --arg omitted_image "$omitted_image" \
+    'map(select(. != $omitted_image))' \
+    "$release_images_catalog" > "$omitted_image_catalog"
+  expect_rejected \
+    "a release image catalog omitting $omitted_image" \
+    --release-workflow "$repository_root/.github/workflows/release.yml" \
+    --release-images-catalog "$omitted_image_catalog"
+done < <(jq -r '.[]' "$release_images_catalog")
 
-queryless_release_workflow="$temporary_directory/queryless-release.yml"
-sed '/"zinder-query:zinder-query"/d' \
-  "$repository_root/.github/workflows/release.yml" \
-  > "$queryless_release_workflow"
+explorer_release_images_catalog="$temporary_directory/catalog-with-explorer.json"
+jq '. + ["zinder-explorer"]' \
+  "$release_images_catalog" > "$explorer_release_images_catalog"
 expect_rejected \
-  "a release workflow omitting zinder-query" \
-  --release-workflow "$queryless_release_workflow"
+  "a release image catalog containing the optional explorer" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --release-images-catalog "$explorer_release_images_catalog"
 
-queryless_merge_workflow="$temporary_directory/queryless-merge-release.yml"
-sed '/^[[:space:]]*- zinder-query$/d' \
-  "$repository_root/.github/workflows/release.yml" \
-  > "$queryless_merge_workflow"
+mixed_release_images_catalog="$temporary_directory/catalog-with-mixed-runtime.json"
+jq '.[0] = "zinder-single-container"' \
+  "$release_images_catalog" > "$mixed_release_images_catalog"
 expect_rejected \
-  "a release workflow building query but omitting its published manifest" \
-  --release-workflow "$queryless_merge_workflow"
+  "a release image catalog containing the mixed single-container runtime" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --release-images-catalog "$mixed_release_images_catalog"
+
+duplicate_release_images_catalog="$temporary_directory/catalog-with-duplicate.json"
+jq '.[3] = .[0]' \
+  "$release_images_catalog" > "$duplicate_release_images_catalog"
+expect_rejected \
+  "a release image catalog containing duplicate runtimes" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --release-images-catalog "$duplicate_release_images_catalog"
+
+malformed_release_images_catalog="$temporary_directory/malformed-release-images.json"
+printf '{\n' > "$malformed_release_images_catalog"
+expect_rejected \
+  "a malformed release image catalog" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --release-images-catalog "$malformed_release_images_catalog"
+
+static_merge_workflow="$temporary_directory/static-merge-release.yml"
+sed '/image: \${{ fromJSON(needs.validate.outputs.release_images) }}/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$static_merge_workflow"
+expect_rejected \
+  "a release workflow whose manifest matrix bypasses the validated catalog" \
+  --release-workflow "$static_merge_workflow"
 
 manual_release_workflow="$temporary_directory/manual-release.yml"
 sed '/^on:/a\  workflow_dispatch:' \
@@ -288,6 +317,8 @@ expect_rejected \
   --release-workflow "$manual_release_workflow"
 
 early_latest_workflow="$temporary_directory/early-latest-release.yml"
+# The literal workflow expression is the unsafe fixture insertion target.
+# shellcheck disable=SC2016
 sed '/-t "${image}:${RELEASE_TAG}"/a\            -t "${image}:latest"' \
   "$repository_root/.github/workflows/release.yml" \
   > "$early_latest_workflow"
@@ -323,24 +354,36 @@ expect_rejected \
   "a release workflow whose manifest publisher bypasses digest builds" \
   --release-workflow "$bypassed_manifest_dependency_workflow"
 
-queryless_build_workflow="$temporary_directory/queryless-build-images.yml"
-sed '/"zinder-query:zinder-query:zinder-query"/d' \
+catalogless_build_workflow="$temporary_directory/catalogless-build-images.yml"
+sed '/RELEASE_IMAGES_JSON: \${{ needs.verify.outputs.release_images }}/d' \
   "$repository_root/.github/workflows/build-images.yml" \
-  > "$queryless_build_workflow"
+  > "$catalogless_build_workflow"
 expect_rejected \
-  "a pull-request image workflow omitting native query" \
-  --build-images-workflow "$queryless_build_workflow"
+  "a pull-request image workflow bypassing the validated image catalog" \
+  --build-images-workflow "$catalogless_build_workflow"
 
-compatless_build_workflow="$temporary_directory/compatless-build-images.yml"
-sed '/"zinder-compat-lightwalletd:zinder-compat-lightwalletd:zinder-compat-lightwalletd"/d' \
+unverified_build_workflow="$temporary_directory/unverified-build-images.yml"
+sed '/^[[:space:]]*needs: verify$/d' \
   "$repository_root/.github/workflows/build-images.yml" \
-  > "$compatless_build_workflow"
+  > "$unverified_build_workflow"
 expect_rejected \
-  "a pull-request image workflow omitting lightwalletd compatibility" \
-  --build-images-workflow "$compatless_build_workflow"
+  "a pull-request image workflow bypassing deployment admission" \
+  --build-images-workflow "$unverified_build_workflow"
+
+volatile_provenance_build_workflow="$temporary_directory/volatile-provenance-build-images.yml"
+# The literal shell variables are the unsafe fixture replacement targets.
+# shellcheck disable=SC2016
+sed 's/${SMOKE_BUILD_GIT_COMMIT}/${GITHUB_SHA}/' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$volatile_provenance_build_workflow"
+expect_rejected \
+  "a pull-request image workflow invalidating Cargo caches with each commit" \
+  --build-images-workflow "$volatile_provenance_build_workflow"
 
 helpless_build_workflow="$temporary_directory/helpless-build-images.yml"
-sed '/docker run --rm --entrypoint="\$help_entrypoint"/d' \
+# The literal shell variable is the unsafe fixture removal target.
+# shellcheck disable=SC2016
+sed '/docker run --rm --entrypoint="\$image_name"/d' \
   "$repository_root/.github/workflows/build-images.yml" \
   > "$helpless_build_workflow"
 expect_rejected \
@@ -356,6 +399,8 @@ expect_rejected \
   --build-images-workflow "$arm64less_build_workflow"
 
 platformless_build_workflow="$temporary_directory/platformless-build-images.yml"
+# The literal shell variable is the unsafe fixture removal target.
+# shellcheck disable=SC2016
 sed '/--platform "\$PLATFORM_REF"/d' \
   "$repository_root/.github/workflows/build-images.yml" \
   > "$platformless_build_workflow"

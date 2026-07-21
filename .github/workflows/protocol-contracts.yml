@@ -5,6 +5,7 @@ on:
     paths:
       - "buf.gen.yaml"
       - "buf.yaml"
+      - "scripts/generate-api-artifacts.sh"
       - "crates/zinder-client/src/**"
       - "crates/zinder-client/tests/integration/capability_coverage.rs"
       - "crates/zinder-proto/proto/**"
@@ -16,6 +17,7 @@ on:
     paths:
       - "buf.gen.yaml"
       - "buf.yaml"
+      - "scripts/generate-api-artifacts.sh"
       - "crates/zinder-client/src/**"
       - "crates/zinder-client/tests/integration/capability_coverage.rs"
       - "crates/zinder-proto/proto/**"
@@ -69,20 +71,12 @@ jobs:
           # are detached with the base only under refs/remotes, so materialize it.
           git rev-parse --verify --quiet "refs/heads/${base_ref}" >/dev/null \
             || git branch "${base_ref}" "origin/${base_ref}"
-          buf lint
           buf breaking \
             --against ".git#branch=${base_ref}" \
             --against-config "${against_config}"
 
       - name: Generate API release artifacts
-        run: |
-          set -euo pipefail
-
-          buf generate
-          find dist/openapi -type f -name '*.yaml' -size +0c -print -quit \
-            | grep -q .
-          buf build --output dist/zinder.v1.descriptor.bin
-          test -s dist/zinder.v1.descriptor.bin
+        run: bash scripts/generate-api-artifacts.sh
 
   capability-coverage:
     name: capability coverage

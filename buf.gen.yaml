@@ -5,11 +5,10 @@
 # are excluded; downstream consumers consuming `lightwalletd` already have its
 # public protocol.
 #
-# Build invocation (per-release; the CI workflow at
-# .github/workflows/release.yml and protocol-contracts.yml run the same commands):
+# Build invocation (used by release and protocol-contract workflows through
+# scripts/generate-api-artifacts.sh):
 #
-#   buf generate           # OpenAPI YAML into dist/openapi/
-#   buf build -o dist/zinder.v1.descriptor.bin
+#   bash scripts/generate-api-artifacts.sh
 #
 # The descriptor set artifact is built directly by `buf build` (no plugin);
 # the OpenAPI artifact uses the protoc-gen-openapiv2 plugin pinned below.
