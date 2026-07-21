@@ -77,6 +77,16 @@ pub enum CanonicalWriterError {
         /// Latest atomic source observation.
         source_tip: BlockId,
     },
+    /// A READY store omits canonical history required by this invocation.
+    #[error(
+        "canonical READY store starts at height {actual_first_available_height:?}, after configured required height {required_first_available_height:?}"
+    )]
+    InsufficientRetainedHistory {
+        /// Earliest height the current configuration requires.
+        required_first_available_height: BlockHeight,
+        /// Earliest height retained by the admitted READY store.
+        actual_first_available_height: BlockHeight,
+    },
     /// Continuous following failed after READY admission.
     #[error(transparent)]
     Follow(#[from] CanonicalFollowError),
@@ -195,6 +205,7 @@ fn open_existing_store(
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     )?;
+    validate_retained_history_coverage(&store, config)?;
     tracing::info!(
         target: "zinder::ingest",
         event = "canonical_ready_store_reopened",
@@ -227,17 +238,18 @@ fn recover_staged_store(
         config.resource_budget,
     ) {
         Ok(staged_ready) => {
+            validate_retained_history_coverage(&staged_ready, config)?;
             drop(staged_ready);
             install_staged_store(staging_path, &config.storage_path)?;
-            RocksDbCanonicalStore::open_ready(
+            let store = RocksDbCanonicalStore::open_ready(
                 &config.storage_path,
                 network_upgrade_activations,
                 CanonicalStoreWorkload::Wallet,
                 CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
                 config.resource_budget,
-            )
-            .map(Some)
-            .map_err(CanonicalWriterError::from)
+            )?;
+            validate_retained_history_coverage(&store, config)?;
+            Ok(Some(store))
         }
         Err(CanonicalStoreError::StoreNotReady { .. }) => {
             remove_unpublished_staging(staging_path)?;
@@ -365,6 +377,7 @@ where
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     )?;
+    validate_retained_history_coverage(&store, config)?;
     if store.event_fence() != published_fence {
         return Err(CanonicalWriterError::InstalledFenceMismatch);
     }
@@ -378,6 +391,35 @@ where
         "published and cold-reopened the canonical baseline"
     );
     Ok(store)
+}
+
+fn validate_retained_history_coverage(
+    store: &RocksDbCanonicalStore,
+    config: &CanonicalWriterConfig,
+) -> Result<(), CanonicalWriterError> {
+    validate_first_available_height(
+        store.history_bounds().first_available_height(),
+        configured_first_available_height(config.checkpoint_height),
+    )
+}
+
+fn configured_first_available_height(checkpoint_height: Option<BlockHeight>) -> BlockHeight {
+    checkpoint_height.map_or(BlockHeight::new(1), |checkpoint_height| {
+        BlockHeight::new(checkpoint_height.value().saturating_add(1))
+    })
+}
+
+fn validate_first_available_height(
+    actual_first_available_height: BlockHeight,
+    required_first_available_height: BlockHeight,
+) -> Result<(), CanonicalWriterError> {
+    if actual_first_available_height > required_first_available_height {
+        return Err(CanonicalWriterError::InsufficientRetainedHistory {
+            required_first_available_height,
+            actual_first_available_height,
+        });
+    }
+    Ok(())
 }
 
 async fn resolve_construction_range<Source>(
@@ -501,12 +543,35 @@ mod tests {
     use zinder_testkit::sample_regtest_upgrade_activations;
 
     use super::{
-        discard_unpublished_block_load_staging, remove_empty_construction_staging,
-        remove_unpublished_staging, resolve_build_plan,
+        CanonicalWriterError, discard_unpublished_block_load_staging,
+        remove_empty_construction_staging, remove_unpublished_staging, resolve_build_plan,
+        validate_first_available_height,
     };
 
     #[derive(Clone)]
     struct GenesisSource;
+
+    #[test]
+    fn ready_store_rejects_narrower_history_than_configured() {
+        let outcome =
+            validate_first_available_height(BlockHeight::new(4_189_466), BlockHeight::new(280_000));
+
+        assert!(matches!(
+            outcome,
+            Err(CanonicalWriterError::InsufficientRetainedHistory {
+                required_first_available_height,
+                actual_first_available_height,
+            }) if required_first_available_height == BlockHeight::new(280_000)
+                && actual_first_available_height == BlockHeight::new(4_189_466)
+        ));
+    }
+
+    #[test]
+    fn ready_store_accepts_equal_or_broader_history() -> Result<(), CanonicalWriterError> {
+        validate_first_available_height(BlockHeight::new(280_000), BlockHeight::new(280_000))?;
+        validate_first_available_height(BlockHeight::new(1), BlockHeight::new(280_000))?;
+        Ok(())
+    }
 
     #[async_trait]
     impl NodeSource for GenesisSource {

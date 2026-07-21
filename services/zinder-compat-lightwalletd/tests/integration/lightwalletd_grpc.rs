@@ -1058,10 +1058,10 @@ async fn tree_state_reports_future_height_like_lightwalletd() -> eyre::Result<()
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "the wallet-serving floor contract is a cross-RPC lightwalletd compatibility claim"
+    reason = "the retained-history floor contract is a cross-RPC lightwalletd compatibility claim"
 )]
-async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::Result<()> {
-    let (store_fixture, wallet_serving_floor_height) = wallet_serving_floor_store_fixture()?;
+async fn retained_history_floor_unavailable_artifacts_return_not_found() -> eyre::Result<()> {
+    let (store_fixture, retained_history_floor_height) = retained_history_floor_store_fixture()?;
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
             store_fixture.chain_store().clone(),
@@ -1070,7 +1070,7 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
         ),
         Arc::new(sample_regtest_upgrade_activations()),
     );
-    let floor_height = u64::from(wallet_serving_floor_height.value());
+    let floor_height = u64::from(retained_history_floor_height.value());
 
     let Err(status) = adapter
         .get_block(Request::new(lightwalletd::BlockId {
@@ -1080,7 +1080,7 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
         .await
     else {
         return Err(eyre!(
-            "expected GetBlock to report unavailable wallet-serving floor bytes"
+            "expected GetBlock to report unavailable retained-history floor bytes"
         ));
     };
     assert_eq!(status.code(), Code::NotFound);
@@ -1093,7 +1093,7 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
         .await
     else {
         return Err(eyre!(
-            "expected GetBlockNullifiers to report unavailable wallet-serving floor bytes"
+            "expected GetBlockNullifiers to report unavailable retained-history floor bytes"
         ));
     };
     assert_eq!(status.code(), Code::NotFound);
@@ -1113,7 +1113,7 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
         .await
     else {
         return Err(eyre!(
-            "expected GetBlockRange to report unavailable wallet-serving floor bytes"
+            "expected GetBlockRange to report unavailable retained-history floor bytes"
         ));
     };
     assert_eq!(status.code(), Code::NotFound);
@@ -1133,7 +1133,7 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
         .await
     else {
         return Err(eyre!(
-            "expected GetBlockRangeNullifiers to report unavailable wallet-serving floor bytes"
+            "expected GetBlockRangeNullifiers to report unavailable retained-history floor bytes"
         ));
     };
     assert_eq!(status.code(), Code::NotFound);
@@ -1146,7 +1146,7 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
         .await
     else {
         return Err(eyre!(
-            "expected GetTreeState to report unavailable wallet-serving floor tree state"
+            "expected GetTreeState to report unavailable retained-history floor tree state"
         ));
     };
     assert_eq!(status.code(), Code::NotFound);
@@ -1160,7 +1160,7 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
         .await
     else {
         return Err(eyre!(
-            "expected GetSubtreeRoots to report unavailable wallet-serving floor subtree root"
+            "expected GetSubtreeRoots to report unavailable retained-history floor subtree root"
         ));
     };
     assert_eq!(status.code(), Code::NotFound);
@@ -1170,7 +1170,7 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
         .await
     else {
         return Err(eyre!(
-            "expected GetLatestTreeState to report unavailable wallet-serving floor tree state"
+            "expected GetLatestTreeState to report unavailable retained-history floor tree state"
         ));
     };
     assert_eq!(status.code(), Code::NotFound);
@@ -1179,9 +1179,9 @@ async fn wallet_serving_floor_unavailable_artifacts_return_not_found() -> eyre::
 }
 
 #[tokio::test]
-async fn compact_block_methods_serve_first_retained_block_above_wallet_serving_floor()
--> eyre::Result<()> {
-    let boundary_fixture = wallet_serving_boundary_store_fixture()?;
+async fn compact_block_methods_serve_first_block_above_retained_history_floor() -> eyre::Result<()>
+{
+    let boundary_fixture = retained_history_boundary_store_fixture()?;
     let retained_block =
         expected_empty_lightwalletd_block(&boundary_fixture.retained_compact_block);
     let retained_height = u64::from(boundary_fixture.retained_compact_block.height().value());
@@ -1241,9 +1241,9 @@ fn expected_empty_lightwalletd_block(block: &CompactBlockArtifact) -> lightwalle
 }
 
 #[tokio::test]
-async fn tree_state_methods_serve_first_retained_checkpoint_above_wallet_serving_floor()
--> eyre::Result<()> {
-    let boundary_fixture = wallet_serving_boundary_store_fixture()?;
+async fn tree_state_methods_serve_first_checkpoint_above_retained_history_floor() -> eyre::Result<()>
+{
+    let boundary_fixture = retained_history_boundary_store_fixture()?;
     let retained_height = u64::from(boundary_fixture.retained_compact_block.height().value());
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
@@ -2529,17 +2529,17 @@ fn genesis_store_fixture() -> eyre::Result<StoreFixture> {
     Ok(store_fixture)
 }
 
-fn wallet_serving_floor_store_fixture() -> eyre::Result<(StoreFixture, BlockHeight)> {
+fn retained_history_floor_store_fixture() -> eyre::Result<(StoreFixture, BlockHeight)> {
     let store_fixture = StoreFixture::open()?;
-    let wallet_serving_floor_height = BlockHeight::new(1_000);
-    let wallet_serving_floor_hash = BlockHash::from_bytes([0x42; 32]);
+    let retained_history_floor_height = BlockHeight::new(1_000);
+    let retained_history_floor_hash = BlockHash::from_bytes([0x42; 32]);
     let chain_epoch = ChainEpoch {
         id: ChainEpochId::new(1),
         network: Network::ZcashRegtest,
-        visible_tip_height: wallet_serving_floor_height,
-        visible_tip_hash: wallet_serving_floor_hash,
-        settled_tip_height: wallet_serving_floor_height,
-        settled_tip_hash: wallet_serving_floor_hash,
+        visible_tip_height: retained_history_floor_height,
+        visible_tip_hash: retained_history_floor_hash,
+        settled_tip_height: retained_history_floor_height,
+        settled_tip_hash: retained_history_floor_hash,
         artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::new(SUBTREE_LEAF_COUNT, 0, 0),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
@@ -2549,17 +2549,17 @@ fn wallet_serving_floor_store_fixture() -> eyre::Result<(StoreFixture, BlockHeig
         .chain_store()
         .commit_artifactless_checkpoint(chain_epoch)?;
 
-    Ok((store_fixture, wallet_serving_floor_height))
+    Ok((store_fixture, retained_history_floor_height))
 }
 
-struct WalletServingBoundaryFixture {
+struct RetainedHistoryBoundaryFixture {
     store_fixture: StoreFixture,
     retained_compact_block: CompactBlockArtifact,
 }
 
-fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundaryFixture> {
+fn retained_history_boundary_store_fixture() -> eyre::Result<RetainedHistoryBoundaryFixture> {
     let store_fixture = StoreFixture::open()?;
-    let wallet_serving_floor_height = BlockHeight::new(1);
+    let retained_history_floor_height = BlockHeight::new(1);
     let retained_height = BlockHeight::new(2);
     let retained_tree_state_payload = br#"{"hash":"020202","height":2,"time":1296694003,"sapling":{"commitments":{"finalState":"aabbcc"}},"orchard":{"commitments":{"finalState":"ddeeff"}},"ironwood":{"commitments":{"finalState":"112233"}}}"#
         .to_vec();
@@ -2567,7 +2567,7 @@ fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundary
         .extend_blocks(2)
         .with_tree_state_checkpoint_payload_at(retained_height, retained_tree_state_payload);
     let floor_block = chain_fixture
-        .block_at(wallet_serving_floor_height)
+        .block_at(retained_history_floor_height)
         .ok_or_else(|| eyre!("compact-block boundary fixture must include the floor block"))?
         .clone();
     let retained_block = chain_fixture
@@ -2619,7 +2619,7 @@ fn wallet_serving_boundary_store_fixture() -> eyre::Result<WalletServingBoundary
         }),
     )?;
 
-    Ok(WalletServingBoundaryFixture {
+    Ok(RetainedHistoryBoundaryFixture {
         store_fixture,
         retained_compact_block,
     })

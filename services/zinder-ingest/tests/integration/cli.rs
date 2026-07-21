@@ -402,7 +402,7 @@ fn wallet_serving_rejects_explicit_checkpoint_height() -> Result<(), Box<dyn Err
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains(
-            "ingest.run_overrides.coverage = \"wallet-serving\" derives checkpoint_height from the node"
+            "ingest.run_overrides.coverage = \"wallet-serving\" requires complete transparent history and sets checkpoint_height to zero"
         ),
         "{stderr}"
     );

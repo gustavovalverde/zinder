@@ -914,8 +914,8 @@ listen_addr = "127.0.0.1:0"
 
 /// Renders a wallet-serving bounded phase-driven ingest TOML config.
 ///
-/// The `coverage = "wallet-serving"` modifier instructs the loop to derive
-/// the historical floor from upstream activation heights before committing.
+/// The `coverage = "wallet-serving"` modifier instructs the loop to retain
+/// complete non-genesis history before committing.
 pub(crate) fn wallet_serving_ingest_config_toml(
     config_toml: &WalletServingIngestConfigToml<'_>,
 ) -> Result<String> {

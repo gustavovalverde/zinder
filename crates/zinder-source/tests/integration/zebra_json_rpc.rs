@@ -1826,14 +1826,6 @@ async fn fetch_network_upgrade_activations_parses_getblockchaininfo_upgrades() -
         activations.consensus_branch_id_at(zinder_core::BlockHeight::new(2_000_000)),
         zinder_core::ConsensusBranchId::new(0xc2d6_d0b4)
     );
-    let earliest = activations
-        .earliest_wallet_servable_activation()
-        .ok_or_else(|| eyre::eyre!("Sapling and NU5 must yield an earliest activation"))?;
-    assert_eq!(earliest.name, "Sapling");
-    assert_eq!(
-        earliest.activation_height,
-        zinder_core::BlockHeight::new(280_000)
-    );
     Ok(())
 }
 

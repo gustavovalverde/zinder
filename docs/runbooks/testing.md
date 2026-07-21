@@ -40,7 +40,7 @@ actual public deployment. The required boundaries and reference pins live in
 [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md).
 
 Keep the evidence simple: retain the exact commands, image digests, client
-version, network, wallet-serving floor, and command output with the release.
+version, network, wallet-serving coverage bounds, and command output with the release.
 Do not generate a repository-specific report or manifest merely to restate
 those results.
 
@@ -218,7 +218,7 @@ the mainnet-only tests
 (`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
 `bulk_catchup_last_1000_blocks_from_checkpoint`) and the testnet-or-mainnet tests
-(`cli_bulk_catchup_bounded_wallet_serving_floor_from_config`,
+(`cli_constructs_complete_wallet_serving_history_from_config`,
 `checkpoint_bounded_read_endpoint_latency_baseline`).
 
 Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, the two Zebra Indexer mempool-source
@@ -895,10 +895,9 @@ For production Android-wallet claims
 
 - Create-new-wallet bootstrap reaches the compat endpoint's advertised tip
   without protocol-shape errors.
-- Restore/import and resync flows either request tree state and subtree roots at
-  or above the wallet-serving store floor, or fail only with the documented
-  strict `NOT_FOUND` unsupported-floor case. Unknown tree-state or subtree-root
-  gaps are release blockers, not acceptable follow-up notes.
+- Restore/import and resync flows request tree state and subtree roots inside
+  the complete wallet-serving retained range. Unknown tree-state or
+  subtree-root gaps are release blockers, not acceptable follow-up notes.
 - `GetAddressUtxosStream` is backed by stored transparent output artifacts.
   Synthetic empty responses, upstream-node fallbacks, and compact-block scans do
   not satisfy the wallet-serving contract.

@@ -50,11 +50,11 @@ fence, installs it at the configured path, and starts continuous following.
 The configured path does not become a ready store until publication succeeds.
 
 The checked ingest configuration uses `coverage = "wallet-serving"`. The
-writer derives the earliest supported wallet height from node-advertised
-network activations and uses its predecessor as the construction checkpoint.
-This avoids storing history that the supported lightwalletd wallet workload
-cannot consume. An explicit checkpoint must carry the required predecessor
-tree state and source identity.
+writer uses the genesis block as the authenticated predecessor and retains
+every block from height one. This is required for transparent predecessor
+resolution even though shielded wallet data begins at later activation heights.
+An explicit checkpoint remains available only for non-wallet-serving workloads
+and must carry the required predecessor tree state and source identity.
 
 Useful canonical metrics:
 
@@ -88,6 +88,14 @@ authenticated first retained block rather than assuming height one. Every
 transparent spend in the retained range must still resolve to an output in
 that range; an unresolved pre-checkpoint prevout fails the build closed because
 no transparent prefix state is carried by the checkpoint.
+
+The `wallet-serving` coverage profile therefore uses complete non-genesis
+history, with height zero as the authenticated predecessor and height one as
+the first retained block. A shielded activation checkpoint is insufficient for
+the global transparent projection because later transactions may spend outputs
+created before that activation. If a READY store starts later than the coverage
+requested at startup, ingest rejects it; rebuild the canonical and wallet stores
+instead of attempting to follow the narrower store forward.
 
 Restarting projector is safe. Lease generation, build state, source identity,
 and ready evidence are persisted. A second projector using the same wallet path

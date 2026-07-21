@@ -95,7 +95,7 @@ async fn cli_constructs_bounded_canonical_store_from_config() -> Result<()> {
     clippy::too_many_lines,
     reason = "the live CLI scenario keeps node-derived range selection, process execution, and cold READY-store admission in one auditable flow"
 )]
-async fn cli_constructs_wallet_serving_range_from_config() -> Result<()> {
+async fn cli_constructs_complete_wallet_serving_history_from_config() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashTestnet, Network::ZcashMainnet])? else {
         return Ok(());
@@ -116,23 +116,13 @@ async fn cli_constructs_wallet_serving_range_from_config() -> Result<()> {
         Arc::clone(&activations),
     );
     let source = zebra_source_from_bulk_catchup(&probe_config)?;
-    let wallet_serving_floor = activations
-        .earliest_wallet_servable_activation()
-        .ok_or_else(|| eyre!("node did not advertise Sapling or NU5 activation heights"))?
-        .activation_height;
-    if wallet_serving_floor == BlockHeight::new(0) {
-        return Err(eyre!("wallet-serving floor cannot be genesis"));
-    }
-    let to_height = BlockHeight::new(
-        wallet_serving_floor
-            .value()
-            .checked_add(WALLET_SERVING_BOUNDED_DEPTH_BLOCKS - 1)
-            .ok_or_else(|| eyre!("wallet-serving bounded height overflowed"))?,
-    );
+    let first_retained_height = BlockHeight::new(1);
+    let checkpoint_height = BlockHeight::new(0);
+    let to_height = BlockHeight::new(WALLET_SERVING_BOUNDED_DEPTH_BLOCKS);
     let node_tip = NodeSource::tip_id(&source).await?.height;
     if node_tip.value() <= to_height.value() {
         return Err(eyre!(
-            "wallet-serving bounded test needs tip above {}; got {}",
+            "complete wallet-serving bounded test needs tip above {}; got {}",
             to_height.value(),
             node_tip.value()
         ));
@@ -162,13 +152,12 @@ async fn cli_constructs_wallet_serving_range_from_config() -> Result<()> {
 
     assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr)?;
-    let checkpoint_height = BlockHeight::new(wallet_serving_floor.value() - 1);
     assert!(
         stderr.contains("event=\"wallet_serving_modifiers_resolved\""),
         "{stderr}"
     );
     assert!(
-        stderr.contains(&format!("from_height={}", wallet_serving_floor.value())),
+        stderr.contains(&format!("from_height={}", first_retained_height.value())),
         "{stderr}"
     );
     assert!(
@@ -190,24 +179,26 @@ async fn cli_constructs_wallet_serving_range_from_config() -> Result<()> {
     assert_eq!(store.event_fence().visible_tip().height, to_height);
     assert_eq!(
         store.history_bounds().first_available_height(),
-        wallet_serving_floor
+        first_retained_height
     );
     assert_eq!(
         store
             .history_bounds()
             .preceding_checkpoint()
             .map(|checkpoint| checkpoint.height),
-        Some(checkpoint_height)
+        None
     );
     assert!(store.compact_block_at(checkpoint_height)?.is_none());
-    assert!(store.compact_block_at(wallet_serving_floor)?.is_some());
+    assert!(store.compact_block_at(first_retained_height)?.is_some());
     assert!(
         store
             .tree_state_checkpoint_at_or_before(to_height)?
             .is_some()
     );
-    let compact_blocks = store
-        .compact_blocks_in_range(BlockHeightRange::inclusive(wallet_serving_floor, to_height))?;
+    let compact_blocks = store.compact_blocks_in_range(BlockHeightRange::inclusive(
+        first_retained_height,
+        to_height,
+    ))?;
     assert_eq!(
         compact_blocks.len(),
         usize::try_from(WALLET_SERVING_BOUNDED_DEPTH_BLOCKS)?

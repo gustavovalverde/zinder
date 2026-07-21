@@ -281,7 +281,7 @@ async fn run_ingest(
     check_schema_phase.complete();
 
     let recover_state_phase = StartupPhase::RecoverState.start();
-    resolve_wallet_serving_modifiers(&mut command_config, &network_upgrade_activations)?;
+    resolve_wallet_serving_modifiers(&mut command_config);
     recover_state_phase.complete();
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
@@ -566,33 +566,12 @@ fn log_canonical_writer_start(
     );
 }
 
-fn resolve_wallet_serving_modifiers(
-    command_config: &mut IngestCommandConfig,
-    activations: &NetworkUpgradeActivations,
-) -> Result<(), IngestConfigError> {
+fn resolve_wallet_serving_modifiers(command_config: &mut IngestCommandConfig) {
     if !matches!(command_config.coverage, IngestCoverage::WalletServing) {
-        return Ok(());
+        return;
     }
 
-    let Some(earliest) = activations.earliest_wallet_servable_activation() else {
-        return Err(
-            IngestError::from(zinder_source::SourceError::SourceProtocolMismatch {
-                reason: "getblockchaininfo did not advertise Sapling or NU5 activation heights",
-            })
-            .into(),
-        );
-    };
-    let wallet_serving_floor = earliest.activation_height;
-    if wallet_serving_floor == BlockHeight::new(0) {
-        return Err(
-            IngestError::from(zinder_source::SourceError::SourceProtocolMismatch {
-                reason: "wallet-serving bulk_catchup floor cannot be the genesis block",
-            })
-            .into(),
-        );
-    }
-
-    let checkpoint_height = BlockHeight::new(wallet_serving_floor.value().saturating_sub(1));
+    let checkpoint_height = BlockHeight::new(0);
     command_config.runtime_config.run_overrides = CanonicalRunOverrides {
         target_height: command_config.runtime_config.run_overrides.target_height,
         checkpoint_height: Some(checkpoint_height),
@@ -609,13 +588,10 @@ fn resolve_wallet_serving_modifiers(
     tracing::info!(
         target: "zinder::ingest",
         event = "wallet_serving_modifiers_resolved",
-        from_height = wallet_serving_floor.value(),
+        from_height = 1_u32,
         checkpoint_height = checkpoint_height.value(),
-        earliest_upgrade = %earliest.name,
-        "resolved wallet-serving floor from node activation heights"
+        "resolved complete wallet-serving history"
     );
-
-    Ok(())
 }
 
 async fn ensure_node_capabilities(

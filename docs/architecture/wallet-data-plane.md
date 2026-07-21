@@ -407,7 +407,8 @@ a store with transaction blobs retained and both
 `transparent_address_transaction_history` and `transparent_outpoint_spend`
 covering the canonical tip. The wallet-serving coverage profile
 (`ingest.run_overrides.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`) is
-the supported way to select transaction retention. A
+the supported way to select transaction retention and complete non-genesis
+canonical history. A
 recent-checkpoint or tip-bootstrapped store may have the address-output index
 family enabled but still lack the historical rows needed by wallet birthdays and
 resync anchors; that deployment posture is not wallet-serving.
@@ -569,7 +570,7 @@ Zinder compatibility claims use these levels:
 | --- | --- | --- |
 | `protocol-compatible` | Zinder builds and serves the pinned `lightwallet-protocol` messages without local schema drift. | Vendored proto drift check, generated client smoke tests, and protocol field golden tests. |
 | `reference-parity-compatible` | Zinder behavior matches reference `lightwalletd` for the claimed RPC set, with documented allow-listed operator differences. | Live parity suite against pinned reference inputs. |
-| `client-compatible` | Real lightwalletd-compatible wallet clients can create, restore, resync, send, and observe mempool behavior through Zinder. | Android SDK and Zodl evidence for the claimed network and wallet-serving floor. |
+| `client-compatible` | Real lightwalletd-compatible wallet clients can create, restore, resync, send, and observe mempool behavior through Zinder. | Android SDK and Zodl evidence for the claimed network and complete wallet-serving coverage. |
 | `public-operator-compatible` | A public deployment can safely expose the compatible endpoint. | TLS/proxy, bind, rate-limit, redaction, readiness, metrics, and operational runbook evidence. |
 
 A release or deployment may advertise only the highest level whose required

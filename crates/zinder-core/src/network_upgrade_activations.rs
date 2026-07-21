@@ -330,45 +330,14 @@ impl NetworkUpgradeActivations {
     }
 
     /// Returns the activation height of the upgrade named `name`
-    /// (case-insensitive), if advertised. Used by the wallet-serving
-    /// bulk-catchup floor and the lightwalletd `saplingActivationHeight`
-    /// response.
+    /// (case-insensitive), if advertised. Used by protocol surfaces such as
+    /// lightwalletd's `saplingActivationHeight` response.
     #[must_use]
     pub fn activation_height_by_name(&self, name: &str) -> Option<BlockHeight> {
         self.activations
             .iter()
             .find(|activation| activation.name.eq_ignore_ascii_case(name))
             .map(|activation| activation.activation_height)
-    }
-
-    /// Returns the earliest activation a wallet-serving bulk catchup must reach
-    /// to serve lightwalletd clients on this network.
-    ///
-    /// Defined as the earlier of the Sapling and NU5 activations when both
-    /// are advertised; the single advertised one otherwise; `None` when
-    /// neither is advertised (a malformed node response on supported
-    /// networks).
-    #[must_use]
-    pub fn earliest_wallet_servable_activation(&self) -> Option<&NetworkUpgradeActivation> {
-        let sapling = self.find_by_name("Sapling");
-        let nu5 = self.find_by_name("NU5");
-        match (sapling, nu5) {
-            (Some(sapling), Some(nu5)) => {
-                if sapling.activation_height.value() <= nu5.activation_height.value() {
-                    Some(sapling)
-                } else {
-                    Some(nu5)
-                }
-            }
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
-        }
-    }
-
-    fn find_by_name(&self, name: &str) -> Option<&NetworkUpgradeActivation> {
-        self.activations
-            .iter()
-            .find(|activation| activation.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -491,31 +460,6 @@ mod tests {
                 branch_id: ConsensusBranchId::new(0xc8e7_1055),
             })
         );
-    }
-
-    #[test]
-    fn earliest_wallet_servable_activation_prefers_earlier_of_sapling_and_nu5() -> TestResult {
-        let activations = sample_regtest_activations()?;
-        let earliest = activations
-            .earliest_wallet_servable_activation()
-            .ok_or("Sapling at 1 must yield an earliest activation")?;
-        assert_eq!(earliest.name, "Sapling");
-        assert_eq!(earliest.activation_height, BlockHeight::new(1));
-        Ok(())
-    }
-
-    #[test]
-    fn earliest_wallet_servable_activation_returns_none_when_neither_present() -> TestResult {
-        let activations = NetworkUpgradeActivations::new(
-            Network::ZcashRegtest,
-            vec![NetworkUpgradeActivation {
-                branch_id: ConsensusBranchId::new(0xc8e7_1055),
-                activation_height: BlockHeight::new(2),
-                name: "NU6".to_owned(),
-            }],
-        )?;
-        assert!(activations.earliest_wallet_servable_activation().is_none());
-        Ok(())
     }
 
     #[test]
