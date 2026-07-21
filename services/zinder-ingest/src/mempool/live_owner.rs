@@ -5,11 +5,7 @@
 //! the follower-owned canonical primary and are reached only through the
 //! canonical control channel.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use tokio::sync::Mutex;
@@ -124,7 +120,6 @@ impl LiveMempoolOwner {
     }
 
     /// Returns a durable/index consistency error while a source reseed is required.
-    #[cfg(test)]
     pub(crate) fn require_serving(&self) -> Result<(), Status> {
         let status = *self.status.read();
         match status {
@@ -166,6 +161,7 @@ impl LiveMempoolOwner {
         chain_epoch: ChainEpoch,
         transaction_id: TransactionId,
     ) -> Result<Option<Arc<MempoolEntry>>, Status> {
+        self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
         self.coherent_source_tip_for(chain_epoch)?;
         Ok(self.index.entry_for(transaction_id))
@@ -178,6 +174,7 @@ impl LiveMempoolOwner {
         address_script_hash: TransparentAddressScriptHash,
         max_entries: u32,
     ) -> Result<Vec<TransparentMempoolOutput>, Status> {
+        self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
         self.coherent_source_tip_for(chain_epoch)?;
         Ok(self
@@ -191,6 +188,7 @@ impl LiveMempoolOwner {
         chain_epoch: ChainEpoch,
         outpoints: impl IntoIterator<Item = TransparentOutPoint>,
     ) -> Result<Vec<TransparentMempoolSpend>, Status> {
+        self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
         self.coherent_source_tip_for(chain_epoch)?;
         Ok(outpoints
@@ -205,6 +203,7 @@ impl LiveMempoolOwner {
         chain_epoch: ChainEpoch,
         outpoints: &[TransparentOutPoint],
     ) -> Result<Vec<TransparentOutputEntry>, Status> {
+        self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
         self.coherent_source_tip_for(chain_epoch)?;
         Ok(self.index.transparent_outputs_by_outpoints(outpoints))
@@ -218,6 +217,7 @@ impl LiveMempoolOwner {
         max_entries: u32,
         from_cursor: Vec<u8>,
     ) -> Result<LiveMempoolSnapshotPage, Status> {
+        self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
         let source_tip = self.coherent_source_tip_for(chain_epoch)?;
         let start = canonical.begin_mempool_snapshot(from_cursor).await?;
@@ -494,70 +494,95 @@ impl LiveMempoolOwner {
         canonical: &CanonicalControlHandle,
         mut staged_generation: StagedMempoolGeneration,
     ) -> Result<(), Status> {
-        let current_entries = self.index.snapshot(u32::MAX);
-        let staged_entries = staged_generation.index.snapshot(u32::MAX);
-        let current_transaction_ids = current_entries
-            .iter()
-            .map(|entry| entry.transaction_id())
-            .collect::<HashSet<_>>();
-        let staged_transaction_ids = staged_entries
-            .iter()
-            .map(|entry| entry.transaction_id())
-            .collect::<HashSet<_>>();
-
-        let mut removals = Vec::with_capacity(MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS);
-        for entry in current_entries {
-            let transaction_id = entry.transaction_id();
-            if staged_transaction_ids.contains(&transaction_id) {
-                continue;
-            }
-            let (terminal_event, observed_at) = staged_generation
-                .terminal_events
-                .remove(&transaction_id)
-                .unwrap_or_else(|| {
-                    (
-                        MempoolEvent::Invalidated {
-                            transaction_id,
-                            reason: MempoolEvictionReason::Unknown,
-                        },
-                        UnixTimestampMillis::now(),
-                    )
-                });
-            removals.push((terminal_event, observed_at));
-            if removals.len() == MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS {
-                self.append_and_apply_reconciliation_batch_locked(
-                    canonical,
-                    std::mem::take(&mut removals),
-                )
-                .await?;
-            }
-        }
-        self.append_and_apply_reconciliation_batch_locked(canonical, removals)
+        self.reconcile_removed_entries_locked(canonical, &mut staged_generation)
             .await?;
-
-        let mut additions = Vec::with_capacity(MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS);
-        for entry in staged_entries {
-            if current_transaction_ids.contains(&entry.transaction_id()) {
-                continue;
-            }
-            additions.push((
-                MempoolEvent::Added {
-                    entry: entry.as_ref().clone(),
-                },
-                entry.first_seen_unix_millis(),
-            ));
-            if additions.len() == MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS {
-                self.append_and_apply_reconciliation_batch_locked(
-                    canonical,
-                    std::mem::take(&mut additions),
-                )
-                .await?;
-            }
-        }
-        self.append_and_apply_reconciliation_batch_locked(canonical, additions)
+        self.reconcile_added_entries_locked(canonical, &staged_generation)
             .await?;
 
         Ok(())
+    }
+
+    async fn reconcile_removed_entries_locked(
+        &self,
+        canonical: &CanonicalControlHandle,
+        staged_generation: &mut StagedMempoolGeneration,
+    ) -> Result<(), Status> {
+        let mut after_transaction_id = None;
+        loop {
+            let page = self.index.snapshot_page(
+                u32::try_from(MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS).map_err(|_| {
+                    Status::internal("mempool reconciliation page size exceeds u32")
+                })?,
+                after_transaction_id,
+            );
+            let Some(last_entry) = page.entries.last() else {
+                return Ok(());
+            };
+            after_transaction_id = Some(last_entry.transaction_id());
+            let mut removals = Vec::with_capacity(page.entries.len());
+            for entry in page.entries {
+                let transaction_id = entry.transaction_id();
+                if staged_generation.index.is_in_mempool(transaction_id) {
+                    continue;
+                }
+                let (terminal_event, observed_at) = staged_generation
+                    .terminal_events
+                    .remove(&transaction_id)
+                    .unwrap_or_else(|| {
+                        (
+                            MempoolEvent::Invalidated {
+                                transaction_id,
+                                reason: MempoolEvictionReason::Unknown,
+                            },
+                            UnixTimestampMillis::now(),
+                        )
+                    });
+                removals.push((terminal_event, observed_at));
+            }
+            self.append_and_apply_reconciliation_batch_locked(canonical, removals)
+                .await?;
+            if page.next_after_transaction_id.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn reconcile_added_entries_locked(
+        &self,
+        canonical: &CanonicalControlHandle,
+        staged_generation: &StagedMempoolGeneration,
+    ) -> Result<(), Status> {
+        let mut after_transaction_id = None;
+        loop {
+            let page = staged_generation.index.snapshot_page(
+                u32::try_from(MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS).map_err(|_| {
+                    Status::internal("mempool reconciliation page size exceeds u32")
+                })?,
+                after_transaction_id,
+            );
+            let Some(last_entry) = page.entries.last() else {
+                return Ok(());
+            };
+            after_transaction_id = Some(last_entry.transaction_id());
+            let additions = page
+                .entries
+                .into_iter()
+                .filter(|entry| !self.index.is_in_mempool(entry.transaction_id()))
+                .map(|entry| {
+                    (
+                        MempoolEvent::Added {
+                            entry: entry.as_ref().clone(),
+                        },
+                        entry.first_seen_unix_millis(),
+                    )
+                })
+                .collect();
+            self.append_and_apply_reconciliation_batch_locked(canonical, additions)
+                .await?;
+            if page.next_after_transaction_id.is_none() {
+                return Ok(());
+            }
+        }
     }
 
     async fn restore_durable_index(
@@ -1063,6 +1088,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydrating_point_read_fails_before_waiting_for_the_mutation_gate()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let owner = LiveMempoolOwner::default();
+        let _stalled_reconciliation = owner.mutation_gate.lock().await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(25),
+            owner.entry_for(chain_epoch, TransactionId::from_bytes([0xAA; 32])),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn point_read_rejects_a_chain_epoch_newer_than_its_certified_source_tip()
     -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::TempDir::new()?;
@@ -1436,6 +1491,74 @@ mod tests {
         assert_eq!(
             reconciliation_batch_sizes.iter().sum::<usize>(),
             expected_event_count
+        );
+        cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_page_mixed_replacement_applies_only_the_symmetric_difference()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let (source, source_control) = MockMempoolSource::streaming();
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+        let initial_entry_count = MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS * 2;
+        wait_for_source_open(&source_control, 1).await?;
+        for transaction_nonce in 0..initial_entry_count {
+            source_control
+                .push_added(source_entry_with_nonce(u32::try_from(transaction_nonce)?)?)?;
+        }
+        wait_for_staged_entries(&owner, initial_entry_count).await?;
+        source_control.complete_initial_snapshot(fixture_source_tip())?;
+        wait_for_hydration(&ready_gate, true).await?;
+
+        let shared_start = MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS / 2;
+        let shared_end = shared_start + MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS;
+        let added_end = initial_entry_count + MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS;
+        source_control.close_stream();
+        wait_for_source_open(&source_control, 2).await?;
+        for transaction_nonce in shared_start..shared_end {
+            source_control
+                .push_added(source_entry_with_nonce(u32::try_from(transaction_nonce)?)?)?;
+        }
+        for transaction_nonce in initial_entry_count..added_end {
+            source_control
+                .push_added(source_entry_with_nonce(u32::try_from(transaction_nonce)?)?)?;
+        }
+        wait_for_staged_entries(&owner, initial_entry_count).await?;
+        source_control.complete_initial_snapshot(fixture_source_tip())?;
+        wait_for_hydration(&ready_gate, true).await?;
+
+        assert_eq!(owner.index.entry_count(), initial_entry_count);
+        for transaction_nonce in 0..added_end {
+            let transaction_id =
+                source_entry_with_nonce(u32::try_from(transaction_nonce)?)?.transaction_id;
+            let should_remain = (shared_start..shared_end).contains(&transaction_nonce)
+                || transaction_nonce >= initial_entry_count;
+            assert_eq!(owner.index.is_in_mempool(transaction_id), should_remain);
+        }
+        assert_eq!(
+            durable_event_count(&canonical).await?,
+            initial_entry_count + MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS * 2
         );
         cancel.cancel();
         owner_task.await?;

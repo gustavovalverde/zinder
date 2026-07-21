@@ -180,9 +180,9 @@ pub struct MempoolSnapshotRequest {
 
 /// Opaque next-page cursor for paged mempool snapshots.
 ///
-/// Cursor for paged implementations. Today's in-memory snapshot returns the
-/// head of the live index in one response and ignores supplied cursors; servers
-/// that return `next_cursor` use this value for the next page.
+/// Pass the cursor returned in one snapshot page to the next request. The
+/// cursor binds the durable event-resume anchor and the last transaction id in
+/// that page; callers must treat its bytes as opaque.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg(feature = "remote")]
 pub struct MempoolSnapshotCursor(Vec<u8>);

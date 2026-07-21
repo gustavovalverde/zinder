@@ -26,15 +26,23 @@ The decisions to record here are:
 
 ### Mempool live state is in-memory; mempool history is in RocksDB
 
-`MempoolIndex` is owned by `zinder-ingest` as in-process state. It is a concurrent map keyed by `TransactionId` plus transparent overlays (output / spend lookups). It is not a column family. Crashes drop the live index; the next restart rebuilds it from the source's snapshot.
+`MempoolIndex` is owned by `zinder-ingest` as in-process state. Its primary
+entries are ordered by `TransactionId`, with hash-indexed transparent overlays
+for output and spend lookups. The ordered primary index makes snapshot paging
+and source-generation reconciliation use working memory bounded by the page
+size rather than cloning and sorting the full mempool. Total reconciliation
+work remains proportional to the old and staged entry counts. It is not a
+column family. Crashes drop the live index; the next restart rebuilds it from
+the source's snapshot.
 
 The canonical store persists durable mempool event history in its `mempool_event` column family. Every typed `Added` / `Invalidated` / `Mined` envelope is committed there before consumers see it. The retention floor is stored with the canonical control records, so cursor expiration is a single durable read rather than a column-family scan.
 
 Source-generation reconciliation holds the live owner's mutation gate while it
-computes the old-to-new set delta. It appends ordered removals and additions in
-synchronously committed RocksDB batches with a bounded event count, applying
-each batch's contiguous positions to the private index before continuing. Reads remain unavailable until every
-batch has been applied and the source generation is certified. A
+walks the old and new ordered indexes in bounded pages. It appends ordered
+removals and additions in synchronously committed RocksDB batches with a
+bounded event count, applying each batch's contiguous positions to the private
+index before continuing. Reads remain unavailable until every batch has been
+applied and the source generation is certified. A
 network-upgrade activation can therefore evict thousands of transactions
 without issuing one synchronous write per transaction or constructing one
 unbounded write batch, while the durable event stream still retains one typed

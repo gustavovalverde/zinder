@@ -12,7 +12,7 @@ use crate::{
 /// Both forms are 32 bytes and are addressed as the same canonical
 /// identifier on the wire and in storage; Zinder treats the bytes as opaque
 /// and does not recompute them.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TransactionId([u8; 32]);
 
 impl TransactionId {
