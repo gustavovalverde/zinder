@@ -976,11 +976,13 @@ pub async fn run_mempool_retention(
     loop {
         if has_immediate_work {
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => return,
                 () = tokio::task::yield_now() => {}
             }
         } else {
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => return,
                 () = tokio::time::sleep(settings.check_interval) => {}
             }
@@ -1257,7 +1259,9 @@ mod tests {
         MempoolObservation, RawTransactionBytes, TransactionId, UnixTimestampMillis,
     };
     use zinder_source::MempoolSourceEntry;
-    use zinder_store::MempoolEvent;
+    use zinder_store::{
+        MempoolEvent, MempoolEventRetentionConfig, MempoolEventRetentionStepBudget,
+    };
     use zinder_testkit::{MockMempoolSource, MockMempoolSourceControl};
 
     use crate::{
@@ -1270,7 +1274,8 @@ mod tests {
 
     use super::{
         LiveMempoolOwner, MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS, MempoolOwnerStatus,
-        record_mempool_lifecycle_status, record_mempool_retention_pass, run_live_mempool_owner,
+        MempoolRetentionSettings, record_mempool_lifecycle_status, record_mempool_retention_pass,
+        run_live_mempool_owner, run_mempool_retention,
     };
 
     #[test]
@@ -1327,6 +1332,58 @@ mod tests {
                 "missing `{expected_sample}` in metrics exposition:\n{exposition}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_an_immediate_retention_backlog_between_steps()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        for transaction_tag in 1_u8..=3 {
+            let _envelope = store.append_mempool_event(
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+                    reason: MempoolEvictionReason::Unknown,
+                },
+                UnixTimestampMillis::new(1_000),
+            )?;
+        }
+        let (canonical, mut commands) = canonical_control_channel();
+        let cancel = CancellationToken::new();
+        let command_cancel = cancel.clone();
+        let command_task = tokio::spawn(async move {
+            let mut command_count = 0_u32;
+            while let Some(command) = commands.recv().await {
+                command_count = command_count.saturating_add(1);
+                apply_canonical_control_command(&mut store, command);
+                if command_count == 1 {
+                    command_cancel.cancel();
+                }
+            }
+            command_count
+        });
+
+        let retention_task = tokio::spawn(run_mempool_retention(
+            canonical,
+            LiveMempoolOwner::default(),
+            MempoolRetentionSettings {
+                retention: MempoolEventRetentionConfig::new(
+                    Some(Duration::from_millis(1)),
+                    Some(Duration::from_millis(1)),
+                ),
+                budget: MempoolEventRetentionStepBudget::new(
+                    NonZeroU32::new(1).ok_or("retention event budget must be nonzero")?,
+                    NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+                ),
+                check_interval: Duration::ZERO,
+            },
+            cancel,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), retention_task).await??;
+        let command_count = tokio::time::timeout(Duration::from_secs(1), command_task).await??;
+        assert_eq!(command_count, 1);
+        Ok(())
     }
 
     #[tokio::test]

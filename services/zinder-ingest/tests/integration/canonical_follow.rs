@@ -3,21 +3,29 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    num::{NonZeroU32, NonZeroU64},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tempfile::tempdir;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use zebra_chain::{block::Block as ZebraBlock, serialization::ZcashDeserializeInto};
 use zinder_core::{
     BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, SubtreeRootRange,
-    UnixTimestampMillis,
+    CommitmentTreeFrontiers, MempoolEvictionReason, Network, NetworkUpgradeActivations,
+    SubtreeRootRange, TransactionId, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalFollower, RawBlobPolicy,
-    follow_canonical_tip, load_fresh_canonical, prepare_canonical_block,
+    CanonicalConstructionConfig, CanonicalControlCommand, CanonicalFollowConfig, CanonicalFollower,
+    RawBlobPolicy, follow_canonical_tip, follow_canonical_tip_with_control, load_fresh_canonical,
+    prepare_canonical_block,
 };
 use zinder_runtime::{Readiness, ReadinessCause};
 use zinder_source::{
@@ -26,7 +34,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbResourceBudget,
+    CanonicalStoreWorkload, MempoolEvent, MempoolEventRetentionConfig,
+    MempoolEventRetentionStepBudget, RocksDbCanonicalBuilder, RocksDbResourceBudget,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
@@ -54,8 +63,16 @@ struct RecordingParseableSource {
     tip_height: Arc<Mutex<BlockHeight>>,
     calls: Arc<Mutex<Vec<SourceCall>>>,
     tip_call_count: Arc<Mutex<u32>>,
+    tip_call_gate: Arc<Mutex<Option<SourceTipCallGate>>>,
     cancel_after_tip_call: Arc<Mutex<Option<(u32, CancellationToken)>>>,
     cancel_after_checkpoint: Arc<Mutex<Option<(BlockHeight, CancellationToken)>>>,
+}
+
+#[derive(Clone)]
+struct SourceTipCallGate {
+    call_count: u32,
+    entered: Arc<Notify>,
+    resume: Arc<Notify>,
 }
 
 impl RecordingParseableSource {
@@ -70,6 +87,7 @@ impl RecordingParseableSource {
             tip_height: Arc::new(Mutex::new(tip_height)),
             calls: Arc::new(Mutex::new(Vec::new())),
             tip_call_count: Arc::new(Mutex::new(0)),
+            tip_call_gate: Arc::new(Mutex::new(None)),
             cancel_after_tip_call: Arc::new(Mutex::new(None)),
             cancel_after_checkpoint: Arc::new(Mutex::new(None)),
         }
@@ -97,6 +115,17 @@ impl RecordingParseableSource {
 
     fn cancel_after_tip_call(&self, call_count: u32, cancel: CancellationToken) {
         *self.cancel_after_tip_call.lock() = Some((call_count, cancel));
+    }
+
+    fn pause_tip_call(&self, call_count: u32) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *self.tip_call_gate.lock() = Some(SourceTipCallGate {
+            call_count,
+            entered: Arc::clone(&entered),
+            resume: Arc::clone(&resume),
+        });
+        (entered, resume)
     }
 
     fn cancel_after_checkpoint(&self, height: BlockHeight, cancel: CancellationToken) {
@@ -186,6 +215,16 @@ impl NodeSource for RecordingParseableSource {
             && call_count == *cancel_at
         {
             cancel.cancel();
+        }
+        let tip_call_gate = self
+            .tip_call_gate
+            .lock()
+            .as_ref()
+            .filter(|gate| gate.call_count == call_count)
+            .cloned();
+        if let Some(gate) = tip_call_gate {
+            gate.entered.notify_one();
+            gate.resume.notified().await;
         }
         let height = *self.tip_height.lock();
         let block = self.block_at(height)?;
@@ -603,6 +642,108 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
             .map(|header| BlockId::new(header.height, header.block_hash)),
         Some(original_four)
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fairness proof keeps both queued maintenance steps, the gated source observation, and cancellation in one causal timeline"
+)]
+async fn retention_steps_yield_to_canonical_source_observation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempdir()?;
+    let store_path = temporary.path().join("canonical");
+    let blocks = parseable_multi_block_chain()?;
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let checkpoints = checkpoints_for_parseable_chain(&blocks, &activations)?;
+    let source = RecordingParseableSource::new(blocks.clone(), checkpoints, BlockHeight::new(4));
+    let store = publish_parseable_store(
+        &source,
+        &blocks,
+        Arc::clone(&activations),
+        &store_path,
+        4,
+        BlockHeight::new(4),
+    )
+    .await?;
+    for transaction_tag in 1_u8..=3 {
+        let _envelope = store.append_mempool_event(
+            MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            },
+            UnixTimestampMillis::new(1_000),
+        )?;
+    }
+
+    let retention = MempoolEventRetentionConfig::new(
+        Some(Duration::from_millis(1)),
+        Some(Duration::from_millis(1)),
+    );
+    let budget = MempoolEventRetentionStepBudget::new(
+        NonZeroU32::new(1).ok_or("retention event budget must be nonzero")?,
+        NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+    );
+    let (command_sender, control_commands) = mpsc::channel(2);
+    let (first_reply, first_outcome) = oneshot::channel();
+    command_sender
+        .send(CanonicalControlCommand::PruneMempoolEvents {
+            now: UnixTimestampMillis::new(10_000),
+            retention,
+            budget,
+            reply: first_reply,
+        })
+        .await?;
+    let (second_reply, second_outcome) = oneshot::channel();
+    command_sender
+        .send(CanonicalControlCommand::PruneMempoolEvents {
+            now: UnixTimestampMillis::new(10_000),
+            retention,
+            budget,
+            reply: second_reply,
+        })
+        .await?;
+    drop(command_sender);
+
+    source.clear_calls();
+    let cancel = CancellationToken::new();
+    source.cancel_after_tip_call(2, cancel.clone());
+    let (first_tip_entered, resume_first_tip) = source.pause_tip_call(1);
+    let follower_source = source.clone();
+    let follower_task = tokio::spawn(async move {
+        let readiness = Readiness::default();
+        let follower = CanonicalFollower::new(
+            &follower_source,
+            activations,
+            CanonicalFollowConfig {
+                request_timeout: Duration::from_secs(5),
+                poll_interval: Duration::from_secs(1),
+                lag_threshold_blocks: 0,
+                target_height: None,
+                event_retention_window: None,
+                event_retention_check_interval: Duration::from_secs(1),
+                mempool_ready_gate: None,
+            },
+            &readiness,
+            &cancel,
+        );
+        follow_canonical_tip_with_control(store, follower, control_commands).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), first_tip_entered.notified()).await?;
+    let first_outcome = tokio::time::timeout(Duration::from_secs(1), first_outcome).await???;
+    assert!(first_outcome.has_immediate_work());
+    let mut second_outcome = second_outcome;
+    assert!(matches!(
+        second_outcome.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    resume_first_tip.notify_one();
+    let second_outcome = tokio::time::timeout(Duration::from_secs(1), second_outcome).await???;
+    assert!(second_outcome.has_immediate_work());
+    let _store = tokio::time::timeout(Duration::from_secs(1), follower_task).await???;
+    assert_eq!(source.calls(), vec![SourceCall::Tip, SourceCall::Tip]);
     Ok(())
 }
 

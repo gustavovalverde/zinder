@@ -1490,6 +1490,7 @@ pub(crate) mod test_support {
         time::Duration,
     };
 
+    use rust_rocksdb::{DB, Options};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_util::sync::CancellationToken;
@@ -2233,6 +2234,71 @@ pub(crate) mod test_support {
     }
 
     #[test]
+    fn retention_gap_fails_closed_without_committing_partial_floor_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_fixture_store(&store_path)?;
+        for transaction_tag in 1_u8..=5 {
+            let _envelope = store.append_mempool_event(
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+                    reason: MempoolEvictionReason::Unknown,
+                },
+                UnixTimestampMillis::new(1_000),
+            )?;
+        }
+        drop(store);
+        let removed_event = swap_raw_mempool_event(&store_path, 3, None)?
+            .ok_or("corruption target event must exist")?;
+
+        let activations = fixture_activations()?;
+        let corrupted = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(1)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let error = corrupted
+            .advance_mempool_event_retention(
+                UnixTimestampMillis::new(10_000),
+                MempoolEventRetentionConfig::new(
+                    Some(Duration::from_millis(1)),
+                    Some(Duration::from_millis(1)),
+                ),
+                MempoolEventRetentionStepBudget::new(
+                    NonZeroU32::new(16).ok_or("retention event budget must be nonzero")?,
+                    NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+                ),
+            )
+            .err()
+            .ok_or("retention unexpectedly crossed an interior history gap")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreError::MempoolEventLogInvalid { .. }
+        ));
+        drop(corrupted);
+
+        let replaced_event = swap_raw_mempool_event(&store_path, 3, Some(&removed_event))?;
+        assert!(replaced_event.is_none());
+        let repaired = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(1)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let retained = repaired.mempool_event_history(MempoolEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(8).ok_or("mempool history limit must be nonzero")?,
+        ))?;
+        assert_eq!(retained.len(), 5);
+        assert_eq!(retained[0].position().event_sequence, 1);
+        Ok(())
+    }
+
+    #[test]
     fn bounded_retention_restart_rescans_from_the_durable_floor()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::TempDir::new()?;
@@ -2535,6 +2601,27 @@ pub(crate) mod test_support {
             let _envelope = store.append_mempool_event(event, UnixTimestampMillis::new(1_000))?;
         }
         Ok(())
+    }
+
+    fn swap_raw_mempool_event(
+        store_path: &std::path::Path,
+        event_sequence: u64,
+        replacement: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        let column_families = DB::list_cf(&Options::default(), store_path)?;
+        let database = DB::open_cf(&Options::default(), store_path, column_families)?;
+        let event_family = database
+            .cf_handle("mempool_event")
+            .ok_or("mempool event column family must exist")?;
+        let key = event_sequence.to_be_bytes();
+        let previous = database.get_cf(&event_family, key)?;
+        if let Some(replacement) = replacement {
+            database.put_cf(&event_family, key, replacement)?;
+        } else {
+            database.delete_cf(&event_family, key)?;
+        }
+        database.flush_cf(&event_family)?;
+        Ok(previous)
     }
 
     fn authenticated<Message>(message: Message) -> Request<Message> {
