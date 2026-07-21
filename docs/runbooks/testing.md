@@ -910,13 +910,19 @@ For production Android-wallet claims
 Reference comparison points: `zec.rocks` for public lightwalletd behavior,
 the existing `wallet_sdk_scan.rs` for the in-process baseline.
 
-## Internal native `WalletQuery` contract
+## Public native `WalletQuery` contract
 
-`zinder-query` remains the Rust library that owns native wallet request types,
-the query API, error mapping, and compatibility adapter inputs. Its standalone
-binary has been deleted and is not a deployment or fallback path. Exercise the
-library through its unit/integration tests and the public
-`zinder-compat-lightwalletd` parity suite.
+`zinder-query` owns the native wallet request types, query API, error mapping,
+gRPC adapter, and standalone serving runtime. It is a first-class external
+protocol surface for native consumers such as Zally and is deployed alongside
+ingest and projector in the wallet-serving topology. Certify it directly
+through its unit and integration tests plus the
+[standalone native WalletQuery smoke](#standalone-native-walletquery-smoke).
+
+`zinder-compat-lightwalletd` is a separate first-class external service that
+translates the lightwalletd protocol. Its parity and wallet certification do
+not replace native WalletQuery contract or live-smoke coverage, and native
+coverage does not replace compatibility certification.
 
 ### Capability descriptor
 
@@ -1009,8 +1015,10 @@ explorer.migration.denominations_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 
-The wallet rows above describe the internal native query contract consumed by
-the compatibility adapter. Explorer rows belong to the optional
+The wallet rows above describe the public native contract advertised by the
+standalone `zinder-query` runtime. The compatibility adapter may consume those
+capabilities internally, but its lightwalletd protocol remains a separately
+certified external surface. Explorer rows belong to the optional
 `zinder-explorer` runtime and are not published as a release image.
 
 ## Failure interpretation reference
@@ -1115,10 +1123,11 @@ For ordinary code changes, use the shorter pre-flight checklist below.
 - [ ] If the change touched the lightwalletd wire surface: a manual end-to-end
       run with a lightwalletd-compatible wallet or the Android SDK against
       `zinder-compat-lightwalletd`.
-- [ ] If the change touched the internal native `WalletQuery` contract: its
-      library integration tests and the compatibility parity profile are green,
+- [ ] If the change touched the public native `WalletQuery` contract: its unit
+      and integration tests plus the standalone live contract smoke are green,
       and the capability descriptor reflects every added, removed, or renamed
-      capability.
+      capability. Run compatibility parity separately when the change also
+      affects the lightwalletd adapter or shared behavior it exposes.
 - [ ] If the change altered storage byte layout: `cargo mutants` against
       `chain_store.rs` and `chain_store/validation.rs` is a healthy plus
       coverage run via `cargo llvm-cov`.
