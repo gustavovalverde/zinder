@@ -138,15 +138,6 @@ async fn run_polling_loop(
         {
             Ok(PollCompletion::Complete { source_tip }) => {
                 if certified_source_tip.is_none() {
-                    if event_sender
-                        .send(Ok(MempoolSourceEvent::InitialSnapshotComplete {
-                            source_tip,
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
                     certified_source_tip = Some(source_tip);
                 }
             }
@@ -190,7 +181,7 @@ enum PollCompletion {
     /// A hydration or lookup race needs another poll before the first snapshot
     /// can be declared complete.
     RetryNeeded,
-    /// The upstream best chain moved beyond the tip that certified the
+    /// The upstream best chain differs from the tip that certified the
     /// currently exposed generation.
     SourceTipChanged {
         certified_source_tip: zinder_core::BlockId,
@@ -245,34 +236,178 @@ async fn poll_once(
     let (added_transaction_ids, removed_transaction_ids) =
         diff_known_state(known_transaction_ids, &observed_transaction_ids);
 
-    let added_observations = futures_util::stream::iter(added_transaction_ids)
-        .map(|transaction_id| observe_added_event(json_rpc, transaction_id, observed_at))
-        .buffer_unordered(MEMPOOL_POLL_HYDRATION_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    let removed_observations = futures_util::stream::iter(removed_transaction_ids)
-        .map(|transaction_id| observe_disappearance_event(json_rpc, transaction_id))
-        .buffer_unordered(MEMPOOL_POLL_HYDRATION_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+    let mut pending_retry = false;
+    for (transaction_ids, transition_kind) in [
+        (added_transaction_ids, PollTransitionKind::Added),
+        (removed_transaction_ids, PollTransitionKind::Removed),
+    ] {
+        for transaction_batch in transaction_ids.chunks(MEMPOOL_POLL_HYDRATION_CONCURRENCY) {
+            match poll_transition_batch(
+                json_rpc,
+                known_transaction_ids,
+                transaction_batch,
+                transition_kind,
+                observed_at,
+                source_tip_before,
+                event_sender,
+            )
+            .await?
+            {
+                PollBatchCompletion::Complete => {}
+                PollBatchCompletion::RetryNeeded => {
+                    pending_retry = true;
+                }
+                PollBatchCompletion::SourceTipChanged {
+                    observed_source_tip,
+                } => {
+                    return source_tip_change_outcome(
+                        certified_source_tip,
+                        source_tip_before,
+                        observed_source_tip,
+                    );
+                }
+            }
+        }
+    }
+    certify_poll_completion(
+        json_rpc,
+        event_sender,
+        certified_source_tip,
+        source_tip_before,
+        pending_retry,
+    )
+    .await
+}
+
+async fn certify_poll_completion(
+    json_rpc: &ZebraJsonRpcSource,
+    event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
+    certified_source_tip: Option<zinder_core::BlockId>,
+    source_tip_before: zinder_core::BlockId,
+    pending_retry: bool,
+) -> Result<PollCompletion, PollFailure> {
+    let initial_snapshot_permit = if certified_source_tip.is_none() && !pending_retry {
+        Some(
+            event_sender
+                .reserve()
+                .await
+                .map_err(|_| PollFailure::ReceiverGone)?,
+        )
+    } else {
+        None
+    };
     let source_tip_after = json_rpc.tip_id().await.map_err(PollFailure::Source)?;
     if source_tip_before != source_tip_after {
-        return Ok(PollCompletion::RetryNeeded);
+        return source_tip_change_outcome(
+            certified_source_tip,
+            source_tip_before,
+            source_tip_after,
+        );
+    }
+    if pending_retry && certified_source_tip.is_none() {
+        return Err(PollFailure::Source(SourceError::MempoolStreamUnavailable {
+            reason: "initial mempool snapshot hydration was incomplete".to_owned(),
+        }));
+    }
+    if let Some(initial_snapshot_permit) = initial_snapshot_permit {
+        initial_snapshot_permit.send(Ok(MempoolSourceEvent::InitialSnapshotComplete {
+            source_tip: source_tip_before,
+        }));
+    }
+    Ok(if pending_retry {
+        PollCompletion::RetryNeeded
+    } else {
+        PollCompletion::Complete {
+            source_tip: source_tip_before,
+        }
+    })
+}
+
+fn source_tip_change_outcome(
+    certified_source_tip: Option<zinder_core::BlockId>,
+    source_tip_before: zinder_core::BlockId,
+    observed_source_tip: zinder_core::BlockId,
+) -> Result<PollCompletion, PollFailure> {
+    certified_source_tip.map_or_else(
+        || {
+            Err(PollFailure::Source(SourceError::MempoolStreamUnavailable {
+                reason: format!(
+                    "source tip changed from {source_tip_before:?} to {observed_source_tip:?} while constructing the initial mempool snapshot"
+                ),
+            }))
+        },
+        |certified_source_tip| {
+            Ok(PollCompletion::SourceTipChanged {
+                certified_source_tip,
+                observed_source_tip,
+            })
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PollTransitionKind {
+    Added,
+    Removed,
+}
+
+enum PollBatchCompletion {
+    Complete,
+    RetryNeeded,
+    SourceTipChanged {
+        observed_source_tip: zinder_core::BlockId,
+    },
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The batch boundary receives the complete source-tip and delivery contract explicitly."
+)]
+async fn poll_transition_batch(
+    json_rpc: &ZebraJsonRpcSource,
+    known_transaction_ids: &Arc<Mutex<HashSet<TransactionId>>>,
+    transaction_ids: &[TransactionId],
+    transition_kind: PollTransitionKind,
+    observed_at: UnixTimestampMillis,
+    expected_source_tip: zinder_core::BlockId,
+    event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
+) -> Result<PollBatchCompletion, PollFailure> {
+    let observations = futures_util::stream::iter(transaction_ids.iter().copied())
+        .map(|transaction_id| async move {
+            match transition_kind {
+                PollTransitionKind::Added => {
+                    observe_added_event(json_rpc, transaction_id, observed_at).await
+                }
+                PollTransitionKind::Removed => {
+                    observe_disappearance_event(json_rpc, transaction_id).await
+                }
+            }
+        })
+        .buffer_unordered(MEMPOOL_POLL_HYDRATION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let observed_source_tip = json_rpc.tip_id().await.map_err(PollFailure::Source)?;
+    if observed_source_tip != expected_source_tip {
+        return Ok(PollBatchCompletion::SourceTipChanged {
+            observed_source_tip,
+        });
     }
 
     let mut pending_retry = false;
-    for observation in added_observations.into_iter().chain(removed_observations) {
+    for observation in observations {
         match observation {
             PollObservation::Transition {
                 event,
                 transaction_id,
-                is_addition,
             } => {
                 forward_event(event, event_sender).await?;
-                if is_addition {
-                    remember_added_transaction_id(known_transaction_ids, transaction_id);
-                } else {
-                    forget_removed_transaction_id(known_transaction_ids, transaction_id);
+                match transition_kind {
+                    PollTransitionKind::Added => {
+                        remember_added_transaction_id(known_transaction_ids, transaction_id);
+                    }
+                    PollTransitionKind::Removed => {
+                        forget_removed_transaction_id(known_transaction_ids, transaction_id);
+                    }
                 }
             }
             PollObservation::Retry => pending_retry = true,
@@ -283,11 +418,9 @@ async fn poll_once(
         }
     }
     Ok(if pending_retry {
-        PollCompletion::RetryNeeded
+        PollBatchCompletion::RetryNeeded
     } else {
-        PollCompletion::Complete {
-            source_tip: source_tip_after,
-        }
+        PollBatchCompletion::Complete
     })
 }
 
@@ -326,7 +459,6 @@ enum PollObservation {
     Transition {
         event: MempoolSourceEvent,
         transaction_id: TransactionId,
-        is_addition: bool,
     },
     Retry,
     RetryAfterError(SourceError),
@@ -349,7 +481,6 @@ async fn observe_added_event(
             PollObservation::Transition {
                 event: MempoolSourceEvent::Added(entry),
                 transaction_id,
-                is_addition: true,
             }
         }
         Ok(None) => {
@@ -381,7 +512,6 @@ async fn observe_disappearance_event(
                 block_hash,
             },
             transaction_id,
-            is_addition: false,
         },
         Ok(UpstreamTransactionLookup::NotFound) => PollObservation::Transition {
             event: MempoolSourceEvent::Invalidated {
@@ -389,7 +519,6 @@ async fn observe_disappearance_event(
                 reason: MempoolEvictionReason::Unknown,
             },
             transaction_id,
-            is_addition: false,
         },
         Ok(UpstreamTransactionLookup::InMempool) => {
             // Source reports the txid is still in the mempool; the diff
@@ -560,8 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_does_not_complete_initial_snapshot_while_hydration_is_pending()
-    -> eyre::Result<()> {
+    async fn polling_rejects_an_initial_generation_with_pending_hydration() -> eyre::Result<()> {
         let transaction_id_hex = "A1".repeat(32);
         let source_tip_response = serde_json::json!({
             "height": 7,
@@ -580,6 +708,9 @@ mod tests {
                     "No such mempool or blockchain transaction",
                 ),
             ),
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(source_tip_response.clone()),
+            ),
             zinder_testkit::method("getbestblockheightandhash")
                 .reply(zinder_testkit::RpcReply::result(source_tip_response)),
         ])?;
@@ -592,18 +723,20 @@ mod tests {
         let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
         let (event_sender, mut event_receiver) = mpsc::channel(4);
 
-        let Ok(completion) = poll_once(
+        let outcome = poll_once(
             &json_rpc,
             &known_transaction_ids,
             UnixTimestampMillis::new(1_750_000_000_000),
             &event_sender,
             None,
         )
-        .await
-        else {
-            return Err(eyre::eyre!("pending hydration must be retried, not fail"));
-        };
-        assert_eq!(completion, PollCompletion::RetryNeeded);
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(PollFailure::Source(
+                SourceError::MempoolStreamUnavailable { .. }
+            ))
+        ));
         assert!(
             event_receiver.try_recv().is_err(),
             "a pending hydration must not emit a source event or completion marker"
@@ -613,7 +746,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_discards_a_snapshot_when_its_source_tip_changes() -> eyre::Result<()> {
+    async fn polling_rejects_an_initial_generation_when_its_source_tip_changes() -> eyre::Result<()>
+    {
         let transaction_id_hex = "11".repeat(32);
         let server = zinder_testkit::JsonRpcTestServer::start([
             zinder_testkit::method("getbestblockheightandhash").reply(
@@ -644,17 +778,21 @@ mod tests {
         let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
         let (event_sender, mut event_receiver) = mpsc::channel(4);
 
-        let completion = poll_once(
+        let outcome = poll_once(
             &json_rpc,
             &known_transaction_ids,
             UnixTimestampMillis::new(1_750_000_000_000),
             &event_sender,
             None,
         )
-        .await
-        .map_err(|_| eyre::eyre!("tip instability must request a retry, not fail"))?;
+        .await;
 
-        assert_eq!(completion, PollCompletion::RetryNeeded);
+        assert!(matches!(
+            outcome,
+            Err(PollFailure::Source(
+                SourceError::MempoolStreamUnavailable { .. }
+            ))
+        ));
         assert!(
             event_receiver.try_recv().is_err(),
             "an unstable source snapshot must publish no partial transitions"
@@ -704,6 +842,140 @@ mod tests {
         ));
         assert!(event_receiver.try_recv().is_err());
         assert!(server.requests_for("getrawmempool")?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn polling_hydration_obeys_event_channel_backpressure() -> eyre::Result<()> {
+        const TRANSACTION_COUNT: usize = MEMPOOL_POLL_HYDRATION_CONCURRENCY * 4;
+        let transaction_ids = (0..TRANSACTION_COUNT)
+            .map(|index| format!("{:02x}", index.saturating_add(1)).repeat(32))
+            .collect::<Vec<_>>();
+        let source_tip_response = serde_json::json!({
+            "height": 7,
+            "hash": vec![0x07; 32],
+        });
+        let mut stubs = vec![
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(source_tip_response.clone()),
+            ),
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!(transaction_ids),
+            )),
+        ];
+        stubs.extend((0..TRANSACTION_COUNT).map(|_| {
+            zinder_testkit::method("getrawtransaction").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!("deadbeef"),
+            ))
+        }));
+        stubs.extend((0..5).map(|_| {
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(source_tip_response.clone()),
+            )
+        }));
+        let server = zinder_testkit::JsonRpcTestServer::start(stubs)?;
+        let json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let (event_sender, _event_receiver) = mpsc::channel(1);
+        let poll_task = tokio::spawn(async move {
+            poll_once(
+                &json_rpc,
+                &known_transaction_ids,
+                UnixTimestampMillis::new(1_750_000_000_000),
+                &event_sender,
+                None,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .requests_for("getrawtransaction")
+                    .unwrap_or_default()
+                    .len()
+                    >= MEMPOOL_POLL_HYDRATION_CONCURRENCY
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let hydrated_request_count = server.requests_for("getrawtransaction")?.len();
+        poll_task.abort();
+        let _ = poll_task.await;
+
+        assert!(
+            hydrated_request_count < TRANSACTION_COUNT,
+            "a blocked consumer must stop polling hydration before all raw transactions are retained"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn polling_rechecks_tip_after_waiting_for_snapshot_marker_capacity() -> eyre::Result<()> {
+        let transaction_ids = ["11".repeat(32)];
+        let source_tip_before = serde_json::json!({
+            "height": 7,
+            "hash": vec![0x07; 32],
+        });
+        let source_tip_after = serde_json::json!({
+            "height": 8,
+            "hash": vec![0x08; 32],
+        });
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getbestblockheightandhash")
+                .reply(zinder_testkit::RpcReply::result(source_tip_before.clone())),
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!(transaction_ids),
+            )),
+            zinder_testkit::method("getrawtransaction").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!("deadbeef"),
+            )),
+            zinder_testkit::method("getbestblockheightandhash")
+                .reply(zinder_testkit::RpcReply::result(source_tip_before)),
+            zinder_testkit::method("getbestblockheightandhash")
+                .reply(zinder_testkit::RpcReply::result(source_tip_after)),
+        ])?;
+        let json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let (event_sender, mut event_receiver) = mpsc::channel(1);
+        let poll_task = tokio::spawn(async move {
+            poll_once(
+                &json_rpc,
+                &known_transaction_ids,
+                UnixTimestampMillis::new(1_750_000_000_000),
+                &event_sender,
+                None,
+            )
+            .await
+        });
+
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::Added(_)))
+        ));
+        let outcome = poll_task.await?;
+
+        assert!(matches!(
+            outcome,
+            Err(PollFailure::Source(
+                SourceError::MempoolStreamUnavailable { .. }
+            ))
+        ));
+        assert!(event_receiver.try_recv().is_err());
         Ok(())
     }
 }

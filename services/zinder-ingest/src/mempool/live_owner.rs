@@ -39,6 +39,7 @@ use super::{
 
 const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
 const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
 
 /// One source generation buffered until its snapshot-complete marker.
 ///
@@ -49,7 +50,6 @@ const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 struct StagedMempoolGeneration {
     index: MempoolIndex,
     terminal_events: HashMap<TransactionId, (MempoolEvent, UnixTimestampMillis)>,
-    side_events: Vec<(MempoolEvent, UnixTimestampMillis)>,
     next_synthetic_sequence: u64,
 }
 
@@ -58,7 +58,6 @@ impl StagedMempoolGeneration {
         Self {
             index: MempoolIndex::new(),
             terminal_events: HashMap::new(),
-            side_events: Vec::new(),
             next_synthetic_sequence: 0,
         }
     }
@@ -506,7 +505,7 @@ impl LiveMempoolOwner {
             .map(|entry| entry.transaction_id())
             .collect::<HashSet<_>>();
 
-        let mut removals = Vec::new();
+        let mut removals = Vec::with_capacity(MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS);
         for entry in current_entries {
             let transaction_id = entry.transaction_id();
             if staged_transaction_ids.contains(&transaction_id) {
@@ -525,11 +524,18 @@ impl LiveMempoolOwner {
                     )
                 });
             removals.push((terminal_event, observed_at));
+            if removals.len() == MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS {
+                self.append_and_apply_reconciliation_batch_locked(
+                    canonical,
+                    std::mem::take(&mut removals),
+                )
+                .await?;
+            }
         }
         self.append_and_apply_reconciliation_batch_locked(canonical, removals)
             .await?;
 
-        let mut additions = Vec::new();
+        let mut additions = Vec::with_capacity(MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS);
         for entry in staged_entries {
             if current_transaction_ids.contains(&entry.transaction_id()) {
                 continue;
@@ -540,15 +546,17 @@ impl LiveMempoolOwner {
                 },
                 entry.first_seen_unix_millis(),
             ));
+            if additions.len() == MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS {
+                self.append_and_apply_reconciliation_batch_locked(
+                    canonical,
+                    std::mem::take(&mut additions),
+                )
+                .await?;
+            }
         }
         self.append_and_apply_reconciliation_batch_locked(canonical, additions)
             .await?;
 
-        for (side_event, observed_at) in staged_generation.side_events {
-            let _outcome = self
-                .append_and_apply_locked(canonical, side_event, observed_at)
-                .await?;
-        }
         Ok(())
     }
 
@@ -1005,12 +1013,14 @@ mod tests {
     use crate::{
         MempoolReadyGate, mempool_ready_channel,
         writer::control::{
-            CanonicalControlHandle, apply_canonical_control_command, canonical_control_channel,
-            test_support::published_fixture_store,
+            CanonicalControlCommand, CanonicalControlHandle, apply_canonical_control_command,
+            canonical_control_channel, test_support::published_fixture_store,
         },
     };
 
-    use super::{LiveMempoolOwner, run_live_mempool_owner};
+    use super::{
+        LiveMempoolOwner, MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS, run_live_mempool_owner,
+    };
 
     #[tokio::test]
     async fn snapshot_marker_with_a_different_source_tip_remains_private()
@@ -1370,8 +1380,78 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn activation_scale_empty_replacement_reconciles_in_bounded_batches()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let (batch_size_sender, mut batch_size_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let CanonicalControlCommand::AppendMempoolEvents { events, .. } = &command {
+                    let _send_outcome = batch_size_sender.send(events.len());
+                }
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let (source, source_control) = MockMempoolSource::streaming();
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+        let transaction_count = MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS * 4;
+        wait_for_source_open(&source_control, 1).await?;
+        for transaction_nonce in 0..transaction_count {
+            source_control
+                .push_added(source_entry_with_nonce(u32::try_from(transaction_nonce)?)?)?;
+        }
+        wait_for_staged_entries(&owner, transaction_count).await?;
+        source_control.complete_initial_snapshot(fixture_source_tip())?;
+        wait_for_hydration(&ready_gate, true).await?;
+        assert_eq!(owner.index.entry_count(), transaction_count);
+
+        source_control.close_stream();
+        wait_for_source_open(&source_control, 2).await?;
+        source_control.complete_initial_snapshot(fixture_source_tip())?;
+        wait_for_hydration(&ready_gate, true).await?;
+
+        assert_eq!(owner.index.entry_count(), 0);
+        let expected_event_count = transaction_count.saturating_mul(2);
+        assert_eq!(durable_event_count(&canonical).await?, expected_event_count);
+        let reconciliation_batch_sizes =
+            std::iter::from_fn(|| batch_size_receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(reconciliation_batch_sizes.len() > 2);
+        assert!(
+            reconciliation_batch_sizes
+                .iter()
+                .all(|batch_size| *batch_size <= MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS)
+        );
+        assert_eq!(
+            reconciliation_batch_sizes.iter().sum::<usize>(),
+            expected_event_count
+        );
+        cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
     fn source_entry(transaction_tag: u8) -> Result<MempoolSourceEntry, Box<dyn Error>> {
-        let raw_transaction_bytes = synthetic_v4_tx_bytes(transaction_tag);
+        source_entry_with_nonce(u32::from(transaction_tag))
+    }
+
+    fn source_entry_with_nonce(
+        transaction_nonce: u32,
+    ) -> Result<MempoolSourceEntry, Box<dyn Error>> {
+        let raw_transaction_bytes = synthetic_v4_tx_bytes(transaction_nonce);
         let transaction: ZebraTransaction =
             raw_transaction_bytes.as_slice().zcash_deserialize_into()?;
         Ok(MempoolSourceEntry {
@@ -1391,19 +1471,37 @@ mod tests {
         )
     }
 
-    fn synthetic_v4_tx_bytes(transaction_tag: u8) -> Vec<u8> {
+    fn synthetic_v4_tx_bytes(transaction_nonce: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0x8000_0004_u32.to_le_bytes());
         bytes.extend_from_slice(&0x892F_2085_u32.to_le_bytes());
         bytes.push(0);
         bytes.push(0);
-        bytes.extend_from_slice(&u32::from(transaction_tag).to_le_bytes());
+        bytes.extend_from_slice(&transaction_nonce.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes.extend_from_slice(&0_i64.to_le_bytes());
         bytes.push(0);
         bytes.push(0);
         bytes.push(0);
         bytes
+    }
+
+    async fn durable_event_count(
+        canonical: &CanonicalControlHandle,
+    ) -> Result<usize, Box<dyn Error>> {
+        let page_size = NonZeroU32::new(64).ok_or("mempool page size must be nonzero")?;
+        let mut after_cursor = None;
+        let mut event_count = 0_usize;
+        loop {
+            let page = canonical
+                .mempool_event_page(after_cursor, page_size)
+                .await?;
+            let Some(last) = page.last() else {
+                return Ok(event_count);
+            };
+            event_count = event_count.saturating_add(page.len());
+            after_cursor = Some(last.cursor.as_bytes().to_vec());
+        }
     }
 
     async fn wait_for_source_open(

@@ -31,12 +31,22 @@ The decisions to record here are:
 The canonical store persists durable mempool event history in its `mempool_event` column family. Every typed `Added` / `Invalidated` / `Mined` envelope is committed there before consumers see it. The retention floor is stored with the canonical control records, so cursor expiration is a single durable read rather than a column-family scan.
 
 Source-generation reconciliation holds the live owner's mutation gate while it
-computes the old-to-new set delta. It appends the ordered removals in one synced
-RocksDB batch, applies their contiguous positions to the private index, and
-then does the same for additions. A network-upgrade activation can therefore
-evict thousands of transactions without issuing one synchronous write per
-transaction, while the durable event stream still retains one typed envelope
-per transaction and readers never observe a partially reconciled set.
+computes the old-to-new set delta. It appends ordered removals and additions in
+synchronously committed RocksDB batches with a bounded event count, applying
+each batch's contiguous positions to the private index before continuing. Reads remain unavailable until every
+batch has been applied and the source generation is certified. A
+network-upgrade activation can therefore evict thousands of transactions
+without issuing one synchronous write per transaction or constructing one
+unbounded write batch, while the durable event stream still retains one typed
+envelope per transaction and readers never observe a partially reconciled set.
+
+Snapshot hydration is also backpressured. Streaming and polling sources retain
+at most one hydration-concurrency window beyond the bounded event channel,
+rather than collecting every raw transaction before delivery. Events emitted
+before `InitialSnapshotComplete` are provisional: the live owner stages them
+privately and discards the generation if hydration fails or its source tip
+changes. Polling verifies the source tip between bounded-size hydration batches;
+the streaming source verifies it before publishing the completion marker.
 
 The split exists because the live index needs to answer transparent lookups in microseconds without a RocksDB round-trip, and because it can be reconstructed deterministically from a source snapshot at startup. The event log needs to answer cursor resume and rebroadcast detection with millisecond latency over hours of history, which RocksDB does well and an in-process ring buffer does not.
 
