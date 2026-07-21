@@ -38,8 +38,8 @@ version and commit appear in the `zinder_build_info` metric and native
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
 | `cursor_at_risk` | Canonical event retention is approaching an active cursor. |
 | `mempool_cursor_at_risk` | Mempool retention is approaching an active cursor. |
-| `mempool_source_unavailable` | The live mempool source is unavailable. |
-| `mempool_hydration_lagging` | Mempool transaction hydration is falling behind. |
+| `mempool_source_unavailable` | The live mempool source is unavailable; traffic is blocked if this reserved typed cause is published. |
+| `mempool_hydration_lagging` | Mempool transaction hydration is falling behind; traffic is blocked if this reserved typed cause is published. |
 | `shutting_down` | New traffic has been drained for termination. |
 
 Payload-bearing causes include structured detail. `node_unavailable` carries a
@@ -57,10 +57,14 @@ secrets.
 ### Ingest
 
 Ingest is ready when its canonical fence is within the configured source lag
-and the current mempool source generation has published a complete snapshot.
+and the current mempool source generation has published a complete snapshot
+certified at that exact canonical tip.
 Fresh construction, source recovery, schema admission, and reorg refusal keep
-it unready. The private control server is supervised with the writer; an
-unexpected control-server exit terminates the runtime.
+it unready. The canonical follower owns the one process-readiness state; the
+mempool owner communicates only through its hydration prerequisite, so source
+and retention tasks cannot overwrite a canonical failure. The private control
+server and live mempool owner are supervised with the writer; an unexpected
+exit from either terminates the runtime.
 
 ### Projector
 
@@ -110,6 +114,29 @@ build Git commit, and network. Important runtime metrics include:
 
 The last two counters are expected to remain zero and protect the canonical
 block-local boundary.
+
+### Mempool owner
+
+- `zinder_mempool_lifecycle_state{status}` is a one-hot gauge over the closed
+  `hydrating`, `serving`, and `rebuild_required` states.
+- `zinder_mempool_entries` reports the current process-local live entry count.
+- `zinder_mempool_source_errors_total{kind,failure_class}` and
+  `zinder_mempool_hydration_failures_total{reason}` diagnose bounded source
+  and hydration failure classes.
+- `zinder_mempool_snapshot_age_seconds` samples the age of the certified
+  source-generation snapshot when a page is served.
+- `zinder_mempool_events_retained`,
+  `zinder_mempool_event_retention_oldest_sequence`, and
+  `zinder_mempool_event_retention_oldest_age_seconds` report the durable event
+  floor after each retention pass.
+- `zinder_mempool_events_pruned_total{kind}` and
+  `zinder_mempool_event_pruning_duration_seconds{status}` report per-kind
+  deletion counts and sweep outcomes with the closed `success` / `error` label
+  set.
+
+Mempool retention metrics describe stored history, not active consumer
+cursors. Retention is contiguous-prefix based, and active `Added` replay
+anchors can keep later rows beyond their individual minimum residence window.
 
 ### Projector and wallet store
 

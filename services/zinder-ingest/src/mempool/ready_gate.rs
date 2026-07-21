@@ -9,9 +9,10 @@
 //! backend emits it after a complete first poll. Opening a stream alone is
 //! not evidence that an empty index is safe to expose.
 //!
-//! [`MempoolReadyGate`] is a live `false ↔ true` watch that the tip-follow
-//! readiness state machine consults before flipping to
-//! [`zinder_runtime::ReadinessCause::Ready`]. It returns to `false` on every
+//! [`MempoolReadyGate`] watches the source tip certified by the current
+//! hydrated generation. The tip-follow readiness state machine publishes
+//! [`zinder_runtime::ReadinessCause::Ready`] only when that source tip exactly
+//! matches its canonical fence. The certification is withdrawn on every
 //! source reconnect because a discarded in-memory index is not safe to serve
 //! until the replacement snapshot completes.
 //!
@@ -19,19 +20,35 @@
 //! zinder_source::MempoolSourceEvent::InitialSnapshotComplete
 
 use tokio::sync::watch;
+use zinder_core::BlockId;
 
 /// Read-side handle observed by the tip-follow state machine.
 #[derive(Clone, Debug)]
 pub struct MempoolReadyGate {
-    hydrated: watch::Receiver<bool>,
+    certified_source_tip: watch::Receiver<Option<BlockId>>,
 }
 
 impl MempoolReadyGate {
-    /// Returns `true` only while the current source generation has observed a
-    /// complete initial snapshot.
+    /// Returns the current source generation's certified tip while its owner
+    /// is still running.
+    ///
+    /// A closed channel fails closed even though `tokio::sync::watch` retains
+    /// its last value. Otherwise an owner that exits after publishing `true`
+    /// could leave ingest readiness permanently admitted.
     #[must_use]
-    pub fn is_hydrated(&self) -> bool {
-        *self.hydrated.borrow()
+    pub fn certified_source_tip(&self) -> Option<BlockId> {
+        self.certified_source_tip
+            .has_changed()
+            .is_ok()
+            .then(|| *self.certified_source_tip.borrow())
+            .flatten()
+    }
+
+    /// Returns whether the current source generation is certified against the
+    /// supplied canonical fence.
+    #[must_use]
+    pub fn admits_canonical_tip(&self, canonical_tip: BlockId) -> bool {
+        self.certified_source_tip() == Some(canonical_tip)
     }
 
     /// Waits until the source generation changes its hydration state.
@@ -39,7 +56,7 @@ impl MempoolReadyGate {
     /// The canonical follower uses this to withdraw or restamp readiness
     /// immediately instead of waiting for its next tip poll.
     pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
-        self.hydrated.changed().await
+        self.certified_source_tip.changed().await
     }
 }
 
@@ -47,31 +64,36 @@ impl MempoolReadyGate {
 /// cheap; every clone shares the same hydration state.
 #[derive(Clone, Debug)]
 pub struct MempoolReadySignal {
-    hydrated: watch::Sender<bool>,
+    certified_source_tip: watch::Sender<Option<BlockId>>,
 }
 
 impl MempoolReadySignal {
-    /// Marks the current source generation as fully hydrated.
-    pub fn set_ready(&self) {
+    /// Marks the current source generation as hydrated and certified against
+    /// `source_tip`.
+    pub fn certify_source_tip(&self, source_tip: BlockId) {
         // `send_replace` ignores the "no receivers" condition that `send`
         // returns, so optional readiness wiring does not make source
         // ownership fail.
-        let _ = self.hydrated.send_replace(true);
+        let _ = self.certified_source_tip.send_replace(Some(source_tip));
     }
 
     /// Withdraws the gate while the current index is being rebuilt.
-    pub fn set_hydrating(&self) {
-        let _ = self.hydrated.send_replace(false);
+    pub fn withdraw_certification(&self) {
+        let _ = self.certified_source_tip.send_replace(None);
     }
 }
 
 /// Constructs a fresh, unhydrated gate plus its sender.
 #[must_use]
 pub fn mempool_ready_channel() -> (MempoolReadySignal, MempoolReadyGate) {
-    let (tx, rx) = watch::channel(false);
+    let (tx, rx) = watch::channel(None);
     (
-        MempoolReadySignal { hydrated: tx },
-        MempoolReadyGate { hydrated: rx },
+        MempoolReadySignal {
+            certified_source_tip: tx,
+        },
+        MempoolReadyGate {
+            certified_source_tip: rx,
+        },
     )
 }
 
@@ -82,34 +104,58 @@ mod tests {
         reason = "Unit test names describe the behavior under test."
     )]
 
+    use zinder_core::{BlockHash, BlockHeight, BlockId};
+
     use super::mempool_ready_channel;
+
+    fn source_tip(tag: u8) -> BlockId {
+        BlockId::new(
+            BlockHeight::new(u32::from(tag)),
+            BlockHash::from_bytes([tag; 32]),
+        )
+    }
 
     #[test]
     fn gate_is_unhydrated_at_construction() {
         let (_signal, gate) = mempool_ready_channel();
-        assert!(!gate.is_hydrated());
+        assert_eq!(gate.certified_source_tip(), None);
     }
 
     #[test]
-    fn set_ready_flips_gate_to_true() {
+    fn certifying_a_source_tip_admits_that_exact_tip() {
         let (signal, gate) = mempool_ready_channel();
-        signal.set_ready();
-        assert!(gate.is_hydrated());
+        let certified_tip = source_tip(1);
+        signal.certify_source_tip(certified_tip);
+        assert!(gate.admits_canonical_tip(certified_tip));
     }
 
     #[test]
-    fn set_ready_is_idempotent() {
+    fn certifying_the_same_source_tip_is_idempotent() {
         let (signal, gate) = mempool_ready_channel();
-        signal.set_ready();
-        signal.set_ready();
-        assert!(gate.is_hydrated());
+        let certified_tip = source_tip(1);
+        signal.certify_source_tip(certified_tip);
+        signal.certify_source_tip(certified_tip);
+        assert!(gate.admits_canonical_tip(certified_tip));
     }
 
     #[test]
-    fn set_hydrating_withdraws_a_previously_ready_gate() {
+    fn withdrawing_certification_revokes_a_previously_admitted_tip() {
         let (signal, gate) = mempool_ready_channel();
-        signal.set_ready();
-        signal.set_hydrating();
-        assert!(!gate.is_hydrated());
+        let certified_tip = source_tip(1);
+        signal.certify_source_tip(certified_tip);
+        signal.withdraw_certification();
+        assert!(!gate.admits_canonical_tip(certified_tip));
+    }
+
+    #[test]
+    fn dropping_the_signal_withdraws_a_previously_ready_gate() {
+        let (signal, gate) = mempool_ready_channel();
+        let certified_tip = source_tip(1);
+        signal.certify_source_tip(certified_tip);
+        assert!(gate.admits_canonical_tip(certified_tip));
+
+        drop(signal);
+
+        assert!(!gate.admits_canonical_tip(certified_tip));
     }
 }

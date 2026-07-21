@@ -1211,15 +1211,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       than zero. Defaults to 30000.",
     },
     EnvVarDoc {
-        name: "ZINDER_RETENTION__MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES",
-        toml_path: "retention.mempool_cursor_at_risk_warning_minutes",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Mempool cursor-at-risk warning lead time in minutes. Must be \u{2264} the \
-                      shortest configured mempool retention window. Defaults to 12.",
-    },
-    EnvVarDoc {
         name: "ZINDER_EXPLORER__BEARER_TOKEN_PATH",
         toml_path: "explorer.bearer_token_path",
         used_by: &["zinder-explorer"],

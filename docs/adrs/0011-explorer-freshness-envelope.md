@@ -58,8 +58,9 @@ message ExplorerFreshness {
 }
 ```
 
-`snapshot_age_millis` is meaningful for transient mempool-backed responses and
-is zero otherwise. `capability_version` is the exact advertised capability that
+`snapshot_age_millis` measures time since the current mempool source generation
+was certified, including for a certified empty mempool, and is zero for
+responses that do not touch mempool state. `capability_version` is the exact advertised capability that
 produced the response. `UnavailableField` carries a proto field path, a typed
 `UnavailableReason`, and a stable human-readable explanation. Optional fields
 stay absent when their source fact, parser support, privacy boundary, or

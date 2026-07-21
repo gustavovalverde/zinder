@@ -116,13 +116,34 @@ The defaults are calibrated for two distinct consumer expectations:
 - A wallet that comes back online after a brief disconnect (minutes) must be able to resume the stream and see the `Mined` event for the transaction it broadcast. 60 minutes covers normal mobile-wallet reconnect behavior plus margin.
 - A wallet that wants to detect "my submitted transaction was rejected by the network" needs `Invalidated` events to outlive a typical user-driven retry cadence. 24 hours covers the case where a user submits, closes the app, returns the next morning, and expects to see whether the transaction is still pending or has been evicted.
 
-`run_mempool_retention` runs the pruner. Its retention state feeds three readiness causes:
+`run_mempool_retention` runs the pruner. Retention windows are minimum
+residence periods, not maximum row ages: pruning removes only a contiguous
+expired prefix, retains the current head, and cannot cross the last `Added`
+event for a transaction that is still active. A long-lived transaction or an
+unexpired floor event can therefore retain later events past their individual
+windows. This is required for restart reconstruction and cursor continuity,
+and it makes retained-row count and pruning duration important capacity
+signals.
 
-- `MempoolCursorAtRisk { oldest_retained_age_minutes, retention_minutes }` when the oldest retained event is approaching its window. The threshold is configurable; the default is to flip when 80 % of the shorter window has elapsed.
-- `MempoolSourceUnavailable` when the source stream emits `MempoolStreamUnavailable { is_retryable: false }` or when the source has been down longer than the source-availability threshold.
-- `MempoolHydrationLagging { recent_hydration_failures }` when `getrawtransaction` hydration falls behind the source's `Added` emission rate beyond the lag threshold.
+Retention does not manufacture a cursor-at-risk readiness state from the age
+of the oldest row. Zinder has no consumer cursor registration or lease, so row
+age is not evidence that an active consumer is about to expire. The retention
+loop instead reports retained rows, floor sequence and age, per-kind prune
+counts, and sweep duration with bounded success/error labels through metrics. Source and
+hydration failures remain source-owner diagnostics. The canonical follower is
+the only publisher of ingest readiness and treats the mempool hydration gate
+as a hard prerequisite. The gate carries the source tip certified by the
+hydrated generation, and readiness requires exact equality with the canonical
+fence, avoiding both cross-tip admission and last-writer-wins races between
+independent background tasks.
 
-These three causes are documented in [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness). The corresponding metrics (`zinder_mempool_events_pruned_total`, `zinder_mempool_event_retention_oldest_sequence`, `zinder_mempool_snapshot_age_seconds`) are documented in the [Metrics table](../architecture/service-operations.md#metrics).
+`snapshot_age_millis` measures time since the current source generation's
+snapshot was certified, including for a certified empty mempool. It is not the
+age of the most recent transaction mutation. The matching histogram samples
+that age when a snapshot page is served. This in-place semantic correction
+raises `zinder_proto::CONTRACT_REVISION` to 4; native clients that expose this
+field require revision 4 so they cannot interpret the earlier mutation-age
+implementation as generation freshness.
 
 Cursor expiration on read is a hard stop, not a warning. A consumer whose `from_cursor` is below `oldest_retained_mempool_event_sequence` receives `MempoolCursorExpired` carrying the current floor, mapped to gRPC `FailedPrecondition` with a `PreconditionFailure` detail. The consumer must resnapshot, not retry the same cursor.
 

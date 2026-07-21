@@ -113,7 +113,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
-pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 3;
+pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 4;
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
@@ -2537,13 +2537,13 @@ mod tests {
     }
 
     #[test]
-    fn contract_revision_three_is_the_minimum() {
+    fn contract_revision_four_is_the_minimum() {
         assert!(matches!(
-            ensure_supported_contract_revision(2),
+            ensure_supported_contract_revision(3),
             Err(IndexerError::FailedPrecondition { .. })
         ));
-        assert!(ensure_supported_contract_revision(3).is_ok());
         assert!(ensure_supported_contract_revision(4).is_ok());
+        assert!(ensure_supported_contract_revision(5).is_ok());
     }
 
     #[test]

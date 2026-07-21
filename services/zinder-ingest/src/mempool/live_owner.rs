@@ -5,7 +5,12 @@
 //! the follower-owned canonical primary and are reached only through the
 //! canonical control channel.
 
-use std::{collections::HashMap, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    num::NonZeroU64,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use tokio::sync::Mutex;
@@ -37,6 +42,7 @@ use super::{
 const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
 const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
+const MEMPOOL_LIFECYCLE_STATUS_LABELS: &[&str] = &["hydrating", "serving", "rebuild_required"];
 /// Default raw transaction payload budget for one durable reconciliation append.
 pub const DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES: u64 = 16_000_000;
 
@@ -93,7 +99,10 @@ enum MempoolOwnerStatus {
     /// exposed until its completion marker arrives.
     Hydrating,
     /// The durable log and process-local index have a verified transition path.
-    Serving { source_tip: BlockId },
+    Serving {
+        source_tip: BlockId,
+        snapshot_certified_at: UnixTimestampMillis,
+    },
     /// A defensive post-append divergence was detected and the index must be reseeded.
     RebuildRequired,
 }
@@ -115,14 +124,16 @@ impl LiveMempoolOwner {
     /// Creates an empty live index backed by the configured canonical writer.
     #[must_use]
     pub fn new() -> Self {
-        Self {
+        let owner = Self {
             index: MempoolIndex::new(),
             reconciliation_batch_target_raw_transaction_bytes:
                 DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
             mutation_gate: Arc::new(Mutex::new(())),
             status: Arc::new(RwLock::new(MempoolOwnerStatus::Hydrating)),
             staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
-        }
+        };
+        record_mempool_lifecycle_status(MempoolOwnerStatus::Hydrating);
+        owner
     }
 
     /// Creates an empty live index with a custom raw transaction payload budget
@@ -131,14 +142,16 @@ impl LiveMempoolOwner {
     pub fn with_reconciliation_batch_target_raw_transaction_bytes(
         reconciliation_batch_target_raw_transaction_bytes: NonZeroU64,
     ) -> Self {
-        Self {
+        let owner = Self {
             index: MempoolIndex::new(),
             reconciliation_batch_target_raw_transaction_bytes:
                 reconciliation_batch_target_raw_transaction_bytes.get(),
             mutation_gate: Arc::new(Mutex::new(())),
             status: Arc::new(RwLock::new(MempoolOwnerStatus::Hydrating)),
             staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
-        }
+        };
+        record_mempool_lifecycle_status(MempoolOwnerStatus::Hydrating);
+        owner
     }
 
     /// Returns a durable/index consistency error while a source reseed is required.
@@ -155,10 +168,16 @@ impl LiveMempoolOwner {
         }
     }
 
-    fn coherent_source_tip_for(&self, chain_epoch: ChainEpoch) -> Result<BlockId, Status> {
+    fn coherent_serving_state_for(
+        &self,
+        chain_epoch: ChainEpoch,
+    ) -> Result<(BlockId, UnixTimestampMillis), Status> {
         let status = *self.status.read();
         match status {
-            MempoolOwnerStatus::Serving { source_tip } => {
+            MempoolOwnerStatus::Serving {
+                source_tip,
+                snapshot_certified_at,
+            } => {
                 let visible_tip =
                     BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
                 if source_tip != visible_tip {
@@ -166,7 +185,7 @@ impl LiveMempoolOwner {
                         "live mempool index is not coherent with the requested chain epoch",
                     ));
                 }
-                Ok(source_tip)
+                Ok((source_tip, snapshot_certified_at))
             }
             MempoolOwnerStatus::Hydrating => Err(Status::unavailable(
                 "live mempool index is hydrating from an upstream snapshot",
@@ -185,7 +204,7 @@ impl LiveMempoolOwner {
     ) -> Result<Option<Arc<MempoolEntry>>, Status> {
         self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
-        self.coherent_source_tip_for(chain_epoch)?;
+        self.coherent_serving_state_for(chain_epoch)?;
         Ok(self.index.entry_for(transaction_id))
     }
 
@@ -198,7 +217,7 @@ impl LiveMempoolOwner {
     ) -> Result<Vec<TransparentMempoolOutput>, Status> {
         self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
-        self.coherent_source_tip_for(chain_epoch)?;
+        self.coherent_serving_state_for(chain_epoch)?;
         Ok(self
             .index
             .transparent_outputs_by_address(address_script_hash, max_entries))
@@ -212,7 +231,7 @@ impl LiveMempoolOwner {
     ) -> Result<Vec<TransparentMempoolSpend>, Status> {
         self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
-        self.coherent_source_tip_for(chain_epoch)?;
+        self.coherent_serving_state_for(chain_epoch)?;
         Ok(outpoints
             .into_iter()
             .filter_map(|outpoint| self.index.transparent_spend_by_outpoint(outpoint))
@@ -227,7 +246,7 @@ impl LiveMempoolOwner {
     ) -> Result<Vec<TransparentOutputEntry>, Status> {
         self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
-        self.coherent_source_tip_for(chain_epoch)?;
+        self.coherent_serving_state_for(chain_epoch)?;
         Ok(self.index.transparent_outputs_by_outpoints(outpoints))
     }
 
@@ -241,7 +260,7 @@ impl LiveMempoolOwner {
     ) -> Result<LiveMempoolSnapshotPage, Status> {
         self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
-        let source_tip = self.coherent_source_tip_for(chain_epoch)?;
+        let (source_tip, snapshot_certified_at) = self.coherent_serving_state_for(chain_epoch)?;
         let start = canonical.begin_mempool_snapshot(from_cursor).await?;
         let snapshot = self
             .index
@@ -259,7 +278,9 @@ impl LiveMempoolOwner {
         };
         let snapshot_age_millis = UnixTimestampMillis::now()
             .value()
-            .saturating_sub(snapshot.last_updated_at.value());
+            .saturating_sub(snapshot_certified_at.value());
+        metrics::histogram!("zinder_mempool_snapshot_age_seconds")
+            .record(Duration::from_millis(snapshot_age_millis));
         Ok(LiveMempoolSnapshotPage {
             source_tip,
             entries: snapshot.entries,
@@ -513,13 +534,18 @@ impl LiveMempoolOwner {
     }
 
     fn mark_rebuild_required(&self) {
-        *self.status.write() = MempoolOwnerStatus::RebuildRequired;
+        self.set_status(MempoolOwnerStatus::RebuildRequired);
+    }
+
+    fn set_status(&self, status: MempoolOwnerStatus) {
+        *self.status.write() = status;
+        record_mempool_lifecycle_status(status);
     }
 
     async fn begin_hydration(&self) {
         let _mutation_guard = self.mutation_gate.lock().await;
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
-        *self.status.write() = MempoolOwnerStatus::Hydrating;
+        self.set_status(MempoolOwnerStatus::Hydrating);
     }
 
     pub(crate) async fn complete_hydration(
@@ -547,7 +573,10 @@ impl LiveMempoolOwner {
         })?;
         self.reconcile_staged_generation_locked(canonical, staged_generation)
             .await?;
-        *self.status.write() = MempoolOwnerStatus::Serving { source_tip };
+        self.set_status(MempoolOwnerStatus::Serving {
+            source_tip,
+            snapshot_certified_at: UnixTimestampMillis::now(),
+        });
         record_mempool_size_gauge(&self.index);
         Ok(())
     }
@@ -655,7 +684,7 @@ impl LiveMempoolOwner {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.index.reset();
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
-        *self.status.write() = MempoolOwnerStatus::Hydrating;
+        self.set_status(MempoolOwnerStatus::Hydrating);
         let mut after_cursor = None;
         loop {
             let page = canonical
@@ -777,7 +806,7 @@ async fn restore_durable_mempool_index(
         match owner.restore_durable_index(canonical).await {
             Ok(()) => return true,
             Err(status) => {
-                mempool_ready_signal.set_hydrating();
+                mempool_ready_signal.withdraw_certification();
                 tracing::warn!(
                     target: "zinder::ingest",
                     event = "mempool_durable_replay_failed",
@@ -799,8 +828,8 @@ async fn run_source_generation(
     mempool_ready_signal: &MempoolReadySignal,
     cancel: &CancellationToken,
 ) -> MempoolOwnerLoopOutcome {
+    mempool_ready_signal.withdraw_certification();
     owner.begin_hydration().await;
-    mempool_ready_signal.set_hydrating();
     if wait_for_canonical_epoch(canonical, cancel).await.is_none() {
         return MempoolOwnerLoopOutcome::Shutdown;
     }
@@ -860,7 +889,7 @@ async fn consume_source_events(
                         reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
                     };
                 }
-                mempool_ready_signal.set_ready();
+                mempool_ready_signal.certify_source_tip(source_tip);
                 tracing::info!(
                     target: "zinder::ingest",
                     event = "mempool_snapshot_complete",
@@ -909,8 +938,8 @@ async fn withdraw_and_wait_for_mempool_rebuild(
     cancel: &CancellationToken,
     reconnect_backoff: Duration,
 ) -> bool {
+    mempool_ready_signal.withdraw_certification();
     owner.withdraw_for_rebuild().await;
-    mempool_ready_signal.set_hydrating();
     tracing::error!(
         target: "zinder::ingest",
         event = "mempool_index_rebuild_required",
@@ -935,7 +964,11 @@ pub async fn run_mempool_retention(
         tokio::select! {
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(check_interval) => {
-                if let Err(status) = owner.prune_events(&canonical, UnixTimestampMillis::now(), retention).await {
+                let now = UnixTimestampMillis::now();
+                let started_at = Instant::now();
+                let retention_outcome = owner.prune_events(&canonical, now, retention).await;
+                record_mempool_retention_pass(started_at, now, &retention_outcome);
+                if let Err(status) = retention_outcome {
                     tracing::warn!(
                         target: "zinder::ingest",
                         event = "mempool_event_retention_failed",
@@ -1107,15 +1140,77 @@ fn record_mempool_size_gauge(index: &MempoolIndex) {
     metrics::gauge!("zinder_mempool_entries").set(index.entry_count() as f64);
 }
 
+fn record_mempool_lifecycle_status(status: MempoolOwnerStatus) {
+    let active_status = match status {
+        MempoolOwnerStatus::Hydrating => "hydrating",
+        MempoolOwnerStatus::Serving { .. } => "serving",
+        MempoolOwnerStatus::RebuildRequired => "rebuild_required",
+    };
+    for status_label in MEMPOOL_LIFECYCLE_STATUS_LABELS {
+        let sample = f64::from(u8::from(*status_label == active_status));
+        metrics::gauge!(
+            "zinder_mempool_lifecycle_state",
+            "status" => *status_label
+        )
+        .set(sample);
+    }
+}
+
+fn record_mempool_retention_pass(
+    started_at: Instant,
+    now: UnixTimestampMillis,
+    retention_outcome: &Result<MempoolEventRetentionReport, Status>,
+) {
+    let status = if retention_outcome.is_ok() {
+        "success"
+    } else {
+        "error"
+    };
+    metrics::histogram!(
+        "zinder_mempool_event_pruning_duration_seconds",
+        "status" => status
+    )
+    .record(started_at.elapsed());
+
+    let Ok(report) = retention_outcome else {
+        return;
+    };
+    for (kind, pruned_count) in [
+        ("added", report.pruned_added_count),
+        ("mined", report.pruned_mined_count),
+        ("invalidated", report.pruned_invalidated_count),
+    ] {
+        metrics::counter!("zinder_mempool_events_pruned_total", "kind" => kind)
+            .increment(pruned_count);
+    }
+    metrics::gauge!("zinder_mempool_events_retained").set(u64_to_f64(report.retained_event_count));
+    metrics::gauge!("zinder_mempool_event_retention_oldest_sequence")
+        .set(u64_to_f64(report.oldest_retained_sequence.unwrap_or(0)));
+    let oldest_retained_age_seconds = report.oldest_retained_observed_at.map_or(0, |observed_at| {
+        now.value().saturating_sub(observed_at.value()) / 1_000
+    });
+    metrics::gauge!("zinder_mempool_event_retention_oldest_age_seconds")
+        .set(u64_to_f64(oldest_retained_age_seconds));
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges accept f64 samples; retention counters are diagnostic."
+)]
+fn u64_to_f64(sample: u64) -> f64 {
+    sample as f64
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         error::Error,
         num::{NonZeroU32, NonZeroU64},
         sync::Arc,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use tokio_util::sync::CancellationToken;
     use tonic::Code;
     use zebra_chain::{
@@ -1138,8 +1233,54 @@ mod tests {
     };
 
     use super::{
-        LiveMempoolOwner, MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS, run_live_mempool_owner,
+        LiveMempoolOwner, MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS, MempoolOwnerStatus,
+        record_mempool_lifecycle_status, record_mempool_retention_pass, run_live_mempool_owner,
     };
+
+    #[test]
+    fn lifecycle_and_retention_metrics_publish_the_documented_contract() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let now = UnixTimestampMillis::now();
+        let retention_report = zinder_store::MempoolEventRetentionReport {
+            current_event_sequence: 12,
+            oldest_retained_sequence: Some(7),
+            oldest_retained_observed_at: Some(UnixTimestampMillis::new(
+                now.value().saturating_sub(5_000),
+            )),
+            retained_event_count: 6,
+            pruned_added_count: 1,
+            pruned_mined_count: 2,
+            pruned_invalidated_count: 3,
+        };
+
+        metrics::with_local_recorder(&recorder, || {
+            record_mempool_lifecycle_status(MempoolOwnerStatus::Serving {
+                source_tip: fixture_source_tip(),
+                snapshot_certified_at: now,
+            });
+            record_mempool_retention_pass(Instant::now(), now, &Ok(retention_report));
+        });
+
+        let exposition = handle.render();
+        for expected_sample in [
+            "zinder_mempool_lifecycle_state{status=\"hydrating\"} 0",
+            "zinder_mempool_lifecycle_state{status=\"serving\"} 1",
+            "zinder_mempool_lifecycle_state{status=\"rebuild_required\"} 0",
+            "zinder_mempool_events_pruned_total{kind=\"added\"} 1",
+            "zinder_mempool_events_pruned_total{kind=\"mined\"} 2",
+            "zinder_mempool_events_pruned_total{kind=\"invalidated\"} 3",
+            "zinder_mempool_events_retained 6",
+            "zinder_mempool_event_retention_oldest_sequence 7",
+            "zinder_mempool_event_retention_oldest_age_seconds 5",
+            "zinder_mempool_event_pruning_duration_seconds_count{status=\"success\"} 1",
+        ] {
+            assert!(
+                exposition.contains(expected_sample),
+                "missing `{expected_sample}` in metrics exposition:\n{exposition}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn snapshot_marker_with_a_different_source_tip_remains_private()
@@ -1242,6 +1383,37 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn snapshot_age_uses_source_generation_certification_even_when_empty()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let owner = LiveMempoolOwner::default();
+        owner.set_status(MempoolOwnerStatus::Serving {
+            source_tip: fixture_source_tip(),
+            snapshot_certified_at: UnixTimestampMillis::new(
+                UnixTimestampMillis::now().value().saturating_sub(5_000),
+            ),
+        });
+
+        let snapshot = owner
+            .snapshot_page(&canonical, chain_epoch, 8, Vec::new())
+            .await?;
+
+        assert!(snapshot.entries.is_empty());
+        assert!(snapshot.snapshot_age_millis >= 5_000);
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn source_snapshot_marker_hides_partial_hydration_and_reconnect_gap()
     -> Result<(), Box<dyn Error>> {
@@ -1303,7 +1475,7 @@ mod tests {
             owner.require_serving().err().map(|status| status.code()),
             Some(Code::Unavailable)
         );
-        assert!(!ready_gate.is_hydrated());
+        assert_eq!(ready_gate.certified_source_tip(), None);
 
         source_control.push_added(source_entry(0xA1)?)?;
         wait_for_staged_entries(owner, 1).await?;
@@ -1312,7 +1484,7 @@ mod tests {
             owner.require_serving().err().map(|status| status.code()),
             Some(Code::Unavailable)
         );
-        assert!(!ready_gate.is_hydrated());
+        assert_eq!(ready_gate.certified_source_tip(), None);
         assert!(
             canonical
                 .mempool_event_page(
@@ -1879,7 +2051,7 @@ mod tests {
         ready_gate: &super::super::MempoolReadyGate,
         expected: bool,
     ) -> Result<(), Box<dyn Error>> {
-        wait_until(|| ready_gate.is_hydrated() == expected).await
+        wait_until(|| ready_gate.certified_source_tip().is_some() == expected).await
     }
 
     async fn wait_until(mut condition: impl FnMut() -> bool) -> Result<(), Box<dyn Error>> {

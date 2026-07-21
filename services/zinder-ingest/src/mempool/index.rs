@@ -21,7 +21,6 @@ use thiserror::Error;
 use zinder_core::{
     MempoolEntry, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput,
     TransparentMempoolSpend, TransparentOutPoint, TransparentOutput, TransparentOutputEntry,
-    UnixTimestampMillis,
 };
 use zinder_store::{MempoolEvent, MempoolEventPosition};
 
@@ -88,8 +87,6 @@ pub struct MempoolSnapshotPage {
     pub entries: Vec<Arc<MempoolEntry>>,
     /// Last transaction id included in this page when more entries remain.
     pub next_after_transaction_id: Option<TransactionId>,
-    /// Last time this in-memory index observed an applied mempool state change.
-    pub last_updated_at: UnixTimestampMillis,
     /// Log position of the last event applied to the index, read atomically
     /// with the page entries. `None` before any event has been applied.
     pub last_applied_event: Option<MempoolEventPosition>,
@@ -101,7 +98,7 @@ pub struct MempoolIndex {
     state: Arc<RwLock<MempoolIndexState>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct MempoolIndexState {
     entries: BTreeMap<TransactionId, Arc<MempoolEntry>>,
     outputs_by_address: HashMap<
@@ -110,21 +107,7 @@ struct MempoolIndexState {
     >,
     output_by_outpoint: HashMap<TransparentOutPoint, TransparentMempoolOutput>,
     spend_by_outpoint: HashMap<TransparentOutPoint, TransactionId>,
-    last_updated_at: UnixTimestampMillis,
     last_applied_event: Option<MempoolEventPosition>,
-}
-
-impl Default for MempoolIndexState {
-    fn default() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-            outputs_by_address: HashMap::new(),
-            output_by_outpoint: HashMap::new(),
-            spend_by_outpoint: HashMap::new(),
-            last_updated_at: UnixTimestampMillis::now(),
-            last_applied_event: None,
-        }
-    }
 }
 
 impl MempoolIndex {
@@ -219,7 +202,6 @@ impl MempoolIndex {
             Entry::Vacant(slot) => Arc::clone(slot.insert(Arc::new(entry))),
         };
         index_secondary_overlays(&mut state, inserted_entry.as_ref());
-        state.last_updated_at = UnixTimestampMillis::now();
         drop(state);
         MempoolApplyOutcome::Applied
     }
@@ -259,7 +241,6 @@ impl MempoolIndex {
             return MempoolApplyOutcome::NoChange;
         };
         unindex_secondary_overlays(&mut state, removed_entry.as_ref());
-        state.last_updated_at = UnixTimestampMillis::now();
         drop(state);
         MempoolApplyOutcome::Applied
     }
@@ -382,7 +363,6 @@ impl MempoolIndex {
         after_transaction_id: Option<TransactionId>,
     ) -> MempoolSnapshotPage {
         let state = self.state.read();
-        let last_updated_at = state.last_updated_at;
         let last_applied_event = state.last_applied_event;
         let bound = u32_to_usize(max_entries);
         let mut entries = after_transaction_id.map_or_else(
@@ -415,7 +395,6 @@ impl MempoolIndex {
         MempoolSnapshotPage {
             entries,
             next_after_transaction_id,
-            last_updated_at,
             last_applied_event,
         }
     }

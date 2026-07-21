@@ -369,7 +369,7 @@ Every `explorer.*` capability is served by the explorer plane itself; clients re
 Every explorer response embeds `ExplorerFreshness` at field tag 1. The shape and rationale live in [ADR-0011](../adrs/0011-explorer-freshness-envelope.md). The key fields:
 
 - `chain_view`: the cross-plane chain-state envelope (chain epoch, the `{role}_tip` axes, materialized-view status). Identifies the snapshot the response was produced from. The upstream tip rides on `chain_view.upstream_tip`; the materialized-view replay ceiling on `chain_view.indexed_tip`. Index lag is `chain_view.chain_epoch.visible_tip.height - chain_view.indexed_tip.tip.height`.
-- `snapshot_age_millis`: age of the mempool snapshot, when the response touches mempool state.
+- `snapshot_age_millis`: milliseconds since the current mempool source generation was certified, including a certified empty mempool; zero when the response does not touch mempool state.
 - `capability_version`: exact capability string that produced the response.
 - `unavailable`: repeated `UnavailableField` entries declaring specific field paths absent with structured reasons.
 

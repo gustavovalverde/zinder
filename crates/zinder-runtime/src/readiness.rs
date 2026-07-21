@@ -382,11 +382,7 @@ impl ReadinessCause {
     pub const fn permits_traffic(&self) -> bool {
         matches!(
             self,
-            Self::Ready
-                | Self::CursorAtRisk { .. }
-                | Self::MempoolCursorAtRisk { .. }
-                | Self::MempoolSourceUnavailable
-                | Self::MempoolHydrationLagging { .. }
+            Self::Ready | Self::CursorAtRisk { .. } | Self::MempoolCursorAtRisk { .. }
         )
     }
 
@@ -1171,8 +1167,6 @@ mod tests {
         let warning_states = [
             ReadinessState::cursor_at_risk(145, 168, Some(100)),
             ReadinessState::mempool_cursor_at_risk(49, 60, Some(100)),
-            ReadinessState::mempool_source_unavailable(Some(100)),
-            ReadinessState::mempool_hydration_lagging(3, Some(100)),
         ];
 
         for state in warning_states {
@@ -1182,6 +1176,18 @@ mod tests {
                 "warning cause {:?} must not fail traffic readiness",
                 report.cause
             );
+            assert_eq!(report.current_height, Some(100));
+        }
+    }
+
+    #[test]
+    fn mempool_availability_causes_block_traffic() {
+        for state in [
+            ReadinessState::mempool_source_unavailable(Some(100)),
+            ReadinessState::mempool_hydration_lagging(3, Some(100)),
+        ] {
+            let report = Readiness::new(state).report();
+            assert!(!report.is_ready);
             assert_eq!(report.current_height, Some(100));
         }
     }

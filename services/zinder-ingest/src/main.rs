@@ -473,11 +473,32 @@ async fn run_supervised_canonical_writer(
                 };
                 Err(zinder_ingest::CanonicalWriterError::ControlServer { reason })
             }
+            mempool_owner_result = await_mempool_owner_exit(&mut control_tasks.mempool_owner) => {
+                let _completed_owner_task = control_tasks.mempool_owner.take();
+                if cancel.is_cancelled() {
+                    return writer.await.map(drop);
+                }
+                cancel.cancel();
+                let reason = match mempool_owner_result {
+                    Ok(()) => "live mempool owner stopped unexpectedly".to_owned(),
+                    Err(join_error) => join_error.to_string(),
+                };
+                Err(zinder_ingest::CanonicalWriterError::MempoolOwner { reason })
+            }
         }
     } else {
         writer.await
     };
     writer_result.map(drop)
+}
+
+async fn await_mempool_owner_exit(
+    mempool_owner: &mut Option<JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    match mempool_owner {
+        Some(mempool_owner) => mempool_owner.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn coordinate_canonical_writer_lifecycle<DrainWorkers, ShutdownOps>(

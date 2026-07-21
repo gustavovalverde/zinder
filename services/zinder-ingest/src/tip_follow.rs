@@ -281,7 +281,10 @@ where
             Ok(lag_state) => lag_state,
             Err(error) => break Err(error),
         };
-        set_tip_follow_readiness(readiness, lag_state, mempool_ready_gate);
+        let canonical_tip = store.current_chain_epoch()?.map(|chain_epoch| {
+            BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash)
+        });
+        set_tip_follow_readiness(readiness, lag_state, canonical_tip, mempool_ready_gate);
 
         let store_tip = current_chain_height(&store);
         if reached_target_height(config.target_height, store_tip) {
@@ -385,10 +388,12 @@ fn start_chain_tip_notification_wakeup(
 fn set_tip_follow_readiness(
     readiness: &Readiness,
     lag_state: ReadinessState,
+    canonical_tip: Option<BlockId>,
     mempool_ready_gate: Option<&MempoolReadyGate>,
 ) {
     let gated_state = if matches!(lag_state.cause, ReadinessCause::Ready)
-        && mempool_ready_gate.is_some_and(|gate| !gate.is_hydrated())
+        && mempool_ready_gate
+            .is_some_and(|gate| !canonical_tip.is_some_and(|tip| gate.admits_canonical_tip(tip)))
     {
         ReadinessState::syncing(None, lag_state.current_height, lag_state.target_height)
     } else {
@@ -1148,6 +1153,7 @@ mod tests {
             set_tip_follow_readiness(
                 &readiness,
                 ReadinessState::ready_with_target(Some(120), Some(121)),
+                None,
                 None,
             );
 

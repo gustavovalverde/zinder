@@ -10,7 +10,7 @@ use zinder_core::{
     CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, NetworkUpgradeActivations,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
-use zinder_runtime::{IngestPhase, Readiness, ReadinessState};
+use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{
     CanonicalAppendAnchor, CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalLiveAppend,
@@ -394,15 +394,28 @@ where
             return Ok(store);
         }
 
-        let prepared = match prepare_follow_iteration(
-            &store,
-            follower.source,
-            Arc::clone(&follower.network_upgrade_activations),
-            follower.config.clone(),
-            follower.cancel,
+        let Some(prepared) = await_follow_preparation_or_mempool_change(
+            prepare_follow_iteration(
+                &store,
+                follower.source,
+                Arc::clone(&follower.network_upgrade_activations),
+                follower.config.clone(),
+                follower.cancel,
+            ),
+            &mut mempool_hydration_changes,
+            follower.config.mempool_ready_gate.as_ref(),
+            follower.readiness,
+            store.event_fence().visible_tip(),
         )
         .await
-        {
+        else {
+            // Source preparation is read-only, so dropping it on a mempool
+            // lifecycle transition preserves the admitted canonical fence.
+            // Restarting the loop requires a fresh source-tip observation
+            // before either subsystem can publish Ready again.
+            continue;
+        };
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(CanonicalFollowError::Source(source_error)) => {
                 if follower
@@ -453,15 +466,12 @@ where
                     let control_channel_closed = tokio::select! {
                         () = follower.cancel.cancelled() => return Ok(store),
                         hydration_changed = wait_for_mempool_hydration_change(&mut mempool_hydration_changes) => {
-                            if !hydration_changed {
-                                mempool_hydration_changes = None;
-                            }
-                            set_follow_readiness(
+                            apply_mempool_hydration_change(
+                                hydration_changed,
+                                &mut mempool_hydration_changes,
                                 follower.readiness,
-                                &store,
-                                observed_tip,
-                                follower.config.lag_threshold_blocks,
                                 follower.config.mempool_ready_gate.as_ref(),
+                                store.event_fence().visible_tip(),
                             );
                             false
                         }
@@ -480,15 +490,12 @@ where
                     tokio::select! {
                         () = follower.cancel.cancelled() => return Ok(store),
                         hydration_changed = wait_for_mempool_hydration_change(&mut mempool_hydration_changes) => {
-                            if !hydration_changed {
-                                mempool_hydration_changes = None;
-                            }
-                            set_follow_readiness(
+                            apply_mempool_hydration_change(
+                                hydration_changed,
+                                &mut mempool_hydration_changes,
                                 follower.readiness,
-                                &store,
-                                observed_tip,
-                                follower.config.lag_threshold_blocks,
                                 follower.config.mempool_ready_gate.as_ref(),
+                                store.event_fence().visible_tip(),
                             );
                         }
                         () = tokio::time::sleep(follower.config.poll_interval) => {}
@@ -1000,6 +1007,42 @@ async fn source_request<T>(
     }
 }
 
+async fn await_follow_preparation_or_mempool_change<T>(
+    preparation: impl Future<Output = T>,
+    mempool_hydration_changes: &mut Option<MempoolReadyGate>,
+    mempool_ready_gate: Option<&MempoolReadyGate>,
+    readiness: &Readiness,
+    canonical_tip: BlockId,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        hydration_changed = wait_for_mempool_hydration_change(mempool_hydration_changes) => {
+            apply_mempool_hydration_change(
+                hydration_changed,
+                mempool_hydration_changes,
+                readiness,
+                mempool_ready_gate,
+                canonical_tip,
+            );
+            None
+        }
+        prepared = preparation => Some(prepared),
+    }
+}
+
+fn apply_mempool_hydration_change(
+    hydration_changed: bool,
+    mempool_hydration_changes: &mut Option<MempoolReadyGate>,
+    readiness: &Readiness,
+    mempool_ready_gate: Option<&MempoolReadyGate>,
+    canonical_tip: BlockId,
+) {
+    if !hydration_changed {
+        *mempool_hydration_changes = None;
+    }
+    withdraw_follow_readiness_for_mempool_hydration(readiness, canonical_tip, mempool_ready_gate);
+}
+
 fn set_follow_readiness(
     readiness: &Readiness,
     store: &RocksDbCanonicalStore,
@@ -1032,21 +1075,42 @@ fn set_follow_readiness(
             .value()
             .saturating_sub(store.event_fence().visible_tip().height.value()),
     ));
-    let state = gate_canonical_readiness_on_mempool_hydration(state, mempool_ready_gate);
+    let state = gate_canonical_readiness_on_mempool_hydration(
+        state,
+        store.event_fence().visible_tip(),
+        mempool_ready_gate,
+    );
     readiness.set(state.with_phase(IngestPhase::FollowingTip));
 }
 
 fn gate_canonical_readiness_on_mempool_hydration(
     state: ReadinessState,
+    canonical_tip: BlockId,
     mempool_ready_gate: Option<&MempoolReadyGate>,
 ) -> ReadinessState {
     if matches!(&state.cause, zinder_runtime::ReadinessCause::Ready)
-        && mempool_ready_gate.is_some_and(|gate| !gate.is_hydrated())
+        && mempool_ready_gate.is_some_and(|gate| !gate.admits_canonical_tip(canonical_tip))
     {
         ReadinessState::syncing(None, state.current_height, state.target_height)
     } else {
         state
     }
+}
+
+fn withdraw_follow_readiness_for_mempool_hydration(
+    readiness: &Readiness,
+    canonical_tip: BlockId,
+    mempool_ready_gate: Option<&MempoolReadyGate>,
+) {
+    if mempool_ready_gate.is_none_or(|gate| gate.admits_canonical_tip(canonical_tip)) {
+        return;
+    }
+
+    readiness.update(|state| {
+        if state.cause.permits_traffic() {
+            state.cause = ReadinessCause::Syncing { lag_blocks: None };
+        }
+    });
 }
 
 async fn wait_for_mempool_hydration_change(
@@ -1081,25 +1145,37 @@ mod tests {
     use std::{num::NonZeroU32, time::Duration};
 
     use zinder_core::{
-        BlockHeight, ChainTipMetadata, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootIndex,
-        SubtreeRootRange,
+        BlockHash, BlockHeight, BlockId, ChainTipMetadata, SUBTREE_LEAF_COUNT, ShieldedProtocol,
+        SubtreeRootIndex, SubtreeRootRange,
     };
 
     use super::{
-        gate_canonical_readiness_on_mempool_hydration, live_subtree_root_ranges,
-        next_settled_height, wait_for_mempool_hydration_change,
+        await_follow_preparation_or_mempool_change, gate_canonical_readiness_on_mempool_hydration,
+        live_subtree_root_ranges, next_settled_height, wait_for_mempool_hydration_change,
+        withdraw_follow_readiness_for_mempool_hydration,
     };
     use crate::mempool_ready_channel;
-    use zinder_runtime::{ReadinessCause, ReadinessState};
+    use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
+
+    fn block_id(height: u32, hash_tag: u8) -> BlockId {
+        BlockId::new(
+            BlockHeight::new(height),
+            BlockHash::from_bytes([hash_tag; 32]),
+        )
+    }
 
     #[test]
     fn hydration_marker_does_not_make_a_syncing_canonical_writer_ready() {
         let (signal, gate) = mempool_ready_channel();
-        signal.set_hydrating();
+        signal.withdraw_certification();
         let canonical_syncing = ReadinessState::syncing(Some(3), Some(100), Some(103));
+        let canonical_tip = block_id(100, 1);
 
-        let while_hydrating =
-            gate_canonical_readiness_on_mempool_hydration(canonical_syncing.clone(), Some(&gate));
+        let while_hydrating = gate_canonical_readiness_on_mempool_hydration(
+            canonical_syncing.clone(),
+            canonical_tip,
+            Some(&gate),
+        );
         assert!(matches!(
             &while_hydrating.cause,
             ReadinessCause::Syncing {
@@ -1108,9 +1184,12 @@ mod tests {
         ));
         assert!(!while_hydrating.cause.permits_traffic());
 
-        signal.set_ready();
-        let after_marker =
-            gate_canonical_readiness_on_mempool_hydration(canonical_syncing, Some(&gate));
+        signal.certify_source_tip(canonical_tip);
+        let after_marker = gate_canonical_readiness_on_mempool_hydration(
+            canonical_syncing,
+            canonical_tip,
+            Some(&gate),
+        );
         assert!(matches!(
             &after_marker.cause,
             ReadinessCause::Syncing {
@@ -1121,30 +1200,137 @@ mod tests {
     }
 
     #[test]
-    fn canonical_ready_requires_current_mempool_hydration() {
+    fn canonical_ready_requires_a_mempool_generation_certified_at_its_exact_tip() {
         let (signal, gate) = mempool_ready_channel();
         let canonical_ready = ReadinessState::ready_with_target(Some(100), Some(100));
+        let canonical_tip = block_id(100, 2);
 
-        let while_hydrating =
-            gate_canonical_readiness_on_mempool_hydration(canonical_ready.clone(), Some(&gate));
+        let while_hydrating = gate_canonical_readiness_on_mempool_hydration(
+            canonical_ready.clone(),
+            canonical_tip,
+            Some(&gate),
+        );
         assert!(matches!(
             &while_hydrating.cause,
             ReadinessCause::Syncing { .. }
         ));
         assert!(!while_hydrating.cause.permits_traffic());
 
-        signal.set_ready();
-        let after_marker =
-            gate_canonical_readiness_on_mempool_hydration(canonical_ready, Some(&gate));
-        assert!(matches!(&after_marker.cause, ReadinessCause::Ready));
-        assert!(after_marker.cause.permits_traffic());
+        signal.certify_source_tip(block_id(99, 1));
+        let after_stale_marker = gate_canonical_readiness_on_mempool_hydration(
+            canonical_ready.clone(),
+            canonical_tip,
+            Some(&gate),
+        );
+        assert!(matches!(
+            &after_stale_marker.cause,
+            ReadinessCause::Syncing { .. }
+        ));
+
+        signal.certify_source_tip(canonical_tip);
+        let after_current_marker = gate_canonical_readiness_on_mempool_hydration(
+            canonical_ready,
+            canonical_tip,
+            Some(&gate),
+        );
+        assert!(matches!(&after_current_marker.cause, ReadinessCause::Ready));
+        assert!(after_current_marker.cause.permits_traffic());
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn hydration_watch_withdraws_and_restamps_ready_without_waiting_for_a_poll() {
+    async fn hydration_withdrawal_cancels_inflight_preparation_and_requires_fresh_observation() {
+        let (signal, gate) = mempool_ready_channel();
+        let mut hydration_changes = Some(gate.clone());
+        let canonical_tip = block_id(100, 1);
+        signal.certify_source_tip(canonical_tip);
+        assert!(wait_for_mempool_hydration_change(&mut hydration_changes).await);
+        let readiness = Readiness::new(
+            ReadinessState::ready_with_target(Some(100), Some(100))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        let (preparation_sender, preparation_receiver) = tokio::sync::oneshot::channel::<()>();
+
+        let (preparation_outcome, ()) = tokio::join!(
+            await_follow_preparation_or_mempool_change(
+                preparation_receiver,
+                &mut hydration_changes,
+                Some(&gate),
+                &readiness,
+                canonical_tip,
+            ),
+            async {
+                tokio::task::yield_now().await;
+                signal.withdraw_certification();
+            },
+        );
+
+        assert!(preparation_outcome.is_none());
+        assert!(
+            preparation_sender.send(()).is_err(),
+            "the read-only canonical preparation must be dropped on withdrawal"
+        );
+        let withdrawn = readiness.report();
+        assert!(matches!(
+            withdrawn.cause,
+            ReadinessCause::Syncing { lag_blocks: None }
+        ));
+        assert_eq!(withdrawn.current_height, Some(100));
+        assert_eq!(withdrawn.target_height, Some(100));
+        assert_eq!(withdrawn.phase, Some(IngestPhase::FollowingTip));
+
+        signal.certify_source_tip(canonical_tip);
+        let interrupted_by_rehydration = await_follow_preparation_or_mempool_change(
+            std::future::ready(()),
+            &mut hydration_changes,
+            Some(&gate),
+            &readiness,
+            canonical_tip,
+        )
+        .await;
+
+        assert!(
+            interrupted_by_rehydration.is_none(),
+            "snapshot completion must restart canonical observation instead of restoring stale Ready"
+        );
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::Syncing { .. }
+        ));
+
+        let fresh_observation = await_follow_preparation_or_mempool_change(
+            std::future::ready(()),
+            &mut hydration_changes,
+            Some(&gate),
+            &readiness,
+            canonical_tip,
+        )
+        .await;
+        assert!(fresh_observation.is_some());
+    }
+
+    #[test]
+    fn hydration_withdrawal_preserves_canonical_non_ready_authority() {
+        let (_signal, gate) = mempool_ready_channel();
+        let canonical_syncing = ReadinessState::syncing(Some(3), Some(100), Some(103))
+            .with_phase(IngestPhase::FollowingTip);
+        let readiness = Readiness::new(canonical_syncing.clone());
+        let canonical_tip = block_id(100, 1);
+
+        withdraw_follow_readiness_for_mempool_hydration(&readiness, canonical_tip, Some(&gate));
+
+        let report = readiness.report();
+        assert_eq!(report.cause, canonical_syncing.cause);
+        assert_eq!(report.current_height, canonical_syncing.current_height);
+        assert_eq!(report.target_height, canonical_syncing.target_height);
+        assert_eq!(report.phase, canonical_syncing.phase);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hydration_watch_interrupts_at_tip_wait_on_each_transition() {
         let (signal, gate) = mempool_ready_channel();
         let canonical_ready = ReadinessState::ready_with_target(Some(100), Some(100));
-        signal.set_ready();
+        let canonical_tip = block_id(100, 1);
+        signal.certify_source_tip(canonical_tip);
 
         let (withdraw_sender, withdraw_receiver) = tokio::sync::oneshot::channel();
         let mut hydration_changes = Some(gate.clone());
@@ -1156,7 +1342,7 @@ mod tests {
             let _ = withdraw_sender.send(woke_for_hydration_change);
         });
         tokio::task::yield_now().await;
-        signal.set_hydrating();
+        signal.withdraw_certification();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), withdraw_receiver)
                 .await
@@ -1165,31 +1351,41 @@ mod tests {
             Some(true),
             "a reconnect must interrupt the at-tip wait instead of waiting for the poll delay"
         );
-        let withdrawn =
-            gate_canonical_readiness_on_mempool_hydration(canonical_ready.clone(), Some(&gate));
+        let withdrawn = gate_canonical_readiness_on_mempool_hydration(
+            canonical_ready.clone(),
+            canonical_tip,
+            Some(&gate),
+        );
         assert!(matches!(&withdrawn.cause, ReadinessCause::Syncing { .. }));
 
-        let (restamp_sender, restamp_receiver) = tokio::sync::oneshot::channel();
+        let (rehydration_sender, rehydration_receiver) = tokio::sync::oneshot::channel();
         let mut hydration_changes = Some(gate.clone());
         tokio::spawn(async move {
             let woke_for_hydration_change = tokio::select! {
                 changed = wait_for_mempool_hydration_change(&mut hydration_changes) => changed,
                 () = std::future::pending::<()>() => false,
             };
-            let _ = restamp_sender.send(woke_for_hydration_change);
+            let _ = rehydration_sender.send(woke_for_hydration_change);
         });
         tokio::task::yield_now().await;
-        signal.set_ready();
+        signal.certify_source_tip(canonical_tip);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), restamp_receiver)
+            tokio::time::timeout(Duration::from_secs(1), rehydration_receiver)
                 .await
                 .ok()
                 .and_then(Result::ok),
             Some(true),
-            "snapshot completion must restamp readiness without waiting for the poll delay"
+            "snapshot completion must interrupt the wait so canonical state is observed again"
         );
-        let restamped = gate_canonical_readiness_on_mempool_hydration(canonical_ready, Some(&gate));
-        assert!(matches!(&restamped.cause, ReadinessCause::Ready));
+        let after_fresh_observation = gate_canonical_readiness_on_mempool_hydration(
+            canonical_ready,
+            canonical_tip,
+            Some(&gate),
+        );
+        assert!(matches!(
+            &after_fresh_observation.cause,
+            ReadinessCause::Ready
+        ));
     }
 
     #[test]

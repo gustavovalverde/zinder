@@ -216,7 +216,7 @@ pub struct MempoolSnapshotView {
     /// subscribes with [`EventStreamStart::EarliestRetained`]. Replaying from
     /// it yields at-least-once delivery; consumers apply events idempotently.
     pub events_resume_cursor: Option<MempoolEventCursor>,
-    /// Snapshot age in milliseconds when the response was constructed.
+    /// Milliseconds since the current source generation's snapshot was certified.
     pub snapshot_age_millis: u64,
     /// Hydrated mempool entries.
     pub entries: Vec<MempoolEntry>,

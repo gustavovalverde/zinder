@@ -1134,7 +1134,6 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
     let decoded = round_trip(&server_info)?;
 
     assert_eq!(decoded.contract_revision, zinder_proto::CONTRACT_REVISION);
-    assert_eq!(decoded.contract_revision, 3);
     assert_eq!(
         decoded.build_git_commit,
         "0123456789abcdef0123456789abcdef01234567"

@@ -91,8 +91,8 @@ async fn verify_server_info(
     assert_eq!(common.service_name, "zinder-query");
     assert_eq!(common.network, expected_network);
     assert!(
-        common.contract_revision >= 3,
-        "native contract revision must be at least 3, got {}",
+        common.contract_revision >= 4,
+        "native contract revision must be at least 4, got {}",
         common.contract_revision
     );
     for required_capability in [
