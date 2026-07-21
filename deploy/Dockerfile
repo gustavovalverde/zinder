@@ -6,6 +6,7 @@
 #
 #     docker build -f deploy/Dockerfile --target zinder-ingest -t zinder-ingest .
 #     docker build -f deploy/Dockerfile --target zinder-projector -t zinder-projector .
+#     docker build -f deploy/Dockerfile --target zinder-query -t zinder-query .
 #     docker build -f deploy/Dockerfile --target zinder-compat-lightwalletd -t zinder-compat-lightwalletd .
 #     docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench .
 #     docker build -f deploy/Dockerfile --target zinder-ingest-live-tests -t zinder-ingest-live-tests .
@@ -68,11 +69,13 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && cargo build --locked --release \
         --bin zinder-ingest \
         --bin zinder-projector \
+        --bin zinder-query \
         --bin zinder-compat-lightwalletd \
         --bin zinder-bench \
     && mkdir -p /zinder-binaries \
     && cp /workspace/target/release/zinder-ingest /zinder-binaries/zinder-ingest \
     && cp /workspace/target/release/zinder-projector /zinder-binaries/zinder-projector \
+    && cp /workspace/target/release/zinder-query /zinder-binaries/zinder-query \
     && cp /workspace/target/release/zinder-compat-lightwalletd /zinder-binaries/zinder-compat-lightwalletd \
     && cp /workspace/target/release/zinder-bench /zinder-binaries/zinder-bench
 
@@ -142,6 +145,20 @@ USER zinder:zinder
 WORKDIR /var/lib/zinder
 
 ENTRYPOINT ["zinder-ingest-acceptance"]
+
+FROM zinder-runtime-base AS zinder-query
+
+COPY --from=zinder-binaries /zinder-binaries/zinder-query /usr/local/bin/zinder-query
+
+USER zinder:zinder
+WORKDIR /var/lib/zinder
+
+EXPOSE 9102 9106
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS http://localhost:9106/readyz || exit 1
+
+ENTRYPOINT ["zinder-query"]
 
 FROM zinder-runtime-base AS zinder-compat-lightwalletd
 

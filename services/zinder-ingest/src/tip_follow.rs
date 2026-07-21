@@ -1,7 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use futures_util::stream::StreamExt;
-use prost::Message;
 use std::time::Instant;
 use tokio::{
     sync::mpsc::{self, error::TrySendError},
@@ -12,7 +11,6 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata,
     Network, NetworkUpgradeActivations, TreeStateArtifact,
 };
-use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 
 use zinder_runtime::{NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessState};
 use zinder_source::{
@@ -864,11 +862,7 @@ fn tip_metadata_at(
     let compact_block = reader
         .compact_block_at(height)?
         .ok_or(IngestError::TipFollowParentMetadataUnavailable { height })?;
-    let compact_block = LightwalletdCompactBlock::decode(compact_block.payload_bytes.as_slice())
-        .map_err(|_| IngestError::TipFollowParentMetadataUnavailable { height })?;
-    let chain_metadata = compact_block
-        .chain_metadata
-        .ok_or(IngestError::TipFollowParentMetadataUnavailable { height })?;
+    let chain_metadata = compact_block.chain_metadata();
 
     Ok(ChainTipMetadata::new(
         chain_metadata.sapling_commitment_tree_size,
@@ -994,6 +988,7 @@ async fn populate_tip_follow_tree_state_artifacts<Source>(
             batch.push_tree_state_checkpoint(TreeStateArtifact::new(
                 source_tree_state.block_id.height,
                 source_tree_state.block_id.hash,
+                source_tree_state.block_time_seconds,
                 source_tree_state.payload_bytes,
             ));
         }
@@ -1099,9 +1094,9 @@ mod tests {
     use parking_lot::Mutex;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, SubtreeRootHash, SubtreeRootIndex,
+        BlockFinalNoteCommitmentRoots, CompactBlockArtifact, CompactChainMetadata,
+        FinalNoteCommitmentRoot, SubtreeRootHash, SubtreeRootIndex,
     };
-    use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_runtime::{IngestPhase, ReadinessCause};
     use zinder_source::{
         ChainTipNotification, ChainTipNotificationStream, NodeCapabilities, SourceBlockHeader,
@@ -1649,16 +1644,16 @@ mod tests {
                 transaction_blobs: Vec::new(),
             },
             facts,
-            partial_compact_block: LightwalletdCompactBlock {
-                height: u64::from(source_block.height.value()),
-                hash: zinder_core::wire::encode_internal_block_hash(source_block.hash).to_vec(),
-                prev_hash: zinder_core::wire::encode_internal_block_hash(source_block.parent_hash)
-                    .to_vec(),
-                time: source_block.block_time_seconds,
-                header: Vec::new(),
-                vtx: Vec::new(),
-                chain_metadata: None,
-            },
+            partial_compact_block: CompactBlockArtifact::empty(
+                BlockId::new(source_block.height, source_block.hash),
+                source_block.parent_hash,
+                source_block.block_time_seconds,
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            ),
             tree_size_additions: CommitmentTreeSizes::default(),
         })
     }
@@ -1808,6 +1803,13 @@ mod tests {
             &self,
             block_id: BlockId,
         ) -> Result<SourceTreeState, SourceError> {
+            let block = self.fetch_block_at(block_id.height).await?;
+            if block.hash != block_id.hash {
+                return Err(SourceError::BlockUnavailable {
+                    height: block_id.height,
+                    reason: "test block hash does not match requested tree state".to_owned(),
+                });
+            }
             Ok(SourceTreeState::with_final_note_commitment_roots(
                 BlockFinalNoteCommitmentRoots::new(
                     block_id.height,
@@ -1818,6 +1820,7 @@ mod tests {
                     None,
                     None,
                 ),
+                block.block_time_seconds,
                 format!("tree-state-{}", block_id.height.value()).into_bytes(),
             ))
         }

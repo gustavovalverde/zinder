@@ -5,4 +5,5 @@
 
 mod common;
 mod integration;
+mod live;
 mod perf;

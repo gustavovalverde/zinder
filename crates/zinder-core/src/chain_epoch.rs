@@ -233,10 +233,8 @@ pub struct ChainEpoch {
     pub visible_tip_height: BlockHeight,
     /// Best visible tip hash for this chain epoch.
     pub visible_tip_hash: BlockHash,
-    /// Reorg-window scan ceiling: the highest height for which both
-    /// compact-block and commitment-tree artifacts are coherent past the
-    /// reorg window. The wallet uses this as its scan ceiling; see ADR-0005
-    /// in the zally repo.
+    /// Reorg-window finality watermark. Wallets scan through `visible_tip_height`
+    /// under the pinned epoch and use this lower height for settlement-sensitive policy.
     pub settled_tip_height: BlockHeight,
     /// Block hash at `settled_tip_height`.
     pub settled_tip_hash: BlockHash,

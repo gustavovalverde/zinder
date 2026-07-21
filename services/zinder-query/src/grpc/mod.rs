@@ -14,26 +14,25 @@ use crate::QueryError;
 
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
-    ServerInfoSettings, UpstreamNodeCapabilities, address_lookup_to_script_hash,
-    block_header_by_selector_response, block_id_by_selector_response,
-    broadcast_transaction_response, build_transparent_address_tx_ids_chunk,
-    build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
-    build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
-    compact_block_response, full_block_response, latest_tree_state_checkpoint_response,
-    network_upgrade_activations_response, subtree_roots_response, transaction_response,
-    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
-    visible_tip_block_response,
+    ServerInfoSettings, UpstreamNodeCapabilities, WalletCapabilityProfile,
+    address_lookup_to_script_hash, block_header_by_selector_response,
+    block_id_by_selector_response, broadcast_transaction_response,
+    build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
+    build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
+    build_wallet_server_info, chain_events_response, compact_block_response, full_block_response,
+    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
+    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
+    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
+    tree_state_at_response, visible_tip_block_response, wallet_capability_strings,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
 /// from [`Public Interfaces §Error Conventions`](../../../docs/architecture/public-interfaces.md#error-conventions).
 ///
 /// This is the single source of truth for `QueryError` to gRPC translation.
-/// Both [`WalletQueryGrpcAdapter`] (native surface) and the lightwalletd
-/// compatibility adapter call into this function instead of duplicating the
-/// mapping. The reason comes from [`QueryError::error_reason`] and the code
+/// The native [`WalletQueryGrpcAdapter`] calls this function instead of
+/// duplicating the mapping. The reason comes from [`QueryError::error_reason`] and the code
 /// from the shared reason policy; this function attaches the typed
 /// `BadRequest`/`PreconditionFailure`/`ResourceInfo` detail per variant.
 #[must_use]

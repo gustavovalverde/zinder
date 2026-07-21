@@ -20,21 +20,26 @@ flowchart LR
     Projector --> Wallet[("Wallet RocksDB\nwallet query state")]
     Canonical --> Pair["Exact-fence admission"]
     Wallet --> Pair
+    Pair --> Query["zinder-query\nWalletQuery"]
     Pair --> Compat["zinder-compat-lightwalletd"]
+    Query --> Zally["Native clients such as Zally"]
     Compat --> Wallets["Wallet clients"]
 ```
 
-The release composition has three runtimes:
+The release composition has four runtimes:
 
 | Runtime | Durable ownership | Read ownership |
 | --- | --- | --- |
 | `zinder-ingest` | Canonical RocksDB and live mempool state | Zebra source observations |
 | `zinder-projector` | Wallet RocksDB | Canonical RocksDB secondary and the writer control API |
+| `zinder-query` | None | Immutable canonical and wallet secondary pairs |
 | `zinder-compat-lightwalletd` | None | Immutable canonical and wallet secondary pairs |
 
-`zinder-query` is the Rust query contract used by compatibility adapters. It is
-not a release runtime. `zinder-explorer` and `zinder-compat-cipherscan` remain
-optional workspace services and are not part of the release composition.
+`zinder-query` serves the native `zinder.v1.wallet.WalletQuery` protocol.
+`zinder-compat-lightwalletd` independently translates the compatibility
+protocol; neither replaces the other. `zinder-explorer` and
+`zinder-compat-cipherscan` remain optional workspace services and are not part
+of the release composition.
 
 ## Canonical storage
 
@@ -134,7 +139,7 @@ secondary generations, catches both up, and publishes a
 - both readers are immutable for the lifetime of the pair; and
 - replica lag stays within the configured readiness boundary.
 
-`LightwalletdServingQuery` captures one published pair at request start. Its
+`WalletServingQuery` captures one published pair at request start. Its
 `CanonicalReader` and `WalletProjectionReader` therefore cannot advance to
 different generations during a response. Pair replacement is atomic for new
 requests and does not mutate readers held by in-flight requests.
@@ -156,7 +161,7 @@ be rebuilt independently.
 materialized views through a secondary. It may federate wallet-owned facts
 through `WalletQuery`; it must not duplicate wallet ownership inside the
 explorer schema. The explorer and Cipherscan services are not included in the
-three-runtime release composition, so their compiled APIs do not imply release
+four-runtime release composition, so their compiled APIs do not imply release
 or deployment support.
 
 See [Materialized-view plane](materialized-view-plane.md) and

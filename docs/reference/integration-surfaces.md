@@ -32,7 +32,7 @@ Method coverage proves that Zinder has an appropriate public primitive. A suppor
 ## Lightwalletd compatibility
 
 `zinder-compat-lightwalletd` serves the vendored lightwalletd
-`CompactTxStreamer` protocol by translating requests onto `LightwalletdQueryApi`.
+`CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`.
 It serves indexed reads from an admitted exact-fence pair of canonical and
 wallet-projection secondaries. It does not write canonical storage, build
 artifacts independently, or use Zebra as a fallback for indexed history.
@@ -113,7 +113,7 @@ At connect time, call `ServerInfo` and check:
 2. `contract_revision` meets the consumer's minimum.
 3. Every capability the consumer requires is present in `capabilities`.
 
-One caveat: the wallet-plane mempool capabilities (`wallet.snapshot.mempool_v1`, `wallet.events.mempool_v1`, the `wallet.mempool.*` reads) are always-on and advertised whether or not the deployment wires the ingest-control proxy that feeds them. `wallet.events.chain_v1` is gated on the deployment actually serving the chain-event stream, so a consumer that needs live-plane data probes that capability or issues a live call (for example `MempoolSnapshot`) and handles the failure.
+One caveat: the wallet-plane mempool capabilities (`wallet.snapshot.mempool_v2`, `wallet.events.mempool_v2`, the `wallet.mempool.*` reads) are always-on and advertised whether or not the deployment wires the ingest-control proxy that feeds them. `wallet.events.chain_v1` is gated on the deployment actually serving the chain-event stream, so a consumer that needs live-plane data probes that capability or issues a live call (for example `MempoolSnapshot`) and handles the failure.
 
 ## Server-side wallets
 

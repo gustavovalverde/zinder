@@ -5,7 +5,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-use prost::Message;
 use rust_rocksdb::DB;
 use tempfile::TempDir;
 use zinder_core::{
@@ -15,7 +14,7 @@ use zinder_core::{
     Network, PrivacyShape, SerializedBytesDigest, TransactionBlobArtifact,
     TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
     TransactionLocation, TransactionPublicFacts, TransactionVersion, UnixTimestampMillis,
-    UnsupportedSection, encode_canonical_block_replay, wire::encode_internal_block_hash,
+    UnsupportedSection, encode_canonical_block_replay,
 };
 
 use super::{
@@ -23,14 +22,19 @@ use super::{
     CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
     CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, ProjectionBuildLease,
-    ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+    ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore,
     displaced_archive::{
         encode_test_archive_state, encode_test_hash_pointer_rows, encode_test_order_key,
     },
     publication::encode_live_event,
     rocksdb::{BLOCK_HASH_INDEX_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY},
 };
-use crate::RocksDbResourceBudget;
+use crate::{
+    ChainEvent, ChainEventHistoryRequest, ChainEventStreamFamily, EventStreamStartPosition,
+    RocksDbResourceBudget, StreamCursorTokenV1,
+    format::{ChainEventCursorAnchor, ChainEventLocator},
+};
 
 const REPLACEMENT_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_REPLACEMENT_FAILPOINT";
 const REPLACEMENT_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_REPLACEMENT_STORE_PATH";
@@ -431,6 +435,235 @@ fn retained_events_resume_exactly_and_leases_bound_pruning()
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one secondary-boundary lifecycle proves authenticated cursors, permanent historical locators, real and synthetic reorg delivery, and expiry together"
+)]
+fn secondary_wallet_events_reconstruct_historical_branches_across_multiple_reorgs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let secondary_path = temporary.path().join("secondary");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut store = published_store(&store_path, 32, BlockHeight::new(16), BlockHeight::new(2))?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        &secondary_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(32)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let page_limit = NonZeroU32::new(16).ok_or("wallet event page limit is zero")?;
+    let baseline = secondary
+        .wallet_chain_event_history(ChainEventHistoryRequest {
+            from_cursor: None,
+            max_events: page_limit,
+            family: ChainEventStreamFamily::Visible,
+        })?
+        .into_iter()
+        .next()
+        .ok_or("secondary did not project the baseline event")?;
+    assert_eq!(baseline.event_sequence, 1);
+
+    let mut tampered = baseline.cursor.as_bytes().to_vec();
+    let tampered_byte = tampered
+        .last_mut()
+        .ok_or("baseline cursor must carry authentication bytes")?;
+    *tampered_byte ^= 0xff;
+    let tampered_cursor = StreamCursorTokenV1::from_bytes(tampered);
+    assert!(matches!(
+        secondary.wallet_chain_event_history(ChainEventHistoryRequest {
+            from_cursor: Some(&tampered_cursor),
+            max_events: page_limit,
+            family: ChainEventStreamFamily::Visible,
+        }),
+        Err(CanonicalStoreError::CanonicalEventCursorMalformed { .. })
+    ));
+
+    let baseline_payload = baseline
+        .cursor
+        .decode_chain_event(Network::ZcashTestnet, secondary.cursor_auth_key)?;
+    let wrong_network_cursor = StreamCursorTokenV1::chain_event(
+        Network::ZcashMainnet,
+        baseline_payload.family,
+        baseline_payload.event_sequence,
+        &baseline_payload.locator,
+        secondary.cursor_auth_key,
+    )?;
+    assert!(matches!(
+        secondary.wallet_chain_event_history(ChainEventHistoryRequest {
+            from_cursor: Some(&wrong_network_cursor),
+            max_events: page_limit,
+            family: ChainEventStreamFamily::Visible,
+        }),
+        Err(CanonicalStoreError::CanonicalEventCursorMalformed { .. })
+    ));
+    assert!(matches!(
+        secondary.resolve_wallet_chain_event_stream_start(
+            &EventStreamStartPosition::AfterCursor(baseline.cursor.clone()),
+            ChainEventStreamFamily::Settled,
+        ),
+        Err(CanonicalStoreError::CanonicalEventCursorMalformed { .. })
+    ));
+
+    let first_replacement = replacement_suffix(10, 16, [9; 32], 100)?;
+    let first_fence = store.event_fence();
+    let (next, _) = store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            first_fence,
+            first_replacement,
+            UnixTimestampMillis::new(1_750_000_000_002),
+        ),
+        &activations,
+    )?;
+    store = next;
+    secondary.try_catch_up()?;
+    let retained_reorg = secondary
+        .wallet_chain_event_history(ChainEventHistoryRequest {
+            from_cursor: Some(&baseline.cursor),
+            max_events: page_limit,
+            family: ChainEventStreamFamily::Visible,
+        })?
+        .into_iter()
+        .next()
+        .ok_or("secondary did not project the retained real reorg")?;
+    let ChainEvent::ChainReorged { reverted, .. } = retained_reorg.event else {
+        return Err("secondary projected a non-reorg event for the replacement".into());
+    };
+    assert_eq!(
+        reverted.block_range,
+        BlockHeightRange::inclusive(BlockHeight::new(10), BlockHeight::new(16))
+    );
+
+    let second_replacement = replacement_suffix(13, 16, [112; 32], 200)?;
+    let second_fence = store.event_fence();
+    let (next, _) = store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            second_fence,
+            second_replacement,
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    store = next;
+    let append_fence = store.event_fence();
+    let (next, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            append_fence,
+            replacement_block(BlockHeight::new(17), [217; 32], [216; 32], 217)?,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            UnixTimestampMillis::new(1_750_000_000_004),
+        ),
+        &activations,
+    )?;
+    store = next;
+    secondary.try_catch_up()?;
+
+    let all_events = secondary.wallet_chain_event_history(ChainEventHistoryRequest {
+        from_cursor: None,
+        max_events: page_limit,
+        family: ChainEventStreamFamily::Visible,
+    })?;
+    let historical_baseline = all_events
+        .first()
+        .ok_or("secondary history lost its retained baseline")?;
+    let historical_baseline_payload = historical_baseline
+        .cursor
+        .decode_chain_event(Network::ZcashTestnet, secondary.cursor_auth_key)?;
+    assert_eq!(
+        historical_baseline_payload
+            .locator
+            .entries()
+            .iter()
+            .find(|entry| entry.height == BlockHeight::new(13))
+            .map(|entry| entry.hash),
+        Some(BlockHash::from_bytes([13; 32])),
+        "the earliest later displacement must reconstruct baseline block 13"
+    );
+    let historical_first_reorg = all_events
+        .get(1)
+        .ok_or("secondary history lost the first reorg")?;
+    let historical_first_reorg_payload = historical_first_reorg
+        .cursor
+        .decode_chain_event(Network::ZcashTestnet, secondary.cursor_auth_key)?;
+    assert_eq!(
+        historical_first_reorg_payload
+            .locator
+            .entries()
+            .iter()
+            .find(|entry| entry.height == BlockHeight::new(13))
+            .map(|entry| entry.hash),
+        Some(BlockHash::from_bytes([113; 32])),
+        "the next displacement must reconstruct the first replacement at block 13"
+    );
+
+    store.prune_canonical_events_before(4, UnixTimestampMillis::new(1_750_000_000_005))?;
+    secondary.try_catch_up()?;
+    let resumed = secondary.wallet_chain_event_history(ChainEventHistoryRequest {
+        from_cursor: Some(&historical_baseline.cursor),
+        max_events: page_limit,
+        family: ChainEventStreamFamily::Visible,
+    })?;
+    let synthetic = resumed
+        .first()
+        .ok_or("pruned reconnect did not synthesize a reorg")?;
+    let ChainEvent::ChainReorged {
+        reverted,
+        committed,
+    } = synthetic.event
+    else {
+        return Err("pruned reconnect did not lead with a synthetic reorg".into());
+    };
+    assert_eq!(
+        reverted.block_range,
+        BlockHeightRange::inclusive(BlockHeight::new(10), BlockHeight::new(16))
+    );
+    assert_eq!(reverted.chain_epoch, historical_baseline.chain_epoch);
+    assert_eq!(reverted.chain_epoch.id, ChainEpochId::new(1));
+    assert_eq!(
+        BlockId::new(
+            reverted.chain_epoch.visible_tip_height,
+            reverted.chain_epoch.visible_tip_hash,
+        ),
+        BlockId::new(BlockHeight::new(16), BlockHash::from_bytes([16; 32]))
+    );
+    assert_eq!(
+        reverted.chain_epoch.settled_tip_height,
+        committed.chain_epoch.settled_tip_height
+    );
+    assert_eq!(
+        committed.block_range,
+        BlockHeightRange::inclusive(BlockHeight::new(10), BlockHeight::new(17))
+    );
+
+    let unresolvable_locator = ChainEventLocator::new(vec![ChainEventCursorAnchor {
+        height: BlockHeight::new(16),
+        hash: BlockHash::from_bytes([0xee; 32]),
+    }])?;
+    let deep_cursor = StreamCursorTokenV1::chain_event(
+        Network::ZcashTestnet,
+        ChainEventStreamFamily::Visible,
+        1,
+        &unresolvable_locator,
+        secondary.cursor_auth_key,
+    )?;
+    assert!(matches!(
+        secondary.wallet_chain_event_history(ChainEventHistoryRequest {
+            from_cursor: Some(&deep_cursor),
+            max_events: page_limit,
+            family: ChainEventStreamFamily::Visible,
+        }),
+        Err(CanonicalStoreError::CanonicalEventCursorExpired {
+            event_sequence: 1,
+            oldest_retained_sequence: 4,
+        })
+    ));
+    Ok(())
+}
+
+#[test]
 fn projection_build_lease_capacity_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let store = published_store(
@@ -804,6 +1037,31 @@ fn replacement_block(
     Ok(block)
 }
 
+fn replacement_suffix(
+    start_height: u32,
+    end_height: u32,
+    mut parent_hash: [u8; 32],
+    hash_offset: u8,
+) -> Result<Vec<CanonicalReplacementBlock>, Box<dyn std::error::Error>> {
+    let mut blocks = Vec::new();
+    for height in start_height..=end_height {
+        let hash_byte = hash_offset
+            .checked_add(u8::try_from(height)?)
+            .ok_or("replacement hash tag overflowed")?;
+        blocks.push(CanonicalReplacementBlock::new(
+            replacement_block(
+                BlockHeight::new(height),
+                [hash_byte; 32],
+                parent_hash,
+                hash_byte,
+            )?,
+            Vec::new(),
+        ));
+        parent_hash = [hash_byte; 32];
+    }
+    Ok(blocks)
+}
+
 fn canonical_block(
     height: BlockHeight,
     block_hash: [u8; 32],
@@ -861,23 +1119,16 @@ fn canonical_block(
         CanonicalBlockReplayFormatVersion::V1,
         CanonicalBlockFactsDigestVersion::V1,
     );
-    let compact_payload = zinder_proto::compat::lightwalletd::CompactBlock {
-        height: u64::from(height.value()),
-        hash: encode_internal_block_hash(facts.block_header.block_hash).to_vec(),
-        prev_hash: encode_internal_block_hash(facts.block_header.parent_hash).to_vec(),
-        chain_metadata: Some(zinder_proto::compat::lightwalletd::ChainMetadata {
-            sapling_commitment_tree_size: 0,
-            orchard_commitment_tree_size: 0,
-            ironwood_commitment_tree_size: 0,
-        }),
-        ..Default::default()
-    }
-    .encode_to_vec();
     CanonicalBuildBlock {
-        compact_block: CompactBlockArtifact::new(
-            height,
-            facts.block_header.block_hash,
-            compact_payload,
+        compact_block: CompactBlockArtifact::empty(
+            BlockId::new(height, facts.block_header.block_hash),
+            facts.block_header.parent_hash,
+            height.value(),
+            zinder_core::CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
         ),
         replay_envelope,
         tip_metadata: ChainTipMetadata::new(0, 0, 0),

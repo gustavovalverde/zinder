@@ -47,4 +47,16 @@ if prepare_fixture / >/dev/null 2>&1; then
   fail "the filesystem root was accepted as a work directory"
 fi
 
+for required_query_contract in \
+  'start_service zinder-query' \
+  'wait_service_ready zinder-query' \
+  'native_wallet_grpc' \
+  'target/debug/zinder-query'; do
+  grep -Fq "$required_query_contract" "$smoke_script" ||
+    fail "native query lifecycle contract is missing: $required_query_contract"
+done
+grep -Fq 'host.docker.internal:9193' \
+  "$repository_root/observability/prometheus/prometheus.yml" ||
+  fail "Prometheus does not scrape the native query ops endpoint"
+
 echo "observability smoke safety tests passed"

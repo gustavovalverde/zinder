@@ -27,7 +27,7 @@
 //!
 //! ```bash
 //! cargo run -p zinder-client --example observe_mempool_to_confirmed -- \
-//!     http://127.0.0.1:9101 zcash-regtest tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
+//!     http://127.0.0.1:9102 zcash-regtest tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
 //! ```
 
 use std::collections::HashSet;
@@ -61,7 +61,7 @@ async fn main() -> ExitCode {
         } else {
             eprintln!(
                 "usage: observe_mempool_to_confirmed <endpoint> <network> <t-address>\n\
-                 example: observe_mempool_to_confirmed http://127.0.0.1:9101 zcash-regtest tm..."
+                 example: observe_mempool_to_confirmed http://127.0.0.1:9102 zcash-regtest tm..."
             );
             return ExitCode::from(2);
         };
@@ -99,6 +99,7 @@ async fn run(endpoint: String, network: Network, address: String) -> Result<(), 
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
+                RetryPolicy::RefreshChainEpoch | RetryPolicy::RestartFromEarliestRetained => {}
                 RetryPolicy::OperatorActionRequired | RetryPolicy::ClientError => {
                     return Err(error);
                 }
@@ -159,13 +160,13 @@ async fn subscribe_mempool_events(
         let envelope = envelope?;
         match envelope.event {
             MempoolEvent::Added { entry } => {
-                if entry_touches_address(&chain_index, &entry.transaction_id, script_hash).await?
-                    && watched.insert(entry.transaction_id)
+                if entry_touches_address(&chain_index, &entry.transaction_id(), script_hash).await?
+                    && watched.insert(entry.transaction_id())
                 {
                     println!(
                         "mempool added: tx={:?} first_seen_unix_millis={}",
-                        entry.transaction_id,
-                        entry.first_seen_unix_millis.value()
+                        entry.transaction_id(),
+                        entry.first_seen_unix_millis().value()
                     );
                 }
             }

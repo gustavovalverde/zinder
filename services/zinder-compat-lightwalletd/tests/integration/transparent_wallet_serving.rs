@@ -20,16 +20,18 @@ use zinder_core::{
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::{
-    CanonicalReader, LightwalletdServingQuery, WalletProjectionReader, WalletServingReadPair,
+    CanonicalReader, WalletProjectionReader, WalletServingQuery, WalletServingReadPair,
 };
-use zinder_store::{CanonicalEventFence, CanonicalStoreError};
+use zinder_store::{
+    CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
+    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
+};
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
     sample_regtest_upgrade_activations,
 };
 
-type WalletServingAdapter =
-    LightwalletdGrpcAdapter<LightwalletdServingQuery<MockTransactionBroadcaster>>;
+type WalletServingAdapter = LightwalletdGrpcAdapter<WalletServingQuery<MockTransactionBroadcaster>>;
 
 #[tokio::test]
 #[allow(
@@ -449,7 +451,7 @@ fn build_wallet_serving_adapter_from_readers(
 ) -> eyre::Result<WalletServingAdapter> {
     let serving_pair = Arc::new(WalletServingReadPair::new(canonical_reader, wallet_reader)?);
     let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
-    let query = LightwalletdServingQuery::from_serving_pair_slot(
+    let query = WalletServingQuery::from_serving_pair_slot(
         serving_pair_slot.clone(),
         MockTransactionBroadcaster::broadcast_disabled(),
         activations.clone(),
@@ -592,5 +594,21 @@ impl CanonicalReader for MissingTransactionBlobCanonicalReader {
         range: SubtreeRootRange,
     ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
         self.canonical_reader.subtree_roots(range)
+    }
+
+    fn wallet_chain_event_history(
+        &self,
+        request: ChainEventHistoryRequest<'_>,
+    ) -> Result<Vec<ChainEventEnvelope>, CanonicalStoreError> {
+        self.canonical_reader.wallet_chain_event_history(request)
+    }
+
+    fn resolve_wallet_chain_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, CanonicalStoreError> {
+        self.canonical_reader
+            .resolve_wallet_chain_event_stream_start(start, requested_family)
     }
 }

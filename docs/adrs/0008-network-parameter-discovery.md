@@ -35,7 +35,6 @@ The type exposes pure-data queries:
 - `active_at(height: BlockHeight) -> Option<&NetworkUpgradeActivation>`: the highest activation with `activation_height <= height`.
 - `consensus_branch_id_at(height: BlockHeight) -> u32`: defaults to `PRE_OVERWINTER_BRANCH_ID` (0) for heights below the earliest activation.
 - `activation_height_by_name(name)` and `activation_height_by_branch_id(branch_id)` for targeted lookups.
-- `earliest_wallet_servable_activation()` for the wallet-serving bulk-catchup floor and the lightwalletd shim. Returns the activation itself (name and height) so callers don't have to re-look-up the upgrade by name.
 
 ### Source-of-truth flow
 
@@ -47,7 +46,7 @@ Production code does not consult `RegtestParameters::default()` or library-defau
 
 ### Wiring contract per service
 
-- **`zinder-ingest`** discovers the activations for bulk-catchup-floor resolution (the existing `--wallet-serving` path). Held in the binary main; no further plumbing in this ADR.
+- **`zinder-ingest`** discovers the activations before canonical construction so transaction parsing and the immutable store identity use the node's exact table. Wallet-serving coverage independently requires complete transparent history.
 - **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletQuery` as a required constructor parameter. `MinedTransactionChainContext.consensus_branch_id` always reflects the running node's active branch at the mined height. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
 - **`zinder-compat-lightwalletd`** holds `Arc<NetworkUpgradeActivations>` on `LightwalletdGrpcAdapter` as a required constructor parameter. `GetLightdInfo` reads the table directly. Same startup-time failure if `[node]` is not configured.
 - **`zinder-client/local`** holds the same `Arc<NetworkUpgradeActivations>` on `LocalChainIndex` via a required `LocalOpenOptions.network_upgrade_activations` field.
@@ -69,7 +68,7 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 
 ### What this costs
 
-- Each process pays one `getblockchaininfo` round-trip at startup. The cost is the same call already required for bulk-catchup-floor resolution where applicable; for query and compat shim it adds one round-trip.
+- Each process pays one `getblockchaininfo` round-trip at startup so consensus parsing and served upgrade metadata use the node's exact activation table.
 - The table is cached for process lifetime. If the operator reconfigures the node's activation heights mid-flight without restarting Zinder, the cache goes stale until restart. Documented in the runbook.
 - Tests that exercise `WalletQuery` or `LightwalletdGrpcAdapter` must pass an activations table. The testkit's `sample_regtest_upgrade_activations()` covers the common case; the cost is one extra line per test.
 

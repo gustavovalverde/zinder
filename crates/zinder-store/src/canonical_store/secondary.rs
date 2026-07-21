@@ -69,6 +69,7 @@ pub struct RocksDbCanonicalSecondary {
     workload: CanonicalStoreWorkload,
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
+    pub(super) cursor_auth_key: [u8; 32],
 }
 
 impl RocksDbCanonicalSecondary {
@@ -142,6 +143,7 @@ impl RocksDbCanonicalSecondary {
             workload: expected_workload,
             build_plan: opened_control.build_plan,
             ready_evidence,
+            cursor_auth_key: opened_control.cursor_auth_key,
         })
     }
 
@@ -183,6 +185,12 @@ impl RocksDbCanonicalSecondary {
             return Err(CanonicalStoreError::admission(
                 &self.primary_path,
                 "canonical build identity changed during secondary catch-up",
+            ));
+        }
+        if opened_control.cursor_auth_key != self.cursor_auth_key {
+            return Err(CanonicalStoreError::admission(
+                &self.primary_path,
+                "canonical cursor authentication key changed during secondary catch-up",
             ));
         }
         if ready_evidence.visible_event_sequence < self.ready_evidence.visible_event_sequence {

@@ -7,6 +7,8 @@ Usage:
   validate-deployment-admission.sh --deployment-class CLASS --target TARGET
   validate-deployment-admission.sh --deployment-class CLASS --railway-default
   validate-deployment-admission.sh --release-images-workflow PATH
+  validate-deployment-admission.sh --build-images-workflow PATH
+  validate-deployment-admission.sh --prometheus-config PATH
   validate-deployment-admission.sh --verify-railway-default
   validate-deployment-admission.sh --compose-contract RESOLVED_COMPOSE_JSON
 
@@ -20,6 +22,8 @@ deployment_class=""
 target=""
 railway_default=false
 release_images_workflow=""
+build_images_workflow=""
+prometheus_config=""
 verify_railway_default=false
 compose_contract=""
 
@@ -44,6 +48,16 @@ while [[ $# -gt 0 ]]; do
       release_images_workflow="$2"
       shift 2
       ;;
+    --build-images-workflow)
+      [[ $# -ge 2 ]] || usage
+      build_images_workflow="$2"
+      shift 2
+      ;;
+    --prometheus-config)
+      [[ $# -ge 2 ]] || usage
+      prometheus_config="$2"
+      shift 2
+      ;;
     --verify-railway-default)
       verify_railway_default=true
       shift
@@ -60,7 +74,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$compose_contract" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && "$verify_railway_default" = false ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$build_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false ]] || usage
   [[ -r "$compose_contract" ]] || {
     echo "release admission rejected: cannot read resolved Compose contract $compose_contract" >&2
     exit 1
@@ -79,14 +93,29 @@ if [[ -n "$compose_contract" ]]; then
       [ $services[$service].volumes[]? | select(.type == "volume" and .target == $target) ];
     def resolved_volume_name($source):
       (.volumes[$source].name // $source);
+    def exact_read_only_bind($service; $target; $source_suffix):
+      ([ $services[$service].volumes[]?
+        | select(
+            .type == "bind"
+            and .target == $target
+            and .read_only == true
+            and (.source | endswith($source_suffix))
+          )
+      ] | length) == 1;
+    def has_checkpoint_secret_source($service):
+      [ $services[$service].volumes[]?
+        | select(.type == "bind" and (.source | endswith("/checkpoint.token")))
+      ] | length > 0;
     volume_mounts_at("state-init"; "/var/lib/zinder") as $state_data
     | volume_mounts_at("state-init"; "/var/lib/zinder/checkpoints") as $state_checkpoint
     | volume_mounts_at("zinder-ingest"; "/var/lib/zinder/checkpoints") as $ingest_checkpoint
     | volume_mounts_at("zinder-projector"; "/var/lib/zinder/checkpoints") as $projector_checkpoint
+    | volume_mounts_at("zinder-query"; "/var/lib/zinder/checkpoints") as $query_checkpoint
     | volume_mounts_at("zinder-compat-lightwalletd"; "/var/lib/zinder/checkpoints") as $compat_checkpoint
     | ($services | has("state-init"))
     and ($services | has("zinder-ingest"))
     and ($services | has("zinder-projector"))
+    and ($services | has("zinder-query"))
     and ($services | has("zinder-compat-lightwalletd"))
     and ($services["state-init"].user == "0:0")
     and ($services["state-init"].network_mode == "none")
@@ -94,12 +123,13 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["state-init"].command == [
       "sh",
       "-c",
-      "chown -R 1000:1000 /var/lib/zinder /var/lib/zinder/checkpoints"
+      "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary && chown -R 1000:1000 /var/lib/zinder"
     ])
     and ($state_data | length == 1)
     and ($state_checkpoint | length == 1)
     and ($ingest_checkpoint | length == 1)
     and ($projector_checkpoint | length == 1)
+    and ($query_checkpoint | length == 0)
     and ($compat_checkpoint | length == 0)
     and ($state_data[0].source != $state_checkpoint[0].source)
     and (resolved_volume_name($state_data[0].source) != resolved_volume_name($state_checkpoint[0].source))
@@ -107,42 +137,125 @@ if [[ -n "$compose_contract" ]]; then
     and ($state_checkpoint[0].source == $projector_checkpoint[0].source)
     and ($services["zinder-ingest"].depends_on["state-init"].condition == "service_completed_successfully")
     and ($services["zinder-projector"].network_mode == "service:zinder-ingest")
+    and ($services["zinder-query"].network_mode == "service:zinder-ingest")
     and ($services["zinder-compat-lightwalletd"].network_mode == "service:zinder-ingest")
-    and (($services["zinder-ingest"].ports // []) | length == 4)
+    and (($services["zinder-ingest"].ports // []) | length == 6)
     and (($services["zinder-ingest"].ports // [])
       | all(.host_ip == "127.0.0.1" and .protocol == "tcp" and .mode == "ingress"))
-    and (($services["zinder-ingest"].ports | map(.target) | sort) == [9067, 9105, 9107, 9110])
+    and (($services["zinder-ingest"].ports | map(.published) | unique | length) == 6)
+    and (($services["zinder-ingest"].ports | map(.target) | sort) == [9067, 9102, 9105, 9106, 9107, 9110])
     and ([ $services[] | (.ports // [])[] ] | all(.host_ip == "127.0.0.1"))
     and ([ $services[] | (.ports // [])[] | .target ] | index(9100) == null)
     and (($services["zinder-ingest"].volumes // [])
       | any(.target == "/var/run/zinder-checkpoint/checkpoint.token" and .read_only == true))
     and (($services["zinder-projector"].volumes // [])
       | any(.target == "/var/run/zinder-checkpoint/checkpoint.token" and .read_only == true))
+    and (($services["zinder-query"].volumes // [])
+      | all(.target != "/var/run/zinder-checkpoint/checkpoint.token"))
     and (($services["zinder-compat-lightwalletd"].volumes // [])
       | all(.target != "/var/run/zinder-checkpoint/checkpoint.token"))
+    and (has_checkpoint_secret_source("zinder-query") | not)
+    and (has_checkpoint_secret_source("zinder-compat-lightwalletd") | not)
+    and exact_read_only_bind("zinder-query"; "/etc/zinder/config.toml"; "/deploy/config/query.toml")
+    and exact_read_only_bind("zinder-compat-lightwalletd"; "/etc/zinder/config.toml"; "/deploy/config/compat-lightwalletd.toml")
+    and exact_read_only_bind("zinder-query"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
+    and exact_read_only_bind("zinder-compat-lightwalletd"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
     and ($services["zinder-ingest"].healthcheck | exact_healthcheck("http://localhost:9105/readyz"))
     and ($services["zinder-projector"].healthcheck | exact_healthcheck("http://localhost:9110/readyz"))
+    and ($services["zinder-query"].healthcheck | exact_healthcheck("http://localhost:9106/readyz"))
     and ($services["zinder-compat-lightwalletd"].healthcheck | exact_healthcheck("http://localhost:9107/readyz"))
     and ($services["zinder-projector"].depends_on["zinder-ingest"].condition == "service_healthy")
     and ($services["zinder-compat-lightwalletd"].depends_on["zinder-ingest"].condition == "service_healthy")
     and ($services["zinder-compat-lightwalletd"].depends_on["zinder-projector"].condition == "service_healthy")
+    and ($services["zinder-query"].depends_on["zinder-ingest"].condition == "service_healthy")
+    and ($services["zinder-query"].depends_on["zinder-projector"].condition == "service_healthy")
     and ($services["zinder-ingest"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9105")
     and ($services["zinder-ingest"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
     and ($services["zinder-projector"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9110")
     and ($services["zinder-projector"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
+    and ($services["zinder-query"].environment.ZINDER_QUERY__LISTEN_ADDR == "[::]:9102")
+    and ($services["zinder-query"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9106")
+    and ($services["zinder-query"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
     and ($services["zinder-compat-lightwalletd"].environment.ZINDER_COMPAT__LISTEN_ADDR == "[::]:9067")
     and ($services["zinder-compat-lightwalletd"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9107")
     and ($services["zinder-compat-lightwalletd"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
   ' "$compose_contract" >/dev/null || {
     cat >&2 <<'EOF'
 release admission rejected: resolved Compose contract does not preserve the
-root-owned data and isolated checkpoint-volume initialization, three-runtime
+root-owned data and isolated checkpoint-volume initialization, four-runtime
 shared namespace, exact readiness probes, explicit container listener opt-ins,
-loopback-only host publications, private control port, or the
-ingest/projector-only checkpoint capability and staging mounts.
+loopback-only host publications, private control port, distinct native and
+compatibility readers, or the ingest/projector-only checkpoint capability and staging mounts.
 EOF
     exit 1
   }
+
+  toml_section_value() {
+    local config_path="$1"
+    local section="$2"
+    local key="$3"
+    awk -v heading="[$section]" -v key="$key" '
+      $0 == heading { in_section = 1; next }
+      /^\[/ { in_section = 0 }
+      in_section && $1 == key {
+        value = $0
+        sub(/^[^=]*=[[:space:]]*"/, "", value)
+        sub(/".*$/, "", value)
+        print value
+        exit
+      }
+    ' "$config_path"
+  }
+
+  query_config_source="$(jq -r '
+    .services["zinder-query"].volumes[]
+    | select(.target == "/etc/zinder/config.toml")
+    | .source
+  ' "$compose_contract")"
+  compat_config_source="$(jq -r '
+    .services["zinder-compat-lightwalletd"].volumes[]
+    | select(.target == "/etc/zinder/config.toml")
+    | .source
+  ' "$compose_contract")"
+  reader_secondary_paths=(
+    "$(toml_section_value "$query_config_source" storage secondary_path)"
+    "$(toml_section_value "$query_config_source" wallet secondary_path)"
+    "$(toml_section_value "$compat_config_source" storage secondary_path)"
+    "$(toml_section_value "$compat_config_source" wallet secondary_path)"
+  )
+  nonempty_reader_secondary_path_count="$(
+    printf '%s\n' "${reader_secondary_paths[@]}" | sed '/^$/d' | wc -l
+  )"
+  unique_reader_secondary_path_count="$(
+    printf '%s\n' "${reader_secondary_paths[@]}" | sed '/^$/d' | sort -u | wc -l
+  )"
+  if [[ "$nonempty_reader_secondary_path_count" -ne 4 \
+    || "$unique_reader_secondary_path_count" -ne 4 ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: native query and compatibility must configure four
+distinct canonical and wallet secondary roots.
+EOF
+    exit 1
+  fi
+  normalized_reader_secondary_paths=()
+  for reader_secondary_path in "${reader_secondary_paths[@]}"; do
+    normalized_reader_secondary_paths+=("$(realpath -m -- "$reader_secondary_path")")
+  done
+  for ((left_index = 0; left_index < ${#normalized_reader_secondary_paths[@]}; left_index++)); do
+    for ((right_index = left_index + 1; right_index < ${#normalized_reader_secondary_paths[@]}; right_index++)); do
+      left_path="${normalized_reader_secondary_paths[$left_index]}"
+      right_path="${normalized_reader_secondary_paths[$right_index]}"
+      if [[ "$left_path" == "$right_path" \
+        || "$left_path" == "$right_path"/* \
+        || "$right_path" == "$left_path"/* ]]; then
+        cat >&2 <<'EOF'
+release admission rejected: native query and compatibility secondary roots
+must be path-disjoint; no reader root may equal or contain another.
+EOF
+        exit 1
+      fi
+    done
+  done
   exit 0
 fi
 
@@ -161,7 +274,7 @@ resolve_railway_default_target() {
 }
 
 if [[ "$verify_railway_default" = true ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$build_images_workflow" && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
 
   target="$(resolve_railway_default_target)"
   [[ "$target" = "zinder-admission-required" ]] || {
@@ -184,8 +297,66 @@ if [[ "$verify_railway_default" = true ]]; then
   exit 0
 fi
 
+if [[ -n "$build_images_workflow" ]]; then
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
+  [[ -r "$build_images_workflow" ]] || {
+    echo "release admission rejected: cannot read build image workflow $build_images_workflow" >&2
+    exit 1
+  }
+
+  required_build_images="$({
+    printf '%s\n' \
+      zinder-ingest:zinder-ingest:zinder-ingest \
+      zinder-projector:zinder-projector:zinder-projector \
+      zinder-query:zinder-query:zinder-query \
+      zinder-compat-lightwalletd:zinder-compat-lightwalletd:zinder-compat-lightwalletd
+  } | sort)"
+  configured_build_images="$(
+    sed -n 's/^[[:space:]]*"\(zinder-[a-z0-9-]*:zinder-[a-z0-9-]*:zinder-[a-z0-9-]*\)"$/\1/p' \
+      "$build_images_workflow" | sort -u
+  )"
+  if [[ "$configured_build_images" != "$required_build_images" ]] \
+    || ! grep -Fq 'docker run --rm --entrypoint="$help_entrypoint" "${image_name}:${PR_TAG}" --help' \
+      "$build_images_workflow"; then
+    cat >&2 <<'EOF'
+release admission rejected: the pull-request image workflow must build and run
+the --help smoke for exactly ingest, projector, native query, and lightwalletd
+compatibility images.
+EOF
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ -n "$prometheus_config" ]]; then
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$build_images_workflow" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
+  [[ -r "$prometheus_config" ]] || {
+    echo "release admission rejected: cannot read Prometheus config $prometheus_config" >&2
+    exit 1
+  }
+
+  query_job_count="$(grep -Fc 'job_name: "zinder-query"' "$prometheus_config")"
+  query_job="$({
+    awk '
+      /job_name: "zinder-query"/ { in_query = 1 }
+      in_query && /job_name:/ && !/job_name: "zinder-query"/ { exit }
+      in_query { print }
+    ' "$prometheus_config"
+  })"
+  if [[ "$query_job_count" -ne 1 ]] \
+    || ! grep -Fq 'targets: ["zinder-ingest:9106"]' <<< "$query_job" \
+    || ! grep -Fq 'service: "zinder-query"' <<< "$query_job"; then
+    cat >&2 <<'EOF'
+release admission rejected: deploy Prometheus must scrape the native query ops
+endpoint at zinder-ingest:9106 and label the target as zinder-query.
+EOF
+    exit 1
+  fi
+  exit 0
+fi
+
 if [[ -n "$release_images_workflow" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$build_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
   [[ -r "$release_images_workflow" ]] || {
     echo "release admission rejected: cannot read image workflow $release_images_workflow" >&2
     exit 1
@@ -200,10 +371,10 @@ EOF
     exit 1
   fi
 
-  if grep -Eq '"zinder-(query|explorer):zinder-(query|explorer)"' "$release_images_workflow"; then
+  if grep -Eq '"zinder-explorer:zinder-explorer"' "$release_images_workflow"; then
     cat >&2 <<'EOF'
-release admission rejected: the Railway image set does not publish query or
-explorer ownership runtimes.
+release admission rejected: the release image set does not publish the optional
+explorer runtime.
 EOF
     exit 1
   fi
@@ -213,6 +384,44 @@ EOF
 release admission rejected: the image workflow omits the independent
 zinder-projector runtime required to construct and continuously follow the
 wallet projection.
+EOF
+    exit 1
+  fi
+
+  if ! grep -Fq '"zinder-query:zinder-query"' "$release_images_workflow"; then
+    cat >&2 <<'EOF'
+release admission rejected: the image workflow omits the native WalletQuery
+runtime required by the complete topology.
+EOF
+    exit 1
+  fi
+
+  if ! grep -Fq '"zinder-compat-lightwalletd:zinder-compat-lightwalletd"' "$release_images_workflow"; then
+    cat >&2 <<'EOF'
+release admission rejected: the image workflow omits the lightwalletd
+compatibility runtime required by the complete topology.
+EOF
+    exit 1
+  fi
+
+  required_release_images="$({
+    printf '%s\n' zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
+  } | sort)"
+  build_release_images="$(
+    sed -n 's/^[[:space:]]*"\(zinder-[a-z0-9-]*\):\1"$/\1/p' \
+      "$release_images_workflow" | sort -u
+  )"
+  merge_release_images="$(
+    sed -n '/^  merge:/,/^    steps:/p' "$release_images_workflow" \
+      | sed -n 's/^[[:space:]]*- \(zinder-[a-z0-9-]*\)$/\1/p' \
+      | sort -u
+  )"
+  if [[ "$build_release_images" != "$required_release_images" \
+    || "$merge_release_images" != "$required_release_images" ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: both the digest-build list and the manifest merge
+matrix must contain exactly ingest, projector, native query, and lightwalletd
+compatibility images.
 EOF
     exit 1
   fi

@@ -85,6 +85,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -100,6 +101,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -124,6 +126,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -137,6 +140,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -150,6 +154,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -163,6 +168,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -176,6 +182,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -191,6 +198,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -204,6 +212,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -217,6 +226,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -272,6 +282,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -279,8 +290,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Listen address for the operational HTTP endpoint \
                       (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service \
-                      loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9107` \
-                      compat, `9069` explorer). Set to an empty string to \
+                      loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9106` query, \
+                      `9107` compat, `9069` explorer). Set to an empty string to \
                       disable the endpoint entirely.",
     },
     EnvVarDoc {
@@ -289,6 +300,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -315,7 +327,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_INGEST_CONTROL__ADDR",
         toml_path: "ingest_control.addr",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "URL of the colocated IngestControl writer (`http://host:port`). Readers \
@@ -328,6 +344,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
         ],
         requirement: Requirement::ConditionalOn("ingest enforces auth"),
@@ -347,7 +364,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       CanonicalControl accepts only an opaque candidate id and creates its \
                       canonical checkpoint at `<root>/<candidate-id>/canonical.rocksdb`; \
                       production mounts this path from a dedicated staging volume into ingest \
-                      and projector only, never compatibility. Defaults to \
+                      and projector only, never query or compatibility. Defaults to \
                       `/var/lib/zinder/checkpoints`.",
     },
     EnvVarDoc {
@@ -358,8 +375,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Path to the separate method-level token required by \
                       CanonicalControl.CreateOwnerCheckpoint and ReadmitOwnerCheckpoint. Mount \
-                      this file only into ingest and projector; ordinary ingest-control readers, \
-                      including compat, must not receive it.",
+                      this file only into ingest and projector; query and compatibility must not \
+                      receive it.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR",
@@ -379,7 +396,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Path to the token required by ProjectorControl and presented as the \
                       canonical checkpoint capability. Mount it only into projector and ingest; \
-                      it is never read by compat.",
+                      query and compatibility never read it.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT",
@@ -396,6 +413,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.path",
         used_by: &[
             "zinder-ingest",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -409,6 +427,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.secondary_path",
         used_by: &[
             "zinder-ingest (verify-canonical-replay only)",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -420,7 +439,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
         toml_path: "storage.initial_catchup_timeout_ms",
-        used_by: &["zinder-compat-lightwalletd", "zinder-explorer"],
+        used_by: &[
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum startup RocksDB secondary catchup duration before a reader starts \
@@ -449,91 +472,127 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_WALLET__PATH",
         toml_path: "wallet.path",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
-        requirement: Requirement::ConditionalOn("running zinder-compat-lightwalletd"),
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
+        requirement: Requirement::ConditionalOn("running a wallet-serving reader"),
         sensitive: false,
         description: "Wallet-projection RocksDB primary path. The projector owns it as the \
-                      primary writer and defaults to `/var/lib/zinder/wallet`; compatibility \
-                      opens it as a read-only secondary and requires an explicit path.",
+                      primary writer and defaults to `/var/lib/zinder/wallet`; both serving \
+                      runtimes open it as a read-only secondary and require an explicit path.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__SECONDARY_PATH",
         toml_path: "wallet.secondary_path",
-        used_by: &["zinder-compat-lightwalletd"],
+        used_by: &["zinder-query", "zinder-compat-lightwalletd"],
         requirement: Requirement::Required,
         sensitive: false,
-        description: "Compatibility-server root for immutable wallet-secondary generations. \
+        description: "Wallet-serving reader root for immutable wallet-secondary generations. \
                       Must be distinct from every primary and canonical-secondary path.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES",
         toml_path: "wallet.rocksdb.block_cache_bytes",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB block cache budget in bytes. Defaults to 268435456 \
-                      for the writer and 67108864 for the compatibility reader.",
+                      for the writer and 67108864 for the wallet-serving reader.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__MAX_WAL_BYTES",
         toml_path: "wallet.rocksdb.max_wal_bytes",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB live WAL ceiling in bytes. Defaults to 268435456 \
-                      for the writer and 16777216 for the compatibility reader.",
+                      for the writer and 16777216 for the wallet-serving reader.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES",
         toml_path: "wallet.rocksdb.max_open_files",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB open SST file cap. Defaults to 512 for the writer \
-                      and 64 for the compatibility reader.",
+                      and 64 for the wallet-serving reader.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__WRITE_BUFFER_BYTES",
         toml_path: "wallet.rocksdb.write_buffer_bytes",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB per-column-family write buffer size. Defaults to \
-                      16777216 for the writer and 4194304 for the compatibility reader.",
+                      16777216 for the writer and 4194304 for the wallet-serving reader.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
         toml_path: "wallet.rocksdb.max_write_buffer_count",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB mutable plus immutable write buffer count. Defaults \
-                      to 4 for the writer and 2 for the compatibility reader.",
+                      to 4 for the writer and 2 for the wallet-serving reader.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__MAX_BACKGROUND_JOBS",
         toml_path: "wallet.rocksdb.max_background_jobs",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection primary-writer RocksDB background job cap shared by flush \
                       and compaction work. Defaults to 2 and is not applied to secondary opens, \
-                      including compatibility readers.",
+                      including wallet-serving readers.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__MEMTABLE_BUDGET_BYTES",
         toml_path: "wallet.rocksdb.memtable_budget_bytes",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB total memtable budget across column families. \
-                      Defaults to 536870912 for the writer and 16777216 for the compatibility \
+                      Defaults to 536870912 for the writer and 16777216 for a wallet-serving \
                       reader.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__STATISTICS_LEVEL",
         toml_path: "wallet.rocksdb.statistics_level",
-        used_by: &["zinder-projector", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB statistics collection gate: `off`, `tickers`, or \
@@ -545,6 +604,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -559,6 +619,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -573,6 +634,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -587,6 +649,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -601,6 +664,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -615,6 +679,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -629,6 +694,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -643,6 +709,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &[
             "zinder-ingest",
             "zinder-projector",
+            "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
@@ -650,6 +717,60 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Canonical-store RocksDB statistics collection gate: `off`, `tickers`, or \
                       `full`. Defaults to `tickers`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_QUERY__LISTEN_ADDR",
+        toml_path: "query.listen_addr",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Listen address for the native WalletQuery gRPC endpoint. Defaults to \
+                      `127.0.0.1:9102`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
+        toml_path: "query.reorg_window_blocks",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Exact canonical replacement-depth identity expected by native query. Must \
+                      be greater than zero and match the canonical writer. Defaults to 100.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS",
+        toml_path: "query.pair_convergence_attempts",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum bounded attempts to converge and admit native query's canonical \
+                      and wallet secondary pair. Must be in 1..=64; defaults to 12.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__LISTEN_ADDR",
+        toml_path: "compat.listen_addr",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Listen address for the lightwalletd-compatible gRPC endpoint. Defaults to \
+                      `127.0.0.1:9067`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+        toml_path: "compat.reorg_window_blocks",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Exact canonical replacement-depth identity expected by compatibility. Must \
+                      be greater than zero and match the canonical writer. Defaults to 100.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
+        toml_path: "compat.pair_convergence_attempts",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum bounded attempts to converge and admit compatibility's canonical \
+                      and wallet secondary pair. Must be in 1..=64; defaults to 12.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",
@@ -734,7 +855,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Defaults to `none` for explicit coverage so canonical indexing does not write \
                       raw block or transaction blobs unless a deployment explicitly needs raw export. \
                       Wallet-serving coverage defaults to `transactions` and rejects `none`, because \
-                      lightwalletd transaction and transparent-history methods require retained bytes. \
+                      native and lightwalletd-compatible transaction and transparent-history methods \
+                      require retained bytes. \
                       The first canonical commit fixes historical coverage; changing a non-empty store \
                       requires a rebuild.",
     },
@@ -747,27 +869,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Chain-truth invariant: how deep the live reorg window extends. Bounds \
                       settlement, classifier default, and replacement traversal. Must be \
                       greater than zero. Defaults to 100.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
-        toml_path: "compat.reorg_window_blocks",
-        used_by: &["zinder-compat-lightwalletd"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Exact canonical-store replacement-depth identity expected by the \
-                      compatibility reader. It must match the writer's \
-                      `ingest.reorg_window_blocks`; admission fails closed on mismatch. Must be \
-                      greater than zero. Defaults to 100.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
-        toml_path: "compat.pair_convergence_attempts",
-        used_by: &["zinder-compat-lightwalletd"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Bounded attempts to catch canonical and wallet secondaries to one exact \
-                      authenticated publication fence before reporting replica lag. Defaults to \
-                      12 and must not exceed 64.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS",
@@ -1202,6 +1303,81 @@ mod tests {
                     .contains("not applied to secondary opens")
             );
         }
+    }
+
+    #[test]
+    fn wallet_serving_environment_contract_keeps_both_protocol_runtimes() {
+        let shared_names = [
+            "ZINDER_NETWORK__NAME",
+            "ZINDER_NODE__JSON_RPC_ADDR",
+            "ZINDER_NODE__AUTH__METHOD",
+            "ZINDER_NODE__AUTH__USERNAME",
+            "ZINDER_NODE__AUTH__PASSWORD",
+            "ZINDER_NODE__AUTH__PATH",
+            "ZINDER_NODE__AUTH__COOKIE",
+            "ZINDER_NODE__REQUEST_TIMEOUT_SECS",
+            "ZINDER_NODE__MAX_RESPONSE_BYTES",
+            "ZINDER_NODE__BROADCAST_TIMEOUT_SECS",
+            "ZINDER_OPS__LISTEN_ADDR",
+            "ZINDER_SECURITY__ALLOW_PUBLIC_BIND",
+            "ZINDER_INGEST_CONTROL__ADDR",
+            "ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH",
+            "ZINDER_STORAGE__PATH",
+            "ZINDER_STORAGE__SECONDARY_PATH",
+            "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
+            "ZINDER_WALLET__PATH",
+            "ZINDER_WALLET__SECONDARY_PATH",
+            "ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES",
+            "ZINDER_WALLET__ROCKSDB__MAX_WAL_BYTES",
+            "ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES",
+            "ZINDER_WALLET__ROCKSDB__WRITE_BUFFER_BYTES",
+            "ZINDER_WALLET__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
+            "ZINDER_WALLET__ROCKSDB__MAX_BACKGROUND_JOBS",
+            "ZINDER_WALLET__ROCKSDB__MEMTABLE_BUDGET_BYTES",
+            "ZINDER_WALLET__ROCKSDB__STATISTICS_LEVEL",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__WRITE_BUFFER_BYTES",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_BACKGROUND_JOBS",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__MEMTABLE_BUDGET_BYTES",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__STATISTICS_LEVEL",
+        ];
+        for name in shared_names {
+            assert!(ENVIRONMENT_VARIABLES.iter().any(|env_var| {
+                env_var.name == name
+                    && env_var.used_by.contains(&"zinder-query")
+                    && env_var.used_by.contains(&"zinder-compat-lightwalletd")
+            }));
+        }
+
+        let query_specific = ENVIRONMENT_VARIABLES
+            .iter()
+            .filter(|env_var| env_var.name.starts_with("ZINDER_QUERY__"))
+            .map(|env_var| env_var.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            query_specific,
+            [
+                "ZINDER_QUERY__LISTEN_ADDR",
+                "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
+                "ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS",
+            ]
+        );
+        let compat_specific = ENVIRONMENT_VARIABLES
+            .iter()
+            .filter(|env_var| env_var.name.starts_with("ZINDER_COMPAT__"))
+            .map(|env_var| env_var.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compat_specific,
+            [
+                "ZINDER_COMPAT__LISTEN_ADDR",
+                "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
+            ]
+        );
     }
 
     #[test]

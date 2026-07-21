@@ -23,7 +23,7 @@
 //!
 //! ```bash
 //! cargo run -p zinder-client --example observe_transparent_address -- \
-//!     http://127.0.0.1:9101 zcash-regtest tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
+//!     http://127.0.0.1:9102 zcash-regtest tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
 //! ```
 //!
 //! The third argument is the transparent t-address you want to watch. The
@@ -58,7 +58,7 @@ async fn main() -> ExitCode {
         } else {
             eprintln!(
                 "usage: observe_transparent_address <endpoint> <network> <t-address>\n\
-             example: observe_transparent_address http://127.0.0.1:9101 zcash-regtest tm..."
+             example: observe_transparent_address http://127.0.0.1:9102 zcash-regtest tm..."
             );
             return ExitCode::from(2);
         };
@@ -96,6 +96,7 @@ async fn run(endpoint: String, network: Network, address: String) -> Result<(), 
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
+                RetryPolicy::RefreshChainEpoch | RetryPolicy::RestartFromEarliestRetained => {}
                 RetryPolicy::OperatorActionRequired | RetryPolicy::ClientError => {
                     return Err(error);
                 }

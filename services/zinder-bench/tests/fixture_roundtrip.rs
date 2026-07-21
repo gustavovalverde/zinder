@@ -260,33 +260,15 @@ fn fixture_construction_checkpoint_source(
     let mut sapling_commitments = Vec::new();
     let mut orchard_commitments = Vec::new();
     let mut ironwood_commitments = Vec::new();
-    for transaction in &prepared.partial_compact_block.vtx {
-        for output in &transaction.outputs {
-            sapling_commitments.push(
-                output
-                    .cmu
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| eyre!("fixture Sapling commitment must contain 32 bytes"))?,
-            );
+    for transaction in prepared.partial_compact_block.transactions() {
+        for output in &transaction.data.sapling_outputs {
+            sapling_commitments.push(output.commitment);
         }
-        for action in &transaction.actions {
-            orchard_commitments.push(
-                action
-                    .cmx
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| eyre!("fixture Orchard commitment must contain 32 bytes"))?,
-            );
+        for action in &transaction.data.orchard_actions {
+            orchard_commitments.push(action.commitment);
         }
-        for action in &transaction.ironwood_actions {
-            ironwood_commitments.push(
-                action
-                    .cmx
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| eyre!("fixture Ironwood commitment must contain 32 bytes"))?,
-            );
+        for action in &transaction.data.ironwood_actions {
+            ironwood_commitments.push(action.commitment);
         }
     }
     accumulator.append_block_commitments(

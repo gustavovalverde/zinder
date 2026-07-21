@@ -1,7 +1,7 @@
 use tempfile::tempdir;
 use zinder_core::{
     BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalHistoryBounds, ChainEpoch,
-    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, UnixTimestampMillis,
+    ChainEpochId, ChainTipMetadata, Network, UnixTimestampMillis,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainStoreOptions, PrimaryChainStore, StoreError,
@@ -14,8 +14,7 @@ fn first_full_commit_publishes_complete_history_bounds() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
     let block = block(1, 1, 0);
-    let compact_block =
-        CompactBlockArtifact::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32]), [1]);
+    let compact_block = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
 
     assert_eq!(store.canonical_history_bounds()?, None);
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(

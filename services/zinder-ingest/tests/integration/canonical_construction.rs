@@ -12,20 +12,16 @@ use std::{
 };
 
 use async_trait::async_trait;
-use prost::Message;
-use rust_rocksdb::{DB, Options};
 use tempfile::TempDir;
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
     CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
-    wire::encode_height_key_ascending,
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
     load_fresh_canonical, load_fresh_canonical_blocks,
 };
-use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError,
@@ -142,14 +138,6 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
     assert_eq!(evidence.tip_metadata, expected_tip_metadata);
     drop(builder);
 
-    let compact_block = read_compact_block(&store_path, evidence.tip_height)?;
-    let compact_metadata = compact_block
-        .chain_metadata
-        .ok_or("persisted compact block must carry chain metadata")?;
-    assert_eq!(compact_metadata.sapling_commitment_tree_size, 0);
-    assert_eq!(compact_metadata.orchard_commitment_tree_size, 0);
-    assert_eq!(compact_metadata.ironwood_commitment_tree_size, 2);
-
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
         &regtest_activations(),
@@ -236,22 +224,6 @@ fn pre_ironwood_empty_frontiers() -> CommitmentTreeFrontiers {
         Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
         None,
     )
-}
-
-fn read_compact_block(
-    store_path: &std::path::Path,
-    height: BlockHeight,
-) -> Result<CompactBlock, Box<dyn std::error::Error>> {
-    let column_families = DB::list_cf(&Options::default(), store_path)?;
-    let database =
-        DB::open_cf_for_read_only(&Options::default(), store_path, &column_families, false)?;
-    let compact_blocks = database
-        .cf_handle("compact_block")
-        .ok_or("fresh store must contain the compact-block column family")?;
-    let payload_bytes = database
-        .get_cf(&compact_blocks, encode_height_key_ascending(height))?
-        .ok_or("fresh store must contain the tip compact block")?;
-    Ok(CompactBlock::decode(payload_bytes.as_slice())?)
 }
 
 #[tokio::test]

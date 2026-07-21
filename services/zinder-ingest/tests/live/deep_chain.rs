@@ -7,17 +7,10 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use eyre::{Result, eyre};
-use prost::Message;
 use tempfile::tempdir;
-use tonic::Request;
-use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::BlockHeight;
 use zinder_core::Network;
 use zinder_ingest::run_bulk_catchup;
-use zinder_proto::compat::lightwalletd::{
-    self, CompactBlock as LightwalletdCompactBlock, compact_tx_streamer_server::CompactTxStreamer,
-};
-use zinder_query::WalletQuery;
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{init, require_live_for};
 
@@ -68,34 +61,26 @@ async fn bulk_catchup_deep_chain_with_by_txid_lookups() -> Result<()> {
 
     let store =
         PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
-    let lightwalletd_adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(store.clone(), (), Arc::clone(&activations)),
-        Arc::clone(&activations),
-    );
     let reader = store.current_chain_epoch_reader()?;
 
     for height_value in [1_u32, 5, tip_height.value() / 2, tip_height.value()] {
         let block = reader
             .compact_block_at(BlockHeight::new(height_value))?
             .ok_or_else(|| eyre!("missing compact block at height {height_value}"))?;
-        let lightwalletd_block = LightwalletdCompactBlock::decode(block.payload_bytes.as_slice())?;
-        let txid = lightwalletd_block
-            .vtx
+        let transaction_id = block
+            .transactions()
             .first()
             .ok_or_else(|| eyre!("compact block at height {height_value} has no transactions"))?
-            .txid
-            .clone();
-        let response = lightwalletd_adapter
-            .get_transaction(Request::new(lightwalletd::TxFilter {
-                block: None,
-                index: 0,
-                hash: txid,
-            }))
-            .await?
-            .into_inner();
-        assert_eq!(response.height, u64::from(height_value));
+            .transaction_id;
+        let response = reader
+            .transaction_blob_by_id(transaction_id)?
+            .ok_or_else(|| eyre!("missing transaction blob at height {height_value}"))?;
+        assert_eq!(
+            response.location.block_height,
+            BlockHeight::new(height_value)
+        );
         assert!(
-            !response.data.is_empty(),
+            !response.raw_transaction_bytes.is_empty(),
             "by-txid transaction at height {height_value} returned empty payload"
         );
     }
@@ -104,12 +89,12 @@ async fn bulk_catchup_deep_chain_with_by_txid_lookups() -> Result<()> {
         let block = reader
             .compact_block_at(BlockHeight::new(height_value))?
             .ok_or_else(|| eyre!("missing compact block at height {height_value}"))?;
-        assert_eq!(block.height.value(), height_value);
-        let lightwalletd_block = LightwalletdCompactBlock::decode(block.payload_bytes.as_slice())?;
-        assert!(
-            !lightwalletd_block.header.is_empty(),
-            "compact block at height {height_value} must carry a serialized header"
-        );
+        assert_eq!(block.height().value(), height_value);
+        let header = reader
+            .block_header_at(BlockHeight::new(height_value))?
+            .ok_or_else(|| eyre!("missing block header at height {height_value}"))?;
+        assert_eq!(header.block_hash, block.block_hash());
+        assert_eq!(header.parent_hash, block.previous_block_hash());
     }
     Ok(())
 }

@@ -1,14 +1,16 @@
 //! Protobuf encoders and decoders for store-owned chain-event values.
 
+use prost::Message;
 use thiserror::Error;
 use zinder_core::wire::{
-    decode_rpc_auth_digest_hex, decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex,
-    decode_zinder_native_chain_name, encode_rpc_auth_digest_hex, encode_rpc_block_hash_hex,
+    decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, decode_zinder_native_chain_name,
+    encode_internal_transaction_id, encode_rpc_auth_digest_hex, encode_rpc_block_hash_hex,
     encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
 };
 use zinder_core::{
-    ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, MempoolEntry, MempoolEvictionReason, RawTransactionBytes, TransactionId,
+    ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, CompactChainMetadata, CompactShieldedAction, CompactTransaction,
+    CompactTransactionData, MempoolEntry, MempoolEvictionReason, TransactionId,
     TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
     TransparentOutPoint, TransparentOutput, TransparentOutputEntry, TransparentSpendEntry,
     UnixTimestampMillis,
@@ -31,6 +33,9 @@ pub enum ChainEventEncodeError {
         /// Unsupported event description.
         event: &'static str,
     },
+    /// A mempool eviction reason has no representation in the wallet protocol.
+    #[error("unsupported mempool eviction reason")]
+    UnsupportedMempoolEvictionReason,
 }
 
 /// Encodes a store chain-event envelope into the wallet protocol message.
@@ -89,25 +94,155 @@ fn chain_range_reverted_message(reverted: ChainRangeReverted) -> wallet::ChainRa
 #[must_use]
 pub fn mempool_entry_message(entry: &MempoolEntry) -> wallet::MempoolEntry {
     wallet::MempoolEntry {
-        transaction_id: encode_rpc_transaction_id_hex(entry.transaction_id),
+        transaction_id: encode_rpc_transaction_id_hex(entry.transaction_id()),
         auth_digest: entry
-            .auth_digest
+            .auth_digest()
             .map(encode_rpc_auth_digest_hex)
             .unwrap_or_default(),
-        raw_transaction_bytes: entry.raw_transaction_bytes.as_slice().into(),
-        compact_transaction_bytes: entry.compact_transaction_bytes.clone(),
-        first_seen_unix_millis: entry.first_seen_unix_millis.value(),
-        first_seen_chain_epoch: Some(chain_epoch_message(entry.first_seen_chain_epoch)),
+        raw_transaction_bytes: entry.raw_transaction_bytes().as_slice().into(),
+        compact_transaction_data: Some(compact_transaction_data_message(
+            entry.compact_transaction_data(),
+        )),
+        first_seen_unix_millis: entry.first_seen_unix_millis().value(),
+        first_seen_chain_epoch: Some(chain_epoch_message(entry.first_seen_chain_epoch())),
         transparent_outputs: entry
-            .transparent_outputs
+            .transparent_outputs()
             .iter()
             .map(transparent_mempool_output_message)
             .collect(),
         transparent_spends: entry
-            .transparent_spends
+            .transparent_spends()
             .iter()
             .map(transparent_mempool_spend_message)
             .collect(),
+    }
+}
+
+/// Encodes one structured compact block for the native wallet protocol.
+#[must_use]
+pub fn compact_block_message(block: &CompactBlockArtifact) -> wallet::CompactBlock {
+    wallet::CompactBlock {
+        height: block.height().value(),
+        block_hash: encode_rpc_block_hash_hex(block.block_hash()),
+        previous_block_hash: encode_rpc_block_hash_hex(block.previous_block_hash()),
+        time: block.time(),
+        transactions: block
+            .transactions()
+            .iter()
+            .map(compact_transaction_message)
+            .collect(),
+        chain_metadata: Some(compact_chain_metadata_message(block.chain_metadata())),
+    }
+}
+
+/// Encodes one compact block for canonical storage.
+#[must_use]
+pub fn encode_compact_block_artifact(block: &CompactBlockArtifact) -> Vec<u8> {
+    compact_block_message(block).encode_to_vec()
+}
+
+/// Decodes and validates one native compact block from canonical storage or the wire.
+pub fn compact_block_from_message(
+    message: wallet::CompactBlock,
+) -> Result<CompactBlockArtifact, MempoolDecodeError> {
+    zinder_proto::wire::compact_block_from_message(message).map_err(|error| {
+        MempoolDecodeError::MalformedMessage {
+            field: error.field(),
+        }
+    })
+}
+
+/// Decodes one canonical-storage compact block value.
+pub fn decode_compact_block_artifact(
+    encoded: &[u8],
+) -> Result<CompactBlockArtifact, MempoolDecodeError> {
+    let message = wallet::CompactBlock::decode(encoded).map_err(|_| {
+        MempoolDecodeError::MalformedMessage {
+            field: "compact_block",
+        }
+    })?;
+    compact_block_from_message(message)
+}
+
+fn compact_chain_metadata_message(metadata: CompactChainMetadata) -> wallet::CompactChainMetadata {
+    wallet::CompactChainMetadata {
+        sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
+        orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
+        ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
+    }
+}
+
+fn compact_transaction_message(transaction: &CompactTransaction) -> wallet::CompactTransaction {
+    wallet::CompactTransaction {
+        index: transaction.index,
+        transaction_id: encode_internal_transaction_id(transaction.transaction_id).to_vec(),
+        data: Some(compact_transaction_data_message(&transaction.data)),
+    }
+}
+
+/// Encodes shared structured wallet scan data.
+#[must_use]
+pub(crate) fn compact_transaction_data_message(
+    scan_data: &CompactTransactionData,
+) -> wallet::CompactTransactionData {
+    wallet::CompactTransactionData {
+        fee_zat: scan_data.fee_zat,
+        sapling_spends: scan_data
+            .sapling_spends
+            .iter()
+            .map(|spend| wallet::CompactSaplingSpend {
+                nullifier: spend.nullifier.to_vec(),
+            })
+            .collect(),
+        sapling_outputs: scan_data
+            .sapling_outputs
+            .iter()
+            .map(|output| wallet::CompactSaplingOutput {
+                commitment: output.commitment.to_vec(),
+                ephemeral_key: output.ephemeral_key.to_vec(),
+                ciphertext: output.ciphertext.to_vec(),
+            })
+            .collect(),
+        orchard_actions: scan_data
+            .orchard_actions
+            .iter()
+            .map(compact_shielded_action_message)
+            .collect(),
+        ironwood_actions: scan_data
+            .ironwood_actions
+            .iter()
+            .map(compact_shielded_action_message)
+            .collect(),
+        transparent_inputs: scan_data
+            .transparent_inputs
+            .iter()
+            .map(|input| wallet::CompactTransparentInput {
+                previous_transaction_id: encode_internal_transaction_id(
+                    input.previous_transaction_id,
+                )
+                .to_vec(),
+                previous_output_index: input.previous_output_index,
+            })
+            .collect(),
+        transparent_outputs: scan_data
+            .transparent_outputs
+            .iter()
+            .map(|output| wallet::CompactTransparentOutput {
+                value_zat: output.value_zat,
+                script_pub_key: output.script_pub_key.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn compact_shielded_action_message(
+    action: &CompactShieldedAction,
+) -> wallet::CompactShieldedAction {
+    wallet::CompactShieldedAction {
+        nullifier: action.nullifier.to_vec(),
+        commitment: action.commitment.to_vec(),
+        ephemeral_key: action.ephemeral_key.to_vec(),
+        ciphertext: action.ciphertext.to_vec(),
     }
 }
 
@@ -130,7 +265,7 @@ pub fn mempool_event_envelope_message(
             reason,
         } => wallet::mempool_event_envelope::Event::Invalidated(wallet::MempoolInvalidatedEvent {
             transaction_id: encode_rpc_transaction_id_hex(*transaction_id),
-            reason: mempool_eviction_reason_message(*reason).into(),
+            reason: mempool_eviction_reason_message(*reason)?.into(),
         }),
         MempoolEvent::Mined {
             transaction_id,
@@ -312,18 +447,20 @@ pub fn transparent_mempool_spend_message(
     }
 }
 
-const fn mempool_eviction_reason_message(
+#[allow(
+    unreachable_patterns,
+    reason = "MempoolEvictionReason is non-exhaustive; the encoder rejects future variants until the wallet protocol represents them."
+)]
+fn mempool_eviction_reason_message(
     reason: MempoolEvictionReason,
-) -> wallet::MempoolEvictionReason {
+) -> Result<wallet::MempoolEvictionReason, ChainEventEncodeError> {
     match reason {
-        MempoolEvictionReason::Conflict => wallet::MempoolEvictionReason::Conflict,
-        MempoolEvictionReason::Expired => wallet::MempoolEvictionReason::Expired,
-        MempoolEvictionReason::LowFee => wallet::MempoolEvictionReason::LowFee,
-        MempoolEvictionReason::NodeRejected => wallet::MempoolEvictionReason::NodeRejected,
-        MempoolEvictionReason::Unknown => wallet::MempoolEvictionReason::Unknown,
-        // The Rust enum is non_exhaustive but the wire enum is closed; the
-        // store side projects to the closest known reason.
-        _ => wallet::MempoolEvictionReason::Unspecified,
+        MempoolEvictionReason::Conflict => Ok(wallet::MempoolEvictionReason::Conflict),
+        MempoolEvictionReason::Expired => Ok(wallet::MempoolEvictionReason::Expired),
+        MempoolEvictionReason::LowFee => Ok(wallet::MempoolEvictionReason::LowFee),
+        MempoolEvictionReason::NodeRejected => Ok(wallet::MempoolEvictionReason::NodeRejected),
+        MempoolEvictionReason::Unknown => Ok(wallet::MempoolEvictionReason::Unknown),
+        _ => Err(ChainEventEncodeError::UnsupportedMempoolEvictionReason),
     }
 }
 
@@ -383,6 +520,12 @@ pub fn chain_view_message(chain_epoch: ChainEpoch) -> wallet::ChainView {
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 #[non_exhaustive]
 pub enum MempoolDecodeError {
+    /// A protobuf message could not be decoded.
+    #[error("{field} is not a valid wallet protocol message")]
+    MalformedMessage {
+        /// Static message path.
+        field: &'static str,
+    },
     /// A required protobuf field was absent.
     #[error("{field} is missing from the wallet protocol message")]
     MissingField {
@@ -395,6 +538,16 @@ pub enum MempoolDecodeError {
         /// Static field path that carried the wrong length.
         field: &'static str,
         /// Observed length on the wire.
+        actual: usize,
+    },
+    /// A fixed-width byte field carried the wrong length.
+    #[error("{field} expected {expected} bytes, got {actual}")]
+    WrongLength {
+        /// Static field path that carried the wrong length.
+        field: &'static str,
+        /// Required byte length.
+        expected: usize,
+        /// Observed byte length.
         actual: usize,
     },
     /// An RPC-form hex hash field failed to decode.
@@ -436,8 +589,10 @@ impl MempoolDecodeError {
     #[must_use]
     pub const fn field(&self) -> &'static str {
         match self {
-            Self::MissingField { field }
+            Self::MalformedMessage { field }
+            | Self::MissingField { field }
             | Self::WrongHashLength { field, .. }
+            | Self::WrongLength { field, .. }
             | Self::InvalidRpcHashHex { field, .. }
             | Self::Overflow { field, .. }
             | Self::UnknownNetwork { field, .. }
@@ -503,42 +658,10 @@ pub fn chain_epoch_from_message(
 pub fn mempool_entry_from_message(
     message: wallet::MempoolEntry,
 ) -> Result<MempoolEntry, MempoolDecodeError> {
-    let transaction_id =
-        transaction_id_from_rpc_hex("mempool_entry.transaction_id", &message.transaction_id)?;
-    let auth_digest = if message.auth_digest.is_empty() {
-        None
-    } else {
-        Some(auth_digest_from_rpc_hex(
-            "mempool_entry.auth_digest",
-            &message.auth_digest,
-        )?)
-    };
-    let chain_epoch_message =
-        message
-            .first_seen_chain_epoch
-            .ok_or(MempoolDecodeError::MissingField {
-                field: "mempool_entry.first_seen_chain_epoch",
-            })?;
-    let first_seen_chain_epoch = chain_epoch_from_message(chain_epoch_message)?;
-    let transparent_outputs = message
-        .transparent_outputs
-        .into_iter()
-        .map(transparent_mempool_output_from_message)
-        .collect::<Result<Vec<_>, _>>()?;
-    let transparent_spends = message
-        .transparent_spends
-        .into_iter()
-        .map(transparent_mempool_spend_from_message)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(MempoolEntry {
-        transaction_id,
-        auth_digest,
-        raw_transaction_bytes: RawTransactionBytes::new(message.raw_transaction_bytes),
-        compact_transaction_bytes: message.compact_transaction_bytes,
-        first_seen_unix_millis: UnixTimestampMillis::new(message.first_seen_unix_millis),
-        first_seen_chain_epoch,
-        transparent_outputs,
-        transparent_spends,
+    zinder_proto::wire::mempool_entry_from_message(message).map_err(|error| {
+        MempoolDecodeError::MalformedMessage {
+            field: error.field(),
+        }
     })
 }
 
@@ -665,10 +788,10 @@ fn mempool_eviction_reason_from_message(
         Ok(wallet::MempoolEvictionReason::Expired) => Ok(MempoolEvictionReason::Expired),
         Ok(wallet::MempoolEvictionReason::LowFee) => Ok(MempoolEvictionReason::LowFee),
         Ok(wallet::MempoolEvictionReason::NodeRejected) => Ok(MempoolEvictionReason::NodeRejected),
-        Ok(wallet::MempoolEvictionReason::Unknown | wallet::MempoolEvictionReason::Unspecified) => {
-            Ok(MempoolEvictionReason::Unknown)
+        Ok(wallet::MempoolEvictionReason::Unknown) => Ok(MempoolEvictionReason::Unknown),
+        Ok(wallet::MempoolEvictionReason::Unspecified) | Err(_) => {
+            Err(MempoolDecodeError::UnknownEvictionReason { field, encoded })
         }
-        Err(_) => Err(MempoolDecodeError::UnknownEvictionReason { field, encoded }),
     }
 }
 
@@ -687,16 +810,6 @@ fn block_hash_from_rpc_hex(
     rpc_hex: &str,
 ) -> Result<BlockHash, MempoolDecodeError> {
     decode_rpc_block_hash_hex(rpc_hex).map_err(|error| MempoolDecodeError::InvalidRpcHashHex {
-        field,
-        reason: error.to_string(),
-    })
-}
-
-fn auth_digest_from_rpc_hex(
-    field: &'static str,
-    rpc_hex: &str,
-) -> Result<AuthDigest, MempoolDecodeError> {
-    decode_rpc_auth_digest_hex(rpc_hex).map_err(|error| MempoolDecodeError::InvalidRpcHashHex {
         field,
         reason: error.to_string(),
     })

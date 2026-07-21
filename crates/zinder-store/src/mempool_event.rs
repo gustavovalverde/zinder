@@ -97,7 +97,7 @@ impl MempoolEvent {
     #[must_use]
     pub fn transaction_id(&self) -> TransactionId {
         match self {
-            Self::Added { entry } => entry.transaction_id,
+            Self::Added { entry } => entry.transaction_id(),
             Self::Invalidated { transaction_id, .. } | Self::Mined { transaction_id, .. } => {
                 *transaction_id
             }

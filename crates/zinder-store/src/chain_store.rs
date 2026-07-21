@@ -157,23 +157,23 @@ impl ChainStoreOptions {
 
 /// Durable canonical store schema version written by this binary.
 ///
-/// The current layout carries complete block-replay envelopes and the active
-/// three-kind mempool event encoding. Stores written with any earlier schema
-/// are refused at open and must be rebuilt from the source chain.
-pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 15;
+/// The current layout persists structured compact transaction data and derives
+/// mempool transparent indexes from that data. Stores written with any earlier
+/// schema are refused at open and must be rebuilt from the source chain.
+pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 16;
 /// Durable artifact schema version written by this binary.
 ///
-/// The current artifact contract includes complete semantic replay envelopes,
-/// transaction-intrinsic balances, cumulative value-pool balances, final
-/// note-commitment roots, and complete block-local transparent spend facts.
+/// The current artifact contract includes structured compact blocks and shared
+/// structured scan data for mined and mempool transactions, in addition to
+/// complete semantic replay envelopes and projection facts.
 /// Hash-shaped protobuf fields use RPC byte order as defined by
 /// [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(19);
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(20);
 /// Oldest durable artifact schema version this binary can read.
 ///
-/// Version 19 is the first schema whose canonical history carries complete
-/// block-local semantic replay envelopes for rebuilding independent projections.
-pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 19;
+/// Version 20 is the only accepted schema and requires the structured compact
+/// block and mempool scan-data records.
+pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 20;
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
 /// Default maximum chain events returned by one history read.
@@ -447,7 +447,7 @@ struct ReorgedCursorResume {
     current_chain_epoch: ChainEpoch,
     family: ChainEventStreamFamily,
     fork_point: ChainEventCursorAnchor,
-    reverted_tip_height: BlockHeight,
+    reverted_tip: ChainEventCursorAnchor,
     event_sequence: u64,
     cursor_auth_key: [u8; 32],
     bounds: ChainEventHistoryBounds,
@@ -1774,7 +1774,7 @@ impl ChainStoreInner {
                 current_chain_epoch: *current_chain_epoch,
                 family,
                 fork_point,
-                reverted_tip_height: locator_tip.height,
+                reverted_tip: locator_tip,
                 event_sequence: cursor_payload.event_sequence,
                 cursor_auth_key: self.cursor_auth_key,
                 bounds,
@@ -1939,7 +1939,7 @@ impl ChainStoreInner {
             StoragePut {
                 table: StorageTable::MempoolEvent,
                 key: StoreKey::mempool_event(event_sequence),
-                value: encode_mempool_event_envelope(&envelope),
+                value: encode_mempool_event_envelope(&envelope)?,
             },
             StoragePut {
                 table: StorageTable::StorageControl,
@@ -2394,6 +2394,11 @@ impl ChainStoreInner {
         chain_epoch: &ChainEpoch,
     ) -> Result<Option<ChainEpoch>, StoreError> {
         let Some(current_chain_epoch) = self.current_chain_epoch_id()? else {
+            if chain_epoch.id != ChainEpochId::new(1) {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "first chain epoch id must be 1",
+                });
+            }
             return Ok(None);
         };
 
@@ -2401,6 +2406,15 @@ impl ChainStoreInner {
             return Err(StoreError::ChainEpochConflict {
                 current: current_chain_epoch,
                 attempted: chain_epoch.id,
+            });
+        }
+        if current_chain_epoch
+            .value()
+            .checked_add(1)
+            .is_none_or(|expected| chain_epoch.id != ChainEpochId::new(expected))
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "chain epoch id must increase by exactly one",
             });
         }
 
@@ -2990,7 +3004,7 @@ fn resolve_reorged_cursor_resume(
         current_chain_epoch,
         family,
         fork_point,
-        reverted_tip_height,
+        reverted_tip,
         event_sequence,
         cursor_auth_key,
         bounds,
@@ -3021,7 +3035,8 @@ fn resolve_reorged_cursor_resume(
             current_chain_epoch,
             family,
             fork_point,
-            reverted_tip_height,
+            reverted_tip,
+            historical_event_sequence: event_sequence,
             cursor_auth_key,
             oldest_retained_sequence: bounds.oldest_retained_sequence,
         },
@@ -3039,7 +3054,8 @@ struct SyntheticReorgInputs {
     current_chain_epoch: ChainEpoch,
     family: ChainEventStreamFamily,
     fork_point: ChainEventCursorAnchor,
-    reverted_tip_height: BlockHeight,
+    reverted_tip: ChainEventCursorAnchor,
+    historical_event_sequence: u64,
     cursor_auth_key: [u8; 32],
     oldest_retained_sequence: u64,
 }
@@ -3061,7 +3077,8 @@ fn build_synthetic_reorg_envelope(
         current_chain_epoch,
         family,
         fork_point,
-        reverted_tip_height,
+        reverted_tip,
+        historical_event_sequence,
         cursor_auth_key,
         oldest_retained_sequence,
     } = inputs;
@@ -3069,9 +3086,20 @@ fn build_synthetic_reorg_envelope(
         .height
         .next()
         .ok_or(StoreError::ChainEventSequenceOverflow)?;
+    let historical_epoch = read_chain_epoch(inner, ChainEpochId::new(historical_event_sequence))?;
+    if reverted_tip
+        != (ChainEventCursorAnchor {
+            height: historical_epoch.visible_tip_height,
+            hash: historical_epoch.visible_tip_hash,
+        })
+    {
+        return Err(StoreError::ChainEventCursorInvalid {
+            reason: "cursor tip does not match its historical chain epoch",
+        });
+    }
     let reverted = ChainRangeReverted::new(
-        current_chain_epoch,
-        BlockHeightRange::inclusive(reverted_start, reverted_tip_height),
+        historical_epoch,
+        BlockHeightRange::inclusive(reverted_start, reverted_tip.height),
     );
     let committed = ChainEpochCommitted::new(
         current_chain_epoch,
@@ -4110,7 +4138,7 @@ fn push_compact_block_artifact_puts(
     compact_blocks: Vec<CompactBlockArtifact>,
 ) -> Result<(), StoreError> {
     for compact_block in compact_blocks {
-        let height = compact_block.height;
+        let height = compact_block.height();
         let encoded_compact_block = encode_compact_block_artifact(compact_block)?;
         puts.push(StoragePut {
             table: StorageTable::CompactBlock,
@@ -5022,8 +5050,8 @@ mod tests {
 
     #[test]
     fn current_artifact_schema_version_matches_supported_guard() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 19);
-        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 19);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 20);
+        assert_eq!(MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, 20);
         assert_eq!(
             MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
             CURRENT_ARTIFACT_SCHEMA_VERSION.value()
@@ -5199,6 +5227,7 @@ mod tests {
         let second_tree_state = TreeStateArtifact::new(
             second_block.height,
             second_block.block_hash,
+            u32::try_from(second_block.block_time)?,
             b"tree-state-2".to_vec(),
         );
         let (mut replacement_epoch, replacement_block, replacement_compact_block) =
@@ -5208,6 +5237,7 @@ mod tests {
         let replacement_tree_state = TreeStateArtifact::new(
             replacement_block.height,
             replacement_block.block_hash,
+            u32::try_from(replacement_block.block_time)?,
             b"replacement-tree-state-2".to_vec(),
         );
 
@@ -5540,10 +5570,15 @@ mod tests {
                 parent_hash,
                 format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
             ),
-            CompactBlockArtifact::new(
-                block_height,
-                source_hash,
-                format!("compact-block-{chain_epoch_id}-{height}").into_bytes(),
+            CompactBlockArtifact::empty(
+                BlockId::new(block_height, source_hash),
+                parent_hash,
+                0,
+                zinder_core::CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
             ),
         )
     }

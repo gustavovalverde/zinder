@@ -28,9 +28,9 @@ The Rust client divides the contract by topology. `RemoteChainIndex` uses gRPC a
 
 ### Lightwalletd compatibility contract
 
-`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `LightwalletdQueryApi`. `LightwalletdServingQuery` answers from an admitted pair of canonical and wallet-projection readers; it does not maintain a second index, read Explorer materialized views, use Zebra as a fallback for indexed history, or construct parallel artifacts. It may broadcast transactions, discover network-upgrade activations, and fill sparse tree state through `zinder-source` when the query contract explicitly delegates those operations upstream.
+`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. `WalletServingQuery` answers from an admitted pair of canonical and wallet-projection readers; it does not maintain a second index, read Explorer materialized views, use Zebra as a fallback for indexed history, or construct parallel artifacts. It may broadcast transactions, discover network-upgrade activations, and fill sparse tree state through `zinder-source` when the query contract explicitly delegates those operations upstream.
 
-For a client that already speaks the supported `CompactTxStreamer` protocol, adopting Zinder can be an endpoint substitution rather than a wallet rewrite. This is a wire-compatibility statement, not a claim that the Zinder binaries and configuration replace a lightwalletd deployment unchanged. Operators deploy Zinder's ingest, projector, and compatibility runtimes, and each named wallet requires its own end-to-end certification before the project claims tested support.
+For a client that already speaks the supported `CompactTxStreamer` protocol, adopting Zinder can be an endpoint substitution rather than a wallet rewrite. This is a wire-compatibility statement, not a claim that the Zinder binaries and configuration replace a lightwalletd deployment unchanged. Operators deploy Zinder's ingest, projector, native query, and compatibility runtimes, and each named wallet requires its own end-to-end certification before the project claims tested support.
 
 ## Choose by ownership and topology
 
@@ -76,7 +76,7 @@ This boundary also preserves shielded privacy. Zinder serves compact chain artif
 
 ## Operational boundary
 
-Zinder's release topology is a single operator backed by one upstream Zebra node. `zinder-ingest` is the only canonical writer, `zinder-projector` is the only wallet-projection writer, and `zinder-compat-lightwalletd` serves admitted canonical and wallet-projection secondaries. `zinder-query` is a library, not a release runtime. A custom native `WalletQuery` deployment may embed that library for remote native consumers; release clients use the compatibility endpoint, and local consumers can open secondaries. Readers either see the previous `ChainEpoch` or the newly committed epoch, never a half-committed batch.
+Zinder's release topology is a single operator backed by one upstream Zebra node. `zinder-ingest` is the only canonical writer, `zinder-projector` is the only wallet-projection writer, and `zinder-query` plus `zinder-compat-lightwalletd` independently serve admitted canonical and wallet-projection secondaries. Native clients call the `WalletQuery` runtime; existing lightwalletd clients call the compatibility runtime. Readers either see the previous `ChainEpoch` or the newly committed epoch, never a half-committed batch.
 
 Zinder does not provide tenant isolation, terminate public TLS, authenticate callers, or enforce per-client rate limits. Operators place an appropriate proxy or private network boundary in front of externally reachable services. Cross-host RocksDB secondaries are also outside the recommended topology; remote consumers should use gRPC.
 
@@ -87,7 +87,7 @@ flowchart LR
     Canonical[("Canonical store")]
     Projector["zinder-projector<br/>wallet-projection writer"]
     Wallet[("Wallet projection")]
-    Native["Optional native WalletQuery<br/>adapter using zinder-query"]
+    Native["zinder-query<br/>native WalletQuery"]
     Compat["CompactTxStreamer<br/>lightwalletd compatibility"]
     Products["Wallets, explorers,<br/>payments, and custody"]
     LightClients["Existing lightwalletd clients"]

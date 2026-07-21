@@ -55,11 +55,11 @@ mod tests {
     /// table and in lightwalletd's `LightdInfo.consensusBranchId` field.
     const NU5_BRANCH_ID: u32 = 0xc2d6_d0b4;
 
-    /// Regtest branch ID used as a lightwalletd parity fixture.
+    /// Regtest branch ID used as a protocol known-answer fixture.
     const REGTEST_BRANCH_ID: u32 = 0xc8e7_1055;
 
     #[test]
-    fn encode_matches_lightwalletd_observed_value() {
+    fn encode_matches_protocol_known_answer() {
         assert_eq!(
             encode_branch_id_hex(ConsensusBranchId::new(REGTEST_BRANCH_ID)),
             "c8e71055",

@@ -881,7 +881,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("schema version 1 does not equal required version 5"),
+                .contains("schema version 1 does not equal required version 6"),
             "{error}"
         );
         assert_eq!(read_control(&path)?, control);
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn contract_identity_and_schema_are_exact() {
         assert_eq!(CANONICAL_STORE_IDENTITY, "canonical");
-        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 5);
+        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 6);
     }
 
     fn read_control(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

@@ -169,6 +169,10 @@ pub enum MempoolHydrationFailureReason {
     NoVisibleChainEpoch,
     /// Parsing the raw transaction bytes into a typed transaction failed.
     TransactionParseFailed,
+    /// Source-reported transaction identity disagreed with the hydrated bytes.
+    TransactionIdMismatch,
+    /// Source-reported authorization digest disagreed with the hydrated bytes.
+    AuthDigestMismatch,
     /// Building the compact-transaction projection from the parsed
     /// transaction failed.
     CompactTransactionBuildFailed,
@@ -188,6 +192,8 @@ impl MempoolHydrationFailureReason {
             Self::RpcError => "rpc_error",
             Self::NoVisibleChainEpoch => "no_visible_chain_epoch",
             Self::TransactionParseFailed => "transaction_parse_failed",
+            Self::TransactionIdMismatch => "transaction_id_mismatch",
+            Self::AuthDigestMismatch => "auth_digest_mismatch",
             Self::CompactTransactionBuildFailed => "compact_transaction_build_failed",
             Self::TransparentOutputIndexOverflow => "transparent_output_index_overflow",
             Self::UnknownSourceEventVariant => "unknown_source_event_variant",

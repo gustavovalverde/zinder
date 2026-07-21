@@ -10,6 +10,29 @@ use zinder_core::{
     TransactionVersion, TransparentInputFact, TransparentOutputFact, UnsupportedSection,
     encode_canonical_block_replay,
 };
+
+pub(crate) fn empty_compact_block_for_header(
+    header: &zinder_core::BlockHeaderArtifact,
+    metadata: zinder_core::ChainTipMetadata,
+) -> zinder_core::CompactBlockArtifact {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "integration fixture headers use nonnegative u32-range block times"
+    )]
+    let block_time = header.block_time as u32;
+    zinder_core::CompactBlockArtifact::empty(
+        zinder_core::BlockId::new(header.height, header.block_hash),
+        header.parent_hash,
+        block_time,
+        zinder_core::CompactChainMetadata {
+            sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
+            orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
+        },
+    )
+}
+
 use zinder_store::{ChainEpochArtifacts, ChainEpochCommitOutcome, PrimaryChainStore, StoreError};
 
 mod address_output_projection;

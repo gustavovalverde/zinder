@@ -202,6 +202,7 @@ fn classify<T>(outcome: Result<T, IndexerError>) -> Option<T> {
         Err(error) => {
             match error.retry_policy() {
                 RetryPolicy::RetryWithBackoff => { /* sleep, then retry */ }
+                RetryPolicy::RefreshChainEpoch => { /* reacquire current_epoch and restart */ }
                 RetryPolicy::OperatorActionRequired => { /* page on-call */ }
                 RetryPolicy::ClientError => { /* fix the request, do not retry */ }
                 // RetryPolicy is non_exhaustive; treat unknown policies as a

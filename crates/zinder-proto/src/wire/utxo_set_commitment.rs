@@ -15,35 +15,55 @@ use crate::v1::wallet::{
 
 /// Translates a native commitment scheme into the wire enum.
 ///
-/// A future native scheme with no wire counterpart maps to
-/// [`WireUtxoSetCommitmentScheme::Unspecified`] rather than fabricating a
-/// discriminant.
+/// A future native scheme with no wire counterpart is rejected until the wire
+/// contract assigns it a discriminant.
 #[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "UtxoSetCommitmentScheme is non_exhaustive across the crate boundary; an unknown future scheme has no wire enum value yet."
+    unreachable_patterns,
+    reason = "UtxoSetCommitmentScheme is non-exhaustive; the encoder fails closed for future schemes."
 )]
 fn encode_utxo_set_commitment_scheme(
     scheme: UtxoSetCommitmentScheme,
-) -> WireUtxoSetCommitmentScheme {
+) -> Result<WireUtxoSetCommitmentScheme, TransparentUtxoSetCommitmentEncodeError> {
     match scheme {
-        UtxoSetCommitmentScheme::LtHash16 => WireUtxoSetCommitmentScheme::Lthash16,
-        _ => WireUtxoSetCommitmentScheme::Unspecified,
+        UtxoSetCommitmentScheme::LtHash16 => Ok(WireUtxoSetCommitmentScheme::Lthash16),
+        UtxoSetCommitmentScheme::Unspecified | _ => {
+            Err(TransparentUtxoSetCommitmentEncodeError::UnsupportedScheme)
+        }
     }
 }
+
+/// Error returned when a native commitment cannot be represented on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TransparentUtxoSetCommitmentEncodeError {
+    /// The native scheme has no wallet-protocol discriminant.
+    UnsupportedScheme,
+}
+
+impl std::fmt::Display for TransparentUtxoSetCommitmentEncodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedScheme => {
+                formatter.write_str("unsupported utxo-set commitment scheme")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransparentUtxoSetCommitmentEncodeError {}
 
 /// Builds the wire commitment message from a native commitment.
 ///
 /// Copies the raw accumulator bytes and sets the wire scheme enum. The result
 /// is wrapped in `Some` only at the field site when the capability is
 /// advertised.
-#[must_use]
 pub fn encode_transparent_utxo_set_commitment(
     commitment: &TransparentUtxoSetCommitment,
-) -> WireTransparentUtxoSetCommitment {
-    WireTransparentUtxoSetCommitment {
-        scheme: encode_utxo_set_commitment_scheme(commitment.scheme()) as i32,
+) -> Result<WireTransparentUtxoSetCommitment, TransparentUtxoSetCommitmentEncodeError> {
+    Ok(WireTransparentUtxoSetCommitment {
+        scheme: encode_utxo_set_commitment_scheme(commitment.scheme())? as i32,
         commitment: commitment.accumulator().to_vec(),
-    }
+    })
 }
 
 /// Error returned when a wire commitment message cannot be decoded.
@@ -113,32 +133,34 @@ mod tests {
     fn lthash16_maps_to_wire_lthash16() {
         assert_eq!(
             encode_utxo_set_commitment_scheme(UtxoSetCommitmentScheme::LtHash16),
-            WireUtxoSetCommitmentScheme::Lthash16
+            Ok(WireUtxoSetCommitmentScheme::Lthash16)
         );
     }
 
     #[test]
-    fn unspecified_maps_to_wire_unspecified() {
+    fn unspecified_is_rejected() {
         assert_eq!(
             encode_utxo_set_commitment_scheme(UtxoSetCommitmentScheme::Unspecified),
-            WireUtxoSetCommitmentScheme::Unspecified
+            Err(TransparentUtxoSetCommitmentEncodeError::UnsupportedScheme)
         );
     }
 
     #[test]
-    fn encodes_empty_commitment_with_full_accumulator() {
+    fn encodes_empty_commitment_with_full_accumulator() -> Result<(), Box<dyn std::error::Error>> {
         let commitment = TransparentUtxoSetCommitment::empty();
-        let wire = encode_transparent_utxo_set_commitment(&commitment);
+        let wire = encode_transparent_utxo_set_commitment(&commitment)?;
         assert_eq!(wire.scheme, WireUtxoSetCommitmentScheme::Lthash16 as i32);
         assert_eq!(wire.commitment.len(), commitment.accumulator().len());
+        Ok(())
     }
 
     #[test]
-    fn encode_then_decode_round_trips() {
+    fn encode_then_decode_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         let commitment = TransparentUtxoSetCommitment::empty();
-        let wire = encode_transparent_utxo_set_commitment(&commitment);
+        let wire = encode_transparent_utxo_set_commitment(&commitment)?;
         let decoded = decode_transparent_utxo_set_commitment(&wire);
         assert_eq!(decoded, Ok(commitment));
+        Ok(())
     }
 
     #[test]

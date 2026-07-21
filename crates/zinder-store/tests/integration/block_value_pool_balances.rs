@@ -20,7 +20,8 @@ use super::synthetic_block_header;
 fn balances_round_trip_optional_future_pools_and_bounded_ranges() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 15);
+    let (epoch_1, block_1, compact_1) =
+        epoch_artifacts(1, 1, 1, 0, 1, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     let balances_1 = balances(block_1.height, block_1.block_hash, block_1.block_time, 11);
     store.commit_chain_epoch(
         super::synthetic_chain_epoch_artifacts(epoch_1, vec![block_1], vec![compact_1])
@@ -46,7 +47,8 @@ fn balances_round_trip_optional_future_pools_and_bounded_ranges() -> eyre::Resul
 fn historical_enrichment_is_idempotent_hash_and_time_bound_and_event_neutral() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 14);
+    let (epoch_1, block_1, compact_1) =
+        epoch_artifacts(1, 1, 1, 0, 1, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1.clone()],
@@ -119,21 +121,32 @@ fn historical_enrichment_is_idempotent_hash_and_time_bound_and_event_neutral() -
 fn reorged_balances_remain_epoch_readable_but_leave_the_canonical_view() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 1, 15);
+    let (epoch_1, block_1, compact_1) =
+        epoch_artifacts(1, 1, 1, 0, 1, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1],
         vec![compact_1],
     ))?;
 
-    let (epoch_2, block_2, compact_2) = epoch_artifacts(2, 2, 2, 1, 1, 1, 2, 15);
+    let (epoch_2, block_2, compact_2) =
+        epoch_artifacts(2, 2, 2, 1, 1, 1, 2, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     let old_balances = balances(block_2.height, block_2.block_hash, block_2.block_time, 51);
     store.commit_chain_epoch(
         super::synthetic_chain_epoch_artifacts(epoch_2, vec![block_2], vec![compact_2])
             .with_block_value_pool_balances(vec![old_balances.clone()]),
     )?;
 
-    let (epoch_3, replacement, replacement_compact) = epoch_artifacts(3, 2, 92, 1, 1, 1, 3, 15);
+    let (epoch_3, replacement, replacement_compact) = epoch_artifacts(
+        3,
+        2,
+        92,
+        1,
+        1,
+        1,
+        3,
+        CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+    );
     store.commit_chain_epoch(
         super::synthetic_chain_epoch_artifacts(
             epoch_3,
@@ -178,6 +191,7 @@ fn epoch_artifacts(
     let block_hash = BlockHash::from_bytes([hash_seed; 32]);
     let parent_hash = BlockHash::from_bytes([parent_hash_seed; 32]);
     let block = synthetic_block_header(height, block_hash, parent_hash, b"value-pool-block");
+    let compact = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
     (
         ChainEpoch {
             id: ChainEpochId::new(epoch_id),
@@ -191,7 +205,7 @@ fn epoch_artifacts(
             created_at: UnixTimestampMillis::new(1_774_668_500_000 + created_at_offset),
         },
         block,
-        CompactBlockArtifact::new(height, block_hash, b"value-pool-compact".to_vec()),
+        compact,
     )
 }
 

@@ -3,19 +3,31 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::sync::Arc;
 use std::time::Duration;
+use std::{
+    convert::Infallible,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use eyre::eyre;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
-use tonic::transport::Server;
+use tonic::{
+    Request, Response, Status,
+    body::Body as TonicBody,
+    codegen::{Body, BoxFuture, Service, StdError, http},
+    server::{NamedService, ServerStreamingService},
+    transport::Server,
+};
 use zinder_client::{
     BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
     EndpointBackedIndex, EventStreamStart, Network, RawTransactionBytes, RemoteChainIndex,
     RemoteOpenOptions, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_proto::v1::wallet;
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{
     ChainFixture, MockTransactionBroadcaster, StoreFixture, sample_regtest_upgrade_activations,
@@ -82,7 +94,7 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     );
     assert!(server_info.supports(Capability::Broadcast));
     assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
-    assert_eq!(compact_block.height, BlockHeight::new(1));
+    assert_eq!(compact_block.height(), BlockHeight::new(1));
     assert_eq!(compact_block_count, 2);
     assert_eq!(
         broadcast_outcome,
@@ -96,6 +108,200 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     assert!(!first_event.cursor.as_bytes().is_empty());
 
     Ok(())
+}
+
+#[tokio::test]
+async fn remote_chain_event_stream_rejects_duplicate_sequence_from_the_wire() -> eyre::Result<()> {
+    let chain_epoch = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .chain_epoch_artifacts(zinder_client::ChainEpochId::new(1))
+        .ok_or_else(|| eyre!("chain fixture must be non-empty"))?
+        .chain_epoch;
+    let event = wallet::ChainEventEnvelope {
+        cursor: vec![1],
+        event_sequence: 1,
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(zinder_proto::wire::chain_epoch_message(chain_epoch)),
+            indexed_tip: None,
+            upstream_tip: None,
+            materialized_views: None,
+        }),
+        event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
+            wallet::ChainCommitted {
+                committed: Some(wallet::ChainEpochCommitted {
+                    chain_epoch: Some(zinder_proto::wire::chain_epoch_message(chain_epoch)),
+                    start_height: 1,
+                    end_height: 2,
+                }),
+            },
+        )),
+    };
+    let endpoint = spawn_malformed_chain_event_service(vec![event.clone(), event]).await?;
+    let client = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    let mut stream = client
+        .chain_events(EventStreamStart::EarliestRetained)
+        .await?;
+
+    assert!(matches!(stream.next().await, Some(Ok(_))));
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(zinder_client::IndexerError::MalformedResponse {
+            field: "event_sequence",
+            ..
+        }))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_chain_event_stream_rejects_a_nonadjacent_repeated_cursor_from_the_wire()
+-> eyre::Result<()> {
+    let chain_epoch = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .chain_epoch_artifacts(zinder_client::ChainEpochId::new(1))
+        .ok_or_else(|| eyre!("chain fixture must be non-empty"))?
+        .chain_epoch;
+    let mut first = chain_event_message(chain_epoch, 1, vec![1]);
+    let second = chain_event_message(chain_epoch, 2, vec![2]);
+    let mut repeated = chain_event_message(chain_epoch, 3, vec![1]);
+    // Keep the event payloads independent so the regression specifically
+    // exercises cursor identity across nonadjacent stream items.
+    first.event_sequence = 1;
+    repeated.event_sequence = 3;
+
+    let endpoint = spawn_malformed_chain_event_service(vec![first, second, repeated]).await?;
+    let client = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    let mut stream = client
+        .chain_events(EventStreamStart::EarliestRetained)
+        .await?;
+
+    assert!(matches!(stream.next().await, Some(Ok(_))));
+    assert!(matches!(stream.next().await, Some(Ok(_))));
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(zinder_client::IndexerError::MalformedResponse {
+            field: "cursor",
+            ..
+        }))
+    ));
+    Ok(())
+}
+
+fn chain_event_message(
+    chain_epoch: zinder_client::ChainEpoch,
+    event_sequence: u64,
+    cursor: Vec<u8>,
+) -> wallet::ChainEventEnvelope {
+    wallet::ChainEventEnvelope {
+        cursor,
+        event_sequence,
+        chain_view: Some(wallet::ChainView {
+            chain_epoch: Some(zinder_proto::wire::chain_epoch_message(chain_epoch)),
+            indexed_tip: None,
+            upstream_tip: None,
+            materialized_views: None,
+        }),
+        event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
+            wallet::ChainCommitted {
+                committed: Some(wallet::ChainEpochCommitted {
+                    chain_epoch: Some(zinder_proto::wire::chain_epoch_message(chain_epoch)),
+                    start_height: 1,
+                    end_height: 2,
+                }),
+            },
+        )),
+    }
+}
+
+#[derive(Clone)]
+struct MalformedChainEventService {
+    events: Arc<Vec<wallet::ChainEventEnvelope>>,
+}
+
+impl NamedService for MalformedChainEventService {
+    const NAME: &'static str = "zinder.v1.wallet.WalletQuery";
+}
+
+impl<B> Service<http::Request<B>> for MalformedChainEventService
+where
+    B: Body + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+{
+    type Response = http::Response<TonicBody>;
+    type Error = Infallible;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() != "/zinder.v1.wallet.WalletQuery/ChainEvents" {
+            return Box::pin(async move {
+                let mut response = http::Response::new(TonicBody::default());
+                response.headers_mut().insert(
+                    Status::GRPC_STATUS,
+                    (tonic::Code::Unimplemented as i32).into(),
+                );
+                response.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    tonic::metadata::GRPC_CONTENT_TYPE,
+                );
+                Ok(response)
+            });
+        }
+
+        let events = Arc::clone(&self.events);
+        Box::pin(async move {
+            struct ChainEventsMethod(Arc<Vec<wallet::ChainEventEnvelope>>);
+
+            impl ServerStreamingService<wallet::ChainEventsRequest> for ChainEventsMethod {
+                type Response = wallet::ChainEventEnvelope;
+                type ResponseStream = Pin<
+                    Box<dyn tokio_stream::Stream<Item = Result<Self::Response, Status>> + Send>,
+                >;
+                type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
+
+                fn call(&mut self, _request: Request<wallet::ChainEventsRequest>) -> Self::Future {
+                    let events = Arc::clone(&self.0);
+                    Box::pin(async move {
+                        let stream =
+                            tokio_stream::iter(events.as_ref().clone().into_iter().map(Ok));
+                        Ok(Response::new(Box::pin(stream) as Self::ResponseStream))
+                    })
+                }
+            }
+
+            let codec = tonic_prost::ProstCodec::default();
+            let mut grpc = tonic::server::Grpc::new(codec);
+            Ok(grpc
+                .server_streaming(ChainEventsMethod(events), request)
+                .await)
+        })
+    }
+}
+
+async fn spawn_malformed_chain_event_service(
+    events: Vec<wallet::ChainEventEnvelope>,
+) -> eyre::Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        let _server_result = Server::builder()
+            .add_service(MalformedChainEventService {
+                events: Arc::new(events),
+            })
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    Ok(format!("http://{addr}"))
 }
 
 async fn spawn_wallet_query<QueryApi>(

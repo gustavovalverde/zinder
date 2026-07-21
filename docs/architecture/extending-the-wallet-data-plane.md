@@ -21,7 +21,7 @@ correctness question rather than a rebuildable product aggregate.
   event. It must not create a new storage family or silently widen the
   canonical contract.
 - The lightwalletd adapter exposes only shapes present in its vendored
-  protocol and translates through `LightwalletdQueryApi`.
+  protocol and translates through `WalletQueryApi`.
 
 ## Choosing another boundary
 

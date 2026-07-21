@@ -20,29 +20,19 @@ use std::{
 
 use eyre::{Result, eyre};
 use prost::Message;
-use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::Request;
 use tonic::codegen::tokio_stream::StreamExt;
-use tonic::{Request, transport::Server};
-use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::NetworkUpgradeActivations;
-use zinder_core::wire::{
-    encode_bip70_chain_name, encode_rpc_block_hash_hex, encode_zinder_native_chain_name,
-};
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{
-    BlockHeight, BlockHeightRange, Network, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
+    BlockHeight, BlockHeightRange, Network, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
 };
 use zinder_ingest::{
     BulkCatchupRunConfig, CanonicalPipelineLimits, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
     NodeSourceKind, TipFollowConfig,
 };
-use zinder_proto::{
-    compat::lightwalletd::{
-        self, CompactBlock as LightwalletdCompactBlock,
-        compact_tx_streamer_server::CompactTxStreamer as LightwalletdCompactTxStreamer,
-    },
-    v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
-};
+use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
     ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
     latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
@@ -361,7 +351,7 @@ pub(crate) async fn rpc_block_hash_at_height(env: &LiveTestEnv, height: u32) -> 
 /// for `[start_height..=end_height]` against the visible chain epoch.
 ///
 /// Live tests pass `activations` discovered from the running node via
-/// [`fetch_live_network_upgrade_activations`] so the wallet/compat adapters see
+/// [`fetch_live_network_upgrade_activations`] so the wallet adapters see
 /// a table whose `network` matches the chain epoch's network.
 pub(crate) async fn assert_native_wallet_read_responses(
     store: &PrimaryChainStore,
@@ -421,245 +411,27 @@ pub(crate) async fn assert_wallet_read_responses(
     )
     .await?;
     assert_native_wallet_grpc_responses(store, read_range, &activations).await?;
-    assert_lightwalletd_compat_responses(store, read_range, &activations).await?;
     Ok(())
 }
 
-/// Asserts that the lightwalletd compat shim rejects an obviously malformed
-/// transaction with a non-zero error code.
-pub(crate) async fn assert_lightwalletd_send_transaction_classifies_invalid(
+/// Asserts that the native wallet boundary rejects malformed transaction bytes.
+pub(crate) async fn assert_native_broadcast_classifies_invalid(
     store: &PrimaryChainStore,
     bulk_catchup_config: &BulkCatchupRunConfig,
     activations: Arc<NetworkUpgradeActivations>,
 ) -> Result<()> {
     let source = zebra_source_from_bulk_catchup(bulk_catchup_config)?;
-    let wallet_query = WalletQuery::new(store.clone(), source, Arc::clone(&activations));
-    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, Arc::clone(&activations));
+    let wallet_query = WalletQuery::new(store.clone(), source, activations);
+    let outcome = wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0xff, 0xff, 0xff, 0xff]))
+        .await?;
 
-    let response = LightwalletdCompactTxStreamer::send_transaction(
-        &grpc_adapter,
-        Request::new(lightwalletd::RawTransaction {
-            data: vec![0xff, 0xff, 0xff, 0xff],
-            height: 0,
-        }),
-    )
-    .await?
-    .into_inner();
-
-    assert_ne!(
-        response.error_code, 0,
-        "node must reject malformed transaction bytes"
-    );
-    assert!(
-        !response.error_message.is_empty(),
-        "node must surface a rejection message"
-    );
-    Ok(())
-}
-
-async fn assert_lightwalletd_compat_responses(
-    store: &PrimaryChainStore,
-    read_range: WalletReadTestRange,
-    activations: &Arc<NetworkUpgradeActivations>,
-) -> Result<()> {
-    let wallet_query = WalletQuery::new(store.clone(), (), Arc::clone(activations));
-    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, Arc::clone(activations));
-
-    assert_lightwalletd_trait_responses(&grpc_adapter, read_range).await?;
-    assert_generated_lightwalletd_client_responses(
-        store,
-        read_range.network,
-        read_range.start_height,
-        read_range.end_height,
-        activations,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn assert_lightwalletd_trait_responses(
-    grpc_adapter: &LightwalletdGrpcAdapter<WalletQuery<PrimaryChainStore>>,
-    read_range: WalletReadTestRange,
-) -> Result<()> {
-    let visible_tip_block = LightwalletdCompactTxStreamer::get_latest_block(
-        grpc_adapter,
-        Request::new(lightwalletd::ChainSpec {}),
-    )
-    .await?
-    .into_inner();
-    let block_range = LightwalletdCompactTxStreamer::get_block_range(
-        grpc_adapter,
-        Request::new(lightwalletd::BlockRange {
-            start: Some(lightwalletd::BlockId {
-                height: u64::from(read_range.start_height),
-                hash: Vec::new(),
-            }),
-            end: Some(lightwalletd::BlockId {
-                height: u64::from(read_range.end_height),
-                hash: Vec::new(),
-            }),
-            pool_types: Vec::new(),
-        }),
-    )
-    .await?
-    .into_inner();
-    let compact_blocks = collect_lightwalletd_stream(block_range).await?;
-    let latest_tree_state_checkpoint = LightwalletdCompactTxStreamer::get_latest_tree_state(
-        grpc_adapter,
-        Request::new(lightwalletd::Empty {}),
-    )
-    .await?
-    .into_inner();
-    let lightd_info = LightwalletdCompactTxStreamer::get_lightd_info(
-        grpc_adapter,
-        Request::new(lightwalletd::Empty {}),
-    )
-    .await?
-    .into_inner();
-
-    assert_eq!(visible_tip_block.height, u64::from(read_range.end_height));
-    assert_eq!(
-        compact_blocks.len(),
-        usize::try_from(read_range.end_height - read_range.start_height + 1)?
-    );
-    assert_eq!(
-        compact_blocks
-            .first()
-            .ok_or_else(|| eyre!("lightwalletd range response missing compact block"))?
-            .height,
-        u64::from(read_range.start_height)
-    );
-    assert_eq!(
-        latest_tree_state_checkpoint.network,
-        encode_bip70_chain_name(read_range.network)
-    );
-    assert_eq!(
-        latest_tree_state_checkpoint.height,
-        u64::from(read_range.end_height)
-    );
-    assert_eq!(lightd_info.vendor, "Zinder");
-    assert_eq!(
-        lightd_info.chain_name,
-        encode_bip70_chain_name(read_range.network)
-    );
-    assert_eq!(lightd_info.block_height, u64::from(read_range.end_height));
-    assert_eq!(
-        lightd_info.lightwallet_protocol_version,
-        lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT
-    );
-
-    assert_lightwalletd_subtree_roots(grpc_adapter, read_range.subtree_root_start_indices).await
-}
-
-async fn assert_lightwalletd_subtree_roots(
-    grpc_adapter: &LightwalletdGrpcAdapter<WalletQuery<PrimaryChainStore>>,
-    subtree_root_start_indices: SubtreeRootStartIndices,
-) -> Result<()> {
-    for (protocol, start_index) in [
-        (
-            lightwalletd::ShieldedProtocol::Sapling,
-            subtree_root_start_indices.sapling,
-        ),
-        (
-            lightwalletd::ShieldedProtocol::Orchard,
-            subtree_root_start_indices.orchard,
-        ),
-    ] {
-        let subtree_roots = LightwalletdCompactTxStreamer::get_subtree_roots(
-            grpc_adapter,
-            Request::new(lightwalletd::GetSubtreeRootsArg {
-                start_index,
-                shielded_protocol: protocol as i32,
-                max_entries: 1,
-            }),
-        )
-        .await?
-        .into_inner();
-        let subtree_roots = collect_lightwalletd_stream(subtree_roots).await?;
-        assert!(subtree_roots.len() <= 1);
-        for subtree_root in subtree_roots {
-            assert_eq!(subtree_root.root_hash.len(), 32);
-            assert_eq!(subtree_root.completing_block_hash.len(), 32);
-            assert!(subtree_root.completing_block_height > 0);
-        }
-    }
-
-    Ok(())
-}
-
-async fn assert_generated_lightwalletd_client_responses(
-    store: &PrimaryChainStore,
-    network: Network,
-    start_height: u32,
-    end_height: u32,
-    activations: &Arc<NetworkUpgradeActivations>,
-) -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let server_addr = listener.local_addr()?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(store.clone(), (), Arc::clone(activations)),
-        Arc::clone(activations),
-    )
-    .into_server();
-    let server_handle = tokio::spawn(async move {
-        Server::builder()
-            .add_service(adapter)
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-
-    let mut client = lightwalletd::compact_tx_streamer_client::CompactTxStreamerClient::connect(
-        format!("http://{server_addr}"),
-    )
-    .await?;
-    let visible_tip_block = client
-        .get_latest_block(lightwalletd::ChainSpec {})
-        .await?
-        .into_inner();
-    let mut compact_block_stream = client
-        .get_block_range(lightwalletd::BlockRange {
-            start: Some(lightwalletd::BlockId {
-                height: u64::from(start_height),
-                hash: Vec::new(),
-            }),
-            end: Some(lightwalletd::BlockId {
-                height: u64::from(end_height),
-                hash: Vec::new(),
-            }),
-            pool_types: Vec::new(),
-        })
-        .await?
-        .into_inner();
-    let latest_tree_state_checkpoint = client
-        .get_latest_tree_state(lightwalletd::Empty {})
-        .await?
-        .into_inner();
-
-    let mut compact_blocks = Vec::new();
-    while let Some(compact_block) = compact_block_stream.message().await? {
-        compact_blocks.push(compact_block);
-    }
-
-    assert_eq!(visible_tip_block.height, u64::from(end_height));
-    assert_eq!(
-        compact_blocks.len(),
-        usize::try_from(end_height - start_height + 1)?
-    );
-    assert_eq!(
-        latest_tree_state_checkpoint.network,
-        encode_bip70_chain_name(network)
-    );
-    assert_eq!(latest_tree_state_checkpoint.height, u64::from(end_height));
-    assert!(!latest_tree_state_checkpoint.hash.is_empty());
-
-    for (offset, compact_block) in compact_blocks.iter().enumerate() {
-        let offset = u64::try_from(offset)?;
-        assert_eq!(compact_block.height, u64::from(start_height) + offset);
-        assert_eq!(compact_block.hash.len(), 32);
-    }
-
-    server_handle.abort();
-    let _ = server_handle.await;
+    assert!(matches!(
+        outcome,
+        TransactionBroadcastOutcome::InvalidEncoding(_)
+            | TransactionBroadcastOutcome::Rejected(_)
+            | TransactionBroadcastOutcome::Unknown(_)
+    ));
     Ok(())
 }
 
@@ -749,7 +521,8 @@ async fn assert_native_wallet_grpc_responses(
             .ok_or_else(|| eyre!("native gRPC compact-block chunk missing compact block"))?;
         assert_eq!(compact_block.height, read_range.start_height + offset);
         assert_eq!(compact_block.block_hash.len(), 64);
-        assert!(!compact_block.payload_bytes.is_empty());
+        assert_eq!(compact_block.previous_block_hash.len(), 64);
+        assert!(compact_block.chain_metadata.is_some());
     }
     assert_eq!(tree_state.height, read_range.end_height);
     assert!(!tree_state.payload_bytes.is_empty());
@@ -787,22 +560,6 @@ async fn assert_native_wallet_grpc_responses(
     }
 
     Ok(())
-}
-
-async fn collect_lightwalletd_stream<T, Stream>(
-    mut stream: Stream,
-) -> std::result::Result<Vec<T>, tonic::Status>
-where
-    Stream:
-        tonic::codegen::tokio_stream::Stream<Item = std::result::Result<T, tonic::Status>> + Unpin,
-{
-    use tonic::codegen::tokio_stream::StreamExt;
-
-    let mut values = Vec::new();
-    while let Some(stream_item) = stream.next().await {
-        values.push(stream_item?);
-    }
-    Ok(values)
 }
 
 trait HasNativeGrpcChainEpoch {
@@ -896,11 +653,7 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
     {
         let chunk = wallet::CompactBlocksInRangeChunk {
             chain_view: Some(zinder_store::chain_view_message(range_chain_epoch)),
-            compact_block: Some(wallet::CompactBlock {
-                height: compact_block.height.value(),
-                block_hash: encode_rpc_block_hash_hex(compact_block.block_hash),
-                payload_bytes: compact_block.payload_bytes,
-            }),
+            compact_block: Some(zinder_proto::wire::compact_block_message(&compact_block)),
         };
         let encoded_chunk = chunk.encode_to_vec();
         let decoded_chunk = wallet::CompactBlocksInRangeChunk::decode(encoded_chunk.as_slice())?;
@@ -924,42 +677,11 @@ async fn assert_native_compact_block_range_chunks<QueryApi: WalletQueryApi>(
             end_height
         );
         assert_eq!(compact_block.height, height);
-        assert!(!compact_block.payload_bytes.is_empty());
-        let expected_block_hash_internal =
-            zinder_core::wire::decode_rpc_block_hash_hex(&compact_block.block_hash)?;
-        assert_lightwalletd_compact_block_payload(
-            &compact_block.payload_bytes,
-            height,
-            expected_block_hash_internal.as_bytes().as_slice(),
-        )?;
+        assert_eq!(compact_block.block_hash.len(), 64);
+        assert_eq!(compact_block.previous_block_hash.len(), 64);
+        assert!(compact_block.chain_metadata.is_some());
     }
 
-    Ok(())
-}
-
-fn assert_lightwalletd_compact_block_payload(
-    payload_bytes: &[u8],
-    expected_height: u32,
-    expected_block_hash: &[u8],
-) -> Result<()> {
-    let compact_block = LightwalletdCompactBlock::decode(payload_bytes)?;
-    let _chain_metadata = compact_block
-        .chain_metadata
-        .ok_or_else(|| eyre!("lightwalletd compact block missing chain metadata"))?;
-
-    assert_eq!(compact_block.height, u64::from(expected_height));
-    assert_eq!(compact_block.hash, expected_block_hash);
-    assert_eq!(compact_block.hash.len(), 32);
-    assert_eq!(compact_block.prev_hash.len(), 32);
-    assert!(!compact_block.vtx.is_empty());
-    assert!(compact_block.vtx.iter().any(|transaction| {
-        !transaction.spends.is_empty()
-            || !transaction.outputs.is_empty()
-            || !transaction.actions.is_empty()
-            || !transaction.ironwood_actions.is_empty()
-            || !transaction.vin.is_empty()
-            || !transaction.vout.is_empty()
-    }));
     Ok(())
 }
 
@@ -1192,8 +914,8 @@ listen_addr = "127.0.0.1:0"
 
 /// Renders a wallet-serving bounded phase-driven ingest TOML config.
 ///
-/// The `coverage = "wallet-serving"` modifier instructs the loop to derive
-/// the historical floor from upstream activation heights before committing.
+/// The `coverage = "wallet-serving"` modifier instructs the loop to retain
+/// complete non-genesis history before committing.
 pub(crate) fn wallet_serving_ingest_config_toml(
     config_toml: &WalletServingIngestConfigToml<'_>,
 ) -> Result<String> {

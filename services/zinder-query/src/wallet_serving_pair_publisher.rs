@@ -1,9 +1,9 @@
-//! Wallet-serving secondary-pair lifecycle for the lightwalletd adapter.
+//! Wallet-serving secondary-pair lifecycle shared by native and compatibility runtimes.
 //!
-//! The compatibility process owns no canonical or wallet primary handle. It
-//! catches up only an inactive generation, authenticates that generation
-//! against the canonical writer control plane, and atomically publishes it as
-//! one immutable canonical/wallet pair. The prior generation stays open until
+//! Each reader runtime owns no canonical or wallet primary handle. It catches
+//! up only an inactive generation, authenticates that generation against the
+//! canonical writer control plane, and atomically publishes it as one
+//! immutable canonical/wallet pair. The prior generation stays open until
 //! every in-flight request has dropped its captured pair `Arc`.
 
 use std::{
@@ -13,6 +13,9 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
+};
 use arc_swap::ArcSwap;
 use thiserror::Error;
 use tokio::{task::JoinHandle, time::Instant};
@@ -21,9 +24,6 @@ use zinder_core::{Network, NetworkUpgradeActivations, wire::encode_zinder_native
 use zinder_proto::v1::ingest::{
     CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
     canonical_control_client::CanonicalControlClient,
-};
-use zinder_query::{
-    CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, Readiness, ReadinessCause,
@@ -41,28 +41,41 @@ const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
 
 /// Immutable configuration for the bounded secondary-pair lifecycle.
 #[derive(Clone, Debug)]
-pub(crate) struct WalletServingPairConfig {
-    pub(crate) canonical_primary_path: PathBuf,
-    pub(crate) canonical_secondary_root: PathBuf,
-    pub(crate) wallet_primary_path: PathBuf,
-    pub(crate) wallet_secondary_root: PathBuf,
-    pub(crate) network: Network,
-    pub(crate) network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    pub(crate) canonical_reorg_policy: CanonicalReorgPolicy,
-    pub(crate) canonical_resource_budget: RocksDbResourceBudget,
-    pub(crate) wallet_resource_budget: RocksDbResourceBudget,
-    pub(crate) catchup_interval: Duration,
-    pub(crate) convergence_timeout: Duration,
-    pub(crate) convergence_attempts: NonZeroU8,
-    pub(crate) replica_lag_threshold_chain_epochs: u64,
+pub struct WalletServingPairConfig {
+    /// Canonical writer-owned primary path followed by the secondary.
+    pub canonical_primary_path: PathBuf,
+    /// Process-exclusive root for canonical secondary generations.
+    pub canonical_secondary_root: PathBuf,
+    /// Wallet projector-owned primary path followed by the secondary.
+    pub wallet_primary_path: PathBuf,
+    /// Process-exclusive root for wallet secondary generations.
+    pub wallet_secondary_root: PathBuf,
+    /// Network both stores and writer status must attest.
+    pub network: Network,
+    /// Network upgrade activation table used to open canonical storage.
+    pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    /// Canonical replacement-depth identity expected from the writer.
+    pub canonical_reorg_policy: CanonicalReorgPolicy,
+    /// `RocksDB` budget for each canonical secondary generation.
+    pub canonical_resource_budget: RocksDbResourceBudget,
+    /// `RocksDB` budget for each wallet secondary generation.
+    pub wallet_resource_budget: RocksDbResourceBudget,
+    /// Delay between refresh attempts after initial publication.
+    pub catchup_interval: Duration,
+    /// Maximum wall time allowed for pair convergence.
+    pub convergence_timeout: Duration,
+    /// Maximum catch-up attempts allowed for pair convergence.
+    pub convergence_attempts: NonZeroU8,
+    /// Writer lag tolerated before readiness fails.
+    pub replica_lag_threshold_chain_epochs: u64,
 }
 
 /// Slot captured once by each request before it reads canonical or wallet data.
-pub(crate) type WalletServingPairSlot = Arc<ArcSwap<WalletServingReadPair>>;
+pub type WalletServingPairSlot = Arc<ArcSwap<WalletServingReadPair>>;
 
 /// Errors that stop bootstrap or make a refresh generation ineligible.
 #[derive(Debug, Error)]
-pub(crate) enum WalletServingPairError {
+pub enum WalletServingPairError {
     /// The canonical secondary failed admission or catch-up.
     #[error(transparent)]
     Canonical(#[from] CanonicalStoreError),
@@ -113,12 +126,12 @@ pub(crate) enum WalletServingPairError {
     },
     /// Pair construction changed after pre-publication validation.
     #[error("wallet-serving read pair changed during publication: {0}")]
-    PairPublication(zinder_query::QueryError),
+    PairPublication(crate::QueryError),
 }
 
 /// Typed candidate outcome used for readiness and metrics classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WalletServingConvergence {
+pub enum WalletServingConvergence {
     /// Canonical and wallet secondaries are exact, but the writer advanced.
     ReplicaBehind,
     /// Canonical is current for the candidate but wallet projection trails it.
@@ -138,7 +151,7 @@ impl WalletServingConvergence {
 }
 
 /// Owns the two bounded reader generations and their publication slot.
-pub(crate) struct WalletServingPairPublisher {
+pub struct WalletServingPairPublisher {
     config: WalletServingPairConfig,
     writer_status: CanonicalWriterStatusClient,
     readiness: Readiness,
@@ -151,7 +164,7 @@ impl WalletServingPairPublisher {
     /// Opens, converges, and authenticates the first serving pair before the
     /// gRPC listener starts. Bootstrap fails closed instead of serving a
     /// primary handle or a mixed secondary view.
-    pub(crate) async fn bootstrap(
+    pub async fn bootstrap(
         config: WalletServingPairConfig,
         readiness: Readiness,
         writer_status_endpoint: &str,
@@ -181,7 +194,7 @@ impl WalletServingPairPublisher {
     /// current immutable pair untouched and updates readiness with its typed
     /// cause; it never falls back to a primary store.
     #[must_use = "await the publisher on shutdown so secondary handles close before process exit"]
-    pub(crate) fn spawn(mut self, cancel: CancellationToken) -> JoinHandle<()> {
+    pub fn spawn(mut self, cancel: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -190,7 +203,7 @@ impl WalletServingPairPublisher {
                         if let Err(error) = self.refresh_once().await {
                             self.record_refresh_failure(&error);
                             tracing::warn!(
-                                target: "zinder::compat_lightwalletd",
+                                target: "zinder::wallet_serving",
                                 event = "wallet_serving_pair_publisher_refresh_failed",
                                 error = %error,
                                 "inactive wallet-serving pair refresh failed; retaining the prior pair"
@@ -240,7 +253,7 @@ impl WalletServingPairPublisher {
             SecondaryGenerationState::Candidate { .. } => return Ok(true),
             SecondaryGenerationState::Published { lease } if !lease.is_reusable() => {
                 metrics::counter!(
-                    "zinder_compat_lightwalletd_wallet_serving_pair_publisher_generation_wait_total",
+                    "zinder_wallet_serving_pair_publisher_generation_wait_total",
                     "reason" => "in_flight_requests"
                 )
                 .increment(1);
@@ -354,7 +367,7 @@ impl WalletServingPairPublisher {
         match candidate_task_outcome {
             Ok(Ok(candidate)) => {
                 metrics::histogram!(
-                    "zinder_compat_lightwalletd_wallet_serving_pair_publisher_catchup_duration_seconds",
+                    "zinder_wallet_serving_pair_publisher_catchup_duration_seconds",
                     "status" => "ok"
                 )
                 .record(started_at.elapsed());
@@ -364,7 +377,7 @@ impl WalletServingPairPublisher {
             }
             Ok(Err(error)) => {
                 metrics::histogram!(
-                    "zinder_compat_lightwalletd_wallet_serving_pair_publisher_catchup_duration_seconds",
+                    "zinder_wallet_serving_pair_publisher_catchup_duration_seconds",
                     "status" => "error"
                 )
                 .record(started_at.elapsed());
@@ -422,12 +435,9 @@ impl WalletServingPairPublisher {
         self.published_generation = Some(generation);
         let visible_height = Some(pair.canonical_fence().visible_tip().height.value());
         self.readiness.set(ReadinessState::ready(visible_height));
-        metrics::counter!(
-            "zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total"
-        )
-        .increment(1);
+        metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);
         tracing::info!(
-            target: "zinder::compat_lightwalletd",
+            target: "zinder::wallet_serving",
             event = "wallet_serving_pair_publisher_published",
             generation,
             chain_epoch = pair.canonical_fence().chain_epoch_id().value(),
@@ -497,7 +507,7 @@ impl WalletServingPairPublisher {
             ));
         }
         metrics::counter!(
-            "zinder_compat_lightwalletd_wallet_serving_pair_publisher_refresh_total",
+            "zinder_wallet_serving_pair_publisher_refresh_total",
             "status" => "error",
             "error_class" => wallet_serving_pair_error_class(error)
         )
@@ -608,17 +618,20 @@ impl CanonicalWriterStatusClient {
             .map(tonic::Response::into_inner)
             .map_err(WalletServingPairError::WriterStatusRpc);
         metrics::histogram!(
-            "zinder_compat_lightwalletd_writer_status_duration_seconds",
+            "zinder_wallet_serving_writer_status_duration_seconds",
             "status" => if outcome.is_ok() { "ok" } else { "error" }
         )
         .record(started_at.elapsed());
         metrics::counter!(
-            "zinder_compat_lightwalletd_writer_status_total",
+            "zinder_wallet_serving_writer_status_total",
             "status" => if outcome.is_ok() { "ok" } else { "error" }
         )
         .increment(1);
-        metrics::gauge!("zinder_compat_lightwalletd_writer_status_available")
-            .set(if outcome.is_ok() { 1.0 } else { 0.0 });
+        metrics::gauge!("zinder_wallet_serving_writer_status_available").set(if outcome.is_ok() {
+            1.0
+        } else {
+            0.0
+        });
         outcome
     }
 }
@@ -662,7 +675,7 @@ fn writer_status_matches_source(
 
 fn record_pair_convergence(outcome: WalletServingConvergence) {
     metrics::counter!(
-        "zinder_compat_lightwalletd_wallet_serving_pair_publisher_convergence_total",
+        "zinder_wallet_serving_pair_publisher_convergence_total",
         "outcome" => outcome.label()
     )
     .increment(1);
@@ -674,10 +687,7 @@ fn record_replica_lag(lag_chain_epochs: u64) {
         reason = "The metric is a bounded operational lag signal; readiness compares the original integer."
     )]
     let lag = lag_chain_epochs as f64;
-    metrics::gauge!(
-        "zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs"
-    )
-    .set(lag);
+    metrics::gauge!("zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs").set(lag);
 }
 
 /// Returns the fail-closed readiness cause for a refresh error. `None` is
@@ -749,39 +759,54 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use parking_lot::Mutex;
-    use prost::Message as _;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
+    use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
     use tokio_util::sync::CancellationToken;
-    use tonic::{Request, Response, Status, transport::Server};
+    use tonic::{Code, Request, Response, Status, transport::Server};
+    use tonic_reflection::pb::v1::{
+        ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+        server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+    };
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
         CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
         CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
         ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId,
         Network, NetworkUpgradeActivation, NetworkUpgradeActivations, SerializedBytesDigest,
-        UnixTimestampMillis, encode_canonical_block_replay,
-        wire::{encode_internal_block_hash, encode_zinder_native_chain_name},
+        UnixTimestampMillis, encode_canonical_block_replay, wire::encode_zinder_native_chain_name,
     };
     use zinder_proto::{
-        compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock},
-        v1::ingest::{
-            AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
-            CanonicalEventPageResponse, CanonicalProjectionBuildLeaseResponse,
-            CanonicalWriterFence, CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
-            CreateCanonicalOwnerCheckpointRequest, CreateCanonicalOwnerCheckpointResponse,
-            ReadmitCanonicalOwnerCheckpointRequest, ReleaseCanonicalProjectionBuildLeaseRequest,
-            ReleaseCanonicalProjectionBuildLeaseResponse,
-            RenewCanonicalProjectionBuildLeaseRequest,
-            canonical_control_server::{CanonicalControl, CanonicalControlServer},
+        capabilities::{
+            WALLET_ADDRESS_TRANSPARENT_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+            WALLET_EVENTS_CHAIN_V1, WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
+            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_COMPACT_BLOCK_AT_V2,
+            WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
+            WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+            WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+            WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+        },
+        v1::{
+            ingest::{
+                AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
+                CanonicalEventPageResponse, CanonicalProjectionBuildLeaseResponse,
+                CanonicalWriterFence, CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
+                CreateCanonicalOwnerCheckpointRequest, CreateCanonicalOwnerCheckpointResponse,
+                ReadmitCanonicalOwnerCheckpointRequest,
+                ReleaseCanonicalProjectionBuildLeaseRequest,
+                ReleaseCanonicalProjectionBuildLeaseResponse,
+                RenewCanonicalProjectionBuildLeaseRequest,
+                canonical_control_server::{CanonicalControl, CanonicalControlServer},
+            },
+            wallet::{self, wallet_query_client::WalletQueryClient},
         },
     };
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+        CanonicalStoreBuildPlan, CanonicalStoreWorkload, EventStreamStartPosition,
+        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+        RocksDbResourceBudget, StreamCursorTokenV1, event_stream_start_message,
     };
     use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionSourcePosition};
     use zinder_wallet_rocksdb::{
@@ -793,6 +818,10 @@ mod tests {
         WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
         classify_pair_admission, publish_serving_pair, refresh_failure_not_ready_cause,
         writer_status_matches_source,
+    };
+    use crate::{
+        ServerInfoSettings, WalletCapabilityProfile, WalletQueryApi, WalletQueryGrpcAdapter,
+        WalletServingQuery, wallet_capability_strings,
     };
 
     #[test]
@@ -825,7 +854,7 @@ mod tests {
     fn equal_cursor_but_mutated_pair_evidence_is_a_schema_or_fence_mismatch() {
         let canonical = source_identity(3, 0x33);
         let wallet = source_identity(3, 0x44);
-        let error = zinder_query::WalletServingAdmissionError::WalletSourceMismatch {
+        let error = crate::WalletServingAdmissionError::WalletSourceMismatch {
             canonical: Box::new(canonical),
             wallet: Box::new(wallet),
         };
@@ -943,6 +972,224 @@ mod tests {
         let old_pair = slot.load_full();
         assert_eq!(old_pair.canonical_fence(), canonical_primary.event_fence());
         assert_eq!(old_pair.wallet_source(), initial_source);
+        let query = WalletServingQuery::from_serving_pair_slot(
+            Arc::clone(&slot),
+            (),
+            Arc::new(activations.clone()),
+        );
+        let visible_tip = query.visible_tip_block(None).await?;
+        let settled_tip = query.settled_tip_block(None).await?;
+        assert_eq!(
+            BlockId::new(visible_tip.height, visible_tip.block_hash),
+            old_pair.canonical_fence().visible_tip()
+        );
+        assert_eq!(
+            BlockId::new(settled_tip.height, settled_tip.block_hash),
+            old_pair.wallet_source().settled_tip()
+        );
+        let pin_outcome = query
+            .visible_tip_block(Some(ChainEpochId::new(
+                visible_tip.chain_epoch.id.value().saturating_add(1),
+            )))
+            .await;
+        assert!(matches!(
+            pin_outcome,
+            Err(crate::QueryError::ChainEpochPinUnavailable { .. })
+        ));
+        let server_info_settings = ServerInfoSettings {
+            transaction_broadcast_enabled: true,
+            capability_profile: WalletCapabilityProfile::ExactPair,
+            ..ServerInfoSettings::default()
+        };
+        let expected_capabilities = wallet_capability_strings(&server_info_settings);
+        let grpc_adapter = WalletQueryGrpcAdapter::new(query.clone(), server_info_settings);
+        let reflection_service = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
+            .build_v1()?;
+        let traffic_readiness = zinder_runtime::Readiness::default();
+        traffic_readiness.set(zinder_runtime::ReadinessState::starting());
+        let wallet_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let wallet_endpoint = format!("http://{}", wallet_listener.local_addr()?);
+        let wallet_cancel = CancellationToken::new();
+        let wallet_server_cancel = wallet_cancel.clone();
+        let query_readiness =
+            zinder_runtime::TrafficReadinessInterceptor::new(traffic_readiness.clone());
+        let reflection_readiness =
+            zinder_runtime::TrafficReadinessInterceptor::new(traffic_readiness.clone());
+        let wallet_server_task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    grpc_adapter.into_server(),
+                    query_readiness,
+                ))
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    reflection_service,
+                    reflection_readiness,
+                ))
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(wallet_listener),
+                    wallet_server_cancel.cancelled_owned(),
+                )
+                .await
+        });
+        let mut wallet_client = WalletQueryClient::connect(wallet_endpoint.clone()).await?;
+        let not_ready = wallet_client
+            .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
+            .await
+            .err()
+            .ok_or("native traffic must be refused before readiness")?;
+        assert_eq!(not_ready.code(), Code::Unavailable);
+        let reflection_channel = tonic::transport::Endpoint::new(wallet_endpoint.clone())?
+            .connect()
+            .await?;
+        let mut reflection_client = ServerReflectionClient::new(reflection_channel);
+        let reflection_request = Request::new(tokio_stream::once(ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        }));
+        let reflection_not_ready = reflection_client
+            .server_reflection_info(reflection_request)
+            .await
+            .err()
+            .ok_or("reflection traffic must be refused before readiness")?;
+        assert_eq!(reflection_not_ready.code(), Code::Unavailable);
+        traffic_readiness.set(zinder_runtime::ReadinessState::ready(Some(
+            visible_tip.height.value(),
+        )));
+        let visible_response = wallet_client
+            .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
+            .await?
+            .into_inner();
+        let mut compact_blocks = wallet_client
+            .compact_blocks_in_range(wallet::CompactBlocksInRangeRequest {
+                start_height: visible_tip.height.value(),
+                end_height: visible_tip.height.value(),
+                at_epoch_id: Some(visible_tip.chain_epoch.id.value()),
+            })
+            .await?
+            .into_inner();
+        let compact_block = compact_blocks
+            .next()
+            .await
+            .ok_or("native compact range must return the visible block")??;
+        assert!(compact_blocks.next().await.is_none());
+        assert_eq!(
+            compact_block
+                .chain_view
+                .as_ref()
+                .and_then(|view| view.chain_epoch.as_ref())
+                .map(|epoch| epoch.chain_epoch_id),
+            Some(visible_tip.chain_epoch.id.value())
+        );
+        let settled_response = wallet_client
+            .settled_tip_block(wallet::SettledTipBlockRequest { at_epoch_id: None })
+            .await?
+            .into_inner();
+        let server_info = wallet_client
+            .server_info(wallet::ServerInfoRequest {})
+            .await?
+            .into_inner()
+            .info
+            .ok_or("native server info response must contain a descriptor")?;
+        assert_eq!(
+            visible_response
+                .visible_tip_block
+                .ok_or("native visible-tip response must contain a block")?
+                .height,
+            visible_tip.height.value()
+        );
+        assert_eq!(
+            settled_response
+                .settled_tip_block
+                .ok_or("native settled-tip response must contain a block")?
+                .height,
+            settled_tip.height.value()
+        );
+        let mut chain_events = wallet_client
+            .chain_events(wallet::ChainEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::EarliestRetained,
+                )),
+                family: wallet::ChainEventStreamFamily::Visible as i32,
+                address_filter: Vec::new(),
+            })
+            .await?
+            .into_inner();
+        let first_chain_event = chain_events
+            .next()
+            .await
+            .ok_or("native exact-pair event stream must return the baseline event")??;
+        assert_eq!(first_chain_event.event_sequence, 1);
+        assert!(!first_chain_event.cursor.is_empty());
+        let advertised = server_info
+            .common
+            .ok_or("native server info must contain common metadata")?
+            .capabilities;
+        assert_eq!(
+            advertised,
+            expected_capabilities
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        for required in [
+            WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+            WALLET_READ_SETTLED_TIP_BLOCK_V1,
+            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
+            WALLET_READ_COMPACT_BLOCK_AT_V2,
+            WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+            WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+            WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
+            WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+            WALLET_READ_TRANSACTION_BY_ID_V2,
+            WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+            WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+            WALLET_EVENTS_CHAIN_V1,
+        ] {
+            assert!(
+                advertised.iter().any(|capability| capability == required),
+                "exact-pair profile omitted Zally sync capability {required}"
+            );
+        }
+        let reflection_channel = tonic::transport::Endpoint::new(wallet_endpoint)?
+            .connect()
+            .await?;
+        let mut reflection_client = ServerReflectionClient::new(reflection_channel);
+        let reflection_request = Request::new(tokio_stream::once(ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        }));
+        let mut reflection_stream = reflection_client
+            .server_reflection_info(reflection_request)
+            .await?
+            .into_inner();
+        let reflection_response = reflection_stream
+            .next()
+            .await
+            .ok_or("reflection stream must return a service list")??
+            .message_response
+            .ok_or("reflection response must contain a service list")?;
+        let MessageResponse::ListServicesResponse(services) = reflection_response else {
+            return Err("reflection response must list services".into());
+        };
+        assert!(
+            services
+                .service
+                .iter()
+                .any(|service| service.name == "zinder.v1.wallet.WalletQuery")
+        );
+        drop(chain_events);
+        let mut live_chain_events = wallet_client
+            .chain_events(wallet::ChainEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::LiveTail,
+                )),
+                family: wallet::ChainEventStreamFamily::Visible as i32,
+                address_filter: Vec::new(),
+            })
+            .await?
+            .into_inner();
         assert!(
             canonical_secondary_root
                 .join("generation-0")
@@ -1002,6 +1249,42 @@ mod tests {
         assert!(!Arc::ptr_eq(&old_pair, &refreshed_pair));
         assert_eq!(refreshed_pair.canonical_fence(), append_fence);
         assert_eq!(refreshed_pair.wallet_source(), updated_source);
+        let appended_event = tokio::time::timeout(Duration::from_secs(5), live_chain_events.next())
+            .await?
+            .ok_or("live-tail stream closed before the post-subscribe event")??;
+        assert_eq!(appended_event.event_sequence, 2);
+        let mut resumed_chain_events = wallet_client
+            .chain_events(wallet::ChainEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::AfterCursor(StreamCursorTokenV1::from_bytes(
+                        first_chain_event.cursor,
+                    )),
+                )),
+                family: wallet::ChainEventStreamFamily::Visible as i32,
+                address_filter: Vec::new(),
+            })
+            .await?
+            .into_inner();
+        let resumed_event =
+            tokio::time::timeout(Duration::from_secs(5), resumed_chain_events.next())
+                .await?
+                .ok_or("after-cursor stream closed across the serving-pair swap")??;
+        assert_eq!(resumed_event.event_sequence, 2);
+        let family_result = query
+            .resolve_chain_events_start(
+                EventStreamStartPosition::AfterCursor(StreamCursorTokenV1::from_bytes(
+                    appended_event.cursor.clone(),
+                )),
+                zinder_store::ChainEventStreamFamily::Settled,
+            )
+            .await;
+        let Err(family_error) = family_result else {
+            return Err("non-default family mismatch must fail closed".into());
+        };
+        assert!(matches!(
+            family_error,
+            crate::QueryError::ChainEventCursorInvalid { .. }
+        ));
         assert_eq!(published_generation_is_reusable(&publisher, 0), Some(false));
         assert!(
             canonical_secondary_root
@@ -1018,6 +1301,10 @@ mod tests {
 
         drop(old_pair);
         assert_eq!(published_generation_is_reusable(&publisher, 0), Some(true));
+        drop(live_chain_events);
+        drop(resumed_chain_events);
+        wallet_cancel.cancel();
+        wallet_server_task.await??;
 
         let mut mutated_status = writer_status_for_store(&canonical_primary);
         let writer_fence = mutated_status
@@ -1173,28 +1460,21 @@ mod tests {
             ),
             transactions: Vec::new(),
         };
-        let compact_payload = LightwalletdCompactBlock {
-            height: u64::from(height.value()),
-            hash: encode_internal_block_hash(block_hash).to_vec(),
-            prev_hash: encode_internal_block_hash(parent_hash).to_vec(),
-            chain_metadata: Some(ChainMetadata {
-                sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 0,
-                ironwood_commitment_tree_size: 0,
-            }),
-            ..Default::default()
-        }
-        .encode_to_vec();
         CanonicalBuildBlock {
             replay_envelope: encode_canonical_block_replay(
                 &facts,
                 CanonicalBlockReplayFormatVersion::V1,
                 CanonicalBlockFactsDigestVersion::V1,
             ),
-            compact_block: zinder_core::CompactBlockArtifact::new(
-                height,
-                block_hash,
-                compact_payload,
+            compact_block: zinder_core::CompactBlockArtifact::empty(
+                BlockId::new(height, block_hash),
+                parent_hash,
+                height.value(),
+                zinder_core::CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
             ),
             tip_metadata: ChainTipMetadata::new(0, 0, 0),
             tree_state_checkpoint: Some(CommitmentTreeCheckpoint::new(

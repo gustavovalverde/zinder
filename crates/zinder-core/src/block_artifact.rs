@@ -1,6 +1,7 @@
 //! Durable block fact and blob values.
 
-use crate::{BlockHash, BlockHeader, BlockHeight};
+use crate::{BlockHash, BlockHeader, BlockHeight, BlockId, CompactTransactionData};
+use thiserror::Error;
 
 /// Canonical block-header facts indexed by block height.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,29 +163,157 @@ impl BlockTransactionIndexArtifact {
     }
 }
 
-/// Wallet-oriented compact block artifact.
+/// Commitment-tree sizes after one compact block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactChainMetadata {
+    /// Sapling note-commitment tree size.
+    pub sapling_commitment_tree_size: u32,
+    /// Orchard note-commitment tree size.
+    pub orchard_commitment_tree_size: u32,
+    /// Ironwood note-commitment tree size.
+    pub ironwood_commitment_tree_size: u32,
+}
+
+/// Wallet-relevant data from one mined transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactTransaction {
+    /// Position within the block.
+    pub index: u64,
+    /// Consensus transaction identifier.
+    pub transaction_id: crate::TransactionId,
+    /// Wallet scan fields.
+    pub data: CompactTransactionData,
+}
+
+/// Wallet-oriented structured compact block artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompactBlockArtifact {
     /// Height of the source block.
-    pub height: BlockHeight,
+    height: BlockHeight,
     /// Hash of the full block this compact artifact was built from.
-    pub block_hash: BlockHash,
-    /// Compact block payload bytes.
-    pub payload_bytes: Vec<u8>,
+    block_hash: BlockHash,
+    /// Parent block hash.
+    previous_block_hash: BlockHash,
+    /// Block time as Unix seconds.
+    time: u32,
+    /// Wallet-relevant transactions in block order.
+    transactions: Vec<CompactTransaction>,
+    /// Commitment-tree sizes after this block.
+    chain_metadata: CompactChainMetadata,
 }
 
 impl CompactBlockArtifact {
-    /// Creates a compact block artifact.
+    /// Creates an artifact with no wallet-relevant transactions.
     #[must_use]
-    pub fn new(
-        height: BlockHeight,
-        block_hash: BlockHash,
-        payload_bytes: impl Into<Vec<u8>>,
+    pub const fn empty(
+        block_id: BlockId,
+        previous_block_hash: BlockHash,
+        time: u32,
+        chain_metadata: CompactChainMetadata,
     ) -> Self {
         Self {
-            height,
-            block_hash,
-            payload_bytes: payload_bytes.into(),
+            height: block_id.height,
+            block_hash: block_id.hash,
+            previous_block_hash,
+            time,
+            transactions: Vec::new(),
+            chain_metadata,
         }
     }
+
+    /// Creates a compact block artifact.
+    pub fn new(
+        block_id: BlockId,
+        previous_block_hash: BlockHash,
+        time: u32,
+        transactions: Vec<CompactTransaction>,
+        chain_metadata: CompactChainMetadata,
+    ) -> Result<Self, CompactBlockArtifactError> {
+        if transactions
+            .windows(2)
+            .any(|pair| pair[0].index >= pair[1].index)
+        {
+            return Err(CompactBlockArtifactError::InvalidTransactionOrder);
+        }
+        Ok(Self {
+            height: block_id.height,
+            block_hash: block_id.hash,
+            previous_block_hash,
+            time,
+            transactions,
+            chain_metadata,
+        })
+    }
+
+    /// Returns the block height.
+    #[must_use]
+    pub const fn height(&self) -> BlockHeight {
+        self.height
+    }
+
+    /// Returns the block hash.
+    #[must_use]
+    pub const fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
+    /// Returns the parent block hash.
+    #[must_use]
+    pub const fn previous_block_hash(&self) -> BlockHash {
+        self.previous_block_hash
+    }
+
+    /// Returns the block time as Unix seconds.
+    #[must_use]
+    pub const fn time(&self) -> u32 {
+        self.time
+    }
+
+    /// Returns wallet-relevant transactions in block order.
+    #[must_use]
+    pub fn transactions(&self) -> &[CompactTransaction] {
+        &self.transactions
+    }
+
+    /// Returns commitment-tree sizes after this block.
+    #[must_use]
+    pub const fn chain_metadata(&self) -> CompactChainMetadata {
+        self.chain_metadata
+    }
+
+    /// Consumes the artifact into its validated constituent fields.
+    #[must_use]
+    pub fn into_parts(self) -> CompactBlockArtifactParts {
+        CompactBlockArtifactParts {
+            block_id: BlockId::new(self.height, self.block_hash),
+            previous_block_hash: self.previous_block_hash,
+            time: self.time,
+            transactions: self.transactions,
+            chain_metadata: self.chain_metadata,
+        }
+    }
+}
+
+/// Validated constituent fields of a compact block artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactBlockArtifactParts {
+    /// Block identity.
+    pub block_id: BlockId,
+    /// Parent block hash.
+    pub previous_block_hash: BlockHash,
+    /// Block time as Unix seconds.
+    pub time: u32,
+    /// Wallet-relevant transactions in block order.
+    pub transactions: Vec<CompactTransaction>,
+    /// Commitment-tree sizes after the block.
+    pub chain_metadata: CompactChainMetadata,
+}
+
+/// Invalid structured compact block artifact.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CompactBlockArtifactError {
+    /// Transaction indexes are duplicated or decrease.
+    #[error("compact transaction indexes are not strictly increasing")]
+    InvalidTransactionOrder,
 }

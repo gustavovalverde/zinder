@@ -812,13 +812,13 @@ mod tests {
     use zinder_core::SUBTREE_LEAF_COUNT;
     use zinder_core::{
         BlockHash, BlockId, CanonicalTransactionFacts, CommitmentTreeFrontier,
-        CommitmentTreeFrontiers, ConsensusBranchId, NetworkUpgradeActivation, ShieldedProtocol,
-        SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact, TransactionId,
-        TransactionIntrinsicValueBalances, TransactionLocation, TransparentAddressScriptHash,
-        TransparentInputFact, TransparentOutPoint, TransparentOutputFact, TransparentUnspentOutput,
-        UnixTimestampMillis, wire::encode_internal_block_hash,
+        CommitmentTreeFrontiers, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
+        CompactShieldedAction, CompactTransaction, CompactTransactionData, ConsensusBranchId,
+        NetworkUpgradeActivation, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
+        TransactionBlobArtifact, TransactionId, TransactionIntrinsicValueBalances,
+        TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
+        TransparentOutPoint, TransparentOutputFact, TransparentUnspentOutput, UnixTimestampMillis,
     };
-    use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
     use zinder_source::{
         NodeCapabilities, NodeCapability, SourceBlock, SourceBlockHeader, SourceChainSegment,
         SourceChainSegmentLimits, SourceChainSegmentStats, SourceError, SourceSubtreeRoot,
@@ -3196,24 +3196,57 @@ mod tests {
         sapling_tree_size_addition: u32,
         orchard_tree_size_addition: u32,
     ) -> PreparedCanonicalBlock {
-        let block_header = zinder_core::BlockHeaderArtifact::new(
-            source_block.height,
-            source_block.hash,
-            source_block.parent_hash,
-            [0; 32],
-            [0; 32],
-            i64::from(source_block.block_time_seconds),
-            0,
-            [0; 32],
-            0,
-            u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+        let block_header = test_block_header(source_block);
+        let transaction_id =
+            TransactionId::from_bytes([source_block.height.value().to_le_bytes()[0]; 32]);
+        let transactions = test_transaction_facts(
+            transaction_id,
+            sapling_tree_size_addition,
+            orchard_tree_size_addition,
         );
         let facts = zinder_core::CanonicalBlockFacts {
             block_header: block_header.clone(),
             serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(
                 &source_block.raw_block_bytes,
             ),
-            transactions: Vec::new(),
+            transactions,
+        };
+        let compact_transactions = test_compact_transactions(
+            transaction_id,
+            sapling_tree_size_addition,
+            orchard_tree_size_addition,
+        );
+        let block_id = BlockId::new(source_block.height, source_block.hash);
+        let compact_block = CompactBlockArtifact::new(
+            block_id,
+            source_block.parent_hash,
+            source_block.block_time_seconds,
+            compact_transactions,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        )
+        .unwrap_or_else(|_| {
+            CompactBlockArtifact::empty(
+                block_id,
+                source_block.parent_hash,
+                source_block.block_time_seconds,
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            )
+        });
+        let transaction_blobs = if facts.transactions.is_empty() {
+            Vec::new()
+        } else {
+            vec![TransactionBlobArtifact::new(
+                TransactionLocation::new(transaction_id, source_block.height, source_block.hash, 0),
+                Vec::new(),
+            )]
         };
         PreparedCanonicalBlock {
             replay_envelope: zinder_core::encode_canonical_block_replay(
@@ -3228,24 +3261,88 @@ mod tests {
                     block_header.parent_hash,
                     source_block.raw_block_bytes.clone(),
                 )),
-                transaction_blobs: Vec::new(),
+                transaction_blobs,
             },
             facts,
-            partial_compact_block: LightwalletdCompactBlock {
-                height: u64::from(source_block.height.value()),
-                hash: encode_internal_block_hash(source_block.hash).to_vec(),
-                prev_hash: encode_internal_block_hash(source_block.parent_hash).to_vec(),
-                time: source_block.block_time_seconds,
-                header: Vec::new(),
-                vtx: Vec::new(),
-                chain_metadata: None,
-            },
+            partial_compact_block: compact_block,
             tree_size_additions: CommitmentTreeSizes {
                 sapling: sapling_tree_size_addition,
                 orchard: orchard_tree_size_addition,
                 ironwood: 0,
             },
         }
+    }
+
+    fn test_block_header(source_block: &SourceBlock) -> zinder_core::BlockHeaderArtifact {
+        zinder_core::BlockHeaderArtifact::new(
+            source_block.height,
+            source_block.hash,
+            source_block.parent_hash,
+            [0; 32],
+            [0; 32],
+            i64::from(source_block.block_time_seconds),
+            0,
+            [0; 32],
+            0,
+            u64::try_from(source_block.raw_block_bytes.len()).unwrap_or(u64::MAX),
+        )
+    }
+
+    fn test_transaction_facts(
+        transaction_id: TransactionId,
+        sapling_tree_size_addition: u32,
+        orchard_tree_size_addition: u32,
+    ) -> Vec<CanonicalTransactionFacts> {
+        if sapling_tree_size_addition == 0 && orchard_tree_size_addition == 0 {
+            return Vec::new();
+        }
+        let mut public_facts =
+            zinder_testkit::synthetic_transaction_public_facts(transaction_id, 0);
+        public_facts.counts.sapling_output_count = sapling_tree_size_addition;
+        public_facts.counts.orchard_action_count = orchard_tree_size_addition;
+        vec![CanonicalTransactionFacts {
+            public_facts,
+            serialized_bytes_digest: zinder_core::SerializedBytesDigest::from_serialized_bytes(&[]),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: Vec::new(),
+        }]
+    }
+
+    fn test_compact_transactions(
+        transaction_id: TransactionId,
+        sapling_tree_size_addition: u32,
+        orchard_tree_size_addition: u32,
+    ) -> Vec<CompactTransaction> {
+        if sapling_tree_size_addition == 0 && orchard_tree_size_addition == 0 {
+            return Vec::new();
+        }
+        vec![CompactTransaction {
+            index: 0,
+            transaction_id,
+            data: CompactTransactionData {
+                sapling_outputs: vec![
+                    CompactSaplingOutput {
+                        commitment: [0; 32],
+                        ephemeral_key: [0; 32],
+                        ciphertext: [0; 52],
+                    };
+                    usize::try_from(sapling_tree_size_addition)
+                        .unwrap_or(usize::MAX)
+                ],
+                orchard_actions: vec![
+                    CompactShieldedAction {
+                        nullifier: [0; 32],
+                        commitment: [0; 32],
+                        ephemeral_key: [0; 32],
+                        ciphertext: [0; 52],
+                    };
+                    usize::try_from(orchard_tree_size_addition)
+                        .unwrap_or(usize::MAX)
+                ],
+                ..CompactTransactionData::default()
+            },
+        }]
     }
 
     fn refresh_test_replay_envelope(prepared: &mut PreparedCanonicalBlock) {

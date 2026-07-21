@@ -9,7 +9,11 @@ use zinder_core::wire::{
     decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, encode_rpc_block_hash_hex,
     encode_rpc_transaction_id_hex,
 };
-use zinder_core::{BlockHash, TransactionId};
+use zinder_core::{
+    BlockHash, CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction,
+    CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, MempoolEntry,
+    MempoolObservation, RawTransactionBytes, TransactionId, UnixTimestampMillis,
+};
 use zinder_proto::v1::{ingest, ops, wallet};
 
 #[test]
@@ -90,14 +94,182 @@ fn compact_block_round_trips_through_prost() -> eyre::Result<()> {
     let compact_block = wallet::CompactBlock {
         height: 42,
         block_hash: "33".repeat(32),
-        payload_bytes: vec![0x01, 0x02, 0x03],
+        previous_block_hash: "22".repeat(32),
+        time: 1_774_670_000,
+        transactions: vec![wallet::CompactTransaction {
+            index: 3,
+            transaction_id: vec![0x44; 32],
+            data: Some(wallet::CompactTransactionData {
+                fee_zat: Some(1_000),
+                sapling_spends: vec![wallet::CompactSaplingSpend {
+                    nullifier: vec![0x45; 32],
+                }],
+                sapling_outputs: vec![wallet::CompactSaplingOutput {
+                    commitment: vec![0x46; 32],
+                    ephemeral_key: vec![0x47; 32],
+                    ciphertext: vec![0x48; 52],
+                }],
+                orchard_actions: vec![wallet::CompactShieldedAction {
+                    nullifier: vec![0x49; 32],
+                    commitment: vec![0x4a; 32],
+                    ephemeral_key: vec![0x4b; 32],
+                    ciphertext: vec![0x4c; 52],
+                }],
+                ironwood_actions: vec![wallet::CompactShieldedAction {
+                    nullifier: vec![0x4d; 32],
+                    commitment: vec![0x4e; 32],
+                    ephemeral_key: vec![0x4f; 32],
+                    ciphertext: vec![0x50; 52],
+                }],
+                transparent_inputs: vec![wallet::CompactTransparentInput {
+                    previous_transaction_id: vec![0x51; 32],
+                    previous_output_index: 7,
+                }],
+                transparent_outputs: vec![wallet::CompactTransparentOutput {
+                    value_zat: 2_000,
+                    script_pub_key: vec![0x52, 0x53],
+                }],
+            }),
+        }],
+        chain_metadata: Some(wallet::CompactChainMetadata {
+            sapling_commitment_tree_size: 10,
+            orchard_commitment_tree_size: 11,
+            ironwood_commitment_tree_size: 12,
+        }),
     };
     let decoded_compact_block = round_trip(&compact_block)?;
 
-    assert_eq!(decoded_compact_block.height, 42);
-    assert_eq!(decoded_compact_block.block_hash, "33".repeat(32));
-    assert_eq!(decoded_compact_block.payload_bytes, vec![0x01, 0x02, 0x03]);
+    assert_eq!(decoded_compact_block, compact_block);
 
+    Ok(())
+}
+
+#[test]
+fn compact_block_decoder_rejects_non_increasing_transaction_indexes() {
+    let data = wallet::CompactTransactionData::default();
+    let block = wallet::CompactBlock {
+        height: 42,
+        block_hash: "33".repeat(32),
+        previous_block_hash: "22".repeat(32),
+        time: 1,
+        transactions: vec![
+            wallet::CompactTransaction {
+                index: 4,
+                transaction_id: vec![0x44; 32],
+                data: Some(data.clone()),
+            },
+            wallet::CompactTransaction {
+                index: 4,
+                transaction_id: vec![0x45; 32],
+                data: Some(data),
+            },
+        ],
+        chain_metadata: Some(wallet::CompactChainMetadata::default()),
+    };
+
+    assert_eq!(
+        zinder_proto::wire::compact_block_from_message(block),
+        Err(zinder_proto::wire::WalletWireDecodeError::InvalidCompactTransactionOrder)
+    );
+}
+
+#[test]
+fn chain_epoch_decoder_rejects_settled_tip_above_visible_tip() -> eyre::Result<()> {
+    let mut epoch = synthetic_chain_epoch();
+    epoch
+        .settled_tip
+        .as_mut()
+        .ok_or_else(|| eyre!("fixture settled tip missing"))?
+        .height = 43;
+    assert_eq!(
+        zinder_proto::wire::chain_epoch_from_message(epoch),
+        Err(zinder_proto::wire::WalletWireDecodeError::InvalidChainEpoch)
+    );
+    Ok(())
+}
+
+#[test]
+fn chain_epoch_decoder_rejects_distinct_hashes_at_same_height() -> eyre::Result<()> {
+    let mut epoch = synthetic_chain_epoch();
+    let visible = epoch
+        .visible_tip
+        .as_ref()
+        .ok_or_else(|| eyre!("fixture visible tip missing"))?
+        .clone();
+    let settled = epoch
+        .settled_tip
+        .as_mut()
+        .ok_or_else(|| eyre!("fixture settled tip missing"))?;
+    settled.height = visible.height;
+    settled.hash = "99".repeat(32);
+    assert_eq!(
+        zinder_proto::wire::chain_epoch_from_message(epoch),
+        Err(zinder_proto::wire::WalletWireDecodeError::InvalidChainEpoch)
+    );
+    Ok(())
+}
+
+#[test]
+fn mempool_entry_round_trips_shared_all_pool_scan_data() -> eyre::Result<()> {
+    let transaction_id = TransactionId::from_bytes([0x44; 32]);
+    let scan_data = CompactTransactionData {
+        fee_zat: None,
+        sapling_spends: vec![CompactSaplingSpend {
+            nullifier: [0x45; 32],
+        }],
+        sapling_outputs: vec![CompactSaplingOutput {
+            commitment: [0x46; 32],
+            ephemeral_key: [0x47; 32],
+            ciphertext: [0x48; 52],
+        }],
+        orchard_actions: vec![CompactShieldedAction {
+            nullifier: [0x49; 32],
+            commitment: [0x4a; 32],
+            ephemeral_key: [0x4b; 32],
+            ciphertext: [0x4c; 52],
+        }],
+        ironwood_actions: vec![CompactShieldedAction {
+            nullifier: [0x4d; 32],
+            commitment: [0x4e; 32],
+            ephemeral_key: [0x4f; 32],
+            ciphertext: [0x50; 52],
+        }],
+        transparent_inputs: vec![CompactTransparentInput {
+            previous_transaction_id: TransactionId::from_bytes([0x51; 32]),
+            previous_output_index: 7,
+        }],
+        transparent_outputs: vec![CompactTransparentOutput {
+            value_zat: 2_000,
+            script_pub_key: vec![0x52, 0x53],
+        }],
+    };
+    let entry = MempoolEntry::new(
+        transaction_id,
+        None,
+        RawTransactionBytes::new(vec![0x01, 0x02]),
+        scan_data,
+        MempoolObservation {
+            first_seen_unix_millis: UnixTimestampMillis::new(1_774_670_000_000),
+            first_seen_chain_epoch: zinder_proto::wire::chain_epoch_from_message(
+                synthetic_chain_epoch(),
+            )?,
+        },
+    )?;
+
+    let message = zinder_proto::wire::mempool_entry_message(&entry);
+    let scan_message = message
+        .compact_transaction_data
+        .as_ref()
+        .ok_or_else(|| eyre!("compact transaction data missing"))?;
+    assert_eq!(scan_message.fee_zat, None);
+    assert_eq!(scan_message.orchard_actions.len(), 1);
+    assert_eq!(scan_message.ironwood_actions.len(), 1);
+    assert_eq!(message.transaction_id, "44".repeat(32));
+    assert_eq!(message.transparent_outputs.len(), 1);
+    assert_eq!(message.transparent_spends.len(), 1);
+
+    let decoded = zinder_proto::wire::mempool_entry_from_message(round_trip(&message)?)?;
+    assert_eq!(decoded, entry);
     Ok(())
 }
 
@@ -288,9 +460,15 @@ fn transaction_status_response_carries_in_mempool_location() -> eyre::Result<()>
         chain_view: Some(synthetic_chain_view()),
         location: Some(wallet::TransactionLocation {
             location: Some(wallet::transaction_location::Location::InMempool(
-                wallet::MempoolTransaction {
-                    payload_bytes: vec![0x07, 0x08, 0x09],
-                    first_seen_unix_seconds: 1_774_670_111,
+                wallet::MempoolEntry {
+                    transaction_id: "07".repeat(32),
+                    auth_digest: String::new(),
+                    raw_transaction_bytes: vec![0x07, 0x08, 0x09],
+                    compact_transaction_data: Some(wallet::CompactTransactionData::default()),
+                    first_seen_unix_millis: 1_774_670_111_000,
+                    first_seen_chain_epoch: Some(synthetic_chain_epoch()),
+                    transparent_outputs: Vec::new(),
+                    transparent_spends: Vec::new(),
                 },
             )),
         }),
@@ -304,8 +482,8 @@ fn transaction_status_response_carries_in_mempool_location() -> eyre::Result<()>
     let wallet::transaction_location::Location::InMempool(mempool) = location else {
         return Err(eyre!("expected in_mempool arm"));
     };
-    assert_eq!(mempool.payload_bytes, vec![0x07, 0x08, 0x09]);
-    assert_eq!(mempool.first_seen_unix_seconds, 1_774_670_111);
+    assert_eq!(mempool.raw_transaction_bytes, vec![0x07, 0x08, 0x09]);
+    assert_eq!(mempool.first_seen_unix_millis, 1_774_670_111_000);
 
     Ok(())
 }
@@ -532,12 +710,14 @@ fn tree_state_checkpoint_response_round_trips_through_prost() -> eyre::Result<()
         height: 42,
         block_hash: "66".repeat(32),
         payload_bytes: br#"{"hash":"block"}"#.to_vec(),
+        block_time_seconds: Some(1_774_668_700),
     };
     let decoded_response = round_trip(&response)?;
 
     assert_eq!(decoded_response.height, 42);
     assert_eq!(decoded_response.block_hash, "66".repeat(32));
     assert_eq!(decoded_response.payload_bytes, br#"{"hash":"block"}"#);
+    assert_eq!(decoded_response.block_time_seconds, Some(1_774_668_700));
     assert!(decoded_response.chain_view.is_some());
 
     Ok(())
@@ -948,7 +1128,7 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
     let decoded = round_trip(&server_info)?;
 
     assert_eq!(decoded.contract_revision, zinder_proto::CONTRACT_REVISION);
-    assert_eq!(decoded.contract_revision, 1);
+    assert_eq!(decoded.contract_revision, 2);
     assert_eq!(decoded.materialized_view_preset, "wallet");
     assert_eq!(
         decoded.materialized_view_identities,

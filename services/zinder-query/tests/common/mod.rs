@@ -12,29 +12,29 @@
     reason = "Items are reachable via `mod support;` from each test binary."
 )]
 
-use prost::Message;
 use zinder_core::{
-    BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, Network, TransparentOutputArtifact, TransparentSpendFact,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, ChainEpoch, ChainEpochId,
+    ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
+    CompactTransaction, CompactTransactionData, CompactTransparentInput, CompactTransparentOutput,
+    Network, TransactionId, TransactionLocation, TransparentOutputArtifact, TransparentSpendFact,
     UnixTimestampMillis,
 };
-use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_proto::v1::wallet;
 use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts};
 use zinder_testkit::{
     FixtureTransactionRows, build_fixture_transaction_rows, encode_fixture_block_replay,
+    synthetic_transaction_public_facts,
 };
 
 /// Builds commit-ready canonical artifacts whose replay envelopes and
 /// transparent projection rows come from the same fixture transaction rows.
-#[must_use]
 pub fn chain_epoch_artifacts_with_transparent_facts(
     chain_epoch: ChainEpoch,
     block_headers: Vec<BlockHeaderArtifact>,
     compact_blocks: Vec<CompactBlockArtifact>,
     transparent_outputs: &[TransparentOutputArtifact],
     transparent_spends: Vec<TransparentSpendFact>,
-) -> ChainEpochArtifacts {
+) -> eyre::Result<ChainEpochArtifacts> {
     let transaction_rows =
         build_fixture_transaction_rows(&[], transparent_outputs, &transparent_spends);
     let block_replay_envelopes = block_headers
@@ -51,6 +51,8 @@ pub fn chain_epoch_artifacts_with_transparent_facts(
             encode_fixture_block_replay(block_header, &block_transaction_rows)
         })
         .collect();
+    let compact_blocks =
+        compact_blocks_with_transaction_rows(&block_headers, compact_blocks, &transaction_rows)?;
     let mut artifacts = ChainEpochArtifacts::new(
         chain_epoch,
         block_headers,
@@ -63,7 +65,83 @@ pub fn chain_epoch_artifacts_with_transparent_facts(
     if !transparent_spends.is_empty() {
         artifacts = artifacts.with_transparent_spend_facts(transparent_spends);
     }
-    artifacts
+    Ok(artifacts)
+}
+
+fn compact_blocks_with_transaction_rows(
+    block_headers: &[BlockHeaderArtifact],
+    compact_blocks: Vec<CompactBlockArtifact>,
+    transaction_rows: &[FixtureTransactionRows],
+) -> eyre::Result<Vec<CompactBlockArtifact>> {
+    compact_blocks
+        .into_iter()
+        .map(|compact_block| {
+            let parts = compact_block.into_parts();
+            let header = block_headers
+                .iter()
+                .find(|header| header.height == parts.block_id.height)
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "compact block at height {} has no canonical header",
+                        parts.block_id.height.value()
+                    )
+                })?;
+            let time = u32::try_from(header.block_time).map_err(|_| {
+                eyre::eyre!(
+                    "canonical block time {} is not representable as u32",
+                    header.block_time
+                )
+            })?;
+            let transactions = transaction_rows
+                .iter()
+                .filter(|rows| {
+                    rows.location.block_height == header.height
+                        && rows.location.block_hash == header.block_hash
+                })
+                .filter_map(|rows| {
+                    let transparent_inputs = rows
+                        .facts
+                        .transparent_inputs
+                        .iter()
+                        .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
+                        .map(|input| CompactTransparentInput {
+                            previous_transaction_id: input.spent_outpoint.transaction_id,
+                            previous_output_index: input.spent_outpoint.output_index,
+                        })
+                        .collect::<Vec<_>>();
+                    let transparent_outputs = rows
+                        .facts
+                        .transparent_outputs
+                        .iter()
+                        .map(|output| CompactTransparentOutput {
+                            value_zat: output.value_zat,
+                            script_pub_key: output.script_pub_key.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    if transparent_inputs.is_empty() && transparent_outputs.is_empty() {
+                        return None;
+                    }
+                    Some(CompactTransaction {
+                        index: u64::from(rows.location.tx_index_in_block),
+                        transaction_id: rows.location.transaction_id,
+                        data: CompactTransactionData {
+                            transparent_inputs,
+                            transparent_outputs,
+                            ..CompactTransactionData::default()
+                        },
+                    })
+                })
+                .collect();
+            CompactBlockArtifact::new(
+                BlockId::new(header.height, header.block_hash),
+                header.parent_hash,
+                time,
+                transactions,
+                parts.chain_metadata,
+            )
+            .map_err(|error| eyre::eyre!("invalid compact block fixture: {error}"))
+        })
+        .collect()
 }
 
 fn attach_fixture_transaction_rows(
@@ -96,6 +174,66 @@ fn attach_fixture_transaction_rows(
                 .flat_map(FixtureTransactionRows::transparent_output_artifacts)
                 .collect(),
         )
+}
+
+/// Builds one block whose canonical and compact facts contain exactly the
+/// requested number of Sapling outputs.
+pub fn chain_epoch_artifacts_with_sapling_outputs(
+    chain_epoch: ChainEpoch,
+    block_header: BlockHeaderArtifact,
+    sapling_output_count: u32,
+) -> eyre::Result<ChainEpochArtifacts> {
+    let transaction_id = TransactionId::from_bytes([0x53; 32]);
+    let location = TransactionLocation::new(
+        transaction_id,
+        block_header.height,
+        block_header.block_hash,
+        0,
+    );
+    let mut public_facts = synthetic_transaction_public_facts(transaction_id, 0);
+    public_facts.counts.sapling_output_count = sapling_output_count;
+    let transaction_rows = FixtureTransactionRows::from_public_facts(location, public_facts);
+    let replay =
+        encode_fixture_block_replay(&block_header, std::slice::from_ref(&transaction_rows));
+    let sapling_output_count_usize = usize::try_from(sapling_output_count)
+        .map_err(|_| eyre::eyre!("Sapling output count is not representable as usize"))?;
+    let sapling_outputs = vec![
+        CompactSaplingOutput {
+            commitment: [0; 32],
+            ephemeral_key: [0; 32],
+            ciphertext: [0; 52],
+        };
+        sapling_output_count_usize
+    ];
+    let compact_block = CompactBlockArtifact::new(
+        BlockId::new(block_header.height, block_header.block_hash),
+        block_header.parent_hash,
+        u32::try_from(block_header.block_time)
+            .map_err(|_| eyre::eyre!("fixture block time is not representable as u32"))?,
+        vec![CompactTransaction {
+            index: 0,
+            transaction_id,
+            data: CompactTransactionData {
+                sapling_outputs,
+                ..CompactTransactionData::default()
+            },
+        }],
+        CompactChainMetadata {
+            sapling_commitment_tree_size: sapling_output_count,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    )
+    .map_err(|error| eyre::eyre!("invalid Sapling compact fixture: {error}"))?;
+    Ok(attach_fixture_transaction_rows(
+        ChainEpochArtifacts::new(
+            chain_epoch,
+            vec![block_header],
+            vec![replay],
+            vec![compact_block],
+        ),
+        &[transaction_rows],
+    ))
 }
 
 /// Splits a `TransparentAddressUnspentOutputs` stream into the single leading
@@ -208,10 +346,15 @@ pub fn synthetic_chain_epoch(
             0,
             u64::try_from(synthetic_raw_block_bytes(height).len()).unwrap_or(u64::MAX),
         ),
-        CompactBlockArtifact::new(
-            block_height,
-            source_hash,
-            format!("compact-block-{chain_epoch_id}-{height}").into_bytes(),
+        CompactBlockArtifact::empty(
+            BlockId::new(block_height, source_hash),
+            parent_hash,
+            0,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
         ),
     )
 }
@@ -264,10 +407,15 @@ fn synthetic_block_header(height: u32) -> BlockHeaderArtifact {
 }
 
 fn synthetic_block_compact(height: u32) -> CompactBlockArtifact {
-    CompactBlockArtifact::new(
-        BlockHeight::new(height),
-        block_hash_from_seed(height),
-        format!("compact-block-{height}").into_bytes(),
+    CompactBlockArtifact::empty(
+        BlockId::new(BlockHeight::new(height), block_hash_from_seed(height)),
+        block_hash_from_seed(height.saturating_sub(1)),
+        0,
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
     )
 }
 
@@ -279,20 +427,14 @@ pub fn compact_block_with_tree_sizes(
     sapling_commitment_tree_size: u32,
     orchard_commitment_tree_size: u32,
 ) -> CompactBlockArtifact {
-    let payload_bytes = LightwalletdCompactBlock {
-        height: u64::from(height.value()),
-        hash: block_hash.as_bytes().into(),
-        prev_hash: vec![0; 32],
-        time: 1_774_668_300,
-        header: Vec::new(),
-        vtx: Vec::new(),
-        chain_metadata: Some(ChainMetadata {
+    CompactBlockArtifact::empty(
+        BlockId::new(height, block_hash),
+        block_hash_from_seed(height.value().saturating_sub(1)),
+        0,
+        CompactChainMetadata {
             sapling_commitment_tree_size,
             orchard_commitment_tree_size,
             ironwood_commitment_tree_size: 0,
-        }),
-    }
-    .encode_to_vec();
-
-    CompactBlockArtifact::new(height, block_hash, payload_bytes)
+        },
+    )
 }

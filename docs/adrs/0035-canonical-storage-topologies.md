@@ -88,10 +88,12 @@ The supported deployment topology is `rocksdb-single-host`:
 - authenticated private control APIs coordinate fences, leases, mempool state,
   and recovery operations.
 
-The three release runtimes are `zinder-ingest`, `zinder-projector`, and
-`zinder-compat-lightwalletd`. `zinder-query` is a library used by compatibility
-services. Explorer and Cipherscan services are optional workspace components,
-not release topology members.
+The four release runtimes are `zinder-ingest`, `zinder-projector`,
+`zinder-query`, and `zinder-compat-lightwalletd`. The two serving runtimes open
+process-unique secondary generations over the same canonical and wallet
+primaries. Native `WalletQuery` and lightwalletd compatibility are independent
+protocol surfaces; neither aliases the other. Explorer and Cipherscan services
+are optional workspace components, not release topology members.
 
 PostgreSQL support in `zinder-bench` is a diagnostic persistence arm for the
 same canonical replay corpus and digest oracle. It does not provide the

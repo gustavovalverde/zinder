@@ -781,7 +781,7 @@ fn replay_envelopes(headers: &[BlockHeaderArtifact]) -> Vec<CanonicalBlockReplay
 fn compact_blocks(headers: &[BlockHeaderArtifact]) -> Vec<CompactBlockArtifact> {
     headers
         .iter()
-        .map(|header| CompactBlockArtifact::new(header.height, header.block_hash, [0x01]))
+        .map(|header| super::empty_compact_block_for_header(header, ChainTipMetadata::empty()))
         .collect()
 }
 

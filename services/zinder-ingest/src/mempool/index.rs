@@ -145,11 +145,11 @@ impl MempoolIndex {
         let state = self.state.read();
         match event {
             MempoolEvent::Added { entry } => {
-                if state.entries.contains_key(&entry.transaction_id) {
+                if state.entries.contains_key(&entry.transaction_id()) {
                     return Ok(MempoolIndexPreflight::NoChange);
                 }
                 let mut output_outpoints = HashSet::new();
-                for output in &entry.transparent_outputs {
+                for output in entry.transparent_outputs() {
                     if !output_outpoints.insert(output.outpoint) {
                         return Err(MempoolIndexInvariantError::DuplicateOutput {
                             outpoint: output.outpoint,
@@ -162,7 +162,7 @@ impl MempoolIndex {
                     }
                 }
                 let mut spent_outpoints = HashSet::new();
-                for spend in &entry.transparent_spends {
+                for spend in entry.transparent_spends() {
                     if !spent_outpoints.insert(spend.spent_outpoint) {
                         return Err(MempoolIndexInvariantError::DuplicateSpend {
                             outpoint: spend.spent_outpoint,
@@ -210,7 +210,7 @@ impl MempoolIndex {
     ) -> MempoolApplyOutcome {
         let mut state = self.state.write();
         state.last_applied_event = Some(applied_event);
-        let inserted_entry = match state.entries.entry(entry.transaction_id) {
+        let inserted_entry = match state.entries.entry(entry.transaction_id()) {
             Entry::Occupied(_) => {
                 drop(state);
                 return MempoolApplyOutcome::NoChange;
@@ -351,7 +351,7 @@ impl MempoolIndex {
             .and_then(|spending_transaction_id| state.entries.get(spending_transaction_id))
             .and_then(|entry| {
                 entry
-                    .transparent_spends
+                    .transparent_spends()
                     .iter()
                     .find(|spend| spend.spent_outpoint == spent_outpoint)
                     .copied()
@@ -388,10 +388,10 @@ impl MempoolIndex {
         let mut entries = state.entries.values().cloned().collect::<Vec<_>>();
         drop(state);
 
-        entries.sort_by_key(|entry| entry.transaction_id.as_bytes());
+        entries.sort_by_key(|entry| entry.transaction_id().as_bytes());
         let start_index = after_transaction_id.map_or(0, |transaction_id| {
             let after_bytes = transaction_id.as_bytes();
-            entries.partition_point(|entry| entry.transaction_id.as_bytes() <= after_bytes)
+            entries.partition_point(|entry| entry.transaction_id().as_bytes() <= after_bytes)
         });
         let bound = u32_to_usize(max_entries);
         let end_index = start_index.saturating_add(bound).min(entries.len());
@@ -403,7 +403,7 @@ impl MempoolIndex {
         entries.truncate(end_index);
         entries.drain(..start_index);
         let next_after_transaction_id = if has_more {
-            entries.last().map(|entry| entry.transaction_id)
+            entries.last().map(|entry| entry.transaction_id())
         } else {
             None
         };
@@ -426,7 +426,7 @@ const fn u32_to_usize(count: u32) -> usize {
 }
 
 fn index_secondary_overlays(state: &mut MempoolIndexState, entry: &MempoolEntry) {
-    for transparent_output in &entry.transparent_outputs {
+    for transparent_output in entry.transparent_outputs() {
         state
             .outputs_by_address
             .entry(transparent_output.address_script_hash)
@@ -436,15 +436,15 @@ fn index_secondary_overlays(state: &mut MempoolIndexState, entry: &MempoolEntry)
             .output_by_outpoint
             .insert(transparent_output.outpoint, transparent_output.clone());
     }
-    for transparent_spend in &entry.transparent_spends {
+    for transparent_spend in entry.transparent_spends() {
         state
             .spend_by_outpoint
-            .insert(transparent_spend.spent_outpoint, entry.transaction_id);
+            .insert(transparent_spend.spent_outpoint, entry.transaction_id());
     }
 }
 
 fn unindex_secondary_overlays(state: &mut MempoolIndexState, entry: &MempoolEntry) {
-    for transparent_output in &entry.transparent_outputs {
+    for transparent_output in entry.transparent_outputs() {
         if let Some(outputs) = state
             .outputs_by_address
             .get_mut(&transparent_output.address_script_hash)
@@ -460,7 +460,7 @@ fn unindex_secondary_overlays(state: &mut MempoolIndexState, entry: &MempoolEntr
             .output_by_outpoint
             .remove(&transparent_output.outpoint);
     }
-    for transparent_spend in &entry.transparent_spends {
+    for transparent_spend in entry.transparent_spends() {
         state
             .spend_by_outpoint
             .remove(&transparent_spend.spent_outpoint);
@@ -476,9 +476,10 @@ mod tests {
 
     use super::{MempoolApplyOutcome, MempoolIndex};
     use zinder_core::{
-        BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, MempoolEntry, Network,
-        RawTransactionBytes, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput,
-        TransparentMempoolSpend, TransparentOutPoint, UnixTimestampMillis,
+        BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactTransactionData,
+        CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolEntryBuildError,
+        MempoolObservation, Network, RawTransactionBytes, TransactionId,
+        TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
     };
     use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEventPosition};
 
@@ -507,49 +508,49 @@ mod tests {
         transaction_id_byte: u8,
         address_byte: u8,
         spent_outpoint_txid_byte: u8,
-    ) -> MempoolEntry {
+    ) -> Result<MempoolEntry, MempoolEntryBuildError> {
         let transaction_id = TransactionId::from_bytes([transaction_id_byte; 32]);
-        let address_script_hash = TransparentAddressScriptHash::from_bytes([address_byte; 32]);
-        MempoolEntry {
+        MempoolEntry::new(
             transaction_id,
-            auth_digest: None,
-            raw_transaction_bytes: RawTransactionBytes::new(vec![transaction_id_byte; 8]),
-            compact_transaction_bytes: vec![transaction_id_byte; 4],
-            first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
-            first_seen_chain_epoch: synthetic_chain_epoch(),
-            transparent_outputs: vec![TransparentMempoolOutput {
-                address_script_hash,
-                script_pub_key: vec![address_byte; 25],
-                outpoint: TransparentOutPoint::new(transaction_id, 0),
-                value_zat: 1_000,
-            }],
-            transparent_spends: vec![TransparentMempoolSpend {
-                spent_outpoint: TransparentOutPoint::new(
-                    TransactionId::from_bytes([spent_outpoint_txid_byte; 32]),
-                    0,
-                ),
-                spending_transaction_id: transaction_id,
-            }],
-        }
+            None,
+            RawTransactionBytes::new(vec![transaction_id_byte; 8]),
+            CompactTransactionData {
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: 1_000,
+                    script_pub_key: vec![address_byte; 25],
+                }],
+                transparent_inputs: vec![CompactTransparentInput {
+                    previous_transaction_id: TransactionId::from_bytes(
+                        [spent_outpoint_txid_byte; 32],
+                    ),
+                    previous_output_index: 0,
+                }],
+                ..CompactTransactionData::default()
+            },
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+                first_seen_chain_epoch: synthetic_chain_epoch(),
+            },
+        )
     }
 
     #[test]
-    fn apply_added_inserts_entry_and_secondary_indexes() {
+    fn apply_added_inserts_entry_and_secondary_indexes() -> Result<(), MempoolEntryBuildError> {
         let index = MempoolIndex::new();
-        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20);
+        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20)?;
 
-        let outcome = index.apply_added(entry.clone(), applied_at(1, entry.transaction_id));
+        let outcome = index.apply_added(entry.clone(), applied_at(1, entry.transaction_id()));
 
         assert_eq!(outcome, MempoolApplyOutcome::Applied);
-        assert!(index.is_in_mempool(entry.transaction_id));
+        assert!(index.is_in_mempool(entry.transaction_id()));
         assert_eq!(index.entry_count(), 1);
         assert_eq!(
             index.last_applied_event(),
-            Some(applied_at(1, entry.transaction_id))
+            Some(applied_at(1, entry.transaction_id()))
         );
 
         let outputs = index.transparent_outputs_by_address(
-            TransparentAddressScriptHash::from_bytes([0xAA; 32]),
+            TransparentAddressScriptHash::of_script_pub_key(&[0xAA; 25]),
             10,
         );
         assert_eq!(outputs.len(), 1);
@@ -559,18 +560,19 @@ mod tests {
             0,
         ));
         assert!(spend.is_some());
+        Ok(())
     }
 
     #[test]
-    fn apply_added_is_idempotent_for_duplicate_txid() {
+    fn apply_added_is_idempotent_for_duplicate_txid() -> Result<(), MempoolEntryBuildError> {
         let index = MempoolIndex::new();
-        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20);
+        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20)?;
         assert_eq!(
-            index.apply_added(entry.clone(), applied_at(1, entry.transaction_id)),
+            index.apply_added(entry.clone(), applied_at(1, entry.transaction_id())),
             MempoolApplyOutcome::Applied
         );
 
-        let transaction_id = entry.transaction_id;
+        let transaction_id = entry.transaction_id();
         let outcome = index.apply_added(entry, applied_at(2, transaction_id));
 
         assert_eq!(outcome, MempoolApplyOutcome::NoChange);
@@ -580,23 +582,27 @@ mod tests {
             index.last_applied_event(),
             Some(applied_at(2, transaction_id))
         );
+        Ok(())
     }
 
     #[test]
-    fn apply_invalidated_removes_entry_and_secondary_indexes() {
+    fn apply_invalidated_removes_entry_and_secondary_indexes() -> Result<(), MempoolEntryBuildError>
+    {
         let index = MempoolIndex::new();
-        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20);
-        let _ = index.apply_added(entry.clone(), applied_at(1, entry.transaction_id));
+        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20)?;
+        let _ = index.apply_added(entry.clone(), applied_at(1, entry.transaction_id()));
 
-        let outcome =
-            index.apply_invalidated(entry.transaction_id, applied_at(2, entry.transaction_id));
+        let outcome = index.apply_invalidated(
+            entry.transaction_id(),
+            applied_at(2, entry.transaction_id()),
+        );
 
         assert_eq!(outcome, MempoolApplyOutcome::Applied);
-        assert!(!index.is_in_mempool(entry.transaction_id));
+        assert!(!index.is_in_mempool(entry.transaction_id()));
         assert!(
             index
                 .transparent_outputs_by_address(
-                    TransparentAddressScriptHash::from_bytes([0xAA; 32]),
+                    TransparentAddressScriptHash::of_script_pub_key(&[0xAA; 25]),
                     10,
                 )
                 .is_empty()
@@ -609,6 +615,7 @@ mod tests {
                 ))
                 .is_none()
         );
+        Ok(())
     }
 
     #[test]
@@ -620,30 +627,32 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_respects_max_entries_bound() {
+    fn snapshot_respects_max_entries_bound() -> Result<(), MempoolEntryBuildError> {
         let index = MempoolIndex::new();
         for index_byte in 0u8..5 {
-            let entry = entry_with_outputs_and_spend(index_byte, 0xAA, 0x20);
-            let transaction_id = entry.transaction_id;
+            let entry = entry_with_outputs_and_spend(index_byte, 0xAA, 0x20)?;
+            let transaction_id = entry.transaction_id();
             let _ = index.apply_added(entry, applied_at(u64::from(index_byte) + 1, transaction_id));
         }
         assert_eq!(index.snapshot(2).len(), 2);
         assert_eq!(index.snapshot(10).len(), 5);
+        Ok(())
     }
 
     #[test]
-    fn snapshot_page_carries_last_applied_event() {
+    fn snapshot_page_carries_last_applied_event() -> Result<(), MempoolEntryBuildError> {
         let index = MempoolIndex::new();
         assert!(index.snapshot_page(10, None).last_applied_event.is_none());
 
-        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20);
-        let position = applied_at(7, entry.transaction_id);
+        let entry = entry_with_outputs_and_spend(0x10, 0xAA, 0x20)?;
+        let position = applied_at(7, entry.transaction_id());
         let _ = index.apply_added(entry, position);
 
         assert_eq!(
             index.snapshot_page(10, None).last_applied_event,
             Some(position)
         );
+        Ok(())
     }
 
     #[test]

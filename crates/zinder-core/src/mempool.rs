@@ -6,9 +6,10 @@
 //! epoch visible at first observation.
 
 use crate::{
-    AuthDigest, ChainEpoch, RawTransactionBytes, TransactionId, TransparentAddressScriptHash,
-    TransparentOutPoint, UnixTimestampMillis,
+    AuthDigest, ChainEpoch, CompactTransactionData, RawTransactionBytes, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
 };
+use thiserror::Error;
 
 /// Hydrated record describing a mempool transaction observed by the indexer.
 ///
@@ -19,30 +20,175 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MempoolEntry {
     /// Transaction identifier reported by the source.
-    pub transaction_id: TransactionId,
+    transaction_id: TransactionId,
     /// ZIP-244 authorization digest, when the source provides one.
     ///
     /// Set for v5+ transactions; `None` for v1-v4 transactions where the
     /// txid alone authenticates witness data.
-    pub auth_digest: Option<AuthDigest>,
+    auth_digest: Option<AuthDigest>,
     /// Raw serialized transaction bytes hydrated from the source.
-    pub raw_transaction_bytes: RawTransactionBytes,
-    /// Lightwalletd-compatible compact transaction bytes derived from the
-    /// raw transaction.
-    ///
-    /// Pre-built so the lightwalletd compatibility adapter does not parse
-    /// raw bytes on the read path.
-    pub compact_transaction_bytes: Vec<u8>,
+    raw_transaction_bytes: RawTransactionBytes,
+    /// Structured wallet scan data derived from the raw transaction.
+    compact_transaction_data: CompactTransactionData,
     /// Wall-clock time when the indexer first observed this mempool entry.
-    pub first_seen_unix_millis: UnixTimestampMillis,
+    first_seen_unix_millis: UnixTimestampMillis,
     /// Chain epoch visible to ingest when this mempool entry was first
     /// observed.
-    pub first_seen_chain_epoch: ChainEpoch,
+    first_seen_chain_epoch: ChainEpoch,
     /// Transparent outputs created by this mempool transaction, indexed for
     /// address lookups.
-    pub transparent_outputs: Vec<TransparentMempoolOutput>,
+    transparent_outputs: Vec<TransparentMempoolOutput>,
     /// Transparent inputs that spend previously-known outpoints.
-    pub transparent_spends: Vec<TransparentMempoolSpend>,
+    transparent_spends: Vec<TransparentMempoolSpend>,
+}
+
+impl MempoolEntry {
+    /// Creates an entry and derives its transparent lookup indexes from the
+    /// structured scan data and enclosing transaction identifier.
+    pub fn new(
+        transaction_id: TransactionId,
+        auth_digest: Option<AuthDigest>,
+        raw_transaction_bytes: RawTransactionBytes,
+        compact_transaction_data: CompactTransactionData,
+        observation: MempoolObservation,
+    ) -> Result<Self, MempoolEntryBuildError> {
+        let transparent_outputs = compact_transaction_data
+            .transparent_outputs
+            .iter()
+            .enumerate()
+            .map(|(output_index, output)| {
+                let output_index = u32::try_from(output_index)
+                    .map_err(|_| MempoolEntryBuildError::TransparentOutputIndexOverflow)?;
+                Ok(TransparentMempoolOutput {
+                    address_script_hash: TransparentAddressScriptHash::of_script_pub_key(
+                        &output.script_pub_key,
+                    ),
+                    script_pub_key: output.script_pub_key.clone(),
+                    outpoint: TransparentOutPoint::new(transaction_id, output_index),
+                    value_zat: output.value_zat,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transparent_spends = compact_transaction_data
+            .transparent_inputs
+            .iter()
+            .map(|input| TransparentMempoolSpend {
+                spent_outpoint: TransparentOutPoint::new(
+                    input.previous_transaction_id,
+                    input.previous_output_index,
+                ),
+                spending_transaction_id: transaction_id,
+            })
+            .collect();
+
+        Ok(Self {
+            transaction_id,
+            auth_digest,
+            raw_transaction_bytes,
+            compact_transaction_data,
+            first_seen_unix_millis: observation.first_seen_unix_millis,
+            first_seen_chain_epoch: observation.first_seen_chain_epoch,
+            transparent_outputs,
+            transparent_spends,
+        })
+    }
+
+    /// Returns the transaction identifier.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the authorization digest when available.
+    #[must_use]
+    pub const fn auth_digest(&self) -> Option<AuthDigest> {
+        self.auth_digest
+    }
+
+    /// Returns the raw serialized transaction bytes.
+    #[must_use]
+    pub const fn raw_transaction_bytes(&self) -> &RawTransactionBytes {
+        &self.raw_transaction_bytes
+    }
+
+    /// Returns structured wallet scan data.
+    #[must_use]
+    pub const fn compact_transaction_data(&self) -> &CompactTransactionData {
+        &self.compact_transaction_data
+    }
+
+    /// Returns the first-observed timestamp.
+    #[must_use]
+    pub const fn first_seen_unix_millis(&self) -> UnixTimestampMillis {
+        self.first_seen_unix_millis
+    }
+
+    /// Returns the chain epoch visible at first observation.
+    #[must_use]
+    pub const fn first_seen_chain_epoch(&self) -> ChainEpoch {
+        self.first_seen_chain_epoch
+    }
+
+    /// Returns derived transparent output indexes.
+    #[must_use]
+    pub fn transparent_outputs(&self) -> &[TransparentMempoolOutput] {
+        &self.transparent_outputs
+    }
+
+    /// Returns derived transparent spend indexes.
+    #[must_use]
+    pub fn transparent_spends(&self) -> &[TransparentMempoolSpend] {
+        &self.transparent_spends
+    }
+
+    /// Consumes the entry into source-observed fields; derived indexes are
+    /// intentionally omitted because they are reconstructed by [`Self::new`].
+    #[must_use]
+    pub fn into_parts(self) -> MempoolEntryParts {
+        MempoolEntryParts {
+            transaction_id: self.transaction_id,
+            auth_digest: self.auth_digest,
+            raw_transaction_bytes: self.raw_transaction_bytes,
+            compact_transaction_data: self.compact_transaction_data,
+            observation: MempoolObservation {
+                first_seen_unix_millis: self.first_seen_unix_millis,
+                first_seen_chain_epoch: self.first_seen_chain_epoch,
+            },
+        }
+    }
+}
+
+/// Source-observed fields that uniquely determine a mempool entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MempoolEntryParts {
+    /// Transaction identifier.
+    pub transaction_id: TransactionId,
+    /// Authorization digest when available.
+    pub auth_digest: Option<AuthDigest>,
+    /// Raw serialized transaction bytes.
+    pub raw_transaction_bytes: RawTransactionBytes,
+    /// Structured wallet scan data.
+    pub compact_transaction_data: CompactTransactionData,
+    /// First-observation chain context and time.
+    pub observation: MempoolObservation,
+}
+
+/// Chain context and time attached to the first source observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolObservation {
+    /// Wall-clock time when the indexer first observed the transaction.
+    pub first_seen_unix_millis: UnixTimestampMillis,
+    /// Chain epoch visible at the first observation.
+    pub first_seen_chain_epoch: ChainEpoch,
+}
+
+/// Error returned when structured mempool data cannot form lookup indexes.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MempoolEntryBuildError {
+    /// The transaction has more transparent outputs than an outpoint can index.
+    #[error("transparent output count exceeds u32::MAX")]
+    TransparentOutputIndexOverflow,
 }
 
 /// Reason a mempool transaction was removed from the source's mempool view

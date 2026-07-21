@@ -298,7 +298,10 @@ async fn forward_wire_message(
         Ok(transaction_id) => transaction_id,
         Err(decode_error) => return forward_error(decode_error, event_sender).await,
     };
-    let auth_digest = decode_auth_digest(&wire_message.auth_digest);
+    let auth_digest = match decode_auth_digest(&wire_message.auth_digest) {
+        Ok(auth_digest) => auth_digest,
+        Err(decode_error) => return forward_error(decode_error, event_sender).await,
+    };
 
     let outcome = match ChangeType::try_from(wire_message.change_type) {
         Ok(ChangeType::Added) => {
@@ -428,11 +431,18 @@ fn decode_transaction_id(wire_bytes: &[u8]) -> Result<TransactionId, SourceError
 
 /// Decodes a `MempoolChangeMessage.auth_digest` into an [`AuthDigest`].
 ///
-/// Same `bytes_in_display_order` wire contract as the txid field. An
-/// absent or malformed digest reads as `None`; pre-v5 transactions carry
-/// no digest.
-fn decode_auth_digest(wire_bytes: &[u8]) -> Option<AuthDigest> {
-    zinder_core::wire::decode_rpc_auth_digest_bytes(wire_bytes).ok()
+/// Same `bytes_in_display_order` wire contract as the txid field. Empty
+/// bytes represent an omitted digest for pre-v5 transactions. Any
+/// non-empty malformed value is a protocol error rather than absent metadata.
+fn decode_auth_digest(wire_bytes: &[u8]) -> Result<Option<AuthDigest>, SourceError> {
+    if wire_bytes.is_empty() {
+        return Ok(None);
+    }
+    zinder_core::wire::decode_rpc_auth_digest_bytes(wire_bytes)
+        .map(Some)
+        .map_err(|_| SourceError::SourceProtocolMismatch {
+            reason: "Zebra indexer mempool auth_digest was not exactly 32 bytes",
+        })
 }
 
 #[cfg(test)]
@@ -489,7 +499,7 @@ mod tests {
     #[test]
     fn decode_auth_digest_returns_none_for_empty_bytes() {
         let auth_digest = decode_auth_digest(&[]);
-        assert!(auth_digest.is_none());
+        assert!(matches!(auth_digest, Ok(None)));
     }
 
     #[test]
@@ -498,7 +508,9 @@ mod tests {
         for (index, slot) in wire_bytes.iter_mut().enumerate() {
             *slot = u8::try_from(index).unwrap_or_default();
         }
-        let auth_digest = decode_auth_digest(&wire_bytes).ok_or("32 byte payload decodes")?;
+        let auth_digest = decode_auth_digest(&wire_bytes)
+            .map_err(|_| "32 byte payload decodes")?
+            .ok_or("32 byte payload is present")?;
         let mut internal_bytes = wire_bytes;
         internal_bytes.reverse();
         assert_eq!(auth_digest.as_bytes(), internal_bytes);
@@ -506,10 +518,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_auth_digest_returns_none_for_invalid_length() {
+    fn decode_auth_digest_rejects_non_empty_invalid_length() {
         let wire_bytes = [0x55u8; 16];
         let auth_digest = decode_auth_digest(&wire_bytes);
-        assert!(auth_digest.is_none());
+        assert!(matches!(
+            auth_digest,
+            Err(SourceError::SourceProtocolMismatch { .. })
+        ));
     }
 
     // Regression coverage for the resnapshot-on-connect gap: `mempool_change`

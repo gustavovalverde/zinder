@@ -15,7 +15,7 @@ pub(crate) enum PayloadFormat {
     /// Zinder protobuf payload for block-header facts.
     ZinderBlockHeaderArtifactV1 = 1,
     /// Zinder protobuf payload for a compact block artifact.
-    ZinderCompactBlockArtifactV1 = 2,
+    ZinderCompactBlockArtifactV2 = 22,
     /// Zinder protobuf payload for transaction facts.
     ZinderTransactionFactsArtifactV1 = 3,
     /// Zinder protobuf payload for a tree-state artifact.
@@ -56,7 +56,7 @@ impl PayloadFormat {
     const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::ZinderBlockHeaderArtifactV1),
-            2 => Some(Self::ZinderCompactBlockArtifactV1),
+            22 => Some(Self::ZinderCompactBlockArtifactV2),
             3 => Some(Self::ZinderTransactionFactsArtifactV1),
             4 => Some(Self::ZinderTreeStateArtifactV1),
             5 => Some(Self::ZinderSubtreeRootArtifactV1),
@@ -339,7 +339,7 @@ mod tests {
     -> Result<(), ArtifactEnvelopeError> {
         let payload_bytes = b"compact payload";
         let envelope_bytes = ArtifactEnvelopeHeaderV1::encode_payload(
-            PayloadFormat::ZinderCompactBlockArtifactV1,
+            PayloadFormat::ZinderCompactBlockArtifactV2,
             payload_bytes,
         )?;
 
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(envelope_bytes[4], 1);
         assert_eq!(
             envelope_bytes[5],
-            PayloadFormat::ZinderCompactBlockArtifactV1 as u8
+            PayloadFormat::ZinderCompactBlockArtifactV2 as u8
         );
         assert_eq!(envelope_bytes[6], 0);
         assert_eq!(envelope_bytes[7], 0);
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(
             ArtifactEnvelopeHeaderV1::decode_payload(
                 &envelope_bytes,
-                PayloadFormat::ZinderCompactBlockArtifactV1,
+                PayloadFormat::ZinderCompactBlockArtifactV2,
             )?,
             payload_bytes,
         );

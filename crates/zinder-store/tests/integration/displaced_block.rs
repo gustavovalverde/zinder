@@ -5,7 +5,7 @@ use tempfile::tempdir;
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockId, BlockTransactionIndexArtifact, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, FinalNoteCommitmentRoot, Network, ShieldedProtocol, TransactionId,
+    FinalNoteCommitmentRoot, Network, ShieldedProtocol, TransactionId,
     TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
     UnixTimestampMillis,
@@ -213,10 +213,9 @@ fn failed_replacement_writes_no_archive_rows_or_metadata() -> eyre::Result<()> {
         super::synthetic_chain_epoch_artifacts(
             replacement_epoch,
             vec![replacement_header.clone()],
-            vec![CompactBlockArtifact::new(
-                replacement_header.height,
-                replacement_header.block_hash,
-                [0x03],
+            vec![super::empty_compact_block_for_header(
+                &replacement_header,
+                ChainTipMetadata::empty(),
             )],
         )
         .with_block_blobs(vec![replacement_block_blob])
@@ -366,7 +365,7 @@ fn initial_artifacts(
         .collect();
     let compacts = headers
         .iter()
-        .map(|header| CompactBlockArtifact::new(header.height, header.block_hash, [0x01]))
+        .map(|header| super::empty_compact_block_for_header(header, ChainTipMetadata::empty()))
         .collect();
     let transaction_index = vec![
         BlockTransactionIndexArtifact::new(BlockHeight::new(2), 0, coinbase_id_2, old_hash_2),
@@ -531,7 +530,7 @@ fn replacement_artifacts(hash_2: BlockHash, hash_3: BlockHash) -> ChainEpochArti
         .collect();
     let compacts = headers
         .iter()
-        .map(|header| CompactBlockArtifact::new(header.height, header.block_hash, [0x02]))
+        .map(|header| super::empty_compact_block_for_header(header, ChainTipMetadata::empty()))
         .collect();
     super::with_synthetic_block_replay_envelopes(
         super::synthetic_chain_epoch_artifacts(epoch, headers, compacts)
@@ -557,10 +556,9 @@ fn single_block_replacement(
         super::synthetic_chain_epoch_artifacts(
             epoch,
             vec![header.clone()],
-            vec![CompactBlockArtifact::new(
-                header.height,
-                header.block_hash,
-                [0x04],
+            vec![super::empty_compact_block_for_header(
+                &header,
+                ChainTipMetadata::empty(),
             )],
         )
         .with_block_blobs(vec![block_blob])

@@ -154,7 +154,7 @@ fn commit_unspent_outputs(
         vec![compact_block],
         &prevouts,
         Vec::new(),
-    );
+    )?;
     store.commit_chain_epoch(artifacts)?;
     Ok(total_value_zat)
 }

@@ -50,6 +50,7 @@ pub(crate) struct WalletProjectionLoadConfig<'options> {
     pub(crate) staging_path: &'options Path,
     pub(crate) options: &'options Options,
     pub(crate) network: Network,
+    pub(crate) first_retained_block: BlockId,
     pub(crate) settled_tip: BlockId,
     pub(crate) supported_reorg_depth: u32,
     pub(crate) max_outpoint_sort_memory_bytes: u64,
@@ -336,7 +337,12 @@ pub(crate) fn write_projection_ssts(
         let reference_digest = replay.reference_digest();
         let facts = replay.into_facts();
         let block = BlockId::new(facts.block_header.height, facts.block_header.block_hash);
-        validate_next_block(previous_block, block, facts.block_header.parent_hash)?;
+        validate_next_block(
+            config.first_retained_block,
+            previous_block,
+            block,
+            facts.block_header.parent_hash,
+        )?;
         first_block.get_or_insert(block);
         let source_sequence_digest_before = sequence_digest.clone().finish();
         sequence_digest.try_append(reference_digest)?;
@@ -894,12 +900,13 @@ fn prepare_families(
 }
 
 fn validate_next_block(
+    first_retained_block: BlockId,
     previous: Option<BlockId>,
     block: BlockId,
     parent_hash: BlockHash,
 ) -> Result<(), WalletProjectionContractError> {
     match previous {
-        None if block.height == BlockHeight::new(1) => Ok(()),
+        None if block == first_retained_block => Ok(()),
         Some(previous)
             if previous.height.next() == Some(block.height) && previous.hash == parent_hash =>
         {
@@ -1009,6 +1016,64 @@ mod tests {
                 temporary_files_per_sorter: TEST_TEMPORARY_FILE_BYTES,
             }
         }
+    }
+
+    #[test]
+    fn external_loader_accepts_an_authenticated_checkpoint_successor_as_its_first_block()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let options = Options::default();
+        let first_retained = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
+        let tip = BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([0xc3; 32]));
+        let blocks = vec![
+            block_facts(2, [0xc1; 32], [0xc2; 32], Vec::new()),
+            block_facts(3, [0xc2; 32], [0xc3; 32], Vec::new()),
+        ];
+
+        let prepared = write_projection_ssts(
+            test_config_with_bounds(
+                temporary.path(),
+                &options,
+                TestByteLimits::default(),
+                first_retained,
+                tip,
+            ),
+            canonical_scan(validated_replays(&blocks)?),
+        )?;
+
+        assert_eq!(prepared.first_block, first_retained);
+        assert_eq!(prepared.tip, tip);
+        assert_eq!(prepared.counters.scanned_block_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn external_loader_rejects_a_first_block_outside_the_authenticated_retained_anchor()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let options = Options::default();
+        let expected_first = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xd2; 32]));
+        let observed_first = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
+        let blocks = vec![block_facts(2, [0xc1; 32], [0xc2; 32], Vec::new())];
+
+        let result = write_projection_ssts(
+            test_config_with_bounds(
+                temporary.path(),
+                &options,
+                TestByteLimits::default(),
+                expected_first,
+                observed_first,
+            ),
+            canonical_scan(validated_replays(&blocks)?),
+        );
+
+        assert!(matches!(
+            result,
+            Err(RocksDbWalletError::Contract(
+                WalletProjectionContractError::NonContiguousBlock
+            ))
+        ));
+        Ok(())
     }
 
     #[test]
@@ -1187,12 +1252,14 @@ mod tests {
                 ],
             )],
         )];
+        let mixed_tip = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xd1; 32]));
         let mixed = write_projection_ssts(
-            test_config_with_settled_tip(
+            test_config_with_bounds(
                 temporary.path(),
                 &options,
                 TestByteLimits::default(),
-                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xd1; 32])),
+                mixed_tip,
+                mixed_tip,
             ),
             canonical_scan(validated_replays(&mixed_blocks)?),
         )?;
@@ -1331,10 +1398,27 @@ mod tests {
         limits: TestByteLimits,
         settled_tip: BlockId,
     ) -> WalletProjectionLoadConfig<'options> {
+        test_config_with_bounds(
+            staging_path,
+            options,
+            limits,
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xc1; 32])),
+            settled_tip,
+        )
+    }
+
+    fn test_config_with_bounds<'options>(
+        staging_path: &'options Path,
+        options: &'options Options,
+        limits: TestByteLimits,
+        first_retained_block: BlockId,
+        settled_tip: BlockId,
+    ) -> WalletProjectionLoadConfig<'options> {
         WalletProjectionLoadConfig {
             staging_path,
             options,
             network: Network::ZcashRegtest,
+            first_retained_block,
             settled_tip,
             supported_reorg_depth: 0,
             max_outpoint_sort_memory_bytes: limits.outpoint_sort,

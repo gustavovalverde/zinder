@@ -119,7 +119,7 @@ pub fn resolve_ingest_control_writer(
 }
 
 /// Validates and resolves an [`IngestControlSection`] for a reader
-/// (`zinder-projector`, `zinder-compat-lightwalletd`).
+/// (`zinder-projector`, `zinder-query`).
 ///
 /// An unset [`IngestControlSection::addr`] falls back to
 /// [`DEFAULT_INGEST_CONTROL_READER_URL`]. The URL is validated as a

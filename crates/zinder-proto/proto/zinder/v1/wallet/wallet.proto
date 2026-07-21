@@ -35,10 +35,9 @@ message ChainEpoch {
   // Best visible block in this chain epoch.
   BlockTip visible_tip = 5;
 
-  // Highest block in this chain epoch for which both compact-block and
-  // commitment-tree artifacts are coherent past the reorg window. The wallet
-  // uses this as its scan ceiling; see ADR-0005 in the zally repo. Carries the
-  // exact reorg-window semantics the prior `settled_tip_*` fields did.
+  // Reorg-window settlement watermark for this chain epoch. Wallets scan
+  // through visible_tip under the epoch pin and use this lower height for
+  // settlement-sensitive policy.
   BlockTip settled_tip = 6;
 
   // Sapling note commitment tree size at the visible tip. Wallets use this to
@@ -160,8 +159,7 @@ message VisibleTipBlockRequest {
 }
 
 // Settled-tip block metadata response bound to one chain epoch. Returns the
-// block at the chain epoch's settled_tip, which the wallet uses as its scan
-// ceiling.
+// block at the chain epoch's settlement watermark.
 message SettledTipBlockResponse {
   // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
   ChainView chain_view = 1;
@@ -255,11 +253,7 @@ message BlockHeaderResponse {
   BlockHeader block_header = 2;
 }
 
-// A wallet-facing compact block payload from one chain epoch.
-//
-// Distinct from `cash.z.wallet.sdk.rpc.CompactBlock` in the vendored
-// lightwalletd compat schema; the lightwalletd one keeps its frozen
-// `bytes`-typed `hash` field on the compat plane.
+// A wallet-facing compact block from one chain epoch.
 message CompactBlock {
   // Height of the source block.
   uint32 height = 1;
@@ -268,8 +262,117 @@ message CompactBlock {
   // Reference: Zcash protocol spec term `\rpcByteOrder`.
   string block_hash = 2;
 
-  // Encoded compact block payload bytes.
-  bytes payload_bytes = 3;
+  // Canonical parent block hash in RPC byte order (64 lowercase hex
+  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string previous_block_hash = 3;
+
+  // Block time as Unix seconds.
+  uint32 time = 4;
+
+  // Wallet-relevant transactions in consensus block order.
+  repeated CompactTransaction transactions = 5;
+
+  // Required commitment-tree sizes after this block. Servers MUST populate
+  // this message, including zero values for pools not yet activated.
+  CompactChainMetadata chain_metadata = 6;
+}
+
+// Commitment-tree sizes after one compact block.
+message CompactChainMetadata {
+  // Sapling note-commitment tree size after this block.
+  uint32 sapling_commitment_tree_size = 1;
+
+  // Orchard note-commitment tree size after this block.
+  uint32 orchard_commitment_tree_size = 2;
+
+  // Ironwood note-commitment tree size after this block.
+  uint32 ironwood_commitment_tree_size = 3;
+}
+
+// Wallet-relevant transaction data within a compact block.
+message CompactTransaction {
+  // Zero-based transaction position in consensus block order.
+  uint64 index = 1;
+
+  // Consensus transaction identifier as exactly 32 bytes in Zcash protocol
+  // byte order. Reference: Zcash protocol spec section 7.1.
+  bytes transaction_id = 2;
+
+  // Required structured wallet scan fields for this transaction.
+  CompactTransactionData data = 3;
+}
+
+// Wallet scan fields shared by mined and mempool transactions.
+message CompactTransactionData {
+  // Transaction fee in zatoshis when known. Absence means unknown and MUST
+  // NOT be interpreted as a zero fee.
+  optional uint64 fee_zat = 1;
+
+  // Sapling spends in consensus transaction order.
+  repeated CompactSaplingSpend sapling_spends = 2;
+
+  // Sapling outputs in consensus transaction order.
+  repeated CompactSaplingOutput sapling_outputs = 3;
+
+  // Orchard actions in consensus transaction order.
+  repeated CompactShieldedAction orchard_actions = 4;
+
+  // Ironwood actions in consensus transaction order. This vector is distinct
+  // from Orchard even though both pools share the compact action shape.
+  repeated CompactShieldedAction ironwood_actions = 5;
+
+  // Transparent inputs in consensus transaction order.
+  repeated CompactTransparentInput transparent_inputs = 6;
+
+  // Transparent outputs in consensus transaction order.
+  repeated CompactTransparentOutput transparent_outputs = 7;
+}
+
+message CompactSaplingSpend {
+  // Sapling nullifier as exactly 32 consensus bytes.
+  bytes nullifier = 1;
+}
+
+message CompactSaplingOutput {
+  // Sapling note commitment as exactly 32 consensus bytes.
+  bytes commitment = 1;
+
+  // Sapling ephemeral key as exactly 32 consensus bytes.
+  bytes ephemeral_key = 2;
+
+  // First exactly 52 bytes of the encrypted note ciphertext.
+  bytes ciphertext = 3;
+}
+
+message CompactShieldedAction {
+  // Action nullifier as exactly 32 consensus bytes.
+  bytes nullifier = 1;
+
+  // Action note commitment as exactly 32 consensus bytes.
+  bytes commitment = 2;
+
+  // Action ephemeral key as exactly 32 consensus bytes.
+  bytes ephemeral_key = 3;
+
+  // First exactly 52 bytes of the encrypted note ciphertext.
+  bytes ciphertext = 4;
+}
+
+message CompactTransparentInput {
+  // Spent transaction identifier as exactly 32 bytes in Zcash protocol byte
+  // order. Reference: Zcash protocol spec section 7.1.
+  bytes previous_transaction_id = 1;
+
+  // Zero-based output index in the spent transaction.
+  uint32 previous_output_index = 2;
+}
+
+message CompactTransparentOutput {
+  // Output value in zatoshis.
+  uint64 value_zat = 1;
+
+  // Consensus scriptPubKey bytes.
+  bytes script_pub_key = 2;
 }
 
 // Inclusive compact block range request.
@@ -427,7 +530,7 @@ message MinedTransaction {
   MinedTransactionChainContext chain_context = 2;
 
   // Serialized consensus transaction bytes. Carries the same value the
-  // mempool arm exposes as `MempoolTransaction.payload_bytes`, so a verbose
+  // mempool entry exposes as `raw_transaction_bytes`, so a verbose
   // mined-transaction read (serialized bytes plus mined location plus
   // confirmations) is answered by this one response. Absent when the
   // deployment does not retain raw transaction blobs (ingest `raw_blob_policy`
@@ -435,16 +538,6 @@ message MinedTransaction {
   // the `wallet.read.transaction_bytes_v1` capability; clients branch on
   // presence.
   optional bytes raw_transaction_bytes = 3;
-}
-
-// Mempool-transaction response carrier.
-message MempoolTransaction {
-  // Serialized transaction payload bytes.
-  bytes payload_bytes = 1;
-
-  // Wall-clock time at which the indexer first observed the
-  // transaction in the source mempool.
-  int64 first_seen_unix_seconds = 2;
 }
 
 // Canonical transaction-location discriminator shared by every read surface.
@@ -461,7 +554,7 @@ message TransactionLocation {
     MinedTransaction mined = 1;
 
     // Transaction is currently visible in the live mempool.
-    MempoolTransaction in_mempool = 2;
+    MempoolEntry in_mempool = 2;
 
   }
 }
@@ -521,6 +614,10 @@ message TreeStateResponse {
 
   // Encoded tree-state payload bytes.
   bytes payload_bytes = 4;
+
+  // Block timestamp in Unix seconds. Presence is required by contract
+  // revision 2 so clients can reject responses from older implementations.
+  optional uint32 block_time_seconds = 5;
 }
 
 // One node-advertised network-upgrade activation.
@@ -832,14 +929,12 @@ message ChainEventEnvelope {
 // in [`zinder.v1.ops.ServerInfo`]. The wallet-specific fields below
 // describe operator configuration that constrains a wallet consumer's
 // behavior (retention windows, reorg depth, upstream-node capability
-// snapshot, vendored lightwalletd protocol commit, canonical artifact
-// schema version).
+// snapshot and canonical artifact schema version).
 message WalletServerInfo {
   // Cross-service identity and capability descriptor.
   zinder.v1.ops.ServerInfo common = 1;
 
-  // Vendored lightwalletd protocol commit served by this deployment.
-  string lightwalletd_protocol_commit = 2;
+  reserved 2;
 
   // Canonical artifact schema version.
   uint32 schema_version = 3;
@@ -941,10 +1036,8 @@ message MempoolEntry {
   // Raw serialized transaction bytes hydrated from the source.
   bytes raw_transaction_bytes = 3;
 
-  // Lightwalletd-compatible compact transaction bytes derived from the raw
-  // transaction. Pre-built so the lightwalletd compatibility adapter does
-  // not parse raw bytes on the read path.
-  bytes compact_transaction_bytes = 4;
+  // Zinder-native compact transaction data derived from the raw transaction.
+  CompactTransactionData compact_transaction_data = 4;
 
   // Wall-clock time when the indexer first observed this entry.
   uint64 first_seen_unix_millis = 5;
@@ -1552,9 +1645,7 @@ service WalletQuery {
   // Return the visible-tip block identity.
   rpc VisibleTipBlock(VisibleTipBlockRequest) returns (VisibleTipBlockResponse);
 
-  // Return the block at the settled tip height: the highest height at which
-  // both compact blocks and a coherent tree-state checkpoint are
-  // guaranteed available. The wallet uses this as its scan ceiling.
+  // Return the block at the settled reorg-window settlement watermark.
   rpc SettledTipBlock(SettledTipBlockRequest) returns (SettledTipBlockResponse);
 
   // Resolve a typed block selector against the canonical best chain.

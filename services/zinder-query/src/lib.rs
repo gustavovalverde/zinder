@@ -1,7 +1,9 @@
 //! Wallet and application query boundary for Zinder.
 //!
 //! This crate serves indexed artifacts through [`ChainEpochReadApi`] without
-//! calling upstream node sources or mutating canonical storage.
+//! mutating canonical storage or using upstream nodes as a fallback for
+//! indexed history. Upstream access is limited to explicitly delegated sparse
+//! tree-state fill and transaction broadcast operations.
 
 use std::{collections::HashSet, fmt, num::NonZeroU32, sync::Arc, time::Instant};
 
@@ -37,11 +39,12 @@ use zinder_store::{
 };
 
 mod grpc;
-mod lightwalletd_serving_query;
 mod wallet_serving_pair;
+mod wallet_serving_pair_publisher;
+mod wallet_serving_query;
 
 pub use grpc::{
-    ServerInfoSettings, UpstreamNodeCapabilities, WalletQueryGrpcAdapter,
+    ServerInfoSettings, UpstreamNodeCapabilities, WalletCapabilityProfile, WalletQueryGrpcAdapter,
     address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response,
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
@@ -52,12 +55,16 @@ pub use grpc::{
     transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
     transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
     transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
-    visible_tip_block_response,
+    visible_tip_block_response, wallet_capability_strings,
 };
-pub use lightwalletd_serving_query::LightwalletdServingQuery;
 pub use wallet_serving_pair::{
     CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
 };
+pub use wallet_serving_pair_publisher::{
+    WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
+    WalletServingPairPublisher, WalletServingPairSlot,
+};
+pub use wallet_serving_query::WalletServingQuery;
 /// Wallet-facing read API backed by epoch-bound canonical reads.
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves to
@@ -76,9 +83,9 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError>;
 
-    /// Reads the block at the chain epoch's settled tip (the wallet's scan
-    /// ceiling). Mirrors `visible_tip_block` but resolves to
-    /// `chain_epoch.settled_tip_height` rather than `chain_epoch.tip_height`.
+    /// Reads the block at the chain epoch's settled finality watermark.
+    /// Mirrors `visible_tip_block` but resolves to
+    /// `chain_epoch.settled_tip_height` rather than `chain_epoch.visible_tip_height`.
     async fn settled_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
@@ -309,207 +316,6 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     ) -> Result<TransactionBroadcastOutcome, QueryError>;
 }
 
-/// Read and broadcast operations required by the lightwalletd compatibility adapter.
-///
-/// The native [`WalletQueryApi`] remains the complete wallet boundary. This
-/// narrower trait lets the compatibility server depend only on operations its
-/// `CompactTxStreamer` translation actually uses.
-#[async_trait]
-pub trait LightwalletdQueryApi: Send + Sync + 'static {
-    /// Reads the visible-tip block identity.
-    async fn visible_tip_block(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<VisibleTipBlock, QueryError>;
-
-    /// Resolves a typed block selector against the canonical best chain.
-    async fn block_id_by_selector(
-        &self,
-        selector: BlockSelector,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockIdAtEpoch, QueryError>;
-
-    /// Reads one compact block artifact at a given height.
-    async fn compact_block_at(
-        &self,
-        height: BlockHeight,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<CompactBlock, QueryError>;
-
-    /// Reads compact block artifacts for an inclusive height range.
-    async fn compact_blocks_in_range(
-        &self,
-        block_range: BlockHeightRange,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<CompactBlockRange, QueryError>;
-
-    /// Reads typed transaction status by transaction id.
-    async fn transaction(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransactionStatus, QueryError>;
-
-    /// Reads an optional raw transaction blob by transaction id.
-    async fn raw_transaction(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<RawTransaction, QueryError>;
-
-    /// Reads the complete unspent transparent output set for one address.
-    async fn transparent_address_unspent_outputs(
-        &self,
-        request: TransparentAddressUnspentOutputsRequest,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentAddressUnspentOutputs, QueryError>;
-
-    /// Reads a bounded page of transparent-address transaction history.
-    async fn transparent_address_tx_ids_in_range(
-        &self,
-        request: TransparentAddressTxIdsInRangeRequest,
-    ) -> Result<TransparentAddressTxIds, QueryError>;
-
-    /// Sums transparent-address balances at one pinned chain epoch.
-    async fn transparent_address_balance(
-        &self,
-        addresses: Vec<TransparentAddressScriptHash>,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentAddressBalance, QueryError>;
-
-    /// Reads the tree state at exactly `height`.
-    async fn tree_state_at(
-        &self,
-        height: BlockHeight,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TreeState, QueryError>;
-
-    /// Reads the latest tree-state checkpoint at the visible chain epoch tip.
-    async fn latest_tree_state_checkpoint(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TreeState, QueryError>;
-
-    /// Reads subtree-root artifacts for a bounded subtree range.
-    async fn subtree_roots(
-        &self,
-        subtree_root_range: SubtreeRootRange,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<SubtreeRoots, QueryError>;
-
-    /// Broadcasts a raw transaction without mutating canonical storage.
-    async fn broadcast_transaction(
-        &self,
-        raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastOutcome, QueryError>;
-}
-
-#[async_trait]
-impl<T> LightwalletdQueryApi for T
-where
-    T: WalletQueryApi,
-{
-    async fn visible_tip_block(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<VisibleTipBlock, QueryError> {
-        WalletQueryApi::visible_tip_block(self, at_epoch_id).await
-    }
-
-    async fn block_id_by_selector(
-        &self,
-        selector: BlockSelector,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<BlockIdAtEpoch, QueryError> {
-        WalletQueryApi::block_id_by_selector(self, selector, at_epoch_id).await
-    }
-
-    async fn compact_block_at(
-        &self,
-        height: BlockHeight,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<CompactBlock, QueryError> {
-        WalletQueryApi::compact_block_at(self, height, at_epoch_id).await
-    }
-
-    async fn compact_blocks_in_range(
-        &self,
-        block_range: BlockHeightRange,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<CompactBlockRange, QueryError> {
-        WalletQueryApi::compact_blocks_in_range(self, block_range, at_epoch_id).await
-    }
-
-    async fn transaction(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransactionStatus, QueryError> {
-        WalletQueryApi::transaction(self, transaction_id, at_epoch_id).await
-    }
-
-    async fn raw_transaction(
-        &self,
-        transaction_id: TransactionId,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<RawTransaction, QueryError> {
-        WalletQueryApi::raw_transaction(self, transaction_id, at_epoch_id).await
-    }
-
-    async fn transparent_address_unspent_outputs(
-        &self,
-        request: TransparentAddressUnspentOutputsRequest,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
-        WalletQueryApi::transparent_address_unspent_outputs(self, request, at_epoch_id).await
-    }
-
-    async fn transparent_address_tx_ids_in_range(
-        &self,
-        request: TransparentAddressTxIdsInRangeRequest,
-    ) -> Result<TransparentAddressTxIds, QueryError> {
-        WalletQueryApi::transparent_address_tx_ids_in_range(self, request).await
-    }
-
-    async fn transparent_address_balance(
-        &self,
-        addresses: Vec<TransparentAddressScriptHash>,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentAddressBalance, QueryError> {
-        WalletQueryApi::transparent_address_balance(self, addresses, at_epoch_id).await
-    }
-
-    async fn tree_state_at(
-        &self,
-        height: BlockHeight,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TreeState, QueryError> {
-        WalletQueryApi::tree_state_at(self, height, at_epoch_id).await
-    }
-
-    async fn latest_tree_state_checkpoint(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TreeState, QueryError> {
-        WalletQueryApi::latest_tree_state_checkpoint(self, at_epoch_id).await
-    }
-
-    async fn subtree_roots(
-        &self,
-        subtree_root_range: SubtreeRootRange,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<SubtreeRoots, QueryError> {
-        WalletQueryApi::subtree_roots(self, subtree_root_range, at_epoch_id).await
-    }
-
-    async fn broadcast_transaction(
-        &self,
-        raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastOutcome, QueryError> {
-        WalletQueryApi::broadcast_transaction(self, raw_transaction).await
-    }
-}
-
 /// Query boundary backed by a [`ChainEpochReadApi`] implementation.
 ///
 /// Pass `()` as the broadcaster to disable transaction broadcast.
@@ -661,6 +467,7 @@ enum TreeStateProbe {
     Fill {
         chain_epoch: ChainEpoch,
         block_id: BlockId,
+        block_time_seconds: u32,
     },
 }
 
@@ -1400,6 +1207,7 @@ where
                     chain_epoch,
                     height: stored.height,
                     block_hash: stored.block_hash,
+                    block_time_seconds: stored.block_time_seconds,
                     payload_bytes: stored.payload_bytes,
                 }));
             }
@@ -1415,6 +1223,12 @@ where
             Ok(TreeStateProbe::Fill {
                 chain_epoch,
                 block_id: BlockId::new(height, block.block_hash),
+                block_time_seconds: u32::try_from(block.block_time).map_err(|_| {
+                    QueryError::ArtifactCorrupt {
+                        family: ArtifactFamily::BlockHeader,
+                        reason: "canonical block time is outside the u32 range".to_owned(),
+                    }
+                })?,
             })
         }))
         .await;
@@ -1424,6 +1238,7 @@ where
             Ok(TreeStateProbe::Fill {
                 chain_epoch,
                 block_id,
+                block_time_seconds,
             }) => match self.tree_state_upstream.as_ref() {
                 Some(source) => {
                     let height = block_id.height;
@@ -1431,13 +1246,30 @@ where
                     source
                         .fetch_tree_state_for_block(block_id)
                         .await
-                        .map(|source_tree_state| TreeState {
-                            chain_epoch,
-                            height,
-                            block_hash,
-                            payload_bytes: source_tree_state.payload_bytes,
-                        })
                         .map_err(QueryError::Node)
+                        .and_then(|source_tree_state| {
+                            if source_tree_state.block_id != block_id {
+                                return Err(QueryError::Node(
+                                    SourceError::SourceProtocolMismatch {
+                                        reason: "tree-state source identity does not match the canonical block",
+                                    },
+                                ));
+                            }
+                            if source_tree_state.block_time_seconds != block_time_seconds {
+                                return Err(QueryError::Node(
+                                    SourceError::SourceProtocolMismatch {
+                                        reason: "tree-state source time does not match the canonical block",
+                                    },
+                                ));
+                            }
+                            Ok(TreeState {
+                                chain_epoch,
+                                height,
+                                block_hash,
+                                block_time_seconds,
+                                payload_bytes: source_tree_state.payload_bytes,
+                            })
+                        })
                 }
                 None => Err(block_height_artifact_unavailable(
                     ArtifactFamily::TreeState,
@@ -1479,6 +1311,7 @@ where
                 chain_epoch,
                 height: tree_state.height,
                 block_hash: tree_state.block_hash,
+                block_time_seconds: tree_state.block_time_seconds,
                 payload_bytes: tree_state.payload_bytes,
             })
         }))
@@ -2058,6 +1891,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::UnsupportedChainEvent { .. }) => "unsupported_chain_event",
         Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
+        Some(QueryError::UnsupportedWalletEncoding { .. }) => "unsupported_wallet_encoding",
         Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
@@ -2137,8 +1971,7 @@ pub struct VisibleTipBlock {
 }
 
 /// Settled-tip block metadata bound to one chain epoch. The block sits at
-/// `chain_epoch.settled_tip_height` and is the highest height the wallet can
-/// safely use as its scan ceiling.
+/// `chain_epoch.settled_tip_height` and marks the reorg-window finality boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SettledTipBlock {
     /// Chain epoch used to answer the query.
@@ -2307,6 +2140,8 @@ pub struct TreeState {
     pub height: BlockHeight,
     /// Hash of the block this tree state belongs to.
     pub block_hash: zinder_core::BlockHash,
+    /// Block timestamp in Unix seconds.
+    pub block_time_seconds: u32,
     /// Encoded tree-state payload bytes.
     pub payload_bytes: Vec<u8>,
 }
@@ -2505,6 +2340,13 @@ pub enum QueryError {
         reason: &'static str,
     },
 
+    /// A native domain value has no representation in the wallet protocol.
+    #[error("unsupported wallet encoding: {value_kind}")]
+    UnsupportedWalletEncoding {
+        /// Native value family that cannot be represented.
+        value_kind: &'static str,
+    },
+
     /// Transaction broadcast is disabled for this query handle.
     #[error("transaction broadcast is disabled")]
     TransactionBroadcastDisabled,
@@ -2594,6 +2436,7 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::UnsupportedChainEvent { .. } => ErrorReason::UnsupportedChainEvent,
             Self::UnsupportedBlockSelector { .. } => ErrorReason::UnsupportedBlockSelector,
             Self::UnsupportedTransactionStatus { .. } => ErrorReason::UnsupportedTransactionStatus,
+            Self::UnsupportedWalletEncoding { .. } => ErrorReason::UnsupportedWalletEncoding,
             Self::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
             Self::Node(source_error) if source_error.is_node_capability_missing() => {
                 ErrorReason::NodeCapabilityMissing
@@ -2770,6 +2613,9 @@ mod error_reason_tests {
             QueryError::UnsupportedChainEvent { event: "probe" },
             QueryError::UnsupportedBlockSelector { reason: "probe" },
             QueryError::UnsupportedTransactionStatus { reason: "probe" },
+            QueryError::UnsupportedWalletEncoding {
+                value_kind: "probe",
+            },
             QueryError::TransactionBroadcastDisabled,
             QueryError::BroadcastTransactionTooLarge {
                 actual: MAX_RAW_TRANSACTION_BYTES + 1,

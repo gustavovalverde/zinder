@@ -1,27 +1,39 @@
 //! Public client error vocabulary.
 
 use thiserror::Error;
+#[cfg(feature = "remote")]
 use tonic::Code;
+#[cfg(feature = "remote")]
 use tonic_types::StatusExt;
 use zinder_core::Network;
+#[cfg(feature = "local")]
 use zinder_materialized_views::MaterializedViewStoreError;
+#[cfg(feature = "remote")]
 use zinder_proto::v1::ops::ErrorReason;
+#[cfg(feature = "local")]
 use zinder_store::StoreError;
 
 /// Domain Zinder services set on every `google.rpc.ErrorInfo`.
 ///
 /// Matches the error vocabulary reference; duplicated here so the client does
 /// not need to depend on a service crate.
+#[cfg(feature = "remote")]
 pub(crate) const ZINDER_ERROR_DOMAIN: &str = "zinder.dev";
 
 /// Suggested retry policy attached to every [`IndexerError`].
 ///
 /// Clients consult this to decide whether to retry, surface to the operator,
 /// or fail the caller. The policy is derived from the gRPC code and the
-/// typed [`ErrorReason`], so it is stable across Zinder releases.
+/// typed remote error reason, so it is stable across Zinder releases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RetryPolicy {
+    /// Acquire a fresh chain epoch and restart the whole epoch-bound operation.
+    /// Retrying the same pinned request cannot succeed.
+    RefreshChainEpoch,
+    /// Restart the chain-event stream from the earliest retained event and
+    /// rebuild derived state from that replay boundary.
+    RestartFromEarliestRetained,
     /// Retry with exponential backoff. The remote service or upstream node
     /// is transiently unavailable; the request shape is correct.
     RetryWithBackoff,
@@ -34,6 +46,14 @@ pub enum RetryPolicy {
     ClientError,
 }
 
+/// Recovery position for an expired chain-event cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ChainEventCursorRecovery {
+    /// Discard the expired cursor and subscribe from the earliest retained event.
+    EarliestRetained,
+}
+
 /// Error returned by [`crate::ChainIndex`] implementations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -41,6 +61,17 @@ pub enum IndexerError {
     /// No visible chain epoch has been committed yet.
     #[error("no visible chain epoch has been committed")]
     NoVisibleChainEpoch,
+
+    /// Requested chain epoch is no longer retained by this serving pair.
+    #[error("requested chain epoch pin is unavailable")]
+    ChainEpochPinUnavailable,
+
+    /// A chain-event cursor points before the retained event window.
+    #[error("chain event cursor expired; restart from the earliest retained event")]
+    ChainEventCursorExpired {
+        /// Safe non-operator recovery action.
+        recovery: ChainEventCursorRecovery,
+    },
 
     /// Requested data is not indexed in the visible chain.
     #[error("{resource} was not found")]
@@ -126,6 +157,7 @@ pub enum IndexerError {
 }
 
 impl IndexerError {
+    #[cfg(feature = "local")]
     #[allow(
         clippy::needless_pass_by_value,
         reason = "StoreError is consumed through map_err adapters at storage boundaries"
@@ -149,12 +181,10 @@ impl IndexerError {
                 reason: reason.to_owned(),
             },
             StoreError::ChainEventCursorExpired {
-                event_sequence,
-                oldest_retained_sequence,
-            } => Self::FailedPrecondition {
-                reason: format!(
-                    "chain event cursor {event_sequence} is before oldest retained event {oldest_retained_sequence}"
-                ),
+                event_sequence: _,
+                oldest_retained_sequence: _,
+            } => Self::ChainEventCursorExpired {
+                recovery: ChainEventCursorRecovery::EarliestRetained,
             },
             StoreError::MempoolEventCursorExpired {
                 event_sequence,
@@ -183,6 +213,7 @@ impl IndexerError {
         }
     }
 
+    #[cfg(feature = "local")]
     #[allow(
         clippy::needless_pass_by_value,
         clippy::wildcard_enum_match_arm,
@@ -207,6 +238,7 @@ impl IndexerError {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[allow(
         clippy::needless_pass_by_value,
         reason = "tonic::Status is consumed through map_err adapters at gRPC boundaries"
@@ -236,7 +268,18 @@ impl IndexerError {
             };
         }
 
+        if status.code() == Code::FailedPrecondition
+            && matches!(zinder_reason, ErrorReason::ChainEventCursorExpired)
+        {
+            return Self::ChainEventCursorExpired {
+                recovery: ChainEventCursorRecovery::EarliestRetained,
+            };
+        }
+
         match status.code() {
+            _ if matches!(zinder_reason, ErrorReason::ChainEpochPinUnavailable) => {
+                Self::ChainEpochPinUnavailable
+            }
             Code::InvalidArgument => Self::InvalidRequest { reason: message },
             Code::FailedPrecondition => Self::FailedPrecondition { reason: message },
             Code::NotFound => Self::NotFound {
@@ -266,12 +309,15 @@ impl IndexerError {
     /// for client-side validation errors that never crossed a Zinder gRPC
     /// boundary.
     #[must_use]
+    #[cfg(feature = "remote")]
     pub fn reason(&self) -> Option<ErrorReason> {
         // Variant-level inference: each variant is most commonly produced by
         // one reason. The full reason is available on the wire via
         // ErrorInfo; this accessor exposes the variant's canonical mapping
         // so consumers can pattern-match without parsing strings.
         match self {
+            Self::ChainEpochPinUnavailable => Some(ErrorReason::ChainEpochPinUnavailable),
+            Self::ChainEventCursorExpired { .. } => Some(ErrorReason::ChainEventCursorExpired),
             Self::NotFound { .. } => Some(ErrorReason::BlockNotInBestChain),
             Self::ArtifactUnavailable { .. } => Some(ErrorReason::ArtifactUnavailable),
             Self::StorageUnavailable { .. } => Some(ErrorReason::StorageUnavailable),
@@ -294,6 +340,8 @@ impl IndexerError {
     #[must_use]
     pub fn retry_policy(&self) -> RetryPolicy {
         match self {
+            Self::ChainEpochPinUnavailable => RetryPolicy::RefreshChainEpoch,
+            Self::ChainEventCursorExpired { .. } => RetryPolicy::RestartFromEarliestRetained,
             Self::NoVisibleChainEpoch
             | Self::NotFound { .. }
             | Self::ArtifactUnavailable { .. }
@@ -309,6 +357,7 @@ impl IndexerError {
         }
     }
 
+    #[cfg(any(feature = "local", feature = "remote"))]
     pub(crate) fn malformed(field: &'static str, reason: impl Into<String>) -> Self {
         Self::MalformedResponse {
             field,
@@ -316,9 +365,76 @@ impl IndexerError {
         }
     }
 
+    #[cfg(any(feature = "local", feature = "remote"))]
     pub(crate) fn invalid_request(reason: impl Into<String>) -> Self {
         Self::InvalidRequest {
             reason: reason.into(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod tests {
+    use tonic_types::ErrorDetails;
+
+    use super::*;
+
+    #[test]
+    fn stale_chain_epoch_pin_round_trips_as_typed_retryable_error() {
+        let status = tonic::Status::with_error_details(
+            Code::FailedPrecondition,
+            "requested chain epoch is not retained",
+            ErrorDetails::with_error_info(
+                ErrorReason::ChainEpochPinUnavailable.as_str_name(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert!(matches!(error, IndexerError::ChainEpochPinUnavailable));
+        assert_eq!(error.reason(), Some(ErrorReason::ChainEpochPinUnavailable));
+        assert_eq!(error.retry_policy(), RetryPolicy::RefreshChainEpoch);
+    }
+
+    #[test]
+    fn expired_chain_event_cursor_round_trips_with_replay_recovery() {
+        let status = zinder_query::status_from_query_error(
+            &zinder_query::QueryError::ChainEventCursorExpired {
+                event_sequence: 4,
+                oldest_retained_sequence: 9,
+            },
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert!(matches!(
+            error,
+            IndexerError::ChainEventCursorExpired {
+                recovery: ChainEventCursorRecovery::EarliestRetained,
+            }
+        ));
+        assert_eq!(error.reason(), Some(ErrorReason::ChainEventCursorExpired));
+        assert_eq!(
+            error.retry_policy(),
+            RetryPolicy::RestartFromEarliestRetained
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn local_expired_chain_event_cursor_uses_the_same_typed_recovery() {
+        let error = IndexerError::from_store_error(StoreError::ChainEventCursorExpired {
+            event_sequence: 4,
+            oldest_retained_sequence: 9,
+        });
+
+        assert!(matches!(
+            error,
+            IndexerError::ChainEventCursorExpired {
+                recovery: ChainEventCursorRecovery::EarliestRetained,
+            }
+        ));
     }
 }

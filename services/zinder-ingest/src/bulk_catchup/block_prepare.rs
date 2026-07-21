@@ -23,13 +23,11 @@ use futures_util::{
 };
 use parking_lot::Mutex;
 use zinder_core::{
-    BlockHeight, CanonicalBlockFacts, CanonicalTransactionFacts, TransactionBlobArtifact,
+    BlockHeight, CanonicalBlockFacts, CanonicalTransactionFacts, CompactBlockArtifact,
+    CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransaction,
+    CompactTransparentInput, CompactTransparentOutput, TransactionBlobArtifact,
     TransparentInputFact, TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact,
     UnsupportedSection,
-};
-use zinder_proto::compat::lightwalletd::{
-    CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
-    CompactTxIn, TxOut,
 };
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{PrimaryChainStore, StoreReadCaller};
@@ -909,58 +907,31 @@ fn canonical_block_facts_heap_bytes(facts: &CanonicalBlockFacts) -> usize {
     resident_bytes
 }
 
-fn compact_block_heap_bytes(block: &CompactBlock) -> usize {
-    let mut resident_bytes = block
-        .hash
-        .capacity()
-        .saturating_add(block.prev_hash.capacity())
-        .saturating_add(block.header.capacity())
-        .saturating_add(vector_allocation_bytes::<CompactTx>(block.vtx.capacity()));
-    for transaction in &block.vtx {
+fn compact_block_heap_bytes(block: &CompactBlockArtifact) -> usize {
+    let mut resident_bytes =
+        vector_allocation_bytes::<CompactTransaction>(block.transactions().len());
+    for transaction in block.transactions() {
+        let scan_data = &transaction.data;
         resident_bytes = resident_bytes
-            .saturating_add(transaction.txid.capacity())
             .saturating_add(vector_allocation_bytes::<CompactSaplingSpend>(
-                transaction.spends.capacity(),
+                scan_data.sapling_spends.capacity(),
             ))
             .saturating_add(vector_allocation_bytes::<CompactSaplingOutput>(
-                transaction.outputs.capacity(),
+                scan_data.sapling_outputs.capacity(),
             ))
-            .saturating_add(vector_allocation_bytes::<CompactOrchardAction>(
-                transaction.actions.capacity(),
+            .saturating_add(vector_allocation_bytes::<CompactShieldedAction>(
+                scan_data.orchard_actions.capacity(),
             ))
-            .saturating_add(vector_allocation_bytes::<CompactOrchardAction>(
-                transaction.ironwood_actions.capacity(),
+            .saturating_add(vector_allocation_bytes::<CompactShieldedAction>(
+                scan_data.ironwood_actions.capacity(),
             ))
-            .saturating_add(vector_allocation_bytes::<CompactTxIn>(
-                transaction.vin.capacity(),
+            .saturating_add(vector_allocation_bytes::<CompactTransparentInput>(
+                scan_data.transparent_inputs.capacity(),
             ))
-            .saturating_add(vector_allocation_bytes::<TxOut>(
-                transaction.vout.capacity(),
+            .saturating_add(vector_allocation_bytes::<CompactTransparentOutput>(
+                scan_data.transparent_outputs.capacity(),
             ));
-        for spend in &transaction.spends {
-            resident_bytes = resident_bytes.saturating_add(spend.nf.capacity());
-        }
-        for output in &transaction.outputs {
-            resident_bytes = resident_bytes
-                .saturating_add(output.cmu.capacity())
-                .saturating_add(output.ephemeral_key.capacity())
-                .saturating_add(output.ciphertext.capacity());
-        }
-        for action in transaction
-            .actions
-            .iter()
-            .chain(&transaction.ironwood_actions)
-        {
-            resident_bytes = resident_bytes
-                .saturating_add(action.nullifier.capacity())
-                .saturating_add(action.cmx.capacity())
-                .saturating_add(action.ephemeral_key.capacity())
-                .saturating_add(action.ciphertext.capacity());
-        }
-        for input in &transaction.vin {
-            resident_bytes = resident_bytes.saturating_add(input.prevout_txid.capacity());
-        }
-        for output in &transaction.vout {
+        for output in &scan_data.transparent_outputs {
             resident_bytes = resident_bytes.saturating_add(output.script_pub_key.capacity());
         }
     }

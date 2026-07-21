@@ -41,7 +41,7 @@ Domain and storage crates do not expose generated protobuf types in their
 public APIs. Storage-private control encodings may live in `zinder-store` when
 they are not service contracts.
 
-`zinder-compat-lightwalletd` translates `LightwalletdQueryApi` semantics into
+`zinder-compat-lightwalletd` translates `WalletQueryApi` semantics into
 the vendored lightwalletd contract. It does not build missing canonical
 artifacts or mutate canonical storage. Its explicitly configured edge calls
 may broadcast a transaction, discover network-upgrade activations, or fill

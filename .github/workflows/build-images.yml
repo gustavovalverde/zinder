@@ -53,6 +53,7 @@ jobs:
           images=(
             "zinder-ingest:zinder-ingest:zinder-ingest"
             "zinder-projector:zinder-projector:zinder-projector"
+            "zinder-query:zinder-query:zinder-query"
             "zinder-compat-lightwalletd:zinder-compat-lightwalletd:zinder-compat-lightwalletd"
           )
 

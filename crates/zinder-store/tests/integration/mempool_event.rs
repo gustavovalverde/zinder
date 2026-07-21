@@ -8,10 +8,9 @@ use std::time::Duration;
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    MempoolEntry, MempoolEvictionReason, Network, RawTransactionBytes, TransactionId,
-    TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, UnixTimestampMillis,
+    BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactTransactionData,
+    CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolEvictionReason,
+    MempoolObservation, Network, RawTransactionBytes, TransactionId, UnixTimestampMillis,
 };
 use zinder_store::{
     ChainStoreOptions, EventStreamStartPosition, MempoolEvent, MempoolEventHistoryRequest,
@@ -27,7 +26,7 @@ fn mempool_event_history_round_trip() -> eyre::Result<()> {
     let store = open_store(tempdir.path())?;
 
     let chain_epoch = synthetic_chain_epoch(1);
-    let added = synthetic_entry(0xA0, chain_epoch);
+    let added = synthetic_entry(0xA0, chain_epoch)?;
     let added_envelope = store.append_mempool_event(
         MempoolEvent::Added {
             entry: added.clone(),
@@ -36,7 +35,7 @@ fn mempool_event_history_round_trip() -> eyre::Result<()> {
     )?;
     let mined_envelope = store.append_mempool_event(
         MempoolEvent::Mined {
-            transaction_id: added.transaction_id,
+            transaction_id: added.transaction_id(),
             mined_height: BlockHeight::new(7),
             block_hash: BlockHash::from_bytes([0xC7; 32]),
         },
@@ -77,13 +76,13 @@ fn mempool_event_history_resumes_strictly_after_cursor() -> eyre::Result<()> {
 
     let first = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA0, chain_epoch),
+            entry: synthetic_entry(0xA0, chain_epoch)?,
         },
         UnixTimestampMillis::new(1_000),
     )?;
     let _second = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA1, chain_epoch),
+            entry: synthetic_entry(0xA1, chain_epoch)?,
         },
         UnixTimestampMillis::new(2_000),
     )?;
@@ -109,7 +108,7 @@ fn tampered_mempool_event_cursor_is_rejected() -> eyre::Result<()> {
 
     let appended = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA0, chain_epoch),
+            entry: synthetic_entry(0xA0, chain_epoch)?,
         },
         UnixTimestampMillis::new(1_000),
     )?;
@@ -143,13 +142,13 @@ fn mempool_event_history_resume_from_latest_event_is_empty() -> eyre::Result<()>
 
     let _first = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA0, chain_epoch),
+            entry: synthetic_entry(0xA0, chain_epoch)?,
         },
         UnixTimestampMillis::new(1_000),
     )?;
     let latest = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA1, chain_epoch),
+            entry: synthetic_entry(0xA1, chain_epoch)?,
         },
         UnixTimestampMillis::new(2_000),
     )?;
@@ -196,7 +195,7 @@ fn events_resume_cursor_matches_anchor_envelope_cursor() -> eyre::Result<()> {
 
     let envelope = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA0, chain_epoch),
+            entry: synthetic_entry(0xA0, chain_epoch)?,
         },
         UnixTimestampMillis::new(1_000),
     )?;
@@ -217,13 +216,13 @@ fn mempool_live_tail_start_skips_prior_events_and_delivers_later_appends() -> ey
 
     let _first = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA0, chain_epoch),
+            entry: synthetic_entry(0xA0, chain_epoch)?,
         },
         UnixTimestampMillis::new(1_000),
     )?;
     let second = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA1, chain_epoch),
+            entry: synthetic_entry(0xA1, chain_epoch)?,
         },
         UnixTimestampMillis::new(2_000),
     )?;
@@ -240,7 +239,7 @@ fn mempool_live_tail_start_skips_prior_events_and_delivers_later_appends() -> ey
 
     let third = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA2, chain_epoch),
+            entry: synthetic_entry(0xA2, chain_epoch)?,
         },
         UnixTimestampMillis::new(3_000),
     )?;
@@ -295,7 +294,7 @@ fn prune_advances_floor_when_deletes_already_applied() -> eyre::Result<()> {
     )?;
     let _recent = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA2, chain_epoch),
+            entry: synthetic_entry(0xA2, chain_epoch)?,
         },
         UnixTimestampMillis::new(1_000_000_000),
     )?;
@@ -334,7 +333,7 @@ fn prune_when_only_current_event_exists() -> eyre::Result<()> {
 
     let only_envelope = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA0, chain_epoch),
+            entry: synthetic_entry(0xA0, chain_epoch)?,
         },
         UnixTimestampMillis::new(1_000_000_000),
     )?;
@@ -376,7 +375,7 @@ fn cursor_below_pruned_floor_returns_mempool_cursor_expired() -> eyre::Result<()
     )?;
     let _recent = store.append_mempool_event(
         MempoolEvent::Added {
-            entry: synthetic_entry(0xA1, chain_epoch),
+            entry: synthetic_entry(0xA1, chain_epoch)?,
         },
         UnixTimestampMillis::new(1_000_000_000),
     )?;
@@ -425,7 +424,7 @@ fn pruned_floor_persists_across_store_reopen() -> eyre::Result<()> {
         )?;
         let _recent = store.append_mempool_event(
             MempoolEvent::Added {
-                entry: synthetic_entry(0xA1, chain_epoch),
+                entry: synthetic_entry(0xA1, chain_epoch)?,
             },
             UnixTimestampMillis::new(1_000_000_000),
         )?;
@@ -458,35 +457,38 @@ fn synthetic_chain_epoch(chain_epoch_id: u64) -> ChainEpoch {
         visible_tip_hash: BlockHash::from_bytes([0x42; 32]),
         settled_tip_height: BlockHeight::new(1),
         settled_tip_hash: BlockHash::from_bytes([0x42; 32]),
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_700_000_000_000),
     }
 }
 
-fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolEntry {
+fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> eyre::Result<MempoolEntry> {
     let transaction_id = TransactionId::from_bytes([transaction_id_byte; 32]);
-    MempoolEntry {
+    Ok(MempoolEntry::new(
         transaction_id,
-        auth_digest: None,
-        raw_transaction_bytes: RawTransactionBytes::new(vec![transaction_id_byte; 8]),
-        compact_transaction_bytes: vec![transaction_id_byte; 4],
-        first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
-        first_seen_chain_epoch: chain_epoch,
-        transparent_outputs: vec![TransparentMempoolOutput {
-            address_script_hash: TransparentAddressScriptHash::from_bytes(
-                [transaction_id_byte; 32],
-            ),
-            script_pub_key: vec![transaction_id_byte; 25],
-            outpoint: TransparentOutPoint::new(transaction_id, 0),
-            value_zat: 1_000,
-        }],
-        transparent_spends: vec![TransparentMempoolSpend {
-            spent_outpoint: TransparentOutPoint::new(
-                TransactionId::from_bytes([transaction_id_byte.wrapping_add(1); 32]),
-                0,
-            ),
-            spending_transaction_id: transaction_id,
-        }],
-    }
+        None,
+        RawTransactionBytes::new(vec![transaction_id_byte; 8]),
+        CompactTransactionData {
+            fee_zat: None,
+            sapling_spends: Vec::new(),
+            sapling_outputs: Vec::new(),
+            orchard_actions: Vec::new(),
+            ironwood_actions: Vec::new(),
+            transparent_inputs: vec![CompactTransparentInput {
+                previous_transaction_id: TransactionId::from_bytes(
+                    [transaction_id_byte.wrapping_add(1); 32],
+                ),
+                previous_output_index: 0,
+            }],
+            transparent_outputs: vec![CompactTransparentOutput {
+                script_pub_key: vec![transaction_id_byte; 25],
+                value_zat: 1_000,
+            }],
+        },
+        MempoolObservation {
+            first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+            first_seen_chain_epoch: chain_epoch,
+        },
+    )?)
 }

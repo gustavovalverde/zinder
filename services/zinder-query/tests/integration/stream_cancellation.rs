@@ -9,8 +9,8 @@
 //!   with no cooldown.
 //! - The server must serve many concurrent streamed reads without
 //!   serializing them or returning errors. The default deployment shape
-//!   puts one `zinder-query` process behind several `zinder-compat-lightwalletd`
-//!   processes, each fanning out wallet scan-back ranges over the same
+//!   puts one `zinder-query` process behind several native wallet clients,
+//!   each fanning out wallet scan-back ranges over the same
 //!   store; if the read path can't handle parallel streams, that topology
 //!   is unusable.
 //!

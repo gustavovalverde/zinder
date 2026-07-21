@@ -77,6 +77,16 @@ pub enum CanonicalWriterError {
         /// Latest atomic source observation.
         source_tip: BlockId,
     },
+    /// A READY store omits canonical history required by this invocation.
+    #[error(
+        "canonical READY store starts at height {actual_first_available_height:?}, after configured required height {required_first_available_height:?}"
+    )]
+    InsufficientRetainedHistory {
+        /// Earliest height the current configuration requires.
+        required_first_available_height: BlockHeight,
+        /// Earliest height retained by the admitted READY store.
+        actual_first_available_height: BlockHeight,
+    },
     /// Continuous following failed after READY admission.
     #[error(transparent)]
     Follow(#[from] CanonicalFollowError),
@@ -195,6 +205,7 @@ fn open_existing_store(
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     )?;
+    validate_retained_history_coverage(&store, config)?;
     tracing::info!(
         target: "zinder::ingest",
         event = "canonical_ready_store_reopened",
@@ -227,17 +238,18 @@ fn recover_staged_store(
         config.resource_budget,
     ) {
         Ok(staged_ready) => {
+            validate_retained_history_coverage(&staged_ready, config)?;
             drop(staged_ready);
             install_staged_store(staging_path, &config.storage_path)?;
-            RocksDbCanonicalStore::open_ready(
+            let store = RocksDbCanonicalStore::open_ready(
                 &config.storage_path,
                 network_upgrade_activations,
                 CanonicalStoreWorkload::Wallet,
                 CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
                 config.resource_budget,
-            )
-            .map(Some)
-            .map_err(CanonicalWriterError::from)
+            )?;
+            validate_retained_history_coverage(&store, config)?;
+            Ok(Some(store))
         }
         Err(CanonicalStoreError::StoreNotReady { .. }) => {
             remove_unpublished_staging(staging_path)?;
@@ -365,6 +377,7 @@ where
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     )?;
+    validate_retained_history_coverage(&store, config)?;
     if store.event_fence() != published_fence {
         return Err(CanonicalWriterError::InstalledFenceMismatch);
     }
@@ -378,6 +391,35 @@ where
         "published and cold-reopened the canonical baseline"
     );
     Ok(store)
+}
+
+fn validate_retained_history_coverage(
+    store: &RocksDbCanonicalStore,
+    config: &CanonicalWriterConfig,
+) -> Result<(), CanonicalWriterError> {
+    validate_first_available_height(
+        store.history_bounds().first_available_height(),
+        configured_first_available_height(config.checkpoint_height),
+    )
+}
+
+fn configured_first_available_height(checkpoint_height: Option<BlockHeight>) -> BlockHeight {
+    checkpoint_height.map_or(BlockHeight::new(1), |checkpoint_height| {
+        BlockHeight::new(checkpoint_height.value().saturating_add(1))
+    })
+}
+
+fn validate_first_available_height(
+    actual_first_available_height: BlockHeight,
+    required_first_available_height: BlockHeight,
+) -> Result<(), CanonicalWriterError> {
+    if actual_first_available_height > required_first_available_height {
+        return Err(CanonicalWriterError::InsufficientRetainedHistory {
+            required_first_available_height,
+            actual_first_available_height,
+        });
+    }
+    Ok(())
 }
 
 async fn resolve_construction_range<Source>(
@@ -396,31 +438,14 @@ where
         }
         _ => source_tip,
     };
-    let build_plan = if let Some(checkpoint_height) = config.checkpoint_height {
-        if fixed_tip.height <= checkpoint_height {
-            return Err(CanonicalWriterError::CheckpointNotBehindSource {
-                checkpoint_height,
-                source_tip: fixed_tip,
-            });
-        }
-        let checkpoint = source
-            .fetch_chain_checkpoint(checkpoint_height, network_upgrade_activations)
-            .await?;
-        CanonicalStoreBuildPlan::checkpointed(
-            network_upgrade_activations,
-            checkpoint,
-            fixed_tip,
-            CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
-        )?
-    } else {
-        let genesis = source.fetch_block_at(BlockHeight::new(0)).await?;
-        CanonicalStoreBuildPlan::complete(
-            network_upgrade_activations,
-            genesis.block_time_seconds,
-            fixed_tip,
-            CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
-        )?
-    };
+    let build_plan = resolve_build_plan(
+        source,
+        network_upgrade_activations,
+        config.checkpoint_height,
+        fixed_tip,
+        config.reorg_window_blocks,
+    )
+    .await?;
     let first_retained_height = build_plan.history_bounds().first_available_height();
     let settled_height = BlockHeight::new(
         fixed_tip
@@ -436,6 +461,47 @@ where
         BlockId::new(settled_height, block.hash)
     };
     Ok((build_plan, settled_tip, fixed_tip))
+}
+
+async fn resolve_build_plan<Source>(
+    source: &Source,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    checkpoint_height: Option<BlockHeight>,
+    fixed_tip: BlockId,
+    reorg_window_blocks: u32,
+) -> Result<CanonicalStoreBuildPlan, CanonicalWriterError>
+where
+    Source: NodeSource,
+{
+    if let Some(checkpoint_height) = checkpoint_height {
+        if fixed_tip.height <= checkpoint_height {
+            return Err(CanonicalWriterError::CheckpointNotBehindSource {
+                checkpoint_height,
+                source_tip: fixed_tip,
+            });
+        }
+        if checkpoint_height != BlockHeight::new(0) {
+            let checkpoint = source
+                .fetch_chain_checkpoint(checkpoint_height, network_upgrade_activations)
+                .await?;
+            return CanonicalStoreBuildPlan::checkpointed(
+                network_upgrade_activations,
+                checkpoint,
+                fixed_tip,
+                CanonicalReorgPolicy::new(reorg_window_blocks)?,
+            )
+            .map_err(CanonicalWriterError::from);
+        }
+    }
+
+    let genesis = source.fetch_block_at(BlockHeight::new(0)).await?;
+    CanonicalStoreBuildPlan::complete(
+        network_upgrade_activations,
+        genesis.block_time_seconds,
+        fixed_tip,
+        CanonicalReorgPolicy::new(reorg_window_blocks)?,
+    )
+    .map_err(CanonicalWriterError::from)
 }
 
 fn construction_staging_path(storage_path: &std::path::Path) -> PathBuf {
@@ -468,12 +534,100 @@ fn install_staged_store(
 mod tests {
     use std::error::Error;
 
+    use async_trait::async_trait;
     use tempfile::tempdir;
+    use zinder_core::{BlockHash, BlockHeight, BlockId, Network};
+    use zinder_source::{
+        NodeCapabilities, NodeSource, SourceBlock, SourceBlockHeader, SourceError,
+    };
+    use zinder_testkit::sample_regtest_upgrade_activations;
 
     use super::{
-        discard_unpublished_block_load_staging, remove_empty_construction_staging,
-        remove_unpublished_staging,
+        CanonicalWriterError, discard_unpublished_block_load_staging,
+        remove_empty_construction_staging, remove_unpublished_staging, resolve_build_plan,
+        validate_first_available_height,
     };
+
+    #[derive(Clone)]
+    struct GenesisSource;
+
+    #[test]
+    fn ready_store_rejects_narrower_history_than_configured() {
+        let outcome =
+            validate_first_available_height(BlockHeight::new(4_189_466), BlockHeight::new(280_000));
+
+        assert!(matches!(
+            outcome,
+            Err(CanonicalWriterError::InsufficientRetainedHistory {
+                required_first_available_height,
+                actual_first_available_height,
+            }) if required_first_available_height == BlockHeight::new(280_000)
+                && actual_first_available_height == BlockHeight::new(4_189_466)
+        ));
+    }
+
+    #[test]
+    fn ready_store_accepts_equal_or_broader_history() -> Result<(), CanonicalWriterError> {
+        validate_first_available_height(BlockHeight::new(280_000), BlockHeight::new(280_000))?;
+        validate_first_available_height(BlockHeight::new(1), BlockHeight::new(280_000))?;
+        Ok(())
+    }
+
+    #[async_trait]
+    impl NodeSource for GenesisSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            NodeCapabilities::new([]).unwrap_or_default()
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            if height != BlockHeight::new(0) {
+                return Err(SourceError::BlockUnavailable {
+                    height,
+                    reason: "genesis source exposes only height zero".to_owned(),
+                });
+            }
+            Ok(SourceBlock::new(
+                SourceBlockHeader {
+                    network: Network::ZcashRegtest,
+                    height,
+                    hash: BlockHash::from_bytes([0; 32]),
+                    parent_hash: BlockHash::from_bytes([0; 32]),
+                    block_time_seconds: 1_700_000_000,
+                },
+                Vec::new(),
+            ))
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            Ok(BlockId::new(
+                BlockHeight::new(2),
+                BlockHash::from_bytes([2; 32]),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn genesis_predecessor_selects_complete_history_without_genesis_artifact()
+    -> Result<(), Box<dyn Error>> {
+        let plan = resolve_build_plan(
+            &GenesisSource,
+            &sample_regtest_upgrade_activations(),
+            Some(BlockHeight::new(0)),
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            100,
+        )
+        .await?;
+
+        assert_eq!(
+            plan.history_bounds().first_available_height(),
+            BlockHeight::new(1)
+        );
+        assert_eq!(
+            plan.history_predecessor().block_id.height,
+            BlockHeight::new(0)
+        );
+        Ok(())
+    }
 
     #[test]
     fn empty_construction_staging_is_removed() -> Result<(), Box<dyn Error>> {

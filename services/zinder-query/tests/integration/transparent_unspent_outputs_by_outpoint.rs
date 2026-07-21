@@ -54,7 +54,7 @@ fn commit_unspent_and_spent_outputs(
 
     let spend = TransparentSpendFact::new(
         spent_outpoint,
-        2,
+        0,
         TransactionId::from_bytes([0x33; 32]),
         0,
         block_two.height,
@@ -70,14 +70,14 @@ fn commit_unspent_and_spent_outputs(
         vec![compact_one],
         &[unspent_output, spent_output],
         Vec::new(),
-    ))?;
+    )?)?;
     store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
         epoch_two,
         vec![block_two],
         vec![compact_two],
         &[],
         vec![spend],
-    ))?;
+    )?)?;
 
     Ok((unspent_outpoint, spent_outpoint, unspent_value_zat))
 }
@@ -184,7 +184,7 @@ async fn transparent_unspent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel(
         vec![compact_block],
         &[],
         Vec::new(),
-    ))?;
+    )?)?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
 

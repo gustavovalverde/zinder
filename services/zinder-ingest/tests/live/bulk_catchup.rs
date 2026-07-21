@@ -17,7 +17,7 @@ use zinder_store::{PrimaryChainStore, StoreError};
 use zinder_testkit::live::{init, require_live, require_live_for};
 
 use crate::common::{
-    assert_lightwalletd_send_transaction_classifies_invalid, assert_native_wallet_read_responses,
+    assert_native_broadcast_classifies_invalid, assert_native_wallet_read_responses,
     fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
     zebra_source_from_bulk_catchup,
 };
@@ -73,7 +73,7 @@ async fn bulk_catchup_initial_range() -> Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tip tree-state artifact"))?;
 
     assert_eq!(block.height, to_height);
-    assert_eq!(compact_block.height, to_height);
+    assert_eq!(compact_block.height(), to_height);
     assert_eq!(tree_state.height, to_height);
     assert!(!tree_state.payload_bytes.is_empty());
     assert_native_wallet_read_responses(
@@ -84,7 +84,7 @@ async fn bulk_catchup_initial_range() -> Result<()> {
         Arc::clone(&activations),
     )
     .await?;
-    assert_lightwalletd_send_transaction_classifies_invalid(
+    assert_native_broadcast_classifies_invalid(
         &store,
         &bulk_catchup_config,
         Arc::clone(&activations),

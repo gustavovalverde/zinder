@@ -103,8 +103,8 @@ pub(crate) struct IngestCommandConfig {
 pub(crate) enum IngestCoverage {
     /// Use explicitly supplied modifier heights as-is.
     Explicit,
-    /// Derive the historical floor needed by lightwalletd-compatible
-    /// wallets. The ingest loop looks up the checkpoint against the
+    /// Derive the historical floor needed by native wallet serving. The
+    /// ingest loop looks up the checkpoint against the
     /// upstream node before entering the first phase.
     WalletServing,
 }
@@ -687,7 +687,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         && config.ingest.run_overrides.checkpoint_height.is_some()
     {
         return Err(ConfigError::invalid(
-            "ingest.run_overrides.coverage = \"wallet-serving\" derives checkpoint_height from the node; remove ingest.run_overrides.checkpoint_height",
+            "ingest.run_overrides.coverage = \"wallet-serving\" requires complete transparent history and sets checkpoint_height to zero; remove ingest.run_overrides.checkpoint_height",
         )
         .into());
     }

@@ -347,7 +347,6 @@ mod tests {
     };
 
     use metrics_exporter_prometheus::PrometheusBuilder;
-    use prost::Message;
     use rust_rocksdb::DB;
     use tempfile::TempDir;
     use zinder_core::{
@@ -356,17 +355,17 @@ mod tests {
         CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
         CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds,
         CanonicalTransactionFacts, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
-        DisplacedBlockArchiveCoverage, FinalNoteCommitmentRoot, LockTime, PrivacyShape,
-        SerializedBytesDigest, TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
+        CompactTransaction, CompactTransactionData, DisplacedBlockArchiveCoverage,
+        FinalNoteCommitmentRoot, LockTime, PrivacyShape, SerializedBytesDigest,
+        TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
         TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
         TransactionVersion, TransparentAddressScriptHash, TransparentOutputFact,
         UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
-        wire::encode_internal_block_hash,
     };
 
     use super::*;
     use crate::canonical_store::{
-        block_load::canonical_block_families_are_empty,
+        block_load::{canonical_block_families_are_empty, validate_compact_block_payload},
         block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, validate_persisted_block_replays},
         construction_manifest::CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME,
         control::{decode_store_control, encode_ready_store_control},
@@ -669,7 +668,7 @@ mod tests {
             assert_eq!(
                 before
                     .iter()
-                    .map(|block| block.height.value())
+                    .map(|block| block.height().value())
                     .collect::<Vec<_>>(),
                 [1, 2, 3]
             );
@@ -1973,8 +1972,8 @@ mod tests {
         add_tree_state_checkpoint(&mut block)?;
         let expected_block_replay_logical_bytes =
             4_u64 + u64::try_from(block.replay_envelope.as_bytes().len())?;
-        let expected_compact_block_logical_bytes =
-            4_u64 + u64::try_from(block.compact_block.payload_bytes.len())?;
+        let expected_compact_block_logical_bytes = 4_u64
+            + u64::try_from(zinder_proto::wire::encode_compact_block(&block.compact_block).len())?;
 
         let evidence = store.bulk_load_blocks(vec![Ok::<_, std::io::Error>(block)])?;
 
@@ -2127,7 +2126,16 @@ mod tests {
             [1; 32],
             Network::ZcashTestnet.genesis_hash().as_bytes(),
         );
-        compact_block.compact_block.payload_bytes = vec![0xff];
+        compact_block.compact_block = CompactBlockArtifact::empty(
+            zinder_core::BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xff; 32])),
+            Network::ZcashTestnet.genesis_hash(),
+            0,
+            zinder_core::CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        );
         let error = compact_store
             .bulk_load_blocks(vec![Ok::<_, std::io::Error>(compact_block)])
             .err()
@@ -2139,6 +2147,56 @@ mod tests {
         assert!(canonical_block_families_are_empty(
             &compact_store.bounded_open.db
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_payload_validation_rejects_parent_time_index_and_transaction_id_mismatches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let height = BlockHeight::new(1);
+        let block_hash = [1; 32];
+        let parent_hash = Network::ZcashTestnet.genesis_hash().as_bytes();
+
+        for (parent, time) in [
+            (BlockHash::from_bytes([99; 32]), height.value()),
+            (BlockHash::from_bytes(parent_hash), height.value() + 1),
+        ] {
+            let mut block = canonical_build_block(height, block_hash, parent_hash);
+            block.compact_block = CompactBlockArtifact::empty(
+                BlockId::new(height, BlockHash::from_bytes(block_hash)),
+                parent,
+                time,
+                zinder_core::CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            );
+            assert!(validate_compact_block_payload(&block).is_err());
+        }
+
+        for (index, transaction_id) in [
+            (1, TransactionId::from_bytes([9; 32])),
+            (0, TransactionId::from_bytes([10; 32])),
+        ] {
+            let mut block = canonical_build_block_with_raw_blobs(height, block_hash, parent_hash);
+            block.compact_block = CompactBlockArtifact::new(
+                BlockId::new(height, BlockHash::from_bytes(block_hash)),
+                BlockHash::from_bytes(parent_hash),
+                height.value(),
+                vec![CompactTransaction {
+                    index,
+                    transaction_id,
+                    data: CompactTransactionData::default(),
+                }],
+                zinder_core::CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            )?;
+            assert!(validate_compact_block_payload(&block).is_err());
+        }
         Ok(())
     }
 
@@ -2715,23 +2773,16 @@ mod tests {
             CanonicalBlockReplayFormatVersion::V1,
             CanonicalBlockFactsDigestVersion::V1,
         );
-        let compact_payload = zinder_proto::compat::lightwalletd::CompactBlock {
-            height: u64::from(height.value()),
-            hash: encode_internal_block_hash(facts.block_header.block_hash).to_vec(),
-            prev_hash: encode_internal_block_hash(facts.block_header.parent_hash).to_vec(),
-            chain_metadata: Some(zinder_proto::compat::lightwalletd::ChainMetadata {
-                sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 0,
-                ironwood_commitment_tree_size: 0,
-            }),
-            ..Default::default()
-        }
-        .encode_to_vec();
         crate::CanonicalBuildBlock {
-            compact_block: CompactBlockArtifact::new(
-                height,
-                facts.block_header.block_hash,
-                compact_payload,
+            compact_block: CompactBlockArtifact::empty(
+                zinder_core::BlockId::new(height, facts.block_header.block_hash),
+                facts.block_header.parent_hash,
+                height.value(),
+                zinder_core::CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
             ),
             replay_envelope,
             tip_metadata: ChainTipMetadata::new(0, 0, 0),

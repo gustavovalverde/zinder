@@ -15,7 +15,8 @@ prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 tonic-types.workspace = true
-zinder-core.workspace = true
+thiserror.workspace = true
+zinder-core = { path = "../zinder-core", default-features = false }
 
 [package.metadata.cargo-machete]
 # The generated modules included from OUT_DIR reference these crates directly.

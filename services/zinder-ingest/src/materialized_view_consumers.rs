@@ -8,8 +8,8 @@
 //! Consumer writes and cursor advances land in one materialized-view write batch
 //! per chain epoch.
 //!
-//! Reader processes (`zinder-query`, `zinder-compat-lightwalletd`, and
-//! `zinder-explorer`) open the same materialized-view store path in secondary mode (per
+//! Reader processes (`zinder-query` and `zinder-explorer`) open the same
+//! materialized-view store path in secondary mode (per
 //! [`zinder_materialized_views::MaterializedViewStore::open_secondary`]) and advance their view via
 //! [`zinder_materialized_views::MaterializedViewStore::try_catch_up`].
 

@@ -2206,7 +2206,6 @@ fn with_chain_routes(router: Router<CipherscanRestAdapter>) -> Router<Cipherscan
         .route("/api/tx/shielded", get(shielded_transactions))
         .route("/api/tx/broadcast", post(broadcast_transaction))
         .route("/api/scan/orchard", post(scan_orchard))
-        .route("/api/lightwalletd/scan", post(lightwalletd_scan))
         .route("/api/tx/raw/batch", post(raw_transactions_batch))
         .route(
             "/api/tx/{transaction_id}/linkability",
@@ -3340,7 +3339,7 @@ async fn raw_transaction(
         .into_inner();
     let raw_bytes = raw_transaction_bytes(response.location.as_ref()).ok_or(
         CipherscanRestError::MissingUpstreamField(
-            "location.mined.raw_transaction_bytes or location.in_mempool.payload_bytes",
+            "location.mined.raw_transaction_bytes or location.in_mempool.raw_transaction_bytes",
         ),
     )?;
     Ok(json_response(
@@ -3498,18 +3497,6 @@ async fn scan_orchard(
         StatusCode::OK,
         orchard_candidate_scan_json(range, &scan.entries),
     ))
-}
-
-async fn lightwalletd_scan(Json(body): Json<Value>) -> Response {
-    let range = match parse_scan_range(&body, false) {
-        Ok(range) => range,
-        Err(error) => return scan_bad_request_response(error),
-    };
-
-    json_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        lightwalletd_scan_unavailable_json(range.start_height, range.end_height),
-    )
 }
 
 async fn broadcast_transaction(
@@ -7105,7 +7092,7 @@ fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> V
         "blockHash": block_location.map(|location| location.block_hash.as_str()),
         "blockTime": mined_chain_context.map(|chain_context| chain_context.block_time.to_string()),
         "confirmations": mined_chain_context.map(|chain_context| chain_context.confirmations),
-        "mempoolTime": mempool.map(|entry| entry.first_seen_unix_seconds),
+        "mempoolTime": mempool.map(mempool_first_seen_unix_seconds),
         "status": transaction_status(location),
         "size": facts.size_bytes,
         "version": facts.version.as_ref().map(|version| version.effective_version),
@@ -8132,7 +8119,7 @@ fn mempool_transaction_not_found_response() -> Response {
 fn mempool_transaction_json(
     network: Network,
     facts: &explorer::TransactionPublicFacts,
-    mempool: &wallet::MempoolTransaction,
+    mempool: &wallet::MempoolEntry,
     response: &explorer::TransactionDetailResponse,
 ) -> Value {
     let counts = facts.counts.as_ref();
@@ -8178,7 +8165,7 @@ fn mempool_transaction_json(
         "version": facts.version.as_ref().map(|version| version.effective_version),
         "versionKind": facts.version.as_ref().map(|version| version.kind),
         "locktime": lock_time_json(facts.lock_time.as_ref()),
-        "firstSeen": mempool.first_seen_unix_seconds,
+        "firstSeen": mempool_first_seen_unix_seconds(mempool),
         "vinCount": counts.map(|counts| counts.transparent_input_count),
         "voutCount": counts.map(|counts| counts.transparent_output_count),
         "shieldedSpends": counts.map(|counts| counts.sapling_spend_count),
@@ -13587,20 +13574,6 @@ fn orchard_candidate_scan_json(
     })
 }
 
-fn lightwalletd_scan_unavailable_json(start_height: u64, end_height: u64) -> Value {
-    json!({
-        "success": false,
-        "error": "Lightwalletd compact-block scan is not available from the Zinder Cipherscan compatibility adapter",
-        "startHeight": start_height,
-        "endHeight": end_height,
-        "blocks": [],
-        "degraded": true,
-        "unavailable": [
-            "Compact-block range streaming belongs to lightwalletd compatibility surfaces, not the Cipherscan REST adapter."
-        ],
-    })
-}
-
 fn chain_info_json(height: u32) -> Value {
     let height_string = height.to_string();
     json!({
@@ -13684,7 +13657,7 @@ fn raw_transaction_bytes(location: Option<&wallet::TransactionLocation>) -> Opti
             mined.raw_transaction_bytes.as_deref()
         }
         Some(transaction_location::Location::InMempool(mempool)) => {
-            Some(mempool.payload_bytes.as_slice())
+            Some(mempool.raw_transaction_bytes.as_slice())
         }
         None => None,
     }
@@ -13701,11 +13674,15 @@ fn mined_location(
 
 fn mempool_location(
     location: Option<&wallet::TransactionLocation>,
-) -> Option<&wallet::MempoolTransaction> {
+) -> Option<&wallet::MempoolEntry> {
     match location.and_then(|location| location.location.as_ref()) {
         Some(transaction_location::Location::InMempool(mempool)) => Some(mempool),
         Some(transaction_location::Location::Mined(_)) | None => None,
     }
+}
+
+const fn mempool_first_seen_unix_seconds(mempool: &wallet::MempoolEntry) -> u64 {
+    mempool.first_seen_unix_millis / 1_000
 }
 
 fn transaction_status(location: Option<&wallet::TransactionLocation>) -> &'static str {
@@ -15320,9 +15297,10 @@ mod tests {
             privacy_shape: explorer::PrivacyShape::Mixed as i32,
             ..Default::default()
         };
-        let mempool = wallet::MempoolTransaction {
-            payload_bytes: vec![0, 1],
-            first_seen_unix_seconds: 1_700_000_000,
+        let mempool = wallet::MempoolEntry {
+            raw_transaction_bytes: vec![0, 1],
+            first_seen_unix_millis: 1_700_000_000_000,
+            ..Default::default()
         };
         let response = explorer::TransactionDetailResponse {
             transparent_outputs: vec![
@@ -15377,9 +15355,10 @@ mod tests {
     fn confirmed_transaction_location_rejects_mempool_transactions() {
         let unconfirmed_location = wallet::TransactionLocation {
             location: Some(transaction_location::Location::InMempool(
-                wallet::MempoolTransaction {
-                    payload_bytes: vec![0, 1],
-                    first_seen_unix_seconds: 1_700_000_000,
+                wallet::MempoolEntry {
+                    raw_transaction_bytes: vec![0, 1],
+                    first_seen_unix_millis: 1_700_000_000_000,
+                    ..Default::default()
                 },
             )),
         };
@@ -16974,22 +16953,6 @@ mod tests {
         assert_eq!(body["success"], json!(false));
         assert_eq!(body["code"], json!("upstream_unavailable"));
         Ok(())
-    }
-
-    #[test]
-    fn lightwalletd_scan_unavailable_json_preserves_error_shape() {
-        let lightwalletd = lightwalletd_scan_unavailable_json(10, 12);
-
-        assert_eq!(lightwalletd["success"], json!(false));
-        assert_eq!(lightwalletd["startHeight"], json!(10));
-        assert_eq!(lightwalletd["endHeight"], json!(12));
-        assert_eq!(lightwalletd["blocks"], json!([]));
-        assert_eq!(lightwalletd["degraded"], json!(true));
-        assert!(
-            lightwalletd["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("Lightwalletd"))
-        );
     }
 
     #[test]

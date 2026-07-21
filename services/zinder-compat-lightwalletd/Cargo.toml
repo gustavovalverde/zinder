@@ -16,7 +16,6 @@ async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
 hex.workspace = true
-metrics.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -35,7 +34,6 @@ zinder-query.workspace = true
 zinder-runtime.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
-zinder-wallet-projection.workspace = true
 zinder-wallet-rocksdb.workspace = true
 
 [dev-dependencies]

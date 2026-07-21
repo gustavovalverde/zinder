@@ -18,8 +18,10 @@ pub use error_policy::{
 /// Wire-contract revision advertised in every `ops.ServerInfo` response.
 ///
 /// Monotonically increasing marker, incremented whenever the semantics of an
-/// existing wire surface are revised in place. Consumers assert a minimum.
-pub const CONTRACT_REVISION: u32 = 1;
+/// existing wire surface are revised in place. Consumers require the minimum
+/// revision they implement and may accept newer revisions when the server's
+/// advertised capabilities satisfy their requirements.
+pub const CONTRACT_REVISION: u32 = 2;
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///
@@ -29,10 +31,6 @@ pub const ZINDER_V1_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/zinder_v1_descriptor.bin"));
 
 /// Encoded descriptor set for the vendored lightwalletd compatibility schemas.
-///
-/// Mirrors [`ZINDER_V1_FILE_DESCRIPTOR_SET`] for the compat shim's
-/// `CompactTxStreamer` surface so lightwalletd-compatible wallets can discover
-/// the served service via gRPC reflection.
 pub const LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/lightwalletd_compat_descriptor.bin"
@@ -118,7 +116,7 @@ pub mod v1 {
     }
 }
 
-/// Compatibility protocol modules.
+/// Compatibility protocol modules kept separate from native Zinder contracts.
 pub mod compat {
     /// Vendored lightwalletd-compatible protocol messages.
     pub mod lightwalletd {

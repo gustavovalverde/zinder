@@ -42,11 +42,12 @@ The core contract is:
 
 `wallet-serving` is the operator-facing coverage profile for stores intended to serve wallet flows. It means the store was built with enough historical artifact coverage for wallet creation, recovery, rescan, imported-account, and transparent-UTXO flows supported by the published API.
 
-`wallet-serving` is not a Zodl profile and not a lightwalletd profile. It is the conservative store posture for wallet consumers. The bulk-catchup floor is derived from upstream-node-advertised shielded activation heights, because that is the simplest general rule that covers subtree roots from index `0` and historical tree-state anchors without encoding public-network constants into docs or config.
+`wallet-serving` is not a Zodl profile and not a lightwalletd profile. It is the conservative store posture for wallet consumers. It retains complete non-genesis canonical history. Shielded activation heights are sufficient for shielded tree data, but they cannot bound transparent history: a transaction mined at any later height can spend an output created before the earliest shielded activation. Complete history lets the global transparent projection resolve every predecessor without an unauthenticated prefix-state shortcut.
 
 Serving coverage fails closed:
 
 - `wallet-serving` rejects explicit `from_height` and `checkpoint_height` overrides.
+- An existing or staged READY store is rejected when its immutable retained-history floor is later than the floor required by the current invocation. Following cannot repair omitted history; operators must rebuild the canonical and wallet stores.
 - `wallet-serving` rejects `allow_reorg_window_settlement`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
 - Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes, with one bounded exception: `tree_state_at(height)` fills from the configured upstream node on a cache-miss (see the tree-state-at-height carve-out under Tradeoffs).
 - Readiness does not claim production traffic is safe before secondary catchup and writer-status validation have established the reader's state.

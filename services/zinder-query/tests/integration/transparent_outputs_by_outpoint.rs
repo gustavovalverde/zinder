@@ -7,8 +7,9 @@ use eyre::eyre;
 use std::sync::Arc;
 use tonic::{Code, Request};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, TransactionId,
-    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId,
+    CompactChainMetadata, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentOutputArtifact,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
@@ -52,7 +53,7 @@ async fn transparent_outputs_by_outpoint_resolves_known_outpoint() -> eyre::Resu
         vec![compact_block],
         &[prevout],
         Vec::new(),
-    ))?;
+    )?)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
@@ -121,7 +122,7 @@ async fn transparent_outputs_by_outpoint_returns_none_for_out_of_bounds_index() 
         vec![compact_block],
         &[prevout],
         Vec::new(),
-    ))?;
+    )?)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
@@ -216,12 +217,15 @@ async fn transparent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyr
 /// Fixture: two committed blocks at distinct heights with three transactions
 /// (two in the first block, one in the second). Returns the chain epoch and
 /// the three transaction ids in commit order.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture keeps both blocks and their cross-block spend relationship in one construction"
+)]
 fn commit_two_block_fixture(
     store: &zinder_store::PrimaryChainStore,
 ) -> eyre::Result<(ChainEpoch, [TransactionId; 3])> {
     use zinder_core::{
-        BlockHash, BlockHeaderArtifact, ChainTipMetadata, CompactBlockArtifact, Network,
-        UnixTimestampMillis,
+        BlockHash, BlockHeaderArtifact, ChainTipMetadata, Network, UnixTimestampMillis,
     };
 
     let first_height = BlockHeight::new(1);
@@ -268,8 +272,26 @@ fn commit_two_block_fixture(
         ),
     ];
     let compact_blocks = vec![
-        CompactBlockArtifact::new(first_height, first_hash, b"compact-block-1-100".to_vec()),
-        CompactBlockArtifact::new(second_height, second_hash, b"compact-block-1-101".to_vec()),
+        zinder_core::CompactBlockArtifact::empty(
+            BlockId::new(first_height, first_hash),
+            BlockHash::from_bytes([0; 32]),
+            0,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        ),
+        zinder_core::CompactBlockArtifact::empty(
+            BlockId::new(second_height, second_hash),
+            first_hash,
+            0,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        ),
     ];
     let prevouts = vec![
         synthetic_transparent_output_artifact(first_height, first_hash, 0xA1, 0x11),
@@ -288,7 +310,7 @@ fn commit_two_block_fixture(
             compact_blocks,
             &prevouts,
             Vec::new(),
-        )
+        )?
         .with_reorg_window_change(ReorgWindowChange::Extend {
             block_range: BlockHeightRange::inclusive(first_height, second_height),
         }),
@@ -368,7 +390,7 @@ async fn transparent_outputs_by_outpoint_preserves_input_order_and_dedupes_reads
         vec![compact_block],
         &[prevout],
         Vec::new(),
-    ))?;
+    )?)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let outpoints = vec![

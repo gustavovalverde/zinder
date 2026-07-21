@@ -135,6 +135,7 @@ jobs:
         env:
           ZINDER_INGEST_IMAGE: zinder-ingest:ci-proof
           ZINDER_PROJECTOR_IMAGE: zinder-projector:ci-proof
+          ZINDER_QUERY_IMAGE: zinder-query:ci-proof
           ZINDER_COMPAT_IMAGE: zinder-compat-lightwalletd:ci-proof
           ZINDER_SINGLE_HOST_DATA_VOLUME_NAME: zinder-ci-proof-data
           ZINDER_PROMETHEUS_VOLUME_NAME: zinder-ci-proof-prometheus
@@ -149,11 +150,14 @@ jobs:
           | jq -e '
               .services["zinder-ingest"].command == ["--config", "/etc/zinder/config.toml"]
               and .services["zinder-projector"].command == ["--config", "/etc/zinder/config.toml"]
+              and .services["zinder-query"].command == ["--config", "/etc/zinder/config.toml"]
               and .services["zinder-compat-lightwalletd"].command == ["--config", "/etc/zinder/config.toml"]
               and .services["zinder-ingest"].image == "zinder-ingest:ci-proof"
               and .services["zinder-projector"].image == "zinder-projector:ci-proof"
+              and .services["zinder-query"].image == "zinder-query:ci-proof"
               and .services["zinder-compat-lightwalletd"].image == "zinder-compat-lightwalletd:ci-proof"
               and .services["zinder-projector"].network_mode == "service:zinder-ingest"
+              and .services["zinder-query"].network_mode == "service:zinder-ingest"
               and .services["zinder-compat-lightwalletd"].network_mode == "service:zinder-ingest"
               and .volumes.data.name == "zinder-ci-proof-data"
               and .volumes.prometheus.name == "zinder-ci-proof-prometheus"

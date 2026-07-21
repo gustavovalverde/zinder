@@ -6,7 +6,7 @@
 //! - [`SecondaryStorageSection`] for readers that open both canonical and
 //!   materialized-view stores (`zinder-query`, `zinder-explorer`).
 //! - [`CanonicalSecondaryStorageSection`] for readers that open only the
-//!   canonical store (`zinder-compat-lightwalletd`).
+//!   canonical store (`zinder-query`).
 
 use std::{path::PathBuf, time::Duration};
 

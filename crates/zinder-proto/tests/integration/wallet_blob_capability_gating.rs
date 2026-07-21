@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use zinder_proto::capabilities::{
     AdvertisePolicy, CapabilitySurface, ExplorerReadiness, WALLET_READ_FULL_BLOCK_AT_V1,
-    WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V1,
+    WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
     WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1,
     WalletAdvertiseInputs, always_on_capability_strings, capabilities_for_surface,
 };
@@ -121,7 +121,7 @@ fn retention_none_advertises_neither_full_block_nor_transaction_bytes() {
     assert!(!advertised.contains(WALLET_READ_FULL_BLOCK_AT_V1));
     assert!(!advertised.contains(WALLET_READ_FULL_BLOCK_RANGE_V1));
     assert!(!advertised.contains(WALLET_READ_TRANSACTION_BYTES_V1));
-    assert!(advertised.contains(WALLET_READ_TRANSACTION_BY_ID_V1));
+    assert!(advertised.contains(WALLET_READ_TRANSACTION_BY_ID_V2));
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn retention_transactions_advertises_transaction_bytes_only() {
     assert!(!advertised.contains(WALLET_READ_FULL_BLOCK_AT_V1));
     assert!(!advertised.contains(WALLET_READ_FULL_BLOCK_RANGE_V1));
     assert!(advertised.contains(WALLET_READ_TRANSACTION_BYTES_V1));
-    assert!(advertised.contains(WALLET_READ_TRANSACTION_BY_ID_V1));
+    assert!(advertised.contains(WALLET_READ_TRANSACTION_BY_ID_V2));
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn retention_all_advertises_full_block_and_transaction_bytes() {
     assert!(advertised.contains(WALLET_READ_FULL_BLOCK_AT_V1));
     assert!(advertised.contains(WALLET_READ_FULL_BLOCK_RANGE_V1));
     assert!(advertised.contains(WALLET_READ_TRANSACTION_BYTES_V1));
-    assert!(advertised.contains(WALLET_READ_TRANSACTION_BY_ID_V1));
+    assert!(advertised.contains(WALLET_READ_TRANSACTION_BY_ID_V2));
 }
 
 #[test]

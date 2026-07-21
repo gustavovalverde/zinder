@@ -115,6 +115,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         ErrorReason::UnsupportedChainEvent
         | ErrorReason::UnsupportedBlockSelector
         | ErrorReason::UnsupportedTransactionStatus
+        | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
         | ErrorReason::StorageUnavailable
