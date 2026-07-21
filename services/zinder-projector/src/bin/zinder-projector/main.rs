@@ -1077,12 +1077,7 @@ fn apply_next_wallet_transition(
     cancel: &CancellationToken,
 ) -> Result<Option<WalletCanonicalSourceIdentity>, ProjectorError> {
     let transition_fence = transition.resulting_fence();
-    let resulting_settled_tip = match &transition {
-        NextWalletTransition::ApplyOne(event) => settled_tip_for_event(canonical, *event)?,
-        NextWalletTransition::ReconcileOverwritten { .. } => {
-            canonical.sequence_checkpoint().through()
-        }
-    };
+    let resulting_settled_tip = settled_tip_for_transition(canonical, &transition)?;
     let expected_result =
         wallet_source_identity_from_fence(transition_fence, resulting_settled_tip);
     let transition_result = match transition {
@@ -1143,6 +1138,23 @@ fn apply_next_wallet_transition(
         });
     }
     Ok(Some(observed))
+}
+
+fn settled_tip_for_transition(
+    canonical: &RocksDbCanonicalSecondary,
+    transition: &NextWalletTransition,
+) -> Result<BlockId, ProjectorError> {
+    let event =
+        match transition {
+            NextWalletTransition::ApplyOne(event) => *event,
+            NextWalletTransition::ReconcileOverwritten { events, .. } => events
+                .last()
+                .copied()
+                .ok_or(ProjectorError::CanonicalEventPageInvalid {
+                    reason: "collapsed reconciliation has no final retained event",
+                })?,
+        };
+    settled_tip_for_event(canonical, event)
 }
 
 async fn wait_for_follow_poll(cancel: &CancellationToken) -> bool {
@@ -1915,27 +1927,172 @@ fn emit_error(error: &ProjectorError) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, str::FromStr as _, time::Duration};
+    use std::{num::NonZeroU32, path::PathBuf, str::FromStr as _, time::Duration};
 
+    use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
     use zinder_runtime::{BearerToken, ResolvedProjectorControl};
 
     use zinder_core::{
-        BlockHash, BlockHeight, BlockHeightRange, BlockId,
-        CanonicalBlockFactsSequenceDigestVersion, ChainEpochId, UnixTimestampMillis,
+        BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+        CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
+        CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion,
+        CanonicalTransactionFacts, ChainEpochId, ChainTipMetadata, CommitmentTreeCheckpoint,
+        CommitmentTreeFrontier, CommitmentTreeFrontiers, CompactBlockArtifact,
+        CompactChainMetadata, LockTime, PrivacyShape, SerializedBytesDigest, ShieldedProtocol,
+        TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
+        TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
+        TransactionVersion, UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
     };
 
     use super::{
-        CanonicalBlockFactsSequenceDigest, CanonicalRetentionLease, ProjectorControlTasks,
-        ProjectorError, ResumedFollowingRetentionPlan, WalletCanonicalSourceIdentity,
-        WalletProjectionSourcePosition, classify_resumed_following_retention,
-        encode_zinder_native_chain_name, following_retention_lease_renewal_expiry,
-        following_retention_lease_transition_expiry, lease_expiry, reconciliation_ranges,
-        require_bounded_reconciliation_replay, require_built_wallet_source,
-        require_pre_promotion_follower_admission, require_retention_lease_anchor,
-        writer_status_matches_source,
+        CanonicalBlockFactsSequenceDigest, CanonicalRetentionLease, NextWalletTransition,
+        ProjectorControlTasks, ProjectorError, ResumedFollowingRetentionPlan,
+        WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
+        classify_resumed_following_retention, encode_zinder_native_chain_name,
+        following_retention_lease_renewal_expiry, following_retention_lease_transition_expiry,
+        lease_expiry, reconciliation_ranges, require_bounded_reconciliation_replay,
+        require_built_wallet_source, require_pre_promotion_follower_admission,
+        require_retention_lease_anchor, settled_tip_for_transition, writer_status_matches_source,
     };
     use zinder_proto::v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse};
+    use zinder_store::{
+        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventHistoryRequest,
+        CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy,
+        CanonicalReplacementBlock, CanonicalStoreBuildPlan, CanonicalStoreWorkload,
+        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    };
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end regression must construct a retained overwritten event, advance settlement beyond it, and compare both settlement sources"
+    )]
+    fn collapsed_transition_uses_target_event_settlement_not_current_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let canonical_path = temporary.path().join("canonical");
+        let reorg_policy = CanonicalReorgPolicy::new(3)?;
+        let block_one = empty_canonical_block(
+            1,
+            zinder_core::Network::ZcashRegtest.genesis_hash().as_bytes(),
+            [0x11; 32],
+        );
+        let block_one_id = BlockId::new(
+            block_one.facts.block_header.height,
+            block_one.facts.block_header.block_hash,
+        );
+        let build_plan =
+            CanonicalStoreBuildPlan::complete(&activations, 0, block_one_id, reorg_policy)?;
+        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+            &canonical_path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        builder.bulk_load_blocks([Ok::<_, std::convert::Infallible>(block_one)])?;
+        builder.load_subtree_roots(std::iter::empty())?;
+        builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+            block_one_id,
+            1,
+            regtest_checkpoint_frontiers_at(BlockHeight::new(1)),
+        ))?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            block_one_id,
+            UnixTimestampMillis::new(1),
+        ))?;
+        let canonical = validated.publish_baseline(publication)?;
+        let baseline_fence = canonical.event_fence();
+
+        let old_block_two = empty_canonical_block(2, [0x11; 32], [0x22; 32]);
+        let (canonical, old_append_fence) = canonical.commit_live_append(
+            CanonicalLiveAppend::new(
+                baseline_fence,
+                old_block_two,
+                Vec::new(),
+                block_one_id,
+                UnixTimestampMillis::new(2),
+            ),
+            &activations,
+        )?;
+        let replacement_block_two = empty_canonical_block(2, [0x11; 32], [0x32; 32]);
+        let replacement_block_two_id = BlockId::new(
+            replacement_block_two.facts.block_header.height,
+            replacement_block_two.facts.block_header.block_hash,
+        );
+        let (canonical, replacement_fence) = canonical.commit_live_replacement(
+            CanonicalLiveReplacement::new(
+                old_append_fence,
+                vec![CanonicalReplacementBlock::new(
+                    replacement_block_two,
+                    Vec::new(),
+                )],
+                UnixTimestampMillis::new(3),
+            ),
+            &activations,
+        )?;
+
+        let mut current_fence = replacement_fence;
+        let mut canonical = canonical;
+        for (height, parent_hash, block_hash, settled_tip) in [
+            (3, [0x32; 32], [0x33; 32], block_one_id),
+            (4, [0x33; 32], [0x34; 32], block_one_id),
+            (5, [0x34; 32], [0x35; 32], replacement_block_two_id),
+        ] {
+            let (next, fence) = canonical.commit_live_append(
+                CanonicalLiveAppend::new(
+                    current_fence,
+                    empty_canonical_block(height, parent_hash, block_hash),
+                    Vec::new(),
+                    settled_tip,
+                    UnixTimestampMillis::new(u64::from(height).saturating_add(3)),
+                ),
+                &activations,
+            )?;
+            canonical = next;
+            current_fence = fence;
+        }
+
+        let secondary = RocksDbCanonicalSecondary::open_ready(
+            &canonical_path,
+            temporary.path().join("canonical-secondary"),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            reorg_policy,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let events = secondary.canonical_event_history(CanonicalEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(16).ok_or("zero event page limit")?,
+        ))?;
+        let overwritten_append = events
+            .iter()
+            .copied()
+            .find(|event| event.resulting_fence() == old_append_fence)
+            .ok_or("overwritten append event missing")?;
+        let replacement = events
+            .iter()
+            .copied()
+            .find(|event| event.resulting_fence() == replacement_fence)
+            .ok_or("replacement event missing")?;
+        let transition = NextWalletTransition::ReconcileOverwritten {
+            events: vec![overwritten_append, replacement],
+            resulting_fence: replacement_fence,
+        };
+
+        assert_eq!(
+            secondary.sequence_checkpoint().through(),
+            replacement_block_two_id,
+            "the current checkpoint must be ahead of the historical event settlement",
+        );
+        assert_eq!(
+            settled_tip_for_transition(&secondary, &transition)?,
+            block_one_id,
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn enabled_projector_control_refuses_an_occupied_listener()
@@ -2210,6 +2367,114 @@ mod tests {
             following_retention_lease_transition_expiry(now, current_expiry, configured_duration,),
             Some(lease_expiry(now, configured_duration))
         );
+    }
+
+    fn empty_canonical_block(
+        height: u32,
+        parent_hash: [u8; 32],
+        block_hash: [u8; 32],
+    ) -> CanonicalBuildBlock {
+        let height = BlockHeight::new(height);
+        let block_hash = BlockHash::from_bytes(block_hash);
+        let parent_hash = BlockHash::from_bytes(parent_hash);
+        let (transaction, transaction_blob) = empty_coinbase(height, block_hash);
+        let facts = CanonicalBlockFacts {
+            block_header: BlockHeaderArtifact::new(
+                height,
+                block_hash,
+                parent_hash,
+                [0; 32],
+                [0; 32],
+                i64::from(height.value()),
+                0,
+                [0; 32],
+                0,
+                0,
+            ),
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
+                &block_hash.as_bytes(),
+            ),
+            transactions: vec![transaction],
+        };
+        let replay_envelope = encode_canonical_block_replay(
+            &facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        );
+        CanonicalBuildBlock {
+            facts,
+            replay_envelope,
+            compact_block: CompactBlockArtifact::empty(
+                BlockId::new(height, block_hash),
+                parent_hash,
+                height.value(),
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            ),
+            tip_metadata: ChainTipMetadata::empty(),
+            tree_state_checkpoint: Some(CommitmentTreeCheckpoint::new(
+                BlockId::new(height, block_hash),
+                height.value(),
+                regtest_checkpoint_frontiers_at(height),
+            )),
+            block_final_note_commitment_roots: None,
+            transaction_blobs: vec![transaction_blob],
+            block_blob: None,
+        }
+    }
+
+    fn empty_coinbase(
+        height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> (CanonicalTransactionFacts, TransactionBlobArtifact) {
+        let transaction_tag = block_hash.as_bytes()[0];
+        let raw_transaction_bytes = vec![transaction_tag];
+        let transaction_id = TransactionId::from_bytes([transaction_tag; 32]);
+        let facts = CanonicalTransactionFacts {
+            public_facts: TransactionPublicFacts {
+                transaction_id,
+                auth_digest: None,
+                wtxid: None,
+                version: TransactionVersion::Unsupported {
+                    effective_version: 0,
+                    version_group_id: None,
+                },
+                consensus_branch_id: None,
+                lock_time: LockTime::Unlocked,
+                expiry_height: None,
+                size_bytes: 1,
+                counts: TransactionComponentCounts::EMPTY,
+                orchard_value_balance_zat: None,
+                orchard_anchor: None,
+                ironwood_value_balance_zat: None,
+                privacy_shape: PrivacyShape::Unclassified,
+                is_coinbase: true,
+                unsupported_sections: vec![UnsupportedSection::FutureVersionHeader],
+            },
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
+                &raw_transaction_bytes,
+            ),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: Vec::new(),
+        };
+        let blob = TransactionBlobArtifact::new(
+            TransactionLocation::new(transaction_id, height, block_hash, 0),
+            raw_transaction_bytes,
+        );
+        (facts, blob)
+    }
+
+    fn regtest_checkpoint_frontiers_at(height: BlockHeight) -> CommitmentTreeFrontiers {
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+            (height.value() >= 2).then(|| CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+            (height.value() >= 603)
+                .then(|| CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
+        )
     }
 
     fn writer_status(identity: WalletCanonicalSourceIdentity) -> CanonicalWriterStatusResponse {
