@@ -100,12 +100,41 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       - name: Verify workflow action pins
         run: scripts/test-workflow-action-pins.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+
+      - name: Install Changie
+        uses: miniscruff/changie-action@11bcad388e7973948cbcecb10863baf024d5f607 # v3.0.0
+        with:
+          version: v1.25.1
+
+      - name: Test changelog policy
+        run: scripts/test-changelog.sh
+
+      - name: Verify pull request changelog declaration
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          pr_body_file="${RUNNER_TEMP}/pr-body.md"
+          printf '%s\n' "$PR_BODY" > "$pr_body_file"
+          scripts/validate-changelog.sh \
+            pr \
+            "$BASE_COMMIT" \
+            "$HEAD_COMMIT" \
+            "$pr_body_file"
+
+      - name: Verify pending changelog fragments
+        if: github.event_name != 'pull_request'
+        run: scripts/validate-changelog.sh fragments
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

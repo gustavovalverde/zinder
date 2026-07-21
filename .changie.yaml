@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/miniscruff/changie/v1.25.1/docs/schema.json
+changesDir: .changes
+unreleasedDir: unreleased
+headerPath: header.tpl.md
+changelogPath: CHANGELOG.md
+versionExt: md
+versionFormat: '## [{{.VersionNoPrefix}}] - {{.Time.Format "2006-01-02"}}'
+kindFormat: '### {{.Kind}}'
+changeFormat: '- {{.Body}} ([#{{.Custom.PR}}](https://github.com/gustavovalverde/zinder/pull/{{.Custom.PR}}))'
+fragmentFileFormat: '{{.Kind}}-{{.Custom.PR}}'
+kinds:
+  - label: Added
+    key: added
+    auto: '{{.Custom.Bump}}'
+  - label: Changed
+    key: changed
+    auto: '{{.Custom.Bump}}'
+  - label: Deprecated
+    key: deprecated
+    auto: '{{.Custom.Bump}}'
+  - label: Removed
+    key: removed
+    auto: '{{.Custom.Bump}}'
+  - label: Fixed
+    key: fixed
+    auto: '{{.Custom.Bump}}'
+  - label: Security
+    key: security
+    auto: '{{.Custom.Bump}}'
+custom:
+  - key: Bump
+    label: SemVer impact
+    type: enum
+    enumOptions:
+      - major
+      - minor
+      - patch
+  - key: PR
+    label: Pull request number
+    type: int
+    minInt: 1
+body:
+  minLength: 10
+newlines:
+  afterChangelogHeader: 1
+  beforeChangelogVersion: 1
+  afterChangelogVersion: 1
+  beforeKind: 1
+  afterKind: 1
+  endOfVersion: 1
